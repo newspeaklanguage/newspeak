@@ -1,0 +1,623 @@
+Newspeak3
+'NewspeakSynchronization'
+class NewspeakSynchronization2 usingPlatform: platform <Platform> usingObjectFormat: aNof <NewspeakObjectFormat> withSystemObjects: systemSnapshot <SequenceableCollection> = NewspeakObject (
+"Provides facilities for synchronizing object between distributed peers.
+
+The canonical representation of an object is the result of sending it the message 'canonicalRepresentation'.
+A non-trivial object is an object whose canonical representation is not itself.
+
+   Copyright 2008 Cadence Design Systems, Inc.
+   
+   Licensed under the Apache License, Version 2.0 (the ''License''); you may not use this file except in compliance with the License.  You may obtain a copy of the License at  http://www.apache.org/licenses/LICENSE-2.0
+"|
+	Collections = platform Collections.
+	Transcript = platform Transcript.
+	CanonicalRepresentation = platform NewspeakSynchronization CanonicalRepresentation.
+	TransactionID = platform NewspeakSynchronization TransactionID.
+	BloatedHistory = platform NewspeakObjectFormat BloatedHistory.
+
+	private assert = platform NewspeakCore Assert new.
+
+	nof <NewspeakObjectFormat> = aNof.
+	snapshot ::= extendSystemSnapshot: systemSnapshot.
+	crc32table = initCrc32table.
+	manager = ImmutabilityManager new.
+	currentAnchor <Anchor>
+	anchors = Collections Dictionary new.
+	tip <Anchor>
+	world = PersistentWorld withInitialObjects: snapshot.
+|manager registerWith: platform NsSystem NoModificationError)
+(
+class Anchor = (
+"An anchor is a pair of a transaction ID and a sequenceable collection of objects, associated with at most two parent anchors.
+
+Initially we assume that anchors have only one parent.
+
+The number of objects in the parent anchor is less than the number of objects in this anchor. The object at index i is this anchors version of the object at index i in the parent. If i greater than the number of objects in the parent, the object is considered new in this anchor.
+"|
+	parent1 <Anchor | nil>
+	changes1
+	parent2 <Anchor | nil>
+	changes2
+	id <TransactionID>
+	objects <Array>
+|)
+('as yet unclassified'
+changesSince: baseId <TransactionID | nil> ^<Set[Integer]> = (
+	id = baseId ifTrue: [^Collections Set new].
+	assert true: [parent2 == nil].
+	^parent1 isNil ifTrue: [Collections Set new] ifFalse: [changes1 asSet, (parent1 changesSince: baseId)]
+)
+copy = (
+	| aCopy |
+	aCopy:: clone.
+	aCopy objects: (fullCopy: objects).
+	^aCopy
+)
+copyWithCurrentObjects: currentObjects = (
+	| aCopy |
+	aCopy:: clone.
+	aCopy objects: (currentObjects copyFrom: 1 to: objects size).
+	^aCopy
+)
+fullCopy: array <Array> = (
+	| arrayCopy |
+	#BOGUS yourself. "this method shadows one in the enclosing class and is a temporary hack to see how it affects speed"
+	arrayCopy:: Array new: array size.
+	array withIndexDo:  [ :obj :i | arrayCopy at: i put: obj clone].
+	^arrayCopy
+)
+objectMap = (
+	| map |
+	map:: Collections IdentityDictionary new.
+	objects withIndexDo: [ :ea :i | map at: ea put: i].
+	^map
+))
+class ByteStream uninstantiable = ()
+() : ('as yet unclassified'
+new = (
+	^Collections WriteStream on: Collections ByteArray new
+))
+class ChangeComputer for: changeRecords = (|
+	allChanges <OrderedCollection[ChangeRecord]> = Collections OrderedCollection new.
+	allCanonicalReps <OrderedCollection> = Collections OrderedCollection new.
+	allNonTrivialCanonicalReps <OrderedCollection> = Collections OrderedCollection new.
+	allNonTrivialObjects <OrderedCollection> = Collections OrderedCollection new.
+	newObjects
+	currentPayload
+|processChanges: changeRecords swap: false)
+('accessing'
+baseObjects = (
+	^Array streamContents: [ :s |
+		s nextPutAll: snapshot.
+		s nextPutAll: currentAnchor objects.
+		s nextPutAll: allNonTrivialObjects]
+)
+setPayload: payload = (
+	|
+	canonicalReps
+	canonicalIndices
+	newPayloadObjects
+	|
+	assert true: [currentPayload isNil].
+	currentPayload:: payload.
+	newPayloadObjects::
+		transitiveClosureOf: {payload root}
+		withBaseObjects: snapshot, currentAnchor objects, newObjects.
+	newPayloadObjects:: newPayloadObjects reject: [:ea | ea class == #isSymbol class].
+
+	canonicalReps:: newPayloadObjects collect: [ :ea |
+		canonicalRepresentationOf: ea].
+	canonicalIndices:: canonicalIndicesOf: newPayloadObjects with: canonicalReps.
+
+	allChanges addAll: (newPayloadObjects collect: [ :ea | ChangeRecord from: nil to: ea]).
+	allNonTrivialCanonicalReps
+		addAll: (canonicalIndices collect: [ :i | canonicalReps at: i]).
+	allNonTrivialObjects
+		addAll: (canonicalIndices collect: [ :i | newPayloadObjects at: i]).
+)
+syncRecord = (
+	^Array "an array keeps things simple when deserializing"
+		with: allNonTrivialObjects size
+		with: currentAnchor id deepCopy
+		with: allChanges asArray
+		with: allNonTrivialCanonicalReps asArray
+		with: currentPayload
+)'as yet unclassified'
+allAfterObjects = (
+	^allChanges collect: [ :cr | cr after]
+)
+processChanges: changes <Array[ChangeRecord]> swap: swap = (
+	|
+	canonicalRepresentations <Array> "The canonical representations of each object in the transitive closure"
+	canonicalIndices <Array[Integer]> "The indices of objects which canonical representation is not the object itself"
+	swappedChanges
+	|
+	changes isEmpty ifTrue: [^self].
+	canonicalRepresentations:: changes collect: [ :ea |
+		canonicalRepresentationOf: ea after].
+	canonicalIndices:: canonicalIndicesOf: (changes collect: [ :ea | ea after]) with: canonicalRepresentations.
+
+	swappedChanges:: swap
+		ifTrue: [changes collect: [ :ea | ea copyForSynchronization]]
+		ifFalse: [changes].
+	allChanges addAll: swappedChanges.
+	allCanonicalReps addAll: canonicalRepresentations.
+
+	allNonTrivialCanonicalReps addAll: (canonicalIndices collect: [ :i | canonicalRepresentations at: i]).
+	
+	allNonTrivialObjects addAll: (canonicalIndices collect: [ :i | (swappedChanges at: i) after]).
+)'initialize-release'
+gatherAllChangeRecords = (
+	processChanges: (checkChangeRecords: manager snapshotAndResetChanges) swap: true.
+	gatherNewObjects.
+	assert true: [allNonTrivialCanonicalReps size = allNonTrivialObjects size].
+)'private'
+gatherNewObjects = (
+	|
+	closure
+	newCanonicalRepresentations
+	newCanonicalIndices
+	newChangeRecords
+	|
+
+	"Determine which objects have been added..."
+	closure:: transitiveClosureWithoutCanonicalRepresentationImplementationOf: allCanonicalReps asArray.
+	newObjects:: transitiveClosureOf: closure withBaseObjects: snapshot, currentAnchor objects.
+	newObjects:: newObjects reject: [:ea | ea class == #isSymbol class].
+
+	"Find the canonical representations of the new objects..."
+	newCanonicalRepresentations:: newObjects collect: [ :ea |
+		canonicalRepresentationOf: ea].
+	newCanonicalIndices:: canonicalIndicesOf: newObjects with: newCanonicalRepresentations.
+
+	"Compute change records for the new objects"
+	newChangeRecords:: newObjects collect: [ :ea | ChangeRecord from: nil to: ea].
+	allChanges addAll: newChangeRecords.
+	allNonTrivialCanonicalReps
+		addAll: (newCanonicalIndices collect: [ :i | newCanonicalRepresentations at: i]).
+	allNonTrivialObjects
+		addAll: (newCanonicalIndices collect: [ :i | newObjects at: i]).
+)) : ('as yet unclassified'
+new = (
+	^(for: {}) gatherAllChangeRecords
+))
+class ChangeRecord from: originalClone to: modifiedObject = (
+"Represents a mutated object.
+
+The original object should a clone of the modified object just before the mutation occurs.
+This preserves the identity of the modified object."|
+	before = originalClone.
+	after = modifiedObject.
+|)
+('as yet unclassified'
+copyForSynchronization = (
+	"This is needed because during synchronization, the object which has changed is already on the peer. So the serialization will only send a reference to the object as well as the full copy before modifications.
+	This trick makes the serialization send a change record whose 'before' slot is a reference to the original object, and 'after' slot is a copy of the orignial object (and thus the modifications)"
+	^ChangeRecord from: after to: after clone
+))
+class ClientSession = Session (|
+	outgoingChanges
+|)
+('as yet unclassified'
+deserializeResponse: message = (
+	|
+	deserializer
+	baseObjectCount
+	nonTrivialObjectCount
+	changes
+	payload
+	id
+	canonicalReps
+	|
+
+	"{baseObjectCount. nonTrivialObjectCount. anchor id. changeRecords. nonTrivialCanonicalReps. payload} "
+
+	"Read the first part of the message to obtain counts"
+	deserializer:: deserializerFrom: message with: snapshot.
+	baseObjectCount:: deserializer nextValue.
+	nonTrivialObjectCount:: deserializer nextValue.
+
+	"Prepare for receiving non-trivial objects"
+	nonTrivialObjects:: Array new: nonTrivialObjectCount.
+	1 to: nonTrivialObjects size do: [ :i | nonTrivialObjects at: i put: Object new].
+
+
+	"Read the entire message"
+	deserializer:: deserializerFrom: message with: (baseObjects, outgoingChanges allAfterObjects).
+	assert true: (deserializer nextValue = baseObjectCount).
+	assert true: (deserializer nextValue = nonTrivialObjectCount).
+	id:: deserializer nextValue.
+	changes:: deserializer nextValue.
+	canonicalReps:: deserializer nextValue.
+	payload:: deserializer nextValue.
+
+	decanonicalize: canonicalReps with: nonTrivialObjects.
+
+	setCurrentAnchor:: reconstructAnchor: id with: changes.
+	^payload
+)
+reconstructAnchor: id with: changes <Collection[ChangeRecord]> ^ <Anchor> = (
+	| objectMap parentObjects newObjects |
+	assert true: [anchor == nil].
+	objectMap:: parent objectMap.
+	parentObjects:: parent objects clone.
+	newObjects:: Array streamContents: [ :s |
+		changes do: [ :cr |
+			nil = cr before
+				ifTrue: [s nextPut: cr after]
+				ifFalse: [
+					parentObjects
+							at: (objectMap at: cr before)
+							put: cr after]]].
+	parent objects do: [ :ea | ea isImmutable: false].
+	parent objects elementsForwardIdentityTo: parentObjects.
+	anchor:: Anchor new.
+	anchor id: id.
+	anchor objects: parent objects, newObjects.
+	^anchor
+)
+serializeChangeRecords: payload ^<ByteArray> = (
+	| changeComputer bytes |
+	parent:: currentAnchor.
+	changeComputer:: ChangeComputer new.
+	changeComputer setPayload: payload.
+	outgoingChanges:: changeComputer.
+
+	"Serialize the changes and canonical representations"
+	bytes:: serialize: changeComputer syncRecord
+				withBaseObjects: changeComputer baseObjects.
+	nonTrivialObjects:: changeComputer allNonTrivialObjects.
+
+	testBaseObjects. "assertion/debugging"
+
+	checkForConcurrentModifications.
+	^bytes
+))
+class ImmutabilityManager = (|
+	changeLog = Collections OrderedCollection new.
+|)
+('as yet unclassified'
+isEmpty = (
+	^changeLog isEmpty
+)
+manage: error <NoModificationError> ifHandled: action = (
+	| modifiedObject originalClone result |
+	modifiedObject:: error receiver.
+	modifiedObject isImmutable ifFalse: [^self]. "Cannot handle become yet"
+	modifiedObject isImmutable: false.
+	originalClone:: modifiedObject clone.
+	originalClone == modifiedObject ifTrue: [^self]. "attempt to mutate truly immutable obj"
+	result:: error retryMutation.
+	changeLog add: (ChangeRecord from: originalClone to: modifiedObject).
+	action value: result "return to sender"
+	"not reached"
+)
+registerWith: cls = (
+	cls addManager: self
+)
+snapshotAndResetChanges ^<Array> = (
+	"Return the current changes and reset the change log."
+	| changes |
+	isImmutable ifTrue: [self halt: 'Manager is immutable'].
+	changes:: Collections OrderedCollection new.
+	changes become: changeLog. "ensure atomicity"
+	^changes asArray
+))
+class PersistentWorld withInitialObjects: initialObjects <Array[E]> = (|
+	objects <Array[E]> ::= initialObjects.
+	objectCount <Integer> ::= initialObjects size.
+	uuidMap <Dictionary[E,Integer]> = BloatedHistory withShift: 3 usingAssert: assert.
+|objects withIndexDo: [:each :i | uuidMap at: each put: i])
+()
+class ServerSession = Session (|
+	incomingChanges
+|)
+('as yet unclassified'
+deriveNewAnchorFrom: baseAnchor <Anchor> changes: changes <Array[ChangeRecord]> ^<Anchor> = (
+	| objectMap parentObjects newObjects changes1 head |
+	assert true: [baseAnchor ~~ (anchors at: baseAnchor id)]. "This process destroys the parent anchor"
+	objectMap:: baseAnchor objectMap.
+	parentObjects:: baseAnchor objects clone.
+	changes1:: Collections OrderedCollection new.
+	newObjects:: Array streamContents: [ :s |
+		changes do: [ :cr |
+			nil = cr before
+				ifTrue: [s nextPut: cr after]
+				ifFalse: [ | i |
+					i:: objectMap at: cr before.
+					changes1 add: i.
+					parentObjects at: i put: cr after]]].
+	currentAnchor objects do: [ :ea | ea isImmutable: false].
+	baseAnchor objects elementsForwardIdentityTo: parentObjects.
+	currentAnchor objects do: [ :ea | ea isImmutable: true].
+	anchor:: Anchor new.
+	anchor objects: currentAnchor objects, newObjects.
+	parent:: anchors at: parent id.
+	anchor parent1: (anchors at: currentAnchor id).
+	anchor changes1: changes1 asArray.
+	^anchor
+)
+deserializeChangeRecords: message <String> ^<Object> = (
+	|
+	baseObjectCount
+	nonTrivialObjectCount
+	id
+	deserializer
+	canonicalRepresentations
+	payload
+	|
+
+	"Read the first part of the message to obtain counts and id."
+	deserializer:: deserializerFrom: message with: snapshot.
+	baseObjectCount:: deserializer nextValue.
+	nonTrivialObjectCount:: deserializer nextValue.
+	id:: deserializer nextValue.
+
+	parent:: (anchors at: id). "parent is currentAnchor or an ancestor of it"
+
+	assert true: [baseObjects size <= baseObjectCount].
+	assert true: [nonTrivialObjectCount = (baseObjectCount - baseObjects size)].
+	"Prepare for receiving non-trivial objects"
+	nonTrivialObjects:: Array new: nonTrivialObjectCount.
+	1 to: nonTrivialObjects size do: [ :i | nonTrivialObjects at: i put: Object new].
+
+	"We currently ignore conflicts and assume latest arriving change is authoritative. There is no merging."
+	parent:: parent copyWithCurrentObjects: currentAnchor objects. "Ignoring the issue of merging, we set up parent so that the 'before' objects in the deserialized change records will be the objects in current anchor."
+	anchors at: currentAnchor id put: currentAnchor copy. "Make a copy of the current anchor as we will modify it when applying the deserialized change records"
+
+	"Read the entire message"
+	deserializer:: deserializerFrom: message with: baseObjects.
+	assert true: (deserializer nextValue = baseObjectCount).
+	assert true: (deserializer nextValue = nonTrivialObjectCount).
+	assert true: (deserializer nextValue = id).
+	incomingChanges:: deserializer nextValue.
+	canonicalRepresentations:: deserializer nextValue.
+	payload:: deserializer nextValue.
+
+	decanonicalize: canonicalRepresentations with: nonTrivialObjects.
+
+	deriveNewAnchorFrom: parent changes: incomingChanges.
+
+	^payload
+)
+serializeSessionChangesWith: payload ^<ByteArray> = (
+	|
+	changesKnownToClient <OrderedCollection[ChangeRecord]>
+	changesNewToClient <OrderedCollection[ChangeRecord]>
+	clientBase <Array>
+	clientBaseSet <IdentitySet>
+	parentObjects
+	changeComputer
+	outgoingSyncRecord <{Integer. TransactionID. Array. Object}>
+	|
+	changesKnownToClient:: Collections OrderedCollection new.
+	changesNewToClient:: Collections OrderedCollection new.
+	clientBase:: incomingChanges collect: [ :cr | cr after].
+	clientBaseSet:: BloatedHistory withShift: 3.
+	clientBase do: [:ea | clientBaseSet at: ea put: nil].
+
+	testBaseObjects. "assertions"
+	assert true: [parent objects size <= anchor objects size].
+
+	parentObjects:: parent objects.
+	parent:: parent copyWithCurrentObjects: currentAnchor objects.
+
+
+	(anchor changesSince: parent id) do: [ :i | | current old |
+		old:: parentObjects at: i ifAbsent: [].
+		old notNil ifTrue: [
+			parent objects at: i put: old.
+			current:: anchor objects at: i.
+			changesKnownToClient add: (ChangeRecord from: old to: current)]].
+
+	parent objects size + 1 to: anchor objects size do: [ :i | | obj cr |
+		obj:: anchor objects at: i.
+		cr:: ChangeRecord from: nil to: obj.
+		(clientBaseSet includesKey: obj)
+			ifTrue: [changesKnownToClient add: cr]
+			ifFalse: [changesNewToClient add: cr]].
+
+	
+	changeComputer:: ChangeComputer for: changesNewToClient.
+	nonTrivialObjects:: changeComputer allNonTrivialObjects.
+
+	outgoingSyncRecord:: {
+		changeComputer allNonTrivialObjects size.
+		anchor id deepCopy.
+		changesNewToClient asArray, changesKnownToClient.
+		changeComputer allNonTrivialCanonicalReps asArray.
+		payload}.
+
+
+	checkForConcurrentModifications.
+
+	^serialize: outgoingSyncRecord withBaseObjects: baseObjects, clientBase
+))
+class Session = (|
+	nonTrivialObjects ::= Array new.
+	parent <Anchor>
+	anchor <Anchor>
+|)
+('as yet unclassified'
+baseObjects = (
+	^snapshot, parent objects, nonTrivialObjects
+)
+installAnchor = (
+	assert true: [anchor parent1 isNil or: [anchors includesKey: anchor parent1 id]].
+	assert true: [anchor parent2 isNil or: [anchors includesKey: anchor parent2 id]].
+	anchors at: anchor id put: anchor.
+	setCurrentAnchor: anchor
+)
+testBaseObjects = (
+	assert true: [baseObjects asIdentitySet size = baseObjects size]
+))'as yet unclassified'
+canonicalIndicesOf: objects with: canonicalRepresentations = (
+	^Array streamContents: [ :s |
+		objects doWithIndex: [ :object :i |
+			object ~~ (canonicalRepresentations at: i) ifTrue: [s nextPut: i]]]
+)
+canonicalRepresentationOf: object = (
+	| canon |
+	canon:: object canonicalRepresentation.
+	(canon ~~ object and: [canon class == CanonicalRepresentation])
+		ifTrue: [canon originalClass: object class].
+	^canon
+)
+checkChangeRecords: changes <Array[ChangeRecord]> = (
+	changes do: [ :ea <ChangeRecord> |
+		"It would also make sense to check that 'ea before' is unmodified.
+		However, it may actually be modified by a 'become:' on one of the objects it references,
+		so the manager does not make the before version immutable."
+		ea after isImmutable ifTrue: [halt: 'Detected immutable modified object'].
+		"Make the object immutable so we detect changes during this sync and for subsequent syncs."
+		ea after isImmutable: true].
+	checkForConcurrentModifications. "not strictly necessary, but makes debugging easier"
+	^changes
+)
+checkForConcurrentModifications = (
+	manager isEmpty ifFalse: [halt: 'Concurrent modifications during serialization']
+)
+crc32: bytes = (
+	"http://www.hackersdelight.org/crc.pdf"
+	| crc |
+	#BOGUS yourself. "The original algorithm may take advantage of overflow in unsigned int"
+	crc:: 16rFFFFFFFF.
+	bytes do: [ :byte |
+		crc:: (crc bitShift: -8) bitXor: (crc32table at: 1 + ((crc bitXor: byte) bitAnd: 16rFF))].
+	^crc bitInvert32
+)
+decanonicalize: canonicalReps <Array[CanonicalRepresentation]> with: nonTrivialObjects <Array> = (
+	| decanonicalizedObjects |
+	assert true: [canonicalReps size = nonTrivialObjects size].
+	decanonicalizedObjects:: canonicalReps collect: [ :ea | ea originalClass fromCanonicalRepresentation: ea].
+	nonTrivialObjects elementsForwardIdentityTo: decanonicalizedObjects
+)
+deserializerFrom: message <String | ByteArray> with: baseObjects <Array> ^<NewspeakObjectFormat NewspeakObjectFormatDeserializer> = (
+	^nof
+		deserializerFrom: message asByteArray readStream
+		withBaseObjects: baseObjects
+)
+extendSystemSnapshot: systemSnapshot <SequenceableCollection> ^<SequenceableCollection> = (
+	"Don't serialize self or nested classes."
+	^systemSnapshot, {self. Anchor. ByteStream. ChangeRecord. ImmutabilityManager. ChangeComputer}
+)
+fullCopy: object = (
+	| s <WriteStream> serializer |
+	s:: ByteStream new.
+	serializer:: nof serializerOn: s withBaseObjects: snapshot.
+	serializer nextPut: object.
+	^(nof deserializerFrom: s contents readStream withBaseObjects: snapshot) nextValue
+)
+initCrc32table = (
+	"http://www.hackersdelight.org/crc.pdf"
+	#BOGUS yourself. "The original algorithm may take advantage of overflow in unsigned int"
+	^(0 to: 255) collect: [ :byte | | crc mask |
+		crc:: byte.
+		7 to: 0 by: -1 do: [ :j |
+			mask:: (crc bitAnd: 1) negated.
+			crc:: (crc bitShift: -1) bitXor: (16rEDB88320 bitAnd: mask)].
+		crc]
+)
+makeInitialAnchorFromRoot: root ^<Anchor> = (
+	| anchor |
+	assert true: [anchors isEmpty].
+	anchor:: Anchor new.
+	anchor objects: {}. "(transitiveClosureOf: {root} withBaseObjects: snapshot)."
+	anchor changes1: Collections OrderedCollection new.
+	anchor id: (TransactionID authorFullName: nil email: nil).
+	anchors at: anchor id put: anchor.
+	^anchor
+)
+persistObjects: objects = (
+	| s <WriteStream> serializer closure |
+	closure:: transitiveClosureOf: objects.
+	closure do: [ :ea | ea isImmutable: true].
+	^closure
+)
+quoteXml: bytes <ByteArray | ByteString> on: stream <WriteStream> = (
+	| str idx prev |
+	bytes isEmpty ifTrue: [^self].
+	bytes size < 3 ifTrue: [
+		stream
+			nextPutAll: 	'<![CDATA[';
+			nextPutAll: bytes asString;
+			nextPutAll: ']]>'.
+		^self].
+	str:: bytes asString.
+	prev:: 1.
+	idx:: 0.
+	[prev <= bytes size] whileTrue: 
+		[idx:: (str findString: ']]>' startingAt: prev) - 1.
+		-1 = idx ifTrue: [idx:: bytes size].
+		prev < idx ifTrue: [
+			stream nextPutAll: '<![CDATA['.
+			prev to: idx do: [ :i | stream nextPut: (str at: i)].
+			stream nextPutAll: ']]>'].
+		idx < bytes size ifTrue: [stream nextPutAll: ']]>'].
+		prev:: idx+4]
+)
+serialize: objects <Array[Object]> withBaseObjects: baseObjects <Array[Object]> ^<ByteArray> = (
+	^serialize: objects withBaseObjects: baseObjects andLocalHistory: nil
+)
+serialize: objects <Array[Object]> withBaseObjects: baseObjects <Array[Object]> andLocalHistory: localHistory <OrderedCollection> ^<ByteArray> = (
+	| s <WriteStream> serializer closure |
+	s:: ByteStream new.
+	serializer:: nof serializerOn: s withBaseObjects: baseObjects.
+	nil = localHistory ifFalse: [serializer localHistory: localHistory].
+	serializer nextPut: baseObjects size.
+	objects do: [ :ea | serializer nextPut: ea].
+	^s contents
+)
+serialize: objects ^<Array[Object]> = (
+	^serialize: objects withBaseObjects: snapshot
+)
+setCurrentAnchor: anchor <Anchor> = (
+	assert true: [manager isEmpty].
+	anchor objects do: [ :ea | ea isImmutable: true].
+	currentAnchor:: anchor.
+)
+transitiveClosureOf: objects = (
+	^transitiveClosureOf: objects withBaseObjects: snapshot.
+)
+transitiveClosureOf: objects withBaseObjects: baseObjects = (
+	| s <WriteStream> serializer closure |
+	s:: ByteStream new.
+	serializer:: nof serializerOn: s withBaseObjects: baseObjects.
+	closure:: Collections OrderedCollection new.
+	serializer localHistory: closure.
+	objects do: [ :ea | serializer nextPut: ea].
+	^closure asArray
+)
+transitiveClosureWithoutCanonicalRepresentationImplementationOf: objects = (
+	| s <WriteStream> serializer closure |
+	s:: ByteStream new.
+	serializer:: nof serializerOn: s withBaseObjects: snapshot.
+	closure:: Collections OrderedCollection new.
+	serializer localHistory: closure.
+	objects do: [ :ea |
+		ea class == CanonicalRepresentation
+			ifTrue: [ea elements do: [ :el | serializer nextPut: el]]
+			ifFalse: [serializer nextPut: ea]
+		].
+	^closure asArray
+)) : ('as yet unclassified'
+globalsToSnapshot ^<SequenceableCollection[Symbol]> = (
+	^{#Smalltalk}
+)
+systemSnapshot: platform <Platform> ^<SequenceableCollection> = (
+	^Array streamContents: [ :s | | specialObjects classes globals |
+		specialObjects:: (platform Smalltalk specialObjectsArray allButFirst: 3) copyWithout: nil. "exclude nil, false, and true"
+		assert: [specialObjects size = specialObjects asIdentitySet size].
+		s nextPutAll: specialObjects.
+		specialObjects:: specialObjects asIdentitySet.
+		0 to: 255 do: [ :i | s nextPut: (Character value: i)].
+		classes:: (platform Smalltalk associations select: [ :ea | (ea value isBehavior and: [ea key == ea value name])]) asArray.
+		classes sort: [ :a :b | a key < b key].
+		globals:: globalsToSnapshot collect: [ :ea | platform Smalltalk associationAt: ea].
+		classes, globals do: [ :ea <Association> |
+			(specialObjects includes: ea) ifFalse: [s nextPut: ea].
+			(specialObjects includes: ea value) ifFalse: [s nextPut: ea value]].
+		classes do: [ :ea <Association> |
+			(specialObjects includes: ea value class) ifFalse: [s nextPut: ea value class]]]
+))

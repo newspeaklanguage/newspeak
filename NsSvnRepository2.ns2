@@ -1,932 +1,1 @@
-Newspeak3
-'NsSvnRepository2'
-class NsSvnRepository2 usingPlatform: platform = NewspeakObject (
-"
-   Copyright 2008 Cadence Design Systems, Inc.
-   
-   Licensed under the Apache License, Version 2.0 (the ''License''); you may not use this file except in compliance with the License.  You may obtain a copy of the License at  http://www.apache.org/licenses/LICENSE-2.0
-"|
-	CrLfFileStream = platform Files CrLfFileStream.
-	Date = platform Kernel Date.
-	DateAndTime = platform Kernel DateAndTime.
-	Dictionary = platform Collections Dictionary.
-	FileDirectory = platform Files FileDirectory.
-	FilePackage = platform System FilePackage.
-	FileStream = platform Files FileStream.
-	MCCacheRepository = platform Monticello MCCacheRepository.
-	MCDefinitionCollector = platform NsBabel MCDefinitionCollector.
-	MCDependencySorter = platform Monticello MCDependencySorter.
-	MCPackage = platform Monticello MCPackage.
-	MCRepository = platform Monticello MCRepository.
-	MCRepositoryInspector = platform Monticello MCRepositoryInspector.
-	MCStReader = platform Monticello MCStReader.
-	MCStWriter = platform Monticello MCStWriter.
-	MCVersion = platform Monticello MCVersion.
-	MCVersionInfo = platform Monticello MCVersionInfo.
-	MCVersionReader = platform Monticello MCVersionReader.
-	MCWorkingCopy = platform Monticello MCWorkingCopy.
-	MCRepositoryGroup = platform Monticello MCRepositoryGroup.
-	OrderedCollection = platform Collections OrderedCollection.
-	Scanner = platform Compiler Scanner.
-	Set = platform Collections Set.
-	String = platform Collections String.
-	ThisOSProcess = platform OSProcess ThisOSProcess.
-	Time = platform Kernel Time.
-	UUID = platform Network UUID.
-	XMLDOMParser = (platform moduleOf: #'XML-Parser') XMLDOMParser.
-	SAXHandler = (platform moduleOf: #'XML-Parser') SAXHandler.
-	Monitor = platform Kernel Monitor.
-
-	assert = platform NewspeakCore Assert new.
-
-	"Global variables"
-	Transcript = platform Transcript.
-
-	"{ExternalProcess}"
-	NewShell = platform ExternalProcess NewShell.
-
-	"{NsToolSet}"
-	NsToolSet = platform NsToolSet NsToolSet.
-
-	"{Newsqueak-mixins}"
-	DefiningClassMetadata = platform NewsqueakMixins DefiningClassMetadata.
-
-	"My slots"
-	newShell = (NewShell usingPlatform: platform).
-	monitor = Monitor new.
-|setupSvn)
-(
-class LogEntry = (|
-	revision
-	author
-	date
-	paths =  OrderedCollection new.
-	msg
-	versionInfo
-|)
-('as yet unclassified'
-message ^ <String> = (
-	msg isNil ifFalse:[^msg].
-	^''
-)
-message: m <String> = (
-	msg: m
-)
-printOn: stream = (
-	stream
-		nextPutAll: class simpleName;
-		nextPut: $:;
-		nextPutAll: revision printString
-)
-timestamp = (
-
-	^date
-)
-versionInfoPath = (
-
-	^paths detect: [ :path | path path endsWith: '/=versioninfo'] ifNone: []
-)'private'
-initializeFromElement: xmlElement = (
-
-
-	revision:: (xmlElement attributeAt: 'revision') asNumber.
-	author::  (xmlElement elementAt: 'author') contentString.
-	date:: DateAndTime fromString: (xmlElement elementAt: 'date') contentString.
-	message::  (xmlElement elementAt: 'msg') contentString
-)'testing'
-isVersionInfosUpdate = (
-
-
-	^message includesSubString: 'Updated =versioninfos for '
-)) : ('instance creation'
-fromElement: element = (
- "<XMLElement>"
-
-	^self new initializeFromElement: element
-))
-class LogPath = (| copyFromPath copyFromRev action path |)
-('as yet unclassified'
-isCopy = (
-	action = 'A' ifFalse: [^false].
-	copyFromPath notNil ifTrue: [^(copyFromPath endsWith: '/=versioninfo') not].
-	^false
-)
-isDeletion = (
-	^action = 'D'
-)
-isValid = (
-
-	self shouldBeImplemented
-)
-packageName = (
-
-	| lastIndex |
-	assert true: [path endsWith: '/=versioninfo'].
-	lastIndex:: path size - self versionInfoFileNameSize.
-	lastIndex to: 1 by: -1 do: [ :i |
-		(path at: i) = $/ ifTrue: [^path copyFrom: i +1 to: lastIndex]].
-	self error: 'Internal error'
-)
-packagePath = (
-
-	assert true: [path endsWith: '/=versioninfo'].
-	^path allButLast: self versionInfoFileNameSize
-)
-versionInfoFileNameSize = (
-
-	^13 "'/=versioninfo' size"
-))
-class MCSvnRepository url: url = MCRepository (|
-	repositoryUuid
-	nsSvnRepository
-	repositoryUrl = url.
-	logEntries
-	packageMap
-|)
-(
-class VersionSaver save: v <MCVersion> = (|
-	version = v.
-	dir <FileDirectory>
-	classes <Set[Class]> = Set new.
-	extensionMethods <Collection[MCMethodDefinition]> = OrderedCollection new.
-	packageOrganization
-	allDefs = OrderedCollection new.
-	existing = Dictionary new.
-	stClasses = Dictionary new.
-	fileList = OrderedCollection new.
-	addedFiles = OrderedCollection new.
-	definitions
-|save)
-('as yet unclassified'
-addNewFiles = (
-	addedFiles isEmpty ifTrue: [^self].
-	svn with: {'add'}, (addedFiles collect: [ :fn | dir fullNameFor: fn])
-)'initialize-release'
-save = (
-	prepareWorkingCopy.
-	analyzeDefinitions.
-	findExistingFiles.
-	writePackageOrganization.
-	writeExtensionMethods.
-	writeMultiLanguageClasses.
-	writeSmalltalkClasses.
-	writeVersionInfo.
-	writeFileList.
-	writeMultiLanguageTimeStamps.
-	cleanupDeletedClasses.
-	addNewFiles.
-	ensureNativeEolStyle.
-
-	commit
-)'private'
-analyzeDefinitions = (
-	| orgSeen |
-	definitions:: MCDependencySorter sortItems: version snapshot definitions.
-	definitions do: [ :def |	
-		def isClassDefinition ifTrue: [
-			classes add: (DefiningClassMetadata of: def actualClass theNonMetaClass) definingModule]].
-	orgSeen:: false.
-	definitions do: [ :def | "MCDependencySorter takes care of putting method defs after their class def"
-		def isClassDefinition ifTrue: [
-			def actualClass theNonMetaClass language name = #Smalltalk ifTrue: [
-				allDefs add: def]].
-		def isMethodDefinition ifTrue: [
-			(classes includes: (DefiningClassMetadata of: def actualClass theNonMetaClass) definingModule)
-				ifTrue: [
-					def actualClass theNonMetaClass language name = #Smalltalk ifTrue: [
-						allDefs add: def]]
-				ifFalse: [extensionMethods add: def]].
-		def isOrganizationDefinition ifTrue: [
-			assert true: [packageOrganization isNil].
-			packageOrganization: def]].
-
-	extensionMethods:: extensionMethods reject: [ :m | classes includes: m actualClass theNonMetaClass].
-	classes:: (classes collect: [ :cls | (DefiningClassMetadata of: cls) definingModule]) asSet.
-)
-cleanupDeletedClasses = (
-	existing values do: [ :efn | svn value: 'rm' value: (dir fullNameFor: efn)].
-)
-commit = (
-	| rev |
-	rev:: workingCopy commit: dir message: version info message.
-	version info id: rev @ repositoryUuid.
-)
-ensureNativeEolStyle = (
-	svn with: {'propset'. '-R'. 'svn:eol-style'. 'native'. dir fullName}.
-)
-findExistingFiles = (
-	((dir entries collect: [:ea | ea name]) reject: [:ea | ea first = $. or: [ea first = $= and: [ea = '=versioninfos']]]) do: [ :ea |
-		existing at: (ea readStream upTo: $.) put: ea].
-)
-prepareWorkingCopy = (
-	|
-	parentRev <Integer>
-	nspkg
-	path
-	|
-	parentRev:: version info ancestors notEmpty ifTrue: [
-		(version info ancestors collect: [:ea | ea id x]) max].
-	nspkg:: nsSvnPackages detect: [ :pkg | pkg name = version package name] ifNone: [].
-	nspkg isNil
-		ifTrue: ["New package"
-			path:: '/packages/', version package name.
-			 workingCopy createPackageNamed: path.
-			refresh]
-		ifFalse: [
-			assert true: [nspkg logEntries last revision = parentRev].
-			path:: nspkg currentPath].
-	parentRev:: logEntries last revision.
-	dir:: workingCopy packageNamed: path allButFirst at: parentRev.
-	assert true: [dir exists]
-)
-writeExtensionMethods = (
-	extensionMethods notEmpty ifTrue: [ | efn fn |
-		fn:: 'extensions.st'.
-		fileList add: fn.
-		efn:: existing removeKey:  'extensions' ifAbsent: [
-			addedFiles add: fn.
-			fn].
-		efn = fn ifFalse: [svn value: 'mv' value: (dir fullNameFor: efn) value: (dir fullNameFor: fn)].
-		FileStream forceNewFileNamed: (dir fullNameFor: fn) do: [ :s | | writer |
-			setLineEndConversion: s.
-			writer:: MCStWriter new.
-			writer stream: s.
-			writer writeDefinitions: extensionMethods]].
-)
-writeFileList = (
-	| fn |
-	fn:: '=filelist'.
-	existing removeKey:  fn ifAbsent: [addedFiles add: fn].
-	FileStream forceNewFileNamed: (dir fullNameFor: fn) do: [ :s |
-		setLineEndConversion: s.
-		fileList asArray storeOn: s.
-		s cr]
-)
-writeMultiLanguageClasses = (
-	| classList |
-	"Definitions are ordered so superclasses comes first. Preserve this order in classList."
-	classList:: OrderedCollection new.
-	definitions do: [ :def |
-		def isClassDefinition ifTrue: [ | cls |
-			cls:: classes detect: [ :c | c name = def actualClass theNonMetaClass name ] ifNone: [].
-			cls isNil ifFalse: [
-				classes remove: cls.
-				classList add: cls.
-			]]].
-	assert true: [classes isEmpty].
-	classList do:
-		[ :cls | | efn fn |
-		fn:: cls name, FileDirectory dot, cls language fileExtension.
-		efn:: existing removeKey: cls name ifAbsent: [
-			addedFiles add: fn.
-			fn].
-		efn = fn ifFalse: [
-			(dir fileExists: fn)
-				ifTrue: 
-					["Workaround for historical strange situations that no one understands when both .ns0 and .newspeak0 extensions."
-					svn value: 'rm' value: (dir fullNameFor: efn)]
-				ifFalse: [svn value: 'mv' value: (dir fullNameFor: efn) value: (dir fullNameFor: fn)]].
-		fileList add: fn.
-		cls language name = #Smalltalk
-			ifTrue: [stClasses at: cls put: OrderedCollection new]
-			ifFalse: [
-				FileStream forceNewFileNamed: (dir fullNameFor: fn) do: [ :s |
-					setLineEndConversion: s.
-					[cls printClassOn: s] displayingProgress: 'Writing ', fn]]]
-		displayingProgress: 'Writing non-Smalltalk classes'.
-)
-writeMultiLanguageTimeStamps = (
-	| fn |
-	fn:: '=timestamps'.
-	existing removeKey: fn ifAbsent: [
-		addedFiles add: fn.
-		fn].
-
-	FileStream forceNewFileNamed: (dir fullNameFor: fn) do: [ :s |
-		fileList add: fn.
-		setLineEndConversion: s.
-		definitions do: [ :def |
-			def isMethodDefinition ifTrue: [ | language ts |
-				language:: def actualClass theNonMetaClass language.
-				language shouldPersistTimeStamps ifTrue: [
-					ts:: language timeStampFor: def.
-					ts isEmptyOrNil ifFalse: [
-						s	nextPutAll: def fullClassName;
-							nextPut: $>;
-							nextPutAll: def selector; space;
-							nextPutAll: ts;
-							cr]]]]]
-)
-writePackageOrganization = (
-	packageOrganization notNil ifTrue: [ | efn fn |
-		fn:: 'organization.st'.
-		efn:: existing removeKey:  'organization' ifAbsent: [
-			addedFiles add: fn.
-			fn].
-		efn = fn ifFalse: [svn value: 'mv' value: (dir fullNameFor: efn) value: (dir fullNameFor: fn)].
-		FileStream forceNewFileNamed: (dir fullNameFor: fn) do: [ :s |
-			fileList add: fn.
-			setLineEndConversion: s.
-			packageOrganization categories do: [ :ea |
-				s nextChunkPut: 'SystemOrganization addCategory: ', ea printString; cr]]].
-)
-writeSmalltalkClasses = (
-	allDefs do: [ :def |
-		stClasses at: def actualClass theNonMetaClass ifPresent: [ :defs | defs add: def]].
-
-	stClasses keys do:
-		[ :cls | | defs fn |
-		defs:: stClasses at: cls.
-		fn:: cls name, FileDirectory dot, cls language fileExtension.
-		FileStream forceNewFileNamed: (dir fullNameFor: fn) do: [ :s | | writer |
-			setLineEndConversion: s.
-			writer:: MCStWriter on: s.
-			writer initStream: String new writeStream.
-			[(defs reject: [ :d | d isMethodDefinition]) do: [ :ea | ea accept: writer].
-			((defs select: [ :d | d isMethodDefinition]) asArray sort: [ :a :b | a selector <= b selector]) "Ensure small diffs"
-				do: [ :ea | ea accept: writer].
-			s nextPutAll: writer initStream contents] displayingProgress: 'Writing ', fn]]
-		displayingProgress: 'Writing Smalltalk classes'.
-)
-writeVersionInfo =(
-	| fn |
-	fn:: '=versioninfo'.
-	existing removeKey: fn ifAbsent: [
-		addedFiles add: fn.
-		fn].
-
-	FileStream forceNewFileNamed: (dir fullNameFor: fn) do: [ :s |
-		setLineEndConversion: s.
-		svn value: 'add' value: s fullName.
-		svn with: {'propset'. 'svn:keywords'. 'URL Author Date Rev Id'. s fullName}.
-		s nextPutAll: 'Monticello:'; crtab.
-		version summary do: [ :c |
-			s nextPut: c.
-			c == Character cr ifTrue: [s tab]].
-		s cr; cr.
-		s nextPutAll: 'Subversion:'; cr.
-		{'URL'. 'Author'. 'Date'. 'Rev'} do: [ :kwd |
-			s tab; nextPut: $$; nextPutAll: kwd; nextPut: $$; cr]].
-))'as yet unclassified'
-addEntries: newEntries = (
-
-	| versionInfoPaths versionMap |
-	newEntries isEmpty ifTrue: [^self].
-	packageMap:: nil.
-	versionInfoPaths:: newEntries collect: [ :entry | entry versionInfoPath].
-	(versionInfoPaths anySatisfy: [ :ea | ea notNil]) ifTrue: [ | dir args existing |
-		args:: {'copy'. '-m'. 'Copying version info'. nil. nil. nil}.
-		dir:: workingCopy packageNamed: '=versioninfos' at: 'HEAD' revert: false.
-		existing:: (dir entries collect: [:ea | ea name]) asSet.
-		newEntries with: versionInfoPaths do: [ :entry :path |
-			path notNil ifTrue: [
-				(existing includes: entry revision asString) ifFalse: [
-					args at: 4 put: '-r', entry revision asString.
-					args at: 5 put: repositoryUrl, path path.
-					args at: 6 put: repositoryUrl, '/=versioninfos/', entry revision asString.
-					svn launcher
-						runWith: args
-						ifSuccess: [ :stdout :stderr |]
-						ifFailure: [ :stdout :stderr | Transcript cr; show: stdout upToEnd, stderr upToEnd]]]].
-		dir:: workingCopy packageNamed: '=versioninfos' at: 'HEAD' revert: false.
-		existing:: (dir entries collect: [ :ea | ea name]) asSet.
-		newEntries with: versionInfoPaths do: [ :entry :path |
-			path notNil ifTrue: [ | versionInfo |
-				assert true: [existing includes: entry revision asString].
-				versionInfo:: CrLfFileStream
-					fileNamed: (dir fullNameFor: entry revision asString)
-					do: [ :stream | readVersioninfoFrom: stream].
-				entry versionInfo: versionInfo.
-				versionInfo id: entry revision @ repositoryUuid]]].
-	versionMap:: Dictionary new.
-	(logEntries ifNil: [Array new]), newEntries do: [ :entry |
-		entry versionInfo notNil
-			ifTrue: [versionMap at: entry versionInfo name put: entry versionInfo]].
-	newEntries do: [ :entry |
-		entry versionInfo ifNotNil: [ :versionInfo |
-			versionInfo ancestors: ((versionInfo ancestors collect: [ :ea | versionMap at: ea ifAbsent: []]) copyWithoutAll: {nil. versionInfo})]].
-	logEntries isNil ifTrue: [logEntries:: Array new].
-	logEntries:: logEntries, newEntries
-)
-addRepository: url ifError: onError = (
-	| trimmedUrl |
-	trimmedUrl:: url.
-	[trimmedUrl last = $/] whileTrue: [trimmedUrl:: url allButLast].
-	[install: trimmedUrl]
-		on: newShell CommandError superclass "HACK"
-		do: [:ex | onError value: ex messageText].
-)
-basicStoreVersion: aVersion <MCVersion> ^<MCVersionInfo> = (
-	VersionSaver save: aVersion.
-	^aVersion info
-)
-cacheAllFileNamesDuring: action <BlockContext> = (
-	^action value
-)
-copiesAndDeletes = (
-
-	logEntries isNil ifTrue: [^{}].
-	^Array streamContents: [ :s |
-		logEntries do: [ :entry |
-			entry paths do: [ :path |
-				path affectsPackageNames ifTrue: [
-					s nextPut: path -> entry revision]]]]
-)
-createRepository: dir ifError: onError = (
-	[svnadmin with: {'create'. dir fullName}]
-		on: newShell CommandError superclass "HACK"
-		do:
-			[:ex |
-			^onError value: ex messageText withSqueakLineEndings].
-	{'=versioninfos'. 'nspackages'. 'packages'} do:
-		[:each |
-		[svn
-			with: {'mkdir'. '--non-interactive'. '-m'. 'Initial directory layout'.
-				(dir directoryNamed: each) asUrl asString}]
-			on: newShell CommandError superclass "HACK" do:
-				[:ex |
-				^onError value: ex messageText withSqueakLineEndings]].
-)
-description = (
-
-	^repositoryUrl asString, '/*'
-)
-isValidPath: path <String> = (
-
-	^((path beginsWith: '/attic/') or: [path beginsWith: '/unstable/']) not
-)
-notificationForVersion: aVersion = (
-
-	shouldNotImplement
-)
-notifyList = (
-
-	shouldNotImplement
-)
-nsSvnPackages ^<Collection[Package]> = (
-
-	| newPackageMap |
-	logEntries isNil ifTrue: [^{}].
-	packageMap notNil ifTrue: [^packageMap values].
-	newPackageMap:: Dictionary new.
-	logEntries do: [ :entry |
-		entry versionInfoPath ifNotNil: [ :path |
-			| package pkgPath |
-			pkgPath:: path packagePath.
-			(isValidPath: pkgPath) ifTrue: [
-				package:: newPackageMap at: pkgPath ifAbsentPut: [
-					Package new
-						name: path packageName;
-						currentPath: pkgPath].
-				package addLogEntry: entry]]
-			ifNil: [
-				"It is important to scan the paths twice as Subversion may report deletions before copies in the same revision"
-				entry paths do: [ :p |
-					p isCopy ifTrue: [
-						newPackageMap at: p copyFromPath ifPresent: [ :oldpkg | | newpkg |
-							newpkg:: newPackageMap at: p path ifAbsentPut: [
-								Package new
-									name: (p path findTokens: '/') last;
-									currentPath: p path].
-							newpkg logEntries: ((oldpkg logEntries, newpkg logEntries) asArray sort: [ :a :b | a revision < b revision])]]].
-				entry paths do: [ :p |
-					p isDeletion ifTrue: [newPackageMap removeKey: p path ifAbsent: []]]]].
-	packageMap:: newPackageMap.
-	^packageMap values
-)
-packages = (
-
-	refresh.
-	^(nsSvnPackages collect: [ :p | MCPackage named: p name]) asArray sort: [ :a :b | a name <= b name]
-)
-possiblyNewerVersionsOfAnyOf: someVersions = (
-
-	^{}
-)
-prepareVersionForStorage: aVersion = (
-
-	^aVersion
-)
-printOn: stream = (
-	stream
-		nextPutAll: class simpleName;
-		nextPut: $:;
-		nextPutAll: repositoryUrl printString
-)
-readVersioninfoFrom: stream <ReadStream> = (
-
-	| cr name author date time uuid ancestors message |
-	cr:: Character cr.
-	name:: stream match: 'Name:'; skipSeparators; upTo: cr.
-	(name beginsWith: 'Name:') ifTrue: [ "Work around long fixed bug"
-		name:: name readStream match: 'Name:'; skipSeparators; upToEnd].
-	author:: stream match: 'Author:'; skipSeparators; upTo: cr.
-	stream match: 'Time:'; skipSeparators.
-	date:: Date readFrom: stream.
-	stream skip: 1 "comma"; skipSeparators.
-	time:: Time readFrom: stream.
-	uuid:: UUID fromString: (stream match: 'UUID:'; skipSeparators; upTo: cr).
-	ancestors:: stream match: 'Ancestors: '; upTo: cr.
-	ancestors:: (ancestors findBetweenSubStrs: {', '}) asArray collect: [ :ea |
-		"Work around long fixed bug"
-		(ea beginsWith: 'Name:')
-			ifTrue: [ea readStream match: 'Name:'; skipSeparators; upToEnd]
-			ifFalse: [ea]].
-	message:: stream skipSeparators; upToAll: '\\Subversion:' withCRs.
-	^MCVersionInfo
-		name: name
-		id: nil
-		message: message
-		date: date
-		time: time
-		author: author
-		ancestors: ancestors
-)
-refresh = (
-	monitor critical: [
-		NsToolSet showWaitCursorWhile: [ | xml range newEntries |
-			changed: self with: #refresh.
-			repositoryUuid isNil ifTrue: [
-				xml:: svn value: 'info' value: '--xml' value: repositoryUrl.
-				repositoryUuid:: UUID fromString: (XMLDOMParser parseDocumentFrom: xml readStream) info entry repository uuid characterData].
-			range:: logEntries isNil ifTrue: ['-r1:HEAD'] ifFalse: ['-r', logEntries last revision asString, ':HEAD'].
-			xml:: svn value: 'log' value: '--xml' value: '-v' value: range value: repositoryUrl.
-			changed: self with: #xml.
-			newEntries:: (SvnInfoParser parseDocumentFrom: xml readStream) entries asArray.
-			addEntries:: logEntries isNil
-				ifTrue: [newEntries]
-				ifFalse: [newEntries allButFirst].
-			changed: self with: #done]]
-)
-sendNotificationsForVersion: aVersion = (
-
-	shouldNotImplement
-)
-storeVersion: aVersion <MCVersion> ^<MCVersionInfo> = (
-	^basicStoreVersion: (prepareVersionForStorage: aVersion)
-)
-topLevelPackageContents = (
-
-	^nsSvnPackages
-)
-versionsAvailableForPackage: package <MCPackage> ^<Collection[MCVersionInfo]> = (
-
-	package isNil ifTrue: [^{}].
-	^((nsSvnPackages detect: [ :p | p name = package name] ifNone: [^{}])
-		logEntries collect: [ :entry | entry versionInfo]) reverse
-)
-workingCopy = (
-
-	nsSvnRepository isNil ifTrue: [
-		nsSvnRepository:: SvnRepository new
-			repositoryUrl: repositoryUrl].
-	^nsSvnRepository
-)'interface'
-includesVersionNamed: versionName <String> = (
-	logEntries isNil ifTrue: [^false].
-	logEntries do: [ :e | e versionInfo name = versionName ifTrue: [^true]].
-	^false
-)
-morphicOpen: aWorkingCopy = (
-
-	(MCRepositoryInspector repository: self workingCopy: aWorkingCopy) show
-)
-versionWithInfo: versionInfo <MCVersionInfo> ifAbsent: aBlock ^<MCVersion> = (
-
-	|
-	version <MCSvnDirectoryReader | MCVersion>
-	entry <LogEntry>
-	path <LogPath>
-	package <MCPackage>
-	|
-	entry:: logEntries at: versionInfo id x ifAbsent: [^aBlock value].
-	assert true: [entry revision = versionInfo id x].
-	path:: entry versionInfoPath.
-	package:: MCPackage named: path packageName.
-	version:: MCCacheRepository default versionWithInfo: versionInfo ifAbsent: [ | dir |
-		dir:: workingCopy packageNamed: path packagePath allButFirst at: entry revision.
-		(SvnDirectoryReader versionInfo: versionInfo directory: dir)].
-	^MCVersion package: package info: versionInfo snapshot: version snapshot
-)'testing'
-isValid = (
-
-	^repositoryUrl notNil
-)) : ('as yet unclassified'
-isAbstract = (
-	^true
-))
-class Package = (|
-	name
-	logEntries = OrderedCollection new.
-	currentPath
-|)
-('as yet unclassified'
-addLogEntry: entry <LogEntry> = (
-
-	logEntries:: logEntries asOrderedCollection add: entry; yourself
-)
-author = (
-
-	^logEntries last author
-)
-message = (
-
-	^logEntries last message
-)
-owner = (
-	^author
-)
-printOn: stream = (
-	stream
-		nextPutAll: class simpleName;
-		nextPut: $:;
-		nextPutAll: name printString
-)
-revision = (
-
-
-	^logEntries last revision
-)
-timestamp = (
-
-	^logEntries last date
-))
-class SvnDirectoryReader versionInfo: anMCSVNVersionInfo directory: aFileDirectory = MCVersionReader (|
-	directory = aFileDirectory.
-	versionInfo = anMCSVNVersionInfo.
-	timestamps
-|info:: anMCSVNVersionInfo.
-	dependencies:: {})
-('as yet unclassified'
-openFileNamed: filename = (
- "<String>" "^<ReadStream>"
-	| fileStream fullname contents |
-	fullname:: directory fullNameFor: filename.
-	fileStream:: CrLfFileStream new open: fullname forWrite: false; yourself.
-	[ contents:: fileStream upToEnd ] ensure: [ fileStream close ].
-	^contents readStream
-)'file parsing'
-definitionsForFileName: filenameString = (
-
-	| readStream extension |
-	readStream:: self openFileNamed: filenameString.
-	^(extension:: FileDirectory extensionFor: filenameString) = 'st'
-				ifTrue: [self parseDefinitionsInDotStFile: readStream named: filenameString ]
-				ifFalse: [self parseDefinitionsInLanguage: extension from: readStream]
-)
-parseDefinitionsInDotStFile: fileStream named: filename = (
- "<String>"
-	"Answer a sequence of MCDefinitions for the definitions in fileStream."
-	| filePackage |
-	filePackage:: FilePackage new
-					fullName: filename;
-					fileInFrom: fileStream;
-					yourself.
-	^(MCStReader new loadDefinitionsFrom: filePackage) definitions
-)
-parseDefinitionsInLanguage: extensionString from: aStream = (
-
-	| damaged undamaged contentStream |
-	"Hack work-around for bogus organization info left on Newsqueak1 files.
-	 Quickly look at the last couple of characters.  If there's a shriek then
-	 there's bogus organization info."
-	damaged:: (aStream position: aStream size - 4; upToEnd) includes: $!.
-	aStream position: 0.
-	damaged ifFalse:
-		[^(MCDefinitionCollector stream: aStream timestamps: timestamps)
-			definitions].
-	"Sigh; aStream could be a crlf stream.  If so, position reports underlying
-	 characters, not the output.  So we need to use a stream on the output."
-	contentStream:: aStream upToEnd readStream.
-	"Skip as much Newsqueak code as possible..."
-	[undamaged:: contentStream position.
-	 contentStream match: (String with: Character cr with: $))] whileTrue.
-	contentStream position: 0.
-	undamaged:: contentStream next: undamaged + 1 "include new line after closing paren (?)".
-	^(MCDefinitionCollector stream: undamaged readStream timestamps: timestamps)
-		definitions
-)'loading'
-filelist = (
-
-	^(Scanner new scan: (directory readOnlyFileNamed: '=filelist')) nextLiteral copyWithout: '=versioninfo'
-)
-loadDefinitions = (
-
-	definitions::  OrderedCollection new.
-	self loadTimestamps.
-	self filelist
-		do: [ :filename |
-			definitions addAllLast: (self definitionsForFileName: filename)
-		]
-		displayingProgress: versionInfo name asString.
-		
-)
-loadTimestamps = (
-
-	| s |
-	timestamps:: Dictionary new.
-	(directory fileExists: '=timestamps') ifTrue:
-		[s:: directory readOnlyFileNamed: '=timestamps'.
-		 s
-			wantsLineEndConversion: true;
-			lineEndConvention: (FileDirectory pathNameDelimiter == $\
-								ifTrue: [#crlf]
-								ifFalse: [#lf]).
-		 [s atEnd] whileFalse:
-			[(timestamps
-				at: (s upTo: $>) "class name"
-				ifAbsentPut: [Dictionary new])
-					at: (s upTo: Character space)
-					put: (s upTo: Character cr)]]
-)) : ('as yet unclassified'
-isAbstract = (
-	^true
-))
-class SvnInfoParser on: stream = SAXHandler on: stream (|
-	entries = OrderedCollection new.
-	currentLogEntry
-	currentPath
-	lastString
-|super initialize)
-('as yet unclassified'
-characters: string = (
-
-	lastString:: string
-)
-endElement: elementName = (
-
-	elementName = 'logentry' ifTrue: [
-		entries add: currentLogEntry.
-		currentLogEntry paths: currentLogEntry paths asArray.
-		^currentLogEntry:: nil].
-	currentLogEntry isNil ifTrue: [^nil].
-	elementName = 'author' ifTrue: [
-		^currentLogEntry author: lastString].
-	elementName = 'msg' ifTrue: [
-		^currentLogEntry message: lastString].
-	elementName = 'date' ifTrue: [
-		^currentLogEntry date: (DateAndTime fromString: lastString)].
-	elementName = 'path' ifTrue: [
-		currentLogEntry paths add: currentPath.
-		currentPath path: lastString.
-		^currentPath:: nil].
-)
-startElement: elementName attributeList: attributeList = (
-
-	lastString:: nil.
-	elementName = 'logentry' ifTrue: [
-		currentLogEntry:: LogEntry new.
-		currentLogEntry revision: (attributeList at: 'revision') asInteger].
-	elementName = 'path' ifTrue: [
-		currentPath:: LogPath new.
-		attributeList at: 'copyfrom-path' ifPresent: [ :v | currentPath copyFromPath: v].
-		attributeList at: 'copyfrom-rev' ifPresent: [ :v | currentPath copyFromRev: v asInteger].
-		attributeList at: 'action' ifPresent: [ :v | currentPath action: v]]
-)) : ('as yet unclassified'
-parseDocumentFrom: stream = (
-	|  parser |
-	parser:: on: stream.
-	parser startDocument.
-	parser parseDocument.
-	^parser
-))
-class SvnRepository = (|
-	repositoryUrl
-	workingCopyDir = Delay computation: [defaultWorkingCopyDir].
-|)
-('as yet unclassified'
-commit: dir message: message = (
-	logMessage: message inDirectory: dir do: [ :fn |
-		svn with: {'commit'. '--non-interactive'. '-F'. fn. dir fullName}].
-	FileStream fileNamed: (dir fullNameFor: '=versioninfo') do: [ :s |
-		^(s readStream match: Character tab asString, '$Rev: '; upTo: $$) asInteger]
-)
-createPackageNamed: packageName = (
-	logMessage: 'Initial package directory for ', packageName inDirectory: FileDirectory default do: [ :fn |
-		svn with: {'mkdir'. '--non-interactive'. '-F'. fn. repositoryUrl, packageName}].
-)
-defaultWorkingCopyDir = (
-
-	| dirname |
-	dirname:: String streamContents: [ :s |
-		(repositoryUrl findTokens: ':/') do: [ :t | s nextPutAll: t] separatedBy: [s nextPut: $-]].
-	^FileDirectory default directoryNamed: dirname, '.workingcopy'
-)
-ensureExistence = (
-
-
-	workingCopyDir exists ifFalse: [
-		svn value: 'co' value: '--non-interactive' value: '-N' value: repositoryUrl value: workingCopyDir fullName].
-	workingCopyDir exists ifFalse: [halt]
-)
-ensureExistenceOf: dir = (
-
-
-	dir exists ifFalse: [
-		svn value: 'update' value: '--non-interactive' value: '-N' value: dir fullName].
-	dir exists ifFalse: [halt]
-)
-export: url to: destination = (
-	svn with: {'export'. url. destination}
-)
-logMessage: message inDirectory: dir do: action <[]> = (
-	| fn |
-	fn:: dir fullNameFor: '=log.txt'.
-	FileStream forceNewFileNamed: fn do: [ :s |
-		setLineEndConversion: s.
-		s nextPutAll: message].
-	action value: fn.
-	dir deleteFileNamed: '=log.txt'. 
-)
-move: source <String> to: target <String> message: message <String> = (
-	monitor critical: [
-		logMessage: message inDirectory: defaultWorkingCopyDir do:
-			[ :fn |
-			svn with: {
-				'move'. '--non-interactive'. '-F'. fn.
-				repositoryUrl, source.
-				repositoryUrl, target}]]
-)
-packageNamed: packageName at: revision = (
-
-	^packageNamed: packageName at: revision revert: true
-)
-packageNamed: packageName at: revision revert: revert = (
-
-	| dir cmd |
-	ensureExistence.
-	dir:: workingCopyDir.
-	(packageName findTokens: $/) allButLast do: [ :ea |
-		dir:: dir directoryNamed: ea.
-		dir exists ifFalse: [ensureExistenceOf: dir]].
-	dir:: dir directoryNamed: (packageName findTokens: $/) last.
-	revert ifTrue: [[recursivelyRemoveAllNonSvnFileFrom: dir] ifError: [:a :b | halt]].
-	svn value: 'update' value: '--non-interactive' value: '-r', revision asString value: dir fullName.
-	svn value: 'revert' value: '-R' value: dir fullName.
-	^dir
-)
-printOn: stream = (
-	stream
-		nextPutAll: class simpleName;
-		nextPut: $:;
-		nextPutAll: repositoryUrl printString
-)
-recursivelyRemoveAllNonSvnFileFrom: dir = (
-
-	dir exists ifFalse: [^self].
-	dir entries do: [ :entry |
-		entry isDirectory
-			ifTrue: [
-				entry name = '.svn' ifFalse: [
-					recursivelyRemoveAllNonSvnFileFrom: (dir directoryNamed: entry name)]]
-			ifFalse: [
-				dir deleteFileNamed: entry name ifAbsent: []]].
-	(dir entries isEmpty and: [dir exists]) ifTrue: [
-		dir containingDirectory deleteDirectory: dir localName]
-)
-revisionsOf: packageName at: revision = (
-
-	| dir xml |
-	dir:: packageNamed: packageName at: revision.
-	xml:: svn value: 'log' value: '--xml' value: '-v' value: dir fullName.
-	^SvnInfoParser parseDocumentFrom: xml readStream
-))'as yet unclassified'
-install: repositoryUrl = (
-	| rep |
-
-	rep:: MCSvnRepository url: repositoryUrl.
-	rep refresh.
-	MCRepositoryGroup default addRepository: rep.
-	rep nsSvnPackages do: [ :package |
-		| mcpkg |
-		mcpkg:: MCPackage named: package name.
-		mcpkg hasWorkingCopy ifTrue: [
-			| wc ancestor info newancestor |
-			wc:: mcpkg workingCopy.
-			ancestor:: wc ancestors first.
-			info:: package logEntries last versionInfo.
-			newancestor:: {info}, info breadthFirstAncestors detect: [ :a | a name = ancestor name].
-			wc ancestors at: 1 put: newancestor.
-			wc repositoryGroup: MCRepositoryGroup new.
-			wc repositoryGroup addRepository: rep]].
-	^rep
-)
-setupSvn = (
-	svn launcher
-		otherWindowsLocations: {
-			'%ProgramFiles%\Subversion\bin'.
-			'%ProgramFiles%\Subversion'.
-			'%ProgramFiles%\Collabnet Subversion'};
-		otherUnixLocations: {'/usr/local/bin'}
-)
-svn = (
-	^newShell svn
-)
-svnadmin = (
-	^newShell svnadmin
-)'private'
-setLineEndConversion: stream = (
-	stream
-		wantsLineEndConversion: true;
-		lineEndConvention: (ThisOSProcess isWindows ifTrue: [#crlf] ifFalse: [#lf])
-))
+Newspeak3'NsSvnRepository2'class NsSvnRepository2 usingPlatform: platform  = NewspeakObject ("   Copyright 2008 Cadence Design Systems, Inc.      Licensed under the Apache License, Version 2.0 (the ''License''); you may not use this file except in compliance with the License.  You may obtain a copy of the License at  http://www.apache.org/licenses/LICENSE-2.0"|	CrLfFileStream = platform Files CrLfFileStream.	Date = platform Kernel Date.	DateAndTime = platform Kernel DateAndTime.	Dictionary = platform Collections Dictionary.	FileDirectory = platform Files FileDirectory.	FilePackage = platform System FilePackage.	FileStream = platform Files FileStream.	MCCacheRepository = platform Monticello MCCacheRepository.	MCDefinitionCollector = platform NsBabel MCDefinitionCollector.	MCDependencySorter = platform Monticello MCDependencySorter.	MCPackage = platform Monticello MCPackage.	MCRepository = platform Monticello MCRepository.	MCRepositoryInspector = platform Monticello MCRepositoryInspector.	MCStReader = platform Monticello MCStReader.	MCStWriter = platform Monticello MCStWriter.	MCVersion = platform Monticello MCVersion.	MCVersionInfo = platform Monticello MCVersionInfo.	MCVersionReader = platform Monticello MCVersionReader.	MCWorkingCopy = platform Monticello MCWorkingCopy.	MCRepositoryGroup = platform Monticello MCRepositoryGroup.	OrderedCollection = platform Collections OrderedCollection.	Scanner = platform Compiler Scanner.	Set = platform Collections Set.	String = platform Collections String.	ThisOSProcess = platform OSProcess ThisOSProcess.	Time = platform Kernel Time.	UUID = platform Network UUID.	XMLDOMParser = (platform moduleOf: #'XML-Parser') XMLDOMParser.	SAXHandler = (platform moduleOf: #'XML-Parser') SAXHandler.	Monitor = platform Kernel Monitor.	assert = platform NewspeakCore Assert new.	"Global variables"	Transcript = platform Transcript.	"{ExternalProcess}"	NewShell = platform ExternalProcess NewShell.	"{NsToolSet}"	NsToolSet = platform NsToolSet NsToolSet.	"{Newsqueak-mixins}"	DefiningClassMetadata = platform NewsqueakMixins DefiningClassMetadata.	"My slots"	newShell = (NewShell usingPlatform: platform).	monitor = Monitor new.|	setupSvn.)(class MCSvnRepository url: url = MCRepository  (|	repositoryUuid	nsSvnRepository	repositoryUrl = url.	logEntries	packageMap|)(class VersionSaver save: v <MCVersion> = (|	version = v.	dir <FileDirectory>	classes <Set[Class]> = Set new.	extensionMethods <Collection[MCMethodDefinition]> = OrderedCollection new.	packageOrganization	allDefs = OrderedCollection new.	existing = Dictionary new.	stClasses = Dictionary new.	fileList = OrderedCollection new.	addedFiles = OrderedCollection new.	definitions|	save.)('as yet unclassified'addNewFiles = (	addedFiles isEmpty ifTrue: [^self].	svn with: {'add'}, (addedFiles collect: [ :fn | dir fullNameFor: fn]))'private'analyzeDefinitions = (	| orgSeen |	definitions:: MCDependencySorter sortItems: version snapshot definitions.	definitions do: [ :def |			def isClassDefinition ifTrue: [			classes add: (DefiningClassMetadata of: def actualClass theNonMetaClass) definingModule]].	orgSeen:: false.	definitions do: [ :def | "MCDependencySorter takes care of putting method defs after their class def"		def isClassDefinition ifTrue: [			def actualClass theNonMetaClass language name = #Smalltalk ifTrue: [				allDefs add: def]].		def isMethodDefinition ifTrue: [			(classes includes: (DefiningClassMetadata of: def actualClass theNonMetaClass) definingModule)				ifTrue: [					def actualClass theNonMetaClass language name = #Smalltalk ifTrue: [						allDefs add: def]]				ifFalse: [extensionMethods add: def]].		def isOrganizationDefinition ifTrue: [			assert true: [packageOrganization isNil].			packageOrganization: def]].	extensionMethods:: extensionMethods reject: [ :m | classes includes: m actualClass theNonMetaClass].	classes:: (classes collect: [ :cls | (DefiningClassMetadata of: cls) definingModule]) asSet.)cleanupDeletedClasses = (	existing values do: [ :efn | svn value: 'rm' value: (dir fullNameFor: efn)].)commit = (	| rev |	rev:: workingCopy commit: dir message: version info message.	version info id: rev @ repositoryUuid.)ensureNativeEolStyle = (	svn with: {'propset'. '-R'. 'svn:eol-style'. 'native'. dir fullName}.)findExistingFiles = (	((dir entries collect: [:ea | ea name]) reject: [:ea | ea first = $. or: [ea first = $= and: [ea = '=versioninfos']]]) do: [ :ea |		existing at: (ea readStream upTo: $.) put: ea].)prepareWorkingCopy = (	|	parentRev <Integer>	nspkg	path	|	parentRev:: version info ancestors notEmpty ifTrue: [		(version info ancestors collect: [:ea | ea id x]) max].	nspkg:: nsSvnPackages detect: [ :pkg | pkg name = version package name] ifNone: [].	nspkg isNil		ifTrue: ["New package"			path:: '/packages/', version package name.			 workingCopy createPackageNamed: path.			refresh]		ifFalse: [			assert true: [nspkg logEntries last revision = parentRev].			path:: nspkg currentPath].	parentRev:: logEntries last revision.	dir:: workingCopy packageNamed: path allButFirst at: parentRev.	assert true: [dir exists])writeExtensionMethods = (	extensionMethods notEmpty ifTrue: [ | efn fn |		fn:: 'extensions.st'.		fileList add: fn.		efn:: existing removeKey:  'extensions' ifAbsent: [			addedFiles add: fn.			fn].		efn = fn ifFalse: [svn value: 'mv' value: (dir fullNameFor: efn) value: (dir fullNameFor: fn)].		FileStream forceNewFileNamed: (dir fullNameFor: fn) do: [ :s | | writer |			setLineEndConversion: s.			writer:: MCStWriter new.			writer stream: s.			writer writeDefinitions: extensionMethods]].)writeFileList = (	| fn |	fn:: '=filelist'.	existing removeKey:  fn ifAbsent: [addedFiles add: fn].	FileStream forceNewFileNamed: (dir fullNameFor: fn) do: [ :s |		setLineEndConversion: s.		fileList asArray storeOn: s.		s cr])writeMultiLanguageClasses = (	| classList |	"Definitions are ordered so superclasses comes first. Preserve this order in classList."	classList:: OrderedCollection new.	definitions do: [ :def |		def isClassDefinition ifTrue: [ | cls |			cls:: classes detect: [ :c | c name = def actualClass theNonMetaClass name ] ifNone: [].			cls isNil ifFalse: [				classes remove: cls.				classList add: cls.			]]].	assert true: [classes isEmpty].	classList do:		[ :cls | | efn fn |		fn:: cls name, FileDirectory dot, cls language fileExtension.		efn:: existing removeKey: cls name ifAbsent: [			addedFiles add: fn.			fn].		efn = fn ifFalse: [			(dir fileExists: fn)				ifTrue: 					["Workaround for historical strange situations that no one understands when both .ns0 and .newspeak0 extensions."					svn value: 'rm' value: (dir fullNameFor: efn)]				ifFalse: [svn value: 'mv' value: (dir fullNameFor: efn) value: (dir fullNameFor: fn)]].		fileList add: fn.		cls language name = #Smalltalk			ifTrue: [stClasses at: cls put: OrderedCollection new]			ifFalse: [				FileStream forceNewFileNamed: (dir fullNameFor: fn) do: [ :s |					setLineEndConversion: s.					[cls printClassOn: s] displayingProgress: 'Writing ', fn]]]		displayingProgress: 'Writing non-Smalltalk classes'.)writeMultiLanguageTimeStamps = (	| fn |	fn:: '=timestamps'.	existing removeKey: fn ifAbsent: [		addedFiles add: fn.		fn].	FileStream forceNewFileNamed: (dir fullNameFor: fn) do: [ :s |		fileList add: fn.		setLineEndConversion: s.		definitions do: [ :def |			def isMethodDefinition ifTrue: [ | language ts |				language:: def actualClass theNonMetaClass language.				language shouldPersistTimeStamps ifTrue: [					ts:: language timeStampFor: def.					ts isEmptyOrNil ifFalse: [						s	nextPutAll: def fullClassName;							nextPut: $>;							nextPutAll: def selector; space;							nextPutAll: ts;							cr]]]]])writePackageOrganization = (	packageOrganization notNil ifTrue: [ | efn fn |		fn:: 'organization.st'.		efn:: existing removeKey:  'organization' ifAbsent: [			addedFiles add: fn.			fn].		efn = fn ifFalse: [svn value: 'mv' value: (dir fullNameFor: efn) value: (dir fullNameFor: fn)].		FileStream forceNewFileNamed: (dir fullNameFor: fn) do: [ :s |			fileList add: fn.			setLineEndConversion: s.			packageOrganization categories do: [ :ea |				s nextChunkPut: 'SystemOrganization addCategory: ', ea printString; cr]]].)writeSmalltalkClasses = (	allDefs do: [ :def |		stClasses at: def actualClass theNonMetaClass ifPresent: [ :defs | defs add: def]].	stClasses keys do:		[ :cls | | defs fn |		defs:: stClasses at: cls.		fn:: cls name, FileDirectory dot, cls language fileExtension.		FileStream forceNewFileNamed: (dir fullNameFor: fn) do: [ :s | | writer |			setLineEndConversion: s.			writer:: MCStWriter on: s.			writer initStream: String new writeStream.			[(defs reject: [ :d | d isMethodDefinition]) do: [ :ea | ea accept: writer].			((defs select: [ :d | d isMethodDefinition]) asArray sort: [ :a :b | a selector <= b selector]) "Ensure small diffs"				do: [ :ea | ea accept: writer].			s nextPutAll: writer initStream contents] displayingProgress: 'Writing ', fn]]		displayingProgress: 'Writing Smalltalk classes'.)writeVersionInfo =(	| fn |	fn:: '=versioninfo'.	existing removeKey: fn ifAbsent: [		addedFiles add: fn.		fn].	FileStream forceNewFileNamed: (dir fullNameFor: fn) do: [ :s |		setLineEndConversion: s.		svn value: 'add' value: s fullName.		svn with: {'propset'. 'svn:keywords'. 'URL Author Date Rev Id'. s fullName}.		s nextPutAll: 'Monticello:'; crtab.		version summary do: [ :c |			s nextPut: c.			c == Character cr ifTrue: [s tab]].		s cr; cr.		s nextPutAll: 'Subversion:'; cr.		{'URL'. 'Author'. 'Date'. 'Rev'} do: [ :kwd |			s tab; nextPut: $$; nextPutAll: kwd; nextPut: $$; cr]].)'initialize-release'save = (	prepareWorkingCopy.	analyzeDefinitions.	findExistingFiles.	writePackageOrganization.	writeExtensionMethods.	writeMultiLanguageClasses.	writeSmalltalkClasses.	writeVersionInfo.	writeFileList.	writeMultiLanguageTimeStamps.	cleanupDeletedClasses.	addNewFiles.	ensureNativeEolStyle.	commit))'as yet unclassified'addEntries: newEntries = (	| versionInfoPaths versionMap |	newEntries isEmpty ifTrue: [^self].	packageMap:: nil.	versionInfoPaths:: newEntries collect: [ :entry | entry versionInfoPath].	(versionInfoPaths anySatisfy: [ :ea | ea notNil]) ifTrue: [ | dir args existing |		args:: {'copy'. '-m'. 'Copying version info'. nil. nil. nil}.		dir:: workingCopy packageNamed: '=versioninfos' at: 'HEAD' revert: false.		existing:: (dir entries collect: [:ea | ea name]) asSet.		newEntries with: versionInfoPaths do: [ :entry :path |			path notNil ifTrue: [				(existing includes: entry revision asString) ifFalse: [					args at: 4 put: '-r', entry revision asString.					args at: 5 put: repositoryUrl, path path.					args at: 6 put: repositoryUrl, '/=versioninfos/', entry revision asString.					svn launcher						runWith: args						ifSuccess: [ :stdout :stderr |]						ifFailure: [ :stdout :stderr | Transcript cr; show: stdout upToEnd, stderr upToEnd]]]].		dir:: workingCopy packageNamed: '=versioninfos' at: 'HEAD' revert: false.		existing:: (dir entries collect: [ :ea | ea name]) asSet.		newEntries with: versionInfoPaths do: [ :entry :path |			path notNil ifTrue: [ | versionInfo |				assert true: [existing includes: entry revision asString].				versionInfo:: CrLfFileStream					fileNamed: (dir fullNameFor: entry revision asString)					do: [ :stream | readVersioninfoFrom: stream].				entry versionInfo: versionInfo.				versionInfo id: entry revision @ repositoryUuid]]].	versionMap:: Dictionary new.	(logEntries ifNil: [Array new]), newEntries do: [ :entry |		entry versionInfo notNil			ifTrue: [versionMap at: entry versionInfo name put: entry versionInfo]].	newEntries do: [ :entry |		entry versionInfo ifNotNil: [ :versionInfo |			versionInfo ancestors: ((versionInfo ancestors collect: [ :ea | versionMap at: ea ifAbsent: []]) copyWithoutAll: {nil. versionInfo})]].	logEntries isNil ifTrue: [logEntries:: Array new].	logEntries:: logEntries, newEntries)addRepository: url ifError: onError = (	| trimmedUrl |	trimmedUrl:: url.	[trimmedUrl last = $/] whileTrue: [trimmedUrl:: url allButLast].	[install: trimmedUrl]		on: newShell CommandError superclass "HACK"		do: [:ex | onError value: ex messageText].)basicStoreVersion: aVersion <MCVersion> ^<MCVersionInfo> = (	VersionSaver save: aVersion.	^aVersion info)cacheAllFileNamesDuring: action <BlockContext> = (	^action value)copiesAndDeletes = (	logEntries isNil ifTrue: [^{}].	^Array streamContents: [ :s |		logEntries do: [ :entry |			entry paths do: [ :path |				path affectsPackageNames ifTrue: [					s nextPut: path -> entry revision]]]])createRepository: dir ifError: onError = (	[svnadmin with: {'create'. dir fullName}]		on: newShell CommandError superclass "HACK"		do:			[:ex |			^onError value: ex messageText withSqueakLineEndings].	{'=versioninfos'. 'nspackages'. 'packages'} do:		[:each |		[svn			with: {'mkdir'. '--non-interactive'. '-m'. 'Initial directory layout'.				(dir directoryNamed: each) asUrl asString}]			on: newShell CommandError superclass "HACK" do:				[:ex |				^onError value: ex messageText withSqueakLineEndings]].)description = (	^repositoryUrl asString, '/*')isValidPath: path <String> = (	^((path beginsWith: '/attic/') or: [path beginsWith: '/unstable/']) not)notificationForVersion: aVersion = (	shouldNotImplement)notifyList = (	shouldNotImplement)nsSvnPackages ^<Collection[Package]> = (	| newPackageMap |	logEntries isNil ifTrue: [^{}].	packageMap notNil ifTrue: [^packageMap values].	newPackageMap:: Dictionary new.	logEntries do: [ :entry |		entry versionInfoPath ifNotNil: [ :path |			| package pkgPath |			pkgPath:: path packagePath.			(isValidPath: pkgPath) ifTrue: [				package:: newPackageMap at: pkgPath ifAbsentPut: [					Package new						name: path packageName;						currentPath: pkgPath].				package addLogEntry: entry]]			ifNil: [				"It is important to scan the paths twice as Subversion may report deletions before copies in the same revision"				entry paths do: [ :p |					p isCopy ifTrue: [						newPackageMap at: p copyFromPath ifPresent: [ :oldpkg | | newpkg |							newpkg:: newPackageMap at: p path ifAbsentPut: [								Package new									name: (p path findTokens: '/') last;									currentPath: p path].							newpkg logEntries: ((oldpkg logEntries, newpkg logEntries) asArray sort: [ :a :b | a revision < b revision])]]].				entry paths do: [ :p |					p isDeletion ifTrue: [newPackageMap removeKey: p path ifAbsent: []]]]].	packageMap:: newPackageMap.	^packageMap values)packages = (	refresh.	^(nsSvnPackages collect: [ :p | MCPackage named: p name]) asArray sort: [ :a :b | a name <= b name])possiblyNewerVersionsOfAnyOf: someVersions = (	^{})prepareVersionForStorage: aVersion = (	^aVersion)printOn: stream = (	stream		nextPutAll: class simpleName;		nextPut: $:;		nextPutAll: repositoryUrl printString)readVersioninfoFrom: stream <ReadStream> = (	| cr name author date time uuid ancestors message |	cr:: Character cr.	name:: stream match: 'Name:'; skipSeparators; upTo: cr.	(name beginsWith: 'Name:') ifTrue: [ "Work around long fixed bug"		name:: name readStream match: 'Name:'; skipSeparators; upToEnd].	author:: stream match: 'Author:'; skipSeparators; upTo: cr.	stream match: 'Time:'; skipSeparators.	date:: Date readFrom: stream.	stream skip: 1 "comma"; skipSeparators.	time:: Time readFrom: stream.	uuid:: UUID fromString: (stream match: 'UUID:'; skipSeparators; upTo: cr).	ancestors:: stream match: 'Ancestors: '; upTo: cr.	ancestors:: (ancestors findBetweenSubStrs: {', '}) asArray collect: [ :ea |		"Work around long fixed bug"		(ea beginsWith: 'Name:')			ifTrue: [ea readStream match: 'Name:'; skipSeparators; upToEnd]			ifFalse: [ea]].	message:: stream skipSeparators; upToAll: '\\Subversion:' withCRs.	^MCVersionInfo		name: name		id: nil		message: message		date: date		time: time		author: author		ancestors: ancestors)refresh = (	monitor critical: [		NsToolSet showWaitCursorWhile: [ | xml range newEntries |			changed: self with: #refresh.			repositoryUuid isNil ifTrue: [				xml:: svn value: 'info' value: '--xml' value: repositoryUrl.				repositoryUuid:: UUID fromString: (XMLDOMParser parseDocumentFrom: xml readStream) info entry repository uuid characterData].			range:: logEntries isNil ifTrue: ['-r1:HEAD'] ifFalse: ['-r', logEntries last revision asString, ':HEAD'].			xml:: svn value: 'log' value: '--xml' value: '-v' value: range value: repositoryUrl.			changed: self with: #xml.			newEntries:: (SvnInfoParser parseDocumentFrom: xml readStream) entries asArray.			addEntries:: logEntries isNil				ifTrue: [newEntries]				ifFalse: [newEntries allButFirst].			changed: self with: #done]])sendNotificationsForVersion: aVersion = (	shouldNotImplement)storeVersion: aVersion <MCVersion> ^<MCVersionInfo> = (	^basicStoreVersion: (prepareVersionForStorage: aVersion))topLevelPackageContents = (	^nsSvnPackages)versionsAvailableForPackage: package <MCPackage> ^<Collection[MCVersionInfo]> = (	package isNil ifTrue: [^{}].	^((nsSvnPackages detect: [ :p | p name = package name] ifNone: [^{}])		logEntries collect: [ :entry | entry versionInfo]) reverse)workingCopy = (	nsSvnRepository isNil ifTrue: [		nsSvnRepository:: SvnRepository new			repositoryUrl: repositoryUrl].	^nsSvnRepository)'testing'isValid = (	^repositoryUrl notNil)'interface'includesVersionNamed: versionName <String> = (	logEntries isNil ifTrue: [^false].	logEntries do: [ :e | e versionInfo name = versionName ifTrue: [^true]].	^false)morphicOpen: aWorkingCopy = (	(MCRepositoryInspector repository: self workingCopy: aWorkingCopy) show)versionWithInfo: versionInfo <MCVersionInfo> ifAbsent: aBlock ^<MCVersion> = (	|	version <MCSvnDirectoryReader | MCVersion>	entry <LogEntry>	path <LogPath>	package <MCPackage>	|	entry:: logEntries at: versionInfo id x ifAbsent: [^aBlock value].	assert true: [entry revision = versionInfo id x].	path:: entry versionInfoPath.	package:: MCPackage named: path packageName.	version:: MCCacheRepository default versionWithInfo: versionInfo ifAbsent: [ | dir |		dir:: workingCopy packageNamed: path packagePath allButFirst at: entry revision.		(SvnDirectoryReader versionInfo: versionInfo directory: dir)].	^MCVersion package: package info: versionInfo snapshot: version snapshot)) : ('as yet unclassified'isAbstract = (	^true))class LogEntry =  (|	revision	author	date	paths =  OrderedCollection new.	msg	versionInfo|)('as yet unclassified'message ^ <String> = (	msg isNil ifFalse:[^msg].	^'')message: m <String> = (	msg: m)printOn: stream = (	stream		nextPutAll: class simpleName;		nextPut: $:;		nextPutAll: revision printString)timestamp = (	^date)versionInfoPath = (	^paths detect: [ :path | path path endsWith: '/=versioninfo'] ifNone: [])'private'initializeFromElement: xmlElement = (	revision:: (xmlElement attributeAt: 'revision') asNumber.	author::  (xmlElement elementAt: 'author') contentString.	date:: DateAndTime fromString: (xmlElement elementAt: 'date') contentString.	message::  (xmlElement elementAt: 'msg') contentString)'testing'isVersionInfosUpdate = (	^message includesSubString: 'Updated =versioninfos for ')) : ('instance creation'fromElement: element = ( "<XMLElement>"	^self new initializeFromElement: element))class LogPath =  (| copyFromPath copyFromRev action path |)('as yet unclassified'isCopy = (	action = 'A' ifFalse: [^false].	copyFromPath notNil ifTrue: [^(copyFromPath endsWith: '/=versioninfo') not].	^false)isDeletion = (	^action = 'D')isValid = (	self shouldBeImplemented)packageName = (	| lastIndex |	assert true: [path endsWith: '/=versioninfo'].	lastIndex:: path size - self versionInfoFileNameSize.	lastIndex to: 1 by: -1 do: [ :i |		(path at: i) = $/ ifTrue: [^path copyFrom: i +1 to: lastIndex]].	self error: 'Internal error')packagePath = (	assert true: [path endsWith: '/=versioninfo'].	^path allButLast: self versionInfoFileNameSize)versionInfoFileNameSize = (	^13 "'/=versioninfo' size"))class SvnInfoParser on: stream = SAXHandler on: stream (|	entries = OrderedCollection new.	currentLogEntry	currentPath	lastString|	super initialize.)('as yet unclassified'characters: string = (	lastString:: string)endElement: elementName = (	elementName = 'logentry' ifTrue: [		entries add: currentLogEntry.		currentLogEntry paths: currentLogEntry paths asArray.		^currentLogEntry:: nil].	currentLogEntry isNil ifTrue: [^nil].	elementName = 'author' ifTrue: [		^currentLogEntry author: lastString].	elementName = 'msg' ifTrue: [		^currentLogEntry message: lastString].	elementName = 'date' ifTrue: [		^currentLogEntry date: (DateAndTime fromString: lastString)].	elementName = 'path' ifTrue: [		currentLogEntry paths add: currentPath.		currentPath path: lastString.		^currentPath:: nil].)startElement: elementName attributeList: attributeList = (	lastString:: nil.	elementName = 'logentry' ifTrue: [		currentLogEntry:: LogEntry new.		currentLogEntry revision: (attributeList at: 'revision') asInteger].	elementName = 'path' ifTrue: [		currentPath:: LogPath new.		attributeList at: 'copyfrom-path' ifPresent: [ :v | currentPath copyFromPath: v].		attributeList at: 'copyfrom-rev' ifPresent: [ :v | currentPath copyFromRev: v asInteger].		attributeList at: 'action' ifPresent: [ :v | currentPath action: v]])) : ('as yet unclassified'parseDocumentFrom: stream = (	|  parser |	parser:: on: stream.	parser startDocument.	parser parseDocument.	^parser))class SvnRepository =  (|	repositoryUrl	workingCopyDir = Delay computation: [defaultWorkingCopyDir].|)('as yet unclassified'commit: dir message: message = (	logMessage: message inDirectory: dir do: [ :fn |		svn with: {'commit'. '--non-interactive'. '-F'. fn. dir fullName}].	FileStream fileNamed: (dir fullNameFor: '=versioninfo') do: [ :s |		^(s readStream match: Character tab asString, '$Rev: '; upTo: $$) asInteger])createPackageNamed: packageName = (	logMessage: 'Initial package directory for ', packageName inDirectory: FileDirectory default do: [ :fn |		svn with: {'mkdir'. '--non-interactive'. '-F'. fn. repositoryUrl, packageName}].)defaultWorkingCopyDir = (	| dirname |	dirname:: String streamContents: [ :s |		(repositoryUrl findTokens: ':/') do: [ :t | s nextPutAll: t] separatedBy: [s nextPut: $-]].	^FileDirectory default directoryNamed: dirname, '.workingcopy')ensureExistence = (	workingCopyDir exists ifFalse: [		svn value: 'co' value: '--non-interactive' value: '-N' value: repositoryUrl value: workingCopyDir fullName].	workingCopyDir exists ifFalse: [halt])ensureExistenceOf: dir = (	dir exists ifFalse: [		svn value: 'update' value: '--non-interactive' value: '-N' value: dir fullName].	dir exists ifFalse: [halt])export: url to: destination = (	svn with: {'export'. url. destination})logMessage: message inDirectory: dir do: action <[]> = (	| fn |	fn:: dir fullNameFor: '=log.txt'.	FileStream forceNewFileNamed: fn do: [ :s |		setLineEndConversion: s.		s nextPutAll: message].	action value: fn.	dir deleteFileNamed: '=log.txt'. )move: source <String> to: target <String> message: message <String> = (	monitor critical: [		logMessage: message inDirectory: defaultWorkingCopyDir do:			[ :fn |			svn with: {				'move'. '--non-interactive'. '-F'. fn.				repositoryUrl, source.				repositoryUrl, target}]])packageNamed: packageName at: revision = (	^packageNamed: packageName at: revision revert: true)packageNamed: packageName at: revision revert: revert = (	| dir cmd |	ensureExistence.	dir:: workingCopyDir.	(packageName findTokens: $/) allButLast do: [ :ea |		dir:: dir directoryNamed: ea.		dir exists ifFalse: [ensureExistenceOf: dir]].	dir:: dir directoryNamed: (packageName findTokens: $/) last.	revert ifTrue: [[recursivelyRemoveAllNonSvnFileFrom: dir] ifError: [:a :b | halt]].	svn value: 'update' value: '--non-interactive' value: '-r', revision asString value: dir fullName.	svn value: 'revert' value: '-R' value: dir fullName.	^dir)printOn: stream = (	stream		nextPutAll: class simpleName;		nextPut: $:;		nextPutAll: repositoryUrl printString)recursivelyRemoveAllNonSvnFileFrom: dir = (	dir exists ifFalse: [^self].	dir entries do: [ :entry |		entry isDirectory			ifTrue: [				entry name = '.svn' ifFalse: [					recursivelyRemoveAllNonSvnFileFrom: (dir directoryNamed: entry name)]]			ifFalse: [				dir deleteFileNamed: entry name ifAbsent: []]].	(dir entries isEmpty and: [dir exists]) ifTrue: [		dir containingDirectory deleteDirectory: dir localName])revisionsOf: packageName at: revision = (	| dir xml |	dir:: packageNamed: packageName at: revision.	xml:: svn value: 'log' value: '--xml' value: '-v' value: dir fullName.	^SvnInfoParser parseDocumentFrom: xml readStream))class SvnDirectoryReader versionInfo: anMCSVNVersionInfo directory: aFileDirectory = MCVersionReader (|	directory = aFileDirectory.	versionInfo = anMCSVNVersionInfo.	timestamps|	info:: anMCSVNVersionInfo.	dependencies:: {}. "Currently we don't support (or understand) dependencies.")('as yet unclassified'openFileNamed: filename = ( "<String>" "^<ReadStream>"	| fileStream fullname contents |	fullname:: directory fullNameFor: filename.	fileStream:: CrLfFileStream new open: fullname forWrite: false; yourself.	[ contents:: fileStream upToEnd ] ensure: [ fileStream close ].	^contents readStream)'file parsing'definitionsForFileName: filenameString = (	| readStream extension |	readStream:: self openFileNamed: filenameString.	^(extension:: FileDirectory extensionFor: filenameString) = 'st'				ifTrue: [self parseDefinitionsInDotStFile: readStream named: filenameString ]				ifFalse: [self parseDefinitionsInLanguage: extension from: readStream])parseDefinitionsInDotStFile: fileStream named: filename = ( "<String>"	"Answer a sequence of MCDefinitions for the definitions in fileStream."	| filePackage |	filePackage:: FilePackage new					fullName: filename;					fileInFrom: fileStream;					yourself.	^(MCStReader new loadDefinitionsFrom: filePackage) definitions)parseDefinitionsInLanguage: extensionString from: aStream = (	| damaged undamaged contentStream |	"Hack work-around for bogus organization info left on Newsqueak1 files.	 Quickly look at the last couple of characters.  If there's a shriek then	 there's bogus organization info."	damaged:: (aStream position: aStream size - 4; upToEnd) includes: $!.	aStream position: 0.	damaged ifFalse:		[^(MCDefinitionCollector stream: aStream timestamps: timestamps)			definitions].	"Sigh; aStream could be a crlf stream.  If so, position reports underlying	 characters, not the output.  So we need to use a stream on the output."	contentStream:: aStream upToEnd readStream.	"Skip as much Newsqueak code as possible..."	[undamaged:: contentStream position.	 contentStream match: (String with: Character cr with: $))] whileTrue.	contentStream position: 0.	undamaged:: contentStream next: undamaged + 1 "include new line after closing paren (?)".	^(MCDefinitionCollector stream: undamaged readStream timestamps: timestamps)		definitions)'loading'filelist = (	^(Scanner new scan: (directory readOnlyFileNamed: '=filelist')) nextLiteral copyWithout: '=versioninfo')loadDefinitions = (	definitions::  OrderedCollection new.	self loadTimestamps.	self filelist		do: [ :filename |			definitions addAllLast: (self definitionsForFileName: filename)		]		displayingProgress: versionInfo name asString.		)loadTimestamps = (	| s |	timestamps:: Dictionary new.	(directory fileExists: '=timestamps') ifTrue:		[s:: directory readOnlyFileNamed: '=timestamps'.		 s			wantsLineEndConversion: true;			lineEndConvention: (FileDirectory pathNameDelimiter == $\								ifTrue: [#crlf]								ifFalse: [#lf]).		 [s atEnd] whileFalse:			[(timestamps				at: (s upTo: $>) "class name"				ifAbsentPut: [Dictionary new])					at: (s upTo: Character space)					put: (s upTo: Character cr)]])) : ('as yet unclassified'isAbstract = (	^true))class Package =  (|	name	logEntries = OrderedCollection new.	currentPath|)('as yet unclassified'addLogEntry: entry <LogEntry> = (	logEntries:: logEntries asOrderedCollection add: entry; yourself)author = (	^logEntries last author)message = (	^logEntries last message)owner = (	^author)printOn: stream = (	stream		nextPutAll: class simpleName;		nextPut: $:;		nextPutAll: name printString)revision = (	^logEntries last revision)timestamp = (	^logEntries last date))'as yet unclassified'install: repositoryUrl = (	| rep |	rep:: MCSvnRepository url: repositoryUrl.	rep refresh.	MCRepositoryGroup default addRepository: rep.	rep nsSvnPackages do: [ :package |		| mcpkg |		mcpkg:: MCPackage named: package name.		mcpkg hasWorkingCopy ifTrue: [			| wc ancestor info newancestor |			wc:: mcpkg workingCopy.			ancestor:: wc ancestors first.			info:: package logEntries last versionInfo.			newancestor:: {info}, info breadthFirstAncestors detect: [ :a | a name = ancestor name].			wc ancestors at: 1 put: newancestor.			wc repositoryGroup: MCRepositoryGroup new.			wc repositoryGroup addRepository: rep]].	^rep)setupSvn = (	svn launcher		otherWindowsLocations: {			'%ProgramFiles%\Subversion\bin'.			'%ProgramFiles%\Subversion'.			'%ProgramFiles%\Collabnet Subversion'};		otherUnixLocations: {'/usr/local/bin'})svn = (	^newShell svn)svnadmin = (	^newShell svnadmin)'private'setLineEndConversion: stream = (	stream		wantsLineEndConversion: true;		lineEndConvention: (ThisOSProcess isWindows ifTrue: [#crlf] ifFalse: [#lf])))

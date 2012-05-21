@@ -1,6 +1,9 @@
 Newspeak3
 'NS2Dart'
-class Newspeak2DartCompilation usingPlatform: platform parsing: parsing mirrors: mirrors = (
+class Newspeak2DartCompilation usingPlatform: platform
+	parsing: parsing
+	generation: generation
+	mirrors: mirrors = (
 "Does the interesting work in Newspeak-to-Dart translation.
 
 Derived from the NS2JS compiler, in turn derived from the NS2Squeak compiler.
@@ -39,6 +42,8 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
       VarDeclAST = astModule VarDeclAST.
 	VariableAST = astModule VariableAST.
 	
+	dart = generation factory.
+	
 	LowLevelMixinMirror = mirrors LowLevelMixinMirror.
 	InstanceVariableMirror = mirrors InstanceVariableMirror.
 	CompiledMixinMirror = mirrors CompiledMixinMirror.
@@ -57,6 +62,8 @@ class Compiler = (|
 	
 	rewriter = Rewriter new.
 	translator = Translator new.
+	
+	inlineOperators ::= false.
 	|)
 (
 class Rewriter = ASTTool (
@@ -1468,9 +1475,90 @@ class Translator = ASTTool (
 	protected containsNonLocalReturn <Boolean> "Set to false at the beginning of translating a method. The code that emits a non-local return sets this to true. The top-level code checks the value to see whether to emit a try-catch wrapper for an NLR."
 
 |)
-() : ()'as yet unclassified'
+('as yet unclassified'
+beginNewTranslationCycle = (
+	scopeStack:: OrderedCollection new.
+	containsNonLocalReturn:: false.
+)
+blockLocalReturnNode: node <BlockLocalReturnAST> = (
+"	(node expr isNormalSendNode and: [isInlinableConditionalNode: node expr]) ifTrue:
+		""Optimize the common special case of returning the value of an ifTrue:ifFalse: message send.
+		The clauses already have the necessary local returns of the last expression of each clause
+		inserted by the rewriter.""
+		[^js if: (node expr recv apply: self)
+			then: (node expr msg args first body apply: self)
+			else: ((node expr msg args at: 2) body apply: self)]."
+	^dart return: (node expr apply: self)
+)
+codeBodyNode: node <CodeBodyAST> = (
+	| locals statements |
+	locals:: node temporaries collect: [:each | each apply: self].
+	statements:: node statements collect: [:each | each apply: self].
+	^dart block: (locals asArray, statements) asArray
+)
+implicitSendNode: node <ImplicitRcvrSendNode> = (
+	^processSend: node msg to: (processOuterReceiverAtDepth: node depth) with: node msg args
+)
+mangleMethodName: name <String> = (
+	#FLAG.
+	^name
+)
+messageNode: node = (
+	"useDnuCatcher ifTrue: [sentSelectors add: node sel]."
+	^(mangleMethodName: node sel)
+)
+messagePatternNode: node <MessagePatternAST> ^<List[String]> = (
+	currentSelector:: node selector.
+	^node parameters collect: [:each | each apply: self]
+)
+methodNode: node <MethodAST> ^<Node> = (
+	| translatedBody |
+	translatedBody:: node body apply: self.
+	^dart
+		method: (mangleMethodName: node pattern selector)
+		params: (node pattern apply: self) asArray
+		body: (containsNonLocalReturn
+			ifTrue: [wrapBodyForNlrHandling: translatedBody]
+			ifFalse: [wrapBodyNoNlrHandling: translatedBody]).
+)
+normalSendNode: node <NormalSendNode> = (
+	^processSend: node msg to: (node recv apply: self) with: node msg args
+)
+processOuterReceiverAtDepth: depth <Integer> = (
+	| slotName |
+	depth = 0 ifTrue: [^dart ident: 'self'].
+	halt. "Index into enclosing object array."
+)
+processSend: message to: receiver with: args = (
+
+	#FLAG. "Unlike JS, Dart has DNU"
+
+	^dart 
+		on: receiver
+		invoke: (message apply: self)
+		with: (args collect: [:each | each apply: self]) asArray
+)
+selfName = (
+	^'self'
+)
+wrapBodyNoNlrHandling: body <Block> = (
+
+	#FLAG. "Some identifier mangling seems more appropriate than assigning this to self."
+
+	^dart block: {dart var: selfName value: (dart ident: 'this')}, body statements
+)) : ()'as yet unclassified'
 language = (
 	^#Newspeak3
+)
+processSide: side <SideAST> ofMixin: mixinMirror <LowLevelMixinMirror> = (
+	side categories do:
+		[:cat |
+		| mirror <MethodMirror> |
+		cat methods do: [:m | 
+			"who checks that the methods do not conflict with each other or with another slot or class in the same enclosing class? The mirror or the compiler?"
+			mirror:: methodNode: m.
+			mirror metadata at: #category put: cat.
+			mixinMirror methods addMirror: mirror]].
 )
 setInput: source <ReadStream> = (
 	source position: 1.
@@ -1670,7 +1758,7 @@ processInitializerFor: aNode <ClassAST> in: mixinMirror <LowLevelMixinMirror> = 
 )
 processInstanceSideOf: aNode <ClassAST> ofMixin: mixinMirror <LowLevelMixinMirror> ^ <Collection[MixinRep]> = (
 	| side <SideAST> |
-	processInitializerFor: aNode in: mixinMirror.
+	"processInitializerFor: aNode in: mixinMirror." #FLAG.
 	side:: aNode instanceSide.
 	processSide: side ofMixin: mixinMirror. "compile instance methods"
 	^compileNestedClassesOf: side within: mixinMirror. "gather nested classes"
@@ -1808,6 +1896,24 @@ depth ^ <Integer> = (
 REFACTORING = (
 	"This should be factored out along with ScopeBuilder. Perhaps it should also become nested within ScopeBuilder."
 ))
+class SemanticVarDecl decl: d <VarDeclAST> = SymbolTableEntry for: d (
+"Semantic info for a variable: slot, local or parameter."|
+  offset <Integer>
+  remote ::= false.
+  remoteVector <SemanticVarDecl>
+|)
+('as yet unclassified'
+isTemporaryAST ^ <Boolean> = (
+	^data isTemporaryAST
+)
+setIndex: i <Integer> InVector: v <VarDeclAST> = (
+	assert: remote message: 'Var Decl is not remote'.
+	remoteVector:: v.
+	offset:: i.
+)
+variableClass ^ <Class> = (
+	^data variableClass
+)) : ()
 class SymbolTableEntry for: datum = (| 
   sym  
   data ::= datum first.  
@@ -1816,4 +1922,7 @@ class SymbolTableEntry for: datum = (|
 ('as yet unclassified'
 isMethodNode = (^self data  isMethodNode)'testing'
 isMessagePatternNode = (^self data  isMessagePatternNode)
-isVarDeclNode = (^self data isVarDeclNode)) : ()) : ()
+isVarDeclNode = (^self data isVarDeclNode)) : ()'as yet unclassified'
+assert: block = (
+	assert: block message: 'Assertion failed'
+)) : ()

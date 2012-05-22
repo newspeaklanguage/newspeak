@@ -1527,9 +1527,15 @@ methodNode: node <MethodAST> ^<Node> = (
 normalSendNode: node <NormalSendNode> = (
 	^processSend: node msg to: (node recv apply: self) with: node msg args
 )
+parameterDeclNode: node <ParameterAST> = (
+	^mangleSelector: node name
+)
+parameterNode: node <ParameterVariableAST> = (
+	^dart ident: (mangleSelector: node name)
+)
 processOuterReceiverAtDepth: depth <Integer> = (
 	| slotName |
-	depth = 0 ifTrue: [^dart ident: 'self'].
+	depth = 0 ifTrue: [^dart ident: 'this'].
 	halt. "Index into enclosing object array."
 )
 processSend: message to: receiver with: args = (
@@ -1541,39 +1547,26 @@ processSend: message to: receiver with: args = (
 		invoke: (dart ident: (message apply: self))
 		with: (args collect: [:each | each apply: self]) asArray
 )
-selfName = (
-	^'self'
+propertyCallNode: node <PropertyCallAST> = (
+	"Unmangled invokation"
+	^node sel
+)
+receiverNode: node <ReceiverAST> = (
+	^dart ident: 'this'
+)
+superSendNode: node <SuperSendAST> = (
+	^processSend: node msg to: (dart ident: 'super') with: node msg args
 )
 wrapBodyNoNlrHandling: body <Block> = (
+	"Unlike JS's this, Dart's this scopes like Newspeak's self"
 
-	#FLAG. "Some identifier mangling seems more appropriate than assigning this to self."
-
-	^dart block: {dart var: selfName value: (dart ident: 'this')}, body statements
+	^dart block: "{dart var: selfName value: (dart ident: 'this')}," body statements
 )) : ()'as yet unclassified'
 language = (
 	^#Newspeak3
 )
-outputTopLevelClass: rep <MixinRep> to: stream <WriteStream> = (
-	| ast |
-	ast:: translateMixinRep: rep. 
-	dartWriter generateSourceFor: ast on: stream.
-	^stream
-)
-processFactoryFor: aNode <ClassAST> in: mixinMirror <LowLevelMixinMirror> = (
-	| accessor <MethdMirror> argNames ast |
-	accessor:: MethodMirror named: aNode hdr constructor selector.
-	argNames:: (aNode hdr constructor parameters collect: [:each | translator mangleVarName: each name]) asArray.
-	ast:: dart
-		method: (mangleSelector: aNode hdr constructor selector)
-		params: argNames
-		body: (dart block: {
-			dart return: (dart
-				on: (dart new: (dart ident: aNode hdr name) with: {})
-				invoke: (dart ident: 'instanceInitializer')
-				with: (argNames collect: [:each | dart ident: each]))
-		}).
-	accessor method: ast.
-	mixinMirror methods addMirror: accessor.
+selfNode = (
+	^VariableAST new name: #self; start: 0; end: 0
 )
 setInput: source <ReadStream> = (
 	source position: 1.
@@ -1788,7 +1781,7 @@ generateSlotAccessorsFor: m <MixinMirror>  = (
 		setterDart <Node>
 		|
 		getterName:: mangleSelector: iv name.
-		setterName:: mangleSelector: (iv name , ':').
+		setterName:: mangleSelector: (setterSelectorFor: iv).
 		ivName:: mangleSlotName: iv name.
 		
 		getter:: MethodMirror named: getterName.
@@ -1811,6 +1804,45 @@ generateSlotAccessorsFor: m <MixinMirror>  = (
 		m methods addMirror:  setter.
 	]
 )
+initializerFor: node <ClassHeaderAST> ^<MethodAST> = (
+	|
+	stmts  <Collection[StatementAST]>
+	start <Integer> = node superConstructorCall start.
+	end <Integer> = node superConstructorCall end.
+	initHdr <MessagePatternAST>
+	body <CodeBodyAST> 
+	copier <ASTCopier> = ASTCopier new.
+	params <List[VarDeclAST]>
+	|
+	
+	params:: node constructor parameters collect: [:formal | formal apply: copier].
+	initHdr:: MessagePatternAST new 
+		selector: #instanceInitializer
+		parameters: params;
+		start: start; end: end. 
+	"set up scope with constructor parameters"
+	stmts:: node slots collect: [:slot <SlotDefAST> | | aMsg <MessageAST> |
+		aMsg:: MessageAST new
+			send: (setterSelectorFor: slot) asSymbol
+			with: {slot initializer apply: copier};
+			start: slot start; end: slot end.
+		NormalSendAST new msg: aMsg; 
+			recv: (selfNode start: aMsg start; end: aMsg end);
+			start: aMsg start; end: aMsg end.			
+	].
+
+	stmts addAll: (node initExprs collect:[:ie | ie apply: copier]).
+	body:: CodeBodyAST new
+		temporaries: OrderedCollection new
+		statements: stmts; 
+		start: start; end: end.
+
+	^MethodAST new 
+		pattern: initHdr
+		body: body
+		visibility: #public; 
+		start: start; end: end.
+)
 methodNode: aNode <MethodAST> ^ <MethodMirror> = (
 	| tree <AST> dartTree |
 	tree:: aNode apply: rewriter.  "rewrite ast"
@@ -1826,14 +1858,30 @@ processClassSideOf: aNode <ClassAST> ofMixin: mixinMirror <LowLevelMixinMirror> 
 	processFactoryFor: aNode in: mixinMirror.
 	processSide: aNode classSide ofMixin: mixinMirror. "compile class methods"
 )
+processFactoryFor: aNode <ClassAST> in: mixinMirror <LowLevelMixinMirror> = (
+	| accessor <MethdMirror> argNames ast |
+	accessor:: MethodMirror named: aNode hdr constructor selector.
+	argNames:: (aNode hdr constructor parameters collect: [:each | translator mangleVarName: each name]) asArray.
+	ast:: dart
+		method: (mangleSelector: aNode hdr constructor selector)
+		params: argNames
+		body: (dart block: {
+			dart return: (dart
+				on: (dart new: (dart ident: aNode hdr name) with: {})
+				invoke: (dart ident: 'instanceInitializer')
+				with: (argNames collect: [:each | dart ident: each]))
+		}).
+	accessor method: ast.
+	mixinMirror methods addMirror: accessor.
+)
 processInitializerFor: aNode <ClassAST> in: mixinMirror <LowLevelMixinMirror> = (
 	processMethod: (superConstructorMethodFor: aNode hdr) inScope:  (scopeMap at: aNode instanceSide) in: mixinMirror. 
-	makeCreateSlotsFor: aNode hdr within: mixinMirror.
+	"makeCreateSlotsFor: aNode hdr within: mixinMirror."
 	processMethod: (initializerFor: aNode hdr) inScope:  (scopeMap at: aNode instanceSide) in: mixinMirror.
 )
 processInstanceSideOf: aNode <ClassAST> ofMixin: mixinMirror <LowLevelMixinMirror> ^ <Collection[MixinRep]> = (
 	| side <SideAST> |
-	"processInitializerFor: aNode in: mixinMirror."
+	processInitializerFor: aNode in: mixinMirror.
 	side:: aNode instanceSide.
 	processSide: side ofMixin: mixinMirror. "compile instance methods"
 	^compileNestedClassesOf: side within: mixinMirror. "gather nested classes"
@@ -1863,6 +1911,12 @@ slotDefNode: node <SlotDefAST> = (
 		field: (dart var: (mangleSlotName: node name));
 		src: (sourceForNode: node)
 )'top-processing2'
+outputTopLevelClass: rep <MixinRep> to: stream <WriteStream> = (
+	| ast |
+	ast:: translateMixinRep: rep. 
+	dartWriter generateSourceFor: ast on: stream.
+	^stream
+)
 translateMixinRep: rep <MixinRep> = (
 	| 
 	cmm <CompiledMixinMirror> = rep first.
@@ -2082,6 +2136,8 @@ assert: block = (
 mangleSelector: selector <String> ^<String> = (
 	"Convert a Newspeak selector into a Dart identifer."
 	| res <String> ::= selector. |
+	selector = 'self' ifTrue: [halt. ^'this'].
+	selector = 'this' ifTrue: [^'this_'].
 	res:: res copyReplaceAll: '_' with: '__'. "Must be first"
 	res:: res copyReplaceAll: '`' with: '_'.
 	res:: res copyReplaceAll: ':' with: '_'.

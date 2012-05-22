@@ -43,7 +43,9 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 	VariableAST = astModule VariableAST.
 	
 	dart = generation factory.
+	DartWriter = generation Writer.
 	
+	LowLevelMirror = mirrors "LowLevel"Mirror.
 	LowLevelMixinMirror = mirrors LowLevelMixinMirror.
 	InstanceVariableMirror = mirrors InstanceVariableMirror.
 	CompiledMixinMirror = mirrors CompiledMixinMirror.
@@ -62,6 +64,7 @@ class Compiler = (|
 	
 	rewriter = Rewriter new.
 	translator = Translator new.
+	dartWriter = DartWriter new.
 	
 	inlineOperators ::= false.
 	|)
@@ -1499,23 +1502,23 @@ codeBodyNode: node <CodeBodyAST> = (
 implicitSendNode: node <ImplicitRcvrSendNode> = (
 	^processSend: node msg to: (processOuterReceiverAtDepth: node depth) with: node msg args
 )
-mangleMethodName: name <String> = (
-	#FLAG.
-	^name
+mangleVarName: name <String> ^<String> = (
+	#FLAG. "How does this fit with mangling of identifiers?"
+	^'l_', name
 )
 messageNode: node = (
 	"useDnuCatcher ifTrue: [sentSelectors add: node sel]."
-	^(mangleMethodName: node sel)
+	^(mangleSelector: node sel)
 )
 messagePatternNode: node <MessagePatternAST> ^<List[String]> = (
-	currentSelector:: node selector.
+	currentSelector:: mangleSelector: node selector.
 	^node parameters collect: [:each | each apply: self]
 )
 methodNode: node <MethodAST> ^<Node> = (
 	| translatedBody |
 	translatedBody:: node body apply: self.
 	^dart
-		method: (mangleMethodName: node pattern selector)
+		method: (mangleSelector: node pattern selector)
 		params: (node pattern apply: self) asArray
 		body: (containsNonLocalReturn
 			ifTrue: [wrapBodyForNlrHandling: translatedBody]
@@ -1535,7 +1538,7 @@ processSend: message to: receiver with: args = (
 
 	^dart 
 		on: receiver
-		invoke: (message apply: self)
+		invoke: (dart ident: (message apply: self))
 		with: (args collect: [:each | each apply: self]) asArray
 )
 selfName = (
@@ -1550,19 +1553,42 @@ wrapBodyNoNlrHandling: body <Block> = (
 language = (
 	^#Newspeak3
 )
-processSide: side <SideAST> ofMixin: mixinMirror <LowLevelMixinMirror> = (
-	side categories do:
-		[:cat |
-		| mirror <MethodMirror> |
-		cat methods do: [:m | 
-			"who checks that the methods do not conflict with each other or with another slot or class in the same enclosing class? The mirror or the compiler?"
-			mirror:: methodNode: m.
-			mirror metadata at: #category put: cat.
-			mixinMirror methods addMirror: mirror]].
+outputTopLevelClass: rep <MixinRep> to: stream <WriteStream> = (
+	| ast |
+	ast:: translateMixinRep: rep. 
+	dartWriter generateSourceFor: ast on: stream.
+	^stream
+)
+processFactoryFor: aNode <ClassAST> in: mixinMirror <LowLevelMixinMirror> = (
+	| accessor <MethdMirror> argNames ast |
+	accessor:: MethodMirror named: aNode hdr constructor selector.
+	argNames:: (aNode hdr constructor parameters collect: [:each | translator mangleVarName: each name]) asArray.
+	ast:: dart
+		method: (mangleSelector: aNode hdr constructor selector)
+		params: argNames
+		body: (dart block: {
+			dart return: (dart
+				on: (dart new: (dart ident: aNode hdr name) with: {})
+				invoke: (dart ident: 'instanceInitializer')
+				with: (argNames collect: [:each | dart ident: each]))
+		}).
+	accessor method: ast.
+	mixinMirror methods addMirror: accessor.
 )
 setInput: source <ReadStream> = (
 	source position: 1.
 	input: source. "save the input"
+)
+setterSelectorFor: slot <SlotDefAST | InstanceVariableMirror> ^<Symbol> = (
+	^((slot isMutableSlot ifTrue: [ '' ] ifFalse: [ 'setOnce`' ]), slot name, ':') asSymbol.
+)
+slotDefNode: node <SlotDefAST> = (
+	
+	^(InstanceVariableMirror 
+		named: node name
+		mutable: node isMutableSlot)
+		field: (dart var: (mangleSlotName: node name));
+		src: (sourceForNode: node)
 )
 sourceForNode: node <AST> ^ <String> = (
 	| savedPos <Integer> pos <Integer> len <Integer> s <String> |
@@ -1576,6 +1602,26 @@ sourceForNode: node <AST> ^ <String> = (
 		s at: index put: input next].	
 	input position: savedPos.
 	^s
+)
+translateMixinRep: rep <MixinRep> = (
+	| 
+	cmm <CompiledMixinMirror> = rep first.
+	|
+	
+	rep last do: [:ea | halt. "When we start supporting nested classes, we will place all the mixins for a module into a flat list in a Dart library."].
+	
+	^dart library: cmm name classes: {
+		dart 
+			class: cmm name 
+			extends: 'Object'
+			fields: (cmm lowLevelMirror instVars collect: [:ea | ea field])
+			methods: (cmm lowLevelMirror methods collect: [:ea | ea method]).
+		dart
+			class: cmm name, '_class'
+			extends: 'Object'
+			fields: {}
+			methods: (cmm lowLevelMirror classMixin methods collect: [:ea | ea method])
+	}
 )'entry'
 public compileClassSource: source <ReadStream> within: enclosing <MixinMirror> ^<MixinRep> = (
 	|
@@ -1711,6 +1757,27 @@ classNode: node <ClassDeclarationAST> ^<MixinRep> = (
 	currentMixinUID:: priorMixinUID.
 	^{mixinMirror. nestedClasses}
 )
+compileNestedClasses: nestedClasses <Collection[ClassDeclarationAST]> within: mixinMirror <LowLevelMixinMirror> ^ <Collection[MixinRep]> = (
+	| results <OrderedCollection[MixinRep]> |
+      results:: OrderedCollection new.
+	nestedClasses do:
+		[ :nc <ClassDeclarationAST> |  
+			| nSlotName <String> nSlot <InstanceVariableMirror> |
+		nc hdr category: mixinMirror category, '-nested'.
+		nSlotName:: slotNameForNestedClassNamed: nc name 
+		                   within: mixinMirror name.
+		nSlot:: InstanceVariableMirror named: nSlotName mutable: true.
+		nSlot metadata at: #isSynthetic put: true.
+		mixinMirror instVars addMirror: nSlot.
+		results add: (classNode: (nestedMixinWrapperFor: nc in: mixinMirror)). "make 'mixin' (a Smalltalk subclass of ProtoObject) for nested class"
+		createNestedClassAccessorFrom: nc within: mixinMirror
+		].
+	^results
+)
+compileNestedClassesOf: aNode <SideAST> within: mixinMirror <LowLevelMixinMirror> ^ <Collection[MixinRep]> = (
+	"where do we check that nested classes do not conflict with each other, or with methods or slots?"
+	^compileNestedClasses: aNode nestedClasses within: mixinMirror
+)
 computeMethod: aNode <MethodAST> inScope: s <Scope> = (
 	|  scopeBuilder <ScopeBuilder>  |
 	scopeBuilder:: ScopeBuilder nestedIn: s atLevel: currentDepth.
@@ -1720,36 +1787,72 @@ computeMethod: aNode <MethodAST> inScope: s <Scope> = (
 )
 computeMixinFrom: aNode <ClassHeaderAST> ^<CompiledMixinMirror> = (
 	| 
-	ivNames <Collection[String]>
-	mixinMirror <LowLevelMixinMirror>
-	hdrString <String>
+	mixinMirror = LowLevelMixinMirror named: aNode name isMeta: false.
 	|
-	ivNames:: aNode slots collect:[:s | s name].
-	mixinMirror:: LowLevelMixinMirror named: aNode name isMeta: false.
-	ivNames do:
-		[:iv | 
-		mixinMirror instVars addMirror: (InstanceVariableMirror named: iv mutable: true)].
-	hdrString:: input contents copyFrom: aNode start to: aNode end.
-	^(CompiledMixinMirror language: language header: hdrString mirror: mixinMirror)
+	
+	aNode slots do: [:slot | 
+		mixinMirror instVars addMirror: (slot apply: self)].
+	
+	^(CompiledMixinMirror 
+		language: language
+		header: (sourceForNode: aNode)
+		mirror: mixinMirror)
 		factoryName: aNode constructor selector;
 		category: aNode category;
 		comment: (aNode classComment isNil 
 			ifTrue: [''] 
-			ifFalse: [aNode classComment]);
-		slots: (
-			aNode slots collect: [:each | | source |
-				source:: input contents copyFrom: each start to: each end.
-				SlotMirror named: each name source: source isMutable: each isMutable]).
+			ifFalse: [aNode classComment])
+)
+generateSlotAccessorsFor: m <MixinMirror>  = (
+	"We need accessor METHODS so we can call them uniformly"
+	m instVars do: [:iv <InstanceVariableMirror> | 
+		|
+		getterName <String>
+		setterName <String>
+		ivName <String>
+		getter <MethodMirror>
+		getterDart <Node>
+		setter <MethodMirror>
+		setterDart <Node>
+		|
+		getterName:: mangleSelector: iv name.
+		setterName:: mangleSelector: (iv name , ':').
+		ivName:: mangleSlotName: iv name.
+		
+		getter:: MethodMirror named: getterName.
+		getterDart:: dart method: getterName params: {} body: (dart block: {
+			dart return: (dart memberOf: (dart ident: 'this') at: ivName)
+			}).
+		getter method: getterDart.	
+		getter isAccessor: true.
+		m methods addMirror:  getter.
+		
+		#FLAG. "TODO: immutables"
+		setter:: MethodMirror named: setterName.
+		setterDart:: dart method: setterName params: {'v'} body: (dart block: {
+			(dart assign: (dart memberOf: (dart ident: 'this') at: ivName)
+				toBe: (dart ident: 'v')).
+			dart return: (dart ident: 'this')
+			}).
+		setter method: setterDart.
+		setter isAccessor: true.
+		m methods addMirror:  setter.
+	]
 )
 methodNode: aNode <MethodAST> ^ <MethodMirror> = (
-	| tree <AST> jsTree |
+	| tree <AST> dartTree |
 	tree:: aNode apply: rewriter.  "rewrite ast"
 	translator beginNewTranslationCycle.
-	jsTree:: tree apply: translator.	 "final pass: visit rewritten ast"
+	dartTree:: tree apply: translator.	 "final pass: visit rewritten ast"
 	"pop scope?"
-	^((MethodMirror named: translator currentSelector)
-		method: jsTree)
-			src: (sourceForNode: aNode)
+	^(MethodMirror named: translator currentSelector)
+		method: dartTree;
+		src: (sourceForNode: aNode);
+		yourself
+)
+processClassSideOf: aNode <ClassAST> ofMixin: mixinMirror <LowLevelMixinMirror> = (
+	processFactoryFor: aNode in: mixinMirror.
+	processSide: aNode classSide ofMixin: mixinMirror. "compile class methods"
 )
 processInitializerFor: aNode <ClassAST> in: mixinMirror <LowLevelMixinMirror> = (
 	processMethod: (superConstructorMethodFor: aNode hdr) inScope:  (scopeMap at: aNode instanceSide) in: mixinMirror. 
@@ -1769,7 +1872,53 @@ processMethod: aNode <MethodAST> inScope: s <Scope>  in: mixinMirror <LowLevelMi
 	method isSynthetic: true.
 	mixinMirror methods addMirror: method.
 	"install method"	
+)
+processSide: side <SideAST> ofMixin: mixinMirror <LowLevelMixinMirror> = (
+	side categories do:
+		[:cat |
+		| mirror <MethodMirror> |
+		cat methods do: [:m | 
+			"who checks that the methods do not conflict with each other or with another slot or class in the same enclosing class? The mirror or the compiler?"
+			mirror:: methodNode: m.
+			mirror metadata at: #category put: cat.
+			mixinMirror methods addMirror: mirror]].
 )) : ()
+class MethodMirror named: s <Symbol> = LowLevelMirror (
+"A descriptor for a Dart method."| 
+	selector <Symbol> = s.
+	method <Node>  "Dart code"
+	src <String> "Newspeak source - optional"
+	|)
+('as yet unclassified'
+isAccessor ^ <Boolean> = (
+	^metadata at: #isAccessor ifAbsent:[false]
+)
+isAccessor: b <Boolean> = (
+	isSynthetic: b.
+	metadata at: #isAccessor put: b
+)
+isFactory ^ <Boolean> = (
+	^metadata at: #isFactory ifAbsent:[false]
+)
+isFactory: b <Boolean> = (
+	isSynthetic: b.
+	metadata at: #isFactory put: b
+)
+isSynthetic ^ <Boolean> = (
+	^metadata at: #isSynthetic ifAbsent:[false]
+)
+isSynthetic: b <Boolean> = (
+	metadata at: #isSynthetic put: b
+)
+name ^ <Symbol> = (
+	^selector
+)
+simpleName ^ <Symbol> = (
+	^selector
+)) : ('as yet unclassified'
+REFACTORING = (
+	"Maybe this should be the class called LowLevelMethodMirror and live in the mirrors module."
+))
 class MixinRep first: cmm last: subreps = (
 "The other compilers and mirror systems typically use tuples such that type MixinRep = {CompiledMixinMirror. List[MixinRep]}. For interoperability, this class understands #first and #last."|
 	compiledMixinMirror <CompiledMixinMirror> = cmm.
@@ -1923,6 +2072,23 @@ class SymbolTableEntry for: datum = (|
 isMethodNode = (^self data  isMethodNode)'testing'
 isMessagePatternNode = (^self data  isMessagePatternNode)
 isVarDeclNode = (^self data isVarDeclNode)) : ()'as yet unclassified'
+MutableString = (
+	#FLAG.
+	^String
+)
 assert: block = (
 	assert: block message: 'Assertion failed'
+)
+mangleSelector: selector <String> ^<String> = (
+	"Convert a Newspeak selector into a Dart identifer."
+	| res <String> ::= selector. |
+	res:: res copyReplaceAll: '_' with: '__'. "Must be first"
+	res:: res copyReplaceAll: '`' with: '_'.
+	res:: res copyReplaceAll: ':' with: '_'.
+	res:: res copyReplaceAll: '*' with: '_times'.
+	res:: res copyReplaceAll: '+' with: '_plus'.
+	^res
+)
+mangleSlotName: n = (
+	^((mangleSelector: n) , '_slot') asSymbol
 )) : ()

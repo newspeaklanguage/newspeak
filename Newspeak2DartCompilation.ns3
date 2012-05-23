@@ -52,12 +52,15 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 	SlotMirror = mirrors SlotMirror.
 |)
 (
-class Compiler = (|
+class Compiler = (
+"Translates Newspeak ASTs into Dart ASTs in three phases. First, scopes are computed an associated with ASTs. Second, ASTs are rewritten to capture information such as whether an implicit receiver send is an outer send or a self send, message sends that are reads and writes to locals, messages sends that are inlinable, and implied block-local returns. Third, the rewritten ASTs are translated into Dart ASTs. 
+
+Dart ASTs are always constructed with names already mangled."|
 	scopeMap <Map[AST,Scope]> ::= Dictionary new.
 	scopeStack <List[Scope]> ::= OrderedCollection new.
 	currentDepth <Integer>
 	
-	literalTable
+	literalTable "Nix?"
 	input <ReadStream>
 	
 	currentMixinUID "Nix?"
@@ -67,6 +70,7 @@ class Compiler = (|
 	dartWriter = DartWriter new.
 	
 	inlineOperators ::= false.
+	enableIntrinsics ::= false.
 	|)
 (
 class Rewriter = ASTTool (
@@ -1477,8 +1481,25 @@ class Translator = ASTTool (
 	currentSelector
 	protected containsNonLocalReturn <Boolean> "Set to false at the beginning of translating a method. The code that emits a non-local return sets this to true. The top-level code checks the value to see whether to emit a try-catch wrapper for an NLR."
 
+	vmmirror = VMMirrorIntrinsics new.
+|)
+(
+class VMMirrorIntrinsics = (
+"When compiling the Kernel, all sends to the receiver 'vmmirror' are evaluated at compile time. They are sent to an instance of this class, which answers Dart ASTs."|
 |)
 ('as yet unclassified'
+doesNotUnderstand: msg = (
+	Error signal: 'Unknown intrinsic: ', msg selector
+)
+is: a identicalTo: b = (
+	^dart operator: '===' with: a and: b
+)
+multiply: a by: b = (
+	^dart operator: '*' with: a and: b
+)
+sqrt: a = (
+	^dart on: (dart ident: 'Math') invoke: (dart ident: 'sqrt') with: {a}
+)) : ()'as yet unclassified'
 beginNewTranslationCycle = (
 	scopeStack:: OrderedCollection new.
 	containsNonLocalReturn:: false.
@@ -1500,7 +1521,7 @@ codeBodyNode: node <CodeBodyAST> = (
 	^dart block: (locals asArray, statements) asArray
 )
 implicitSendNode: node <ImplicitRcvrSendNode> = (
-	^processSend: node msg to: (processOuterReceiverAtDepth: node depth) with: node msg args
+	^processSend: node msg to: (processOuterReceiverAtDepth: node depth)
 )
 mangleVarName: name <String> ^<String> = (
 	#FLAG. "How does this fit with mangling of identifiers?"
@@ -1525,7 +1546,7 @@ methodNode: node <MethodAST> ^<Node> = (
 			ifFalse: [wrapBodyNoNlrHandling: translatedBody]).
 )
 normalSendNode: node <NormalSendNode> = (
-	^processSend: node msg to: (node recv apply: self) with: node msg args
+	^processSend: node msg to: (node recv apply: self)
 )
 parameterDeclNode: node <ParameterAST> = (
 	^mangleSelector: node name
@@ -1533,29 +1554,42 @@ parameterDeclNode: node <ParameterAST> = (
 parameterNode: node <ParameterVariableAST> = (
 	^dart ident: (mangleSelector: node name)
 )
+processIntrinsic: message = (
+
+	^vmmirror 
+		perform: message sel
+		withArguments: (message args collect: [:ea | ea apply: self]) asArray
+)
 processOuterReceiverAtDepth: depth <Integer> = (
 	| slotName |
 	depth = 0 ifTrue: [^dart ident: 'this'].
 	halt. "Index into enclosing object array."
 )
-processSend: message to: receiver with: args = (
+processSend: message to: receiver = (
 
 	#FLAG. "Unlike JS, Dart has DNU"
+
+	"Yucky pattern matching"
+	enableIntrinsics ifTrue: [
+		receiver isMethodInvocation ifTrue: [
+			receiver target = (dart ident: 'this') ifTrue: [
+				receiver method name = 'vmmirror' ifTrue: [
+					^processIntrinsic: message]]]].
 
 	^dart 
 		on: receiver
 		invoke: (dart ident: (message apply: self))
-		with: (args collect: [:each | each apply: self]) asArray
+		with: (message args collect: [:each | each apply: self]) asArray
 )
 propertyCallNode: node <PropertyCallAST> = (
-	"Unmangled invokation"
+	"Unmangled invocation"
 	^node sel
 )
 receiverNode: node <ReceiverAST> = (
 	^dart ident: 'this'
 )
 superSendNode: node <SuperSendAST> = (
-	^processSend: node msg to: (dart ident: 'super') with: node msg args
+	^processSend: node msg to: (dart ident: 'super')
 )
 wrapBodyNoNlrHandling: body <Block> = (
 	"Unlike JS's this, Dart's this scopes like Newspeak's self"
@@ -1839,6 +1873,8 @@ computeMixinFrom: aNode <ClassHeaderAST> ^<CompiledMixinMirror> = (
 	mixinMirror = LowLevelMixinMirror named: aNode name isMeta: false.
 	|
 	
+	mixinMirror superclassName: aNode superclassName.
+	
 	aNode slots do: [:slot | 
 		mixinMirror instVars addMirror: (slot apply: self)].
 	
@@ -1876,7 +1912,6 @@ generateSlotAccessorsFor: m <MixinMirror>  = (
 		getter isAccessor: true.
 		m methods addMirror:  getter.
 		
-		#FLAG. "TODO: immutables"
 		setter:: MethodMirror named: setterName.
 		setterDart:: dart method: setterName params: {'v'} body: (dart block: {
 			(dart assign: (dart memberOf: (dart ident: 'this') at: ivName)
@@ -1913,7 +1948,7 @@ processFactoryFor: node <ClassAST> in: mixinMirror <LowLevelMixinMirror> = (
 		params: argNames
 		body: (dart block: {
 			dart return: (dart
-				on: (dart new: (dart ident: node hdr name) with: {})
+				on: (dart new: (dart ident: (mangleSelector: node hdr name)) with: {})
 				invoke: (dart ident: (mangleSelector: initializerName))
 				with: (argNames collect: [:each | dart ident: each]))
 		}).
@@ -1971,15 +2006,70 @@ translateMixinRep: rep <MixinRep> = (
 	
 	^dart library: cmm name classes: {
 		dart 
-			class: cmm name 
-			extends: 'Object'
+			class: (mangleSelector: cmm name)
+			extends: (mangleSelector: cmm lowLevelMirror superclassName)
 			fields: (cmm lowLevelMirror instVars collect: [:ea | ea field])
 			methods: (cmm lowLevelMirror methods collect: [:ea | ea method]).
 		dart
-			class: cmm name, '_class'
-			extends: 'Object'
+			class: (mangleSelector: cmm name), '_class'
+			extends: (mangleSelector: 'Class')
 			fields: {}
 			methods: (cmm lowLevelMirror classMixin methods collect: [:ea | ea method])
+	}
+)) : ()
+class Infrastructure = (|
+	Top = super Object.
+	compiler = Compiler new.
+|compiler enableIntrinsics: true)
+(
+class Class = (|
+|)
+() : ()
+class Number wrapping: n = (|
+	dartNumber = n.	
+|)
+('as yet unclassified'
+* other = (
+	^self Number wrapping: (vmmirror multiply: self dartNumber by: other dartNumber)
+)
+sqrt = (
+	^self Number wrapping: (vmmirror sqrt: self dartNumber)
+)) : ()
+class Object = Top ()
+('as yet unclassified'
+== other = (
+
+	^vmmirror is: self identicalTo: other
+)) : ()'accessing'
+kernelClasses ^<List[Node]> = (
+	^{
+		compileClass: Object.
+		compileClass: Class.
+		compileClass: Number.
+	}
+)'private'
+compileClass: klass <Class> ^<Node> = (
+	| stream source |
+	stream:: (String new: 1000) writeStream.
+	klass mixin printTopClassOn: stream.
+	source:: stream contents.
+	^compiler compileClassSource: source readStream within: nil
+)
+topClass ^<Node> = (
+	
+	^dart class: 'Top' extends: 'Object' fields: {} methods: {
+	
+		dart
+			method: 'noSuchMethod'
+			params: {'invocationMirror'}
+			body: (dart block: {
+				"Repackage as a MessageMirror and send DNU"}).
+		
+		dart 
+			method: (mangleSelector: (compiler initializerSelectorNameFor: 'new'))
+			params: {}
+			body: (dart block: { 
+				dart return: (dart ident: 'this')}).
 	}
 )) : ()
 class MethodMirror named: s <Symbol> = LowLevelMirror (
@@ -2175,19 +2265,45 @@ MutableString = (
 	#FLAG.
 	^String
 )
+REFACTORING = (
+	"Rewriter, Translator, Writer are stateful visitors that have a method to reset their state. It would be less error prone if they had no such reset methods and instead a new instance was created for each use."
+)
 assert: block = (
 	assert: block message: 'Assertion failed'
+)
+infrastructureTest = (
+	|
+	infrastructure = Infrastructure new. 
+	stream = String new writeStream.
+	dartWriter = DartWriter new.
+	|
+
+	dartWriter generateSourceFor: infrastructure topClass on: stream.
+
+	infrastructure kernelClasses do: [:rep |
+		infrastructure compiler outputTopLevelClass: rep to: stream].
+	
+	stream inspect.
 )
 mangleSelector: selector <String> ^<String> = (
 	"Convert a Newspeak selector into a Dart identifer."
 	| res <String> ::= selector. |
+	selector first = $_ ifTrue: [halt "Affects access semantics in Dart"].
+
 	selector = 'self' ifTrue: [halt. ^'this'].
 	selector = 'this' ifTrue: [^'this_'].
-	res:: res copyReplaceAll: '_' with: '__'. "Must be first"
+	selector = 'Object' ifTrue: [^'Object_'].
+	selector = 'new' ifTrue: [^'new_'].
+	
+	
+	selector = '*' ifTrue: [^'times_'].
+	selector = '+' ifTrue: [^'times_'].
+	selector = '==' ifTrue: [^'equalequal_'].
+	
+		
+	res:: res copyReplaceAll: '_' with: '___'. "Must be first"
+	res:: res copyReplaceAll: ':' with: '__'.
 	res:: res copyReplaceAll: '`' with: '_'.
-	res:: res copyReplaceAll: ':' with: '_'.
-	res:: res copyReplaceAll: '*' with: '_times'.
-	res:: res copyReplaceAll: '+' with: '_plus'.
 	^res
 )
 mangleSlotName: n = (

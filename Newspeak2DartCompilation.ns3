@@ -1488,6 +1488,12 @@ class VMMirrorIntrinsics = (
 "When compiling the Kernel, all sends to the receiver 'vmmirror' are evaluated at compile time. They are sent to an instance of this class, which answers Dart ASTs."|
 |)
 ('as yet unclassified'
+Number = (
+	^dart ident: 'Number_global'
+)
+add: a to: b = (
+	^dart operator: '+' with: a and: b
+)
 doesNotUnderstand: msg = (
 	Error signal: 'Unknown intrinsic: ', msg selector
 )
@@ -1548,6 +1554,20 @@ methodNode: node <MethodAST> ^<Node> = (
 normalSendNode: node <NormalSendNode> = (
 	^processSend: node msg to: (node recv apply: self)
 )
+numberNode: node <NumberAST> = (
+	|
+	Number = dart
+		on: (dart ident: 'this')
+		invoke: (dart ident: 'Number')
+		with: {}.
+	|
+	#FLAG. "Should use an implicit send, not a self send."
+		
+	^dart
+		on: Number
+		invoke: (dart ident: (mangleSelector: 'wrapping:'))
+		with: {dart literal: node val}
+)
 parameterDeclNode: node <ParameterAST> = (
 	^mangleSelector: node name
 )
@@ -1567,9 +1587,7 @@ processOuterReceiverAtDepth: depth <Integer> = (
 )
 processSend: message to: receiver = (
 
-	#FLAG. "Unlike JS, Dart has DNU"
-
-	"Yucky pattern matching"
+	#FLAG. "Yucky pattern matching"
 	enableIntrinsics ifTrue: [
 		receiver isMethodInvocation ifTrue: [
 			receiver target = (dart ident: 'this') ifTrue: [
@@ -1948,7 +1966,7 @@ processFactoryFor: node <ClassAST> in: mixinMirror <LowLevelMixinMirror> = (
 		params: argNames
 		body: (dart block: {
 			dart return: (dart
-				on: (dart new: (dart ident: (mangleSelector: node hdr name)) with: {})
+				on: (dart new: (dart ident: (mangleSelector: node hdr name),'_mixin') with: {})
 				invoke: (dart ident: (mangleSelector: initializerName))
 				with: (argNames collect: [:each | dart ident: each]))
 		}).
@@ -1991,10 +2009,23 @@ slotDefNode: node <SlotDefAST> = (
 		field: (dart var: (mangleSlotName: node name));
 		src: (sourceForNode: node)
 )'top-processing2'
-outputTopLevelClass: rep <MixinRep> to: stream <WriteStream> = (
+outputMainForReps: reps to: stream = (
+
 	| ast |
-	ast:: translateMixinRep: rep. 
-	dartWriter generateSourceFor: ast on: stream.
+	ast:: dart method: 'main' params: {} body: (dart block: (
+		reps collect: [:rep <MixinRep> | | cmm = rep first. |
+			dart 
+				assign: (dart ident: (mangleSelector: cmm name),'_global')
+				toBe: (dart new: (dart ident: (mangleSelector: cmm name), '_class_mixin') with: {}).
+		])
+	).
+
+	dartWriter generateSourceFor: ast on: stream
+)
+outputTopLevelClass: rep <MixinRep> to: stream <WriteStream> = (
+	| asts |
+	asts:: translateMixinRep: rep. 
+	asts do: [:ast | dartWriter generateSourceFor: ast on: stream].
 	^stream
 )
 translateMixinRep: rep <MixinRep> = (
@@ -2004,17 +2035,20 @@ translateMixinRep: rep <MixinRep> = (
 	
 	rep last do: [:ea | halt. "When we start supporting nested classes, we will place all the mixins for a module into a flat list in a Dart library."].
 	
-	^dart library: cmm name classes: {
+	^{
 		dart 
-			class: (mangleSelector: cmm name)
-			extends: (mangleSelector: cmm lowLevelMirror superclassName)
+			class: (mangleSelector: cmm name),'_mixin'
+			extends: (mangleSelector: cmm lowLevelMirror superclassName),'_mixin'
 			fields: (cmm lowLevelMirror instVars collect: [:ea | ea field])
 			methods: (cmm lowLevelMirror methods collect: [:ea | ea method]).
 		dart
-			class: (mangleSelector: cmm name), '_class'
-			extends: (mangleSelector: 'Class')
+			class: (mangleSelector: cmm name), '_class_mixin'
+			extends: (mangleSelector: 'Class'),'_mixin'
 			fields: {}
-			methods: (cmm lowLevelMirror classMixin methods collect: [:ea | ea method])
+			methods: (cmm lowLevelMirror classMixin methods collect: [:ea | ea method]).
+			
+		dart
+			var: (dart ident: (mangleSelector: cmm name),'_global').
 	}
 )) : ()
 class Infrastructure = (|
@@ -2032,6 +2066,9 @@ class Number wrapping: n = (|
 * other = (
 	^self Number wrapping: (vmmirror multiply: self dartNumber by: other dartNumber)
 )
++ other = (
+	^self Number wrapping: (vmmirror add: self dartNumber to: other dartNumber)
+)
 sqrt = (
 	^self Number wrapping: (vmmirror sqrt: self dartNumber)
 )) : ()
@@ -2040,6 +2077,9 @@ class Object = Top ()
 == other = (
 
 	^vmmirror is: self identicalTo: other
+)
+Number = (
+	^vmmirror Number
 )) : ()'accessing'
 kernelClasses ^<List[Node]> = (
 	^{
@@ -2057,11 +2097,11 @@ compileClass: klass <Class> ^<Node> = (
 )
 topClass ^<Node> = (
 	
-	^dart class: 'Top' extends: 'Object' fields: {} methods: {
+	^dart class: 'Top_mixin' extends: 'Object' fields: {} methods: {
 	
 		dart
 			method: 'noSuchMethod'
-			params: {'invocationMirror'}
+			params: {'name'. 'args'}
 			body: (dart block: {
 				"Repackage as a MessageMirror and send DNU"}).
 		
@@ -2271,19 +2311,26 @@ REFACTORING = (
 assert: block = (
 	assert: block message: 'Assertion failed'
 )
-infrastructureTest = (
+compile: source <ReadStream> = (
 	|
-	infrastructure = Infrastructure new. 
-	stream = String new writeStream.
+	compiler = Compiler new.
+	infrastructure = Infrastructure new.
 	dartWriter = DartWriter new.
-	|
-
-	dartWriter generateSourceFor: infrastructure topClass on: stream.
-
-	infrastructure kernelClasses do: [:rep |
-		infrastructure compiler outputTopLevelClass: rep to: stream].
 	
-	stream inspect.
+	output = String new writeStream.
+	
+	reps <List[MixinRep]> = OrderedCollection new.
+	|
+	
+	dartWriter generateSourceFor: infrastructure topClass on: output.
+	
+	reps addAll: infrastructure kernelClasses.
+	reps add: (compiler compileClassSource: source within: nil).
+	
+	reps do: [:rep | compiler outputTopLevelClass: rep to: output].
+	compiler outputMainForReps: reps to: output.
+	
+	^output
 )
 mangleSelector: selector <String> ^<String> = (
 	"Convert a Newspeak selector into a Dart identifer."
@@ -2297,7 +2344,7 @@ mangleSelector: selector <String> ^<String> = (
 	
 	
 	selector = '*' ifTrue: [^'times_'].
-	selector = '+' ifTrue: [^'times_'].
+	selector = '+' ifTrue: [^'plus_'].
 	selector = '==' ifTrue: [^'equalequal_'].
 	
 		

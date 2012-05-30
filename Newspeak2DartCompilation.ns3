@@ -1817,39 +1817,15 @@ wrapBodyNoNlrHandling: body <Block> = (
 	^dart block: "{dart var: selfName value: (dart ident: 'this')}," body statements
 )) : ()'as yet unclassified'
 accessorForNestedClass: classDecl <ClassDeclarationAST> within: mixinMirror = (
-	"Foo>> Inner {
-	if(Inner_slot === null){
-
-		var superclass = this.Super();
-		var metaclass = new Foo_Inner_metamixin( Metaclass_global );
-		var class = new Foo_Inner_mixin(metaclass);
-		
-		class.superclass__(superclass);
-		class.enclosingObject__(this);
-		class.name('Foo`Inner');
-		class.mixin( );
-		
-		metaclass.superclass__( Class_global );
-		metaclass.enclosingObject__(this);
-		metaclass.mixin( );
-
-		Inner_slot = class;
-	}
-	return Inner_slot;
-	}"
 	|
 	simpleName = classDecl hdr name.
 	fullName = fullyQualifySimpleName: simpleName with: mixinMirror name.
 	slotName = mangleSlotName: fullName.
-	superclass = dart 
-		on: (dart ident: 'this') "should be a here send..."
-		invoke: (dart ident: (mangleSelector: classDecl hdr superclassName))
-		with: {}.
+	superclass = accessorForSuperclass: classDecl hdr superclassName inScope:  (scopeMap at: classDecl instanceSide).
 	metamixin = dart ident: (metamixinClassNameFor: fullName).
 	mixin = dart ident: (metamixinClassNameFor: fullName).
 	|
 	#FLAG.
-	
 	
 	^dart method: (dart ident: (mangleSelector: simpleName)) params: {} body: (dart block: {dart
 		if: (dart 
@@ -1873,7 +1849,7 @@ accessorForNestedClass: classDecl <ClassDeclarationAST> within: mixinMirror = (
 			dart 
 				on: (dart ident: 'klass')
 				invoke: (dart ident: (mangleSelector: 'superclass:'))
-				with: {superclass}.
+				with: {dart ident: 'superclass'}.
 			dart 
 				on: (dart ident: 'klass')
 				invoke: (dart ident: (mangleSelector: 'enclosingObject:'))
@@ -1881,7 +1857,7 @@ accessorForNestedClass: classDecl <ClassDeclarationAST> within: mixinMirror = (
 			dart 
 				on: (dart ident: 'klass')
 				invoke: (dart ident: (mangleSelector: 'name:'))
-				with: {(SymbolAST new val: simpleName) apply: translator}.
+				with: {(SymbolAST new val: fullName) apply: translator}.
 				
 			dart 
 				on: (dart ident: 'metaclass')
@@ -1903,6 +1879,26 @@ accessorForNestedClass: classDecl <ClassDeclarationAST> within: mixinMirror = (
 			
 			dart return: (dart ident: slotName).
 	})
+)
+accessorForSuperclass: superclassName <String> inScope: s <Scope> ^<Node> = (
+	| send scopeBuilder |
+	send:: NormalSendAST new
+		to: hereNode
+		send: (MessageAST new
+			send: superclassName
+			with: {}).
+	
+	rewriter pushScope: s.
+	send:: send apply: rewriter.
+	rewriter popScope.
+	
+	translator beginNewTranslationCycle.
+	^send apply: translator
+	
+	"^dart 
+		on: (dart ident: 'this')
+		invoke: (dart ident: (mangleSelector: superclassName))
+		with: {}."
 )
 createNestedClassAccessorFrom: classDecl <ClassDeclarationAST> within: mixinMirror <LowLevelMixinMirror> = (
 "Create an accessor method for the nested class represented by the incoming class tree.
@@ -1944,15 +1940,23 @@ nestedMixinWrapperFor: nested <ClassDeclarationAST> in: outerClass <MixinMirror>
 	wrapper hdr name: (fullyQualifySimpleName: nested name with: outerClass name).
 	^wrapper
 )
-resolveSuperclass: name = (
-	name = 'Object' ifTrue: [^'KernelForDart`Object'].
-	name = 'Class' ifTrue: [^'KernelForDart`Class'].
-	name = 'Behavior' ifTrue: [^'KernelForDart`Behavior'].
-	name = 'Boolean' ifTrue: [^'KernelForDart`Boolean'].
-	name = 'Error' ifTrue: [^'KernelForDart`Error'].
-	name = 'Top' ifTrue: [^'Top'].
+resolveSuperclassOf: node <ClassDeclarationAST> ^<String> = (
+	"Try to find the fully qualified name of the mixin of the superclass of the given class declaration. This cannot be done in general statically. Additionally, the scopes do not have enough information to tell us whether the binding is actually a class declaration, or a method or slot. If the latter two, the compiler will hum along but the Dart compiler will complain when the mixin class tries to inherit from a nonexistent class."
 	
-	halt.
+	| name = node hdr superclassName. scope binding tokens |
+	
+	tokens:: node hdr name findTokens: $`.
+	scope:: scopeMap at: node instanceSide.
+	binding:: scope at: node hdr superclassName ifAbsent: [
+		
+		name = 'Top' ifTrue: [^'Top'].
+		name = 'Object' ifTrue: [^'KernelForDart`Object'].
+		
+		Error signal: 'Sorry, your code relies on a true dynamic superclass, which isnt supported yet'
+	].
+	
+	tokens:: (tokens copyFrom: 1 to: binding depth + 1) , {name}.
+	^tokens fold: [:a :b | a , '`', b]
 )
 selfNode = (
 	^VariableAST new name: #self; start: 0; end: 0
@@ -2188,7 +2192,7 @@ classNode: node <ClassDeclarationAST> ^<MixinRep> = (
 	|
 	assert: [node hdr category notNil] message: 'No category for class header'.
 	checkForDuplicateNames: node.
-	mixinMirror:: computeMixinFrom: node hdr.
+	mixinMirror:: computeMixinFrom: node.
 
 	currentDepth::currentDepth + 1.
 	generateSlotAccessorsFor: mixinMirror lowLevelMirror. "Called before handling nested classes because we don't need the accessors for their synthetic slots."
@@ -2229,25 +2233,26 @@ computeMethod: aNode <MethodAST> inScope: s <Scope> = (
 	"need to build scope for method before visiting it"
 	^methodNode: aNode.
 )
-computeMixinFrom: aNode <ClassHeaderAST> ^<CompiledMixinMirror> = (
+computeMixinFrom: node <ClassDeclarationAST> ^<CompiledMixinMirror> = (
 	| 
-	mixinMirror = LowLevelMixinMirror named: aNode name isMeta: false.
+	hdr = node hdr.
+	mixinMirror = LowLevelMixinMirror named: hdr name isMeta: false.
 	|
 	
-	mixinMirror superclassName: aNode superclassName.
+	mixinMirror superclassName: (resolveSuperclassOf: node).
 	
-	aNode slots do: [:slot |
+	hdr slots do: [:slot |
 		mixinMirror instVars addMirror: (slot apply: self)].
 	
 	^(CompiledMixinMirror 
 		language: language
-		header: (sourceForNode: aNode)
+		header: (sourceForNode: hdr)
 		mirror: mixinMirror)
-		factoryName: aNode constructor selector;
-		category: aNode category;
-		comment: (aNode classComment isNil 
+		factoryName: hdr constructor selector;
+		category: hdr category;
+		comment: (hdr classComment isNil 
 			ifTrue: [''] 
-			ifFalse: [aNode classComment])
+			ifFalse: [hdr classComment])
 )
 generateSlotAccessorsFor: m <MixinMirror>  = (
 	"We need accessor METHODS so we can call them uniformly. Dart's special getters and setters won't do."
@@ -2392,14 +2397,14 @@ translateMixinRep: rep <MixinRep> ^<List[Node]> = (
 		
 	results add: (dart 
 		class: (mixinClassNameFor: cmm name)
-		extends: (mixinClassNameFor: (resolveSuperclass: llmm superclassName))
+		extends: (mixinClassNameFor: llmm superclassName)
 		fields: (llmm instVars collect: [:ea | ea field])
 		constructors: {dart verbatim: (mixinClassNameFor: cmm name),'(c):super(c);'}
 		methods: (llmm methods collect: [:ea | ea method])).
 			
 	results add: (dart
 		class: (metamixinClassNameFor: cmm name)
-		extends: (mixinClassNameFor: (resolveSuperclass: 'Class'))
+		extends: (mixinClassNameFor: ('KernelForDart`Class'))
 		fields: {}
 		constructors: {dart verbatim: (metamixinClassNameFor: cmm name),'(c):super(c);'}
 		methods: (llmm classMixin methods collect: [:ea | ea method])).

@@ -3,8 +3,11 @@ Newspeak3
 class Newspeak2DartCompilation usingPlatform: platform
 	parsing: parsing
 	generation: generation
-	mirrors: mirrors = (
+	mirrors: mirrors 
+	kernelClass: K = (
 "Does the interesting work in Newspeak-to-Dart translation.
+
+Throughout this module, the type annotation <Node> means a Dart AST, a subclass of DartGeneration`Syntax`Node.
 
 Derived from the NS2JS compiler, in turn derived from the NS2Squeak compiler.
 
@@ -50,6 +53,8 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 	InstanceVariableMirror = mirrors InstanceVariableMirror.
 	CompiledMixinMirror = mirrors CompiledMixinMirror.
 	SlotMirror = mirrors SlotMirror.
+	
+	Kernel = K.
 |)
 (
 class Compiler = (
@@ -62,8 +67,6 @@ Dart ASTs are always constructed with names already mangled."|
 	
 	literalTable "Nix?"
 	input <ReadStream>
-	
-	currentMixinUID "Nix?"
 	
 	rewriter = Rewriter new.
 	translator = Translator new.
@@ -1499,10 +1502,10 @@ Block = (
 	^dart ident: 'Block_global'
 )
 Error = (
-	^dart ident: 'Error_global'
+	halt.
 )
 MessageNotUnderstood = (
-	^dart ident: 'MessageNotUnderstood_global'
+	halt.
 )
 Number = (
 	^dart ident: 'Number_global'
@@ -1556,7 +1559,7 @@ is: a greaterThan: b = (
 	^asNsBoolean: (dart operator: '>' with: a and: b)
 )
 is: a identicalTo: b = (
-	^dart operator: '===' with: a and: b
+	^asNsBoolean: (dart operator: '===' with: a and: b)
 )
 is: a lessOrEqual: b = (
 	^asNsBoolean: (dart operator: '<=' with: a and: b)
@@ -1600,6 +1603,27 @@ toString: a = (
 )
 try: b1 catch: b2 = (
 	halt.
+)
+try: b1 ensure: b2 = (
+	^dart 
+		try: (dart return: (dart on: b1 invoke: (dart ident: (mangleSelector: 'value')) with: {})) asBlock
+		catch: nil
+		with: nil
+		finally: (dart on: b2 invoke: (dart ident: (mangleSelector: 'value')) with: {}) asBlock
+)
+try: tryblock on: expectedclass do: catchblock = (
+	halt. "But non-NS exceptions (e.g., NLR exceptions) do not have a class getter..."
+	
+	"try {...} catch( ex_ ) {
+		for(c = ex_.class; c != nil; c=c.superclass){
+			if(c==exceptionclass) return catchblock.value()
+		}
+		throw ex_
+	}"
+
+	^dart try: tryblock catch: (dart ident: 'ex_') with: (dart block: {
+		
+	})
 )) : ()'as yet unclassified'
 assignmentNode: node <AssignmentAST> = (
 
@@ -1635,6 +1659,9 @@ codeBodyNode: node <CodeBodyAST> = (
 	locals:: node temporaries collect: [:each | each apply: self].
 	statements:: node statements collect: [:each | each apply: self].
 	^dart block: (locals asArray, statements) asArray
+)
+explicitOuterReceiverNode: node <ExplicitRecvrAST> = (
+	^processOuterReceiverAtDepth: node depth
 )
 implicitSendNode: node <ImplicitRcvrSendNode> = (
 	^processSend: node msg to: (processOuterReceiverAtDepth: node depth)
@@ -1703,9 +1730,14 @@ processIntrinsic: message = (
 		withArguments: (message args collect: [:ea | ea apply: self]) asArray
 )
 processOuterReceiverAtDepth: depth <Integer> = (
-	| slotName |
+	| exp |
 	depth = 0 ifTrue: [^dart ident: 'this'].
-	halt. "Index into enclosing object array."
+	
+	"Since nesting chains are typically short, it seems like the simplicity of following them directly won't be too expensive. Possibly for depths 1 and 2 this is faster than the enclosing objects array scheme."
+	exp:: dart memberOf: (dart ident: 'this') at: 'klass_'.
+	depth timesRepeat: [
+		exp:: dart memberOf: exp at: (mangleSlotName: 'enclosingObject')].
+	^exp
 )
 processSend: message to: receiver = (
 
@@ -1784,6 +1816,108 @@ wrapBodyNoNlrHandling: body <Block> = (
 
 	^dart block: "{dart var: selfName value: (dart ident: 'this')}," body statements
 )) : ()'as yet unclassified'
+accessorForNestedClass: classDecl <ClassDeclarationAST> within: mixinMirror = (
+	"Foo>> Inner {
+	if(Inner_slot === null){
+
+		var superclass = this.Super();
+		var metaclass = new Foo_Inner_metamixin( Metaclass_global );
+		var class = new Foo_Inner_mixin(metaclass);
+		
+		class.superclass__(superclass);
+		class.enclosingObject__(this);
+		class.name('Foo`Inner');
+		class.mixin( );
+		
+		metaclass.superclass__( Class_global );
+		metaclass.enclosingObject__(this);
+		metaclass.mixin( );
+
+		Inner_slot = class;
+	}
+	return Inner_slot;
+	}"
+	|
+	simpleName = classDecl hdr name.
+	fullName = fullyQualifySimpleName: simpleName with: mixinMirror name.
+	slotName = mangleSlotName: fullName.
+	superclass = dart 
+		on: (dart ident: 'this') "should be a here send..."
+		invoke: (dart ident: (mangleSelector: classDecl hdr superclassName))
+		with: {}.
+	metamixin = dart ident: (metamixinClassNameFor: fullName).
+	mixin = dart ident: (metamixinClassNameFor: fullName).
+	|
+	#FLAG.
+	
+	
+	^dart method: (dart ident: (mangleSelector: simpleName)) params: {} body: (dart block: {dart
+		if: (dart 
+			operator: '==='
+			with: (dart ident: slotName)
+			and: (dart ident: 'null'))
+		then: (dart block: {
+			dart 
+				var: (dart ident: 'superclass') 
+				value: superclass.
+			dart 
+				var: (dart ident: 'metaclass') 
+				value: (dart 
+					on: (dart ident: 'Metaclass_global') 
+					invoke: (dart ident: (mangleSelector: 'new'))
+					with: {}).
+			dart 
+				var: (dart ident: 'klass')
+				value: (dart new: metamixin with: {dart ident: 'metaclass'}).
+				
+			dart 
+				on: (dart ident: 'klass')
+				invoke: (dart ident: (mangleSelector: 'superclass:'))
+				with: {superclass}.
+			dart 
+				on: (dart ident: 'klass')
+				invoke: (dart ident: (mangleSelector: 'enclosingObject:'))
+				with: {dart ident: 'this'}.
+			dart 
+				on: (dart ident: 'klass')
+				invoke: (dart ident: (mangleSelector: 'name:'))
+				with: {(SymbolAST new val: simpleName) apply: translator}.
+				
+			dart 
+				on: (dart ident: 'metaclass')
+				invoke: (dart ident: (mangleSelector: 'superclass:'))
+				with: {dart ident: 'Class_global'}.
+			dart 
+				on: (dart ident: 'metaclass')
+				invoke: (dart ident: (mangleSelector: 'enclosingObject:'))
+				with: {dart ident: 'this'}.
+			dart 
+				on: (dart ident: 'metaclass')
+				invoke: (dart ident: (mangleSelector: 'thisClass:'))
+				with: {dart ident: 'klass'}.
+							
+			dart
+				assign: (dart ident: slotName)
+				toBe: (dart ident: 'klass').
+			}).
+			
+			dart return: (dart ident: slotName).
+	})
+)
+createNestedClassAccessorFrom: classDecl <ClassDeclarationAST> within: mixinMirror <LowLevelMixinMirror> = (
+"Create an accessor method for the nested class represented by the incoming class tree.
+This accessor will lazily generate the nested class when its enclosing instance is first asked for it."
+
+	| n <String>  accessorString <String> methodSrc <String>  hdr <ClassHeaderAST> accessor <MethdMirror>  |
+	hdr:: classDecl hdr.
+	n:: hdr name. 
+	methodSrc:: 
+		accessorForNestedClass: classDecl within: mixinMirror.
+	accessor:: MethodMirror named: (mangleSelector: classDecl name).
+	accessor method: methodSrc.
+	accessor isSynthetic: true.
+	mixinMirror methods addMirror: accessor.
+)
 hereNode ^<VariableAST> = (
 	"Generates an AST representing the implicit receiver. We use a string so that we can represent a name that is not a legal identier"
 	
@@ -1800,6 +1934,25 @@ hereSendFrom: arg <VarDeclAST> ^<MessageNode> = (
 )
 language = (
 	^#Newspeak3
+)
+nestedMixinWrapperFor: nested <ClassDeclarationAST> in: outerClass <MixinMirror>  ^ <ClassDeclarationAST> = (
+"Wrap a class declaration to make it look like a nested mixin within outerClass should. This includes making the name be the fully qualified name, and hiding the superclass."
+
+	| wrapper <ClassDeclarationAST> |
+	wrapper:: nested clone.
+	wrapper hdr: nested hdr clone.
+	wrapper hdr name: (fullyQualifySimpleName: nested name with: outerClass name).
+	^wrapper
+)
+resolveSuperclass: name = (
+	name = 'Object' ifTrue: [^'KernelForDart`Object'].
+	name = 'Class' ifTrue: [^'KernelForDart`Class'].
+	name = 'Behavior' ifTrue: [^'KernelForDart`Behavior'].
+	name = 'Boolean' ifTrue: [^'KernelForDart`Boolean'].
+	name = 'Error' ifTrue: [^'KernelForDart`Error'].
+	name = 'Top' ifTrue: [^'Top'].
+	
+	halt.
 )
 selfNode = (
 	^VariableAST new name: #self; start: 0; end: 0
@@ -1832,7 +1985,6 @@ public compileClassSource: source <ReadStream> within: enclosing <MixinMirror> ^
 	tree:: parser classDefinition parse: source.
 	setInput: source.
 	setScopeFor: tree in: enclosing.
-	"sentSelectors:: Set new."
 	mixinRep:: classNode: tree.
 	scopeMap:: Dictionary new.
 	^enclosing isNil ifTrue:[mixinRep] ifFalse:[{enclosing. mixinRep}].
@@ -1892,7 +2044,7 @@ processFactoryFor: node <ClassAST> in: mixinMirror <LowLevelMixinMirror> = (
 		body: (dart block: {
 			dart return: (dart
 				on: (dart 
-					new: (dart ident: (mangleSelector: node hdr name),'_mixin') 
+					new: (dart ident: (mixinClassNameFor: node hdr name)) 
 					with: {dart ident: 'this'})
 				invoke: (dart ident: (mangleSelector: initializerName))
 				with: (argNames collect: [:each | dart ident: each]))
@@ -1969,7 +2121,8 @@ superConstructorMethodFor: node <ClassHeaderAST> ^<MethodAST> = (
   		start: start; end: end	
 )
 superConstructorNameFor: node <ClassHeaderAST> ^<Symbol> = (
-	^'superInit`' , node constructor selector
+	#FLAG. "Needs full qualification"
+	^'superInit`' , node name, '`', node constructor selector
 )'scopes'
 currentScope ^<Scope> = (
 	^scopeStack last
@@ -2031,20 +2184,19 @@ classNode: node <ClassDeclarationAST> ^<MixinRep> = (
 	|
 	mixinMirror <LowLevelMixinMirror>
 	nestedClasses <Collection[MixinRep]>
-	priorMixinUID <String>
+	
 	|
 	assert: [node hdr category notNil] message: 'No category for class header'.
 	checkForDuplicateNames: node.
 	mixinMirror:: computeMixinFrom: node hdr.
-	priorMixinUID:: currentMixinUID.
-	currentMixinUID::  mixinMirror name.
+
 	currentDepth::currentDepth + 1.
+	generateSlotAccessorsFor: mixinMirror lowLevelMirror. "Called before handling nested classes because we don't need the accessors for their synthetic slots."
 	nestedClasses:: processInstanceSideOf: node ofMixin: mixinMirror lowLevelMirror.
-	generateSlotAccessorsFor: mixinMirror lowLevelMirror. 
-	"must be called after nested classes are processed, so all synthetic slots have been added"
+	
 	processClassSideOf: node ofMixin: mixinMirror lowLevelMirror classMixin.
 	currentDepth::currentDepth - 1.
-	currentMixinUID:: priorMixinUID.
+
 	^{mixinMirror. nestedClasses}
 )
 compileNestedClasses: nestedClasses <Collection[ClassDeclarationAST]> within: mixinMirror <LowLevelMixinMirror> ^ <Collection[MixinRep]> = (
@@ -2052,14 +2204,16 @@ compileNestedClasses: nestedClasses <Collection[ClassDeclarationAST]> within: mi
       results:: OrderedCollection new.
 	nestedClasses do:
 		[ :nc <ClassDeclarationAST> |  
-			| nSlotName <String> nSlot <InstanceVariableMirror> |
+			| nClassName <String> nSlot <InstanceVariableMirror> |
 		nc hdr category: mixinMirror category, '-nested'.
-		nSlotName:: slotNameForNestedClassNamed: nc name 
-		                   within: mixinMirror name.
-		nSlot:: InstanceVariableMirror named: nSlotName mutable: true.
+		
+		nClassName:: fullyQualifySimpleName: nc name 
+		                   with: mixinMirror name.
+		nSlot:: InstanceVariableMirror named: nClassName mutable: true.
+		nSlot field: (dart var: (mangleSlotName: nClassName)).
 		nSlot metadata at: #isSynthetic put: true.
 		mixinMirror instVars addMirror: nSlot.
-		results add: (classNode: (nestedMixinWrapperFor: nc in: mixinMirror)). "make 'mixin' (a Smalltalk subclass of ProtoObject) for nested class"
+		results add: (classNode: (nestedMixinWrapperFor: nc in: mixinMirror)).
 		createNestedClassAccessorFrom: nc within: mixinMirror
 		].
 	^results
@@ -2082,7 +2236,7 @@ computeMixinFrom: aNode <ClassHeaderAST> ^<CompiledMixinMirror> = (
 	
 	mixinMirror superclassName: aNode superclassName.
 	
-	aNode slots do: [:slot | 
+	aNode slots do: [:slot |
 		mixinMirror instVars addMirror: (slot apply: self)].
 	
 	^(CompiledMixinMirror 
@@ -2226,506 +2380,251 @@ outputMainForReps: reps to: stream = (
 outputTopLevelClass: rep <MixinRep> to: stream <WriteStream> = (
 	| asts |
 	asts:: translateMixinRep: rep. 
-	asts do: [:ast | dartWriter generateSourceFor: ast on: stream].
+	asts do: [:ast | dartWriter generateSourceFor: ast on: stream. stream cr].
 	^stream
 )
-translateMixinRep: rep <MixinRep> = (
+translateMixinRep: rep <MixinRep> ^<List[Node]> = (
 	| 
+	results <Node> = OrderedCollection new.
 	cmm <CompiledMixinMirror> = rep first.
+	llmm <LowLevelMixinMirror> = cmm lowLevelMirror.
 	|
-	
-	rep last do: [:ea | halt. "When we start supporting nested classes, we will place all the mixins for a module into a flat list in a Dart library."].
-	
-	^{
-		dart 
-			class: (mangleSelector: cmm name),'_mixin'
-			extends: (mangleSelector: cmm lowLevelMirror superclassName),'_mixin'
-			fields: (cmm lowLevelMirror instVars collect: [:ea | ea field])
-			constructors: {dart verbatim: (mangleSelector: cmm name),'_mixin(c):super(c);'}
-			methods: (cmm lowLevelMirror methods collect: [:ea | ea method]).
-		dart
-			class: (mangleSelector: cmm name), '_class_mixin'
-			extends: (mangleSelector: 'Class'),'_mixin'
-			fields: {}
-			constructors: {dart verbatim: (mangleSelector: cmm name),'_class_mixin(c):super(c);'}
-			methods: (cmm lowLevelMirror classMixin methods collect: [:ea | ea method]).
+		
+	results add: (dart 
+		class: (mixinClassNameFor: cmm name)
+		extends: (mixinClassNameFor: (resolveSuperclass: llmm superclassName))
+		fields: (llmm instVars collect: [:ea | ea field])
+		constructors: {dart verbatim: (mixinClassNameFor: cmm name),'(c):super(c);'}
+		methods: (llmm methods collect: [:ea | ea method])).
 			
-		dart
-			var: (dart ident: (mangleSelector: cmm name),'_global').
-	}
-)) : ()
-class Infrastructure = (
-"We have to be careful here about implicit receivers, since the kernel classes will end up flattened at the top level."|
-	Top = super Object.
-	compiler = Compiler new.
-|compiler enableIntrinsics: true)
-(
-class Array wrapping: d = (|
-	dartList = d.
-|)
-('as yet unclassified'
-at: index = (
-	^vmmirror list: self dartList at: (index - 1) dartNumber
-)
-at: index put: value = (
-	^vmmirror list: self dartList at: (index - 1) dartNumber put: value
-)
-do: blk <[E]> separatedBy: betweenBlk <[]> = (
-	"Useful when you need to do something 'between' elements (i.e. not before the first one, and not after the last one).
-		blk is evaluated the same way as for #do:, but betweenBlk is evaluated once between each pair of elements."
-
-	| firstTime <Boolean> |
-	firstTime:: true.
-	do:
-		[ :el <E> |
-			firstTime
-				ifTrue: [ firstTime:: false ]
-				ifFalse: [ betweenBlk value ].
-			blk value: el.
-		]
-)
-do: block = (
-	1 to: size do: [:n | block value: (self at: n)].
-)
-isArray = (
-	^true
-)
-printString = (
-	| x ::= '{'. |
-	self do: [:ea | x:: x , ea printString] separatedBy: [x:: x, '. '].
-	^x , '}'
-)
-size = (
-	^self Number wrapping: (vmmirror lengthOf: self dartList)
-)) : ('as yet unclassified'
-new: size = (
-	| a = self wrapping: (vmmirror newList: size dartNumber). |
-	1 to: size do: [:i | a at: i put: nil].
-	^a
-)
-printString = (
-	^'Array'
-))
-class Behavior = (|
-	superclass
-	mixin
-	enclosingObject
-|)
-() : ()
-class Block wrapping: f = (|
-	dartFunction = f.
-	"numArgs = n."
-|)
-('as yet unclassified'
-cull: arg1 = (
-	^asYetUnimplemented
-)
-ensure: block = (
-	"try...finally"
-	^asYetUnimplemented
-)
-ifError: b = (
-	^asYetUnimplemented
-)
-isBlock = (
-	^true
-)
-numArgsError: calledWith = (
-	(self Error description: 'This block accepts ', numArgs printString,
-		' arguments but was called with ',calledWith printString) signal
-)
-on: error do: handlerBlock = (
-	^asYetUnimplemented
-)
-printString = (
-	^'[closure] in SomeNewspeakContext'
-)
-repeat = (
-	[true] whileTrue: self
-)
-value = (
-	^vmmirror invoke: dartFunction
-)
-value: arg1 = (
-	^vmmirror invoke: dartFunction with: arg1
-)
-value: arg1 value: arg2 = (
-	^vmmirror invoke: dartFunction with: arg1 with: arg2
-)
-value: arg1 value: arg2 value: arg3= (
-	^vmmirror invoke: dartFunction with: arg1 with: arg2 with: arg3
-)
-value: arg1 value: arg2 value: arg3 value: arg4 = (
-	^vmmirror invoke: dartFunction with: arg1 with: arg2 with: arg3 with: arg4
-)
-valueWithArguments: argArray = (
-	^asYetUnimplemented
-	"^vmmirror invoke: dartFunction withAll: argArray"
-)
-whileFalse = (
-	self whileFalse: []
-)
-whileFalse: aBlock = (
-	'FLAG'. "BOGUS recursion"
-	^self value ifFalse: [
-		aBlock value.
-		self whileFalse: aBlock]
-)
-whileTrue = (
-	self whileTrue: []
-)
-whileTrue: aBlock = (
-	'FLAG'. "BOGUS recursion"
-	^self value ifTrue: [
-		aBlock value.
-		self whileTrue: aBlock]
-)) : ()
-class Boolean = ()
-('as yet unclassified'
-clone = (
-
-	^ self
-)
-value = (
-
-	^ self
-)) : ()
-class Class = Behavior (|
-|)
-('as yet unclassified'
-printString = (
-	^'a Newspeak class'
-)) : ()
-class Error description: d <String> = (| description = d. |)
-('as yet unclassified'
-printString = (
-	^'NewspeakError: ',description
-)
-signal = (
-	vmmirror throw: self.
-)) : ('as yet unclassified'
-signal: description = (
-	^(self description: description) signal
-))
-class False doNotInstaniate = Boolean ()
-('as yet unclassified'
-& other <Boolean> ^ <Boolean> = (
-	^false
-)
-and: f <[^Boolean]> ^ <Boolean> = (
-	^false
-)
-ifFalse: else = (
-	^else value
-)
-ifFalse: else ifTrue: then = (
-	^else value
-)
-ifTrue: then = (
-	^nil
-)
-ifTrue: then ifFalse: else = (
-	^else value
-)
-not = (
-	^true
-)
-or: f <[^Boolean]> ^ <Boolean> = (
-	^f value
-)
-printString = (
-	^'false'
-)
-| other <Boolean> ^ <Boolean> = (
-	^other
-)) : ('as yet unclassified'
-printString = (
-	^'False'
-))
-class Message selector: s arguments: a = (|
-	selector = s.
-	arguments = a.
-|)
-() : ()
-class MessageNotUnderstood receiver: r message: m = Error description: 'MessageNotUnderstood: #', m selector (|
-receiver = r.
-message = m.
-|)
-('as yet unclassified'
-printString = (
-	^description
-)) : ()
-class Metaclass = Behavior (|
-	thisClass
-|)
-() : ()
-class Number wrapping: n = (|
-	dartNumber = n.	
-|)
-('as yet unclassified'
-* other = (
-	^self Number wrapping: (vmmirror multiply: self dartNumber by: other dartNumber)
-)
-** other = (
-	^asYetUnimplemented
-)
-+ other = (
-	^self Number wrapping: (vmmirror to: self dartNumber add: other dartNumber)
-)
-- other = (
-	^self Number wrapping: (vmmirror from: self dartNumber subtract: other dartNumber)
-)
-/ other = (
-	^self Number wrapping: (vmmirror divide: self dartNumber by: other dartNumber)
-)
-// other = (
-	^asYetUnimplemented
-)
-< other = (
-	^vmmirror is: self dartNumber lessThan: other dartNumber
-)
-<= other = (
-	^vmmirror is: self dartNumber lessOrEqual: other dartNumber
-)
-= other = (
-	^vmmirror is: self dartNumber equalTo: other dartNumber
-)
-> other = (
-	^vmmirror is: self dartNumber greaterThan: other dartNumber
-)
->= other = (
-	^vmmirror is: self dartNumber greaterOrEqual: other dartNumber
-)
-bitAnd: other = (
-	^asYetUnimplemented
-)
-bitOr: other = (
-	^asYetUnimplemented
-)
-isNumber = (
-	^true
-)
-printString = (
-	^self String wrapping: (vmmirror toString: dartNumber)
-)
-sqrt = (
-	^self Number wrapping: (vmmirror sqrt: self dartNumber)
-)
-timesRepeat: aBlock = (
-	1 to: self do: [:i | aBlock value]
-)
-to: stop by: step do: aBlock = (
-	| nextValue |
-	nextValue: self.
-	step = 0 ifTrue: [self error: 'step must be non-zero'].
-	step < 0
-		ifTrue: [[stop <= nextValue]
-				whileTrue: 
-					[aBlock value: nextValue.
-					nextValue: nextValue + step]]
-		ifFalse: [[stop >= nextValue]
-				whileTrue: 
-					[aBlock value: nextValue.
-					nextValue: nextValue + step]]
-)
-to: stop do: aBlock = (
-	| nextValue |
-	nextValue: self.
-	[nextValue <= stop]
-		whileTrue: 
-			[aBlock value: nextValue.
-			nextValue: nextValue + 1]
-)
-value = (
-	^self
-)) : ()
-class Object = Top ()
-('as yet unclassified'
-= other = (
-	^self == other
-)
-== other = (
-
-	^vmmirror is: self identicalTo: other
-)
-Array = (
-	^vmmirror Array
-)
-Error = (
-	^vmmirror Error
-)
-Number = (
-	^vmmirror Number
-)
-Object = (
-	^vmmirror Object
-)
-String = (
-	^vmmirror String
-)
-assert: condition <[^Boolean]> message: message = (
-	"Raises an error with the given message if and only if condition evaluates to false."
-	condition isBlock ifFalse: [Error signal: 'Block required'].
-	condition value ifFalse: [Error signal: message]
-)
-class = (
-	^vmmirror classOf: self
-)
-doesNotUnderstand: message = (
-	(vmmirror MessageNotUnderstood receiver: self message: message) signal
-)
-ifNil: nilBlock = (
-	^self.
-)
-ifNil: nilBlock ifNotNil: notNilBlock = (
-	^notNilBlock value
-)
-ifNotNil: notNilBlock = (
-	^notNilBlock value
-)
-print: obj = (
-	"Dart debugging"
-	^vmmirror print: obj
-)
-printString = (
-	^'some Newspeak object'
-)
-yourself = (
-	^self
-)) : ('as yet unclassified'
-printString = (
-	^'Object'
-))
-class String wrapping: s = (| dartString = s. |)
-('as yet unclassified'
-, other = (
-	^self String wrapping: (vmmirror concatenate: self dartString and: other dartString)
-)
-= other = (
-	^asYetUnimplemented
-)
-at: index = (
-	^self String wrapping: (vmmirror list: self dartString at: (index - 1) dartNumber)
-)
-do: block = (
-	1 to: size do: [:n | block value: (self at: n)].
-)
-hash = (
-	^asYetUnimplemented
-)
-isString = (
-	^true
-)
-printString = (
-	#FLAG. "Need to escape single quotes in self"
-	^'''', self, ''''
-)
-size = (
-	^self Number wrapping: (vmmirror lengthOf: self dartString)
-)) : ()
-class True doNotInstaniate = Boolean ()
-('as yet unclassified'
-& other <Boolean> ^ <Boolean> = (
-	^other
-)
-and: f <[^Boolean]>	 ^ <Boolean> = (
-	^f value
-)
-ifFalse: else = (
-	^nil
-)
-ifFalse: else ifTrue: then = (
-	^then value
-)
-ifTrue: then = (
-	^then value
-)
-ifTrue: then ifFalse: else = (
-	^then value
-)
-not ^<Boolean> = (
-	^false
-)
-or: f <[^Boolean]> ^ <Boolean> = (
-	^true
-)
-printString = (
-	^'true'
-)
-| other <Boolean> ^ <Boolean> = (
-	^true
-)) : ('as yet unclassified'
-printString = (
-	^'True'
-))
-class UndefinedObject doNotInstaniate = ()
-('as yet unclassified'
-clone = (
-	^self
-)
-ifNil: nilBlock = (
-	^nilBlock value
-)
-ifNil: nilBlock ifNotNil: notNilBlock = (
-	^nilBlock value
-)
-ifNotNil: notNilBlock = (
-	^nil
-)
-isNil = (
-	^true
-)
-notNil = (
-	^false
-)
-printString = (
-	^'nil'
-)) : ('as yet unclassified'
-printString = (
-	^'UndefinedObject'
-))'accessing'
-kernelClasses ^<List[Node]> = (
-	| c = OrderedCollection new. |
-	c add: (compileClass: Array).
-	c add: (compileClass: Behavior).
-	c add: (compileClass: Block).
-	c add: (compileClass: Boolean).
-	c add: (compileClass: Class).
-	c add: (compileClass: Error).
-	c add: (compileClass: False).
-	c add: (compileClass: Metaclass).
-	c add: (compileClass: Message).
-	c add: (compileClass: MessageNotUnderstood).
-	c add: (compileClass: Number).
-	c add: (compileClass: Object).
-	c add: (compileClass: String).
-	c add: (compileClass: True).
-	c add: (compileClass: UndefinedObject).
-	^c
-)'as yet unclassified'
-nlrClass ^<Node> = (
+	results add: (dart
+		class: (metamixinClassNameFor: cmm name)
+		extends: (mixinClassNameFor: (resolveSuperclass: 'Class'))
+		fields: {}
+		constructors: {dart verbatim: (metamixinClassNameFor: cmm name),'(c):super(c);'}
+		methods: (llmm classMixin methods collect: [:ea | ea method])).
 	
-	^dart 
-		class: 'NLR_'
-		extends: 'Object'
-		fields: {dart var: 'value'}
-		constructors: {}
-		methods: {}
+	rep last do: [:each | results addAll: (translateMixinRep: each)].
+	
+	^results
+)) : ()
+class Infrastructure outputTo: stream = (|
+	compiler = Compiler new enableIntrinsics: true.
+	writer = DartWriter new.
+|writer generateSourceFor: topClass on: stream.
+	writer generateSourceFor: nlrClass on: stream.
+	
+	compiler outputTopLevelClass: (compileClass: Kernel) to: stream.
+	
+	writer generateSourceFor: kernelInit on: stream)
+('as yet unclassified'
+kernelInit ^<Node> = (
+
+	#REFACTORING. #FLAG. "This is brittle"
+
+	"Create class objects. Create metaclass objects. Link classes and metaclasses. Extract true/false/nil."
+
+^dart verbatim: '
+
+var true_, false_, nil_;
+var Object_global, Class_global, Metaclass_global;
+var String_global, Number_global, Block_global, Array_global;
+var Message_global;
+
+kernelInit(){
+	var Kernel = new KernelForDart_metamixin(null);
+	var kernel = Kernel.new_();
+	
+	//class, superclass, enclosingObject, name/thisClass
+
+	kernel.KernelForDart_Metaclass_slot = new KernelForDart_Metaclass_metamixin(null);
+	kernel.KernelForDart_False_slot = new KernelForDart_False_metamixin(null);
+	kernel.KernelForDart_Boolean_slot = new KernelForDart_Boolean_metamixin(null);
+	kernel.KernelForDart_Error_slot = new KernelForDart_Error_metamixin(null);
+	kernel.KernelForDart_Block_slot = new KernelForDart_Block_metamixin(null);
+	kernel.KernelForDart_Number_slot = new KernelForDart_Number_metamixin(null);
+	kernel.KernelForDart_Array_slot = new KernelForDart_Array_metamixin(null);
+	kernel.KernelForDart_UndefinedObject_slot = new KernelForDart_UndefinedObject_metamixin(null);
+	kernel.KernelForDart_Object_slot = new KernelForDart_Object_metamixin(null);
+	kernel.KernelForDart_Behavior_slot = new KernelForDart_Behavior_metamixin(null);
+	kernel.KernelForDart_MessageNotUnderstood_slot = new KernelForDart_MessageNotUnderstood_metamixin(null);
+	kernel.KernelForDart_String_slot = new KernelForDart_String_metamixin(null);
+	kernel.KernelForDart_Class_slot = new KernelForDart_Class_metamixin(null);
+	kernel.KernelForDart_True_slot = new KernelForDart_True_metamixin(null);
+	kernel.KernelForDart_Message_slot = new KernelForDart_Message_metamixin(null);
+
+	true_ = new KernelForDart_True_mixin(kernel.KernelForDart_True_slot);
+	false_ = new KernelForDart_False_mixin(kernel.KernelForDart_False_slot);
+	nil_ = new KernelForDart_UndefinedObject_mixin(kernel.KernelForDart_UndefinedObject_slot);
+
+	kernel.KernelForDart_Object_slot.superclass_slot = nil_;
+	kernel.KernelForDart_Object_slot.name_slot = kernel.KernelForDart_String_slot.wrapping__("Object");
+	kernel.KernelForDart_Object_slot.enclosingObject_slot = kernel;
+	kernel.KernelForDart_Object_slot.klass_ = kernel.KernelForDart_Metaclass_slot.new_();
+	kernel.KernelForDart_Object_slot.klass_.superclass_slot = kernel.KernelForDart_Class_slot;
+	kernel.KernelForDart_Object_slot.klass_.thisClass_slot = kernel.KernelForDart_Object_slot;
+	kernel.KernelForDart_Object_slot.klass_.enclosingObject_slot = kernel;
+
+	kernel.KernelForDart_Metaclass_slot.superclass_slot = kernel.KernelForDart_Behavior_slot;
+	kernel.KernelForDart_Metaclass_slot.name_slot = kernel.KernelForDart_String_slot.wrapping__("Metaclass");
+	kernel.KernelForDart_Metaclass_slot.enclosingObject_slot = kernel;
+	kernel.KernelForDart_Metaclass_slot.klass_ = kernel.KernelForDart_Metaclass_slot.new_();
+	kernel.KernelForDart_Metaclass_slot.klass_.superclass_slot = kernel.KernelForDart_Class_slot;
+	kernel.KernelForDart_Metaclass_slot.klass_.thisClass_slot = kernel.KernelForDart_Metaclass_slot;
+	kernel.KernelForDart_Metaclass_slot.klass_.enclosingObject_slot = kernel;
+
+	kernel.KernelForDart_False_slot.superclass_slot = kernel.KernelForDart_Boolean_slot;
+	kernel.KernelForDart_False_slot.name_slot = kernel.KernelForDart_String_slot.wrapping__("False");
+	kernel.KernelForDart_False_slot.enclosingObject_slot = kernel;
+	kernel.KernelForDart_False_slot.klass_ = kernel.KernelForDart_Metaclass_slot.new_();
+	kernel.KernelForDart_False_slot.klass_.superclass_slot = kernel.KernelForDart_Class_slot;
+	kernel.KernelForDart_False_slot.klass_.thisClass_slot = kernel.KernelForDart_False_slot;
+	kernel.KernelForDart_False_slot.klass_.enclosingObject_slot = kernel;
+
+	kernel.KernelForDart_Boolean_slot.superclass_slot = kernel.KernelForDart_Object_slot;
+	kernel.KernelForDart_Boolean_slot.name_slot = kernel.KernelForDart_String_slot.wrapping__("Boolean");
+	kernel.KernelForDart_Boolean_slot.enclosingObject_slot = kernel;
+	kernel.KernelForDart_Boolean_slot.klass_ = kernel.KernelForDart_Metaclass_slot.new_();
+	kernel.KernelForDart_Boolean_slot.klass_.superclass_slot = kernel.KernelForDart_Class_slot;
+	kernel.KernelForDart_Boolean_slot.klass_.thisClass_slot = kernel.KernelForDart_Boolean_slot;
+	kernel.KernelForDart_Boolean_slot.klass_.enclosingObject_slot = kernel;
+
+	kernel.KernelForDart_Error_slot.superclass_slot = kernel.KernelForDart_Object_slot;
+	kernel.KernelForDart_Error_slot.name_slot = kernel.KernelForDart_String_slot.wrapping__("Error");
+	kernel.KernelForDart_Error_slot.enclosingObject_slot = kernel;
+	kernel.KernelForDart_Error_slot.klass_ = kernel.KernelForDart_Metaclass_slot.new_();
+	kernel.KernelForDart_Error_slot.klass_.superclass_slot = kernel.KernelForDart_Class_slot;
+	kernel.KernelForDart_Error_slot.klass_.thisClass_slot = kernel.KernelForDart_Error_slot;
+	kernel.KernelForDart_Error_slot.klass_.enclosingObject_slot = kernel;
+
+	kernel.KernelForDart_Block_slot.superclass_slot = kernel.KernelForDart_Object_slot;
+	kernel.KernelForDart_Block_slot.name_slot = kernel.KernelForDart_String_slot.wrapping__("Block");
+	kernel.KernelForDart_Block_slot.enclosingObject_slot = kernel;
+	kernel.KernelForDart_Block_slot.klass_ = kernel.KernelForDart_Metaclass_slot.new_();
+	kernel.KernelForDart_Block_slot.klass_.superclass_slot = kernel.KernelForDart_Class_slot;
+	kernel.KernelForDart_Block_slot.klass_.thisClass_slot = kernel.KernelForDart_Block_slot;
+	kernel.KernelForDart_Block_slot.klass_.enclosingObject_slot = kernel;
+
+	kernel.KernelForDart_Number_slot.superclass_slot = kernel.KernelForDart_Object_slot;
+	kernel.KernelForDart_Number_slot.name_slot = kernel.KernelForDart_String_slot.wrapping__("Number");
+	kernel.KernelForDart_Number_slot.enclosingObject_slot = kernel;
+	kernel.KernelForDart_Number_slot.klass_ = kernel.KernelForDart_Metaclass_slot.new_();
+	kernel.KernelForDart_Number_slot.klass_.superclass_slot = kernel.KernelForDart_Class_slot;
+	kernel.KernelForDart_Number_slot.klass_.thisClass_slot = kernel.KernelForDart_Number_slot;
+	kernel.KernelForDart_Number_slot.klass_.enclosingObject_slot = kernel;
+
+	kernel.KernelForDart_Array_slot.superclass_slot = kernel.KernelForDart_Object_slot;
+	kernel.KernelForDart_Array_slot.name_slot = kernel.KernelForDart_String_slot.wrapping__("Array");
+	kernel.KernelForDart_Array_slot.enclosingObject_slot = kernel;
+	kernel.KernelForDart_Array_slot.klass_ = kernel.KernelForDart_Metaclass_slot.new_();
+	kernel.KernelForDart_Array_slot.klass_.superclass_slot = kernel.KernelForDart_Class_slot;
+	kernel.KernelForDart_Array_slot.klass_.thisClass_slot = kernel.KernelForDart_Array_slot;
+	kernel.KernelForDart_Array_slot.klass_.enclosingObject_slot = kernel;
+
+	kernel.KernelForDart_UndefinedObject_slot.superclass_slot = kernel.KernelForDart_Object_slot;
+	kernel.KernelForDart_UndefinedObject_slot.name_slot = kernel.KernelForDart_String_slot.wrapping__("UndefinedObject");
+	kernel.KernelForDart_UndefinedObject_slot.enclosingObject_slot = kernel;
+	kernel.KernelForDart_UndefinedObject_slot.klass_ = kernel.KernelForDart_Metaclass_slot.new_();
+	kernel.KernelForDart_UndefinedObject_slot.klass_.superclass_slot = kernel.KernelForDart_Class_slot;
+	kernel.KernelForDart_UndefinedObject_slot.klass_.thisClass_slot = kernel.KernelForDart_UndefinedObject_slot;
+	kernel.KernelForDart_UndefinedObject_slot.klass_.enclosingObject_slot = kernel;
+
+	kernel.KernelForDart_Behavior_slot.superclass_slot = kernel.KernelForDart_Object_slot;
+	kernel.KernelForDart_Behavior_slot.name_slot = kernel.KernelForDart_String_slot.wrapping__("Behavior");
+	kernel.KernelForDart_Behavior_slot.enclosingObject_slot = kernel;
+	kernel.KernelForDart_Behavior_slot.klass_ = kernel.KernelForDart_Metaclass_slot.new_();
+	kernel.KernelForDart_Behavior_slot.klass_.superclass_slot = kernel.KernelForDart_Class_slot;
+	kernel.KernelForDart_Behavior_slot.klass_.thisClass_slot = kernel.KernelForDart_Behavior_slot;
+	kernel.KernelForDart_Behavior_slot.klass_.enclosingObject_slot = kernel;
+
+	kernel.KernelForDart_MessageNotUnderstood_slot.superclass_slot = kernel.KernelForDart_Object_slot;
+	kernel.KernelForDart_MessageNotUnderstood_slot.name_slot = kernel.KernelForDart_String_slot.wrapping__("MessageNotUnderstood");
+	kernel.KernelForDart_MessageNotUnderstood_slot.enclosingObject_slot = kernel;
+	kernel.KernelForDart_MessageNotUnderstood_slot.klass_ = kernel.KernelForDart_Metaclass_slot.new_();
+	kernel.KernelForDart_MessageNotUnderstood_slot.klass_.superclass_slot = kernel.KernelForDart_Class_slot;
+	kernel.KernelForDart_MessageNotUnderstood_slot.klass_.thisClass_slot = kernel.KernelForDart_MessageNotUnderstood_slot;
+	kernel.KernelForDart_MessageNotUnderstood_slot.klass_.enclosingObject_slot = kernel;
+
+	kernel.KernelForDart_String_slot.superclass_slot = kernel.KernelForDart_Object_slot;
+	kernel.KernelForDart_String_slot.name_slot = kernel.KernelForDart_String_slot.wrapping__("String");
+	kernel.KernelForDart_String_slot.enclosingObject_slot = kernel;
+	kernel.KernelForDart_String_slot.klass_ = kernel.KernelForDart_Metaclass_slot.new_();
+	kernel.KernelForDart_String_slot.klass_.superclass_slot = kernel.KernelForDart_Class_slot;
+	kernel.KernelForDart_String_slot.klass_.thisClass_slot = kernel.KernelForDart_String_slot;
+	kernel.KernelForDart_String_slot.klass_.enclosingObject_slot = kernel;
+
+	kernel.KernelForDart_Class_slot.superclass_slot = kernel.KernelForDart_Behavior_slot;
+	kernel.KernelForDart_Class_slot.name_slot = kernel.KernelForDart_String_slot.wrapping__("Class");
+	kernel.KernelForDart_Class_slot.enclosingObject_slot = kernel;
+	kernel.KernelForDart_Class_slot.klass_ = kernel.KernelForDart_Metaclass_slot.new_();
+	kernel.KernelForDart_Class_slot.klass_.superclass_slot = kernel.KernelForDart_Class_slot;
+	kernel.KernelForDart_Class_slot.klass_.thisClass_slot = kernel.KernelForDart_Class_slot;
+	kernel.KernelForDart_Class_slot.klass_.enclosingObject_slot = kernel;
+
+	kernel.KernelForDart_True_slot.superclass_slot = kernel.KernelForDart_Boolean_slot;
+	kernel.KernelForDart_True_slot.name_slot = kernel.KernelForDart_String_slot.wrapping__("True");
+	kernel.KernelForDart_True_slot.enclosingObject_slot = kernel;
+	kernel.KernelForDart_True_slot.klass_ = kernel.KernelForDart_Metaclass_slot.new_();
+	kernel.KernelForDart_True_slot.klass_.superclass_slot = kernel.KernelForDart_Class_slot;
+	kernel.KernelForDart_True_slot.klass_.thisClass_slot = kernel.KernelForDart_True_slot;
+	kernel.KernelForDart_True_slot.klass_.enclosingObject_slot = kernel;
+
+	kernel.KernelForDart_Message_slot.superclass_slot = kernel.KernelForDart_Message_slot;
+	kernel.KernelForDart_Message_slot.name_slot = kernel.KernelForDart_String_slot.wrapping__("Message");
+	kernel.KernelForDart_Message_slot.enclosingObject_slot = kernel;
+	kernel.KernelForDart_Message_slot.klass_ = kernel.KernelForDart_Metaclass_slot.new_();
+	kernel.KernelForDart_Message_slot.klass_.superclass_slot = kernel.KernelForDart_Class_slot;
+	kernel.KernelForDart_Message_slot.klass_.thisClass_slot = kernel.KernelForDart_Message_slot;
+	kernel.KernelForDart_Message_slot.klass_.enclosingObject_slot = kernel;
+
+	//Used by mixin application. Replacement with here sends questionable.
+	Object_global = kernel.KernelForDart_Object_slot;
+	Class_global = kernel.KernelForDart_Class_slot;
+	Metaclass_global = kernel.KernelForDart_Metaclass_slot;
+
+	//Used by literal re-writes. In principle replaceable with here sends.
+	String_global = kernel.KernelForDart_String_slot;
+	Number_global = kernel.KernelForDart_Number_slot;
+	Block_global = kernel.KernelForDart_Block_slot;
+	Array_global = kernel.KernelForDart_Array_slot;
+
+	//Needed by Top noSuchMethod
+	Message_global = kernel.KernelForDart_Message_slot;
+}
+
+main(){
+	kernelInit();
+	var Test_class = Metaclass_global.new_();
+	var Test = new Test_metamixin(Test_class);
+	Test_class.thisClass_slot = Test;
+
+	Test.main();
+}
+'
 )'private'
-compileClass: klass <Class> ^<Node> = (
+compileClass: klass <Class> ^<MixinRep> = (
 	| stream source |
 	stream:: (super String new: 1000) writeStream.
 	klass mixin printTopClassOn: stream.
 	source:: stream contents.
 	^compiler compileClassSource: source readStream within: nil
 )
-topClass ^<Node> = (
-	
+nlrClass ^<Node> = (
+	"Instances of this class are thrown as the exceptions used to implement non-local returns."
 	^dart 
-		class: 'Top_mixin'
+		class: 'NLR_'
 		extends: 'Object'
+		fields: {dart var: 'value'}
+		constructors: {}
+		methods: {}
+)
+topClass ^<Node> = (
+	"Top allows all Newspeak code to reside in mixins. In particular, it means we don't need a special case for Object. Top has one instance variable to track the Newspeak class of an object since Dart does not support asking for the runtime class of an object. Top has three methods: noSuchMethod() which wraps its arguments appropriately and delegates to #doesNotUnderstand:, toString() which delegates to #printString and unwraps the Newspeak String, and initializer_new() which is the basis case for the instance initializer scheme."
+	^dart 
+		class: (mixinClassNameFor: 'Top')
+		extends: 'Object' "Dart's Object"
 		fields: {dart var: 'klass_'}
-		constructors: {dart verbatim: 'Top_mixin(this.klass_);'}
+		constructors: {dart verbatim: (mixinClassNameFor: 'Top'),'(this.klass_);'}
 		methods: {
 	
 		dart
@@ -2965,27 +2864,21 @@ REFACTORING = (
 assert: block = (
 	assert: block message: 'Assertion failed'
 )
-compile: source <ReadStream> = (
+compile: source <ReadStream> to: output <WriteStream> = (
 	|
 	compiler = Compiler new.
-	infrastructure = Infrastructure new.
-	dartWriter = DartWriter new.
-	
-	output = String new writeStream.
-	
-	reps <List[MixinRep]> = OrderedCollection new.
+	rep
 	|
 	
-	dartWriter generateSourceFor: infrastructure topClass on: output.
-	dartWriter generateSourceFor: infrastructure nlrClass on: output.
+	Infrastructure outputTo: output.
 	
-	reps addAll: infrastructure kernelClasses.
-	reps add: (compiler compileClassSource: source within: nil).
+	rep:: (compiler compileClassSource: source within: nil).
+	compiler outputTopLevelClass: rep to: output.
 	
-	reps do: [:rep | compiler outputTopLevelClass: rep to: output].
-	compiler outputMainForReps: reps to: output.
-	
-	^output
+	"compiler outputMainForReps: reps to: output."
+)'names'
+fullyQualifySimpleName: simpleName <Symbol> with: fullyQualifiedPackage <Symbol> = (
+	^fullyQualifiedPackage, '`', simpleName
 )
 mangleSelector: selector <String> ^<String> = (
 	"Convert a Newspeak selector into a Dart identifer."
@@ -3027,4 +2920,10 @@ mangleSelector: selector <String> ^<String> = (
 )
 mangleSlotName: n = (
 	^((mangleSelector: n) , '_slot') asSymbol
+)
+metamixinClassNameFor: fqn <String> ^<String> = (
+	^(mangleSelector: fqn), '_metamixin'
+)
+mixinClassNameFor: fqn <String> ^<String> = (
+	^(mangleSelector: fqn), '_mixin'
 )) : ()

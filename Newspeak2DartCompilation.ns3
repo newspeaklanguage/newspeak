@@ -72,8 +72,7 @@ Dart ASTs are always constructed with names already mangled."|
 	scopeMap <Map[AST,Scope]> ::= Dictionary new.
 	scopeStack <List[Scope]> ::= OrderedCollection new.
 	currentDepth <Integer>
-	
-	literalTable "Nix?"
+	currentMixinClassName <String>
 	input <ReadStream>
 	
 	rewriter = Rewriter new.
@@ -82,6 +81,7 @@ Dart ASTs are always constructed with names already mangled."|
 	
 	inlineOperators ::= false.
 	enableIntrinsics ::= false.
+	useCrawlingHereSends ::= true.
 	|)
 (
 class Rewriter = ASTTool (
@@ -357,7 +357,7 @@ apply: aTool <ASTTool > ^ <Self> = (
 	^aTool temporaryNode: self
 )) : ()'as yet unclassified'
 addLiteralConstant: s <Character | Number | String | Symbol> = ( 
-	(literalTable includesKey: s) ifFalse: [literalTable at: s put: literalTable size].
+	"(literalTable includesKey: s) ifFalse: [literalTable at: s put: literalTable size]."
 )
 addNumericLiteral: n <Number> = ( 
    addLiteralConstant: n
@@ -616,7 +616,7 @@ processHereSend: aMsg <MessageAST> = (
 	| binding <AST> |
 	binding:: currentScope at: aMsg sel ifAbsent: [MessageAST new].
 	binding isMessagePatternNode ifTrue:
-		["this is a message send for a lexically defined method"
+		["this is a message send for a lexically defined method"	
 		^processImplicitOuterSend: aMsg atDepth: binding depth].
 	binding isVarDeclNode
 		ifTrue: [^ processVariable: aMsg decl: binding].
@@ -628,6 +628,8 @@ processImplicitOuterSend: aMsg <MessageAST> atDepth: n <Integer> ^ <SendNode> = 
 	"In this case, we don't care about the depth; but when compiling to other platforms, we might, so we maintain the API"
 	| selectorBinding <AST> depth <integer> |
 	selectorBinding:: currentScope at: aMsg sel.
+	
+	"aMsg sel = 'foo' ifTrue: [halt]."
 	"assert:[selectorBinding data  isClassDeclarationAST]."
 	depth: currentDepth -  selectorBinding depth.
 	addNumericLiteral: depth. "the backend checks that depth in 0 - 256"
@@ -951,7 +953,6 @@ methodNode: node <MethodAST> ^<MethodAST | ReturnSelfMethodAST | ReturnInstVarMe
 	result <MethodAST>
 	|
 	assert: [ node isMethodNode ].
-	literalTable:: Dictionary new.
 	pattern:: applyForValueTo: node pattern.
 	rewritingMethodBody: true.
 	body::  applyForValueTo: node body.
@@ -1199,8 +1200,8 @@ variableNode: aNode <VariableAST> = (
 	^aNode
 )'private'
 addLiteral: literal <Character | Number | String | Symbol> = ( 
-	(literalTable includesKey: literal) ifFalse:
-		[literalTable at: literal put: literalTable size].
+	"(literalTable includesKey: literal) ifFalse:
+		[literalTable at: literal put: literalTable size]."
 )
 at: node error: msg = (
 	"Simple solution for now - fix this at some point"
@@ -1686,11 +1687,21 @@ blockNode: node <BlockAST> = (
 boolNode: node <BoolAST> = (
 	^dart ident: (node val ifTrue: ['true_'] ifFalse: ['false_'])
 )
+charNode: node <CharAST> = (
+	"Dart has no characters, only strings. Newspeak will probably move in this direction as well."
+	^dart
+		on: vmmirror String
+		invoke: (dart ident: (mangleSelector: 'wrapping:'))
+		with: {dart literal: node val asString}
+)
 codeBodyNode: node <CodeBodyAST> = (
 	| locals statements |
 	locals:: node temporaries collect: [:each | each apply: self].
 	statements:: node statements collect: [:each | each apply: self].
 	^dart block: (locals asArray, statements) asArray
+)
+definingClassNode = (
+	^dart verbatim: '(){var k_ = this.klass_; while(! k_ is ', currentMixinClassName, ') k_ = k_.superclass_slot; return k_;}()'
 )
 explicitOuterReceiverNode: node <ExplicitRecvrAST> = (
 	^processOuterReceiverAtDepth: node depth
@@ -1766,7 +1777,9 @@ processOuterReceiverAtDepth: depth <Integer> = (
 	depth = 0 ifTrue: [^dart ident: 'this'].
 	
 	"Since nesting chains are typically short, it seems like the simplicity of following them directly won't be too expensive. Possibly for depths 1 and 2 this is faster than the enclosing objects array scheme."
-	exp:: dart memberOf: (dart ident: 'this') at: 'klass_'.
+	useCrawlingHereSends ifFalse: [halt].
+	"exp:: dart memberOf: (dart ident: 'this') at: 'klass_'."
+	exp:: definingClassNode.
 	depth timesRepeat: [
 		exp:: dart memberOf: exp at: (mangleSlotName: 'enclosingObject')].
 	^exp
@@ -1835,7 +1848,7 @@ wrapBodyForNlrHandling: body <Block> = (
 	nlrParamNode:: dart ident: nlrParamName.
 	^dart block: {
 		dart var: nlrName value: (dart new: (dart ident: 'NLR_') with: {}).
-		dart try: body catch: (dart verbatim: 'var ',nlrParamName) with:
+		dart try: body catch: (dart verbatim: 'NLR_ ',nlrParamName) with:
 			(dart block: {
 				dart if: (dart operator: '===' with: nlrVarNode and: nlrParamNode)
 					then: (dart return: (dart memberOf: nlrParamNode at: nlrValueName))
@@ -2334,6 +2347,7 @@ methodNode: aNode <MethodAST> ^ <MethodMirror> = (
 		yourself
 )
 processClassSideOf: aNode <ClassAST> ofMixin: mixinMirror <LowLevelMixinMirror> = (
+	currentMixinClassName:: metamixinClassNameFor: aNode name.
 	processFactoryFor: aNode in: mixinMirror.
 	processSide: aNode classSide ofMixin: mixinMirror. "compile class methods"
 )
@@ -2343,6 +2357,7 @@ processInitializerFor: aNode <ClassAST> in: mixinMirror <LowLevelMixinMirror> = 
 )
 processInstanceSideOf: aNode <ClassAST> ofMixin: mixinMirror <LowLevelMixinMirror> ^ <Collection[MixinRep]> = (
 	| side <SideAST> |
+	currentMixinClassName:: mixinClassNameFor: aNode name.
 	processInitializerFor: aNode in: mixinMirror.
 	side:: aNode instanceSide.
 	processSide: side ofMixin: mixinMirror. "compile instance methods"
@@ -2634,7 +2649,13 @@ main(){
 	kernelInit();
 	var Test_class = Metaclass_global.new_();
 	var Test = new Test_metamixin(Test_class);
+
+	Test.superclass_slot = Object_global;
+	Test.name_slot = String_global.wrapping__("Test");
+	Test.enclosingObject_slot = nil_;
+	Test_class.superclass_slot = Class_global;
 	Test_class.thisClass_slot = Test;
+	Test.enclosingObject_slot = nil_;
 
 	Test.main();
 }

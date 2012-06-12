@@ -84,10 +84,10 @@ Dart ASTs are always constructed with names already mangled."|
 	dartWriter = DartWriter new.
 	
 	inlineConditionals ::= true.
-	inlineOperators ::= false.
+	inlineOperators ::= true.
 	enableIntrinsics ::= false.
 	useCrawlingHereSends ::= true.
-	wrapBooleans ::= true.
+	wrapBooleans ::= false.
 	wrapNumbers ::= true.
 	wrapBlocks ::= true.
 	wrapArrays ::= true.
@@ -129,21 +129,24 @@ class NameMangler = (
 		
 	#FLAG)
 ('as yet unclassified'
-definingClassTemp ^<String> = (
-	^'definingClass_'
-)
 fullyQualifySimpleName: simpleName <Symbol> with: fullyQualifiedPackage <Symbol> = (
 	^fullyQualifiedPackage, '`', simpleName
-)
-nlrExceptionTemp ^<String> = (
-	^'nlr_exception_'
 )'compiler temps'
 cascadeReceiverTemp ^<String> = (
 	^'cascadeReceiver_'
 )
+definingClassTemp ^<String> = (
+	^'definingClass_'
+)
+guardTemp ^<String> = (
+	^'guardTemp_'
+)
 newCompilerTemp ^<String> = (
 	nextTemp: nextTemp + 1.
 	^'t' , nextTemp, '_'
+)
+nlrExceptionTemp ^<String> = (
+	^'nlr_exception_'
 )
 nlrTemp ^<String> = (
 	^'nlr_'
@@ -218,19 +221,7 @@ class Rewriter = ASTTool (
 	protected areReturnsLocal <Boolean> ::= true. "Set to true while visiting nodes contained within a method and its inlined blocks, false in non-inlined blocks."
 	protected rewritingMethodBody <Boolean> ::= true. "Set to true prior to visiting the code body of a method, to false prior to visiting one of a block."
 	protected conditionalSelectors = Set withAll: {#ifTrue:ifFalse:. #ifFalse:ifTrue:. #ifTrue:. #ifFalse:}.
-	protected inlinableOperators <Dictionary[String, String]> = Dictionary new.
-	protected inlinableNumericOperators <Dictionary[String, String]> = Dictionary new.
-|inlinableOperators
-		at: #+ put: '+';
-		at: #- put: '-';
-		at: #* put: '*';
-		at: #/ put: '/';
-		at: #'==' put: '==='.
-	inlinableNumericOperators	
-		at: #'<' put: '<';
-		at: #'<=' put: '<=';
-		at: #'>' put: '>';
-		at: #'>=' put: '>=')
+|)
 (
 class BlockLocalReturnAST expression: x start: s end: e = AST (
 "This class represents a 'local return' (LR) -  a return from a block to its caller, as opposed to the caller of its enclosing method (a 'non-local return' or NLR).
@@ -570,7 +561,7 @@ isHereNode: aNode <AST> ^ <Boolean> = (
 	^true
 )
 isInlinableAsExpressionConditional: node <NormalSendAST> ^ <Boolean> = (
-	(node msg sel = 'ifTrue:ifFalse:' and: [valueExpected]) ifFalse: [^false].
+	((conditionalSelectors includes: node msg sel) and: [valueExpected]) ifFalse: [^false].
 	node msg args do:
 		[:each <AST> |
 		((isRemovableBlock: each withArgs: 0)
@@ -591,19 +582,6 @@ isInlinableConditional: node <NormalSendAST> ^ <Boolean> = (
 	((conditionalSelectors includes: node msg sel) and: [valueExpected not]) ifFalse: [^false].
 	node msg args do: [:each <AST> | (isRemovableBlock: each withArgs: 0) ifFalse: [^false]].
 	^true
-)
-isInlinableNumericOperator: node <NormalSendAST> = (
-	| args |
-	args:: node msg args.
-	args size = 1 ifFalse: [^false].
-	(inlinableNumericOperators includesKey: node msg sel) ifFalse: [^false].
-	(node recv isLiteralNode and: [node recv val isNumber]) ifTrue: [^true].
-	(args first isLiteralNode and: [args first val isNumber]) ifTrue: [^true].
-	^false
-)
-isInlinableOperator: node <NormalSendAST> = (
-	^(inlinableOperators includesKey: node msg sel)
-		and: [node msg args size = 1]
 )
 isInlineableLoop: node <NormalSendAST> ^ <Boolean>= (
 	| selector <Symbol>  args |
@@ -903,9 +881,6 @@ xsetterSendNode: node <SetterSendAST> ^ <AST> = (
 currentSegment ^ <Integer> = (
 	^0 "default until we implement it properly"
 )
-lastWriteOf: t <TemporaryAST> ^ <Integer> = (
-	^0 "default for now"
-)
 readsOf: t <TemporaryAST> ^ <Set[Integer]> = (
 	^Set new
 )
@@ -1096,14 +1071,6 @@ normalSendNode: node <NormalSendAST> ^ <AST> = (
 		[^inline: node as: InlinableConditionalAST
 			selector: node msg sel
 			rewriteArgsAs: [:each | rewriteInlinedBlockNode: each]].
-	(inlineOperators and: [isInlinableNumericOperator: node]) ifTrue:
-		[^inline: node as: InlinedOperatorAST
-			selector: (inlinableNumericOperators at: node msg sel)
-			rewriteArgsAs: [:each | applyForValueTo: each]].
-	(inlineOperators and: [isInlinableOperator: node]) ifTrue:
-		[^inline: node as: InlinedOperatorAST
-			selector: (inlinableOperators at: node msg sel)
-			rewriteArgsAs: [:each | applyForValueTo: each]].
 	(inlineOperators and: [isInlinableBooleanOperator: node]) ifTrue:
 		[^inline: node as: InlinedOperatorAST
 			selector: (node msg sel = 'and:' ifTrue: ['&&'] ifFalse: ['||'])
@@ -1569,16 +1536,102 @@ new ^ <Instance> = (
 	^self nestedIn: Scope new atLevel: 0
 ))
 class Translator = ASTTool (
-"Visits nodes of an NS AST to produce a Javascript AST. The usual translation unit is a method. Translation is initiated by sending the translateMethodNode: message. The argument is the method to translate, the returned value is the translation."|
+"Visits nodes of an NS AST to produce a Dart AST. The usual translation unit is a method. Translation is initiated by sending the translateMethodNode: message. The argument is the method to translate, the returned value is the translation."|
 	scopeStack
 	currentSelector
 	protected containsNonLocalReturn <Boolean> "Set to false at the beginning of translating a method. The code that emits a non-local return sets this to true. The top-level code checks the value to see whether to emit a try-catch wrapper for an NLR."
 	protected usesDefiningClass <Boolean>
+	protected containsGuardedSend <Boolean>
 
-	guardedSelectors = {"#not"}.
+	guards = SendGuards new.
 	vmmirror = VMMirrorIntrinsics new.
 |)
 (
+class SendGuards = (|
+	private guardTemp = dart ident: names guardTemp.
+	private guardedSelectors = Dictionary new
+		at: #not put: #guardNot:to:;
+		at: #& put: #guardAmp:to:;
+		at: #ifTrue:ifFalse: put: #guardIfTrueIfFalse:to:;
+		at: #ifTrue: put: #guardIfTrue:to:;
+		at: #ifFalse: put: #guardIfFalse:to:;
+		at: #ifFalse:ifTrue: put: #guardIfFalseIfTrue:to:;
+		yourself.
+|)
+('as yet unclassified'
+guardAmp: msg <MessageAST> to: rcvr <AST> = (
+	"a & b =>  (t=a) is bool ? b&&a : a.amp_(b)"
+
+	#FLAG. "Is this produce evaluting conjunction?"
+
+	^if: rcvr
+	is: 'bool'
+	do: (dart operator: '&&' with: (msg args first apply: translator) and: guardTemp)
+	otherwiseSend: msg
+)
+guardIfFalse: msg <MessageAST> to: rcvr <AST> = (
+	^self 
+		to: rcvr
+		ifTrue: (dart ident: names nil)
+		ifFalse: (sendValueTo: (msg args at: 1))
+		ifNotBoolean: msg
+)
+guardIfFalseIfTrue: msg <MessageAST> to: rcvr <AST> = (
+	^self 
+		to: rcvr
+		ifTrue: (sendValueTo: (msg args at: 2))
+		ifFalse: (sendValueTo: (msg args at: 1)) 
+		ifNotBoolean: msg
+)
+guardIfTrue: msg <MessageAST> to: rcvr <AST> = (
+	^self 
+		to: rcvr
+		ifTrue: (sendValueTo: (msg args at: 1))
+		ifFalse: (dart ident: names nil)
+		ifNotBoolean: msg
+)
+guardIfTrueIfFalse: msg <MessageAST> to: rcvr <AST> = (
+	^self 
+		to: rcvr
+		ifTrue: (sendValueTo: (msg args at: 1))
+		ifFalse: (sendValueTo: (msg args at: 2)) 
+		ifNotBoolean: msg
+)
+guardNot: msg <MessageAST> to: rcvr <AST> = (
+
+	^if: rcvr
+	is: 'bool'
+	do: (dart prefixOperator: '!' on: guardTemp)
+	otherwiseSend: msg
+)
+if: rcvr is: type do: fastpath otherwiseSend: msg = (
+	^dart
+		ternaryIf: (dart operator: 'is' with: (dart assign: guardTemp toBe: rcvr) and: (dart ident: type))
+		then: fastpath
+		else: (processUnguardedSend: msg to: guardTemp).
+)
+isGuardedSelector: selector <String> ^<Boolean> = (
+	^guardedSelectors includesKey: selector
+)
+processGuardedSend: message <MessageAST> to: receiver <AST> = (
+	^self perform: (guardedSelectors at: message sel) with: message with: receiver
+)
+sendValueTo: ast = (
+	^dart
+		on: (ast apply: translator)
+		invoke: (dart ident: (names mangleSelector: 'value'))
+		with: {}
+)
+to: boolExp ifTrue: trueExp ifFalse: falseExp ifNotBoolean: originalMessage = (
+
+	^if: boolExp
+	is: 'bool'
+	do: (dart
+		ternaryIf: guardTemp
+		then: trueExp
+		else: falseExp)
+	otherwiseSend: originalMessage
+)) : ()
 class VMMirrorIntrinsics = (
 "When compiling the Kernel, all sends to the receiver 'vmmirror' are evaluated at compile time. They are sent to an instance of this class, which answers Dart ASTs."|
 |)
@@ -1803,6 +1856,7 @@ beginNewTranslationCycle = (
 	scopeStack:: OrderedCollection new.
 	containsNonLocalReturn:: false.
 	usesDefiningClass:: false.
+	containsGuardedSend:: false.
 )
 blockLocalReturnNode: node <BlockLocalReturnAST> = (
 "	(node expr isNormalSendNode and: [isInlinableConditionalNode: node expr]) ifTrue:
@@ -1858,35 +1912,31 @@ definingClassTempOrEmpty = (
 explicitOuterReceiverNode: node <ExplicitRecvrAST> = (
 	^processOuterReceiverAtDepth: node depth
 )
-guardSend: message to: receiver = (
-
-	| guardTemp = dart ident: 'guardTemp'. |
-
-	message sel = #not ifTrue: [
-		"foo not =>  ((t=foo) is Boolean ? !t : t.not())"
-		
-		^dart
-			ternaryIf: (dart operator: 'is' with: (dart assign: guardTemp toBe: receiver) and: (dart ident: 'bool'))
-			then: (dart prefixOperator: '!' on: guardTemp)
-			else: (realSend: message to: guardTemp).
-	].
-
-		"foo ifTrue: a ifFalse: b => ((t=foo) is bool ? (t ? a.value() : b.value()) : foo.ifTrue__ifFalse__(a,b)) "
-		
-		
-
-	halt.
+guardTempOrEmpty = (
+	^containsGuardedSend ifTrue: [{dart var: names guardTemp}] ifFalse: [{}].
 )
 implicitSendNode: node <ImplicitRcvrSendNode> = (
 	^processSend: node msg to: (processOuterReceiverAtDepth: node depth)
 )
 inlinableAsExpressionConditionalNode: node <InlinableConditionalAST> = (
-	| inverseCondition condition |
-	inverseCondition:: node msg sel = 'ifFalse:ifTrue:'.
+	| truePath falsePath condition |
+	
 	condition:: nsToDartBool: (node recv apply: self).
-	^dart ternaryIf: (inverseCondition ifTrue: [dart prefixOperator: '!' on: condition] ifFalse: [condition])
-		then: (node msg args first body statements first apply: self)
-		else: ((node msg args at: 2) body statements first apply: self)
+	
+	node msg sel = 'ifTrue:' ifTrue:
+		[truePath:: (node msg args at: 1) body statements first apply: self.
+		falsePath:: dart ident: names nil].
+	node msg sel = 'ifFalse:' ifTrue:
+		[truePath:: dart ident: names nil.
+		falsePath:: (node msg args at: 1) body statements first apply: self].
+	node msg sel = 'ifTrue:ifFalse:' ifTrue:
+		[truePath:: (node msg args at: 1) body statements first apply: self.
+		falsePath:: (node msg args at: 2) body statements first apply: self].
+	node msg sel = 'ifFalse:ifTrue:' ifTrue:
+		[truePath:: (node msg args at: 2) body statements first apply: self.
+		falsePath:: (node msg args at: 1) body statements first apply: self].
+	
+	^dart ternaryIf: condition then: truePath else: falsePath
 )
 inlinableConditionalNode: node <InlinableConditionalAST> = (
 	| selector inverseCondition hasElseClause condition |
@@ -1980,19 +2030,21 @@ processSend: message to: receiver = (
 				receiver method name = 'vmmirror' ifTrue: [
 					^processIntrinsic: message]]]].
 	
-	(guardedSelectors includes: message sel) ifTrue: [^guardSend: message to: receiver].
+	(guards isGuardedSelector: message sel) ifTrue:
+		[containsGuardedSend:: true.
+		^guards processGuardedSend: message to: receiver].
 
-	^realSend: message to: receiver
+	^processUnguardedSend: message to: receiver
 )
-propertyCallNode: node <PropertyCallAST> = (
-	"Unmangled invocation"
-	^node sel
-)
-realSend: message to: receiver = (
+processUnguardedSend: message to: receiver = (
 	^dart 
 		on: receiver
 		invoke: (dart ident: (message apply: self))
 		with: (message args collect: [:each | each apply: self]) asArray
+)
+propertyCallNode: node <PropertyCallAST> = (
+	"Unmangled invocation"
+	^node sel
 )
 receiverNode: node <ReceiverAST> = (
 	^dart ident: 'this'
@@ -2039,8 +2091,8 @@ wrapBodyForNlrHandling: body <Block> = (
 	nlrParamName:: names nlrExceptionTemp.
 	nlrParamNode:: dart ident: nlrParamName.
 	^dart block: 
-		definingClassTempOrEmpty, {
-		"dart var: 'guardTemp'."
+		definingClassTempOrEmpty,
+		guardTempOrEmpty, {
 		dart var: names nlrTemp value: (dart new: (dart ident: names NLR) with: {}).
 		dart try: body catch: (dart verbatim: names NLR,' ',nlrParamName) with:
 			(dart block: {
@@ -2051,9 +2103,10 @@ wrapBodyForNlrHandling: body <Block> = (
 	}
 )
 wrapBodyNoNlrHandling: body <Block> = (
-	"Unlike JS's this, Dart's this scopes like Newspeak's self"
-
-	^dart block: definingClassTempOrEmpty, {"dart var: 'guardTemp'"}, body statements
+	^dart block: 
+		definingClassTempOrEmpty,
+		guardTempOrEmpty,
+		body statements
 )) : ()'as yet unclassified'
 accessorForNestedClass: classDecl <ClassDeclarationAST> within: mixinMirror = (
 	|

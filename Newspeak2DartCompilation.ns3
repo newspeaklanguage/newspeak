@@ -85,6 +85,7 @@ Dart ASTs are always constructed with names already mangled."|
 	
 	inlineConditionals ::= true.
 	inlineOperators ::= true.
+	inlineLoops ::= true.
 	enableIntrinsics ::= false.
 	useCrawlingHereSends ::= true.
 	wrapBooleans ::= false.
@@ -202,6 +203,7 @@ mangleSelector: selector <String> ^<String> = (
 	res:: res copyReplaceAll: '_' with: '___'. "Must be first"
 	res:: res copyReplaceAll: ':' with: '__'.
 	res:: res copyReplaceAll: '`' with: '_'.
+	res:: res copyReplaceAll: '.' with: '_'.
 	^res
 )
 mangleSlotName: n <String> ^<String> = (
@@ -369,6 +371,162 @@ apply: aTool <ASTTool> ^ <Self> = (
 class InstVarVisitor = FalseVisitor ()
 ('node traversal'
 instVarNode: node = (^true)) : ()
+class LoopAST = AST (
+"This node represents a while loop, and its various routines act as constructors that map from various looping constructs into a while loop. In some cases (like whileTrue:) this is trivial, in others it is a bit more involved.
+
+The general form of the loop is:
+
+prologue;
+while (cond = whileTrue) { body}
+
+Ergo, prologue represents some code that sets up the loop (e.g., the initialization of the loop variable when encoding a for loop into a while loop);
+whileTrue is true if the loop continues as long as the test condition holds, and false if the loop runs as long as the condition does not hold;
+cond is the aforementiond test condition; body is the body of the loop."| 
+isWhileTrue <Boolean> 
+prologue <CodeBodyAST> ::= 
+	CodeBodyAST new 
+			parameters: OrderedCollection new;
+			temporaries: OrderedCollection new;
+			statements: OrderedCollection new.
+cond <CodeBodyAST> 
+body <CodeBodyAST>  |)
+('as yet unclassified'
+isExpressionNode ^ <boolean> = (
+	^true
+)'public access'
+apply: aTool <ASTTool>
+ = (
+    ^aTool loopNode: self
+)
+do: n <Integer> timesRepeat: block <BlockAST>
+ = (
+	|
+	skope	<Scope>
+	loopVarName <Symbol>
+	var <ParameterAST>
+	|
+	skope:: scopeMap at: block body.
+
+	"introduce counter variable"
+	loopVarName:: '.i' asSymbol.
+	var:: (ParameterAST name: loopVarName type: nil) start: block start; end: block end.	
+	skope at: loopVarName put: (SemanticVarDecl decl:{var. 0}) ifThere: [ halt ].
+	assert:[block body parameters isEmpty].
+	block body parameters add: var.
+
+	"translate n timesRepeat: [blockBody]  into 1 to: n do: [ :.i | blockBody]"
+	from: (NumberAST new val: 1; start: block start; end: block end) to: n do: block
+)
+from: first <AST> to: last <AST> by: step <AST> do: block <BlockAST>
+ = (
+	|
+	blockScope		<Scope>	
+	counterVar		<TemporaryAST>
+	counter		<TemporaryVariableAST>
+	limitNeeded		<Boolean>
+	limitName		<Symbol>
+	limitVar		<TemporaryAST>
+	limit			<LiteralAST | VariableAST>
+	condSel			<Symbol>
+	condArg		<MutableList[ExpressionAST]>
+	condExpr		<ExpressionAST>
+	condBody		<CodeBodyAST>
+	condStats		<MutableList[StatementAST]>
+	incArg			<MutableList[ExpressionAST]>
+	incExpr			<ExpressionAST>
+	incStat			<StatementAST>
+	|
+	"preliminaries"
+	assert: [ step isNumberNode and:[step val isInteger] ].
+	assert: [ block isBlockNode ].
+	blockScope:: scopeMap at: block body.
+
+	"loop counter (= block parameter)"
+	counterVar:: TemporaryAST name: block parameters removeFirst name type: nil.
+	counter:: TemporaryVariableAST name:  counterVar name  start: block start end: block end.
+	
+	"introduce counter limit variable if needed"
+	(limitNeeded:: last isLiteralNode not)
+		ifFalse: [
+			"no limit variable needed - use last directly since there's no computation involved"
+			limit:: last
+		]
+		ifTrue: [
+			limitName:: '.limit' asSymbol.
+			limitVar:: TemporaryAST name: limitName type: nil.
+			limitVar start: block start; end: block end.
+			prologue temporaries add: limitVar.
+			blockScope at: limitName put: (SemanticVarDecl decl: {limitVar. 0}) ifThere: [ assert:[false] ].
+			limit:: TemporaryVariableAST name: limitName start: block start end: block end.
+		].
+	
+	"setup loop condition => introduce condition block for whileTrue: loop"
+	condSel::
+		step val < 0
+			ifTrue: [ #<= ]
+			ifFalse: [ #>= ].
+	condArg:: OrderedCollection new add: counter ; yourself.
+	condExpr:: NormalSendAST new to: limit send: (MessageAST new send: condSel with: condArg).
+	"limit <= counter OR limit >= counter"
+	condStats:: OrderedCollection new add: condExpr ; yourself.
+	condBody::
+		CodeBodyAST new
+			parameters: OrderedCollection new;
+			temporaries: OrderedCollection new;
+			statements: condStats;
+			start: block start; end: block end.
+
+	"add counter increment to loop body"
+	incArg:: OrderedCollection new add: counter ; yourself.
+	incExpr:: NormalSendAST new to: step send: (MessageAST new send: #+ with: incArg).
+	incExpr start: block start; end: block end.
+	"step + counter"
+	incStat:: AssignmentAST new to: counter assign: incExpr. 
+	incStat start: block start; end: block end.
+	"counter := step + counter"
+	block body statements add: incStat.
+
+	"setup prologue"
+	prologue temporaries add: counterVar.
+	prologue statements add: (AssignmentAST new to: counter assign: first).
+	"counter := first"
+	limitNeeded ifTrue: [
+		"initialize limit variable - note that this must be done *after* setting up the counter because of possible side effects"
+		prologue statements add: (AssignmentAST new to: limit assign: last). ".limit := last"
+	].
+	
+	"initialize loop instance variables"
+	cond:: condBody.
+	isWhileTrue:: true.
+	body:: block body
+)
+from: first <AST> to: last <AST> do: block <BlockAST>
+ = (
+	from: first to: last by: (NumberAST new val: 1) do: block
+)
+repeat: block <BlockAST>
+ = (
+    assert: [block isBlockNode].
+    cond:: block body.
+    cond statements add: (BoolAST withValue: true start: cond end end: cond end).
+    isWhileTrue:: true.
+    body:: nil
+)
+while: b1 <BlockAST>  is: v <Boolean> do: b2 <BlockAST>
+ = (
+    assert: [b1 isBlockNode].
+    assert: [b2 isBlockNode].
+    cond:: b1 body.
+    isWhileTrue:: v.
+    body:: b2 body
+)
+while: v <Boolean> do: b <BlockAST>
+ = (
+    assert: [b isBlockNode].
+    cond:: b body.
+    isWhileTrue:: v.
+    body:: nil
+)) : ()
 class NilAST = VariableAST (
 "")
 ('as yet unclassified'
@@ -585,6 +743,7 @@ isInlinableConditional: node <NormalSendAST> ^ <Boolean> = (
 )
 isInlineableLoop: node <NormalSendAST> ^ <Boolean>= (
 	| selector <Symbol>  args |
+	valueExpected ifTrue: [^false]. #FLAG. "Handle this later"
 	selector:: node msg sel.
 	args:: node msg args.
 	({#whileTrue. #whileFalse. #whileTrue:. #whileFalse:. #repeat} includes:  selector) ifTrue:
@@ -711,6 +870,52 @@ processImplicitOuterSend: aMsg <MessageAST> atDepth: n <Integer> ^ <SendNode> = 
 	"aMsg sel = 'foo' ifTrue: [halt]."
 	
 	^(ImplicitRecvrSendAST send: (aMsg apply: self) depth: depth) start: aMsg start; end: aMsg end
+)
+processInlineableLoop: node <NormalSendAST> ^<LoopAST> = (
+	|
+	rcvr = node recv.
+	msg = node msg.
+	sel = msg sel.
+	numArgs = msg args size.
+	arg1 = numArgs >= 1 ifTrue: [msg args at: 1].
+	arg2 = numArgs >= 2 ifTrue: [msg args at: 2].
+	arg3 = numArgs >= 3 ifTrue: [msg args at: 3].
+	|
+	
+	sel = #whileTrue ifTrue: [^LoopAST new
+		while: true
+		do: (rewriteInlinedBlockNode: rcvr)].
+	sel = #whileFalse ifTrue: [^LoopAST new
+		while: false
+		do: (rewriteInlinedBlockNode: rcvr)].
+	sel = #whileTrue: ifTrue: [^LoopAST new
+		while: (rewriteInlinedBlockNode: rcvr) 
+		is: true
+		do: (rewriteInlinedBlockNode: arg1)].
+	sel = #whileFalse: ifTrue: [^LoopAST new
+		while: (rewriteInlinedBlockNode: rcvr) 
+		is: false
+		do: (rewriteInlinedBlockNode: arg1)].
+	
+	sel = #repeat ifTrue: [^LoopAST new
+		repeat: (rewriteInlinedBlockNode: rcvr)].
+	
+	sel = #timesRepeat: ifTrue: [^LoopAST new
+		do: (rcvr apply: self)
+		timesRepeat: (rewriteInlinedBlockNode: arg1)].
+	
+	sel = #to:do: ifTrue: [^LoopAST new
+		from: (rcvr apply: self)
+		to: (arg1 apply: self)
+		do: (rewriteInlinedBlockNode: arg2)].
+	
+	sel = #to:do:by: ifTrue: [^LoopAST new
+		from: (rcvr apply: self)
+		to: (arg1 apply: self)
+		by: (arg2 apply: self)
+		do: (rewriteInlinedBlockNode: arg3)].
+	
+	assert: [false] message: 'Unknown loop selector'
 )
 processOuterSend: aMsg <MessageAST> = (
 	| holder <NormalSendAST> depth <Integer> binding <AST>  meMsg <MessageAST> |
@@ -1063,7 +1268,9 @@ normalSendNode: node <NormalSendAST> ^ <AST> = (
 	(inlineOperators and: [isInlinableBooleanOperator: node]) ifTrue:
 		[^inline: node as: InlinedOperatorAST
 			selector: (node msg sel = 'and:' ifTrue: ['&&'] ifFalse: ['||'])
-			rewriteArgsAs: [:each <BlockAST> | applyForValueTo: each body statements first]].		
+			rewriteArgsAs: [:each <BlockAST> | applyForValueTo: each body statements first]].
+	(inlineLoops and: [isInlineableLoop: node]) ifTrue: [
+		^processInlineableLoop: node].
 
 	recv:: applyForValueTo: node recv.
 	msg:: applyForValueTo: node msg.
@@ -1954,6 +2161,28 @@ inlinedOperatorNode: node <InlinedOperatorAST> = (
 		with: (node recv apply: self)
 		and: (node msg args first apply: self)
 )
+loopNode: node <LoopAST> = (
+	
+	| processedPrologue processedCond |
+	"prologue; while(cond==whileTrue) {body};"
+	
+	assert: [node cond statements size = 1].
+	
+	"Need to extract prologue so its declarations are in scope for the loop"
+	
+	processedPrologue:: node prologue apply: self.
+	processedCond:: (node cond apply: self) statements first.
+	node isWhileTrue ifFalse: [
+		processedCond:: dart prefixOperator: '!' on: processedCond].
+	
+	^dart block: 
+		processedPrologue statements, {
+		dart 
+			for: (dart verbatim: '')
+			while: processedCond
+			step: (dart verbatim: '')
+			do: (node body apply: self)}
+)
 mangleVarName: name <String> ^<String> = (
 	#FLAG. "How does this fit with mangling of identifiers?"
 	^'l_', name
@@ -2083,13 +2312,13 @@ symbolNode: node <SymbolAST> = (
 	^self stringNode: node
 )
 temporaryDeclNode: node <TemporaryAST> = (
-	^dart var: (mangleVarName: node name)
+	^dart var: (names mangleSelector: node name)
 		value: (node initializer = nil
 			ifTrue: [dart ident: 'nil_']
 			ifFalse: [ node initializer apply: self])
 )
 temporaryNode: node <TemporaryVariableAST> = (
-	^dart ident: (mangleVarName: node name)
+	^dart ident: (names mangleSelector: node name)
 )
 tupleNode: node <TupleAST> = (
 	^dart

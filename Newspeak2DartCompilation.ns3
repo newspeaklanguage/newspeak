@@ -220,8 +220,9 @@ class Rewriter = ASTTool (
 
 	scopeStack <OrderedCollection[Scope]> = OrderedCollection new.
 	protected valueExpected <Boolean> ::= true. "A flag set by visitor methods to indicate whether the parent AST uses the value of the currently visited node or not."
+	protected rewritingBodyForValue <Boolean> ::= false. "Set to false prior to visiting a method body, true prior to visiting a non-inlined block body, and false for some inlined blocks."
 	protected areReturnsLocal <Boolean> ::= true. "Set to true while visiting nodes contained within a method and its inlined blocks, false in non-inlined blocks."
-	protected rewritingMethodBody <Boolean> ::= true. "Set to true prior to visiting the code body of a method, to false prior to visiting one of a block."
+	
 	protected conditionalSelectors = Set withAll: {#ifTrue:ifFalse:. #ifFalse:ifTrue:. #ifTrue:. #ifFalse:}.
 |)
 (
@@ -743,10 +744,10 @@ isInlinableConditional: node <NormalSendAST> ^ <Boolean> = (
 )
 isInlineableLoop: node <NormalSendAST> ^ <Boolean>= (
 	| selector <Symbol>  args |
-	valueExpected ifTrue: [^false]. #FLAG. "Handle this later"
+	valueExpected ifTrue: [^false]. #FLAG. "Handle this later. Note when we do we will have to adjust the forValue flag in processInlineableLoop."
 	selector:: node msg sel.
 	args:: node msg args.
-	({#whileTrue. #whileFalse. #whileTrue:. #whileFalse:. #repeat} includes:  selector) ifTrue:
+	({#whileTrue. #whileFalse. #whileTrue:. #whileFalse:. #repeat} includes: selector) ifTrue:
 		[args do:
 			[:each |
 			(isRemovableBlock: each withArgs: 0) ifFalse: [^false]].
@@ -884,36 +885,36 @@ processInlineableLoop: node <NormalSendAST> ^<LoopAST> = (
 	
 	sel = #whileTrue ifTrue: [^LoopAST new
 		while: true
-		do: (rewriteInlinedBlockNode: rcvr)].
+		do: (rewriteInlinedBlockNode: rcvr forValue: true)].
 	sel = #whileFalse ifTrue: [^LoopAST new
 		while: false
-		do: (rewriteInlinedBlockNode: rcvr)].
+		do: (rewriteInlinedBlockNode: rcvr forValue: true)].
 	sel = #whileTrue: ifTrue: [^LoopAST new
-		while: (rewriteInlinedBlockNode: rcvr) 
+		while: (rewriteInlinedBlockNode: rcvr forValue: true) 
 		is: true
-		do: (rewriteInlinedBlockNode: arg1)].
+		do: (rewriteInlinedBlockNode: arg1 forValue: true)].
 	sel = #whileFalse: ifTrue: [^LoopAST new
-		while: (rewriteInlinedBlockNode: rcvr) 
+		while: (rewriteInlinedBlockNode: rcvr forValue: true) 
 		is: false
-		do: (rewriteInlinedBlockNode: arg1)].
+		do: (rewriteInlinedBlockNode: arg1 forValue: true)].
 	
 	sel = #repeat ifTrue: [^LoopAST new
-		repeat: (rewriteInlinedBlockNode: rcvr)].
+		repeat: (rewriteInlinedBlockNode: rcvr forValue: true)].
 	
 	sel = #timesRepeat: ifTrue: [^LoopAST new
 		do: (rcvr apply: self)
-		timesRepeat: (rewriteInlinedBlockNode: arg1)].
+		timesRepeat: (rewriteInlinedBlockNode: arg1 forValue: true)].
 	
 	sel = #to:do: ifTrue: [^LoopAST new
 		from: (rcvr apply: self)
 		to: (arg1 apply: self)
-		do: (rewriteInlinedBlockNode: arg2)].
+		do: (rewriteInlinedBlockNode: arg2 forValue: true)].
 	
 	sel = #to:do:by: ifTrue: [^LoopAST new
 		from: (rcvr apply: self)
 		to: (arg1 apply: self)
 		by: (arg2 apply: self)
-		do: (rewriteInlinedBlockNode: arg3)].
+		do: (rewriteInlinedBlockNode: arg3 forValue: true)].
 	
 	assert: [false] message: 'Unknown loop selector'
 )
@@ -983,12 +984,20 @@ returnsAreNonLocalWhile: block = (
 	areReturnsLocal: false.
 	^block ensure: [areReturnsLocal: originalValue]
 )
-rewriteInlinedBlockNode: node <BlockAST> ^ <BlockAST> = (
+rewriteBody: node <CodeBodyAST> forValue: forValue <Boolean> ^<CodeBodyAST> = (
+	| original result |
+	original:: rewritingBodyForValue.
+	rewritingBodyForValue:: forValue.
+	result:: node apply: self.
+	rewritingBodyForValue:: original.
+	^result		
+)
+rewriteInlinedBlockNode: node <BlockAST> forValue: forValue <Boolean> ^ <BlockAST> = (
 "An empty block evaluates to nil when called. This method performs the necessary transformation if the block is empty; otherwise it recursively rewrites the block body. This rewrite is done on all blocks, regardless of whether they are inlined."
 	| 
 	rewrittenNode <BlockAST> 
       params <Collection[ParameterAST]>  
-      bodyScope <Scope> 	
+      bodyScope <Scope> 
 	| 
 	assert: [node isBlockNode].
 	"this shouldn't be handled here, but I'm not sure where the block / codebody 
@@ -1002,8 +1011,7 @@ rewriteInlinedBlockNode: node <BlockAST> ^ <BlockAST> = (
 	bodyScope:: scopeMap at: node body.
 	params do: [:each | (bodyScope at: each name) data: each].
 	addNumericLiteral: node parameters size.
-	rewritingMethodBody: false.
-	rewrittenNode:: BlockAST new body: (node body apply: self).
+	rewrittenNode:: BlockAST new body: (rewriteBody: node body forValue: forValue).
 	rewrittenNode start: node start; end: node end.
 	rewrittenNode body parameters: params.
 	node body statements isEmpty ifTrue:
@@ -1110,9 +1118,8 @@ blockNode: node <BlockAST> ^ <BlockAST> = (
 	The reason for this separation is that step (1) is always needed; step (2) is only needed if the block is not inlined.
 	"
 	| rewrittenBlock <BlockAST> last <AST> |
-	rewritingMethodBody: false.
 	returnsAreNonLocalWhile:
-		[rewrittenBlock:: rewriteInlinedBlockNode: node.
+		[rewrittenBlock:: rewriteInlinedBlockNode: node forValue: true.
 		last:: rewrittenBlock body statements last.
 		(last isReturnStatNode or: [last isBlockLocalReturnAST]) ifFalse:
 			["The last expression in a block is returned by it."
@@ -1159,7 +1166,7 @@ codeBodyNode: node <CodeBodyAST> ^ <CodeBodyAST> = (
 	node statements keysAndValuesDo:
 		[:index :statement | 
 		| rewritten |
-		rewritten:: (index = node statements size and: [rewritingMethodBody not])
+		rewritten:: (index = node statements size and: [rewritingBodyForValue])
 			ifTrue: [applyForValueTo: statement]
 			ifFalse: [applyForEffectTo: statement].
 		statements add: rewritten].
@@ -1222,8 +1229,9 @@ methodNode: node <MethodAST> ^<MethodAST | ReturnSelfMethodAST | ReturnInstVarMe
 	|
 	assert: [ node isMethodNode ].
 	pattern:: applyForValueTo: node pattern.
-	rewritingMethodBody: true.
-	body::  applyForValueTo: node body.
+	"rewritingBodyForValue: false.
+	body::  applyForValueTo: node body."
+	body:: rewriteBody: node body forValue: false.
 	body parameters: pattern parameters.
 	body start: node start; end: node end.
 	"Append ^self if there is no explicit return terminating the body.
@@ -1260,11 +1268,11 @@ normalSendNode: node <NormalSendAST> ^ <AST> = (
 	(inlineConditionals and: [isInlinableAsExpressionConditional: node]) ifTrue:
 		[^inline: node as: InlinableAsExpressionConditionalAST
 			selector: node msg sel
-			rewriteArgsAs: [:each | rewriteInlinedBlockNode: each]].
+			rewriteArgsAs: [:each | rewriteInlinedBlockNode: each forValue: true]].
 	(inlineConditionals and: [isInlinableConditional: node]) ifTrue:
 		[^inline: node as: InlinableConditionalAST
 			selector: node msg sel
-			rewriteArgsAs: [:each | rewriteInlinedBlockNode: each]].
+			rewriteArgsAs: [:each | rewriteInlinedBlockNode: each forValue: false]].
 	(inlineOperators and: [isInlinableBooleanOperator: node]) ifTrue:
 		[^inline: node as: InlinedOperatorAST
 			selector: (node msg sel = 'and:' ifTrue: ['&&'] ifFalse: ['||'])

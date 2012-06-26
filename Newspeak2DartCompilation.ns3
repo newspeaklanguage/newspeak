@@ -18,7 +18,7 @@ NLR: Dart does not have non-local return; all return statements in nested functi
 
 Built-in types: Numbers, booleans and closures are represented directly by their Dart couterparts. In cases where the Newspeak and Dart APIs differ, we introduce guards at the relevant send sites and use inline or helper functions to do the Newspeak thing if the receiver is a Dart number, boolean or closure. Strings and arrays are wrapped by objects that map the Newspeak API onto the Dart API.
 
-Implicit receiver sends: At compile-time, we determine whether an implicit receiver send is an outer send or a self send. If it is an outer send, we emit code to walk up the inheritance chain until we hit the class whose mixin defines the current method, then walk up the lexical chain a fixed number of times determined at compile-time.
+Implicit receiver sends: At compile-time, we determine whether an implicit receiver send is an outer send or a self send. If it is an outer send, we index into an array of enclosing objects. The index represents the lexical depth, with 0 being the immediately enclosing object. During mixin application, the enclosing objects array of the parent class is copied and prepended with the parent class.
 
 Factories: Class-side methods matching the factory selector perform a raw allocation then call a (synthetic) instance initializer on the new object, as in the Squeak implementation.
 
@@ -87,11 +87,14 @@ Dart ASTs are always constructed with names already mangled."|
 	translator = Translator new.
 	dartWriter = DartWriter new.
 	
+	enableIntrinsics ::= false.
+	
 	inlineConditionals ::= true.
 	inlineOperators ::= true.
 	inlineLoops ::= true.
-	enableIntrinsics ::= false.
-	useCrawlingHereSends ::= true.
+
+	useCrawlingHereSends ::= false.
+	
 	wrapBooleans ::= false.
 	wrapNumbers ::= false.
 	wrapBlocks ::= false.
@@ -204,6 +207,11 @@ nil = (
 true = (
 	^'true_'
 )'identifiers'
+enclosingObjectsArrayFor: fqn <String> meta: meta <Boolean> ^<String> = (
+	^(meta 
+	ifTrue: [metamixinClassNameFor: fqn] 
+	ifFalse: [mixinClassNameFor: fqn]), '_enclosingObjects'
+)
 mangleSelector: selector <String> ^<String> = (
 	"Convert a Newspeak selector into a Dart identifer."
 	| res <String> ::= selector. |
@@ -2350,7 +2358,13 @@ processOuterReceiverAtDepth: depth <Integer> = (
 	depth = 0 ifTrue: [^dart ident: 'this'].
 	
 	"Since nesting chains are typically short, it seems like the simplicity of following them directly won't be too expensive. Possibly for depths 1 and 2 this is faster than the enclosing objects array scheme."
-	useCrawlingHereSends ifFalse: [halt].
+	useCrawlingHereSends ifFalse: [
+		
+		^dart 
+			subscript: (dart ident: currentMixinClassName, '_enclosingObjects') 
+			at: (dart literal: depth - 1)
+	].
+	
 	
 	usesDefiningClass:: true.
 	
@@ -2458,6 +2472,16 @@ accessorForNestedClass: classDecl <ClassDeclarationAST> within: mixinMirror = (
 	superclass = accessorForSuperclass: classDecl hdr superclassName inScope:  (scopeMap at: classDecl instanceSide).
 	metamixin = dart ident: (names metamixinClassNameFor: fullName).
 	mixin = dart ident: (names metamixinClassNameFor: fullName).
+	
+	parentEOA = dart
+		memberOf: (dart ident: (names mixinClassNameFor: mixinMirror name))
+		at: (names enclosingObjectsArrayFor: mixinMirror name meta: false).
+	childEOA = dart
+		memberOf: (dart ident: (names mixinClassNameFor: fullName))
+		at: (names enclosingObjectsArrayFor: fullName meta: false).
+	metachildEOA = dart
+		memberOf: (dart ident: (names metamixinClassNameFor: fullName))
+		at: (names enclosingObjectsArrayFor: fullName meta: true).
 	|
 	#FLAG.
 	
@@ -2506,6 +2530,13 @@ accessorForNestedClass: classDecl <ClassDeclarationAST> within: mixinMirror = (
 				on: (dart ident: 'metaclass')
 				invoke: (dart ident: (names mangleSelector: 'thisClass:'))
 				with: {dart ident: 'klass'}.
+
+			dart 
+				assign: childEOA 
+				toBe: (dart invoke: (dart ident: 'seqexp_prepend') with: {dart ident: 'this'. parentEOA}).
+			dart 
+				assign: metachildEOA 
+				toBe: (dart invoke: (dart ident: 'seqexp_prepend') with: {dart ident: 'this'. parentEOA}).
 							
 			dart
 				assign: (dart ident: slotName)
@@ -3038,14 +3069,15 @@ translateMixinRep: rep <MixinRep> ^<List[Node]> = (
 	results add: (dart 
 		class: (names mixinClassNameFor: cmm name)
 		extends: (names mixinClassNameFor: llmm superclassName)
-		fields: (llmm instVars collect: [:ea | ea field])
+		fields: (llmm instVars collect: [:ea | ea field]) asArray, 
+			{dart verbatim: 'static var ', (names enclosingObjectsArrayFor: cmm name meta: false),';'}
 		constructors: {dart verbatim: (names mixinClassNameFor: cmm name),'(c):super(c);'}
 		methods: (llmm methods collect: [:ea | ea method])).
 			
 	results add: (dart
 		class: (names metamixinClassNameFor: cmm name)
 		extends: (names mixinClassNameFor: ('KernelForDart`Class'))
-		fields: {}
+		fields: {dart verbatim: 'static var ', (names enclosingObjectsArrayFor: cmm name meta: true),';'}
 		constructors: {dart verbatim: (names metamixinClassNameFor: cmm name),'(c):super(c);'}
 		methods: (llmm classMixin methods collect: [:ea | ea method])).
 	
@@ -3080,6 +3112,13 @@ accessorsForTopLevelClasses = (
 		slotName = names mangleSlotName: name.
 		metamixin = dart ident: (names metamixinClassNameFor: name).
 		mixin = dart ident: (names metamixinClassNameFor: name).
+		
+		childEOA = dart
+			memberOf: (dart ident: (names mixinClassNameFor: name))
+			at: (names enclosingObjectsArrayFor: name meta: false).
+		metachildEOA = dart
+			memberOf: (dart ident: (names metamixinClassNameFor: name))
+			at: (names enclosingObjectsArrayFor: name meta: true).
 		|
 	
 dart method: (dart ident: (names mangleSelector: name)) params: {} body: (dart block: {dart
@@ -3126,6 +3165,13 @@ dart method: (dart ident: (names mangleSelector: name)) params: {} body: (dart b
 				on: (dart ident: 'metaclass')
 				invoke: (dart ident: (names mangleSelector: 'thisClass:'))
 				with: {dart ident: 'klass'}.
+				
+			dart 
+				assign: childEOA 
+				toBe: (dart list: {}).
+			dart 
+				assign: metachildEOA 
+				toBe: (dart list: {}).
 							
 			dart
 				assign: (dart ident: slotName)
@@ -3253,6 +3299,8 @@ Namespace_(){
 	kernel.KernelForDart_Object_slot.klass_.superclass_slot = kernel.KernelForDart_Class_slot;
 	kernel.KernelForDart_Object_slot.klass_.thisClass_slot = kernel.KernelForDart_Object_slot;
 	kernel.KernelForDart_Object_slot.klass_.enclosingObject_slot = kernel;
+	KernelForDart_Object_mixin.KernelForDart_Object_mixin_enclosingObjects = [kernel];
+	KernelForDart_Object_metamixin.KernelForDart_Object_metamixin_enclosingObjects = [kernel];
 
 	kernel.KernelForDart_Metaclass_slot.superclass_slot = kernel.KernelForDart_Behavior_slot;
 	kernel.KernelForDart_Metaclass_slot.name_slot = kernel.KernelForDart_String_slot.wrapping__("Metaclass");
@@ -3261,6 +3309,8 @@ Namespace_(){
 	kernel.KernelForDart_Metaclass_slot.klass_.superclass_slot = kernel.KernelForDart_Class_slot;
 	kernel.KernelForDart_Metaclass_slot.klass_.thisClass_slot = kernel.KernelForDart_Metaclass_slot;
 	kernel.KernelForDart_Metaclass_slot.klass_.enclosingObject_slot = kernel;
+	KernelForDart_Metaclass_mixin.KernelForDart_Metaclass_mixin_enclosingObjects = [kernel];
+	KernelForDart_Metaclass_metamixin.KernelForDart_Metaclass_metamixin_enclosingObjects = [kernel];
 
 	kernel.KernelForDart_False_slot.superclass_slot = kernel.KernelForDart_Boolean_slot;
 	kernel.KernelForDart_False_slot.name_slot = kernel.KernelForDart_String_slot.wrapping__("False");
@@ -3269,6 +3319,8 @@ Namespace_(){
 	kernel.KernelForDart_False_slot.klass_.superclass_slot = kernel.KernelForDart_Class_slot;
 	kernel.KernelForDart_False_slot.klass_.thisClass_slot = kernel.KernelForDart_False_slot;
 	kernel.KernelForDart_False_slot.klass_.enclosingObject_slot = kernel;
+	KernelForDart_False_mixin.KernelForDart_False_mixin_enclosingObjects = [kernel];
+	KernelForDart_False_metamixin.KernelForDart_False_metamixin_enclosingObjects = [kernel];
 
 	kernel.KernelForDart_Boolean_slot.superclass_slot = kernel.KernelForDart_Object_slot;
 	kernel.KernelForDart_Boolean_slot.name_slot = kernel.KernelForDart_String_slot.wrapping__("Boolean");
@@ -3277,14 +3329,8 @@ Namespace_(){
 	kernel.KernelForDart_Boolean_slot.klass_.superclass_slot = kernel.KernelForDart_Class_slot;
 	kernel.KernelForDart_Boolean_slot.klass_.thisClass_slot = kernel.KernelForDart_Boolean_slot;
 	kernel.KernelForDart_Boolean_slot.klass_.enclosingObject_slot = kernel;
-
-	kernel.KernelForDart_Error_slot.superclass_slot = kernel.KernelForDart_Object_slot;
-	kernel.KernelForDart_Error_slot.name_slot = kernel.KernelForDart_String_slot.wrapping__("Error");
-	kernel.KernelForDart_Error_slot.enclosingObject_slot = kernel;
-	kernel.KernelForDart_Error_slot.klass_ = kernel.KernelForDart_Metaclass_slot.new_();
-	kernel.KernelForDart_Error_slot.klass_.superclass_slot = kernel.KernelForDart_Class_slot;
-	kernel.KernelForDart_Error_slot.klass_.thisClass_slot = kernel.KernelForDart_Error_slot;
-	kernel.KernelForDart_Error_slot.klass_.enclosingObject_slot = kernel;
+	KernelForDart_Boolean_mixin.KernelForDart_Boolean_mixin_enclosingObjects = [kernel];
+	KernelForDart_Boolean_metamixin.KernelForDart_Boolean_metamixin_enclosingObjects = [kernel];
 
 	kernel.KernelForDart_Block_slot.superclass_slot = kernel.KernelForDart_Object_slot;
 	kernel.KernelForDart_Block_slot.name_slot = kernel.KernelForDart_String_slot.wrapping__("Block");
@@ -3293,7 +3339,9 @@ Namespace_(){
 	kernel.KernelForDart_Block_slot.klass_.superclass_slot = kernel.KernelForDart_Class_slot;
 	kernel.KernelForDart_Block_slot.klass_.thisClass_slot = kernel.KernelForDart_Block_slot;
 	kernel.KernelForDart_Block_slot.klass_.enclosingObject_slot = kernel;
-
+	KernelForDart_Block_mixin.KernelForDart_Block_mixin_enclosingObjects = [kernel];
+	KernelForDart_Block_metamixin.KernelForDart_Block_metamixin_enclosingObjects = [kernel];
+	
 	kernel.KernelForDart_Number_slot.superclass_slot = kernel.KernelForDart_Object_slot;
 	kernel.KernelForDart_Number_slot.name_slot = kernel.KernelForDart_String_slot.wrapping__("Number");
 	kernel.KernelForDart_Number_slot.enclosingObject_slot = kernel;
@@ -3301,7 +3349,9 @@ Namespace_(){
 	kernel.KernelForDart_Number_slot.klass_.superclass_slot = kernel.KernelForDart_Class_slot;
 	kernel.KernelForDart_Number_slot.klass_.thisClass_slot = kernel.KernelForDart_Number_slot;
 	kernel.KernelForDart_Number_slot.klass_.enclosingObject_slot = kernel;
-
+	KernelForDart_Number_mixin.KernelForDart_Number_mixin_enclosingObjects = [kernel];
+	KernelForDart_Number_metamixin.KernelForDart_Number_metamixin_enclosingObjects = [kernel];
+	
 	kernel.KernelForDart_Array_slot.superclass_slot = kernel.KernelForDart_Object_slot;
 	kernel.KernelForDart_Array_slot.name_slot = kernel.KernelForDart_String_slot.wrapping__("Array");
 	kernel.KernelForDart_Array_slot.enclosingObject_slot = kernel;
@@ -3309,6 +3359,8 @@ Namespace_(){
 	kernel.KernelForDart_Array_slot.klass_.superclass_slot = kernel.KernelForDart_Class_slot;
 	kernel.KernelForDart_Array_slot.klass_.thisClass_slot = kernel.KernelForDart_Array_slot;
 	kernel.KernelForDart_Array_slot.klass_.enclosingObject_slot = kernel;
+	KernelForDart_Array_mixin.KernelForDart_Array_mixin_enclosingObjects = [kernel];
+	KernelForDart_Array_metamixin.KernelForDart_Array_metamixin_enclosingObjects = [kernel];
 
 	kernel.KernelForDart_UndefinedObject_slot.superclass_slot = kernel.KernelForDart_Object_slot;
 	kernel.KernelForDart_UndefinedObject_slot.name_slot = kernel.KernelForDart_String_slot.wrapping__("UndefinedObject");
@@ -3317,7 +3369,9 @@ Namespace_(){
 	kernel.KernelForDart_UndefinedObject_slot.klass_.superclass_slot = kernel.KernelForDart_Class_slot;
 	kernel.KernelForDart_UndefinedObject_slot.klass_.thisClass_slot = kernel.KernelForDart_UndefinedObject_slot;
 	kernel.KernelForDart_UndefinedObject_slot.klass_.enclosingObject_slot = kernel;
-
+	KernelForDart_UndefinedObject_mixin.KernelForDart_UndefinedObject_mixin_enclosingObjects = [kernel];
+	KernelForDart_UndefinedObject_metamixin.KernelForDart_UndefinedObject_metamixin_enclosingObjects = [kernel];
+	
 	kernel.KernelForDart_Behavior_slot.superclass_slot = kernel.KernelForDart_Object_slot;
 	kernel.KernelForDart_Behavior_slot.name_slot = kernel.KernelForDart_String_slot.wrapping__("Behavior");
 	kernel.KernelForDart_Behavior_slot.enclosingObject_slot = kernel;
@@ -3325,15 +3379,9 @@ Namespace_(){
 	kernel.KernelForDart_Behavior_slot.klass_.superclass_slot = kernel.KernelForDart_Class_slot;
 	kernel.KernelForDart_Behavior_slot.klass_.thisClass_slot = kernel.KernelForDart_Behavior_slot;
 	kernel.KernelForDart_Behavior_slot.klass_.enclosingObject_slot = kernel;
-
-	kernel.KernelForDart_MessageNotUnderstood_slot.superclass_slot = kernel.KernelForDart_Error_slot;
-	kernel.KernelForDart_MessageNotUnderstood_slot.name_slot = kernel.KernelForDart_String_slot.wrapping__("MessageNotUnderstood");
-	kernel.KernelForDart_MessageNotUnderstood_slot.enclosingObject_slot = kernel;
-	kernel.KernelForDart_MessageNotUnderstood_slot.klass_ = kernel.KernelForDart_Metaclass_slot.new_();
-	kernel.KernelForDart_MessageNotUnderstood_slot.klass_.superclass_slot = kernel.KernelForDart_Class_slot;
-	kernel.KernelForDart_MessageNotUnderstood_slot.klass_.thisClass_slot = kernel.KernelForDart_MessageNotUnderstood_slot;
-	kernel.KernelForDart_MessageNotUnderstood_slot.klass_.enclosingObject_slot = kernel;
-
+	KernelForDart_Behavior_mixin.KernelForDart_Behavior_mixin_enclosingObjects = [kernel];
+	KernelForDart_Behavior_metamixin.KernelForDart_Behavior_metamixin_enclosingObjects = [kernel];
+	
 	kernel.KernelForDart_String_slot.superclass_slot = kernel.KernelForDart_Object_slot;
 	kernel.KernelForDart_String_slot.name_slot = kernel.KernelForDart_String_slot.wrapping__("String");
 	kernel.KernelForDart_String_slot.enclosingObject_slot = kernel;
@@ -3341,6 +3389,8 @@ Namespace_(){
 	kernel.KernelForDart_String_slot.klass_.superclass_slot = kernel.KernelForDart_Class_slot;
 	kernel.KernelForDart_String_slot.klass_.thisClass_slot = kernel.KernelForDart_String_slot;
 	kernel.KernelForDart_String_slot.klass_.enclosingObject_slot = kernel;
+	KernelForDart_String_mixin.KernelForDart_String_mixin_enclosingObjects = [kernel];
+	KernelForDart_String_metamixin.KernelForDart_String_metamixin_enclosingObjects = [kernel];
 
 	kernel.KernelForDart_Class_slot.superclass_slot = kernel.KernelForDart_Behavior_slot;
 	kernel.KernelForDart_Class_slot.name_slot = kernel.KernelForDart_String_slot.wrapping__("Class");
@@ -3349,7 +3399,9 @@ Namespace_(){
 	kernel.KernelForDart_Class_slot.klass_.superclass_slot = kernel.KernelForDart_Class_slot;
 	kernel.KernelForDart_Class_slot.klass_.thisClass_slot = kernel.KernelForDart_Class_slot;
 	kernel.KernelForDart_Class_slot.klass_.enclosingObject_slot = kernel;
-
+	KernelForDart_Class_mixin.KernelForDart_Class_mixin_enclosingObjects = [kernel];
+	KernelForDart_Class_metamixin.KernelForDart_Class_metamixin_enclosingObjects = [kernel];
+	
 	kernel.KernelForDart_True_slot.superclass_slot = kernel.KernelForDart_Boolean_slot;
 	kernel.KernelForDart_True_slot.name_slot = kernel.KernelForDart_String_slot.wrapping__("True");
 	kernel.KernelForDart_True_slot.enclosingObject_slot = kernel;
@@ -3357,7 +3409,9 @@ Namespace_(){
 	kernel.KernelForDart_True_slot.klass_.superclass_slot = kernel.KernelForDart_Class_slot;
 	kernel.KernelForDart_True_slot.klass_.thisClass_slot = kernel.KernelForDart_True_slot;
 	kernel.KernelForDart_True_slot.klass_.enclosingObject_slot = kernel;
-
+	KernelForDart_True_mixin.KernelForDart_True_mixin_enclosingObjects = [kernel];
+	KernelForDart_True_metamixin.KernelForDart_True_metamixin_enclosingObjects = [kernel];
+	
 	kernel.KernelForDart_Message_slot.superclass_slot = kernel.KernelForDart_Object_slot;
 	kernel.KernelForDart_Message_slot.name_slot = kernel.KernelForDart_String_slot.wrapping__("Message");
 	kernel.KernelForDart_Message_slot.enclosingObject_slot = kernel;
@@ -3365,7 +3419,9 @@ Namespace_(){
 	kernel.KernelForDart_Message_slot.klass_.superclass_slot = kernel.KernelForDart_Class_slot;
 	kernel.KernelForDart_Message_slot.klass_.thisClass_slot = kernel.KernelForDart_Message_slot;
 	kernel.KernelForDart_Message_slot.klass_.enclosingObject_slot = kernel;
-
+	KernelForDart_Message_mixin.KernelForDart_Message_mixin_enclosingObjects = [kernel];
+	KernelForDart_Message_metamixin.KernelForDart_Message_metamixin_enclosingObjects = [kernel];
+	
 	//Used by mixin application. Replacement with here sends questionable.
 	Object_global = kernel.KernelForDart_Object_slot;
 	Class_global = kernel.KernelForDart_Class_slot;
@@ -3467,6 +3523,13 @@ seqexpHelpers ^<List[Node]> = (
 	return 0;
 }'.
 
+	dart verbatim: 
+'seqexp_prepend(element, list){
+  var newlist = new List(list.length + 1);
+  newlist[0] = element;
+  for(var i=0; i<list.length; i++) newlist[i+1] = list[i];
+  return newlist;
+}'.
 
 	}
 )

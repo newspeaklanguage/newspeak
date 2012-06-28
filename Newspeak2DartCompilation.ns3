@@ -72,6 +72,11 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 	lastRuntimeReps
 |)
 (
+class ClassSymbolTableEntry for: datum = SymbolTableEntry for: datum ()
+('as yet unclassified'
+isClassDeclaration ^<Boolean> = (
+	^true
+)) : ()
 class Compiler = (
 "Translates Newspeak ASTs into Dart ASTs in three phases. First, scopes are computed an associated with ASTs. Second, ASTs are rewritten to capture information such as whether an implicit receiver send is an outer send or a self send, message sends that are reads and writes to locals, messages sends that are inlinable, and implied block-local returns. Third, the rewritten ASTs are translated into Dart ASTs. 
 
@@ -1452,7 +1457,7 @@ classNode: aNode <ClassDeclarationAST> = (
 	| vs <Scope> |
 	currentScope
 		at: aNode name 
-		put: (SymbolTableEntry for: {MessagePatternAST new selector: aNode name. currentDepth}).
+		put: (ClassSymbolTableEntry for: {MessagePatternAST new selector: aNode name. currentDepth}).
 	vs:: Scope new. "establish instance side scope"
 	currentDepth:: currentDepth + 1.
 	aNode hdr slots do:
@@ -2059,6 +2064,9 @@ ln: x= (
 millisecondClockValue = (
 	^dart verbatim: '(Clock.now()/Clock.frequency()*1000).toInt()'
 )
+mixinApply: klass to: superclass = (
+	^dart invoke: (dart ident: 'mixinapply2') with: {klass. superclass}
+)
 multiply: a by: b = (
 	^dart operator: '*' with: a and: b
 )
@@ -2485,6 +2493,36 @@ accessorForNestedClass: classDecl <ClassDeclarationAST> within: mixinMirror = (
 	|
 	#FLAG.
 	
+	(canResolveSuperclassOf: classDecl) ifFalse: [
+		
+	^dart method: (dart ident: (names mangleSelector: simpleName)) params: {} body: (dart block: {dart
+		if: (dart 
+			operator: '==='
+			with: (dart ident: slotName)
+			and: (dart ident: 'null'))
+		then: (dart block: 
+			translator definingClassTempOrEmpty, {
+			dart 
+				var: (dart ident: 'superclass') 
+				value: superclass.
+			
+			
+			dart
+				assign: (dart ident: slotName)
+				toBe: (dart invoke: (dart ident: 'mixinapply') with: {
+					dart literal: (names mixinClassNameFor: fullName).
+					dart ident: (names mixinClassNameFor: fullName) , '_body'.
+					dart literal: (names metamixinClassNameFor: fullName).
+					dart ident: (names metamixinClassNameFor: fullName), '_body'.	
+					(dart ident: 'superclass').
+					(SymbolAST new val: fullName) apply: translator.
+					dart invoke: (dart ident: 'seqexp_prepend') with: {dart ident: 'this'. parentEOA}.
+					}).	
+			}).
+		dart return: (dart ident: slotName).
+		})
+	].
+	
 	^dart method: (dart ident: (names mangleSelector: simpleName)) params: {} body: (dart block: {dart
 		if: (dart 
 			operator: '==='
@@ -2566,6 +2604,25 @@ accessorForSuperclass: superclassName <String> inScope: s <Scope> ^<Node> = (
 		invoke: (dart ident: (mangleSelector: superclassName))
 		with: {}."
 )
+canResolveSuperclassOf: node <ClassDeclarationAST> ^<String> = (
+	"Try to find the fully qualified name of the mixin of the superclass of the given class declaration. This cannot be done in general statically. Additionally, the scopes do not have enough information to tell us whether the binding is actually a class declaration, or a method or slot. If the latter two, the compiler will hum along but the Dart compiler will complain when the mixin class tries to inherit from a nonexistent class."
+	
+	| name = node hdr superclassName. scope binding tokens |
+	
+	tokens:: node hdr name findTokens: $`.
+	scope:: scopeMap at: node instanceSide.
+	binding:: scope at: node hdr superclassName ifAbsent: [
+		
+		name = 'Top' ifTrue: [^true].
+		name = 'Object' ifTrue: [^true].
+		name = 'Error' ifTrue: [^true].
+		
+		^false
+	].
+	binding isClassDeclaration ifFalse: [^false].
+	
+	^true
+)
 createNestedClassAccessorFrom: classDecl <ClassDeclarationAST> within: mixinMirror <LowLevelMixinMirror> = (
 "Create an accessor method for the nested class represented by the incoming class tree.
 This accessor will lazily generate the nested class when its enclosing instance is first asked for it."
@@ -2619,8 +2676,9 @@ resolveSuperclassOf: node <ClassDeclarationAST> ^<String> = (
 		name = 'Object' ifTrue: [^'KernelForDart`Object'].
 		name = 'Error' ifTrue: [^'KernelForDart`Error'].
 		
-		Error signal: 'Sorry, your code relies on a true dynamic superclass, which isnt supported yet'
+		^'KernelForDart`Object' "Dynamic mixin"
 	].
+	binding isClassDeclaration ifFalse: [^'KernelForDart`Object' "Dynamic mixin"].
 	
 	tokens:: (tokens copyFrom: 1 to: binding depth + 1) , {name}.
 	^tokens fold: [:a :b | a , '`', b]
@@ -2647,6 +2705,44 @@ sourceForNode: node <AST> ^ <String> = (
 		s at: index put: input next].	
 	input position: savedPos.
 	^s
+)
+translateMixinRepForBodySources: rep <MixinRep> ^<List[Node]> = (
+	| 
+	results <Node> = OrderedCollection new.
+	cmm <CompiledMixinMirror> = rep first.
+	llmm <LowLevelMixinMirror> = cmm lowLevelMirror.
+	
+	members = OrderedCollection new.
+	metamembers = OrderedCollection new.
+	|
+	#FLAG. #REFACTORING.
+	
+	members
+	addAll: (llmm instVars collect: [:ea | ea field]);
+	addAll: {dart verbatim: 'static var ', (names enclosingObjectsArrayFor: cmm name meta: false),';'};
+	"addAll: {dart verbatim: (names mixinClassNameFor: cmm name),'(c):super(c);'};"
+	addAll: (llmm methods collect: [:ea | ea method]).
+
+	metamembers
+	addAll: {dart verbatim: 'static var ', (names enclosingObjectsArrayFor: cmm name meta: true),';'};
+	"addAll: {dart verbatim: (names metamixinClassNameFor: cmm name),'(c):super(c);'};"
+	addAll: (llmm classMixin methods collect: [:ea | ea method]).
+	
+	results add: (dart 
+		var: (names mixinClassNameFor: cmm name), '_body' 
+		value: (dart literal: (
+			String streamContents: [:stm | members do: [:member | 
+				dartWriter generateSourceFor: member on: stm. stm cr]]))).
+		
+	results add: (dart 
+		var: (names metamixinClassNameFor: cmm name), '_body' 
+		value: (dart literal: (
+			String streamContents: [:stm | metamembers do: [:member | 
+				dartWriter generateSourceFor: member on: stm. stm cr]]))).
+	
+	rep last do: [:each | results addAll: (translateMixinRepForBodySources: each)].
+	
+	^results
 )'entry'
 public compileClassSource: source <ReadStream> within: enclosing <MixinMirror> ^<MixinRep> = (
 	|
@@ -2705,18 +2801,22 @@ initializerSelectorNameFor: selector <Symbol> ^<Symbol> = (
 	^'initializer`', selector
 )
 processFactoryFor: node <ClassAST> in: mixinMirror <LowLevelMixinMirror> = (
-	| accessor <MethdMirror> argNames ast initializerName |
+	| accessor <MethdMirror> argNames ast initializerName basicNew |
 	accessor:: MethodMirror named: node hdr constructor selector.
 	argNames:: (node hdr constructor parameters collect: [:each | translator mangleVarName: each name]) asArray.
 	initializerName:: initializerSelectorNameFor: node hdr constructor selector.
+	
+	"basicNew:: dart 
+					new: (dart ident: (names mixinClassNameFor: node hdr name)) 
+					with: {dart ident: 'this'}."
+	basicNew:: dart on: (dart ident: 'this') invoke: (dart ident: 'basicNew_') with: {}.
+	
 	ast:: dart
 		method: (names mangleSelector: node hdr constructor selector)
 		params: argNames
 		body: (dart block: {
 			dart return: (dart
-				on: (dart 
-					new: (dart ident: (names mixinClassNameFor: node hdr name)) 
-					with: {dart ident: 'this'})
+				on: basicNew
 				invoke: (dart ident: (names mangleSelector: initializerName))
 				with: (argNames collect: [:each | dart ident: each]))
 		}).
@@ -3064,7 +3164,9 @@ translateMixinRep: rep <MixinRep> ^<List[Node]> = (
 	results <Node> = OrderedCollection new.
 	cmm <CompiledMixinMirror> = rep first.
 	llmm <LowLevelMixinMirror> = cmm lowLevelMirror.
+	basicNew dartName
 	|
+	#FLAG. #REFACTORING.
 		
 	results add: (dart 
 		class: (names mixinClassNameFor: cmm name)
@@ -3073,13 +3175,21 @@ translateMixinRep: rep <MixinRep> ^<List[Node]> = (
 			{dart verbatim: 'static var ', (names enclosingObjectsArrayFor: cmm name meta: false),';'}
 		constructors: {dart verbatim: (names mixinClassNameFor: cmm name),'(c):super(c);'}
 		methods: (llmm methods collect: [:ea | ea method])).
+	
+	basicNew:: dart method: 'basicNew_' params: {} body: (
+		dart return: (dart
+			new: (dart ident: (names mixinClassNameFor: cmm name)) 
+			with: {dart ident: 'this'})) asBlock.
+			
+	dartName:: dart method: 'dartname_' params: {} body: (
+		dart return: (dart literal: (names mixinClassNameFor: cmm name))) asBlock.
 			
 	results add: (dart
 		class: (names metamixinClassNameFor: cmm name)
 		extends: (names mixinClassNameFor: ('KernelForDart`Class'))
 		fields: {dart verbatim: 'static var ', (names enclosingObjectsArrayFor: cmm name meta: true),';'}
 		constructors: {dart verbatim: (names metamixinClassNameFor: cmm name),'(c):super(c);'}
-		methods: (llmm classMixin methods collect: [:ea | ea method])).
+		methods: (llmm classMixin methods collect: [:ea | ea method]) asArray,{basicNew. dartName}).
 	
 	rep last do: [:each | results addAll: (translateMixinRep: each)].
 	
@@ -3101,7 +3211,85 @@ application main: platform args: {}.
 	names = compiler names.
 	writer = DartWriter new.
 |topLevelMembers do: [:ast | writer generateSourceFor: ast on: stream])
-('private'
+('as yet unclassified'
+dynamicMixinHelpers ^<List[Node]> = (
+	^{
+	dart verbatim: 
+'
+#import("dart-ext:sample_extension");
+INSTALL_NEW_SOURCE(string src) native "LoadSomeSource";
+INSTANITATE_CLASS_ONE_ARG(string classname, arg) native "Instantiate1";
+SET_STATIC(string classname, string fieldname, fieldvalue) native "SetStatic";
+GET_GLOBAL(string fieldname) native "GetGlobal";
+
+var uniqueSuffix = 1;
+
+mixinapply2( mixinclass, superclass )
+{
+	return mixinapply(
+		mixinclass.dartname_(),
+		GET_GLOBAL(mixinclass.name().dartString().replaceAll("`","_").concat("_mixin_body")),
+		mixinclass.dartname_().replaceAll("_mixin","_metamixin"),
+		GET_GLOBAL(mixinclass.name().dartString().replaceAll("`","_").concat("_metamixin_body")),
+		superclass,
+		"unnamed mixin application", //could do better
+		[mixinclass.enclosingObject()] //wrong
+	);
+}
+
+mixinapply( 
+  protomixinclassname,
+  mixinbody,
+  protometamixinclassname,
+  metamixinbody,
+  superclass,
+  applicationName, 
+  enclosingObjects )
+{
+	var supermixinclassname = superclass.dartname_();
+	var mixinclassname = "${protomixinclassname}${uniqueSuffix}";
+	var metamixinclassname = "${protometamixinclassname}${uniqueSuffix}";
+	uniqueSuffix++;
+
+	var constructor = "${mixinclassname}(c):super(c);";
+	var metaconstructor = "${metamixinclassname}(c):super(c);";
+	var basicnew = "basicNew_() { return new ${mixinclassname}(this); }";
+	var dartclassname = "dartname_() { return ''${mixinclassname}''; }";
+
+	var newsource = 
+	"class ${mixinclassname} extends ${supermixinclassname} \n "
+	" { ${mixinbody} ${constructor} } \n"
+	"class ${metamixinclassname} extends KernelForDart_Class_mixin \n"
+	" { ${metamixinbody} ${metaconstructor} ${basicnew} ${dartclassname} } \n";
+	
+	INSTALL_NEW_SOURCE(newsource);
+
+	var metaclass = Metaclass_global.new_();
+	var klass = INSTANITATE_CLASS_ONE_ARG ( metamixinclassname, metaclass );
+
+	klass.superclass__(superclass);
+	klass.enclosingObject__( enclosingObjects[0] );
+	klass.name__(applicationName);
+	metaclass.superclass__(Class_global);
+	metaclass.enclosingObject__( enclosingObjects[0] );
+	metaclass.thisClass__(klass);
+
+	SET_STATIC( mixinclassname, "${protomixinclassname}_enclosingObjects", enclosingObjects );
+	SET_STATIC( metamixinclassname, "${protometamixinclassname}_enclosingObjects", enclosingObjects );
+
+	return klass;
+}
+'
+	}
+)
+mixinSources = (
+	| asts = OrderedCollection new. |
+	
+	appModuleReps, runtimeModuleReps
+		do: [:rep | asts addAll: (compiler translateMixinRepForBodySources: rep)].
+	
+	^asts
+)'private'
 accessorsForTopLevelClasses = (
 
 	#REFACTORING. "Commonality with nested class accessors"
@@ -3291,6 +3479,9 @@ Namespace_(){
 	true_ = new KernelForDart_True_mixin(kernel.KernelForDart_True_slot);
 	false_ = new KernelForDart_False_mixin(kernel.KernelForDart_False_slot);
 	nil_ = new KernelForDart_UndefinedObject_mixin(kernel.KernelForDart_UndefinedObject_slot);
+
+	KernelForDart_mixin.KernelForDart_mixin_enclosingObjects = [];
+	KernelForDart_metamixin.KernelForDart_metamixin_enclosingObjects = [];
 
 	kernel.KernelForDart_Object_slot.superclass_slot = nil_;
 	kernel.KernelForDart_Object_slot.name_slot = kernel.KernelForDart_String_slot.wrapping__("Object");
@@ -3557,8 +3748,8 @@ topInitNew ^<Node> = (
 )
 topLevelMembers ^<List[Node]> = (
 
-	^{topClass. nlrClass}, 
-		mixinClasses, globals, seqexpHelpers,
+	^dynamicMixinHelpers, {topClass. nlrClass}, 
+		mixinClasses, mixinSources, globals, seqexpHelpers,
 		{namespaceClass. mainFunction}
 )
 topNoSuchMethod ^<Node> = (
@@ -3659,9 +3850,7 @@ b. It is read in in a closure c nested within its defining method or closure, an
  |)
 ('access'
 at: aKey put: aValue = (
-
-
-^self bindings at: aKey put: aValue
+	^self bindings at: aKey put: aValue
 )
 at: aKey put: aValue ifThere: aBlock = (
 
@@ -3750,10 +3939,11 @@ setIndex: i <Integer> InVector: v <VarDeclAST> = (
 variableClass ^ <Class> = (
 	^data variableClass
 )) : ()
-class SymbolTableEntry for: datum = (| 
+class SymbolTableEntry for: datum = (
+"An entry in a scope."| 
   sym  
-  data ::= datum first.  
-  depth = datum last.  
+  data ::= datum first.
+  depth = datum last.
 |)
 ('as yet unclassified'
 isMethodNode = (^self data  isMethodNode)'testing'

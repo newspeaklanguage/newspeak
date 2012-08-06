@@ -719,7 +719,7 @@ astForContextAtDepth: targetDepth <Integer> ^<AST> = (
 	returnContext:: NormalSendAST new
 		recv: hereNode;
 		msg: (MessageAST new
-			sel: #'@context';
+			sel: doitContextArgumentName;
 			args: {}).
 		
 	(myDepth - targetDepth) timesRepeat: [
@@ -868,7 +868,9 @@ temporaryNode: node <TemporaryVariableAST> = (
 	]
 )) : ()'as yet unclassified'
 addDebugInfo: sourceInterval <Interval> = (
-
+	"Byte to map is first byte of e.g. send, which is the next, i.e. pc.
+	Hence this must be sent immediately before generating the send or store bytecode.
+	Can't send after generating the bytecode bceause there may be multiple bytes and mapping the last byte is wrong."
 	debugInfo mapPC: pc to: sourceInterval
 )
 addLocalVar: v <VarDeclAST> = (
@@ -975,26 +977,13 @@ currentMethod ^ <SemanticMethod> = (
 currentScope ^ <Scope> = (
 	^scopeStack last
 )
-doReturnBool: b <Boolean> = (
-"decide whether to do an NLR or not"
-  b ifTrue:[cgen returnBoolTrue] ifFalse:[cgen returnBoolFalse].
-)
-doReturnNil = (
-"decide whether to do an NLR or not"
-  cgen returnNilObj.
-)
-doReturnSelf = (
-"decide whether to do an NLR or not"
-  cgen returnSelf.
-)
 explicitOuterReceiverNode: aNode <ExplicitOuterReceiverAST> = (
 	cgen pushExplicitOuterReceiver: aNode depth.
 )
 generateSuperSend: node <SendAST> = (
-  node msg apply: self.
-
-  cgen superSend: node msg sel noOfArgs: node msg args size.
-  addDebugInfo:  (node start to: node msg end).
+	node msg apply: self.
+	addDebugInfo: (node msg start to: node msg end).
+	cgen superSend: node msg sel noOfArgs: node msg args size.
 )
 implicitSendNode: node <ImplicitRcvrSendNode> = (
 | shouldPop <Boolean>  |
@@ -1002,8 +991,8 @@ implicitSendNode: node <ImplicitRcvrSendNode> = (
   statementStarting:: false.
   cgen pushImplicitRcvr: node msg sel.
   node msg apply: self.
-  cgen normalSend: node msg sel noOfArgs: node msg args size.
   addDebugInfo:  (node msg start to: node msg end).
+  cgen normalSend: node msg sel noOfArgs: node msg args size.
   statementStarting:: shouldPop.
 )
 isRemote: node ^ <Boolean> = (
@@ -1067,18 +1056,27 @@ pushScope: s <Scope>= (
  scopeStack addLast: s
 )
 returnStatNode: node <ReturnStatAST> = (
-| shouldPop <Boolean>  |
-   assert:[node isReturnStatNode] message: 'Return node expected'.
-  shouldPop:: statementStarting.
-"if expr is self, true, false or nil do something special"
-   (node expr isReceiverNode) ifTrue:[^doReturnSelf].
-   (node expr isBoolNode) ifTrue:[^doReturnBool: node expr val].
-   (node expr isNilNode) ifTrue:[^doReturnNil].
-"maybe handle -1, 0, 1, 2 as well?"
-   statementStarting:: false.
-   node expr apply: self.
-   doReturn.
-   statementStarting:: shouldPop.
+	| shouldPop <Boolean>  |
+	assert:[node isReturnStatNode] message: 'Return node expected'.
+	shouldPop:: statementStarting.
+	"if expr is self, true, false or nil do something special"
+	(node expr isReceiverNode) ifTrue:
+		["implicit return selfs at end of method have no source range"
+		node expr start == nil ifFalse:
+			[addDebugInfo:  (node expr start to: node expr end)].
+		^cgen returnSelf].
+	(node expr isBoolNode) ifTrue:
+		[addDebugInfo:  (node expr start to: node expr end).
+			^node expr val ifTrue: [cgen returnBoolTrue] ifFalse: [cgen returnBoolFalse]].
+	(node expr isNilNode) ifTrue:
+		[addDebugInfo:  (node expr start to: node expr end).
+		^cgen returnNilObj].
+	"maybe handle -1, 0, 1, 2 as well?"
+	statementStarting:: false.
+	node expr apply: self.
+	addDebugInfo:  (node expr start to: node expr end).
+	cgen returnObject.
+	statementStarting:: shouldPop.
 )
 setup = (
 	cgen:: CodeGenerator new.
@@ -1110,10 +1108,10 @@ assignmentNode: node <AssignmentAST> = (
 	shouldPop:: statementStarting.
 	statementStarting:: false. 
 	node expr apply: self.
+	addDebugInfo: (node var start to: node expr end).
       shouldPop ifTrue:[popAndStoreInto: node var] 
 			    ifFalse:[storeInto: node var] .
 	statementStarting:: shouldPop.
-	addDebugInfo: (node var start to: node expr end).
 )
 charNode: node <CharAST> = (
   "add literal char to literal table"
@@ -1334,15 +1332,9 @@ cascadeSuper: node <SendAST> depth: n <Integer> = (
 currentMethodSource ^ <String> = (
   ^outer Compiler input contents
 )
-doReturn = (
-"decide whether to do an NLR or not"
-	cgen returnObject.
-)
 generateSend: node <SendNode>  = (
-"build debug info:"
-
-   cgen normalSend: node msg sel noOfArgs: node msg args size.
-    addDebugInfo:  (node start to: node msg end).
+	addDebugInfo: (node msg start to: node msg end).
+	cgen normalSend: node msg sel noOfArgs: node msg args size.   
 )
 indexOfVar: v <VarDeclAST> ^ <Integer> = (
    ^(currentScope at: v name asSymbol) offset
@@ -2155,7 +2147,8 @@ class TemporaryVariableAST name: n start: s end: e = VariableAST (
 ('as yet unclassified'
 apply: aTool <ASTTool > ^ <Self> = (
 	^aTool temporaryNode: self
-)) : ()'as yet unclassified'
+)
+isTemporaryVariableNode = (^true)) : ()'as yet unclassified'
 addLiteralConstant: s <Character | Number | String | Symbol> = ( 
   (literalTable includesKey: s) ifFalse:[literalTable at: s put: literalTable size].
 )
@@ -3542,7 +3535,7 @@ compileExpressionSource: src <ReadStream | String> inContext: aContext <MethodCo
 		pattern: (aContext isNil
 			ifTrue: [MessagePatternAST new selector: #DoIt parameters: {}]
 			ifFalse: [MessagePatternAST new selector: #DoItIn: parameters: 
-				{VarDeclAST name: #'@context' type: nil}]);
+				{VarDeclAST name: doitContextArgumentName type: nil}]);
 		body: body;
 		visibility: #public.
 	
@@ -3589,6 +3582,12 @@ compileNestedClassAST: tree <ClassDeclarationAST> into: enclosingClass <ClassDec
 )
 currentScope ^ <Scope> = (
   ^scopeStack last
+)
+doitContextArgumentName = (
+	"Use #'@context', but this can't be mentioned in the debugger,
+	and doesn't need to be since the debugger provides Inspect Context.
+	But if you're desperate, use ThisContext, as does the Squeak debugger."
+	^true ifTrue: [#'@context'] ifFalse: [#'ThisContext']
 )
 futureFor: expression <ExpressionAST> ^<ExpressionAST> = (
 	"@here Future computing: [expression]"

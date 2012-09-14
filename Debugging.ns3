@@ -158,7 +158,11 @@ refresh = (
 	localVariables ifNotNil: [:it | it refresh].
 )
 requestVisibilityOfPcRange = (
-	editor requestVisibilityAroundSelection
+	| range |
+	range:: subject model pcRangeIn: thread.
+	editor
+		requestVisibilityOfTextInterval: range
+		withExtraLines: 1
 )
 respondToBrowseReceiverClass = (
 	browseClass: subject receiverClass
@@ -697,62 +701,14 @@ valueStringLimitedTo: numberOfCharacters <Integer> = (
 	^mirrorOnValue reflecteePrintStringLimitedTo: numberOfCharacters 
 )) : ()
 class ThreadPresenter onSubject: subj <ThreadSubject> = ProgrammingPresenter onSubject: subj (|
-	protected activations
-	protected definitionHolder
+	protected activations <PresenterList>
+	protected definitionHolder <HolderFragment>
+	protected moreLinkHolder <HolderFragment>
 |)
 ('as yet unclassified'
-buildActivationsHeader = (
-	^majorHeadingBlock: (
-		row: {
-			label: 'Call stack' asText allBold.
-			filler.
-			expandButtonWithAction: [respondToExpandAll].
-			blank: 3.
-			collapseButtonWithAction: [respondToCollapseAll].
-		}
-	)
-)
-buildErrorReport = (
-	| toggle |
-	toggle:: heading: ((link: 'Error Report' action: [toggle userToggle]) color: Color black) details:
-		[TextEditorFragment new text: subject errorReport].
-	^toggle
-)
-buildMainActions = (
-	^padded: (row: {
-		filler.
-		button: 'Continue' action: [respondToResume].
-		largeBlank.
-		button: 'Terminate' action: [respondToTerminate].
-		filler.
-	}) with: {20. 20. 20. 20}
-)
-buildMainContent = (
-	^column: {
-		(padded: buildMainHeader with: {3. 3. 3. 3}) color: mainHeadingColor.
-		smallBlank.
-		buildErrorReport.
-		smallBlank.
-		buildActivationsHeader.
-		smallBlank.
-		activations.
-	}
-)
-buildMainHeader = (
-	^column: {
-		buildSummaryRow.
-		buildMainActions.
-	}
-)
-buildSummaryRow = (
-	^row: {
-		(label: subject summary) color: mainHeadingTextColor.
-		filler.
-		dropDownMenu: [secondaryActionsMenu].
-	}
-)
 chunkSize = (
-	^60
+	"Show at most this many activations at first. If there are more activations, show a 'more' link."
+	^100
 )
 compileMethod: newSource <String>
 inPresenter: p <ActivationPresenter>
@@ -778,14 +734,75 @@ ifFailed: onFail <[String]> = (
 			onFail valueWithPossibleArgument: message].
 )
 definition = (
-	isAlive ifFalse: [^nothing].
-	activations:: list.
-	definitionHolder:: holder: [buildMainContent].
-	populateActivations: false.
-	^definitionHolder
+	isAlive ifFalse:
+		[^nothing].
+	^definitionHolder::
+		holder: definitionForMainContent
 )
-expandFirst = (
-	activations presenters first expand
+definitionForActivationsHeader = (
+	^majorHeadingBlock: (
+		row: {
+			label: 'Call stack' asText allBold.
+			filler.
+			expandButtonWithAction: [respondToExpandAll].
+			blank: 3.
+			collapseButtonWithAction: [respondToCollapseAll].
+		}
+	)
+)
+definitionForActivationsList = (
+	^withTopChunkOfActivationsAndMoreLinkDo:
+		[:presenters :moreLinkOrNothing |
+		moreLinkHolder:: holder: moreLinkOrNothing.
+		list: presenters]
+)
+definitionForErrorReport = (
+	| toggle |
+	^toggle::
+		heading: 
+			((link: 'Error Report' action: [toggle userToggle]) color: Color black)
+		details:
+			[TextEditorFragment new text: subject errorReport]
+)
+definitionForMainActions = (
+	^padded: (row: {
+		filler.
+		button: 'Continue' action: [respondToResume].
+		largeBlank.
+		button: 'Terminate' action: [respondToTerminate].
+		filler.
+	}) with: {20. 20. 20. 20}
+)
+definitionForMainContent = (
+	^column: {
+		(padded: definitionForMainHeader with: {3. 3. 3. 3})
+			color: mainHeadingColor.
+		smallBlank.
+		definitionForErrorReport.
+		smallBlank.
+		definitionForActivationsHeader.
+		smallBlank.
+		activations:: definitionForActivationsList.
+		moreLinkHolder ifNil:
+			[moreLinkHolder:: holder: [nothing]].
+	}
+)
+definitionForMainHeader = (
+	^column: {
+		definitionForSummaryRow.
+		definitionForMainActions.
+	}
+)
+definitionForSummaryRow = (
+	^row: {
+		(label: subject summary) color: mainHeadingTextColor.
+		filler.
+		dropDownMenu: [secondaryActionsMenu].
+	}
+)
+expandTopActivation = (
+	activations presenters size > 0
+		ifTrue: [activations presenters first expand]
 )
 navigateTo: destinationSubject = (
 	enterSubject::
@@ -798,20 +815,8 @@ navigateTo: destinationSubject = (
 noticeRemoval = (
 	thread ifNotNil: [releaseThread terminate]
 )
-populateActivations: expandFirst <Boolean> = (
-	refreshWhenDone:
-		[ | presenters |
-		presenters:: OrderedCollection new.
-		subject activationsDo:
-			[:each |
-			presenters size > chunkSize ifTrue:
-				[schedulePresentation: presenters expandFirst: expandFirst.
-				presenters:: OrderedCollection new].
-			presenters add: (ActivationSubject onModel: each) presenter].
-		schedulePresentation: presenters expandFirst: expandFirst.
-		nil].
-)
 refreshActivations = (
+	"Refresh the activation list, often after an incremental state change such as a step. Try to recognize small updates and avoid rebuilding too much. Also be smart about keeping interesting activation presenters expanded. Normally sent by a contained activation presenter via the sendUp mechanism."
 	| oldTop oldSender i <Integer> maybeHome expandFirstIfIntoBlock |
 	oldTop:: activations presenters first subject model.
 	expandFirstIfIntoBlock:: activations presenters first isExpanded.
@@ -821,35 +826,31 @@ refreshActivations = (
 
 	"Same activation"
 	oldTop == activation ifTrue:
-		[^majorUpdate: [refreshAll]].
+		[^majorUpdate: [refreshExistingActivationPresenters]].
 
 	"Returned to sender"
 	oldSender == activation ifTrue:
 		[^majorUpdate:
-			[activations presenters: (activations presenters copyWithout: activations presenters first).
-			refreshAll.
-			expandFirst]].
+			[activations presenters removeAt: 1.
+			refreshExistingActivationPresenters.
+			expandTopActivation]].
 
 	"Called other method"
 	(oldTop isSenderOf: activation) ifTrue:
 		[^majorUpdate:
 			[activations addFirst: (ActivationSubject onModel: activation) presenter.
-			refreshAll.
-			expandFirst]].
+			refreshExistingActivationPresenters.
+			expandTopActivation]].
 
 	"More than one new activation on stack"
 	(activation hasActivation: oldTop) ifTrue:
 		[ | newPresenters |
-		newPresenters:: (activation 
-activationsUpTo: oldTop) collect:
-			
-				[:act| (ActivationSubject onModel: act) presenter
-]
-.
+		newPresenters:: (activation activationsUpTo: oldTop) collect:
+			[:act| (ActivationSubject onModel: act) presenter].
 		^majorUpdate:
-			[refreshAll.
+			[refreshExistingActivationPresenters.
 			activations presenters: newPresenters, activations presenters.
-			expandFirst]].
+			expandTopActivation]].
 
       i:: 0.
 	"See if activation was further up on the stack"
@@ -859,8 +860,8 @@ activationsUpTo: oldTop) collect:
 		each subject model == activation ifTrue:
 			[^majorUpdate:
 				[activations presenters: (activations presenters copyFrom: i to: activations presenters size).
-				expandFirst.
-				refreshAll]]].
+				expandTopActivation.
+				refreshExistingActivationPresenters]]].
 
 	"Now check for a new block activation for stepIntoBlock:"
 	(activation context_slot closure notNil
@@ -874,25 +875,31 @@ activationsUpTo: oldTop) collect:
 				newPresenters,
 				(activations presenters copyFrom: i to: activations presenters size).
 			expandFirstIfIntoBlock ifTrue:
-					[expandFirst].
-			  refreshAll]].
+				[expandTopActivation].
+			refreshExistingActivationPresenters]].
 
 	"Used to think that normally, this should not happen.  But looks like stepIntoBlock makes it happen."
 	activation context_slot home == maybeHome ifTrue:
-		[activations presenters: {}.
-		^populateActivations: expandFirstIfIntoBlock].
+		[repopulateActivations.
+		^expandFirstIfIntoBlock ifTrue: [expandTopActivation]].
 
 	reportNoActivationsFrom: thisContext.
-	activations presenters: {}.
-	populateActivations: false
+	repopulateActivations
 )
-refreshAll = (
+refreshExistingActivationPresenters = (
 	activations presenters do: [:each | each refresh]
 )
 releaseUi: body = (
 	majorUpdate:
 		[activations setPresenters: {}.
 		definitionHolder content: body].
+)
+repopulateActivations = (
+	"Fill the activations list with newly built activation presenters for the top chunk of the stack and update the contents of the moreLinkHolder."
+	withTopChunkOfActivationsAndMoreLinkDo:
+		[:presenters :moreLinkOrNothing |
+		activations presenters: presenters.
+		moreLinkHolder content: moreLinkOrNothing]
 )
 reportNoActivationsFrom: aContext = (
 	"Report that e.g. refreshActivatioons found no activafions to refresh.
@@ -928,19 +935,47 @@ respondToTerminate = (
 			[releaseUi:: label: 'Thread is terminated.'. 
 			isWindowOwnedByDebugger ifTrue: [debuggerHopscotchWindow window close]].
 )
-schedulePresentation: presenters  expandFirst: expandFirst <Boolean> = (
-	schedule:
-		[activations presenters: (activations presenters concatenate: presenters).
-		expandFirst ifTrue:
-			[activations presenters first expand]]
-)
 secondaryActionsMenu = (
 	^menuWithLabelsAndActions: {
 		'Open in Squeak Debugger' -> [respondToOpenSqueakDebugger].
 	}
 )
+showNextChunkOfActivations = (
+	withNextChunkOfActivationsAndMoreLinkDo:
+		[:presenters :moreLinkOrNothing |
+		activations presenters: activations presenters, presenters.
+		moreLinkHolder content: moreLinkOrNothing]
+)
 title = (
 	^'Stack Trace: ', subject title
+)
+withNextChunkOfActivationsAndMoreLinkDo: binaryBlock = (
+	| toSkip index presenters |
+	toSkip:: activations presenters size.
+	index:: 1.
+	presenters:: OrderedCollection new.
+	subject activationsDo:
+		[:each |
+		index > toSkip ifTrue:
+			[presenters size < chunkSize ifFalse:
+				[^binaryBlock
+					value: presenters
+					value: (link: 'show more...' action: [showNextChunkOfActivations]) smallFont].
+			presenters add: (ActivationSubject onModel: each) presenter].
+		index:: index + 1].
+	^binaryBlock value: presenters value: nothing
+)
+withTopChunkOfActivationsAndMoreLinkDo: binaryBlock = (
+	| presenters |
+	presenters:: OrderedCollection new.
+	subject activationsDo:
+		[:each |
+		presenters size < chunkSize ifFalse:
+			[^binaryBlock
+				value: presenters
+				value: (link: 'show more...' action: [showNextChunkOfActivations]) smallFont].
+		presenters add: (ActivationSubject onModel: each) presenter].
+	^binaryBlock value: presenters value: nothing
 )) : ()
 class ThreadSubject onModel: t <ThreadMirror> = Subject onModel: t ()
 ('as yet unclassified'

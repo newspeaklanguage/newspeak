@@ -1562,7 +1562,13 @@ normalSend: selector = (
 		[code byte: 144 + selectorIndex.
 		^self].
 	
-	longForm.
+	(*	238 11101110	i i i i i j j j Send Literal Selector #iiiii (+ Extend A * 32) with jjj (+ Extend B * 8) Arguments *)
+
+	(numArgs < 8) & (selectorIndex < 32) ifTrue:
+		[code byte: 238; byte: (selectorIndex << 3) | numArgs.
+		^self].
+
+	longerForm.
 )
 outerSend: selector = (
 	|
@@ -1592,7 +1598,12 @@ superSend: selector = (
 	decrementStackDepthBy: numArgs.
 	incrementStackDepthBy: 1.
 	
-	longForm.
+	(* 241		11110001	i i i i i j j j	Send To Absent Dynamic Superclass Literal Selector #iiiii (+ Extend A * 32) with jjj (+ Extend B * 8) Arguments *)
+	(numArgs < 8) & (selectorIndex < 32) ifTrue:
+		[code byte: 241; byte: (selectorIndex << 3) | numArgs.
+		^self].
+	
+	halt.
 )'stack'
 decrementStackDepthBy: n = (
 	(* Reduce the current height of the operand stack *)
@@ -1942,6 +1953,16 @@ applyShouldPopTo: node = (
 	shouldPop:: original.
 	^result
 )
+cascadeNormal: node <SendAST> = (
+
+	node isCascadedSendNode
+		ifTrue: [cascadeNormal: node prevSend]
+		ifFalse: [self applyShouldNotPopTo: node prevSend].
+	
+	cgen dup.
+	generateNormalSend: node.
+	cgen pop.
+)
 cleanup = (
 	cgen: nil.
   	debugInfo: nil.
@@ -1959,11 +1980,6 @@ currentMethod ^ <SemanticMethod> = (
 )
 currentScope ^ <Scope> = (
 	^scopeStack last
-)
-generateSuperSend: node <SendAST> = (
-	node msg apply: self.
-	addDebugInfo: (node msg start to: node msg end).
-	cgen superSend: node msg sel noOfArgs: node msg args size.
 )
 implicitSendNode: node <ImplicitRcvrSendNode> = (
 
@@ -1986,6 +2002,12 @@ nextOffset = (
 	next:: offsetStack removeLast.
 	offsetStack addLast: next + 1.
 	^next
+)
+outerSendNode: node <SendAST> = (
+	
+	self applyShouldNotPopTo: node msg.
+	addDebugInfo: (node msg start to: node msg end).
+	cgen outerSend: node msg sel toEnclosingObject: node recv depth.
 )
 pc = (
 	^cgen code compiledMethodSize + 1
@@ -2018,6 +2040,12 @@ pushOffsetCounter = (
 pushScope: s <Scope>= (
 	scopeStack addLast: s
 )
+selfSendNode: node <SendAST> = (
+
+	self applyShouldNotPopTo: node msg.
+	addDebugInfo: (node msg start to: node msg end).
+	cgen selfSend: node msg sel.
+)
 slotsPerMethod ^ <Integer> = (
 	^cgen slotsPerMethod (* must expose this to higher levels of compiler so synthetic methods can be built correctly *)
 )'initialize-release'
@@ -2038,7 +2066,7 @@ arrayNode: node <ArrayAST> = (
 		ifTrue: 
 			[cgen createEmptyArray: node size]
 		ifFalse:
-			[node elements do: [:ea | ea apply: self].
+			[node elements do: [:ea | self applyShouldNotPopTo: ea].
 			cgen createFullArray: node size].
 )
 assignmentNode: node <AssignmentAST> = (
@@ -2060,25 +2088,29 @@ boolNode: node <BoolAST> = (
 )
 cascadedSendNode: node <CascadedSendAST> = (
 	
-	| isSuperSend <Boolean> |
+	| baseSend ::= node. |
+	[baseSend isCascadedSendNode]
+		whileTrue: [baseSend: baseSend prevSend].
 
-   shouldPop:: statementStarting.
-   statementStarting:: false.
-
-   isSuperSend:: false (* node recv apply: SuperVarVisitor new *).
-(* cascaded super sends need more work; not supported right now *)
-   node recv apply: self.
-   isSuperSend ifTrue:[
-       cascadeSuper: node prevSend depth: 1.
-       generateSuperSend: node.
-      ]
-      ifFalse:[
-         cascadeNormal: node prevSend depth:1.
-         cgen popTos.
-         node msg apply: self.
-         generateSend: node.
-      ].
-   statementStarting:: shouldPop.
+	baseSend recv isReceiverNode ifTrue:
+		[cascadeSelf: node prevSend.
+		selfSendNode: node.
+		^self].
+	
+	baseSend recv isExplicitRcvrNode ifTrue:
+		[cascadeOuter: node prevSend depth: cascadedReceiver depth.
+		outerSendNode: node.
+		^self].
+	
+	baseSend isSuperSendNode ifTrue:
+		[cascadeSuper: node prevSend.
+		superSendNode: node.
+		^self].
+	
+	assert: [baseSend isNormalSendNode] message: 'Unknown type of cascade'.
+	
+	cascadeNormal: node prevSend.
+	mnormalSendNode: node.
 )
 charNode: node <CharAST> = (
 	cgen pushLiteral: node val
@@ -2154,7 +2186,7 @@ codeBodyNode: node <CodeBodyAST> = (
 		stmtCount < stmtSize 
 			ifTrue: 
 				[(* Pop intermediate results. *)
-				applyShouldPopTo: statement.
+				self applyShouldPopTo: statement.
 				cgen ensureStackDepth: baselineStackDepth]
 			ifFalse:
 				[(* Pop or retain result based on parent. *)
@@ -2288,9 +2320,14 @@ nilNode: node = (
 	cgen pushNil.
 )
 normalSendNode: node <NormalSendAST> = (
+
+	node recv isReceiverNode ifTrue: [^selfSendNode: node].
+	node recv isExplicitRcvrNode ifTrue: [^outerSendNode: node].
+
 	self applyShouldNotPopTo: node recv.
 	self applyShouldNotPopTo: node msg.
-	generateSend: node.
+	addDebugInfo: (node msg start to: node msg end).
+	cgen normalSend: node msg sel.
 )
 numberNode: node <NumberAST>  = (
 	cgen pushLiteral: node val.
@@ -2332,8 +2369,10 @@ stringNode: node <StringAST>  = (
 	cgen pushLiteral: node val.
 )
 superSendNode: node <SuperSendNode> = (
-	cgen pushSelf.
-	generateSuperSend: node.
+	
+	self applyShouldNotPopTo: node msg.
+	addDebugInfo: (node msg start to: node msg end).
+	cgen superSend: node msg sel.
 )
 superVarNode: node <SuperVarNode>  = (
 	halt.
@@ -2375,12 +2414,8 @@ cascadeSuper: node <SendAST> depth: n <Integer> = (
 currentMethodSource ^ <String> = (
 	^outer Compiler input contents
 )
-generateSend: node <SendNode>  = (
-	addDebugInfo: (node msg start to: node msg end).
-	cgen normalSend: node msg sel.   
-)
 indexOfVar: v <VarDeclAST> ^ <Integer> = (
-   ^(currentScope at: v name asSymbol) offset
+	^(currentScope at: v name asSymbol) offset
 )
 isRemote: node ^ <Boolean> = (
 	^(currentScope at: node name asSymbol) remote

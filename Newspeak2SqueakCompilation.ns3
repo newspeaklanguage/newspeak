@@ -2,7 +2,7 @@ Newspeak3
 'NS2Squeak'
 class Newspeak2SqueakCompilation usingPlatform: platform
  newspeakParser: ns3Parser <Newspeak3Parsing>
- mirrorLib: mirrors = (
+ mirrorLib: mirrors =  (
 (* This is the Newspeak compilation module. It includes the Newspeak compiler (Compiler) as well as a number of other classes used in compilation. For a  detailed overview of compilation see Compiler.
 
 Classes that do not require access to the state of a compiler are defined at the module level, as siblings of the compiler.  This is true even if the class defines a phase of compilation, like the ScopeBuilder.
@@ -81,7 +81,7 @@ Copyright 2011 Matthias Kleine, Ryan Macnak and Cadence Design Systems
 	parser = Parser new.
 	|)
 (
-class Compiler = LanguageCompiler (
+class Compiler  = LanguageCompiler (
 (* The compiler has three main entry points: compileClassSource:Within:, compileClassHeader: within: and compileMethodSource:within:. These compile an entire class declaration, a class header, and a method, respectively. 
 
 The compiler returns low level (e.g., VM level) objects representing the results of compilation.
@@ -1452,14 +1452,20 @@ maxLocals: n <Integer> = (
 )
 methodName: n <Symbol> = (
 	code selector: n
-)
-patchJumpAt: bci_ <Integer> with: offset <Integer> = (
-	#BOGUS.
 )'jumps'
+backJumpBy: offset = (
+	(* 242		11110010	i i i i i i i i	Jump i i i i i i i i (+ Extend B * 256, where bbbbbbbb = sddddddd, e.g. -32768 = i=0, a=0, s=1) *)
+
+	assert: [offset < 0 and: [offset >= -255]] message: 'Jump out of range'.
+	
+	code byte: 225; byte: 255. (* extendB: -1. *)
+	code byte: 242; byte: offset + 256.
+)
 jumpBy: offset = (
 	(* 242		11110010	i i i i i i i i	Jump i i i i i i i i (+ Extend B * 256, where bbbbbbbb = sddddddd, e.g. -32768 = i=0, a=0, s=1) *)
-	#BOGUS.
-	code byte: 242; byte: offset+128
+
+	assert: [offset >= 0 and: [offset <= 255]] message: 'Jump out of range'.
+	code byte: 242; byte: offset
 )
 jumpIf: bool by: offset = (
 
@@ -1473,8 +1479,10 @@ jumpIf: bool by: offset = (
 	code byte: offset.
 	decrementStackDepthBy: 1.
 )
-label: pos = (
-	halt.
+patchJumpAt: jumpBci <Integer> with: offset <Integer> = (
+	
+	(offset < 0) | (offset > 255) ifTrue: [halt].
+	code byteAt: jumpBci put: offset
 )'private'
 extendA: n = (
 	n = 0 ifTrue: [^self].
@@ -1519,7 +1527,7 @@ returnFromMethod = (
 returnSelfFromMethod = (
 	code byte: 216
 )'sends'
-hereSend: selector = (
+implicitReceiverSend: selector = (
 	|
 	selectorIndex = indexForLiteral: selector.
 	numArgs = selector numArgs.
@@ -1957,10 +1965,12 @@ cascadeNormal: node <SendAST> = (
 
 	node isCascadedSendNode
 		ifTrue: [cascadeNormal: node prevSend]
-		ifFalse: [self applyShouldNotPopTo: node prevSend].
+		ifFalse: [self applyShouldNotPopTo: node recv].
 	
 	cgen dup.
-	generateNormalSend: node.
+	self applyShouldNotPopTo: node msg.
+	addDebugInfo: (node msg start to: node msg end).
+	cgen normalSend: node msg sel.
 	cgen pop.
 )
 cleanup = (
@@ -1985,7 +1995,7 @@ implicitSendNode: node <ImplicitRcvrSendNode> = (
 
 	self applyShouldNotPopTo: node msg.
 	addDebugInfo: (node msg start to: node msg end).
-	cgen hereSend: node msg sel.
+	cgen implicitReceiverSend: node msg sel.
 )
 literalArray ^  <Array[Character | Number | String | Symbol]> = (
 	| literals <Array[Character | Number | String | Symbol]> |
@@ -2093,24 +2103,25 @@ cascadedSendNode: node <CascadedSendAST> = (
 		whileTrue: [baseSend: baseSend prevSend].
 
 	baseSend recv isReceiverNode ifTrue:
-		[cascadeSelf: node prevSend.
+		[#BOGUS. (* For now, fall through to a normal send cascade. *)
+		(* cascadeSelf: node prevSend.
 		selfSendNode: node.
-		^self].
+		^self *)].
 	
 	baseSend recv isExplicitRcvrNode ifTrue:
-		[cascadeOuter: node prevSend depth: cascadedReceiver depth.
-		outerSendNode: node.
+		[outerCascadeNotSupported.
 		^self].
 	
 	baseSend isSuperSendNode ifTrue:
-		[cascadeSuper: node prevSend.
-		superSendNode: node.
+		[superCascadeNotSupported.
 		^self].
 	
 	assert: [baseSend isNormalSendNode] message: 'Unknown type of cascade'.
 	
 	cascadeNormal: node prevSend.
-	mnormalSendNode: node.
+	self applyShouldNotPopTo: node msg.
+	addDebugInfo: (node msg start to: node msg end).
+	cgen normalSend: node msg sel.
 )
 charNode: node <CharAST> = (
 	cgen pushLiteral: node val
@@ -2208,8 +2219,11 @@ explicitOuterReceiverNode: node <ExplicitOuterReceiverAST> = (
 ifNode: node <IfAST> = (
 	| ifPos <Integer> endThen <Integer> depth <Integer> thenDepth <Integer> |
 
+	(* cond. branch(L1). then. jump(L2). L1: else. L2: *)
+	(* cond. branch(L1). then. L1: *)
+	
 	(* issues: utilizing short jumps; nested blocks and popping *)
-
+	
 	self applyShouldNotPopTo: node cond.
 	cgen jumpIf: node ifTrue not by: 0. (* jump to else (but needs patching) *)
 
@@ -2247,6 +2261,9 @@ ifNode: node <IfAST> = (
 	(* If shouldPop is false we  want to assume the if left a result on the stack, even if it did not because both branches ended in an NLR *)
 )
 loopNode: node <LoopAST> = (
+
+	(* prologue. L1: cond. branch(L2). body. jump(L1). L2: *)
+
 	|
 	topOfLoop <Integer>
 	whilePos <Integer>
@@ -2279,7 +2296,7 @@ loopNode: node <LoopAST> = (
  		(* Ensure loop body maintains stack depth to prevent overflowing it during loop execution. *)
 		popScope].
 	
-	cgen jumpBy: topOfLoop - cgen bci - 3. (* jump to top of loop *)
+	cgen backJumpBy: topOfLoop - cgen bci - 3. (* jump to top of loop *)
 	
 	cgen patchJumpAt: whilePos with: cgen bci - whilePos.
  	(* patch the jump after the test so it comes to end of the then block *)

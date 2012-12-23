@@ -2,7 +2,7 @@ Newspeak3
 'NS2Squeak'
 class Newspeak2SqueakCompilation usingPlatform: platform
  newspeakParser: ns3Parser <Newspeak3Parsing>
- mirrorLib: mirrors =  (
+ mirrorLib: mirrors = (
 (* This is the Newspeak compilation module. It includes the Newspeak compiler (Compiler) as well as a number of other classes used in compilation. For a  detailed overview of compilation see Compiler.
 
 Classes that do not require access to the state of a compiler are defined at the module level, as siblings of the compiler.  This is true even if the class defines a phase of compilation, like the ScopeBuilder.
@@ -81,7 +81,7 @@ Copyright 2011 Matthias Kleine, Ryan Macnak and Cadence Design Systems
 	parser = Parser new.
 	|)
 (
-class Compiler  = LanguageCompiler (
+class Compiler = LanguageCompiler (
 (* The compiler has three main entry points: compileClassSource:Within:, compileClassHeader: within: and compileMethodSource:within:. These compile an entire class declaration, a class header, and a method, respectively. 
 
 The compiler returns low level (e.g., VM level) objects representing the results of compilation.
@@ -1452,20 +1452,14 @@ maxLocals: n <Integer> = (
 )
 methodName: n <Symbol> = (
 	code selector: n
-)'jumps'
-backJumpBy: offset = (
-	(* 242		11110010	i i i i i i i i	Jump i i i i i i i i (+ Extend B * 256, where bbbbbbbb = sddddddd, e.g. -32768 = i=0, a=0, s=1) *)
-
-	assert: [offset < 0 and: [offset >= -255]] message: 'Jump out of range'.
-	
-	code byte: 225; byte: 255. (* extendB: -1. *)
-	code byte: 242; byte: offset + 256.
 )
+patchJumpAt: bci_ <Integer> with: offset <Integer> = (
+	#BOGUS.
+)'jumps'
 jumpBy: offset = (
 	(* 242		11110010	i i i i i i i i	Jump i i i i i i i i (+ Extend B * 256, where bbbbbbbb = sddddddd, e.g. -32768 = i=0, a=0, s=1) *)
-
-	assert: [offset >= 0 and: [offset <= 255]] message: 'Jump out of range'.
-	code byte: 242; byte: offset
+	#BOGUS.
+	code byte: 242; byte: offset+128
 )
 jumpIf: bool by: offset = (
 
@@ -1479,10 +1473,8 @@ jumpIf: bool by: offset = (
 	code byte: offset.
 	decrementStackDepthBy: 1.
 )
-patchJumpAt: jumpBci <Integer> with: offset <Integer> = (
-	
-	(offset < 0) | (offset > 255) ifTrue: [halt].
-	code byteAt: jumpBci put: offset
+label: pos = (
+	halt.
 )'private'
 extendA: n = (
 	n = 0 ifTrue: [^self].
@@ -1527,7 +1519,7 @@ returnFromMethod = (
 returnSelfFromMethod = (
 	code byte: 216
 )'sends'
-implicitReceiverSend: selector = (
+hereSend: selector = (
 	|
 	selectorIndex = indexForLiteral: selector.
 	numArgs = selector numArgs.
@@ -1965,12 +1957,10 @@ cascadeNormal: node <SendAST> = (
 
 	node isCascadedSendNode
 		ifTrue: [cascadeNormal: node prevSend]
-		ifFalse: [self applyShouldNotPopTo: node recv].
+		ifFalse: [self applyShouldNotPopTo: node prevSend].
 	
 	cgen dup.
-	self applyShouldNotPopTo: node msg.
-	addDebugInfo: (node msg start to: node msg end).
-	cgen normalSend: node msg sel.
+	generateNormalSend: node.
 	cgen pop.
 )
 cleanup = (
@@ -1995,7 +1985,7 @@ implicitSendNode: node <ImplicitRcvrSendNode> = (
 
 	self applyShouldNotPopTo: node msg.
 	addDebugInfo: (node msg start to: node msg end).
-	cgen implicitReceiverSend: node msg sel.
+	cgen hereSend: node msg sel.
 )
 literalArray ^  <Array[Character | Number | String | Symbol]> = (
 	| literals <Array[Character | Number | String | Symbol]> |
@@ -2103,25 +2093,24 @@ cascadedSendNode: node <CascadedSendAST> = (
 		whileTrue: [baseSend: baseSend prevSend].
 
 	baseSend recv isReceiverNode ifTrue:
-		[#BOGUS. (* For now, fall through to a normal send cascade. *)
-		(* cascadeSelf: node prevSend.
+		[cascadeSelf: node prevSend.
 		selfSendNode: node.
-		^self *)].
+		^self].
 	
 	baseSend recv isExplicitRcvrNode ifTrue:
-		[outerCascadeNotSupported.
+		[cascadeOuter: node prevSend depth: cascadedReceiver depth.
+		outerSendNode: node.
 		^self].
 	
 	baseSend isSuperSendNode ifTrue:
-		[superCascadeNotSupported.
+		[cascadeSuper: node prevSend.
+		superSendNode: node.
 		^self].
 	
 	assert: [baseSend isNormalSendNode] message: 'Unknown type of cascade'.
 	
 	cascadeNormal: node prevSend.
-	self applyShouldNotPopTo: node msg.
-	addDebugInfo: (node msg start to: node msg end).
-	cgen normalSend: node msg sel.
+	mnormalSendNode: node.
 )
 charNode: node <CharAST> = (
 	cgen pushLiteral: node val
@@ -2219,11 +2208,8 @@ explicitOuterReceiverNode: node <ExplicitOuterReceiverAST> = (
 ifNode: node <IfAST> = (
 	| ifPos <Integer> endThen <Integer> depth <Integer> thenDepth <Integer> |
 
-	(* cond. branch(L1). then. jump(L2). L1: else. L2: *)
-	(* cond. branch(L1). then. L1: *)
-	
 	(* issues: utilizing short jumps; nested blocks and popping *)
-	
+
 	self applyShouldNotPopTo: node cond.
 	cgen jumpIf: node ifTrue not by: 0. (* jump to else (but needs patching) *)
 
@@ -2261,9 +2247,6 @@ ifNode: node <IfAST> = (
 	(* If shouldPop is false we  want to assume the if left a result on the stack, even if it did not because both branches ended in an NLR *)
 )
 loopNode: node <LoopAST> = (
-
-	(* prologue. L1: cond. branch(L2). body. jump(L1). L2: *)
-
 	|
 	topOfLoop <Integer>
 	whilePos <Integer>
@@ -2296,7 +2279,7 @@ loopNode: node <LoopAST> = (
  		(* Ensure loop body maintains stack depth to prevent overflowing it during loop execution. *)
 		popScope].
 	
-	cgen backJumpBy: topOfLoop - cgen bci - 3. (* jump to top of loop *)
+	cgen jumpBy: topOfLoop - cgen bci - 3. (* jump to top of loop *)
 	
 	cgen patchJumpAt: whilePos with: cgen bci - whilePos.
  	(* patch the jump after the test so it comes to end of the then block *)
@@ -4406,6 +4389,175 @@ pushScope: s <Scope> = (
 new ^ <Instance> = (
 	^self nestedIn: Scope new atLevel: 0
 ))'as yet unclassified'
+accessorASTForNestedClassNamed: simpleName <String> fullName: nestedName  <String> superCall: superCall <NormalSendAST> ^<MethodAST> = (
+	(* Build an AST for a method that would lazily create a nested class 'simpleName' with superclass 'nameOfSuper' via mixin application, and cache it. It would be more convenient to create the method as source code, but it would be syntactically invalid because of the synthetic member names. Also, access to the current mixin is more involved at the source level.
+	
+The generated code has the form
+
+
+simpleName = (
+	nestedName`slot isNil ifTrue:[ 
+		nestedName_slot:: (
+	     	((myMixin instVarAt: metadataSlotIndex) 
+			nestedMixins at: #nestedName
+			) mixin	apply: superCall 
+					withName: ('nestedName`', hash asString) asSymbol
+	
+		).
+		nestedName`slot enclosingObject: self. 
+		].
+	^nestedName`slot
+)	
+	
+where myMixin is the mixin of the current method - which is pointed to via the method's literal table (see class MixinClassNode for details).
+	*)
+	| 	mixinAccessor <String> enclosingObjectMsg <String>	
+			mixinSlotName <String> ncslot <NormalSendAST>
+		nilCheck <NormalSendAST>  
+		myMixin <NormalSendAST>
+		metadataSlotIndex <NumberAST> metadataNode <NormalSendAST>
+		nestedClassNode <normalSendAST>  mixinNode  <NormalSendAST>
+		hashCode <NormalSendAST> 
+		hashString <NormalSendAST> separator <StringLiteral> 
+		suffix <NormalSendAST> prefix <StringAST> str <NormalSendAST>
+		nm <NormalSendAST> applyMixin <NormalSendAST> 
+		setSlot <NormalSendAST> setEnclosingObject <NormalSendAST> 
+		blockBody <CodeBodyAST> block <BlockAST> if <NormalSendAST> 
+		ret <ReturnStatAST> body <CodeBodyAST> |
+
+	enclosingObjectMsg:: SystemMetadata 
+							sourceCodeForSettingEnclosingObjectOf: nestedName.
+	mixinAccessor:: SymbolAST new val: (SystemMetadata 
+						sourceCodeForAccessingMixinOf: nestedName).
+	mixinSlotName:: SystemMetadata mixinSlotNameFor: nestedName.
+	ncslot:: [NormalSendAST new to: hereNode 
+				send: (MessageAST new send: mixinSlotName asSymbol with:{}; 
+										start: 1; end: mixinSlotName size
+					    ); start: 1; end:  mixinSlotName size
+			].  (* generator for  nc`slot *)
+	
+	nilCheck:: NormalSendAST new to: ncslot value 
+							send: (MessageAST  new send: #isNil with:{}; 
+													start: mixinSlotName size + 2; 
+													end: mixinSlotName size + 6
+								); start: 1; end: mixinSlotName size + 6.  (* nc`slot isNil *)
+	
+							
+	metadataSlotIndex:: NumberAST new val: 14 (* (Class instVarIndexFor: 'metadata') *).
+	myMixin:: NormalSendAST new to: MixinClassNode new 
+							send: (MessageAST new send: #value  with:{}; 
+							 						start: 1; end: 5 
+								); start: 1; end: 5. 
+								
+	metadataNode:: NormalSendAST new to: myMixin 
+							send: (MessageAST new send: #instVarAt:  with:{metadataSlotIndex}; 
+							 						start: 1; end: mixinAccessor val size
+								); start: 1; end: mixinAccessor val size. 
+								(* mixinClass instVarAt: metadataSlotIndex *)
+	nestedClassNode:: NormalSendAST new to: metadataNode  
+							send: (MessageAST new send: #nestedMixins  with:{}; 
+							 						start: 1; end: mixinAccessor val size
+								); start: 1; end: mixinAccessor val size. (* (mixinClass instVarAt: metadataSlotIndex) nestedMixins *)
+
+	mixinNode:: NormalSendAST new to: nestedClassNode  
+							send: (MessageAST new send: #at:  with:{mixinAccessor}; 
+							 						start: 1; end: mixinAccessor val size
+								); start: 1; end: mixinAccessor val size. (* (mixinClass instVarAt: metadataSlotIndex) nestedMixins at: mixinAccessor *)
+																	
+	hashCode:: NormalSendAST new to: hereNode 
+					send:  (MessageAST  new send: #hash with:{}; 
+											start: 1; end: 4
+							); start: 1; end: 4. (* hash *)
+							
+	hashString:: NormalSendAST new to: hashCode 
+								send: (MessageAST  new send: #asString with:{}; 
+														start: hashCode end + 2; 
+														end: hashCode end + 9
+									); start: hashCode start; 
+									end: hashCode end + 9. (* hash asString *)
+									
+	separator:: StringAST new val: '`'; start: 1; end: 1.
+	prefix:: StringAST new val: nestedName, '`'; start: 1; end: nestedName size + 1. 
+	(* 'nestedName`' *)
+	suffix:: NormalSendAST new to: hashString 
+				send:  (MessageAST  new send: #, with:{separator}; 
+										start: hashString end +2; 
+										end: hashString end + 2
+					); start: hashString start; end: hashString end + 2. (* hash asString, '`' *)
+	
+	str:: NormalSendAST new to: prefix 
+						send:  (MessageAST  new send: #, with:{suffix}; 
+												start: prefix end + 2; 
+												end: prefix end + 2
+							); start: prefix start; end: prefix end + 2. (* 'nestedName`', hash asString, '`' *)
+							
+	nm:: NormalSendAST new to: str 
+						send: (MessageAST  new send: #asSymbol with:{};
+												start: str end + 2; 
+												end: str end + 9
+							); start: str start; end: str end + 9. 
+							(* '(nestedName`', hash asString, '`') asSymbol *)
+							
+      applyMixin::  NormalSendAST new to:
+		(NormalSendAST new to: mixinNode 
+						send: (MessageAST new send: #mixin with: {};
+												start: mixinNode end + 2; 
+												end: mixinNode end  + 6
+							); start: mixinNode start; end: mixinNode end + 6
+		) 
+		(* ((mixinClass instVarAt: metadataSlotIndex) nestedClasses at: mixinAccessor) mixin *)
+		send: (MessageAST new  send: #apply:withName: with:{superCall. nm}; start: 1; end: nm end);
+		start: 1; end: nm end. 
+(* ((mixinClass instVarAt: metadataSlotIndex) nestedClasses at: mixinAccessor) mixin apply: nameOfSuper 
+						withName: (nestedName`', hash asString, '`') asSymbol *)
+		
+	setSlot:: NormalSendAST new to: hereNode 
+					send: 	(MessageAST new send: (mixinSlotName, ':') asSymbol 
+												with: {applyMixin}; 
+												start:  nilCheck end + 9;
+												 end: applyMixin end
+							); start: nilCheck end + 9; end: applyMixin end. 
+(* nc`slot:: NC mixin apply: nameOfSuper 
+					withName: (nestedName`', hash asString, '`') asSymbol *)
+	
+      setEnclosingObject:: NormalSendAST new to: ncslot value 
+										send: (MessageAST  new 
+												send: #setEnclosingObjectSlot: (* enclosingObjectMsg asSymbol *)
+												with: {selfNode}; 
+												start: mixinSlotName size + setSlot end + 3; 
+												end: mixinSlotName size + setSlot end + 30
+											); start: 1; 
+											end: mixinSlotName size + setSlot end  + 30. 
+											(* nc`slot enclosingObject: self *)
+											
+	blockBody:: CodeBodyAST new parameters: {}
+									temporaries: {}
+									statements:{setSlot. setEnclosingObject};
+					start: setSlot start; end: setEnclosingObject end.
+	block:: BlockAST new body: blockBody; 
+					start: blockBody start; end: blockBody end +1.
+	if:: NormalSendAST new to: nilCheck 
+				send: (MessageAST  new send: #ifTrue: with: {block}; 
+										start: nilCheck end + 2; 
+										end: block end
+					); start: nilCheck start; 
+						end: block end. (* nc`slot isNil ifTrue:[...] *)
+					
+	ret:: ReturnStatAST new expr: (
+				ncslot value
+					start: if end + 3; end:  if end + 3 + mixinSlotName size
+				);
+				start: if end + 2; end: if end + 3 + mixinSlotName size. (* ^nc`slot *)
+	
+	body:: CodeBodyAST new parameters:{}
+							 temporaries:{}
+							 statements: {if. ret}; start: if start; end: ret end.
+	^MethodAST new pattern:( MessagePatternAST new selector:  simpleName asSymbol
+														parameters:{};
+														start: 1; end: simpleName size
+			);
+					 body: body; start: 1; end: body end + 1.
+)
 accessorASTForNestedClassNamed: simpleName <String> fullName: nestedName  <String> superName: nameOfSuper <String> ^<MethodAST> = (
 	(* Build an AST for a method that would lazily create a nested class 'simpleName' with superclass 'nameOfSuper' via mixin application, and cache it. It would be more convenient to create the method as source code, but it would be syntactically invalid because of the synthetic member names. Also, access to the current mixin is more involved at the source level.
 	
@@ -5061,7 +5213,7 @@ This accessor will lazily generate the nested class when its enclosing instance 
 hdr:: classDecl hdr.
 n:: hdr name. 
 nestedName:: fullyQualifySimpleName: hdr name with: mixinMirror name.
-ast:: accessorASTForNestedClassNamed: n fullName: nestedName superName: hdr superclassName.
+ast:: accessorASTForNestedClassNamed: n fullName: nestedName superCall: hdr superclassCall.
 (processMethod: ast inScope: (scopeMap at: classDecl instanceSide) superScope in: mixinMirror)
 	metadata at: #isNestedClassAccessor put: true.
 )

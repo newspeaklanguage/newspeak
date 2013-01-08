@@ -2,7 +2,7 @@ Newspeak3
 'NS2Squeak'
 class Newspeak2SqueakCompilation usingPlatform: platform
  newspeakParser: ns3Parser <Newspeak3Parsing>
- mirrorLib: mirrors = (
+ mirrorLib: mirrors =  (
 (* This is the Newspeak compilation module. It includes the Newspeak compiler (Compiler) as well as a number of other classes used in compilation. For a  detailed overview of compilation see Compiler.
 
 Classes that do not require access to the state of a compiler are defined at the module level, as siblings of the compiler.  This is true even if the class defines a phase of compilation, like the ScopeBuilder.
@@ -82,7 +82,7 @@ Copyright 2012-2013 Gilad Bracha, Ryan Macnak and Cadence Design Systems
 	parser = Parser new.
 	|)
 (
-class Compiler = (
+class Compiler  =  (
 (* The compiler has three main entry points: compileClassSource:Within:, compileClassHeader: within: and compileMethodSource:within:. These compile an entire class declaration, a class header, and a method, respectively. 
 
 The compiler returns low level (e.g., VM level) objects representing the results of compilation.
@@ -1417,7 +1417,7 @@ We don't do this yet.  What we do instead is often suboptimal, but sometimes ins
   contextDepth <Integer> (* The number of outerContexts that need to be traversed to reach the method context.  E.g., 0=method, 1=closure, 2=closure in closure, and so on. Used for debug info. *)
 |)
 (
-class CodeGeneratorV4 = (|
+class CodeGenerator = (|
 code = LowLevelMethodMirror new.
 
 numTemps ::= 1. (* temp0 always allocated *) (*why?*)
@@ -1432,15 +1432,11 @@ bci ^<Integer> = (
 	(* Answers the current bytecode index. Used for calculating jump lengths. Note this is NOT the pc. *)
 	^code size
 )
-close ^ <LowLevelMethodMirror> = (
+close ^<LowLevelMethodMirror> = (
 	(* To be called at the end of code generation. *)
 	| methodContextSize = maxStackDepth + code argCount + code maxLocals. |
 	code maxStack: (methodContextSize max: maxClosureContextSize).
 	^code
-)
-indexForLiteral: literal = (
-	#BOGUS. (* SHOULD NOT INSERT MISSING *)
-	^literalTable at: literal ifAbsent: [literalTable at: literal put: literalTable size]
 )
 literals: ls = (
     code literals: ls.
@@ -1453,6 +1449,304 @@ maxLocals: n <Integer> = (
 )
 methodName: n <Symbol> = (
 	code selector: n
+)'stack'
+decrementStackDepthBy: n = (
+	(* Reduce the current height of the operand stack *)
+	currentStackDepth:: currentStackDepth - n.
+	assert: [currentStackDepth >= 0] 
+		message: 'Stack depth must not be negative'.
+)
+ensureStackDepth: targetDepth <Integer> = (
+
+	assert: [targetDepth <= currentStackDepth]
+		message: 'Stack shorter than expected'.
+	
+	[currentStackDepth > targetDepth] whileTrue: [pop]
+)
+incrementStackDepthBy: n = (
+	(* Increase the current height of the operand stack. Keep track of the maximum operand stack height seen in this method (that's the whole point of tracking the stack height - we need this to create a CompiledMethod. *)
+	currentStackDepth:: currentStackDepth + n.
+	maxStackDepth:: maxStackDepth max: currentStackDepth.
+)) : ()
+class CodeGeneratorV3 = CodeGenerator (|
+specialSelectors = 
+	{#+. #-. #<. #>. #<=. #>=. #=. #~=. #*. #/. #\\. #@. 
+	#bitShift:. #//. #bitAnd:. #bitOr:. 
+	#at:. #at:put:. #size. #next. #nextPut:. #atEnd.
+	#==.
+	#class. #blockCopy:. #value. #value:. #do:. #new. #new:. #x. #y}.
+|)
+('as yet unclassified'
+indexForLiteral: literal = (
+	^literalTable at: literal
+)
+pushRemoteTemporary: index inVector: vectorIndex = (
+	assert: [index between: 0 and: 255]
+		message: 'Temp index out of range'.
+	assert: [vectorIndex between: 0 and: 255]
+		message: 'Temp vector index out of range'.
+	
+	code byte: 140; byte: index; byte: vectorIndex.
+	incrementStackDepthBy: 1.
+)
+storeIntoRemoteTemporary: index inVector: vectorIndex = (
+	assert: [index between: 0 and: 255]
+		message: 'Temp index out of range'.
+	assert: [vectorIndex between: 0 and: 255]
+		message: 'Temp vector index out of range'.
+	
+	code byte: 141; byte: index; byte: vectorIndex.
+)'jumps'
+branchIf: bool <Boolean> by: distance <Integer> = (
+
+	(* always generates long jumps *)
+
+	| popAndJump <Integer> |
+	assert: [distance between: 0 and: 1023]
+		message: 'Conditional jump distance out of bounds'.
+	decrementStackDepthBy: 1.
+	popAndJump:: bool ifTrue: [168] ifFalse: [172].
+	code 
+		byte: popAndJump + (distance bitShift: -8);
+		byte: (distance bitAnd: 16rFF).
+)
+jumpBy: distance <Integer>  = (
+
+	(* always generates long jumps *)
+
+	assert: [distance between: -1024 and: 1023]
+		message: 'Unconditional jump distance out of range'.
+      code
+		byte: 160 + (distance + 1024 bitShift: -8);
+		byte: distance + 1024 \\ 256.
+)
+patchClosureJumpAt: index <Integer> with: targetData <Integer> = (
+
+	code byteAt: index - 1 
+		put: ((code byteAt: index - 1) bitOr: ((targetData bitAnd: 16r700)  >> 8)).
+	code byteAt: index 
+		put: ((code byteAt: index) bitOr: (targetData bitAnd: 16rFF)).
+)
+patchJumpAt: index <Integer> with: targetData <Integer> = (
+
+	code byteAt: index - 1 
+		put: ((code byteAt: index - 1) bitOr: ((targetData bitAnd: 16r700)  >> 8)).
+	code byteAt: index 
+		put: ((code byteAt: index) bitOr: (targetData bitAnd: 16rFF)).
+)'private'
+pushInteger: value = (
+	code byte: 112 + 3 + 2 + value.
+	incrementStackDepthBy: 1.
+)
+pushLiteralWithIndex: index = (
+
+	assert: [index between: 0 and: 255]
+		message: 'Literal index out of range'.
+		
+	incrementStackDepthBy: 1.
+	
+	index < 32 ifTrue: [code byte: 32 + index. ^self].
+	index < 64 ifTrue: [code byte: 128; byte: 128 + index. ^self].
+	code byte: 132; byte: 96; byte: index.
+)'returns'
+returnFromBlock = (
+	code byte: 125.
+	decrementStackDepthBy: 1.
+)
+returnFromMethod = (
+	code byte: 124.
+	decrementStackDepthBy: 1.
+)
+returnSelfFromMethod = (
+	code byte: 120.
+)'sends'
+normalSend: selector = (
+	|
+	numArgs = selector numArgs.
+	index ::= specialSelectors indexOf: selector.
+	|
+	decrementStackDepthBy: selector numArgs + 1 (* the receiver *).
+	incrementStackDepthBy: 1.
+		
+	(* Special selector? *)
+	index = 0 ifFalse: 
+		[code byte: 175 + index.
+		^self].
+	index:: indexForLiteral: selector.
+	
+	assert: [numArgs between: 0 and: 31]
+		message: 'numArgs out of range'.
+	assert: [index between: 0 and: 255]
+		message: 'selector literal index out of range'.
+	
+	(index < 32 and: [numArgs < 8]) ifTrue: 
+		[code byte: 131; byte: ((numArgs bitShift: 5) + index).
+		^self].
+	
+	(index < 64 and: [numArgs < 4]) ifTrue: 
+	 	[code
+			byte: 134;
+			byte: ((numArgs bitShift: 6) + index).
+		 ^self].
+	
+	code byte: 132; byte: numArgs; byte: index.
+)
+pushImplicitReceiver: selector  = (
+
+	| index = indexForLiteral: selector. |
+	assert: [index between: 0 and: 255]
+		message: 'Selector index out of bounds'.
+	
+	incrementStackDepthBy: 1.
+	code byte: 127; byte: index.
+)
+superSend: selector = (
+	|
+	selectorIndex = indexForLiteral: selector.
+	numArgs = selector numArgs.
+	|
+	assert: [selectorIndex between: 0 and: 255]
+		message: 'Selector index out of range'.
+	assert: [numArgs between: 0 and: 255]
+		message: 'Message arity out of range'.
+		
+	decrementStackDepthBy: numArgs + 1 (* the receiver *).
+	incrementStackDepthBy: 1.
+	
+	code byte: 126; byte: numArgs; byte: selectorIndex.
+)'stack'
+dup = (
+	code byte: 136.
+	incrementStackDepthBy: 1.	
+)
+pop = (
+	code byte: 135.
+	decrementStackDepthBy: 1.	
+)'temporaries'
+popIntoRemoteTemporary: index inVector: vectorIndex = (
+	assert: [index between: 0 and: 255]
+		message: 'Temp index out of range'.
+	assert: [vectorIndex between: 0 and: 255]
+		message: 'Temp vector index out of range'.
+	
+	code byte: 142; byte: index; byte: vectorIndex.
+	decrementStackDepthBy: 1.
+)
+popIntoTemporary: index = (
+	assert: [index between: 0 and: 63] message: 'Temp index out of range'.
+		
+	index < 8 ifTrue:
+		[code byte: 104 + index.
+		decrementStackDepthBy: 1.
+		^self].
+	
+	code byte: 130; byte: 64 + index.
+	decrementStackDepthBy: 1.
+)
+pushTemporary: index = (
+	assert: [index between: 0 and: 63] message: 'Temp index out of range'.
+	
+	index < 16 ifTrue:
+		[incrementStackDepthBy: 1.
+		code byte: 16 + index.
+		^self].
+	
+	incrementStackDepthBy: 1.
+	code byte: 128; byte: 64 + index.
+)
+storeIntoTemporary: index = (
+	assert: [index between: 0 and: 63] message: 'Temp index out of range'.
+	
+	code byte: 129; byte: 64 + index.
+)'testing'
+isImplicitReceiverSendAbsentReceiver = (
+	^false
+)
+isSuperSendAbsentReceiver = (
+	^false
+)'values'
+createClosureOfArity: numArgs copying: numCopied length: jumpSize = (
+
+	| numExtensions numCopiedMod8 numArgsMod8 extA |
+	
+	decrementStackDepthBy: numCopied.
+	incrementStackDepthBy: 1.
+	
+	assert: [jumpSize between: 0 and: 65535]
+		message: 'Closure jump out of range'.
+	assert: [numCopied between: 0 and: 15]
+		message: 'Too many copied values in closure'.
+	assert: [numArgs between: 0 and: 15]
+		message: 'Too many args in closure'.
+	
+	code
+		byte: 143;
+		byte: numArgs + (numCopied bitShift: 4);
+		byte: (jumpSize bitShift: -8);
+		byte: (jumpSize bitAnd: 16rFF)
+)
+createEmptyArray: size = (
+	assert: [size between: 0 and: 127] message: 'Array size must be < 128'.
+	incrementStackDepthBy: 1.
+	code byte: 138; byte: size.
+)
+createFullArray: size = (
+	assert: [size between: 0 and: 127] message: 'Array size must be < 128'.
+	decrementStackDepthBy: size.
+	incrementStackDepthBy: 1.
+	code byte: 138; byte: 128 + size.
+)
+pushEnclosingObject: depth = (
+	assert: [depth between: 0 and: 127]
+		message: 'Enclosing object depth out of range'.
+	
+	depth = 0 ifTrue: [^pushSelf].
+	
+	incrementStackDepthBy: 1.
+	
+	code byte: 139; byte: (indexForLiteral: depth). (*What?!*)
+)
+pushFalse = (
+	code byte: 114.
+	incrementStackDepthBy: 1.
+)
+pushLiteral: value = (
+	value == true ifTrue: [^pushTrue].
+	value == false ifTrue: [^pushFalse].
+	value == nil ifTrue: [^pushNil].
+	(value isInteger and: [value between: -1 and: 2])
+		ifTrue: [^pushInteger: value].
+	^pushLiteralWithIndex: (indexForLiteral: value).
+)
+pushNil = (
+	code byte: 115.
+	incrementStackDepthBy: 1.
+)
+pushSelf = (
+	code byte: 112.
+	incrementStackDepthBy: 1.
+)
+pushTrue = (
+	code byte: 113.
+	incrementStackDepthBy: 1.
+)) : ()
+class CodeGeneratorV4 = CodeGenerator (|
+|)
+('as yet unclassified'
+close ^<LowLevelMethodMirror> = (
+	code usesAlternateBytecodeSet: true.
+	^super close
+)
+indexForLiteral: literal = (
+	#BOGUS. (* SHOULD NOT INSERT MISSING *)
+	^literalTable at: literal ifAbsent: [literalTable at: literal put: literalTable size]
+)
+patchClosureJumpAt: blockBci <Integer> with: jumpSize <Integer> = (
+	
+	assert: [jumpSize between: 0 and: 255 (*65535*)]
+		message: 'Closure jump out of range'.
+		
+	code byteAt: blockBci put: jumpSize
 )
 signedSingleExtendB: extendedIndex = (
 
@@ -1489,18 +1783,6 @@ jumpBy: offset = (
 	assert: [offset >= 0 and: [offset <= 255]] message: 'Jump out of range'.
 	code byte: 242; byte: offset
 )
-jumpIf: bool by: offset = (
-
-	#BOGUS. (* support for short jumps *)
-
-	assert: [offset >= 0 and: [offset <= 255]] message: 'Jump out of range'.
-	haltJumpIf.
-	(* 243  11110011	i i i i i i i i	Pop and Jump 0n True i i i i i i i i (+ Extend B * 256, where Extend B >= 0) *)
-	(* 244  11110100	i i i i i i i i	Pop and Jump 0n False i i i i i i i i (+ Extend B * 256, where Extend B >= 0) *)
-	bool ifTrue: [code byte: 243] ifFalse: [code byte: 244].
-	code byte: offset.
-	decrementStackDepthBy: 1.
-)
 label: pos = (
 	halt.
 )
@@ -1536,7 +1818,6 @@ pushLiteralWithIndex: index = (
 	code byte: 228; nextPut: extendedIndex.
 )'returns'
 returnFromBlock = (
-	haltBlockReturn.
 	code byte: 218.
 	decrementStackDepthBy: 1.
 )
@@ -1646,27 +1927,9 @@ superSend: selector = (
 		byte: 241;
 		byte: extendedNArgs + (extendedIndex * 8)
 )'stack'
-decrementStackDepthBy: n = (
-	(* Reduce the current height of the operand stack *)
-	currentStackDepth:: currentStackDepth - n.
-	assert: [currentStackDepth >= 0] 
-		message: 'Stack depth must not be negative'.
-)
 dup = (
 	code byte: 219.
 	incrementStackDepthBy: 1.	
-)
-ensureStackDepth: targetDepth <Integer> = (
-
-	assert: [targetDepth <= currentStackDepth]
-		message: 'Stack shorter than expected'.
-	
-	[currentStackDepth > targetDepth] whileTrue: [pop]
-)
-incrementStackDepthBy: n = (
-	(* Increase the current height of the operand stack. Keep track of the maximum operand stack height seen in this method (that's the whole point of tracking the stack height - we need this to create a CompiledMethod. *)
-	currentStackDepth:: currentStackDepth + n.
-	maxStackDepth:: maxStackDepth max: currentStackDepth.
 )
 nop = (
 	code byte: 221
@@ -1715,13 +1978,44 @@ storeIntoTemporary: index = (
 	assert: [index between: 0 and: 63] message: 'Temp index out of range'.
 	
 	code byte: 234; byte: index.
+)'testing'
+isImplicitReceiverSendAbsentReceiver = (
+	^true
+)
+isSuperSendAbsentReceiver = (
+	^true
 )'values'
-createClosureOfArity: numArgs copying: numCopied length: len = (
+createClosureOfArity: numArgs copying: numCopied length: jumpSize = (
 
-	haltCreateClosure.
+	| numExtensions numCopiedMod8 numArgsMod8 extA |
 	
 	decrementStackDepthBy: numCopied.
 	incrementStackDepthBy: 1.
+	
+	assert: [jumpSize between: 0 and: 65535]
+		message: 'Closure jump out of range'.
+	assert: [numCopied between: 0 and: 127]
+		message: 'Too many copied values in closure'.
+	assert: [numArgs between: 0 and: 127]
+		message: 'Too many args in closure'.
+	
+	extA:: numExtensions:: 0.
+	(numArgsMod8:: numArgs) > 7 ifTrue:
+		[extA:: numArgs // 8.
+		 numArgsMod8:: numArgsMod8 \\ 8].
+	(numCopiedMod8:: numCopied) > 7 ifTrue:
+		[extA:: extA + (numCopied // 8 * 16).
+		 numCopiedMod8:: numCopiedMod8 \\ 8].
+	extA ~= 0 ifTrue:
+		[self unsignedSingleExtendA: extA.
+		 numExtensions:: 1].
+	jumpSize > 255 ifTrue:
+		[numExtensions:: numExtensions + 1.
+		 unsignedSingleExtendB: jumpSize // 256].
+	code
+		byte: 253;
+		byte: (numExtensions bitShift: 6) + (numCopiedMod8 bitShift: 3) + numArgsMod8;
+		byte: (jumpSize bitAnd: 16rFF)
 )
 createEmptyArray: size = (
 	(* 231 11100111 jkkkkkkk	Push (Array new: kkkkkkk) (j = 0) *)
@@ -2019,9 +2313,16 @@ currentScope ^ <Scope> = (
 )
 implicitSendNode: node <ImplicitRcvrSendNode> = (
 
-	self applyShouldNotPopTo: node msg.
-	addDebugInfo: (node msg start to: node msg end).
-	cgen implicitReceiverSend: node msg sel.
+	cgen isImplicitReceiverSendAbsentReceiver
+		ifTrue: 
+			[self applyShouldNotPopTo: node msg.
+			addDebugInfo: (node msg start to: node msg end).
+			cgen implicitReceiverSend: node msg sel]
+		ifFalse:
+			[cgen pushImplicitReceiver: node msg sel.
+			self applyShouldNotPopTo: node msg.
+			addDebugInfo: (node msg start to: node msg end).
+			cgen normalSend: node msg sel].
 )
 literalArray ^  <Array[Character | Number | String | Symbol]> = (
 	| literals <Array[Character | Number | String | Symbol]> |
@@ -2098,7 +2399,7 @@ slotsPerMethod ^ <Integer> = (
 	^cgen slotsPerMethod (* must expose this to higher levels of compiler so synthetic methods can be built correctly *)
 )'initialize-release'
 setup = (
-	cgen: CodeGeneratorV4 new.
+	cgen: CodeGeneratorV3 new.
   	debugInfo: DebugInfo new.
 	contextDepth: 0.
 	
@@ -2128,7 +2429,7 @@ assignmentNode: node <AssignmentAST> = (
 )
 blockLocalReturnNode: node <BlockLocalReturnAST> = (
 
-	node expr applyShouldNotPopTo: self.
+	self applyShouldNotPopTo: node expr.
 	cgen returnFromBlock.
 )
 boolNode: node <BoolAST> = (
@@ -2164,7 +2465,7 @@ charNode: node <CharAST> = (
 closureNode: node <ClosureAST> = (
 	| blockPos <Integer> savedStackDepth <Integer> savedStackMax <Integer> |
 
-	node copiedValues do: [:each | each apply: self].
+	node copiedValues do: [:each | self applyShouldNotPopTo: each].
 	
 	(* do this after pushing copied values! *)
 	pushScope: (scopeMap at: node).  pushOffsetCounter. contextDepth: contextDepth + 1.
@@ -2177,10 +2478,10 @@ closureNode: node <ClosureAST> = (
 	blockPos: cgen bci.
 	savedStackDepth:: cgen currentStackDepth.	
 	savedStackMax:: cgen maxStackDepth.
-	cgen stackMax: 0.
+	cgen maxStackDepth: 0.
 	 
 
-	(node pushNilCount) timesRepeat: [cgen pushNilObj]. 
+	(node pushNilCount) timesRepeat: [cgen pushNil]. 
 	(* These nils establish the temp frame for temps other than params and copied values. They contribute to the operand stack size, obviating the need to directly include the number of local variables in the context size *)
 	node body apply: self.
 	
@@ -2190,7 +2491,7 @@ closureNode: node <ClosureAST> = (
 	cgen maxStackDepth: savedStackMax.
 	
 	
-	cgen patchJump: blockPos with: cgen bci - blockPos. (* patch jump over block body *)
+	cgen patchClosureJumpAt: blockPos with: cgen bci - blockPos. (* patch jump over block body *)
 
 	popScope. popOffsetCounter. contextDepth: contextDepth - 1.
 )
@@ -2261,7 +2562,7 @@ ifNode: node <IfAST> = (
 	(* issues: utilizing short jumps; nested blocks and popping *)
 	
 	self applyShouldNotPopTo: node cond.
-	cgen jumpIf: node ifTrue not by: 0. (* jump to else (but needs patching) *)
+	cgen branchIf: node ifTrue not by: 0. (* jump to else (but needs patching) *)
 
 	ifPos: cgen bci. (* remember patch address *)
 	depth: cgen currentStackDepth.
@@ -2323,7 +2624,7 @@ loopNode: node <LoopAST> = (
 	localVariableDebugInfos addAll: (self applyShouldNotPopTo: node cond). 
 	skope isNil ifFalse: [popScope].
 	
-	cgen jumpIf: node isWhileTrue not by: 0. 
+	cgen branchIf: node isWhileTrue not by: 0. 
 	whilePos:: cgen bci. (* remember patch address *)
 
 	node body isNil ifFalse:
@@ -2332,7 +2633,7 @@ loopNode: node <LoopAST> = (
  		(* Ensure loop body maintains stack depth to prevent overflowing it during loop execution. *)
 		popScope].
 	
-	cgen backJumpBy: topOfLoop - cgen bci - 3. (* jump to top of loop *)
+	cgen jumpBy: topOfLoop - cgen bci - 3. (* jump to top of loop *)
 	
 	cgen patchJumpAt: whilePos with: cgen bci - whilePos.
  	(* patch the jump after the test so it comes to end of the then block *)
@@ -2367,7 +2668,6 @@ methodNode: node <MethodAST> = (
 	popScope. popOffsetCounter.
 	result:: cgen close.
 	cleanup.
-	result usesAlternateBytecodeSet: true.
 	^result
 )
 nilNode: node = (
@@ -2424,13 +2724,13 @@ stringNode: node <StringAST>  = (
 )
 superSendNode: node <SuperSendNode> = (
 	
+	cgen isSuperSendAbsentReceiver ifFalse: [cgen pushSelf].
 	self applyShouldNotPopTo: node msg.
 	addDebugInfo: (node msg start to: node msg end).
 	cgen superSend: node msg sel.
 )
 superVarNode: node <SuperVarNode>  = (
-	halt.
-	(* Not used right now;  when the VM supports dynamic super sends, that will change *)
+	assertUnused.
 	cgen pushSelf.
 )
 symbolNode: node <SymbolAST>  = (

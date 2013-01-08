@@ -23,6 +23,7 @@ In addition, a mirror library should be provided, as the compiler operates by qu
 Copyright 2008 Cadence Design Systems, Inc.
 Copyright 2010 Gilad Bracha, Felix Geller and Ryan Macnak
 Copyright 2011 Matthias Kleine, Ryan Macnak and Cadence Design Systems
+Copyright 2012-2013 Gilad Bracha, Ryan Macnak and Cadence Design Systems
    
    Licensed under the Apache License, Version 2.0 (the ''License''); you may not use this file except in compliance with the License.  You may obtain a copy of the License at  http://www.apache.org/licenses/LICENSE-2.0 *)|
       
@@ -1428,33 +1429,14 @@ argCount: n <Integer> = (
 	code argCount: n
 )
 bci ^<Integer> = (
-    (* Answers the current bytecode index. Used for calculating jump lengths. Note this is NOT the pc. *)
-    ^code size
+	(* Answers the current bytecode index. Used for calculating jump lengths. Note this is NOT the pc. *)
+	^code size
 )
 close ^ <LowLevelMethodMirror> = (
-    (* To be called at the end of code generation. *)
-    code maxStack: ((maxStackDepth + code argCount + code maxLocals) max: maxClosureContextSize).
-    ^code
-)
-implicitReceiverSend: selector = (
-	|
-	selectorIndex = indexForLiteral: selector.
-	numArgs = selector numArgs.
-	|
-	decrementStackDepthBy: numArgs.
-	incrementStackDepthBy: 1.
-	
-	(* 160-175 1010 i i i i Send To Absent Implicit Receiver Literal Selector #iiii With 0 Arguments *)
-	(numArgs = 0) & (selectorIndex < 16) ifTrue:
-		[code byte: 160 + selectorIndex.
-		^self].
-	
-	(* 241 11110001 i i i i i j j j	Send To Absent Dynamic Superclass Literal Selector #iiiii (+ Extend A * 32) with jjj (+ Extend B * 8) Arguments. *)
-	(numArgs < 8) & (selectorIndex < 32) ifTrue:
-		[code byte: 241; byte: (selectorIndex << 3) | numArgs.
-		^self].
-	
-	halt.
+	(* To be called at the end of code generation. *)
+	| methodContextSize = maxStackDepth + code argCount + code maxLocals. |
+	code maxStack: (methodContextSize max: maxClosureContextSize).
+	^code
 )
 indexForLiteral: literal = (
 	#BOGUS. (* SHOULD NOT INSERT MISSING *)
@@ -1471,10 +1453,31 @@ maxLocals: n <Integer> = (
 )
 methodName: n <Symbol> = (
 	code selector: n
+)
+signedSingleExtendB: extendedIndex = (
+
+	assert: [extendedIndex between: -128 and: 127]
+		message: 'Single extend B out of range'.
+	
+	code
+		byte: 225;
+		byte: (extendedIndex >= 0 
+			ifTrue: [extendedIndex]
+			ifFalse: [extendedIndex + 256]) 
+)
+unsignedSingleExtendA: extendedIndex = (
+	assert: [extendedIndex between: 0 and: 255]
+		message: 'Single extend A out of range'.
+	code byte: 224; byte: extendedIndex
+)
+unsignedSingleExtendB: extendedIndex = (
+	assert: [extendedIndex between: 0 and: 255]
+		message: 'Single extend B out of range'.
+	code byte: 225; byte: extendedIndex
 )'jumps'
 backJumpBy: offset = (
 	(* 242		11110010	i i i i i i i i	Jump i i i i i i i i (+ Extend B * 256, where bbbbbbbb = sddddddd, e.g. -32768 = i=0, a=0, s=1) *)
-
+	haltBackJumpBy.
 	assert: [offset < 0 and: [offset >= -255]] message: 'Jump out of range'.
 	
 	code byte: 225; byte: 255. (* extendB: -1. *)
@@ -1482,7 +1485,7 @@ backJumpBy: offset = (
 )
 jumpBy: offset = (
 	(* 242		11110010	i i i i i i i i	Jump i i i i i i i i (+ Extend B * 256, where bbbbbbbb = sddddddd, e.g. -32768 = i=0, a=0, s=1) *)
-
+	haltJumpBy.
 	assert: [offset >= 0 and: [offset <= 255]] message: 'Jump out of range'.
 	code byte: 242; byte: offset
 )
@@ -1491,7 +1494,7 @@ jumpIf: bool by: offset = (
 	#BOGUS. (* support for short jumps *)
 
 	assert: [offset >= 0 and: [offset <= 255]] message: 'Jump out of range'.
-
+	haltJumpIf.
 	(* 243  11110011	i i i i i i i i	Pop and Jump 0n True i i i i i i i i (+ Extend B * 256, where Extend B >= 0) *)
 	(* 244  11110100	i i i i i i i i	Pop and Jump 0n False i i i i i i i i (+ Extend B * 256, where Extend B >= 0) *)
 	bool ifTrue: [code byte: 243] ifFalse: [code byte: 244].
@@ -1506,39 +1509,34 @@ patchJumpAt: jumpBci <Integer> with: offset <Integer> = (
 	(offset < 0) | (offset > 255) ifTrue: [halt].
 	code byteAt: jumpBci put: offset
 )'private'
-extendA: n = (
-	n = 0 ifTrue: [^self].
-	n > 255 ifTrue: [self extendA: n >> 8].
-	code byte: 224.
-	code byte: (n bitAnd: 255).
-)
-extendB: n = (
-	n = 0 ifTrue: [^self].
-	halt.
-)
 pushInteger: n <Integer> = (
 	
-	n = 0 ifTrue: [incrementStackDepthBy: 1. code byte: 78. ^self].
-	n = 1 ifTrue: [incrementStackDepthBy: 1. code byte: 79. ^self].
-	n < 255 ifTrue: [incrementStackDepthBy: 1. code byte: 229; byte: n. ^self].
-	halt.
-	(* small values generate directly. large values from literal table*)
+	incrementStackDepthBy: 1.
+	n = 0 ifTrue: [code byte: 78. ^self].
+	n = 1 ifTrue: [code byte: 79. ^self].
+	assert: [n between: -32768 and: 32767]
+		message: 'Quick integer out of range'.
+	(n < 0 or: [n > 255]) ifTrue: [signedSingleExtendB: (n bitShift: -8)].
+	code byte: 229.
+	code byte: (n bitAnd: 255).
 )
 pushLiteralWithIndex: index = (
-
-	(* 32-63  001 i i i i i  Push Literal #iiiii *)
-	index < 32 ifTrue:
-		[code byte: 32 + index.
-		incrementStackDepthBy: 1.
-		^self].
-	 
-	(* 228  11100100  i i i i i i i i  Push Literal #iiiiiiii (+ Extend A * 256) *)
-	extendA: index >> 8.
-	code byte: 228.
-	code byte: (index bitAnd: 255).
+	| extendedIndex |
+	
+	assert: [index between: 0 and: 65535]
+		message: 'Literal index out of range'.
+		
 	incrementStackDepthBy: 1.
+	
+	index < 32 ifTrue: [code byte: 32 + index. ^self].
+	
+	(extendedIndex:: index) > 256 ifTrue:
+		[unsignedSingleExtendA: extendedIndex // 256.
+		extendedIndex:: extendedIndex \\ 256].
+	code byte: 228; nextPut: extendedIndex.
 )'returns'
 returnFromBlock = (
+	haltBlockReturn.
 	code byte: 218.
 	decrementStackDepthBy: 1.
 )
@@ -1549,36 +1547,60 @@ returnFromMethod = (
 returnSelfFromMethod = (
 	code byte: 216
 )'sends'
+implicitReceiverSend: selector = (
+	|
+	selectorIndex = indexForLiteral: selector.
+	numArgs = selector numArgs.
+	extendedIndex extendedNArgs
+	|
+	decrementStackDepthBy: numArgs.
+	incrementStackDepthBy: 1.
+	
+	assert: [selectorIndex between: 0 and: 65535]
+		message: 'Selector index out of range'.
+	assert: [numArgs between: 0 and: 31]
+		message: 'Message arity out of range'.
+	
+	(selectorIndex < 16 and: [numArgs = 0]) ifTrue: 
+	 	[code byte: 160 + selectorIndex. ^self].
+	
+	(extendedIndex:: selectorIndex) > 31 ifTrue:
+		[self genUnsignedSingleExtendA: extendedIndex // 32.
+		 extendedIndex:: extendedIndex \\ 32].
+	(extendedNArgs:: numArgs) > 7 ifTrue:
+		[self genUnsignedSingleExtendB: extendedNArgs // 8.
+		 extendedNArgs:: extendedNArgs \\ 8].
+	code
+		byte: 240;
+		byte: extendedNArgs + (extendedIndex * 8)
+)
 normalSend: selector = (
 	|
 	selectorIndex = indexForLiteral: selector.
 	numArgs = selector numArgs.
+	extendedIndex extendedNArgs
 	|
 	decrementStackDepthBy: numArgs  + 1 (* the receiver *).
 	incrementStackDepthBy: 1.
 	
-	(* 112-127	0111 i i i i	Send Literal Selector #iiii With 0 Arguments *)
-	(numArgs = 0) & (selectorIndex < 16) ifTrue:
-		[code byte: 112 + selectorIndex.
-		^self].
+	assert: [selectorIndex between: 0 and: 65535]
+		message: 'Selector index out of range'.
+	assert: [numArgs between: 0 and: 31]
+		message: 'Message arity out of range'.
 	
-	(* 128-143	1000 i i i i	Send Literal Selector #iiii With 1 Argument *)
-	(numArgs = 1) & (selectorIndex < 16) ifTrue:
-		[code byte: 128 + selectorIndex.
-		^self].
-	
-	(* 144-159	1001 i i i i	Send Literal Selector #iiii With 2 Arguments *)
-	(numArgs = 2) & (selectorIndex < 16) ifTrue:
-		[code byte: 144 + selectorIndex.
-		^self].
-	
-	(*	238 11101110	i i i i i j j j Send Literal Selector #iiiii (+ Extend A * 32) with jjj (+ Extend B * 8) Arguments *)
+	(selectorIndex < 16 and: [numArgs < 3]) ifTrue: 
+	 	[code byte: 112 + (numArgs * 16) + selectorIndex.
+		 ^self].
 
-	(numArgs < 8) & (selectorIndex < 32) ifTrue:
-		[code byte: 238; byte: (selectorIndex << 3) | numArgs.
-		^self].
-
-	longerForm.
+	(extendedIndex:: selectorIndex) > 31 ifTrue:
+		[self genUnsignedSingleExtendA: extendedIndex // 32.
+		 extendedIndex:: extendedIndex \\ 32].
+	(extendedNArgs:: numArgs) > 7 ifTrue:
+		[self genUnsignedSingleExtendB: extendedNArgs // 8.
+		 extendedNArgs:: extendedNArgs \\ 8].
+	code
+		byte: 238;
+		byte: extendedNArgs + (extendedIndex * 8)
 )
 outerSend: selector = (
 	|
@@ -1588,7 +1610,7 @@ outerSend: selector = (
 	decrementStackDepthBy: numArgs.
 	incrementStackDepthBy: 1.
 	
-	longForm.
+	absentReceiverOuterSendsUnimplemented.
 )
 selfSend: selector = (
 	|
@@ -1598,22 +1620,31 @@ selfSend: selector = (
 	decrementStackDepthBy: numArgs.
 	incrementStackDepthBy: 1.
 	
-	longForm.
+	absentReceiverSelfSendsUnimplemented.
 )
 superSend: selector = (
 	|
 	selectorIndex = indexForLiteral: selector.
 	numArgs = selector numArgs.
+	extendedIndex extendedNArgs
 	|
+	assert: [selectorIndex between: 0 and: 65535]
+		message: 'Selector index out of range'.
+	assert: [numArgs between: 0 and: 31]
+		message: 'Message arity out of range'.
+		
 	decrementStackDepthBy: numArgs.
 	incrementStackDepthBy: 1.
 	
-	(* 241		11110001	i i i i i j j j	Send To Absent Dynamic Superclass Literal Selector #iiiii (+ Extend A * 32) with jjj (+ Extend B * 8) Arguments *)
-	(numArgs < 8) & (selectorIndex < 32) ifTrue:
-		[code byte: 241; byte: (selectorIndex << 3) | numArgs.
-		^self].
-	
-	halt.
+	(extendedIndex:: selectorIndex) > 31 ifTrue:
+		[unsignedSingleExtendA: extendedIndex // 32.
+		 extendedIndex:: extendedIndex \\ 32].
+	(extendedNArgs:: numArgs) > 7 ifTrue:
+		[self genUnsignedSingleExtendB: extendedNArgs // 8.
+		 extendedNArgs:: extendedNArgs \\ 8].
+	code
+		byte: 241;
+		byte: extendedNArgs + (extendedIndex * 8)
 )'stack'
 decrementStackDepthBy: n = (
 	(* Reduce the current height of the operand stack *)
@@ -1645,10 +1676,11 @@ pop = (
 	decrementStackDepthBy: 1.	
 )'temporaries'
 popIntoRemoteTemporary: index inVector: vectorIndex = (
-	halt.
+	haltPopRemote
 )
 popIntoTemporary: index = (
-
+	assert: [index between: 0 and: 63] message: 'Temp index out of range'.
+		
 	(* 184-191	10111 i i i	Pop and Store Temporary Variable #iii *)
 	index < 8 ifTrue:
 		[code byte: 184 + index.
@@ -1656,71 +1688,63 @@ popIntoTemporary: index = (
 		^self].
 	
 	(* 237  11101101	i i i i i i i i  Pop and Store Temporary Variable #iiiiiiii *)
-	index < 255 ifTrue:
-		[code byte: 237; byte: index.
-		decrementStackDepthBy: 1.
-		^self].
-	
-	halt.
+	code byte: 237; byte: index.
+	decrementStackDepthBy: 1.
 )
 pushRemoteTemporary: index inVector: vectorIndex = (
-	halt.
+	haltPushRemoteTemp.
 )
 pushTemporary: index = (
+	assert: [index between: 0 and: 63] message: 'Temp index out of range'.
+	
 	(* 64-71		01000 i i i		Push Temporary Variable #iii *)
-	index < 8 ifTrue:
+	(* 72-75		010010 i i		Push Temporary Variable #ii + 8 *)
+	index < 12 ifTrue:
 		[incrementStackDepthBy: 1.
 		code byte: 64 + index.
 		^self].
 	
-	(* 72-75		010010 i i		Push Temporary Variable #ii + 8 *)
-	index < 12 ifTrue:
-		[incrementStackDepthBy: 1.
-		code byte: 72 + index - 8.
-		^self].
-	
 	(* 230		11100110	i i i i i i i i	Push Temporary Variable #iiiiiiii *)
-	index < 255 ifTrue:
-		[incrementStackDepthBy: 1.
-		code byte: 230; byte: index.
-		^self].
-	
-	halt.
+	incrementStackDepthBy: 1.
+	code byte: 230; byte: index.
 )
 storeIntoRemoteTemporary: index inVector: vectorIndex = (
-	halt.
+	haltstoreremote.
 )
 storeIntoTemporary: index = (
-	halt.
+	assert: [index between: 0 and: 63] message: 'Temp index out of range'.
+	
+	code byte: 234; byte: index.
 )'values'
 createClosureOfArity: numArgs copying: numCopied length: len = (
 
-	numArgs > 8 ifTrue: [halt].
-	numCopied > 8 ifTrue: [halt].
-	len > 255 ifTrue: [halt].
-	(* Need to use extensions, as-yet-unimplemented. *)
+	haltCreateClosure.
 	
 	decrementStackDepthBy: numCopied.
 	incrementStackDepthBy: 1.
-	code byte: 253.
-	code byte: (numCopied << 3) | (numArgs).
-	code byte: len.
 )
 createEmptyArray: size = (
 	(* 231 11100111 jkkkkkkk	Push (Array new: kkkkkkk) (j = 0) *)
-	assert: [size < 128] message: 'Array size must be < 128'.
+	assert: [size between: 0 and: 127] message: 'Array size must be < 128'.
 	incrementStackDepthBy: 1.
 	code byte: 231; byte: size.
 )
 createFullArray: size = (
-	(* 231 11100111 jkkkkkkk Pop kkkkkkk elements into: (Array new: kkkkkkk) (j = 1) *)
-	assert: [size < 128] message: 'Array size must be < 128'.
+	assert: [size between: 0 and: 127] message: 'Array size must be < 128'.
 	decrementStackDepthBy: size.
 	incrementStackDepthBy: 1.
 	code byte: 231; byte: 128 + size.
 )
 pushEnclosingObject: depth = (
-	halt.
+	assert: [depth between: 0 and: 127]
+		message: 'Enclosing object depth out of range'.
+	
+	depth = 0 ifTrue: [^pushSelf].
+	
+	incrementStackDepthBy: 1.
+	
+	signedSingleExtendB: depth negated.
+	code byte: 77
 )
 pushFalse = (
 	code byte: 77.
@@ -1734,7 +1758,7 @@ pushLiteral: value = (
 	^pushLiteralWithIndex: (indexForLiteral: value).
 )
 pushNil = (
-	extendA: 2.
+	unsignedSingleExtendB: 2.
 	code byte: 77.
 	incrementStackDepthBy: 1.	
 )
@@ -1743,12 +1767,12 @@ pushSelf = (
 	incrementStackDepthBy: 1.
 )
 pushThisContext = (
-	extendA: 3.
+	unsignedSingleExtendB: 3.
 	code byte: 77.
 	incrementStackDepthBy: 1.
 )
 pushTrue = (
-	extendA: 1.
+	unsignedSingleExtendB: 1.
 	code byte: 77.
 	incrementStackDepthBy: 1.	
 )) : ()
@@ -2017,9 +2041,15 @@ nextOffset = (
 )
 outerSendNode: node <SendAST> = (
 	
+	(* When we have absent receiver outer sends.
 	self applyShouldNotPopTo: node msg.
 	addDebugInfo: (node msg start to: node msg end).
-	cgen outerSend: node msg sel toEnclosingObject: node recv depth.
+	cgen outerSend: node msg sel toEnclosingObject: node recv depth. *)
+	
+	cgen pushEnclosingObject: node recv depth.
+	self applyShouldNotPopTo: node msg.
+	addDebugInfo: (node msg start to: node msg end).
+	cgen normalSend: node msg sel.
 )
 pc = (
 	^cgen code compiledMethodSize + 1
@@ -2054,9 +2084,15 @@ pushScope: s <Scope>= (
 )
 selfSendNode: node <SendAST> = (
 
+	(* When we have absent receiver self sends.
 	self applyShouldNotPopTo: node msg.
 	addDebugInfo: (node msg start to: node msg end).
-	cgen selfSend: node msg sel.
+	cgen selfSend: node msg sel. *)
+	
+	cgen pushSelf.
+	self applyShouldNotPopTo: node msg.
+	addDebugInfo: (node msg start to: node msg end).
+	cgen normalSend: node msg sel.
 )
 slotsPerMethod ^ <Integer> = (
 	^cgen slotsPerMethod (* must expose this to higher levels of compiler so synthetic methods can be built correctly *)
@@ -2105,10 +2141,7 @@ cascadedSendNode: node <CascadedSendAST> = (
 		whileTrue: [baseSend: baseSend prevSend].
 
 	baseSend recv isReceiverNode ifTrue:
-		[#BOGUS. (* For now, fall through to a normal send cascade. *)
-		(* cascadeSelf: node prevSend.
-		selfSendNode: node.
-		^self *)].
+		[#BOGUS. (* May need special handling once we have absent receiver self sends. *)].
 	
 	baseSend recv isExplicitRcvrNode ifTrue:
 		[outerCascadeNotSupported.
@@ -2137,7 +2170,7 @@ closureNode: node <ClosureAST> = (
 	pushScope: (scopeMap at: node).  pushOffsetCounter. contextDepth: contextDepth + 1.
 
 	cgen
-		pushClosureOfArity: node parameters size
+		createClosureOfArity: node parameters size
 		copying: node copiedValues size
 		length: 0 (* needs patching *).
 
@@ -2216,6 +2249,7 @@ contextNode: node <ContextAST> = (
 	cgen pushThisContext
 )
 explicitOuterReceiverNode: node <ExplicitOuterReceiverAST> = (
+	(*Arguably, this is illegal. *)
 	cgen pushEnclosingObject: node depth.
 )
 ifNode: node <IfAST> = (
@@ -2333,6 +2367,7 @@ methodNode: node <MethodAST> = (
 	popScope. popOffsetCounter.
 	result:: cgen close.
 	cleanup.
+	result usesAlternateBytecodeSet: true.
 	^result
 )
 nilNode: node = (
@@ -4866,17 +4901,18 @@ body:: CodeBodyAST new temporaries: OrderedCollection new statements: calls;
 )
 methodNode: aNode <MethodAST> ^ <LowLevelMethodMirror> = (
 
-| tree <AST> |
-  tree:: aNode apply: rewriter.  (* rewrite ast *)
+	| tree <AST> |
+	tree:: aNode apply: rewriter. (* rewrite ast *)
 
-  
+	(aNode pattern selector startsWith: 'testNewCompiler')
+		ifTrue: [
+		| r = tree apply: AST2ByteCodeV4Compiler new. |
+		r src: (sourceForNode: aNode).
+		^r].
 
-tree apply: 
-
-
-methodCompiler.	 (* final pass: visit rewritten ast *)
-(* pop scope? *)
-  ^(methodCompiler result) src: (sourceForNode: aNode)
+	tree apply: methodCompiler. (* final pass: visit rewritten ast *)
+	(* pop scope? *)
+	^(methodCompiler result) src: (sourceForNode: aNode)
 )
 nestScope: s <Scope> = (
 (* Hook up a new lexically nested scope, and push onto the scope stack *)

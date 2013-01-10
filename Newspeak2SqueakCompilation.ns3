@@ -268,6 +268,9 @@ pushRemoteTemporary: index inVector: vectorIndex = (
 	code byte: 140; byte: index; byte: vectorIndex.
 	incrementStackDepthBy: 1.
 )
+sizeOfBackJump = (
+	^2
+)
 storeIntoRemoteTemporary: index inVector: vectorIndex = (
 	assert: [index between: 0 and: 255]
 		message: 'Temp index out of range'.
@@ -524,6 +527,12 @@ pushTrue = (
 	incrementStackDepthBy: 1.
 )) : ()
 class CodeGeneratorV4 = CodeGenerator (|
+specialSelectors = 
+	{#+. #-. #<. #>. #<=. #>=. #=. #~=. #*. #/. #\\. #@. 
+	#bitShift:. #//. #bitAnd:. #bitOr:. 
+	#at:. #at:put:. #size. #next. #nextPut:. #atEnd.
+	#==.
+	#class. #blockCopy:. #value. #value:. #do:. #new. #new:. #x. #y}.
 |)
 ('as yet unclassified'
 close ^<LowLevelMethodMirror> = (
@@ -531,8 +540,7 @@ close ^<LowLevelMethodMirror> = (
 	^super close
 )
 indexForLiteral: literal = (
-	#BOGUS. (* SHOULD NOT INSERT MISSING *)
-	^literalTable at: literal ifAbsent: [literalTable at: literal put: literalTable size]
+	^literalTable at: literal
 )
 patchClosureJumpAt: blockBci <Integer> with: jumpSize <Integer> = (
 	
@@ -552,6 +560,9 @@ signedSingleExtendB: extendedIndex = (
 			ifTrue: [extendedIndex]
 			ifFalse: [extendedIndex + 256]) 
 )
+sizeOfBackJump = (
+	^4
+)
 unsignedSingleExtendA: extendedIndex = (
 	assert: [extendedIndex between: 0 and: 255]
 		message: 'Single extend A out of range'.
@@ -562,27 +573,51 @@ unsignedSingleExtendB: extendedIndex = (
 		message: 'Single extend B out of range'.
 	code byte: 225; byte: extendedIndex
 )'jumps'
-backJumpBy: offset = (
-	(* 242		11110010	i i i i i i i i	Jump i i i i i i i i (+ Extend B * 256, where bbbbbbbb = sddddddd, e.g. -32768 = i=0, a=0, s=1) *)
-	haltBackJumpBy.
-	assert: [offset < 0 and: [offset >= -255]] message: 'Jump out of range'.
-	
-	code byte: 225; byte: 255. (* extendB: -1. *)
-	code byte: 242; byte: offset + 256.
+jumpBy: distance = (
+
+	distance < 0 ifTrue: [
+		assert: [distance between: -32768 and: -1]
+			message: 'Unconditional backjump out of range'.
+		
+		signedSingleExtendB: (distance bitShift: -8).
+		code byte: 242; byte: (distance bitAnd: 255).
+		^self.
+	].
+
+	assert: [distance between: 0 and: 255]
+		message: 'Unconditional jump out of range'.
+
+	code byte: 242; byte: distance.	
 )
-jumpBy: offset = (
-	(* 242		11110010	i i i i i i i i	Jump i i i i i i i i (+ Extend B * 256, where bbbbbbbb = sddddddd, e.g. -32768 = i=0, a=0, s=1) *)
-	haltJumpBy.
-	assert: [offset >= 0 and: [offset <= 255]] message: 'Jump out of range'.
-	code byte: 242; byte: offset
+jumpIf: bool <Boolean> by: distance <Integer> = (
+	
+	(* Always generates unextended jumps *)
+	
+	assert: [distance >= 0 and: [distance <= 255]]
+		message: 'Conditional jump out of range'.
+		
+	decrementStackDepthBy: 1.
+	
+	code
+		byte: (bool ifTrue: [243] ifFalse: [244]);
+		byte: distance
 )
 label: pos = (
 	halt.
 )
-patchJumpAt: jumpBci <Integer> with: offset <Integer> = (
+patchJumpAt: jumpBci <Integer> with: distance <Integer> = (
 	
-	(offset < 0) | (offset > 255) ifTrue: [halt].
-	code byteAt: jumpBci put: offset
+	assert: [distance between: 0 and: 255]
+		message: 'Unconditional jump out of range'.
+		
+	code byteAt: jumpBci put: distance
+)
+patchJumpIfAt: jumpBci <Integer> with: distance <Integer> = (
+	
+	assert: [distance between: 0 and: 255]
+		message: 'Conditional jump out of range'.
+		
+	code byteAt: jumpBci put: distance
 )'private'
 pushInteger: n <Integer> = (
 	
@@ -650,12 +685,19 @@ implicitReceiverSend: selector = (
 )
 normalSend: selector = (
 	|
-	selectorIndex = indexForLiteral: selector.
 	numArgs = selector numArgs.
+	selectorIndex 
 	extendedIndex extendedNArgs
 	|
-	decrementStackDepthBy: numArgs  + 1 (* the receiver *).
+	
+	decrementStackDepthBy: selector numArgs + 1 (* the receiver *).
 	incrementStackDepthBy: 1.
+	
+	(specialSelectors includes: selector) ifTrue:
+		[code byte: 79 + (specialSelectors indexOf: selector).
+		^self].
+		
+	selectorIndex:: indexForLiteral: selector.
 	
 	assert: [selectorIndex between: 0 and: 65535]
 		message: 'Selector index out of range'.
@@ -732,7 +774,14 @@ pop = (
 	decrementStackDepthBy: 1.	
 )'temporaries'
 popIntoRemoteTemporary: index inVector: vectorIndex = (
-	haltPopRemote
+
+	assert: [index between: 0 and: 255]
+		message: 'Temp index out of range'.
+	assert: [vectorIndex between: 0 and: 255]
+		message: 'Temp vector index out of range'.
+	
+	code byte: 252; byte: index; byte: vectorIndex.
+	decrementStackDepthBy: 1.
 )
 popIntoTemporary: index = (
 	assert: [index between: 0 and: 63] message: 'Temp index out of range'.
@@ -748,7 +797,13 @@ popIntoTemporary: index = (
 	decrementStackDepthBy: 1.
 )
 pushRemoteTemporary: index inVector: vectorIndex = (
-	haltPushRemoteTemp.
+	assert: [index between: 0 and: 255]
+		message: 'Temp index out of range'.
+	assert: [vectorIndex between: 0 and: 255]
+		message: 'Temp vector index out of range'.
+	
+	code byte: 250; byte: index; byte: vectorIndex.
+	incrementStackDepthBy: 1.
 )
 pushTemporary: index = (
 	assert: [index between: 0 and: 63] message: 'Temp index out of range'.
@@ -765,13 +820,21 @@ pushTemporary: index = (
 	code byte: 230; byte: index.
 )
 storeIntoRemoteTemporary: index inVector: vectorIndex = (
-	haltstoreremote.
+	assert: [index between: 0 and: 255]
+		message: 'Temp index out of range'.
+	assert: [vectorIndex between: 0 and: 255]
+		message: 'Temp vector index out of range'.
+	
+	code byte: 251; byte: index; byte: vectorIndex.
 )
 storeIntoTemporary: index = (
 	assert: [index between: 0 and: 63] message: 'Temp index out of range'.
 	
 	code byte: 234; byte: index.
 )'testing'
+hasSpecialReturnBoolean = (
+	^false
+)
 isImplicitReceiverSendAbsentReceiver = (
 	^true
 )
@@ -841,7 +904,8 @@ pushLiteral: value = (
 	value == true ifTrue: [^pushTrue].
 	value == false ifTrue: [^pushFalse].
 	value == nil ifTrue: [^pushNil].
-	value isInteger ifTrue: [^pushInteger: value].
+	(value isInteger and: [value between: -32768 and: 32767])
+		ifTrue: [^pushInteger: value].
 	^pushLiteralWithIndex: (indexForLiteral: value).
 )
 pushNil = (
@@ -1104,27 +1168,11 @@ currentMethod ^ <SemanticMethod> = (
 currentScope ^ <Scope> = (
 	^scopeStack last
 )
-implicitSendNode: node <ImplicitRcvrSendNode> = (
-
-	cgen isImplicitReceiverSendAbsentReceiver
-		ifTrue: 
-			[self applyShouldNotPopTo: node msg.
-			addDebugInfo: (node msg start to: node msg end).
-			cgen implicitReceiverSend: node msg sel]
-		ifFalse:
-			[cgen pushImplicitReceiver: node msg sel.
-			self applyShouldNotPopTo: node msg.
-			addDebugInfo: (node msg start to: node msg end).
-			cgen normalSend: node msg sel].
-)
 literalArray ^  <Array[Character | Number | String | Symbol]> = (
 	| literals <Array[Character | Number | String | Symbol]> |
 	literals:: Array new: literalTable size.
 	literalTable keysAndValuesDo:[:k : v | literals at: v + 1 put: k].
 	^literals
-)
-mixinClassNode: node  = (
-	cgen pushMixinClass.
 )
 nextOffset = (
 	|  next |
@@ -1174,18 +1222,6 @@ pushOffsetCounter = (
 )
 pushScope: s <Scope>= (
 	scopeStack addLast: s
-)
-selfSendNode: node <SendAST> = (
-
-	(* When we have absent receiver self sends.
-	self applyShouldNotPopTo: node msg.
-	addDebugInfo: (node msg start to: node msg end).
-	cgen selfSend: node msg sel. *)
-	
-	cgen pushSelf.
-	self applyShouldNotPopTo: node msg.
-	addDebugInfo: (node msg start to: node msg end).
-	cgen normalSend: node msg sel.
 )
 slotsPerMethod ^ <Integer> = (
 	(*^cgen slotsPerMethod (* must expose this to higher levels of compiler so synthetic methods can be built correctly *) *)
@@ -1393,6 +1429,19 @@ ifNode: node <IfAST> = (
 		[cgen currentStackDepth: (cgen currentStackDepth max: depth+1)].
 	(* If shouldPop is false we  want to assume the if left a result on the stack, even if it did not because both branches ended in an NLR *)
 )
+implicitSendNode: node <ImplicitRcvrSendNode> = (
+
+	cgen isImplicitReceiverSendAbsentReceiver
+		ifTrue: 
+			[self applyShouldNotPopTo: node msg.
+			addDebugInfo: (node msg start to: node msg end).
+			cgen implicitReceiverSend: node msg sel]
+		ifFalse:
+			[cgen pushImplicitReceiver: node msg sel.
+			self applyShouldNotPopTo: node msg.
+			addDebugInfo: (node msg start to: node msg end).
+			cgen normalSend: node msg sel].
+)
 loopNode: node <LoopAST> = (
 
 	(* prologue. L1: cond. branch(L2). body. jump(L1). L2: *)
@@ -1413,7 +1462,7 @@ loopNode: node <LoopAST> = (
 	cgen ensureStackDepth: baselineStackDepth.
 	(* Ensure prologue maintains stack depth to prevent overflowing it during say nested loops. *)
 	
-	topOfLoop:: cgen bci + 1.
+	topOfLoop:: cgen bci.
 	
 	skope:: scopeMap at: node cond ifAbsent: [nil].
 	skope isNil ifFalse: [pushScope: skope].
@@ -1429,7 +1478,7 @@ loopNode: node <LoopAST> = (
  		(* Ensure loop body maintains stack depth to prevent overflowing it during loop execution. *)
 		popScope].
 	
-	cgen jumpBy: topOfLoop - cgen bci - 3. (* jump to top of loop *)
+	cgen jumpBy: topOfLoop - cgen bci - (cgen sizeOfBackJump). (* jump to top of loop *)
 	
 	cgen patchJumpAt: whilePos with: cgen bci - whilePos.
  	(* patch the jump after the test so it comes to end of the then block *)
@@ -1450,6 +1499,8 @@ methodNode: node <MethodAST> = (
 	(* Create a compiled method, whose body is the result of compiling the node's body. *)
 	(* | result <LowLevelMethodMirror> | *)
 	setup.
+	(node pattern selector startsWith: 'testNewCompiler')
+		ifTrue: [cgen: CodeGeneratorV4 new].
 	pushScope: (scopeMap at: node). pushOffsetCounter.
 		currentScope at: #'`currentMethod' put: (SemanticMethod decl: node). (* TODO: Is this used? By whom? *)
 		cgen
@@ -1465,6 +1516,9 @@ methodNode: node <MethodAST> = (
 	result:: cgen close.
 	cleanup.
 	^result
+)
+mixinClassNode: node  = (
+	cgen pushMixinClass.
 )
 nilNode: node = (
 	cgen pushNil.
@@ -1514,6 +1568,18 @@ returnStatNode: node <ReturnStatAST> = (
 	#BOGUS yourself. (*block returns don't add this debug info. should they, or is it unnecessary here?*)
 	
 	cgen returnFromMethod.
+)
+selfSendNode: node <SendAST> = (
+
+	(* When we have absent receiver self sends.
+	self applyShouldNotPopTo: node msg.
+	addDebugInfo: (node msg start to: node msg end).
+	cgen selfSend: node msg sel. *)
+	
+	cgen pushSelf.
+	self applyShouldNotPopTo: node msg.
+	addDebugInfo: (node msg start to: node msg end).
+	cgen normalSend: node msg sel.
 )
 stringNode: node <StringAST>  = (
 	cgen pushLiteral: node val.

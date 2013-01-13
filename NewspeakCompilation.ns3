@@ -1,0 +1,533 @@
+Newspeak3
+'Newspeak'
+class NewspeakCompilation usingPlatform: p asts: asts = (
+(* Facilities common to each of the Newspeak compilers, such as scopes and the scope builder. A common Rewriter should eventually be located here as well.
+
+It is intended that module definitions for each compilation target will be mixed-in to this module definition, and so inherit the facilities provided here. Until general mixin application is supported, the target-specific modules must use the same cheat used by BlocklessCombinatorialParsing of declaraing a superclass clause matching the factory of the class it will be later mixed-in to.
+
+
+This module is derived from Newspeak2SqueakCompilation, which is why the pre-2013 copyrights apply.
+
+Copyright 2008 Cadence Design Systems, Inc.
+Copyright 2010 Gilad Bracha, Felix Geller and Ryan Macnak
+Copyright 2011 Matthias Kleine, Ryan Macnak and Cadence Design Systems
+Copyright 2013 Ryan Macnak
+
+Licensed under the Apache License, Version 2.0 (the ''License''); you may not use this file except in compliance with the License. You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0 *)|
+	protected Dictionary = p collections Dictionary.
+	protected OrderedCollection = p collections OrderedCollection.
+	protected ASTTool = asts ASTTool.
+	protected MessagePatternAST = asts MessagePatternAST.
+|)
+(
+class ClassEntry forDeclaration: cd atDepth: d = SymbolTableEntry forAST: cd atDepth: d (|
+enclosingClass <ClassEntry> (* Currently unused. The intention is to fill this in so we have the information needed to avoid the outer send to a sibling problem.*)
+|)
+() : ()
+class Compiler = (| protected scopeMap <Dictionary[AST, Scope]> ::= Dictionary new. |)
+(
+class RewriterWIP = ASTTool (|
+	scopeStack <OrderedCollection[Scope]> = OrderedCollection new.
+	valueExpected <Boolean> ::= true.
+|)
+(
+class ConditionalAST = AST (|
+	condition <ExpressionAST>
+	then <CodeBodyAST>
+	else <CodeBodyAST>
+	forValue <Boolean>
+|)
+('testing'
+isExpressionNode ^<Boolean> = (
+	^forValue
+)'visiting'
+apply: aTool <ASTTool> = (
+	^aTool conditionalNode: self
+)) : ()
+class EnclosingObjectAST = AST (
+(* See mailing list for debate over 'outer Foo' as an expression. *)| depth <Integer> |)
+('testing'
+isExpressionNode ^<Boolean> = (
+	^true
+)'visiting'
+apply: aTool <ASTTool> = (
+	^aTool enclosingObjectNode: self
+)) : ()
+class ImplicitReceiverSendAST = SendAST (|
+depth <Integer> (* Used on targets that don't have implicit receiver lookup at runtime. *)
+|)
+('visiting'
+apply: aTool <ASTTool> = (
+	^aTool implicitReceiverSend: self
+)) : ()
+class LoopAST = AST (
+(* This node represents a while loop. The general form of the loop is:
+
+prologue; while (cond = whileTrue) { body}
+
+*)|
+	prologue <CodeBodyAST>
+	condition <CodeBodyAST>
+	isWhileTrue <Boolean>
+	body <CodeBodyAST>
+	forValue <Boolean>
+|)
+('testing'
+isExpressionNode ^<Boolean> = (
+	^forValue
+)'visiting'
+apply: aTool <ASTTool> = (
+	^aTool loopNode: self
+)) : ()
+class OuterSendAST = SendAST (|
+depth <Integer>
+|)
+('visiting'
+apply: aTool <ASTTool> = (
+	^aTool outerSendNode: self
+)) : ()
+class ParameterDeclarationAST = (|
+|)
+() : ()
+class SelfSendAST = SendAST ()
+('visiting'
+apply: aTool <ASTTool> = (
+	^aTool selfSendNode: self
+)) : ()
+class SuperSendAST = SendAST ()
+('visiting'
+apply: aTool <ASTTool> = (
+	^aTool superSendNode: self
+)) : ()
+class TemporaryDeclarationAST = ()
+() : ()'as yet unclassified'
+normalSendNode: node <NormalSendAST> ^<AST> = (
+	
+	(isHereNode: node recv)
+		ifTrue:[^processHereSend: node msg].
+	(isOuterNode: node recv)
+		ifTrue:[^processExplicitOuterReceiver: node msg].
+	(isSuperNode: node recv)
+		ifTrue:[^SuperSendAST send: (node msg apply: self)].	
+	(isInlineableSend: node)
+		ifTrue:[^processInlineableSend: node].
+	
+	(* And lo, we really have a normal send. *)
+	^NormalSendAST new
+		to: (node recv apply: self) send: (node msg apply: self);
+		start: node start; end: node end
+)
+processHereSend: msg <MessageAST> = (
+	(* implicit outer, local variable, debug mapped variable, true/false/nil *)
+)'scopes'
+currentScope ^<Scope> = (
+	^scopeStack last
+)
+popScope ^<Scope> = (
+	^scopeStack removeLast
+)
+pushScope: scope <Scope> = (
+	scopeStack addLast: scope
+)
+pushScopeForNode: node <AST> = (
+	pushScope: (scopeMap at: node)
+)) : ()
+class ScopeBuilder nestedIn: initialScope <Scope> atLevel: initialDepth <Integer> = ASTTool (
+(* The scope builder is a visitor on the AST. It computes a tree of scopes that shadows the AST itself. More precisely, it computes a mapping from ASTs to their scopes. This allows us to get to the appropriate scope for an abstract syntax node without polluting the AST with extraneous data like scopes.
+
+We could associate each node in the AST with the scope in which it is found, but this would be overkill. Instead, only nodes that actually introduce new scopes (such as class sides, message patterns, code bodies and blocks) actually get mapped in this manner. The intent is that later phases of compilation will visit the tree and look up the scopes at the points where they are introduced.
+
+The builder starts at a given node, in the context of some mixin, described by a mirror. This is because, in an incremental environment, we may not have the complete AST for a module, but instead be asked to process a part of that module, such as a nested class, slot definition or method. The surrounding scope can be computed from the mirror representing the immediately enclosing mixin.
+
+Then we traverse the tree, creating and populating new scopes as needed. We maintain a stack of scopes (scopeStack) that initially contains only the surrounding scope. Scopes get pushed on to the stack when we encounter a node that introduces a scope, and popped when we finish with that node. The scopes are chained to their super scopes (the scope below them on the stack).
+
+A possible optimization is to avoid a traversal of an entire side of a class.
+One can process only a side without its subtrees (i.e., methods and nested classes). These can be visited later, as long as we ensure that the processing of the subtree begins with a proper super scope on top of the scope stack. *)| 
+scopeStack <OrderedCollection[Scope]> = OrderedCollection new.
+currentDepth <Integer> ::= initialDepth. (* The lexical nesting level of the class declaration currently being visited; top-level classes are level 0. *)
+|pushScope: initialScope)
+('access'
+visitNode: aNode <AST> within: m <ClassDeclarationMirror> ^ <Dictionary[AST, Scope]> = (
+   pushScope: (buildScopeFor: m).
+   aNode apply: self.
+   ^scopeMap
+)'as yet unclassified'
+buildScopeFor: cd <ClassDeclarationMirror> ^<Scope> = (
+	^prvtScopeFor: cd.
+)
+enclosingMixinsOf: m <ClassDeclarationMirror> ^<Collection[ClassDeclarationMirror]> = (
+	(* top to bottom *)
+	| current mixins |
+	mixins:: OrderedCollection new.
+	current:: m.
+	[current isNil] whileFalse:
+		[mixins addFirst: current.
+		current: current enclosingClass].
+	^mixins
+)
+prvtScopeFor: c <ClassDeclarationMirror> ^<Scope> = (
+	(* When incrementally compiling a nested class, we need to reconstruct its scope. *)
+	| 
+	scope <Scope> 
+	outerMixins <Collection[ClassDeclarationMirror]>
+	depth <Integer>
+	|
+
+	outerMixins:: enclosingMixinsOf: c. (* Should use a cleaner API *)
+	currentDepth:: outerMixins size - 1.
+	depth:: 0.
+	
+	outerMixins do:
+		[:o <ClassDeclarationMirror> |
+		scope:: Scope new superScope: scope.
+	
+		depth = 0 ifTrue: [
+			(* Top level to pretend it has an accessor at a level enclosing it. *)
+			scope
+			at: o simpleName asSymbol
+			put: (SymbolTableEntry
+				forMessage: o simpleName asSymbol
+				atDepth: depth-1)].
+	
+		(selectorsFor: o) do: 
+			[:sel |
+			scope
+			at: sel 
+			put: (SymbolTableEntry forMessage: sel atDepth: depth)].
+		
+		depth:: depth + 1].
+	
+	^scope
+)
+selectorsFor: m <ClassDeclarationMirror> ^ <Collection[Symbol]> = (
+	(* Should add a convenience method to mirrors to do this *)
+	| result <Collection[Symbol]> |
+	result:: OrderedCollection new.
+	result addAll: (m instanceSide methods collect: [:s <MethodMirror> | s name]).
+	result addAll: (m instanceSide slots collect: [:s <SlotMirror> | s name]).
+	result addAll: ((m instanceSide slots select: [:s | s isMutable]) 
+	                         collect: [:s <SlotMirror> | s name, ':']).
+	result addAll: (m instanceSide nestedClasses
+		collect: [:s <ClassDeclarationMirror> | s simpleName]).
+	^result
+)'node traversal'
+blockNode: aNode <BlockAST> = (
+	| parameterScope <Scope> |
+	parameterScope:: Scope new.
+	(* establish parameter scope *)
+	aNode parameters do:
+		[:parameter <VarDeclAST> | 
+			parameterScope
+			at: parameter name
+			put: (SlotEntry
+				forDeclaration: parameter
+				atDepth: currentDepth)].
+	nestScope: parameterScope.
+	
+	(* visit body *)
+	aNode body apply: self.
+	scopeMap at: aNode put: (scopeMap at: aNode body).
+	
+	popScope (* pop the parameter scope, ps *)
+)
+cascadedSendNode: aNode <CascadedSendAST> = (
+
+	(* generic traversal code *)
+	(* visit receiver and messages *)
+	aNode prevSend apply: self.
+	aNode msg apply: self.
+)
+charNode: aNode <CharAST> = (
+	(* leaf, do nothing *)
+)
+classHeaderNode: aNode = (
+
+	aNode constructor apply: self.
+	aNode slots do: [:s | s initializer ifNotNil: [:i | i apply: self]].
+	aNode initExprs do: [:e | e apply: self].
+)
+classNode: aNode <ClassDeclarationAST> = (
+
+	| vs <Scope> |
+	
+	currentScope
+		at: aNode name 
+		put: (ClassEntry forDeclaration: aNode atDepth: currentDepth).
+		
+	vs:: Scope new. (* establish instance side scope *)
+	currentDepth:: currentDepth + 1.
+	aNode hdr slots do: [:v <SlotDeclAST> | 
+		| se = SlotEntry forDeclaration: v atDepth: currentDepth. |
+		vs at: v name put: se. (* getter *)
+		vs at: (setterSelectorFor: v) put: se. (* setter *)].
+		
+	self nestScope: vs.
+  		aNode instanceSide apply: self.
+	popScope.
+	self nestScope: Scope new. (* establish class side scope *)
+  		aNode classSide apply: self.
+	popScope.
+	currentDepth:: currentDepth - 1.
+)
+codeBodyNode: aNode <CodeBodyAST> = (
+	| ts <Scope> |
+	(* establish local slot scope *)
+
+	ts:: Scope new.
+	aNode temporaries do:[:t <SlotDefAST> | 
+		|svd|
+		svd:: SlotEntry forDeclaration: t slotDecl atDepth: currentDepth.
+		ts at: t name put: svd. (* getter *)
+		ts at: (setterSelectorFor: t) put: t slotDecl. (* setter *)
+		ts at: ('setOnce`',t name) asSymbol put: svd. (* trick so lookups of the initializer for immutables will find the right slot *)].
+
+	nestScope: ts.
+	scopeMap at: aNode put: ts.
+	(* visit statements *)
+	aNode temporaries do: [:t | 	t initializer isNil ifFalse: [t initializer apply: self]].
+	aNode statements do:[: s <ReturnStatementAST | SendAST>  | s apply: self].
+	popScope.
+)
+keywordPatternNode: n = (
+	(* leaf, do nothing *)
+)
+literalPatternNode: n = (
+	(* leaf, do nothing *)
+)
+messageNode: aNode <MessageAST> = (
+	(* generic traversal code *)
+	(* visit arguments *)
+	aNode args do: [:arg <ExpressionAST> | arg apply: self]
+)
+messagePatternNode: aNode <MessagePatternAST> = (
+
+	| parameterScope <Scope> |
+	parameterScope:: Scope new.
+	(* establish parameter scope *)
+	aNode parameters do:
+		[:parameter <VarDeclAST> | 
+		parameterScope
+		at: parameter name
+		put: (SlotEntry
+			forDeclaration: parameter
+			atDepth: currentDepth)].
+	
+	nestScope: parameterScope.
+	scopeMap at: aNode put: parameterScope.
+	(* the pattern scope, ps, must be popped by the caller *)
+	(* establish type parameter scope - skip for now *)
+)
+methodNode: aNode <MethodAST> = (
+
+	(* register method in current scope *)
+	currentScope
+		at: aNode pattern selector
+		put: (MethodEntry forDeclaration: aNode atDepth: currentDepth).
+
+	(* visit pattern *)
+	aNode pattern apply: self.
+	
+	(* visit body *)
+	aNode body apply: self.
+	scopeMap at: aNode put: (scopeMap at: aNode body).
+
+	popScope (* Pop pattern scope *)
+)
+mixinApplication: node <MixinApplicationAST> = (
+
+	node mixinExpr apply: self.
+	node superclassExpr apply: self
+)
+mixinClassNode: aNode = (
+	(* leaf, do nothing *)
+)
+normalSendNode: aNode <NormalSendAST> = (
+	(* generic traversal code *)
+	(* visit recvr and msg *)
+	aNode recv apply: self.
+	aNode msg apply: self.
+)
+numberNode: aNode <NumberAST> = (
+	(* leaf, do nothing *)
+)
+returnStatNode: aNode <ReturnStatAST> = (
+	(* generic traversal code *)
+	(* visit expression *)
+	aNode expr apply: self
+)
+setterSendNode: aNode <SetterSendAST> = (
+	(* visit recvr and msg *)
+	aNode recv apply: self.
+	aNode msg apply: self.
+)
+sideNode: aNode <SideAST> = (
+
+	scopeMap at: aNode put: currentScope.
+
+	(* visit methods *)
+	aNode categories do:
+		[:c <CategoryAST> | 
+		c methods do:
+			[:m <MethodAST> | m apply: self]].
+	
+	(* visit nested classes *)
+	aNode nestedClasses do:
+		[:nc <ClassDeclarationAST> | nc apply: self].
+)
+stringNode: aNode <StringAST> = (
+	(* leaf, do nothing *)
+)
+symbolNode: aNode <SymbolAST> = (
+	(* leaf, do nothing *)
+)
+tupleNode: aNode <TupleAST> = (
+	(* visit elements *)
+	aNode elements do: [:e <ExpressionAST> | e apply: self]
+)
+varDeclNode: aNode <VarDeclAST> = (
+	(* Do nothing. It could arguably add aNode's data to current scope - but in practice, the context knows better how to do this. *)
+)
+variableNode: aNode <VariableAST> = (
+	assert: [aNode name = #'@here' or: [isPseudoVariableNode: aNode]]
+	message: 'Unexpected variable name'.
+)
+wildcardPatternNode: node = (
+	(* leaf, do nothing *)
+)'private'
+currentScope ^ <Scope> = (
+	^scopeStack last
+)
+isPseudoVariableNode: aNode <VariableAST> ^<Boolean> = (
+	^aNode name = #self
+		or: [aNode name = #super
+		or: [aNode name = #outer
+		or: [aNode name = #thisContext]]]
+)
+nestScope: s <Scope> = (
+	(* Hook up a new lexically nested scope, and push onto the scope stack *)
+	s superScope: currentScope.
+	pushScope: s
+)
+popScope ^<Scope> = (
+	^scopeStack removeLast
+)
+pushScope: s <Scope> = (
+	scopeStack addLast: s
+)) : ('as yet unclassified'
+new ^<Instance> = (
+	^self nestedIn: Scope new atLevel: 0
+))'as yet unclassified'
+setterSelectorFor: slot <SlotDefAST | InstanceVariableMirror> ^<Symbol> = (
+	subclassResponsibility
+)) : ()
+class MethodEntry forDeclaration: decl atDepth: d = SymbolTableEntry forAST: decl atDepth: d (|
+|)
+() : ()
+class Scope = (
+(* A generic scope facility. *)|
+superScope <Scope>
+bindings <Map[Symbol, SymbolTableEntry]> = Dictionary new.
+|)
+('access'
+at: aKey put: aValue = (
+	^self bindings at: aKey put: aValue
+)
+at: aKey put: aValue ifThere: aBlock = (
+
+	(* Associates aValue with aKey and answers aValue if aKey
+    was absent. Otherwise answers the value of aBlock. *)
+	| wasAbsent |
+	assert: [aKey isSymbol] 
+		message: ['Attempt to ok up non-symbol ', aKey printString, ' in scope'].
+	wasAbsent:: false.
+	bindings at: aKey ifAbsent: [bindings at: aKey put: aValue. wasAbsent:: true].
+	^wasAbsent
+		ifTrue: [aValue]
+		ifFalse: [aBlock value]
+)
+at: key <Symbol> ^<SymbolTableEntry> = (
+	(* Answers the value associated with aKey in this or one the super scopes or fails if aKey is absent. *)
+	^self at: key ifAbsent: [Error signal: 'Key ', key, ' not found!']
+)
+at: key ifAbsent: blk = (
+	(* Answers the value associated with aKey in this or one of the superScopes or the value of aBlock if aKey is absent. *)
+	(* Optimization note: This is written using [nil] blocks to avoid passing non-clean blocks dynamically down the scope structure. *)
+
+	| val <T> |
+	(val:: self bindings at: key ifAbsent: [ nil ]) notNil
+		ifTrue: [ ^val ].
+	self superScope isNil
+		ifTrue: [ ^blk value ].
+	(val:: self superScope at: key ifAbsent: [ nil ]) notNil
+		ifTrue: [ ^val ].
+	^blk value
+)
+clear = (
+	self bindings keys do:[:k | self bindings removeKey: k].
+)
+depth ^ <Integer> = (
+	superScope ifNil: [^0].
+	^superScope depth + 1.
+)
+includesIndex: key <Symbol> ^<Boolean> = (
+	(* should this search the superscope? *)
+	^self bindings includesKey: key
+)
+includesIndexLocally: key <Symbol> ^<Boolean> = (
+	^self bindings includesKey: key.
+)
+removeKey: key <Symbol> = (
+	self bindings removeKey: key
+)
+removeKey: key ifAbsent: blk = (
+	self bindings removeKey: key ifAbsent: blk
+)
+within: scope = (
+	(* Creates and initializes a new (sub)scope within scope. *)
+	self superScope: scope.
+)'as yet unclassified'
+printOn: stm = (
+	stm nextPutAll: 'Scope('.
+	superScope printOn: stm.
+	bindings keysAndValuesDo: [:k :v |
+		stm space.
+		k printOn: stm.].
+	stm nextPutAll: ')'.
+)
+setSuperScope: sc = (
+	
+	superScope isNil
+		ifTrue: [superScope: sc]
+		ifFalse: [superScope setSuperScope: sc]
+)) : ()
+class SlotEntry forDeclaration: decl <VarDeclAST> atDepth: d <Integer> = SymbolTableEntry forAST: decl atDepth: d (
+(* Semantic info for a variable: slot, local or parameter. *)|
+offset <Integer>
+remote <Boolean> ::= false.
+remoteVector <SlotEntry>
+|)
+('as yet unclassified'
+isTemporaryAST ^<Boolean> = (
+	^ast isTemporaryAST
+)
+variableClass ^<Class> = (
+	^ast variableClass
+)) : ()
+class SymbolTableEntry forAST: tree atDepth: d = (
+(* An entry in a scope. *)|
+ast <AST> ::= tree. (* Should investigate mutators of this slot and make immutable if possible. *)
+depth <Integer> = d.
+|)
+('testing'
+isMessagePatternNode ^<Boolean> = (
+	^self ast isMessagePatternNode
+)
+isMethodNode ^<Boolean> = (
+	^self ast isMethodNode
+)
+isVarDeclNode ^<Boolean> = (
+	^self ast isVarDeclNode
+)) : ('as yet unclassified'
+forMessage: selector <Symbol> atDepth: depth <Integer> ^<SymbolTableEntry> = (
+	^self forAST: (MessagePatternAST new selector: selector) atDepth: depth
+))) : ()

@@ -82,6 +82,7 @@ Copyright 2012-2013 Gilad Bracha, Ryan Macnak and Cadence Design Systems
 	
 	(* Module variables *)
 	parser = Parser new.
+	internalParser = ns3Parser InternalParser new.
 	|)
 (
 class Compiler = super Compiler (
@@ -3597,6 +3598,67 @@ Otherwise, we return a MixinRep which represents the enclosing class and the nes
   scopeMap:: Dictionary new. 
   ^ mixinRep
 )
+compileExpressionSource: src <ReadStream | String> inContext: aContext <MethodContext> inMixin: enclosing <MixinMirror> allowBacktick: allowBacktick <Boolean> ^<LowLevelMethodMirror>
+= (
+	(* Compile a DoIt method.  If aContext is not nil, compile a DoItIn:ctxt method where accesses to names in scope of the context are rewritten to access through the context.  Cog closures complicate this rewriting compared to BlockContexts, as access might be rather indirect.  Also, in cases where a temp is only a copied value and not in an remote indirection vector, it would be impractical to handle writes such that they actually track down all places where the temp lives and update them.  In these cases, we should merely find the most local copy, which I believe is what closure compiled Squeak does. *)
+	|
+	body <CodeBodyAST>
+	stm <ReadStream>
+	method <MethodAST>
+	result <LowLevelMethodMirror>
+	|
+	assert: [aContext isNil or: [aContext method methodClass language isNewspeakLanguage3]]
+		message: 'Context is not NS3!'.
+	
+	(* Parse as a code body *)
+	src isString ifTrue: [stm: src readStream] ifFalse: [stm: src].
+	body:: (allowBacktick ifTrue: [internalParser] ifFalse: [parser])
+		codeBody parse: stm.
+	saveInput: stm.
+	
+	(* Ensure last statement is a return statement *)
+	body statements isEmpty ifFalse:
+		[body statements last isReturnStatNode ifFalse:
+			[| last |
+			last:: body statements removeLast.
+			body statements add: (ReturnStatAST new 
+				expr: last; start: last start; end: last end)]].
+
+	(* Put into a method *)
+	method:: MethodAST new
+		pattern: (aContext isNil
+			ifTrue: [allowBacktick 
+				ifTrue: [MessagePatternAST new selector: #DoItWithTopLevel: parameters: 
+					{VarDeclAST name: doitTopLevelName type: nil}]
+				ifFalse: [MessagePatternAST new selector: #DoIt parameters: {}]]
+			ifFalse: [MessagePatternAST new selector: #DoItIn: parameters: 
+				{VarDeclAST name: doitContextArgumentName type: nil}]);
+		body: body;
+		visibility: #public.
+	
+	(* Build scope *)
+	aContext isNil ifTrue: [
+		setScopeFor: method in: (enclosing).
+	] ifFalse: [
+		| debugInfo debugMapper |
+		debugInfo:: (compileMethodSource: aContext method getSource asString readStream within: enclosing) debugInfo. (* Resets scope, so do first *)
+		setScopeFor: method in: (enclosing).
+		debugMapper:: debugInfo mapperForContext: aContext.
+		debugMapper localNames do: [:name <Symbol> |
+			currentScope at: name put: 
+				(DebugMappedLocalEntry name: name mapper: debugMapper).
+			currentScope at: (name,':') asSymbol put: 
+				(DebugMappedLocalEntry name: name mapper: debugMapper).
+		].
+	].
+	
+	(* Rewrite and compile *)
+	(method apply: rewriter) apply: methodCompiler.
+ 	result: methodCompiler result.
+	result src: stm contents.
+	scopeMap:: Dictionary new.
+	^result
+)
 compileNestedClassAST: tree <ClassDeclarationAST> into: enclosingClass <ClassDeclarationMirror> ^ <MixinRep> = (
 	| 
 		nestedClassMixinReps <List[MixinRep]>
@@ -3619,6 +3681,9 @@ doitContextArgumentName = (
 	and doesn't need to be since the debugger provides Inspect Context.
 	But if you're desperate, use ThisContext, as does the Squeak debugger. *)
 	^true ifTrue: [#'@context'] ifFalse: [#'ThisContext']
+)
+doitTopLevelName = (
+	^#'`topLevel'
 )
 futureFor: expression <ExpressionAST> ^<ExpressionAST> = (
 	(* @here Future computing: [expression] *)

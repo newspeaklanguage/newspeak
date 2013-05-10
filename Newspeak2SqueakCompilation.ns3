@@ -1259,8 +1259,9 @@ pushScope: s <Scope>= (
 	scopeStack addLast: s
 )
 slotsPerMethod ^ <Integer> = (
-	(*^cgen slotsPerMethod (* must expose this to higher levels of compiler so synthetic methods can be built correctly *) *)
-	^64
+	(* must expose this to higher levels of compiler so synthetic methods can be built correctly *)
+	#BOGUS. (* Should delegate to the code generator, but code generator could be nil. Need to unify choice of bytecode. *)
+	^32768 (* 2<<16 / 4 *)
 )'initialize-release'
 setup = (
 	cgen: CodeGeneratorV4 new.
@@ -3777,6 +3778,52 @@ saveInput: src <ReadStream> = (
 setterSelectorFor: slot <SlotDefAST | InstanceVariableMirror> ^<Symbol> = (
 	^((slot isMutableSlot ifTrue: [ '' ] ifFalse: [ 'setOnce`' ]), slot name, ':') asSymbol.
 )
+singleInitializerFor: aNode <ClassHeaderAST> ^<Collection[MethodAST]> = (
+
+	| 
+	start <integer>
+	end <Integer>
+	stmts <List[StmtAST]> 
+	initHdr <MessagePatternAST>
+	body <CodeBodyAST>  
+	slots <Collection[StmtAST]>
+	copier <ASTCopier>
+	|
+
+	start:: aNode superConstructorCall start.
+	end::  aNode  superConstructorCall end.
+	copier:: ASTCopier new.
+	initHdr:: aNode constructor apply: copier. (* set up scope with constructor parameters *)
+	initHdr selector: (initializerSelectorNameFor: initHdr selector).	
+
+	slots:: (aNode slots reject: [:slot | slot initializer isNil]) collect: 
+		[:slot <SlotDefAST> |
+		| aMsg <MessageAST> slotInitializer <ExpressionAST> |
+		slotInitializer:: slot initializer apply: copier.
+		aNode isSeq ifFalse: [slotInitializer:: futureFor: slotInitializer].
+		aMsg:: MessageAST new 
+			send: (setterSelectorFor: slot) with:  {slotInitializer};
+			start: slot start;
+			end: slot end.
+		NormalSendAST new msg: aMsg; 
+			recv: (selfNode start: aMsg start; end: aMsg end);
+			start: aMsg start; end: aMsg end].
+
+	(* Call super initializer, then run slots initializers, then run init expressions *)
+	stmts:: OrderedCollection new.
+	stmts add: (superConstructorCallFor: aNode). 
+	stmts addAll: slots.
+	aNode initExprs do:
+		[:ie <ExpressionAST> | stmts add: (ie apply: copier)]. 
+
+	body:: CodeBodyAST new
+		temporaries: OrderedCollection new
+		statements: stmts;
+		start: start; end: end.
+	^{MethodAST new 
+		pattern: initHdr body: body visibility: #public;
+		start: start; end: end}
+)
 sourceForNode: node <AST> ^ <String> = (
 	| savedPos <Integer> pos <Integer> len <Integer> s <String> |
 	savedPos:: input position.
@@ -3786,6 +3833,64 @@ sourceForNode: node <AST> ^ <String> = (
 	input next: len into: s startingAt:1.
 	input position: savedPos.
 	^s
+)
+splitInitializersFor: aNode <ClassHeaderAST> ^<Collection[MethodAST]> = (
+
+	(* Because the init sequence may not fit in a single method, because too many literals are needed for all the setters and getters, we produce an init method that calls a number of private sub-initializers. This main initializer routine first calls the superclass's main initializer, then calls the subinitializers to set all the slots, and then any initialization code in the header. Answers a collection of MethodASTs including the main and sub intializers. *)
+	| 
+	start <integer>
+	end <Integer>
+	stmts <List[StmtAST]> 
+	initHdr <MessagePatternAST>
+	body <CodeBodyAST>  
+	slots <Collection[StmtAST]>
+	subs <Collection[MethodAST]>
+	copier <ASTCopier>
+	|
+
+	start:: aNode superConstructorCall start.
+	end::  aNode  superConstructorCall end.
+	copier:: ASTCopier new.
+	initHdr:: aNode constructor apply: copier. (* set up scope with constructor parameters *)
+	initHdr selector: (initializerSelectorNameFor: initHdr selector).	
+	subs:: subInitializersFor: aNode. (* compute (empty) subinitializers *)
+	
+	slots:: (aNode slots reject: [:slot | slot initializer isNil]) collect: 
+		[:slot <SlotDefAST> |
+		| aMsg <MessageAST> slotInitializer <ExpressionAST> |
+		slotInitializer:: slot initializer apply: copier.
+		aNode isSeq ifFalse: [slotInitializer:: futureFor: slotInitializer].
+		aMsg:: MessageAST new 
+			send: (setterSelectorFor: slot) with:  {slotInitializer};
+			start: slot start;
+			end: slot end.
+		NormalSendAST new msg: aMsg; 
+			recv: (selfNode start: aMsg start; end: aMsg end);
+			start: aMsg start; end: aMsg end].
+
+	(* populate subinit methods with slot initialization code *)
+	(1 to: slots size) with: slots do: [:n :stmt |
+		(subs at: n  // methodCompiler slotsPerMethod + 1) body statements add: stmt]. 
+
+	stmts:: OrderedCollection new.
+	(* first call the superclass initializer *)
+	stmts add: (superConstructorCallFor: aNode). 
+	(* then call the subinitializers for the slots *)
+	1 to: subs size -1 do: 
+		[:i | stmts add: (sendForSub: (subs at: i))].
+	(* then the initializer code *)
+	aNode initExprs do:
+		[:ie <ExpressionAST> | stmts add: (ie apply: copier)]. 
+
+	body:: CodeBodyAST new
+		temporaries: OrderedCollection new
+		statements: stmts;
+		start: start; end: end.
+	subs at: subs size put: (MethodAST new 
+		pattern: initHdr body: body visibility: #public;
+		start: start; end: end).
+
+	^subs
 )
 syntheticNameSeparator ^ <String> = (
   ^Language syntheticNameSeparator	
@@ -3862,61 +3967,9 @@ processFactoryFor: aNode <ClassHeaderAST> inScope: s in: mixinMirror <LowLevelMi
 )'instance initializers'
 allInitializersFor: aNode <ClassHeaderAST> ^<Collection[MethodAST]> = (
 
-	(* Because the init sequence may not fit in a single method, because too many literals are needed for all the setters and getters, we produce an init method that calls a number of private sub-initializers. This main initializer routine first calls the superclass's main initializer, then calls the subinitializers to set all the slots, and then any initialization code in the header. Answers a collection of MethodASTs including the main and sub intializers. *)
-	| 
-	start <integer>
-	end <Integer>
-	stmts <List[StmtAST]> 
-	initHdr <MessagePatternAST>
-	body <CodeBodyAST>  
-	slots <Collection[StmtAST]>
-	subs <Collection[MethodAST]>
-	copier <ASTCopier>
-	|
-
-	start:: aNode superConstructorCall start.
-	end::  aNode  superConstructorCall end.
-	copier:: ASTCopier new.
-	initHdr:: aNode constructor apply: copier. (* set up scope with constructor parameters *)
-	initHdr selector: (initializerSelectorNameFor: initHdr selector).	
-	subs:: subInitializersFor: aNode. (* compute (empty) subinitializers *)
-	
-	slots:: (aNode slots reject: [:slot | slot initializer isNil]) collect: 
-		[:slot <SlotDefAST> |
-		| aMsg <MessageAST> slotInitializer <ExpressionAST> |
-		slotInitializer:: slot initializer apply: copier.
-		aNode isSeq ifFalse: [slotInitializer:: futureFor: slotInitializer].
-		aMsg:: MessageAST new 
-			send: (setterSelectorFor: slot) with:  {slotInitializer};
-			start: slot start;
-			end: slot end.
-		NormalSendAST new msg: aMsg; 
-			recv: (selfNode start: aMsg start; end: aMsg end);
-			start: aMsg start; end: aMsg end].
-
-	(* populate subinit methods with slot initialization code *)
-	(1 to: slots size) with: slots do: [:n :stmt |
-		(subs at: n  // methodCompiler slotsPerMethod + 1) body statements add: stmt]. 
-
-	stmts:: OrderedCollection new.
-	(* first call the superclass initializer *)
-	stmts add: (superConstructorCallFor: aNode). 
-	(* then call the subinitializers for the slots *)
-	1 to: subs size -1 do: 
-		[:i | stmts add: (sendForSub: (subs at: i))].
-	(* then the initializer code *)
-	aNode initExprs do:
-		[:ie <ExpressionAST> | stmts add: (ie apply: copier)]. 
-
-	body:: CodeBodyAST new
-		temporaries: OrderedCollection new
-		statements: stmts;
-		start: start; end: end.
-	subs at: subs size put: (MethodAST new 
-		pattern: initHdr body: body visibility: #public;
-		start: start; end: end).
-
-	^subs
+	^aNode slots size > methodCompiler slotsPerMethod
+		ifTrue: [splitInitializersFor: aNode]
+		ifFalse: [singleInitializerFor: aNode]
 )
 initializerSelectorNameFor: selector <Symbol> ^<Symbol> = (
 	^('initializer`', selector) asSymbol

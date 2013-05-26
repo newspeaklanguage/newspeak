@@ -1,0 +1,3061 @@
+Newspeak3
+'Experiments'
+class Newspeak2V8Compilation usingPlatform: platform
+ parsing: parsing
+ generation: generation
+ mirrors: mirrors = NewspeakCompilation
+ usingPlatform: platform
+ asts: parsing ASTModule (
+(* NS2V8 is a fork of NS2JS with attention on avoiding performance traps on V8.
+
+Selectors are mangled to legal JavaScript identifiers to avoid V8 eagerly transitioning objects to dictionary mode. Because more characters are allowable in its identifiers, this is cleaner for JavaScript than Dart. Colons become dollars, binary selectors are mapped by a table, and synthetics start with a dollar. (We don't yet fully live up to that last part.)
+
+Bootstrapping is much more similar to NS2Dart, where there is only one version of the code for the Kernel classes which is hand-initialized, rather than phases as in NS2JS.
+
+NS2V8 treats messages sends in the runtime modules to 'js' as intrinsics, evalutating them at compile time. This allows the logic of primitive behavior to defined where is it need, an improvement over the vmmirror intrinsic in NS2Dart which required the logic to be specified in a compiler class.
+
+Unlike NS2JS, the output conforms to strict mode.
+
+NS2V8 only supports the DNU stubs ('big prototype in the sky') implementation of doesNotUnderstand. It installs all DNU stubs up front, rather than at each mixin application.
+
+TODO: ensure we do all of the inlining done by NS2Dart
+
+TODO: add a testing strategy for the compiler test suite
+
+
+Copyright 2008 Cadence Design Systems, Inc.
+Copyright 2009-2010 Gilad Bracha.
+Copyright 2012 SAP AG.
+Copyright 2012 Google Inc.
+Copyright 2013 Ryan Macnak
+   
+Licensed under the Apache License, Version 2.0 (the ''License''); you may not use this file except in compliance with the License.  You may obtain a copy of the License at  http://www.apache.org/licenses/LICENSE-2.0 *)|
+      asts = parsing ASTModule.
+	Collection = platform collections Collection.
+	Dictionary = platform collections Dictionary.
+	IdentityDictionary = platform collections IdentityDictionary.
+	OrderedCollection = platform collections OrderedCollection.
+	SortedList = platform collections SortedList.
+	Set = platform collections Set.
+	ReadStream = platform streams CharacterReadStream.
+	WriteStream = platform streams CharacterReadWriteStream.
+
+	MutableString = platform kernel MutableString.
+	
+	Parser = parsing Parser.
+	
+	javascriptGeneration = generation.
+	JavascriptWriter = javascriptGeneration Writer.
+	js = javascriptGeneration factory.
+
+	names = NameMangler new.
+
+	ASTTool = asts ASTTool.
+      ASTCopier = asts ASTCopier.
+      SuperFalseVisitor = asts FalseVisitor.
+      AST = asts AST.
+	AssignmentAST = asts AssignmentAST.
+	BlockAST = asts BlockAST.
+	CascadedSendAST = asts CascadedSendAST.
+	CodeBodyAST = asts CodeBodyAST.
+	MessageAST = asts MessageAST.
+      MessagePatternAST = asts MessagePatternAST.
+	MethodAST = asts MethodAST.
+	NormalSendAST = asts NormalSendAST.
+	NumberAST = asts NumberAST.
+	ReturnStatAST = asts ReturnStatAST.
+      SendAST = asts SendAST.
+	SymbolAST = asts SymbolAST.
+	TupleAST = asts TupleAST.
+      VarDeclAST = asts VarDeclAST.
+	VariableAST = asts VariableAST.
+
+	parser = Parser new.
+|)
+(
+class ClassDeclarationIR = (|
+	name
+	instanceSide = MixinIR for: self isMeta: false.
+	classSide = MixinIR for: self isMeta: true.
+|)
+('as yet unclassified'
+basicNew = (
+	^js functionOf: {} body: (js block: (
+		{
+		js call: (js ident: 'superBasicNew.call') with: {js ident: 'this'}.
+		js assign: (js propertyOf: (js ident: 'this') at: (js ident: 'debug')) toBe: (js literal: 'An instance of ', name).
+		},
+		(instanceSide slots collect: [:s | 
+			js assign: (js propertyOf: (js ident: 'this') at: (js ident: (names mangleSlot: s name))) toBe: (js ident: 'nil')])
+	))
+)
+basicNewMeta = (
+	^js functionOf: {} body: (js block: (
+		{
+		js call: (js ident: 'superBasicNew.call') with: {js ident: 'this'}.
+		js assign: (js propertyOf: (js ident: 'this') at: (js ident: 'debug')) toBe: (js literal: 'An instance of ', name, ' class').
+		}
+	))
+)
+invoke = (
+	^js functionOf: {js ident: 'runtimeSuperclass'. js ident: 'enclosingObjects'} body: (js block: {
+		js function: 'constructRuntimeClass' of: {js ident: 'superBasicNew'} body: (js block: (
+			{
+			js assign: (js propertyOf: (js ident: 'this') at: (js ident: 'debug')) toBe: (js literal: 'Runtime class for ', name).
+			},
+			(instanceSide methods collect: [:m | 
+				js assign: (js propertyOf: (js ident: 'this') at: (js ident: m name))
+					toBe: (js propertyOf: (js ident: '$') at: (js ident: m name)) ]),
+			{
+			js assign: (js propertyOf: (js ident: 'this') at: (js ident: (names mangleSelector: 'enclosingObjects`',name)))
+				toBe: (js ident: 'enclosingObjects').
+			js assign: (js propertyOf: (js ident: 'this') at: (js ident: (names mangleSelector: 'super`',name)))
+				toBe: (js ident: 'runtimeSuperclass').
+			js assign: (js propertyOf: (js ident: 'this') at: (js ident: 'basicNew')) toBe: basicNew.
+			js verbatim: 'this.basicNew.prototype = this'.
+			js verbatim: 'this.meta = null'.
+			js verbatim: 'this.newspeakClass = null'.
+			}
+		)).
+		js verbatim: 'constructRuntimeClass.prototype = runtimeSuperclass'.
+		js verbatim: 'return new constructRuntimeClass(runtimeSuperclass.basicNew)'.
+	})
+)
+invokeMeta = (
+	^js functionOf: {js ident: 'runtimeSuperclass'. js ident: 'enclosingObjects'.} body: (js block: {
+		js function: 'constructRuntimeClass' of: {js ident: 'superBasicNew'} body: (js block: (
+			{
+			js assign: (js propertyOf: (js ident: 'this') at: (js ident: 'debug')) toBe: (js literal: 'Runtime meta class for ', name).
+			},
+			(classSide methods collect: [:m | 
+				js assign: (js propertyOf: (js ident: 'this') at: (js ident: m name))
+					toBe: (js propertyOf: (js ident: '$') at: (js ident: m name)) ]),
+			{
+			js assign: (js propertyOf: (js ident: 'this') at: (js ident: (names mangleSelector: 'enclosingObjects`',name)))
+				toBe: (js ident: 'enclosingObjects').
+			js assign: (js propertyOf: (js ident: 'this') at: (js ident: (names mangleSelector: 'super`',name)))
+				toBe: (js ident: 'runtimeSuperclass').	
+			js assign: (js propertyOf: (js ident: 'this') at: (js ident: 'basicNew')) toBe: basicNewMeta.
+			js verbatim: 'this.basicNew.prototype = this'.
+			js assign: (js propertyOf: (js ident: 'this') at: (js ident: 'nonMeta')) toBe: (js ident: 'null').
+			js verbatim: 'this.newspeakClass = null'.
+			}
+		)).
+		js verbatim: 'constructRuntimeClass.prototype = runtimeSuperclass'.
+		js verbatim: 'return new constructRuntimeClass(runtimeSuperclass.basicNew)'.
+	})
+)
+makeMixin: rm = (
+	^js call: (js propertyOf: (js ident: 'Mixin') at: (js ident: 'fromRuntimeMixin')) with: {rm}
+)
+printOn: stm = (
+	stm nextPutAll: 'ClassDeclarationIR:'.
+	stm nextPutAll: name.
+)
+runtimeMetamixin = (
+	^js assign: (js propertyOf: (js ident: 'this') at: (js ident: 'meta')) toBe: (
+	js new: (js functionOf: {} body: (js block: (
+		{
+		js var: '$' value: (js ident: 'this').
+		js assign: (js propertyOf: (js ident: 'this') at: (js ident: 'debug')) toBe: (js literal: 'Runtime meta mixin for ', name).
+		},
+		(classSide methods collect: [:m | 
+			js assign: (js propertyOf: (js ident: 'this') at: (js ident: m name)) toBe: m function]),
+		{
+		js assign: (js propertyOf: (js ident: 'this') at: (js ident: 'invoke')) toBe: invokeMeta.
+		}
+	))) with: {})
+)
+runtimeMixin = (
+	^js new: (js functionOf: {} body: (js block: (
+		{
+		js var: '$' value: (js ident: 'this').
+		js assign: (js propertyOf: (js ident: 'this') at: (js ident: 'debug')) toBe: (js literal: 'Runtime mixin for ', name).
+		},
+		(instanceSide methods collect: [:m | 
+			js assign: (js propertyOf: (js ident: 'this') at: (js ident: m name)) toBe: m function]),
+		(instanceSide nestedClasses collect: [:ncd | 
+			js assign: (js propertyOf: (js ident: 'this') at: (js ident: (names mangleSelector: ncd name))) toBe: ncd runtimeMixin]),
+		{
+		js assign: (js propertyOf: (js ident: 'this') at: (js ident: 'invoke')) toBe: invoke.
+		runtimeMetamixin.
+		}
+	))) with: {}
+)) : ()
+class Compiler = super Compiler (
+(* A work-in-progress Compiler reimplementation, with Javascript AST as the output. This makes automated testing easier and provides control over formatting (for example, placing every expression on its own line to allow for precise breakpoint placement in substandard JS debugger implementations). *)|
+	scopeStack ::= OrderedCollection new.
+	input
+	sentSelectors ::= Set new.
+
+	rewriter = Rewriter new.	
+	translator = Translator new.
+	currentDepth
+	currentMixinUID
+	jsTree
+	jsWriter = JavascriptWriter new.
+	supportDoesNotUnderstand ::= true.
+	inlineOperators ::= true.
+	enableIntrinsics ::= true.
+|)
+(
+class Rewriter = ASTTool (
+(* A visitor that rewrites the AST into a form more suitable for compilation to Javascript. It may be possible to combine the pass that constructs the scopes with the rewriting pass, but this may be messy once we start inlining blocks etc. *)| 
+	scopeStack <OrderedCollection[Scope]> = OrderedCollection new.
+	
+	protected valueExpected <Boolean> ::= true. (* A flag set by visitor methods to indicate whether the parent AST uses the value of the currently visited node or not. *)
+	protected rewritingBodyForValue <Boolean> ::= false. (* Set to false prior to visiting a method body, true prior to visiting a non-inlined block body, and false for some inlined blocks. *)
+	protected areReturnsLocal <Boolean> ::= true. (* Set to true while visiting nodes contained within a method and its inlined blocks, false in non-inlined blocks. *)
+	protected conditionalSelectors = Set withAll: {#ifTrue:ifFalse:. #ifFalse:ifTrue:. #ifTrue:. #ifFalse:}.
+	protected inlinableOperators <Dictionary[String, String]> = Dictionary new.
+	protected inlinableNumericOperators <Dictionary[String, String]> = Dictionary new.
+|inlinableOperators
+		at: #+ put: '+';
+		at: #- put: '-';
+		at: #* put: '*';
+		at: #/ put: '/';
+		at: #'==' put: '==='.
+	inlinableNumericOperators	
+		at: #'<' put: '<';
+		at: #'<=' put: '<=';
+		at: #'>' put: '>';
+		at: #'>=' put: '>=')
+(
+class BlockLocalReturnAST expression: x start: s end: e = AST (
+(* This class represents a 'local return' (LR) -  a return from a block to its caller, as opposed to the caller of its enclosing method (a 'non-local return' or NLR).
+
+An actual return statement in a block means an NLR; an LR is implicit in the source language, and occurs on the last statement of the block, unless that statement is a true return (NLR).  However, the back end of the compiler requires that this information be represented explicitly. This node does that. *)|
+ expr <ExpressionAST> = x.
+|start: s. end: e)
+('as yet unclassified'
+apply: aTool <ASTTool>  = (
+	^aTool blockLocalReturnNode: self
+)
+isBlockLocalReturnAST ^<Boolean> = (
+	^true
+)) : ()
+class BoolAST withValue: aBool <Boolean> start: s end: e = VariableAST (
+(*  *)| val = aBool. |start: s. end: e)
+('as yet unclassified'
+apply: aTool <ASTTool > ^ <Self> = (
+	^aTool boolNode: self
+)
+name = (
+	^val printString asSymbol
+)) : ()
+class BoolVisitor = FalseVisitor ()
+('as yet unclassified'
+boolNode: node = (^true)) : ()
+class ContextAST = VariableAST (
+(* Represents uses of thisContext. I expect these to be restricted in future versions. Currently, we use it for outer sends and super sends *))
+('as yet unclassified'
+apply: aTool <ASTTool > ^ <Self> = (
+	^aTool contextNode: self
+)
+name = (
+	^#thisContext
+)
+printOn: strm <CharOutputStream>
+ = (
+
+	super printOn: strm.
+	strm nextPutAll: '(thisContext)'
+)) : ()
+class ContextVisitor = FalseVisitor ()
+('as yet unclassified'
+contextNode: node = (^true)) : ()
+class ExplicitReceiverVisitor = FalseVisitor ()
+('as yet unclassified'
+explicitOuterReceiverNode: aNode <ExplicitOuterRcvrAST> ^ <Boolean> = (
+	^true
+)) : ()
+class ExplicitRecvrAST send: sym <Symbol> depth: d <Integer> = AST (
+(* Represents the receiver of an explicit outer send. *)|
+	outerClassName <Symbol> = sym.
+	depth <Integer> = d.
+	selector <Symbol>
+|)
+('as yet unclassified'
+apply: aTool <ASTTool> ^ <Self> = (
+	^aTool explicitOuterReceiverNode: self
+)
+isExplicitRcvrNode ^ <Boolean> = (
+	^true
+)
+isExpressionNode ^ <Boolean> = (
+	^true
+)) : ()
+class FalseVisitor = SuperFalseVisitor (
+(* Extends the standard FalseVisitor with methods for dealing with the node types introduced by the rewriter.. *))
+('as yet unclassified'
+boolNode: node = (^false)
+contextNode: node = (^false)
+ifNode: aNode <IfAST> ^ <Boolean> = (
+	^false
+)
+implicitSendNode: aNode <ImplicitRcvrSendAST> ^ <Boolean> = (
+	^false
+)
+loopNode: aNode <LoopAST> ^ <Boolean> = (
+	^false
+)
+nilNode: node = (^false)
+parameterNode: aNode <ParameterAST> ^ <Boolean> = (
+	^false
+)
+receiverNode: aNode <ReceiverAST> ^ <Boolean> = (
+	^false
+)
+returnInstVarMethodNode: aNode <ReturnInstVarMethodAST> ^ <Boolean> = (
+	^false
+)
+returnSelfMethodNode: aNode <ReturnSelfMethodAST> ^ <Boolean> = (
+	^false
+)
+superSendNode: aNode <SuperSendAST> ^ <Boolean> = (
+	^false
+)
+superVarNode: aNode <SuperVarAST> ^ <Boolean> = (
+	^false
+)
+temporaryNode: aNode <TemporaryVariableAST> ^ <Boolean> = (
+	^false
+)
+variableNode: aNode = (
+	^false
+)) : ()
+class ImplicitRecvrSendAST send: aMsg <MessageAST> depth: d <integer> = SendAST send: aMsg (
+(*
+Represent a send of a message with an implicit receiver (aka a here send).
+*)| depth <Integer> ::= d. |)
+('as yet unclassified'
+apply: aTool <ASTTool> ^ <Self> = (
+	^aTool implicitSendNode: self
+)
+isExpressionNode ^ <boolean> = (
+	^true
+)
+recv ^ <VarDeclAST> = (
+  ^ assert:[false] message: 'There is no receiver node. It is implicit'
+)) : ()
+class ImplicitRecvrVisitor = FalseVisitor ()
+('as yet unclassified'
+implicitSendNode: aNode <ImplicitRcvrSendAST> ^ <Boolean> = (
+	^true
+)) : ()
+class InlinableAsExpressionConditionalAST = NormalSendAST (
+(* Produced by the rewriter for the conditional messages whose value is required and which can be compiled into a Javascript ternary operator. *)|
+|)
+('as yet unclassified'
+apply: aTool <ASTTool> ^ <Self> = (
+	^aTool inlinableAsExpressionConditionalNode: self
+)) : ()
+class InlinableConditionalAST = NormalSendAST (
+(* Produced by the rewriter for conditional messages (ifTrue: and the like) that can be compiled into Javascript if statements instead of real message sends. To qualify, the message arguments should be literal blocks and the value of the message send should be ignored (for example, '^x ifTrue: [foo]' is not inlinable, while 'x ifTrue: [^foo]' is). *)|
+|)
+('as yet unclassified'
+apply: aTool <ASTTool> ^ <Self> = (
+	^aTool inlinableConditionalNode: self
+)) : ()
+class InlinedOperatorAST = NormalSendAST (
+(* When the inlineOperators mode is on, message sends with certain selectors are replaced with this node. Javascript code generated for those nodes uses native Javascript operators instead of real message sends. The selector of the message of this AST is not a real Newspeak selector but rather the Javascript operator such as &&. *)|
+|)
+('as yet unclassified'
+apply: aTool <ASTTool> ^ <Self> = (
+	^aTool inlinedOperatorNode: self
+)) : ()
+class InstVarVisitor = FalseVisitor ()
+('node traversal'
+instVarNode: node = (^true)) : ()
+class LoopAST = AST (
+(* This node represents a while loop, and its various routines act as constructors that map from various looping constructs into a while loop. In some cases (like whileTrue:) this is trivial, in others it is a bit more involved.
+
+The general form of the loop is:
+
+prologue;
+while (cond = whileTrue) { body}
+
+Ergo, prologue represents some code that sets up the loop (e.g., the initialization of the loop variable when encoding a for loop into a while loop);
+whileTrue is true if the loop continues as long as the test condition holds, and false if the loop runs as long as the condition does not hold;
+cond is the aforementiond test condition; body is the body of the loop. *)| 
+isWhileTrue <Boolean> 
+prologue <CodeBodyAST> ::= 
+	CodeBodyAST new 
+			parameters: OrderedCollection new;
+			temporaries: OrderedCollection new;
+			statements: OrderedCollection new.
+cond <CodeBodyAST> 
+body <CodeBodyAST>  |)
+('as yet unclassified'
+isExpressionNode ^ <boolean> = (
+	^true
+)'public access'
+apply: aTool <ASTTool>
+ = (
+    ^aTool loopNode: self
+)
+do: n <Integer> timesRepeat: block <BlockAST>
+ = (
+	|
+	skope	<Scope>
+	loopVarName <Symbol>
+	var <ParameterAST>
+	|
+	skope:: scopeMap at: block body.
+
+	(* introduce counter variable *)
+	loopVarName:: '.i' asSymbol.
+	var:: (ParameterAST name: loopVarName type: nil) start: block start; end: block end.	
+	skope at: loopVarName put: (SlotEntry forDeclaration: var atDepth: 0) ifThere: [ halt ].
+	assert:[block body parameters isEmpty].
+	block body parameters add: var.
+
+	(* translate n timesRepeat: [blockBody]  into 1 to: n do: [ :.i | blockBody] *)
+	from: (NumberAST new val: 1; start: block start; end: block end) to: n do: block
+)
+from: first <AST> to: last <AST> by: step <AST> do: block <BlockAST>
+ = (
+	|
+	blockScope		<Scope>	
+	counterVar		<TemporaryAST>
+	counter		<TemporaryVariableAST>
+	limitNeeded		<Boolean>
+	limitName		<Symbol>
+	limitVar		<TemporaryAST>
+	limit			<LiteralAST | VariableAST>
+	condSel			<Symbol>
+	condArg		<MutableList[ExpressionAST]>
+	condExpr		<ExpressionAST>
+	condBody		<CodeBodyAST>
+	condStats		<MutableList[StatementAST]>
+	incArg			<MutableList[ExpressionAST]>
+	incExpr			<ExpressionAST>
+	incStat			<StatementAST>
+	|
+	(* preliminaries *)
+	assert: [ step isNumberNode and:[step val isInteger] ].
+	assert: [ block isBlockNode ].
+	blockScope:: scopeMap at: block body.
+
+	(* loop counter (= block parameter) *)
+	counterVar:: TemporaryAST name: block parameters removeFirst name type: nil.
+	counter:: TemporaryVariableAST name:  counterVar name  start: block start end: block end.
+	
+	(* introduce counter limit variable if needed *)
+	(limitNeeded:: last isLiteralNode not)
+		ifFalse: [
+			(* no limit variable needed - use last directly since there's no computation involved *)
+			limit:: last
+		]
+		ifTrue: [
+			limitName:: '.limit' asSymbol.
+			limitVar:: TemporaryAST name: limitName type: nil.
+			limitVar start: block start; end: block end.
+			prologue temporaries add: limitVar.
+			blockScope at: limitName put: (SlotEntry forDeclaration: limitVar atDepth: 0) ifThere: [ assert:[false] ].
+			limit:: TemporaryVariableAST name: limitName start: block start end: block end.
+		].
+	
+	(* setup loop condition => introduce condition block for whileTrue: loop *)
+	condSel::
+		step val < 0
+			ifTrue: [ #<= ]
+			ifFalse: [ #>= ].
+	condArg:: OrderedCollection new add: counter ; yourself.
+	condExpr:: NormalSendAST new to: limit send: (MessageAST new send: condSel with: condArg).
+	(* limit <= counter OR limit >= counter *)
+	condStats:: OrderedCollection new add: condExpr ; yourself.
+	condBody::
+		CodeBodyAST new
+			parameters: OrderedCollection new;
+			temporaries: OrderedCollection new;
+			statements: condStats;
+			start: block start; end: block end.
+
+	(* add counter increment to loop body *)
+	incArg:: OrderedCollection new add: counter ; yourself.
+	incExpr:: NormalSendAST new to: step send: (MessageAST new send: #+ with: incArg).
+	incExpr start: block start; end: block end.
+	(* step + counter *)
+	incStat:: AssignmentAST new to: counter assign: incExpr. 
+	incStat start: block start; end: block end.
+	(* counter := step + counter *)
+	block body statements add: incStat.
+
+	(* setup prologue *)
+	prologue temporaries add: counterVar.
+	prologue statements add: (AssignmentAST new to: counter assign: first).
+	(* counter := first *)
+	limitNeeded ifTrue: [
+		(* initialize limit variable - note that this must be done *after* setting up the counter because of possible side effects *)
+		prologue statements add: (AssignmentAST new to: limit assign: last). (* .limit := last *)
+	].
+	
+	(* initialize loop instance variables *)
+	cond:: condBody.
+	isWhileTrue:: true.
+	body:: block body
+)
+from: first <AST> to: last <AST> do: block <BlockAST>
+ = (
+	from: first to: last by: (NumberAST new val: 1) do: block
+)
+repeat: block <BlockAST>
+ = (
+    assert: [block isBlockNode].
+    cond:: block body.
+    cond statements add: (BoolAST withValue: true start: cond end end: cond end).
+    isWhileTrue:: true.
+    body:: nil
+)
+while: v <Boolean> do: b <BlockAST>
+ = (
+    assert: [b isBlockNode].
+    cond:: b body.
+    isWhileTrue:: v.
+    body:: nil
+)
+while: b1 <BlockAST>  is: v <Boolean> do: b2 <BlockAST>
+ = (
+    assert: [b1 isBlockNode].
+    assert: [b2 isBlockNode].
+    cond:: b1 body.
+    isWhileTrue:: v.
+    body:: b2 body
+)) : ()
+class NilAST = VariableAST (
+(*  *))
+('as yet unclassified'
+apply: aTool <ASTTool > ^ <Self> = (
+	^aTool nilNode: self
+)
+name = (
+	^#nil
+)) : ()
+class NilVisitor = FalseVisitor ()
+('as yet unclassified'
+nilNode: node = (^true)) : ()
+class ParameterAST name: n type: t = VarDeclAST name: n type: t (
+(*  *))
+('Unclassified'
+apply: aTool <ASTTool > ^ <Self> = (
+	^aTool parameterDeclNode: self
+)
+printOn: strm <CharOutputStream>
+ = (
+
+	super printOn: strm.
+	strm nextPutAll: '(', name, ')'
+)'as yet unclassified'
+variableClass ^ <ParameterVariableAST class> = (
+	^ParameterVariableAST
+)) : ()
+class ParameterVariableAST name: n start: s end: e = VariableAST (
+(*  *)name: n. start: s. end: e)
+('as yet unclassified'
+apply: aTool <ASTTool > ^ <Self> = (
+	^aTool parameterNode: self
+)) : ()
+class ReceiverAST = VariableAST (
+(*  *))
+('Unclassified'
+apply: aTool <ASTTool > ^ <Self> = (
+	^aTool receiverNode: self
+)
+printOn: strm <CharOutputStream>
+ = (
+
+	super printOn: strm.
+	strm nextPutAll: '(self)'
+)'as yet unclassified'
+name = (
+	^#self
+)) : ()
+class ReceiverVisitor = FalseVisitor ()
+('node traversal'
+receiverNode: node = (^true)) : ()
+class SuperSendAST send: aMsg <MessageAST> = SendAST send: aMsg (
+(* This code is currently unused.  
+Unlike Smalltalk, super calls in Newspeak cannot be statically bound.
+Hence, we cannot use the Squeak VM's  super send byte codes. Currently, super sends are rewritten into a complex call structure by the rewriter, to ensure the correct binding of super.
+
+When the Newspeak VM is modified to support dynamic binding of super sends, we will probably use this node and allied code,  which can easily be processed by the byte code compiler and code generator. *))
+('Unclassified'
+apply: aTool <ASTTool> ^ <Self> = (
+	^aTool superSendNode: self
+)
+recv ^ <SuperVarAST> = (
+  ^SuperVarAST new
+)'as yet unclassified'
+isExpressionNode ^ <boolean> = (
+	^true
+)) : ()
+class SuperSendVisitor = FalseVisitor ()
+('node traversal'
+superSendNode: node <SuperSendAST> = (
+      ^true
+   )) : ()
+class SuperVarAST = VarDeclAST name: #super type: nil (
+(*  *))
+('Unclassified'
+apply: aTool <ASTTool> ^ <Self> = (
+	^aTool superVarNode: self
+)) : ()
+class TemporaryAST name: n type: t = VarDeclAST name: n type: t (
+(*  *)| initializer |)
+('Unclassified'
+apply: aTool <ASTTool > ^ <Self> = (
+	^aTool temporaryDeclNode: self
+)
+printOn: strm <CharOutputStream>
+ = (
+
+	super printOn: strm.
+	strm nextPutAll: '(', name, ')'
+)'as yet unclassified'
+isTemporaryAST ^ <Boolean> = (
+	^true
+)
+variableClass ^ <TemporaryVariableAST class> = (
+	^TemporaryVariableAST
+)) : ()
+class TemporaryVariableAST name: n start: s end: e = VariableAST (
+(* This node represents reference to a temporary variable. *)name: n.  start: s. end: e)
+('as yet unclassified'
+apply: aTool <ASTTool > ^ <Self> = (
+	^aTool temporaryNode: self
+)) : ()'as yet unclassified'
+applyForEffectTo: node <Node> = (
+	| original result |
+	original:: valueExpected.
+	valueExpected:: false.
+	result:: node apply: self.
+	valueExpected:: original.
+	^result
+)
+applyForValueTo: node <Node> = (
+	| original result |
+	original:: valueExpected.
+	valueExpected:: true.
+	result:: node apply: self.
+	valueExpected:: original.
+	^result
+)
+assignmentFrom: aMsg <MessageAST> decl: vd <VarDeclAST> ^ <AssignmentNode> = (
+	| var <VariableAST> varName <String> args selector <String> |
+	assert: [aMsg args size = 1].
+	selector:: aMsg sel asString.
+	varName:: selector copyWithSize: (selector size -1).
+	assert: [(currentScope at: varName asSymbol) isTemporaryAST].
+	(* what about setter methods - then we might have an inst var? this cannot happen, because this is only called when processing variables *)
+	var:: TemporaryVariableAST
+		name: varName
+		start: aMsg start
+	 	end: aMsg end.
+
+	args:: applyForValueTo: aMsg args first. (* recurse on RHS *)
+	
+	(* create an assignment *)
+	^AssignmentAST new 
+		to: var assign: args;
+		start: aMsg start;
+		end: aMsg end                     
+)
+boolNode: node = (
+	(* Should not normally be invoked; only possible when rewriting an already rewritten tree. *)
+	halt.
+	^node
+)
+currentScope ^ <Scope> = (
+	^scopeStack last
+)
+enclosingObjSendOfDepth: n <Integer> to: recv <AST> start: start <Integer> end: end <Integer>  ^ <NormalSendAST> = (
+	^NormalSendAST new 
+		recv: recv; 
+		msg:(MessageAST new sel: (enclosingObjectMsgForDepth: n); args: {}; start: start; end: end);
+		start: start; 
+		end: end.
+)
+enclosingObjectMsgForDepth: n <Integer> ^ <String> = (
+(* Compute the selector necessary for obtaining the nth enclosing object wrt to the current lexical scope. *)
+	| otable  <Dictionary[Symbol, Tuple[Class, Integer]]> ec <Class> |
+	(* What if n has no corresponding entry in the outer table? This should not happen, as this method is called on the basis of an n value found in the table to begin with. *)
+	otable:: currentScope at: #outer.
+	ec:: (otable values detect: [:some | (some at: 2) = (n-1)]) at: 1.
+	^(Compiler new enclosingObjectMsgFor: ec) asSymbol
+)
+explicitOuterReceiverNode: node = (
+	assert: [node apply: ExplicitReceiverVisitor new].
+	^node
+)
+hereName = (
+	^#'@here'
+)
+hereNode ^<AST> = (
+	^VariableAST new name: hereName
+)
+inline: node as: sendClass selector: selector rewriteArgsAs: argRewriteBlock = (
+	| receiver message |
+	receiver:: applyForValueTo: node recv.
+	message:: MessageAST new
+		send: selector
+		with: (node msg args collect: argRewriteBlock).
+	^sendClass new
+		to: receiver send: message;
+		start: node start;
+		end: node end
+)
+isHereNode: aNode <AST> ^ <Boolean> = (
+	aNode isVariableNode ifFalse: [^false].
+	(isPseudoVariableNode: aNode) ifTrue: [^false].
+	assert: [aNode name = hereName].
+	^true
+)
+isInlinableAsExpressionConditional: node <NormalSendAST> ^ <Boolean> = (
+	((conditionalSelectors includes: node msg sel) and: [valueExpected]) ifFalse: [^false].
+	node msg args do:
+		[:each <AST> |
+		((isRemovableBlock: each withArgs: 0)
+			and: [each body statements size = 1
+			and: [each body statements first isReturnStatNode not]])
+				ifFalse: [^false]].
+	^true
+)
+isInlinableBooleanOperator: node <NormalSendAST> = (
+	| selector |
+	selector:: node msg sel.
+	^(selector = 'or:' or: [selector = 'and:'])
+		and: [node msg args size = 1
+		and: [node msg args first isBlockNode
+		and: [node msg args first body statements size = 1]]]
+)
+isInlinableConditional: node <NormalSendAST> ^ <Boolean> = (
+	((conditionalSelectors includes: node msg sel) and: [valueExpected not]) ifFalse: [^false].
+	node msg args do: [:each <AST> | (isRemovableBlock: each withArgs: 0) ifFalse: [^false]].
+	^true
+)
+isInlinableNumericOperator: node <NormalSendAST> = (
+	| args |
+	args:: node msg args.
+	args size = 1 ifFalse: [^false].
+	(inlinableNumericOperators includesKey: node msg sel) ifFalse: [^false].
+	(node recv isLiteralNode and: [node recv val isNumber]) ifTrue: [^true].
+	(args first isLiteralNode and: [args first val isNumber]) ifTrue: [^true].
+	^false
+)
+isInlinableOperator: node <NormalSendAST> = (
+	^(inlinableOperators includesKey: node msg sel)
+		and: [node msg args size = 1]
+)
+isInlineableLoop: node <NormalSendAST> ^ <Boolean>= (
+	| selector <Symbol>  args |
+	valueExpected ifTrue: [^false]. #FLAG. (* Handle this later. Note when we do we will have to adjust the forValue flag in processInlineableLoop. *)
+	selector:: node msg sel.
+	args:: node msg args.
+	({#whileTrue. #whileFalse. #whileTrue:. #whileFalse:. #repeat} includes: selector) ifTrue:
+		[args do:
+			[:each |
+			(isRemovableBlock: each withArgs: 0) ifFalse: [^false]].
+		^isRemovableBlock: node recv withArgs: 0].
+	
+	(selector = #timesRepeat:) ifTrue:[^isRemovableBlock: args last withArgs: 0].
+	({#to:do:. #to:by:do:}  includes:  selector) ifFalse:[^false].
+	(isRemovableBlock: args last withArgs: 1) ifFalse:[^false].
+	(selector = #to:do:) ifTrue:[^true].
+	^args size = 3
+)
+isOuterNode: aNode <AST> ^ <Boolean> = (
+	aNode isVariableNode ifFalse: [^false].
+	^aNode name = #outer
+)
+isPseudoVariableNode: aNode <VariableAST> ^ <Boolean> = (
+	^aNode name = #self
+		or: [aNode name = #super
+		or: [aNode name = #outer
+		or: [aNode name = #thisContext]]]
+)
+isSuperNode: aNode <VariableAST> ^ <Boolean> = (
+	aNode isVariableNode ifFalse:[^false].
+	^aNode name =  #super 
+)
+mixinApplication: node <MixinApplicationAST> = (
+	| msg |
+(* For now, just compile it as a regular message send *)
+	msg:: MessageAST new
+			send: #apply:
+			with: (OrderedCollection with: node superclassExpr);
+			start: node start;
+			end: node end.
+
+	^(NormalSendAST new
+		to: node mixinExpr send: msg;
+		start: node start;
+		end: node end) apply: self
+)
+nilNode: node = (
+	(* Should not normally be invoked; only possible when rewriting an already rewritten tree. *)
+	halt.
+	^node
+)
+parameterNode: node <ParameterVariableAST> = (
+	^node
+)
+processExplicitOuterReceiver: aMsg <MessageAST> = (
+	| selectorBinding <AST> depth <integer> |
+	assert:[aMsg args isEmpty]. (* this had better be a unary message *)
+	selectorBinding:: currentScope 
+		at: aMsg sel
+		ifAbsent: [Error signal: 'No outer class named ', aMsg sel].
+	(* assert:[selectorBinding data  isClassDeclarationAST]. *)
+	depth: currentDepth -  selectorBinding depth -1.
+	^(ExplicitRecvrAST send: aMsg sel depth: depth)
+		start: aMsg start;
+		end: aMsg end
+)
+processExplicitOuterSend: aMsg <MessageAST> = (
+(* Unused at the moment *)
+)
+processHereSend: aMsg <MessageAST> = (
+	| binding <AST> |
+	binding:: currentScope at: aMsg sel ifAbsent: [MessageAST new].
+	binding isMessagePatternNode ifTrue:
+		[(* this is a message send for a lexically defined method *)
+		^processImplicitOuterSend: aMsg atDepth: binding depth].
+	binding isVarDeclNode
+		ifTrue: [^ processVariable: aMsg decl: binding].
+	({#true. #false. #nil} includes: aMsg sel) ifTrue:
+		[^processVariable: aMsg decl: nil].
+	^selfSendFrom: aMsg
+)
+processImplicitOuterSend: aMsg <MessageAST> atDepth: n <Integer> ^ <SendNode> = (
+	(* In this case, we don't care about the depth; but when compiling to other platforms, we might, so we maintain the API *)
+	| selectorBinding <AST> depth <integer> |
+	selectorBinding:: currentScope at: aMsg sel.
+	(* assert:[selectorBinding data  isClassDeclarationAST]. *)
+	depth: currentDepth -  selectorBinding depth.
+	^(ImplicitRecvrSendAST send: (aMsg apply: self) depth: depth) start: aMsg start; end: aMsg end
+)
+processInlineableLoop: node <NormalSendAST> ^<LoopAST> = (
+	|
+	rcvr = node recv.
+	msg = node msg.
+	sel = msg sel.
+	numArgs = msg args size.
+	arg1 = numArgs >= 1 ifTrue: [msg args at: 1].
+	arg2 = numArgs >= 2 ifTrue: [msg args at: 2].
+	arg3 = numArgs >= 3 ifTrue: [msg args at: 3].
+	|
+	
+	sel = #whileTrue ifTrue: [^LoopAST new
+		while: true
+		do: (rewriteInlinedBlockNode: rcvr forValue: true)].
+	sel = #whileFalse ifTrue: [^LoopAST new
+		while: false
+		do: (rewriteInlinedBlockNode: rcvr forValue: true)].
+	sel = #whileTrue: ifTrue: [^LoopAST new
+		while: (rewriteInlinedBlockNode: rcvr forValue: true) 
+		is: true
+		do: (rewriteInlinedBlockNode: arg1 forValue: false)].
+	sel = #whileFalse: ifTrue: [^LoopAST new
+		while: (rewriteInlinedBlockNode: rcvr forValue: true) 
+		is: false
+		do: (rewriteInlinedBlockNode: arg1 forValue: false)].
+	
+	sel = #repeat ifTrue: [^LoopAST new
+		repeat: (rewriteInlinedBlockNode: rcvr forValue: false)].
+	
+	sel = #timesRepeat: ifTrue: [^LoopAST new
+		do: (rcvr apply: self)
+		timesRepeat: (rewriteInlinedBlockNode: arg1 forValue: false)].
+	
+	sel = #to:do: ifTrue: [^LoopAST new
+		from: (rcvr apply: self)
+		to: (arg1 apply: self)
+		do: (rewriteInlinedBlockNode: arg2 forValue: false)].
+	
+	sel = #to:by:do: ifTrue: [^LoopAST new
+		from: (rcvr apply: self)
+		to: (arg1 apply: self)
+		by: (arg2 apply: self)
+		do: (rewriteInlinedBlockNode: arg3 forValue: false)].
+	
+	assert: [false] message: 'Unknown loop selector'
+)
+processOuterSend: aMsg <MessageAST> = (
+	| holder <NormalSendAST> depth <Integer> binding <AST>  meMsg <MessageAST> |
+	assert: [aMsg args isEmpty]. (* this had better be a unary message *)
+	binding:: (currentScope at: #outer) at: aMsg sel.
+	(* assert binding makes sense *)
+	assert: [binding isKindOf: Collection].
+	(* assert: [binding first isKindOf: Class]. *) (* disabled temporarily until we get the class story straight on the JS side *)
+	assert: [binding last isKindOf: Integer].
+
+	meMsg:: MessageAST new sel: #yourself; args: {}; start: aMsg start; end: aMsg end. (* hack! *)
+	^processOuterSend: meMsg atDepth: binding last
+)
+processOuterSend: aMsg <MessageAST> atDepth: n = (
+(* For n > 0, return
+thisContext methodClass enclosingObject`Cn ... C0 
+                                         class enclosingObject`Cn ...`C1  ...  
+                                            class enclosingObject`Cn`Cn-1 msg
+
+which is the equivalent of
+
+outer X msg
+
+where X is the nth lexically enclosing class. Otherwise, do a self send *)
+
+	| holder <NormalSendAST> ctxt <VariableAST> start <Integer> end <integer> 
+	enclosingObj <NormalSendAST> nonMeta <NormalSendAST>  |
+
+	n = 0 ifTrue: [^selfSendFrom: aMsg].
+	start:: aMsg start.
+	end:: aMsg end.
+	ctxt:: VariableAST new name: #thisContext; start: start; end: end.
+
+	holder:: NormalSendAST new
+		recv: ctxt;
+	 	msg: (MessageAST new sel: #lexicalClass; args: {});
+		start: start; end: end.
+	nonMeta:: NormalSendAST new
+		recv: holder;
+		msg: (MessageAST new sel: #theNonMetaClass; args: {});
+		start: start; end: end.
+	enclosingObj:: enclosingObjSendOfDepth: 1 to: nonMeta start: start end: end. 
+
+	enclosingObj:: (2 to: n) inject: enclosingObj into:
+		[:r <NormalSendAST> :i <Integer> | 
+		| csend <NormalSendAST> |
+		csend:: NormalSendAST new
+			recv: r; 
+			msg: (MessageAST new sel: #class; args: {}; start: start; end: end);
+			start: start; 
+			end: end.
+		enclosingObjSendOfDepth: i to: csend start: start end: end].
+	^(NormalSendAST new recv: enclosingObj; msg: aMsg; start: start; end: end) apply: self
+)
+processVariable: aMsg <MessageAST> decl: vd <VarDeclAST>  ^ <AssignmentNode | VariableNode> = (
+	^aMsg sel last = $:
+		ifTrue: (* it is a temporary write *)
+			[assignmentFrom: aMsg decl: vd]
+		ifFalse: (* it is a parameter or temporary read *)
+			[variableFrom: aMsg decl: vd]
+)
+propertyCallNode: node <PropertyCallAST> ^ <PropertyCallAST> = (
+	| args |
+	assert: [node isMessageNode].
+	args:: OrderedCollection new.
+	node args do: [:each | args add: (applyForValueTo: each)].
+	^PropertyCallAST new
+		send: node sel with: args;
+		start: node start;
+		end: node end
+)
+returnsAreNonLocalWhile: block = (
+	| originalValue |
+	originalValue: areReturnsLocal.
+	areReturnsLocal: false.
+	^block ensure: [areReturnsLocal: originalValue]
+)
+rewriteBody: node <CodeBodyAST> forValue: forValue <Boolean> ^<CodeBodyAST> = (
+	| original result |
+	original:: rewritingBodyForValue.
+	rewritingBodyForValue:: forValue.
+	result:: node apply: self.
+	rewritingBodyForValue:: original.
+	^result		
+)
+rewriteInlinedBlockNode: node <BlockAST> forValue: forValue <Boolean> ^ <BlockAST> = (
+(* An empty block evaluates to nil when called. This method performs the necessary transformation if the block is empty; otherwise it recursively rewrites the block body. This rewrite is done on all blocks, regardless of whether they are inlined. *)
+	| 
+	rewrittenNode <BlockAST> 
+      params <Collection[ParameterAST]>  
+      bodyScope <Scope> 
+	| 
+	assert: [node isBlockNode].
+	(* this shouldn't be handled here, but I'm not sure where the block / codebody 
+	comes from. *)
+	node body start isNumber
+		ifFalse: [ node body start: node start. node body end: node end ].
+	
+	params:: node parameters collect:
+		[:p <VarDeclAST> |
+		(ParameterAST name: p name type: p type)  start: p start; end: p end].
+	bodyScope:: scopeMap at: node body.
+	params do: [:each | (bodyScope at: each name) ast: each].
+	rewrittenNode:: BlockAST new body: (rewriteBody: node body forValue: forValue).
+	rewrittenNode start: node start; end: node end.
+	rewrittenNode body parameters: params.
+	node body statements isEmpty ifTrue:
+		[rewrittenNode body statements add: (NilAST new start: node body start; end: node body end)].
+    ^rewrittenNode
+)
+selfSendFrom: aMsg <MessageAST>  ^ <MessageNode> = (
+	^(NormalSendAST new
+		msg: aMsg; 
+		recv: (selfNode start: aMsg start; end: aMsg end);
+		start: aMsg start; end: aMsg end) apply: self
+)
+setterBlockArgName = (
+	^ ('setter_arg') asSymbol
+)'node traversal'
+assignmentNode: node <AssignmentAST> ^ <AssignmentAST> = (
+	assert: [node isAssignmentNode].
+	(* note write to target variable! *)
+	^AssignmentAST new
+		to: (node var apply: self) assign: (applyForValueTo: node expr);
+		start: node start; end: node end
+)
+blockLocalReturnNode: node = (
+	^node
+)
+blockNode: node <BlockAST> ^ <BlockAST> = (
+	(* This method should only be called on a block that is not going to be inlined.
+
+	There are two things that require rewriting in blocks.
+
+	1. a.  Non-empty blocks must have their body rewritten recursively
+	    b. Empty blocks need a nil expression in them.
+	    c. All blocks must have their parameters rewritten from generic VarDecls to ParameterASTs. 
+	2. If the last statement in a block is not a return, the block returns
+	the expression to its caller. So the last expression needs to be replaced by a 'local return'.
+
+	We accomplish (1) by calling rewriteInlinedBlockNode:, and then do  (2) explicitly.
+
+	The reason for this separation is that step (1) is always needed; step (2) is only needed if the block is not inlined.
+	*)
+	| rewrittenBlock <BlockAST> last <AST> |
+	returnsAreNonLocalWhile:
+		[rewrittenBlock:: rewriteInlinedBlockNode: node forValue: true.
+		last:: rewrittenBlock body statements last.
+		(last isReturnStatNode or: [last isBlockLocalReturnAST]) ifFalse:
+			[(* The last expression in a block is returned by it. *)
+			rewrittenBlock body statements removeLast.
+			rewrittenBlock body statements add:
+				(BlockLocalReturnAST expression: last start: last start end: last end)].
+  	  scopeMap at: rewrittenBlock put: (scopeMap at: node)].
+    ^rewrittenBlock
+)
+cascadedSendNode: node <CascadeSendAST> ^ <CascadeSendAST> = ( 
+	| prevSend msg |
+	assert: [node isCascadedSendNode].
+	prevSend:: applyForValueTo: node prevSend.
+	msg:: applyForValueTo: node msg.
+	^CascadedSendAST new to: prevSend cascade: msg;
+							start: node start;
+							end: node end;
+							yourself
+)
+charNode: node <CharAST> = (
+	^node
+)
+codeBodyNode: node <CodeBodyAST> ^ <CodeBodyAST> = (
+	| 
+	bodyScope <Scope>
+	statements <OrderedCollection[StatementAST]>
+	temps <OrderedCollection[TemporaryAST]> 
+	result <CodeBodyAST>
+	|
+	assert: [node isCodeBodyNode].
+	pushScopeForNode: node. 
+	temps:: node temporaries collect:
+		[:each <VarDeclAST> |
+		(TemporaryAST name: each name type: each type)
+			start: each start;
+			end: each end.
+		].
+	bodyScope:: scopeMap at: node.
+	temps do:
+		[:t | (bodyScope at: t name) ast: t].
+	node temporaries with: temps do: 
+		[:varDecl <VarDeclAST> :temp <TemporaryAST> |
+		temp initializer: (varDecl initializer ifNotNil: [:it | self applyForValueTo: it])
+		].
+	statements:: OrderedCollection new.
+	node statements keysAndValuesDo:
+		[:index :statement | 
+		| rewritten |
+		rewritten:: (index = node statements size and: [rewritingBodyForValue])
+			ifTrue: [applyForValueTo: statement]
+			ifFalse: [applyForEffectTo: statement].
+		statements add: rewritten].
+	result:: CodeBodyAST new
+		parameters: node parameters temporaries: temps statements: statements;
+		start: node start;
+		end: node end.
+	popScope.
+	scopeMap at: result put: bodyScope.
+	^result.
+)
+genericApplicationExpressionNode: node = (
+	assert: [node isGenericApplicationExpressionNode].
+	^applyForValueTo: node target
+)
+guaranteedNode: node = (
+	assert: [node isGuaranteedNode].
+	^applyForValueTo: node expr
+)
+ifNode: node <ifAST> ^ <ifAST> = (
+	assert: [ node isIfNode ].
+	^node
+)
+implicitSendNode: node = (
+    assert: [node apply: ImplicitRecvrVisitor new].
+    ^node
+)
+loopNode: node <LoopAST> ^ <LoopAST> = (
+    ^node
+)
+messageNode: node <MessageAST> ^ <MessageAST> = (
+    | args |
+    assert: [node isMessageNode].
+    args:: OrderedCollection new.
+    node args do: [ :arg | args add: (applyForValueTo: arg)].
+    ^MessageAST new send: node sel with: args; start: node start; end: node end
+)
+messagePatternNode: node <MessagePatternAST> ^ <MessagePatternAST> = (
+	| params <OrderedCollection[ParameterAST]>  patternScope <Scope> |
+	params:: node parameters collect:
+		[:p <VarDeclAST> | 
+		(ParameterAST name: p name type: p type)
+			start: p start;
+			end: p end].
+	patternScope:: scopeMap at: node.
+	params do:
+		[:p | (patternScope at: p name) ast: p].
+	^MessagePatternAST new
+		selector: node selector parameters: params;
+		start: node start;
+		end: node end.
+)
+methodNode: node <MethodAST> ^<MethodAST | ReturnSelfMethodAST | ReturnInstVarMethodAST>
+= (
+	| 
+	pattern <MessagePatternAST>  
+	body <CodeBodyAST>
+	result <MethodAST>
+	|
+	assert: [ node isMethodNode ].
+	pattern:: applyForValueTo: node pattern.
+	(* rewritingBodyForValue: false.
+	body::  applyForValueTo: node body. *)
+	body:: rewriteBody: node body forValue: false.
+	body parameters: pattern parameters.
+	body start: node start; end: node end.
+	(* Append ^self if there is no explicit return terminating the body.
+	We are at the method level so that return should have been rewritten as a block local one. *)
+	(body statements isEmpty not and: [body statements last isBlockLocalReturnAST]) ifFalse:
+		[assert: [ body start isNumber ]. 		
+		body statements addLast:
+			(BlockLocalReturnAST
+				expression: (ReceiverAST new start: body end; end: body end)
+				start: body end
+				end: body end)].
+	result:: MethodAST new 
+		pattern: pattern
+		body: body
+		visibility: node visibility;
+		start: node start; end: node end; yourself.
+	scopeMap at: result put: (scopeMap at: node).
+	^result
+)
+mixinClassNode: node = (
+	^node
+)
+normalSendNode: node <NormalSendAST> ^ <AST> = (
+	| recv <AST> msg <MessageAST> sel <Symbol> |
+	assert: [node isNormalSendNode].
+
+	(isHereNode: node recv) ifTrue:
+		[^processHereSend: node msg].
+	(isOuterNode: node recv) ifTrue:
+		[^processExplicitOuterReceiver: node msg].
+	(isSuperNode: node recv) ifTrue:
+		[^SuperSendAST send: (applyForValueTo: node msg)].
+
+	(isInlinableAsExpressionConditional: node) ifTrue:
+		[^inline: node as: InlinableAsExpressionConditionalAST
+			selector: node msg sel
+			rewriteArgsAs: [:each | rewriteInlinedBlockNode: each forValue: true]].
+	(isInlinableConditional: node) ifTrue:
+		[^inline: node as: InlinableConditionalAST
+			selector: node msg sel
+			rewriteArgsAs: [:each | rewriteInlinedBlockNode: each forValue: false]].
+	(inlineOperators and: [isInlinableNumericOperator: node]) ifTrue:
+		[^inline: node as: InlinedOperatorAST
+			selector: (inlinableNumericOperators at: node msg sel)
+			rewriteArgsAs: [:each | applyForValueTo: each]].
+	(inlineOperators and: [isInlinableOperator: node]) ifTrue:
+		[^inline: node as: InlinedOperatorAST
+			selector: (inlinableOperators at: node msg sel)
+			rewriteArgsAs: [:each | applyForValueTo: each]].
+	(inlineOperators and: [isInlinableBooleanOperator: node]) ifTrue:
+		[^inline: node as: InlinedOperatorAST
+			selector: (node msg sel = 'and:' ifTrue: ['&&'] ifFalse: ['||']) (* BOGUS *)
+			rewriteArgsAs: [:each <BlockAST> | applyForValueTo: each body statements first]].
+	(isInlineableLoop: node) ifTrue: [
+		^processInlineableLoop: node].
+
+	recv:: applyForValueTo: node recv.
+	msg:: applyForValueTo: node msg.
+	sel:: msg sel.
+	^NormalSendAST new
+		to: recv send: msg;
+		start: node start;
+		end: node end
+)
+numberNode: node = (
+	assert: [node isNumberNode].
+	^node
+)
+receiverNode: node <ReceiverAST> = (
+	^ node
+)
+returnStatNode: node <ReturnStatAST> ^ <ReturnStatAST> = (
+	assert: [node isReturnStatNode].
+	^areReturnsLocal
+		ifTrue:
+			[BlockLocalReturnAST
+				expression: (applyForValueTo: node expr)
+				start: node start
+				end: node end]
+		ifFalse:
+			[ReturnStatAST new
+				expr: (applyForValueTo: node expr); 
+		 		start: node start;
+				end: node end]
+)
+selfNode ^ <VariableAST> = (
+(* shouldn't this be a ReceiverAST? *)
+(* generate a an AST representing self; used for implicit self sends *)
+	^VariableAST new name: #self; start: 0; end: 0
+)
+setterSendNode: node <SetterSendAST> ^ <AST> = (
+(* Rewrite a double-colon setter send. The value of the entire expression should be the value of the argument of the send, NOT the value returned by the setter method. This general case is somewhat inefficient, but in most cases the value of the expression is ignored by the parent so we can use a cheaper regular message send. *)
+	| binding block blockArg blockParam blockScope send rewrittenSetterSend |
+	assert: [node isSetterSendNode ].
+	binding:: currentScope at: node msg sel ifAbsent: [MessageAST new].
+	binding isVarDeclNode ifTrue:
+		(* This is an assignment to a temporary; no special handling is needed
+		as the value of the expression is the value being assigned. *)
+		[^processVariable: node msg decl: binding].
+	valueExpected ifFalse:
+		(* The parent ignores the expression value; use a plain cheap here message send. *)
+		[^processHereSend: 
+			(MessageAST new
+				sel: node msg sel;
+				args: {node msg args first};
+				start: node msg start; end: node msg end)].
+	(* The value is used by the parent; rewrite the whole thing as
+		setter:: expr  =>  [:a | setter: a. a] value: expr *)
+	(* a -- ok to use a constant name as long as it cannot collide with a user's name *)
+	blockArg:: ParameterVariableAST 
+					name: setterBlockArgName 
+					start: node msg start 
+					end: node msg end.
+	blockParam:: ParameterAST name: setterBlockArgName type: nil.
+	(* setter: a *)
+	send:: NormalSendAST new to: node recv send:
+		(MessageAST new sel: node msg sel; args: {blockArg};
+		start: node msg start; end: node msg end; yourself);
+		start: node  start; end: node  end.
+	(* [:a | setter: a. a] *)
+	block:: BlockAST new body:
+		(CodeBodyAST new
+			parameters: {blockParam}
+			temporaries: {}
+			statements: {
+				send.
+				blockArg
+			};			
+			start: node start; end: node end);
+			start: node start; end: node end.
+	blockScope:: Scope new.
+	blockScope
+		superScope: currentScope;
+		at: setterBlockArgName put: (SlotEntry forDeclaration: blockParam atDepth: nil).
+	scopeMap at: block put: blockScope.
+	scopeMap at: block body put: blockScope.
+	(* [:a | setter: a. a] value: expr *)
+	rewrittenSetterSend::
+		NormalSendAST new
+			to: block
+			send: (MessageAST new
+				sel: #value:;
+				args: {node msg args first};
+				start: node msg start; end: node msg end);
+				start: node  start; end: node  end.
+	^applyForValueTo: rewrittenSetterSend
+)
+stringNode: node = (
+	assert: [node isStringNode].
+	^node
+)
+superSendNode: node = (
+	assert: [node apply: SuperSendVisitor new].
+	^node
+)
+symbolNode: node = (
+	assert: [node isSymbolNode].
+	^node
+)
+temporaryNode: node <TemporaryVariableAST> = (
+	(* Possibily *) #BOGUS.
+	^node
+)
+tupleNode: aNode <TupleAST> = (
+	^TupleAST new elements: (aNode elements collect: [:e | e apply: self])
+)
+variableNode: aNode <VariableAST> = (
+	assert: [ aNode start isNumber ].
+	aNode name = #self ifTrue:
+		[^ReceiverAST new start: aNode start; end: aNode end].
+	aNode name = #nil ifTrue:
+		[^NilAST new start: aNode start; end: aNode end].
+	aNode name = #true ifTrue:
+		[^BoolAST withValue: true start: aNode start end: aNode end].
+	aNode name = #false ifTrue:
+		[^BoolAST withValue: false start: aNode start end: aNode end].		
+	aNode name = #thisContext ifTrue:
+		[^ContextAST new start: aNode start; end: aNode end].
+	(* recognize inst vars for accessor methods? handle temps etc. *)
+	^aNode
+)'private'
+isRemovableBlock: block <BlockAST> withArgs: nofArgs <Integer> ^ <Boolean> = (
+(* Answers true if block can be removed (inlined) within another block. *)
+	block isBlockNode ifFalse: [^false].
+	block parameters size = nofArgs ifFalse: [^false].
+	^true
+)
+parameters: pars matchArguments: args
+ = (
+ | i |
+	#BOGUS yourself. (* appears to be unused; delete if so *)
+ i:: pars size.
+ 
+ (* Proceed if no. of parameter matches no. of arguments *)
+ pars size = args size ifFalse: [ ^ false ].
+ 
+ (* check individual arguments, starting with last one *)
+ i:: pars size.
+ [ i > 0 ] whileTrue: [
+  (args at: i) isRefNode ifFalse: [ ^ false ].
+  (pars at: i) == (args at: i) decl ifFalse: [ ^ false ].
+  i:: i - 1
+ ].
+ 
+ (* parameters & arguments match 1-to-1, in same order *)
+ ^ true
+)
+popScope ^ <Scope> = (
+	^scopeStack removeLast
+)
+pushScope: s <Scope> = (
+	scopeStack addLast: s
+)
+pushScopeForNode: n <AST> = (
+	scopeStack addLast: (scopeMap at: n)
+)
+variableFrom: message <MessageAST> decl: declaration <VarDeclAST>  ^ <VariableNode> = (
+	assert: [message args isEmpty].
+	declaration isNil ifTrue:
+		[^(VariableAST new
+			name: message sel;
+			start: message start;
+			end: message end)
+				apply: self].
+	^declaration variableClass
+		name: message sel
+		start: message start
+		end: message end                    
+)) : ()
+class ScopeBuilder nestedIn: initialScope <Scope> atLevel: initialDepth <Integer> = super ScopeBuilder nestedIn: initialScope atLevel: initialDepth ()
+('as yet unclassified'
+propertyCallNode: aNode <PropertyCallAST> = (
+	self messageNode: aNode
+)) : ('as yet unclassified'
+new ^<Instance> = (
+	^self nestedIn: Scope new atLevel: 0
+))
+class Translator = ASTTool (
+(* Visits nodes of an NS AST to produce a Javascript AST. The usual translation unit is a method. Translation is initiated by sending the translateMethodNode: message. The argument is the method to translate, the returned value is the translation. *)|
+	scopeStack
+	currentSelector
+	protected containsNonLocalReturn <Boolean> (* Set to false at the beginning of translating a method. The code that emits a non-local return sets this to true. The top-level code checks the value to see whether to emit a try-catch wrapper for an NLR. *)
+
+|)
+(
+class ASTDescriber = ASTTool (
+(* Convert an AST into JS code that constructs an identical AST.
+
+We need to ensure we cover all relevant ASTs (for now, blocks and their contents) and that we capture start and end info (here and in the JS code we call).
+
+We cover rewritten nodes like assignments out of an abundance of caution. *))
+('as yet unclassified'
+arrayNode: aNode <ArrayAST> = (
+halt. 
+ ^'ast.arr(', (convertList: aNode elements), ')'.	
+)
+assignmentNode: aNode  <AssignmentAST> = (
+halt.
+	^'ast.assign(', (aNode var apply: self), ', ', (aNode expr apply: self), ')'
+)
+binaryTypeOpNode: aNode <BinaryTypeOpAST>  = (
+	^js call: (js propertyOf: (js ident: 'ast') at: (js ident: 'binaryType')) with: {js literal: aNode operator asString. aNode lOperand apply: self. aNode rOperand apply: self}(*
+	^'ast.binaryType(', aNode operator asString printString, ', ', (aNode lOperand apply: self), ', ',  (aNode rOperand apply: self),  ')'
+*))
+blockNode: aNode  <BlockAST> = (
+	^js call: (js propertyOf: (js ident: 'ast') at: (js literal: 'block')) with: {aNode body apply: self}(*
+	^'ast.block(', (aNode body apply: self),  ')' *)
+)
+cascadedSendNode: aNode  <CascadedSendAST> = (
+	^js call: (js propertyOf: (js ident: 'ast') at: (js literal: 'cascade')) with: {aNode prevSend apply: self. aNode msg apply: self}(*
+	^'ast.cascade(', (aNode prevSend apply: self), ', ', (aNode msg apply: self), ')' *)
+)
+charNode: aNode  <CharacterAST> = (
+	^js call: (js propertyOf: (js ident: 'ast') at: (js literal: 'character')) with: {js literal: aNode val asString}(*
+	^'ast.character(""', aNode val asString,  '"")' *)
+)
+codeBodyNode: aNode  <CodeBodyAST> = (
+	| ps ts ss |
+	ps:: convertList: aNode parameters.
+	ts:: convertList: aNode temporaries.
+	ss:: convertList: aNode statements.
+	^js call: (js propertyOf: (js ident: 'ast') at: (js literal: 'codeBody')) with: {ps. ts. ss}(*	
+	^'ast.codeBody(', ps, ', ', ts, ', ', ss, ')' *)
+)
+genericInvocationNode: aNode = (
+	^js call: (js propertyOf: (js ident: 'ast') at: (js literal: 'genericInvoke')) with: {aNode generic apply: self. convertList: aNode arguments}(*
+ ^'ast.genericInvoke(', (aNode generic apply: self), ', ', (convertList: aNode arguments), ')' *)
+)
+messageNode: aNode  <MessageAST> = (
+	^js call: (js propertyOf: (js ident: 'ast') at: (js literal: 'message')) with: {js literal: aNode sel. convertList: aNode args}(*
+	^'ast.message(', aNode sel asString printString, ',', (convertList: aNode args), ')' *)
+)
+normalSendNode: aNode  <NormalSendAST> = (
+	^js call: (js propertyOf: (js ident: 'ast') at: (js literal: 'send')) with: {aNode recv apply: self. aNode msg apply: self}(*
+
+	^'ast.send(', (aNode recv apply: self), ', ', (aNode msg apply: self), ')' *)
+)
+numberNode: aNode  <NumberAST> = (
+	^js call: (js propertyOf: (js ident: 'ast') at: (js literal: 'num')) with: {js literal: aNode val}(*
+	^'ast.num(', aNode val printString,  ')' *)
+)
+returnStatNode: aNode  <ReturnStatAST> = (
+	^js call: (js propertyOf: (js ident: 'ast') at: (js literal: 'ret')) with: {aNode expr apply: self}(*
+	^'ast.ret(', (aNode expr apply: self), ')' *)
+)
+setterSendNode: aNode  <SetterSendAST> = (
+	^js call: (js propertyOf: (js ident: 'ast') at: (js literal: 'setter')) with: {aNode recv apply: self. aNode msg apply: self}(*
+	^'ast.setter(', (aNode recv apply: self), ', ', (aNode msg apply: self), ')' *)
+)
+slotDefNode: aNode <SlotDefAST> = (
+	| init <String>  |	
+	
+	init:: aNode initializer ifNil:[js literal: nil] ifNotNil: [: i | i apply: self].	
+	^js call: (js propertyOf: (js ident: 'ast') at: (js literal: 'slotDef')) with: {aNode slotDecl apply: self. init. js literal: aNode isMutable. js literal: aNode accessModifier}(*
+	init:: aNode initializer ifNil:['null'] ifNotNil: [: i | i apply: self].
+	^'ast. slotDef(', (aNode slotDecl apply: self), ', ', init, ', ', aNode isMutable printString, ', ', aNode accessModifier asString printString,  ')' *)
+)
+stringNode: aNode  <StringAST> = (
+	^js call: (js propertyOf: (js ident: 'ast') at: (js literal: 'str')) with: {js literal: aNode val}(*
+	^'ast.str(""', aNode val,  '"")' *)
+)
+symbolNode: aNode  <SymbolAST> = (
+	^stringNode: aNode
+)
+tupleNode: aNode <TupleAST> = (
+	^js call: (js propertyOf: (js ident: 'ast') at: (js literal: 'tuple')) with: {convertList: aNode elements}(*
+ ^'ast.tuple(', (convertList: aNode elements), ')'. *)	
+)
+typeIdNode: aNode  <TypeIdAST> = (
+	^js call: (js propertyOf: (js ident: 'ast') at: (js literal: 'typeId')) with: {js literal: aNode name}(*
+	^'ast.typeId(', aNode name asString printString,  ')' *)
+)
+unaryTypeOpNode: aNode <UnaryTypeOpAST>  = (
+	^js call: (js propertyOf: (js ident: 'ast') at: (js literal: 'unaryType')) with: {js literal: aNode operator asString. aNode operand apply: self}(*
+	^'ast.unaryType(', aNode operator printString, ', ', (aNode operand apply: self),  ')' *)
+)
+varDeclNode: aNode  <VarDeclAST> = (
+	| typ <String> |
+		
+	typ:: aNode type ifNil:[js ident: 'null'] ifNotNil: [: t | t apply: self].	
+	^js call: (js propertyOf: (js ident: 'ast') at: (js literal: 'vdecl')) with: {js literal: aNode name. typ}(*
+	typ:: aNode type ifNil:['null'] ifNotNil:[: t | aNode type apply: self].
+	^'ast.vdecl(', aNode name asString printString, ', ', typ, ')' *)
+)
+variableNode: aNode  <VariableAST> = (
+	^js call: (js propertyOf: (js ident: 'ast') at: (js literal: 'variable')) with: {js literal: aNode name}(*
+	^'ast.variable(', aNode name asString printString,  ')' *)
+)'private'
+convertList: l = (
+ | elements |
+
+	elements:: l collect:[:e | e apply: self].
+	^js array: elements
+(*
+	elements:: ''.
+	l do:[:e | elements:: elements, (e apply: self)] separatedBy:[elements:: elements, ', '].	
+	^'[', elements, ']' *)
+)) : ()
+class FreeVariableDetector for: codeBody <CodeBodyAST> = (
+(* Discover all free names in the code body. Note that names may be free in a nested closure but not free in the overall  code body.
+
+The motivation for detecting the free names is that a Newspeak closure must provide reflective access to its free variables, but a Javascript closure does not.
+Therefore, the compiler needs to collect this information and build a representation that will be accessible at run time.
+
+In practice, free names fall into two categories: true messages to enclosing objects, and variable accesses in the surrounding scope. Conceptually, these are all message sends, but they are treated very differently during compilation.
+
+The second category is primarily what we want to detect. Message sends can be directed at the enclosing object (starting with self) and looked up via standard lookup rules. *)|
+freeVariables <Set[Symbol]> = Set new.
+boundVariableStack = OrderedCollection new add: Set new; yourself.
+|codeBody apply: self)
+('as yet unclassified'
+assignmentNode: node = (
+	node expr apply: self.
+	node var apply: self.
+)
+blockLocalReturnNode: node  = (
+	node expr apply: self
+)
+blockNode: node <BlockAST> = (
+	pushScope: node body.
+	node body apply: self.
+	popScope.
+)
+boolNode: node = (
+	
+)
+cascadedSendNode: node <CascadedSendAST> = (
+	node prevSend apply: self.
+	node msg apply: self.
+)
+charNode: node <CharAST> = (
+	
+)
+codeBodyNode: node <CodeBodyAST> = (
+	pushScope: node.
+	(* who takes care of slot initializers? they have already been rewritten *)
+	node statements do: [:each <StatementAST>  | each apply: self].
+	popScope.
+)
+explicitOuterReceiverNode: node <ExplicitOuterReceiverAST> = (
+	
+)
+freeNames = (
+	^freeVariables asMutableArrayList
+)
+hereName = (
+	^#'_here'
+)
+implicitSendNode: node = (
+	| b <AST> aMsg <MessageAST> |
+	aMsg:: node msg.
+	aMsg apply: self.  
+	b:: currentScope at: aMsg sel ifAbsent: [MessageAST new].
+	b isMessagePatternNode ifTrue:
+		[(* this is a message send for a lexically defined method *)
+		^processImplicitOuterSend: aMsg atDepth: b depth].
+	b isVarDeclNode
+		ifTrue: [freeVariables add: aMsg sel].(* a real variable in scope *)
+)
+inlinableAsExpressionConditionalNode: node = (
+	normalSendNode: node	
+)
+inlinableConditionalNode: node = (
+	normalSendNode: node
+)
+isHereNode: aNode <AST> ^ <Boolean> = (
+	aNode isVariableNode ifFalse: [^false].
+	^aNode name = hereName
+)
+isPseudoVariableNode: aNode <VariableAST> ^ <Boolean> = (
+	^aNode name = #self
+		or: [aNode name = #super
+		or: [aNode name = #outer
+		or: [aNode name = #thisContext]]]
+)
+keywordPatternNode: node <KeywordPatternAST> = (
+)
+literalPatternNode: aNode <LiteralPatternAST> = (
+)
+messageNode: node <MessageAST> = (	
+	node args do: [:each | each apply: self].
+)
+mixinClassNode: node = (
+	
+)
+nilNode: node = (
+	
+)
+normalSendNode: node <NormalSendAST> = (
+	
+	(* temp reads and writes are here sends *)
+	(isHereNode: node recv) ifTrue: [^self processHereSend: node msg].	
+		(* this is post-rewriter. Do we ever need the above? *)
+	node recv apply: self.
+	node msg apply: self.
+)
+numberNode: node <NumberAST> = (
+	
+)
+parameterDeclNode: node = (
+	
+)
+parameterNode: node = (
+	processName: node name	
+)
+receiverNode: node = (
+	(* freeVariables add: #self *)
+)
+returnStatNode: node <ReturnStatAST> = (
+	node expr apply: self
+)
+setterSendNode: node <SetterSendAST> = (
+ 	normalSendNode: node.
+)
+stringNode: node <StringAST> = (
+	
+)
+superSendNode: node = (
+	node msg apply: self.
+	(* freeVariables add: #self *)
+)
+symbolNode: node <SymbolAST> = (
+	
+)
+temporaryDeclNode: node = (
+	
+)
+temporaryNode: node = (
+	processName: node name	(* what if it is synthetic/ *)
+)
+tupleNode: node <TupleAST> = (
+	node elements do: [:each | each apply: self]
+)
+varDeclNode: node = (
+	
+)
+variableNode: node = (
+	processName: node name	
+)
+wildcardPatternNode: aNode <WildcardPatternAST> = (
+)'private'
+currentScope = (
+	^boundVariableStack last.
+)
+popScope ^ <Set[Symbol]> = (
+	^boundVariableStack removeLast.
+)
+processHereSend: aMsg <MessageAST> = (
+	| b <AST> | (* is this ever called, given we are post rewriter? *)
+	aMsg apply: self.  
+	b:: currentScope at: aMsg sel ifAbsent: [MessageAST new].
+	b isMessagePatternNode ifTrue:
+		[(* this is a message send for a lexically defined method *)
+		^processImplicitOuterSend: aMsg atDepth: b depth].
+	b isVarDeclNode
+		ifTrue: [processName: aMsg sel].(* a real variable in scope *)
+)
+processImplicitOuterSend: aMsg <MessageAST> atDepth: depth <Integer> = (
+	(* stub. At some point, we may want to produce a mapping of free names to the lexical depth they come from to make things easier and more efficient for the closure mirror *)
+)
+processName: n <Symbol> = (
+	boundVariableStack detect:[: s | s includes: n] ifNone:[freeVariables add: n].
+	
+)
+pushScope: s <CodeBodyAST> = (
+	| bvs <Set[Symbol]> |
+	bvs:: Set new.
+	currentScope do:[:v <Symbol> | bvs add: v].
+	s parameters do:[: p | bvs add: p name].
+	s temporaries do:[: t | bvs add: t name].
+	boundVariableStack add: bvs
+)) : ()'AST visiting'
+ifNode: node <IfAST> = (
+	^js if: (node cond apply: self)
+		then: (node then apply: self)
+		else: (node else ifNotNil: [:else | else apply: self])
+)
+messagePatternNode: node <MessagePatternAST> ^<List[String]> = (
+	currentSelector:: node selector.
+	^node parameters collect: [:each | each apply: self]
+)
+methodNode: node <MethodAST> ^<Node> = (
+	| translatedBody |
+	translatedBody:: node body apply: self.
+	^js functionOf: (node pattern apply: self) asArray
+		body: (containsNonLocalReturn
+			ifTrue: [wrapBodyForNlrHandling: translatedBody]
+			ifFalse: [wrapBodyNoNlrHandling: translatedBody]).
+)
+parameterNode: node <ParameterAST> = (
+	^js ident: (names mangleLocal: node name)
+)'accessing'
+translateMethodNode: node <MethodAST> ^<Node> = (
+	| translation |
+	beginNewTranslationCycle.
+	pushScope: (scopeMap at: node).
+	currentScope at: (syntheticNameSeparator, 'currentMethod') asSymbol put: (SemanticMethod decl: node).
+	translation:: node apply: self.
+	popScope.
+	^translation.
+)'as yet unclassified'
+addCascadedSend: node to: statements = (
+	node isCascadedSendNode ifTrue:
+		[addCascadedSend: node prevSend to: statements].
+	statements add:
+		(js call: (js propertyOf: (js ident: 'cascadeReceiver') at: (js literal: (names mangleSelector: node msg sel)))
+			with: (node msg args collect: [:each | each apply: self]) asArray). 
+)
+assignmentNode: node = (
+	^js assign: (node var apply: self) toBe: (node expr apply: self)
+)
+astForBlock: node <BlockAST> ^ <Node> = (
+	| tree <BlockAST> body <CodeBodyAST> params |
+	
+	params:: node parameters collect:[:p | VariableAST new name: p name].
+	(params size = 1and:[params first name = rewriter setterBlockArgName])
+		ifTrue:[^js verbatim:'{}'].
+		(* A gross hack to avoid blocks that are produced by rewriting setter sends, as these do not have parseable block source *)
+	(* parse the source to obtain unrewritten AST *)
+	tree:: parser block parse: (ReadStream  on: (sourceForNode: node)).
+	tree isCodeBodyNode ifTrue:[body:: tree] ifFalse:[body:: tree body].
+	body parameters: params.
+	(* make sure we get a code body, and update any parameters *)
+	(* The above is only needed for sugar that hides the actual closure *)
+	^(body apply: ASTDescriber new)
+)
+astFunctionForBlock: node <BlockAST> ^ <Node> = (
+	| body |
+	body:: astForBlock: node.
+	^js functionOf: {} body: (js block:{
+		js var: (js ident: 'ast') value: (js call: (js ident: 'populateAST') with: {}).
+		js return: (astForBlock: node).
+		}).
+)
+beginNewTranslationCycle = (
+	scopeStack:: OrderedCollection new.
+	containsNonLocalReturn:: false.
+)
+blockLocalReturnNode: node <BlockLocalReturnAST> = (
+(*	(node expr isNormalSendNode and: [isInlinableConditionalNode: node expr]) ifTrue:
+		""Optimize the common special case of returning the value of an ifTrue:ifFalse: message send.
+		The clauses already have the necessary local returns of the last expression of each clause
+		inserted by the rewriter.""
+		[^js if: (node expr recv apply: self)
+			then: (node expr msg args first body apply: self)
+			else: ((node expr msg args at: 2) body apply: self)]. *)
+	^js return: (node expr apply: self)
+)
+blockNode: node <BlockAST> = (
+(* Commented out code creates a special object that may be examined by ClosureMirrors.
+*)
+       ^(* js new: (js ident: #JsBlock) with: { *)
+		js functionOf: (node parameters collect: [:each | each apply: self]) asArray
+			body: (node body apply: self).
+		(* freeNameLiteralOf: node.
+		astFunctionForBlock: node. 
+		js literal:  (sourceForNode: node). 
+		js literal: parsedLanguage
+		} *)
+)
+boolNode: node <BoolAST> = (
+	^js literal: node val
+)
+cascadedSendNode: node <CascadedSendAST> = (
+	| statements |
+	statements:: OrderedCollection new.
+	addCascadedSend: node to: statements.
+	statements at: statements size put: (js return: statements last).
+	^js call: (js functionOf: {'cascadeReceiver'} body: (js block: statements))
+		with: {node recv apply: self}
+)
+charNode: node <CharAST> = (
+	(* Javascript has no characters, only strings. *)
+	^js literal: node val asString
+)
+codeBodyNode: node <CodeBodyAST> = (
+	| locals statements |
+	locals:: node temporaries collect: [:each | each apply: self].
+	statements:: node statements collect: [:each | each apply: self].
+	^js block: (locals asArray, statements) asArray
+)
+explicitOuterReceiverNode: node <ExplicitOuterReceiverAST> = (
+	^processOuterReceiverAtDepth: node depth
+)
+freeNamesOf: block  <BlockAST> ^ <Set[Symbol]> = (
+	^(FreeVariableDetector for: block body) freeNames
+)
+implicitSendNode: node <ImplicitRcvrSendNode> = (
+	^processSend: node msg to: (processOuterReceiverAtDepth: node depth) with: node msg args
+)
+inlinableAsExpressionConditionalNode: node <InlinableConditionalAST> = (
+	| truePath falsePath condition |
+	
+	condition:: (node recv apply: self).
+	
+	node msg sel = 'ifTrue:' ifTrue:
+		[truePath:: (node msg args at: 1) body statements first apply: self.
+		falsePath:: js ident: 'nil'].
+	node msg sel = 'ifFalse:' ifTrue:
+		[truePath:: js ident: 'nil'.
+		falsePath:: (node msg args at: 1) body statements first apply: self].
+	node msg sel = 'ifTrue:ifFalse:' ifTrue:
+		[truePath:: (node msg args at: 1) body statements first apply: self.
+		falsePath:: (node msg args at: 2) body statements first apply: self].
+	node msg sel = 'ifFalse:ifTrue:' ifTrue:
+		[truePath:: (node msg args at: 2) body statements first apply: self.
+		falsePath:: (node msg args at: 1) body statements first apply: self].
+	
+	^js ternaryIf: condition then: truePath else: falsePath
+)
+inlinableConditionalNode: node <InlinableConditionalAST> = (
+	| selector inverseCondition hasElseClause condition |
+	selector:: node msg sel.
+	inverseCondition:: selector = 'ifFalse:ifTrue:' or: [selector = 'ifFalse:'].
+	hasElseClause:: node msg args size = 2.
+	condition:: node recv apply: self.
+	^js if: (inverseCondition ifTrue: [js prefixOperator: '!' on: condition] ifFalse: [condition])
+		then: (node msg args first body apply: self)
+		else: (hasElseClause ifTrue: [(node msg args at: 2) body apply: self] ifFalse: [nil])
+)
+inlinedOperatorNode: node <InlinedOperatorAST> = (
+	(* We are not modeling JS operator precedence, so just parenthesize everything. *)
+	^js operator: node msg sel
+		with: (node recv apply: self)
+		and: (node msg args first apply: self)
+)
+loopNode: node <LoopAST> = (
+
+	(* prologue; while(cond==whileTrue) {body}; *)
+
+	|
+	prologue = node prologue apply: self.
+	cond = node cond apply: self.
+	body = node body ifNil: [js block: {}] ifNotNil: [:it | it apply: self].
+	
+	(* Split the condition is it isn't a single expression *)
+	condExpression ::= cond statements last.
+	condPrologue = cond statements asOrderedCollection removeLast; yourself.
+	|
+	
+	node isWhileTrue ifFalse: [
+		condExpression:: js prefixOperator: '!' on: condExpression].
+	
+	(* Flatten prologue so its declarations are in scope for the loop *)
+	
+	^js block: 
+		prologue statements,
+		condPrologue, {
+		js 
+			for: (js verbatim: '')
+			while: condExpression
+			step: (js verbatim: '')
+			do: (js block: body statements, condPrologue)}
+)
+messageNode: node = (
+	sentSelectors add: node sel.
+	^js ident: (names mangleSelector: node sel)
+)
+nilNode: node = (
+	^js ident: 'nil'
+)
+nlrName = (
+	^'NLR'
+)
+nlrValuePropertyName = (
+	^'value'
+)
+normalSendNode: node <NormalSendNode> = (
+	enableIntrinsics ifTrue: [
+		node recv isNormalSendNode ifTrue: [
+			node recv msg sel = 'js' ifTrue: [^processIntrinsic: node msg]]].
+
+	^processSend: node msg to: (node recv apply: self) with: node msg args
+)
+numberNode: node <NumberAST> = (
+	assert: [node isNumberNode].
+	^js literal: node val
+)
+parameterDeclNode: node <ParameterAST> = (
+	^names mangleLocal: node name
+)
+processIntrinsic: msg <MessageAST> = (
+	^js perform: msg sel 
+		withArguments: (msg args collect: [:arg | processIntrinsicArg: arg]) asArray.
+)
+processIntrinsicArg: arg <AST> = (
+	arg isTupleNode ifTrue: [^(arg elements collect: [:el | processIntrinsicArg: el]) asArray].
+	arg isLiteralNode ifTrue: [^arg val].
+	^arg apply: self
+)
+processOuterReceiverAtDepth: depth <Integer> = (
+	| slotName |
+	depth = 0 ifTrue: [^js ident: 'self'].
+	slotName:: names mangleSelector: 'enclosingObjects`', currentMixinUID.
+	^js propertyOf: (js propertyOf: (js ident: 'self') at: (js ident: slotName))
+		at: (js literal: depth - 1) (* adjust for JS's 0-based indexing *)
+)
+processSend: message to: receiver with: args = (
+	^js 
+		call: (js propertyOf: receiver at: (message apply: self))
+		with: (args collect: [:each | each apply: self]) asArray
+)
+propertyCallNode: node <PropertyCallAST> = (
+	^js ident: (names mangleSelector: node sel)
+)
+receiverNode: node <ReceiverNode> = (
+	(* assert: [ node apply: rewriter ReceiverVisitor new] message: 'ReceiverNode expected'. *)
+	#BOGUS yourself.
+	^js ident: selfName
+)
+returnStatNode: node <ReturnAST> = (
+	containsNonLocalReturn:: true.
+	^js block: {
+		js assign: (js propertyOf: (js ident: nlrName) at: (js literal: nlrValuePropertyName)) toBe: (node expr apply: self).
+		js throw: (js ident: nlrName)
+	}
+)
+selfName = (
+	^'self'
+)
+stringNode: node <StringAST> = (
+	^js literal: node val
+)
+superSendNode: node <SuperSendAST> = (
+	| superSlotName args |
+	superSlotName:: names mangleSelector: 'super`', currentMixinUID.
+	args:: OrderedCollection new.
+	args add: (js ident: 'self').
+	node msg args do: [:each | args add: (each apply: self)].
+	^js call:
+			(js propertyOf:
+				(js propertyOf: (
+					js propertyOf: (js ident: 'self')
+						at: (js ident: superSlotName))
+					at: (node msg apply: self))
+				at: (js ident: 'call'))
+		with: args asArray
+)
+symbolNode: node <SymbolAST> = (
+	assert: [node isSymbolNode].
+	^js literal: node val
+)
+temporaryDeclNode: node <ParameterAST> ^<String> = (
+	^js var: (names mangleLocal: node name)
+		value: (node initializer = nil
+			ifTrue: [js ident: 'nil']
+			ifFalse: [ node initializer apply: self])
+)
+temporaryNode: node <TemporaryVariableAST> = (
+	^js ident: (names mangleLocal: node name)
+)
+tupleNode: node <TupleAST> = (
+	^js array: (node elements collect: [:ea | ea apply: self])
+)
+varDeclNode: node <VarDeclNode> = (
+	(* Produce the corresponding local decl. *)
+	^js var: (names mangleLocal: node name)
+)
+variableNode: node <VariableAST> = (
+	^js ident: (names mangleLocal: node name)
+)
+wrapBodyForNlrHandling: body <Block> = (
+	| nlrVarNode nlrParamName nlrParamNode |
+	nlrVarNode:: js ident: nlrName.
+	nlrParamName:: nlrName, '_exception'.
+	nlrParamNode:: js ident: nlrParamName.
+	^js block: {
+		js var: selfName value: (js ident: 'this').
+		js var: nlrName value: (js new: (js ident: 'Object') with: {}).
+		js try: body catch: nlrParamName with:
+			(js block: {
+				js if: (js operator: '==' with: nlrVarNode and: nlrParamNode)
+					then: (js return: (js propertyOf: nlrParamNode at: (js literal: nlrValuePropertyName)))
+					else: (js throw: nlrParamNode)
+			})
+	}
+)
+wrapBodyNoNlrHandling: body <Block> = (
+	^js block: {js var: selfName value: (js ident: 'this')}, body statements
+)'private'
+freeNameLiteralOf: block <BlockAST> ^ <Node> = (
+	| freeNames <List[Symbol]> vals |
+	freeNames:: freeNamesOf: block.
+	vals:: freeNames collect:[:n <Symbol> | slotForFreeName: n].
+	^js objectLiteralSlotNames: freeNames values: vals
+)
+slotForFreeName: n <Symbol> ^ <Node> = (
+	^js functionOf: {} body: (js return: (js ident: (names mangleLocal:  n)))
+)) : ()'as yet unclassified'
+accessorForNestedClassNamed: simpleName <String> in: mixinName  <String> superCall: superAccessor <Node> ^ <String> = (
+(* Build  a method that will lazily create a nested class 'simpleName' with superclass defined by 'superAccessor' via mixin application, and cache it.  Maybe replace null slot with self-replacing function that computes class and stores in its closure? *)
+
+	| nestedName <String> nestedSlotName <String> nestedSlotNode <Node> enclosingObjectsName <String> |
+	nestedName:: names mangleSelector: mixinName, '`', simpleName.
+	nestedSlotName:: names mangleSlot: mixinName, '`', simpleName.
+	nestedSlotNode:: js propertyOf: (js ident: 'this') at: (js ident: nestedSlotName).	
+	enclosingObjectsName:: names mangleSelector: 'enclosingObjects`', mixinName.
+	^js functionOf: {} body: (js block: {
+		js if: (js operator: '===' with: (js ident: 'nil') and: nestedSlotNode)
+			then: (js block: {
+				js var: 'self' value: (js ident: 'this').
+				js var: 'superclass' value: superAccessor.
+				js var: 'enclosingObjects' value: 
+					(js call: (js propertyOf: (js array: {js ident: 'this'}) at: (js ident: 'concat'))
+						with: {js propertyOf: (js ident: 'this') at: (js ident: enclosingObjectsName)}).
+				js var: 'mixin' value: (js propertyOf: (js ident: 'this') at: (js ident: nestedName)).
+				js assign: nestedSlotNode toBe: 
+					(js call: (js propertyOf: (js ident: 'vmmirror') at: (js ident: 'applyMixin$toSuperclass$withEnclosingObjects$'))
+						with: {(js ident: 'mixin'). js ident: 'superclass'. js ident: 'enclosingObjects'}).
+			}).
+		js return: nestedSlotNode.
+		})
+)
+accessorForSuperclass: superclassCall <AST> inScope: s <Scope> ^<Node> = (
+	| send scopeBuilder |
+	rewriter pushScope: s.
+	send:: superclassCall apply: rewriter.
+	rewriter popScope.
+	
+	translator beginNewTranslationCycle.
+	^send apply: translator
+)
+addMetadataFor: mixin <ClassMixinMirror> to: object <ObjectLiteral> = (
+
+	| metadataSlots | 
+
+	#BOGUS yourself. (* this is not the whole thing *)
+
+	metadataSlots:: OrderedCollection withAll: {
+		(* MKL: We should change this to fullyQualifiedName *)
+		'name'.
+			js literal: mixin name. 
+		'simpleName'.
+			js literal: (fullyQualifiedNameToSimple: mixin name).
+		'isMeta'.
+			js literal: mixin isMeta. 
+		'language'.
+			js literal: parsedLanguage. 
+		'methods'.
+			js array: ((mixin methods mirrors reject: [:each | each isSynthetic])
+					collect: [:each |
+							js objectLiteral: {
+								'language'. js literal: parsedLanguage. 
+								'name'. js literal: each name.
+								'source'. js literal: (each src ifNil: [emptyMethodForSelector: each name])}])}.
+
+	mixin isMeta
+		ifTrue: [metadataSlots addAll: {
+			'slots'. js array: {}}]
+		ifFalse: [metadataSlots addAll: {
+		(* We could store the header only and refrain from storing the source of single slots explicitly. Reconstructing the slots from the source requires the Newspeak parser to be working though, which itself relies on class/slot mirrors being functional to a certain extent. Thus we store the sources of single slots, so that we can at least report the names of slots. Nothing more is required by the parser. *)
+			'header'. js literal: mixin header.
+			'slots'. js array: (mixin slots collect: [:each |
+				js objectLiteral: {
+					'language'. js literal: parsedLanguage. 
+					'name'. js literal: each name.
+					'source'. js literal: each source.
+					'isMutable'. js literal: each isMutable}])},
+			(useDnuCatcher
+				ifTrue: [{'sentSelectors'. js array: (sentSelectors asArray collect: [:each | js literal: each])}]
+				ifFalse: [{}])].
+	
+	object addSlot: 'metadata' value: (js objectLiteral: metadataSlots).
+)
+addMethodsOf: mirror <LowLevelMixinMirror> to: object <ObjectLiteral> = (
+	mirror methods do:
+		[:method <MethodMirror> |
+		| nameMustBeQuoted properName |
+		(*nameMustBeQuoted:: method isSynthetic not or: [method isAccessor or: [method isFactory]].
+		properName:: nameMustBeQuoted
+			ifTrue: ['''#', method name, '''']
+			ifFalse: [method name].*)
+		object addSlot: (names mangleSelector: properName) value: method method]
+)
+addMixinHandleAccessorTo: object = (
+
+	| mixinAccessor |
+	(* We used to generate a single mixin accessor method in newspeakClassRC. We changed to generating a method per mixin, so that mixin handles can also be accessed when only the mixin object is available. *)
+	mixinAccessor:: js
+		functionOf: {}
+		body: (js block: {
+			js return: (js call: (js ident: 'mixinHandleFor') with: {js ident: 'this'})}).
+
+	object
+		addSlot: 'mixinHandle'
+		value: mixinAccessor
+)
+addNestedClassesFor: mixin <MixinRep> to: object <ObjectLiteral> = (
+	| nestedMixins |
+	nestedMixins:: js objectLiteral.
+	mixin last do:
+		[:rep <MixinRep> |
+		nestedMixins
+			addSlot: (names mangleSelector: rep first name)
+			value: (translateMixinRep: rep)].
+	object addSlot: 'nestedMixins' value: nestedMixins.
+)
+addNestedMixinsFromNamespaceFor: mixin <MixinRep> to: object <ObjectLiteral> = (
+	| nestedMixins |
+	nestedMixins:: js objectLiteral.
+	mixin last do:
+		[:rep <MixinRep> |
+		nestedMixins
+			addSlot: rep first name
+			value: (js
+				propertyOf: (js ident: mixinNamespace)
+				at: (js literal: rep first name))].
+	object addSlot: 'nestedMixins' value: nestedMixins.
+)
+beginNewCompileCycle = (
+	scopeStack:: OrderedCollection new.
+)
+checkForDuplicateNames: aNode = (
+
+	| namesWithDuplicates names duplicateNames |
+	
+	namesWithDuplicates:: OrderedCollection new.
+	aNode instanceSide categories do: [:cat |
+		cat methods do: [:each | namesWithDuplicates add: each selector]].
+	
+	aNode hdr slots do: [:each |
+		namesWithDuplicates add: each name.
+		each isMutable ifTrue: [namesWithDuplicates add: each name, ':']].
+	
+	namesWithDuplicates
+		addAll: (aNode instanceSide nestedClasses collect: [:each | each name]).
+
+	names:: Set new.
+	duplicateNames:: Set new.
+	namesWithDuplicates do: [:each | | present |
+		present:: true.
+		names include: each ifNew: [present:: false].
+		present ifTrue: [duplicateNames add: each]].
+	
+	duplicateNames isEmpty ifFalse: [ | message |
+		message:: String streamContents: [:s |
+			s
+				nextPutAll: 'Class ';
+				nextPutAll: aNode name;
+				nextPutAll: '" has multiple definitions for '.
+			duplicateNames
+				do: [:each | s nextPutAll: each asString]
+				separatedBy: [ s nextPutAll: ','].
+			s nextPutAll: '.'.].
+		assert: false message: message].
+
+)
+classNode: aNode <ClassDeclarationAST> ^ <ClassDeclarationIR> = (
+	| ir <ClassDeclarationIR> priorMixinUID <String> |
+	checkForDuplicateNames: aNode.
+	ir:: computeMixinFrom: aNode hdr.
+	priorMixinUID:: currentMixinUID.
+	currentMixinUID:: ir name.
+	currentDepth:: currentDepth + 1.
+	processInstanceSideOf: aNode ofMixin: ir instanceSide.
+	generateSlotAccessorsFor:  ir instanceSide. 
+	(* must be called after nested classes are processed, so all synthetic slots have been added *)
+	processClassSideOf: aNode ofMixin: ir classSide.
+	currentDepth::currentDepth - 1.
+	currentMixinUID:: priorMixinUID.
+	^ir
+)
+compileClassSource: source <ReadStream> within: enclosing <MixinMirror> ^<CompiledMixinMirror> = (
+	| tree <AST> mixinRep <MixinRep> |
+	tree:: parser classDefinition parse: source.
+	setInput: source.
+	setScopeFor: tree in: enclosing.
+	(*sentSelectors:: Set new.*)
+	mixinRep:: classNode: tree.
+	scopeMap:: Dictionary new.
+	^enclosing isNil ifTrue:[mixinRep] ifFalse:[{enclosing. mixinRep}].
+)
+compileMethodSource: source <ReadStream> within: enclosing <MixinMirror> ^<MethodMirror> = (
+	| tree <AST> |
+	tree:: parser methodDecl parse: source.
+	setInput: source.
+	setScopeFor: tree in: enclosing.
+	jsTree:: translateMethodNode: tree.
+	scopeMap:: Dictionary new.
+	^jsTree
+)
+compileNestedClasses: nestedClasses <Collection[ClassDeclarationAST]> within: mixinIR <MixinIR> = (
+	
+	nestedClasses do:
+		[ :nc <ClassDeclarationAST> |  
+			| nSlotName <String> nSlot <InstanceVariableMirror> |
+		nSlotName:: mixinIR declaration name, '`', nc name.
+		nSlot:: SlotIR named: nSlotName mutable: true.
+		nSlot isSynthetic: true.
+		mixinIR slots add: nSlot.
+		mixinIR nestedClasses add: (classNode: (nestedMixinWrapperFor: nc in: mixinIR)). (* make 'mixin' (a Smalltalk subclass of ProtoObject) for nested class *)
+		createNestedClassAccessorFrom: nc within: mixinIR
+		].
+)
+compileNestedClassesOf: aNode <SideAST> within: mixinMirror <LowLevelMixinMirror> ^ <Collection[MixinRep]> = (
+	(* where do we check that nested classes do not conflict with each other, or with methods or slots? *)
+	^compileNestedClasses: aNode nestedClasses within: mixinMirror
+)
+compileWithFullInfoTopLevelClassSource: source <ReadStream> = (
+	| tree rep mixinAst ast output |
+	tree:: parser classDefinition parse: source.
+	setInput: source.
+	setScopeFor: tree in: nil.
+	(*sentSelectors:: Set new.*)
+	rep:: classNode: tree.
+	mixinAst:: translateMixinRep: rep. 
+	ast:: js
+		propertyOf: (js
+			call: (js ident: 'makeTopLevelClass')
+			with: {mixinAst})
+		at: (js literal: 'factory').
+	output:: WriteStream on: (MutableString new: 100).
+	jsWriter generateSourceFor: ast on: output.
+	^{	output contents.
+		jsWriter nsIntervals.
+		jsWriter jsIntervals.
+		tree.
+		ast
+	}
+)
+computeMethod: aNode <MethodAST> inScope: s <Scope> = (
+	|  scopeBuilder <ScopeBuilder>  |
+	scopeBuilder:: ScopeBuilder nestedIn: s atLevel: currentDepth.
+	aNode apply: scopeBuilder.
+	(* need to build scope for method before visiting it *)
+	^methodNode: aNode.
+)
+computeMixinFrom: aNode <ClassHeaderAST> ^ <ClassDeclarationIR> = (
+	| 
+	ir = ClassDeclarationIR new.
+	|
+	
+	ir name: aNode name.
+	aNode slots do: [:s |
+		ir instanceSide slots add: (SlotIR named: s name mutable: s isMutable)].
+	(* ir headerSource: (input contents copyFrom: aNode start to: aNode end).
+	ir factorySelector: aNode constructor selector. *)
+	^ir
+)
+createNestedClassAccessorFrom: classDecl <ClassDeclarationAST> within: mixinMirror <LowLevelMixinMirror> = (
+(* Create an accessor method for the nested class represented by the incoming class tree.
+This accessor will lazily generate the nested class when its enclosing instance is first asked for it. *)
+
+	| n <String>  accessorString <String> methodSrc <String>  hdr <ClassHeaderAST> accessor <MethdMirror>  |
+	hdr:: classDecl hdr.
+	n:: hdr name. 
+	methodSrc:: 
+		accessorForNestedClassNamed: n 
+		in:  mixinMirror name 
+		superCall: (accessorForSuperclass: hdr superclassCall inScope:  (scopeMap at: classDecl instanceSide)).
+	accessor:: MethodIR named: (names mangleSelector: classDecl name) asSymbol.
+	accessor function: methodSrc.
+	accessor isSynthetic: true.
+	mixinMirror methods add: accessor.
+)
+createSlotsFor: aNode <ClassHeaderAST> ^ <String> = (
+	| assignments |
+	assignments:: aNode  slots collect:
+		[:slot <SlotDefAST> |
+		js assign: (js propertyOf: (js ident: 'this') at: (js literal: slot name))
+			toBe: (js ident: 'nil')].
+ 	^js functionOf: {}
+		body: (js block: (assignments asArray, {js return: (js ident: 'this')}))
+)
+currentScope ^<Scope> = (
+	^scopeStack last
+)
+emptyMethodForSelector: selector = (
+
+	| result counter |
+	result:: ''.
+	counter:: 1.
+	(* Could use some generic substring-replacement mechanism.
+	Should not construct a new string on every iteration. *)
+	selector do: [:each | | next |
+		next:: each = $:
+			ifTrue: [': x', counter asString]
+			ifFalse: [each asString].
+		result:: result, next.].
+	^ result, ' = ("generated")'
+)
+generateSlotAccessorsFor: mixinIR <MixinIR>  = (
+(* We need getter FUNCTIONS so we can call them uniformly with arguments (albeit empty ones) *)
+	mixinIR slots do: [:slotIR  | 
+		| getter <MethodMirror> getterJS <Node> setter <MethodMirror> setterJS <Node> slotName <String> fieldName |
+		slotName:: slotIR name.
+		fieldName:: names mangleSlot: slotName.
+		
+		getter:: MethodIR named: (names mangleSelector: slotName).
+		getterJS:: js functionOf: {} body: (js block: {
+			js return: (js propertyOf: (js ident: 'this') at: (js ident: fieldName))
+			}).
+		getter function: getterJS.
+		getter isSynthetic: true.			
+		mixinIR methods add: getter.
+		
+		setter:: MethodIR named: (names mangleSelector: (setterSelectorFor: slotIR)).
+		setterJS:: js functionOf: {'v'} body: (js block: {
+			(js assign: (js propertyOf: (js ident: 'this') at: (js ident: fieldName))
+				toBe: (js ident: 'v')).
+			js return: (js ident: 'this')
+			}).
+		setter function: setterJS.
+		setter isSynthetic: true.	
+		mixinIR methods add: setter.
+		]	
+)
+hereNode ^<VariableAST> = (
+	(* Generates an AST representing the implicit receiver. We use a string so that we can represent a name that is not a legal identier *)
+	
+	^VariableAST new name: #'@here'; start: 0; end: 0.
+)
+hereSendFrom: arg <VarDeclAST> ^<MessageNode> = (
+	^NormalSendAST new
+		to: hereNode
+		send: (MessageAST new 
+			send: arg name
+			with: {};
+			start: arg start; end: arg end); 
+		start: arg start; end: arg end
+)
+initializerFor: aNode <ClassHeaderAST> ^ <MethodAST> = (
+| 
+stmts  <Collection[StatementAST]>
+start <Integer>  
+end <Integer> 
+initHdr <MessagePatternAST>
+body <CodeBodyAST> 
+copier <ASTCopier> 
+params <List[VarDeclAST]>
+|
+
+	start:: aNode superConstructorCall start.
+	end:: aNode superConstructorCall end.
+	copier:: ASTCopier new.
+	params:: aNode constructor parameters collect: 
+		[:formal | formal apply: copier].
+	initHdr:: MessagePatternAST new
+		selector: #instanceInitializer parameters: params;
+		start: start; end: end.
+		
+	(* set up scope with constructor parameters *)
+ 	stmts:: OrderedCollection new.
+	
+	stmts add: (superConstructorCallFor: aNode).
+	
+	(aNode slots reject: [:ea | ea initializer isNil]) 
+		do: [:slot <SlotDefAST> | | aMsg <MessageAST> |
+	aMsg:: MessageAST new send: (names mangleSelector: (setterSelectorFor: slot)) 
+					   with:  {slot initializer apply: copier} ;
+					   start: slot  start; end: slot end.
+	stmts add: (NormalSendAST new msg: aMsg; 
+                          recv: (selfNode start: aMsg start; end: aMsg end);
+                          start: aMsg start; end: aMsg end).			
+	].
+
+ stmts addAll: (aNode initExprs collect:[:ie | ie apply: copier]).
+ body:: CodeBodyAST new temporaries: OrderedCollection new
+                                       statements: stmts; 
+                                       start: start; end: end.
+ ^MethodAST new pattern: initHdr
+                            body: body
+                            visibility: #public; 
+                            start: start; end: end.
+)
+language = (
+	^#NewspeakLanguage2
+)
+makeCreateSlotsFor: hdr <ClassHeaderAST>  within: mixinMirror <LowLevelMixinMirror> ^ <MethodAST> = (
+(* Create the method that initializes the slots defined by the class declaration to nil *)
+	| accessor <MethdMirror>  |
+	accessor:: MethodMirror named: #createSlots.
+	accessor method: (createSlotsFor: hdr).
+	accessor isSynthetic: true.
+	mixinMirror methods addMirror: accessor.
+)
+methodNode: aNode <MethodAST> ^ <MethodMirror> = (
+	| tree <AST> jsTree |
+	tree:: aNode apply: rewriter.  (* rewrite ast *)
+	translator beginNewTranslationCycle.
+	jsTree:: tree apply: translator.	 (* final pass: visit rewritten ast *)
+	(* pop scope? *)
+	^((MethodIR named: (names mangleSelector: translator currentSelector))
+		function: jsTree)
+			src: (sourceForNode: aNode)
+)
+mixinNamespace = (
+
+	^ 'globalMixinNamespace'
+)
+nestScope: scope <Scope> = (
+	(* Hook up a new lexically nested scope, and push onto the scope stack *)
+	scope superScope: currentScope.
+	pushScope: scope
+)
+nestedMixinWrapperFor: nested <ClassDeclarationAST> in: outerClass <MixinMirror>  ^ <ClassDeclarationAST> = (
+(* Wrap a class declaration to make it look like a nested mixin within outerClass should. This includes making the name be the fully qualified name, and hiding the superclass. *)
+
+	| wrapper <ClassDeclarationAST> |
+	wrapper:: nested clone.
+	wrapper hdr: nested hdr clone.
+	wrapper hdr name: (fullyQualifySimpleName: nested name with: outerClass name).
+	^wrapper
+)
+outputClass: mixinRep <MixinRep> toNamespace: namespace <FilePattern> = (
+
+	| ast simpleName |
+	
+	simpleName:: (fullyQualifiedNameToSimple: mixinRep first name).
+	
+	mixinRep last do: [:each |
+		outputClass: each toNamespace: namespace / simpleName].
+	
+	ast:: js script: {js
+		assign: (js propertyOf: (js ident: mixinNamespace) at: (js literal: mixinRep first name))
+		toBe: (translateMixinRepWithNestedMixinsFromNamespace: mixinRep)}.
+	
+	(namespace / (simpleName, '.js')) stream: [:stream |
+		jsWriter generateSourceFor: ast on: stream].
+	
+)
+outputCreationOfClass: mixinRep <MixinRep> to: stream<[:WriteStream]> = (
+
+	| ast |
+	ast:: js
+		propertyOf: (js
+			call: (js ident: 'makeTopLevelClass')
+			with: {js propertyOf: (js ident: mixinNamespace) at: (js literal: mixinRep first name)})
+		at: (js literal: 'factory').
+
+	jsWriter generateSourceFor: ast on: stream
+)
+outputInfrastructureCodeTo: stream = (
+
+	InfrastructureFunctions new outputTo: stream.
+	Phase1Platform new outputTo: stream.
+)
+outputTopLevelClass: rep <MixinRep> to: stream <WriteStream> = (
+	| mixinAst ast |
+	mixinAst:: translateMixinRep: rep. 
+	ast:: js
+		propertyOf: (js
+			call: (js ident: 'makeTopLevelClass')
+			with: {mixinAst})
+		at: (js literal: 'factory').
+		
+	jsWriter generateSourceFor: ast on: stream.
+)
+popScope ^<Scope> = (
+	^scopeStack removeLast
+)
+processClassSideOf: aNode <ClassAST> ofMixin: mixinMirror <LowLevelMixinMirror> = (
+	(* | primaryFactory <MethodMirror> factoryAST <MethodAST> | *)
+	processFactoryFor: aNode in: mixinMirror.
+	processSide: aNode classSide ofMixin: mixinMirror. (* compile class methods *)
+)
+processFactoryFor: aNode <ClassAST> in: mixinIR <MixinIR> = (
+	| accessor <MethdMirror> argNames ast |
+	accessor:: MethodIR named: (names mangleSelector: aNode hdr constructor selector).
+	argNames:: (aNode hdr constructor parameters collect: [:each | names mangleLocal: each name]) asArray.
+	ast:: js functionOf: argNames body: (js block: {
+		js return:
+			(js call: (js ident: '(new this.nonMeta.basicNew()).instanceInitializer') (* cheat! *)
+				with: (argNames collect: [:each | js ident: each]))
+		}).
+	accessor function: ast.
+	mixinIR methods add: accessor.
+)
+processInitializerFor: aNode <ClassAST> in: mixinIR <MixinIR> = (
+	processMethod: (superConstructorMethodFor: aNode hdr) inScope:  (scopeMap at: aNode instanceSide) in: mixinIR. 
+	(*makeCreateSlotsFor: aNode hdr within: mixinIR.*)
+	processMethod: (initializerFor: aNode hdr) inScope:  (scopeMap at: aNode instanceSide) in: mixinIR.
+)
+processInstanceSideOf: aNode <ClassAST> ofMixin: mixinIR <MixinIR> ^ <Collection[MixinRep]> = (
+	processInitializerFor: aNode in: mixinIR.
+	processSide: aNode instanceSide ofMixin: mixinIR. (* compile instance methods *)
+	compileNestedClassesOf: aNode instanceSide within: mixinIR. (* gather nested classes *)
+)
+processMethod: aNode <MethodAST> inScope: s <Scope> in: mixinIR <MixinIR> = (
+	|  method <MethodMirror> |
+	method:: computeMethod: aNode inScope: s.
+	method isSynthetic: true.
+	mixinIR methods add: method.
+)
+processSide: side <SideAST> ofMixin: mixinIR <MixinIR> = (
+	side categories do: [:cat |
+		cat methods do: [:m | 
+			mixinIR methods add: (methodNode: m)]].
+)
+pushScope: scope <Scope> = (
+	scopeStack addLast: scope
+)
+selfNode ^ <VariableAST> = (
+	(* generate a an AST representing self; used for implicit self sends *)
+	^VariableAST new name: #self; start: 0; end: 0
+)
+setInput: source <ReadStream> = (
+	source position: 1.
+	input: source. (* save the input *)
+)
+setScopeFor: node <AST> in: enclosing <MixinMirror | nil> = (
+	| scopeBuilder |
+	pushScope: Scope new.
+	enclosing notNil ifTrue: [nestScope:: ScopeBuilder new buildScopeFor: enclosing].
+	currentDepth:: currentScope depth - 1.
+	scopeBuilder:: ScopeBuilder nestedIn: currentScope atLevel: currentDepth.
+	node apply: scopeBuilder
+)
+setterSelectorFor: slot <SlotDefAST | InstanceVariableMirror> ^<Symbol> = (
+	^((slot isMutableSlot ifTrue: [ '' ] ifFalse: [ 'setOnce`' ]), slot name, ':') asSymbol.
+)
+slotNameForNestedClassNamed: ncn <String> within: outerName <String> ^ <String> = (
+	^mixinSlotNameFor:
+		(fullyQualifySimpleName: ncn with: outerName). 
+)
+sourceForNode: node <AST> ^ <String> = (
+	| savedPos <Integer> pos <Integer> len <Integer> s <String> |
+	(* ^String withAll: (input copyFrom: node start to: node end *)
+	savedPos:: input position.
+	len: (node end - node start) + 1.
+	s:: MutableString new: len.
+	input position: node start -1.
+	1 to: len do:
+		[:index |
+		s at: index put: input next].	
+	input position: savedPos.
+	^s
+)
+superConstructorCallFor: aNode <ClassHeaderAST> ^<NormalSendAST> = (
+	
+	(* create call to super constructor method *)
+	|
+	var  <VariableAST> 
+	send <NormalSendAST>
+	start <Integer> 
+	end <Integer>  
+	superMsg <MessageAST>
+	args <List[VariableAST]> 
+	|
+
+	start:: aNode superConstructorCall start.
+	end:: aNode superConstructorCall end.
+	var:: VariableAST new name: #self; start: start; end: end.
+	args:: aNode constructor parameters collect:
+		[:p <VarDeclAST> | hereSendFrom: p].
+	superMsg:: MessageAST new 
+		send: (superConstructorNameFor: aNode) with: args; 
+		start: start; end: end.
+	send:: NormalSendAST new to: var send: superMsg; start: start; end: end.	
+	^send
+)
+superConstructorMethodFor:  aNode <ClassHeaderAST> ^ <MethodAST> = (
+| 
+start <Integer> 
+end <Integer>
+stmts <List[StmtAST]> 
+var  <VariableAST> 
+initHdr <MessagePatternAST>
+superMsg <MessageAST> 
+send <NormalSendAST>
+body  <CodeBodyAST>
+copier <ASTCopier>
+params <List[VarDeclAST]>
+args <List>
+|
+
+	start:: aNode superConstructorCall start.
+	end::  aNode  superConstructorCall end.
+	copier:: ASTCopier new.
+	params:: aNode constructor parameters collect:[:formal | formal apply: copier].
+	initHdr:: MessagePatternAST new selector: (superConstructorNameFor: aNode) parameters: params;
+				start: start; end: end. 
+	(* set up scope with constructor parameters *)
+	(* create call to superclass initializer *)
+	stmts:: OrderedCollection new. 
+	var:: VariableAST new name: #super; start: start; end: end.
+	args:: aNode superConstructorCall args collect:[:actual | actual apply: copier].
+	superMsg::  PropertyCallAST new send: 'instanceInitializer' with: args; 
+				start: start; end: end. 
+	(* only copy actual args *)
+	(* send these as a tuple? to super instance initializer? *)
+	send:: NormalSendAST new to: var send: superMsg; start: start; end: end. 
+	stmts addFirst: send.
+	body:: CodeBodyAST new temporaries: OrderedCollection new
+                                       	statements: stmts;
+                                      	start: start; end: end.
+	^MethodAST new pattern: initHdr
+                            body: body
+                            visibility: #private;
+                            start: start; end: end	
+)
+superConstructorNameFor: aNode <ClassHeaderAST> ^ <Symbol> = (
+	^'superInit`', aNode name
+)
+translateMethodNode: method <MethodAST> = (
+	| tree <AST> |
+	tree:: method apply: rewriter.
+	translator beginNewTranslationCycle.
+	^tree apply: translator.
+)
+translateMixinRep: mixin <MixinRep> = (
+	| mirror <LowLevelMixinMirror> object |
+	mirror:: mixin first lowLevelMirror.
+	object:: js objectLiteral.
+	mirror isMeta ifFalse: [
+		| classMixinObject |
+		classMixinObject:: js objectLiteral.
+		addMetadataFor: mirror classMixin to: classMixinObject.
+		addMixinHandleAccessorTo: classMixinObject.
+		addMethodsOf: mirror classMixin to: classMixinObject.
+		object addSlot: 'classMixin' value: classMixinObject.
+		addNestedClassesFor: mixin to: object.
+		addMetadataFor: mixin first to: object].
+	addMixinHandleAccessorTo: object.
+	addMethodsOf: mirror to: object.
+	^object
+)
+translateMixinRepWithNestedMixinsFromNamespace: mixin <MixinRep> = (
+	| mirror <LowLevelMixinMirror> object |
+	mirror:: mixin first lowLevelMirror.
+	object:: js objectLiteral.
+	mirror isMeta ifFalse: [
+		| classMixinObject |
+		classMixinObject:: js objectLiteral.
+		addMetadataFor: mirror classMixin to: classMixinObject.
+		addMixinHandleAccessorTo: classMixinObject.
+		addMethodsOf: mirror classMixin to: classMixinObject.
+		object addSlot: 'classMixin' value: classMixinObject.
+		addNestedMixinsFromNamespaceFor: mixin to: object.
+		addMetadataFor: mixin first to: object].
+	addMixinHandleAccessorTo: object.
+	addMethodsOf: mirror to: object.
+	^object
+)
+writeJascriptAST: node <Node> ^<String> = (
+	| writer |
+	writer:: JavascriptWriter on: '' writeStream.
+	writer generateSourceFor: node.
+	^writer contents
+)'lexical export'
+scopeMap = (
+	^super scopeMap
+)) : ()
+class Infrastructure withAppSources: appSources withRuntimeSources: runtimeSources outputTo: stream = (|
+	compiler = Compiler new.
+	applicationMixins = compileModules: appSources enableIntrinsics: false.
+	runtimeMixins = compileModules: runtimeSources enableIntrinsics: true.
+|JavascriptWriter new generateSourceFor: script on: stream)
+('as yet unclassified'
+appDefnName = (
+	 ^applicationMixins first name
+)
+compileModules: modules <List[String]> enableIntrinsics: flag <Boolean> ^<List[ClassDeclarationIR]> = (
+	(* Strictly speaking, these are module definitions not module (instances). *)
+	compiler enableIntrinsics: flag.
+	^modules collect: [:module <String> |
+		compiler compileClassSource: module readStream within: nil].
+)
+dnuHandlers = (
+	^js function: 'installDnuHandlersOn' of: {js ident: 'p'} body: (js block: (
+	compiler sentSelectors collect: [:selector | 
+		| args = ((1 to: selector numArgs) collect: [:i | js ident: 'a',i printString]). |
+		js assign: (js propertyOf: (js ident: 'p') at: (js ident: (names mangleSelector: selector))) toBe:
+		(js functionOf: args body: (js block: {
+			js return: (js call: (js propertyOf: (js ident: 'this') at: (js ident: (names mangleSelector: #doesNotUnderstand:)))
+			 with: {js call: (js verbatim: 'vmmirror.kernel.Message().selector$arguments$') 
+				with: {js literal: (names mangleSelector: selector). js array: args} })
+		}))
+	]))
+	
+	(* sel (a1,a2){  this.dnu(kernel.Message().selector$arguments$('sel', [a1, a2]) )  } *)
+)
+main = (
+	^js verbatim: 
+'var runtime = ns.',runtimeDefnName,'().packageUsing$(ns);
+var platform = runtime.using$(vmmirror);
+var app = ns.',appDefnName,'().packageUsing$(ns);
+app.main$args$(platform, [])'
+)
+namespace = (
+	^js var: 'ns' value: (js new: (js functionOf: {} body: (js block: (
+		(applicationMixins, runtimeMixins collect: [:cd | 
+			js assign: (js propertyOf: (js ident: 'this') at: (js ident: (names mangleSlot: cd name))) 
+				toBe: (js call: (js propertyOf: (js ident: 'vmmirror') at: (js ident: 'applyTopLevelMixin')) 
+						with: {js propertyOf: (js ident: 'mixins') at: (js ident: (names mangleSelector: cd name))})]),
+		(applicationMixins, runtimeMixins collect: [:cd | 
+			js assign: (js propertyOf: (js ident: 'this') at: (js ident: (names mangleSelector: cd name)))
+				toBe: (js functionOf: {} body: (js block: {js return: 
+					(js propertyOf: (js ident: 'this') at: (js ident: (names mangleSlot: cd name)))}))])
+	))) with: {})
+)
+runtimeDefnName = (
+	 ^runtimeMixins first name
+)
+runtimeMixinNamespace = (
+	^js new: (js functionOf: {} body: (js block: (
+		applicationMixins, runtimeMixins collect: [:cd | 
+			js assign: (js propertyOf: (js ident: 'this') at: (js ident: (names mangleSelector: cd name))) toBe: cd runtimeMixin]
+	))) with: {}
+)
+script = (
+	^js script: 
+		{js literal: 'use strict'.
+		js var: 'nil' value: (js literal: 'patch me with nil').
+		js var: 'mixins' value: runtimeMixinNamespace.
+		vmmirror.
+		namespace.
+		dnuHandlers.
+		main}
+)
+source = (
+	^JavascriptWriter new generateSourceFor: script
+)
+vmmirror = (
+	^js verbatim: 
+'
+var vmmirror = new function(){
+	
+	this.ImplementationBase$slot = new function(){
+		this.debug = "ImplementationBase";
+		this.runtimeClass$slot = new function(){
+			this.debug = "Runtime class for ImplementationBase";
+			this.basicNew = function(){};
+			this.instanceInitializer = function(){};
+		};
+	};
+	this.ImplementationBase = function(){return this.ImplementationBase$slot;};
+	this.Array = function(){return Array;};
+	this.String = function(){return String;};	
+	
+	this.createKernel = function(){
+		
+		var enclosingObjects = ["patch me with kernel", "patch me with nil"];
+		var enclosingObjects2 = ["patch me with nil"];
+		
+		var Object$runtimeClass = mixins.KernelForV8.KernelForV8$Object.invoke(this.ImplementationBase().runtimeClass$slot, enclosingObjects);
+		var Class$runtimeClass = mixins.KernelForV8.KernelForV8$Class.invoke(Object$runtimeClass, enclosingObjects);
+		var Metaclass$runtimeClass = mixins.KernelForV8.KernelForV8$Metaclass.invoke(Object$runtimeClass, enclosingObjects);
+		var Mixin$runtimeClass = mixins.KernelForV8.KernelForV8$Mixin.invoke(Object$runtimeClass, enclosingObjects);
+		var UndefinedObject$runtimeClass = mixins.KernelForV8.KernelForV8$UndefinedObject.invoke(Object$runtimeClass, enclosingObjects);
+		var Kernel$runtimeClass = mixins.KernelForV8.invoke(Object$runtimeClass, enclosingObjects2);
+		
+		var Object$class$runtimeClass = mixins.KernelForV8.KernelForV8$Object.meta.invoke(Class$runtimeClass, enclosingObjects);
+		var Class$class$runtimeClass = mixins.KernelForV8.KernelForV8$Class.meta.invoke(Class$runtimeClass, enclosingObjects);
+		var Metaclass$class$runtimeClass = mixins.KernelForV8.KernelForV8$Metaclass.meta.invoke(Class$runtimeClass, enclosingObjects);
+		var Mixin$class$runtimeClass = mixins.KernelForV8.KernelForV8$Mixin.meta.invoke(Class$runtimeClass, enclosingObjects);
+		var UndefinedObject$class$runtimeClass = mixins.KernelForV8.KernelForV8$UndefinedObject.meta.invoke(Class$runtimeClass, enclosingObjects);
+		var Kernel$class$runtimeClass = mixins.KernelForV8.meta.invoke(Class$runtimeClass, enclosingObjects2);
+		
+		Object$runtimeClass.meta = Object$class$runtimeClass;
+		Class$runtimeClass.meta = Class$class$runtimeClass;
+		Metaclass$runtimeClass.meta = Metaclass$class$runtimeClass;
+		Mixin$runtimeClass.meta = Mixin$class$runtimeClass;
+		UndefinedObject$runtimeClass.meta = UndefinedObject$class$runtimeClass;
+		Kernel$runtimeClass.meta = Kernel$class$runtimeClass;
+		
+		Object$class$runtimeClass.nonMeta = Object$runtimeClass;
+		Class$class$runtimeClass.nonMeta = Class$runtimeClass;
+		Metaclass$class$runtimeClass.nonMeta = Metaclass$runtimeClass;
+		Mixin$class$runtimeClass.nonMeta = Mixin$runtimeClass;
+		UndefinedObject$class$runtimeClass.nonMeta = UndefinedObject$runtimeClass;
+		Kernel$class$runtimeClass.nonMeta = Kernel$runtimeClass;
+		
+		nil = new UndefinedObject$runtimeClass.basicNew();
+		
+		var Object = new Object$class$runtimeClass.basicNew();
+		var Class = new Class$class$runtimeClass.basicNew();
+		var Metaclass = new Metaclass$class$runtimeClass.basicNew();
+		var Mixin = new Mixin$class$runtimeClass.basicNew();
+		var UndefinedObject = new UndefinedObject$class$runtimeClass.basicNew();
+		var Kernel = new Kernel$class$runtimeClass.basicNew();
+		
+		var Object$class = new Metaclass$runtimeClass.basicNew();
+		var Class$class = new Metaclass$runtimeClass.basicNew();
+		var Metaclass$class = new Metaclass$runtimeClass.basicNew();
+		var Mixin$class = new Metaclass$runtimeClass.basicNew();
+		var UndefinedObject$class = new Metaclass$runtimeClass.basicNew();
+		var Kernel$class = new Metaclass$runtimeClass.basicNew();
+		
+		Object$class$runtimeClass.newspeakClass = Object$class;
+		Class$class$runtimeClass.newspeakClass = Class$class;
+		Metaclass$class$runtimeClass.newspeakClass = Metaclass$class;
+		Mixin$class$runtimeClass.newspeakClass = Mixin$class;
+		UndefinedObject$class$runtimeClass.newspeakClass = UndefinedObject$class;
+		Kernel$class$runtimeClass.newspeakClass = Kernel$class;
+		
+		Object$runtimeClass.newspeakClass = Object;
+		Class$runtimeClass.newspeakClass = Class;
+		Metaclass$runtimeClass.newspeakClass = Metaclass;
+		Mixin$runtimeClass.newspeakClass = Mixin;
+		UndefinedObject$runtimeClass.newspeakClass = UndefinedObject;
+		Kernel$runtimeClass.newspeakClass = Kernel;
+		
+		var kernel = Kernel.usingVmMirror$(this);
+		
+		//superclass$slot
+		Object.superclass$slot = this.ImplementationBase(); //or null?
+		Class.superclass$slot = Object;
+		Metaclass.superclass$slot = Object;
+		Mixin.superclass$slot = Object;
+		UndefinedObject.superclass$slot = Object;
+		Kernel.superclass$slot = Object;
+		
+		Object$class.superclass$slot = Class;
+		Class$class.superclass$slot = Class;
+		Metaclass$class.superclass$slot = Class;
+		Mixin$class.superclass$slot = Class;
+		UndefinedObject$class.superclass$slot = Class;
+		Kernel$class.superclass$slot = Class;
+		
+		//mixin$slot
+		
+		//enclosingObject$slot
+		Object.enclosingObject$slot = kernel;
+		Class.enclosingObject$slot = kernel;
+		Metaclass.enclosingObject$slot = kernel;
+		Mixin.enclosingObject$slot = kernel;
+		UndefinedObject.enclosingObject$slot = kernel;
+		Kernel.enclosingObject$slot = nil;
+		
+		Object$class.enclosingObject$slot = kernel;
+		Class$class.enclosingObject$slot = kernel;
+		Metaclass$class.enclosingObject$slot = kernel;
+		Mixin$class.enclosingObject$slot = kernel;
+		UndefinedObject$class.enclosingObject$slot = kernel;
+		Kernel$class.$enclosingObject$slot = nil;
+		
+		enclosingObjects[0] = kernel;
+		enclosingObjects[1] = nil;
+		enclosingObjects2[0] = nil;
+		
+		//name$slot
+		
+		//runtimeClass$slot
+		Object.runtimeClass$slot = Object$runtimeClass;
+		Class.runtimeClass$slot = Class$runtimeClass;
+		Metaclass.runtimeClass$slot = Metaclass$runtimeClass;
+		Mixin.runtimeClass$slot = Mixin$runtimeClass;
+		Kernel.runtimeClass$slot = Kernel$runtimeClass;
+		
+		Object$class.runtimeClass$slot = Metaclass$runtimeClass;
+		Class$class.runtimeClass$slot = Metaclass$runtimeClass;
+		Metaclass$class.runtimeClass$slot = Metaclass$runtimeClass;
+		Mixin$class.runtimeClass$slot = Metaclass$runtimeClass;
+		Kernel$class.runtimeClass$slot = Metaclass$runtimeClass;
+		
+		//thisClass$slot
+		Object$class.thisClass$slot = Object;
+		Class$class.thisClass$slot = Class;
+		Metaclass$class.thisClass$slot = Metaclass;
+		Mixin$class.thisClass$slot = Mixin;
+		Kernel$class.thisClass$slot = Kernel;
+		
+		kernel.KernelForV8$Object$slot = Object;
+		kernel.KernelForV8$Class$slot = Class;
+		kernel.KernelForV8$Metaclass$slot = Metaclass;
+		kernel.KernelForV8$Mixin$slot = Mixin;
+		
+		return kernel;
+	};
+	this.kernel = this.createKernel();
+	
+	this.applyTopLevelMixin = function(runtimeMixin){
+		return this.applyMixin$toSuperclass$withEnclosingObjects$(runtimeMixin, this.kernel.$Object(), [nil]);
+	};
+	
+	this.applyMixin$toSuperclass$withEnclosingObjects$ = function(runtimeMixin, newspeakSuperclass, enclosingObjects){
+		
+		var Class = this.kernel.Class();
+		var Metaclass = this.kernel.Metaclass();
+		
+		var runtimeSuperclass = newspeakSuperclass.runtimeClass$slot;
+		var runtimeClass = runtimeMixin.invoke(runtimeSuperclass, enclosingObjects);
+		var runtimeMetaclass = runtimeMixin.meta.invoke(Class.runtimeClass$slot, enclosingObjects);
+		runtimeClass.meta = runtimeMetaclass;
+		runtimeMetaclass.nonMeta = runtimeClass;
+		
+		var newspeakMetaclass = Metaclass.$new();
+		var newspeakClass = new runtimeMetaclass.basicNew();
+		
+		runtimeClass.newspeakClass = newspeakClass;
+		runtimeMetaclass.newspeakClass = newspeakClass;
+		
+		newspeakMetaclass.superclass$slot = Class;
+		newspeakMetaclass.mixin$slot = "implement reified mixins";
+		newspeakMetaclass.enclosingObject$slot = enclosingObjects[0];
+		newspeakMetaclass.name$slot = null;
+		newspeakMetaclass.thisClass$slot = newspeakClass;
+		newspeakMetaclass.runtimeClass$slot = runtimeMetaclass;
+		
+		newspeakClass.superclass$slot = newspeakSuperclass;
+		newspeakClass.runtimeMixin$slot = runtimeMixin;
+		newspeakClass.enclosingObject$slot = enclosingObjects[0];
+		newspeakClass.name$slot = "implement class names";
+		newspeakClass.runtimeClass$slot = runtimeClass;
+		
+		return newspeakClass;
+	};
+};
+'
+)) : ()
+class MethodIR named: n = (|
+	name = n.
+	function
+	src
+	isSynthetic ::= false.
+|)
+('as yet unclassified'
+printOn: stm = (
+	stm nextPutAll: 'MethodIR:'.
+	stm nextPutAll: name.
+)) : ()
+class MixinIR for: d isMeta: m = (|
+	declaration = d.
+	isMeta = m.
+	slots = OrderedCollection new.
+	methods = OrderedCollection new.
+	nestedClasses = OrderedCollection new.
+|)
+('as yet unclassified'
+name = (
+	^declaration name
+)) : ()
+class NameMangler = (|
+	private binarySelectorManglings = Dictionary new.
+	private reservedWordManglings = Dictionary new.
+|binarySelectorManglings
+		at: '+' put: '$plus';
+		at: '-' put: '$minus';
+		at: '*' put: '$times';
+		at: '/' put: '$over';
+		at: '**' put: '$starstar';
+		at: '//' put: '$overover';
+		at: '\\' put: '$overover';	
+		
+		at: '<' put: '$less';
+		at: '>' put: '$greater';
+		at: '<=' put: '$lessequal';
+		at: '>=' put: '$greaterequal';
+		at: '=' put: '$equal';
+		at: '==' put: '$identical';
+		at: '~=' put: '$notequal';
+		at: '~~' put: '$notidentical';
+		
+		at: '&' put: '$amp';
+		at: '|' put: '$pipe';
+		at: ',' put: '$comma';
+		at: '@' put: '$at';
+		at: '|>' put: '$mixinapply';
+		
+		at: '<<' put: '$leftshift';
+		at: '>>' put: '$rightshift';
+		at: '=>' put: '$imply';
+		at: '->' put: '$associate';
+		at: '~' put: '$tilde'.
+		
+	reservedWordManglings
+		at: 'Object' put: '$Object'.
+		
+	class reservedWords do: 
+		[:word | reservedWordManglings at: word put: '$', word])
+('as yet unclassified'
+mangleLocal: selector <String> ^<String> = (
+	^'local$',(mangleSelector: selector)
+)
+mangleSelector: selector <String> ^<String> = (
+	(* Convert a Newspeak selector into a JS identifer. *)
+	
+	(binarySelectorManglings includesKey: selector)
+		ifTrue: [^binarySelectorManglings at: selector].
+	(reservedWordManglings includesKey: selector)
+		ifTrue: [^reservedWordManglings at: selector].
+	
+	^(selector asString copy replaceAll: $: with: $$) replaceAll: $` with: $$; replaceAll: $. with: $_
+)
+mangleSlot: selector <String> ^<String> = (
+	^(mangleSelector: selector), '$slot'
+)) : ('as yet unclassified'
+reservedWords = (
+	(* This tuple is extracted to a class-side method so that NameManager's definition of Array doesn't interfer with the Array used for tuple literals. *)
+	^{'break'. 'finally'. 'switch'. 'with'. 'in'. 'else'. 'return'. 'while'. 'default'. 'try'. 'new'. 'void'. 'continue'. 'if'. 'do'. 'var'. 'catch'. 'function'. 'throw'. 'instanceof'. 'case'. 'for'. 'this'. 'delete'. 'typeof'. 'abstract'. 'export'. 'long'. 'synchronized'. 'const'. 'implements'. 'public'. 'enum'. 'interface'. 'super'. 'class'. 'goto'. 'protected'. 'int'. 'static'. 'char'. 'float'. 'privated'. 'volatile'. 'short'. 'byte'. 'final'. 'package'. 'transient'. 'double'. 'boolean'. 'extends'. 'native'. 'throws'. 'debugger'. 'import'}
+))
+class PropertyCallAST = MessageAST (
+(* Sepcialized node to represent applications of JS properties. In some cases (well, at least one) we need to generate ASTs that call javascript methods directly. These calls need to be translated slightly differently (their names must not be mangled). To distinguish these form normal message sends, we use this node. *))
+('as yet unclassified'
+apply: tool <ASTTool> = (
+	^tool propertyCallNode: self
+)) : ()
+class SlotIR named: n mutable: m = (|
+	name = n.
+	isMutable = m.
+	isSynthetic ::= false.
+|)
+('as yet unclassified'
+isMutableSlot = (
+	(* polymorphic with the AST *)
+	^isMutable
+)
+printOn: stm = (
+	stm nextPutAll: 'SlotIR:'.
+	stm nextPutAll: name.
+)) : ()'as yet unclassified'
+Scope = (
+	^super Scope
+)
+SlotEntry = (
+	^super SlotEntry
+)
+assert: block <[Boolean]> = (
+      super assert: block message: 'assertion failed'.
+	(* block value ifFalse: [error: 'assertion failed'] *)
+)
+fullyQualifiedNameToSimple: fullName <String> = (
+	| parts |
+	
+	parts:: splitFullyQualifiedName: fullName.
+	^parts last asSymbol
+)
+fullyQualifySimpleName: simpleName <Symbol> with: fullyQualifiedPackage <Symbol> = (
+	^(fullyQualifiedPackage asString, syntheticNameSeparator, simpleName) asSymbol
+)
+mixinNameOfClassNamed: className <String> ^<Symbol> = (
+	| simpleNames <Collection[String]> rawNames <Collection[String]> |
+	rawNames:: splitFullyQualifiedName: className. 
+	rawNames size =1 ifTrue: [^className].
+	simpleNames:: rawNames select: [:n <String>  | 
+					n size == 0 or: [ n first isLetter ]].
+				(* this was isDigit--either add isDigit to core string, or perhaps use between:and: *) 
+	assert: [simpleNames size >= 2].
+	^(simpleNames inject: '' into: [:sn1 <String>  :sn2 <String> | sn1, syntheticNameSeparator, sn2]) asSymbol
+)
+mixinSlotNameFor: nestedName <String> = (
+	| mixinName <String> |
+	mixinName:: mixinNameOfClassNamed: nestedName.
+	^mixinName
+)
+split: aString at: aCharacter = (
+	| parts start |
+	parts:: OrderedCollection new.
+	start:: 1.
+	1 to: aString size do:
+		[:index |
+		(aString at: index) = aCharacter ifTrue:
+			[parts add: (aString copyFrom: start to: index - 1).
+			start:: index + 1]].
+	parts add: (aString copyFrom: start to: aString size).
+	^parts
+)
+splitFullyQualifiedName: fqn = (
+
+	(* Make sure we pass only the first character, so that the code works in image and on JS *)
+	^ split: fqn at: syntheticNameSeparator first
+)
+syntheticNameSeparator ^<String> = (
+	^'`'
+)
+testWith: sources = (
+	^(Infrastructure withAppSources: {} withRuntimeSources: sources outputTo: nil) inspect
+)) : ()

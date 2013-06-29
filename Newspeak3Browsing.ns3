@@ -28,6 +28,7 @@ It would be nice to additionally support:
 
 	private cachedPlatform = p.
 
+	ide = ide.
       systemScope = ide systemScope.
 	private AssortedMethodsPresenter = ide browsing AssortedMethodsPresenter.
 	private AssortedMethodsSubject = ide browsing AssortedMethodsSubject.
@@ -221,11 +222,15 @@ classDescriptionDefinition = (
 		}
 )
 classSourceDefinition = (
-	| editor |
-    subject initializer isNil ifFalse:[  
-	^(InitializerMethodPresenter onSubject: subject initializer) expand
+(*  ^InitializerMethodPresenter onSubject: subject initializer*)
+	| editor init <InitializerMethodSubject> = subject initializer. |
+	init isNil ifFalse:[
+		(init methodMirror reflectee properties includesKey:#debugInfo) 
+		ifFalse:[subject acceptClassDefinition: init source]. 
+		(* temp hack until all are recompiled *)
+		^init createPresenter expand; yourself.
+		(*^(InitializerMethodPresenter onSubject: subject initializer) expand; yourself*)
 	].
-
 	^column: {	
 		editor:: CodeEditorFragment new
 			text: subject classMirror header source;
@@ -375,6 +380,7 @@ applicationActionsIfNeeded = (
 						'as IMAGE (warning: closes this image)' -> [subject makeImage].
 						'as Dart' -> [subject makeDart].
 						'as JavaScript' -> [subject makeJavaScript].
+						'as V8' -> [subject makeV8]
 						(* 'as EXE' -> [subject makeExe]. *)}					
 				]) tinyFont.
 				smallBlank.
@@ -390,28 +396,6 @@ classCategoryLink = (
 			[:cat | 
 			link: cat action: [browseClassCategory: cat]])
 				tinyFont
-)
-classDefinitionEditor = (
-	| 
-	editor  
-	headerPresenter <InitializerMethodPresenter> = 
-	   (InitializerMethodSubject onModel: subject model header primaryFactory)
-	       createPresenter.
-	|
-
-^	column: {
-		smallBlank.
-		classNameAndContainmentDefinition.
-		mediumBlank.
-		(* headerPresenter toggle.
-*)
-		editor:: CodeEditorFragment new
-			text: subject classMirror header source;
-			colorizerBlock: [ :text | subject colorizeSource: text];
-			acceptResponse: 
-				[(acceptClassDefinition: editor)
-					ifTrue: [editor defaultAcceptResponse]].
-		}
 )
 classIconAndNameHeading = (
 ^
@@ -500,12 +484,6 @@ definition = (
 		sectionLabelled: 'Methods' presenting: subject methodsSubject allowSwitch: true.
 		sectionLabelled: 'Class Methods' presenting: subject classMethodsSubject allowSwitch: true.
 	}
-)
-definitionSummaryAndEditorPanel = (
-	summaryOrEditor::
-		less: [classSummaryDefinition] label: 'show definition'
-		more: [classDefinitionEditor] label: 'show summary'.
-	^summaryOrEditor
 )
 headingDefinition = (
 	(* Top level of the class header block, the one that provides the expand/collapse button in the top left corner. *)
@@ -668,7 +646,8 @@ classCommentText: newComment <String> = (
 	builder install.
 )
 classMethodsSubject = (
-
+	([ide experimental] ifError: [false]) ifTrue:
+		[^ExemplarMethodGroupSubject onModel: classMirror classSide methods].
 	^MethodGroupSubject onModel: classMirror classSide methods
 )
 classMirror = (
@@ -726,9 +705,10 @@ makeJavaScript = (
 	jsAppPackager:: (blackMarket NS2JSApplicationPackaging packageUsing: blackMarket)
 		main: cachedPlatform args: {}.
 	
-	stream:: blackMarket FileStream forceNewFileNamed: appDefn name , '.js'.
+	stream:: blackMarket CrLfFileStream forceNewFileNamed: appDefn name , '.js'.
 
-	[jsAppPackager compileAppDefn: appDefn usingNamespace: Smalltalk to: stream]
+	[stream nextPutAll: (String streamContents: [:bufferStream |
+	jsAppPackager compileAppDefn: appDefn usingNamespace: Smalltalk to: stream])]
 		ensure: [stream close].
 		
 	stream:: blackMarket FileStream forceNewFileNamed: appDefn name , '.html'.
@@ -738,7 +718,8 @@ makeJavaScript = (
 		ensure: [stream close].
 )
 methodsSubject = (
-
+	(ide experimental) ifTrue:
+		[^ExemplarMethodGroupSubject onModel: model instanceSide methods].
 	^MethodGroupSubject onModel: model instanceSide methods
 )
 nestedClassesSubject = (
@@ -781,9 +762,10 @@ makeDart = (
 
 	flatBlackMarket:: dartAppPackager FlatBlackMarket usingSmalltalk: Smalltalk.
 	
-	stream:: blackMarket FileStream forceNewFileNamed: appDefn name , '.dart'.
+	stream:: blackMarket CrLfFileStream forceNewFileNamed: appDefn name , '.dart'.
 
-	[dartAppPackager compileAppDefn: appDefn usingNamespace: flatBlackMarket to: stream]
+	[stream nextPutAll: (String streamContents: [:bufferStream |
+	dartAppPackager compileAppDefn: appDefn usingNamespace: flatBlackMarket to: bufferStream])]
 		ensure: [stream close]
 )
 makeExe = (
@@ -848,8 +830,8 @@ deleteClass = (
 
 	model enclosingClass = nil ifTrue: [
 		
-		Smalltalk removeKey: model simpleName ifAbsent: [].
-		SystemOrganization removeMissingClasses.		
+		(* This will remove the class from the system dictionary, remove it from its category, and send a system change notification that will be noticed by MemoryHole. *)
+		Smalltalk forgetClass: (Smalltalk at: model simpleName) logged: true.	
 
 	] ifFalse: [
 	
@@ -862,14 +844,38 @@ deleteClass = (
 	^ model simpleName
 )
 initializer ^ <MethodMirror> = (
-	classMirror instanceSide initializer isNil ifTrue:[^nil]. (*temporary measure until all classes have been recompiled *)
-	^InitializerMethodSubject onModel: classMirror instanceSide initializer
+	classMirror instanceSide initializer isNil ifTrue:[^nil].
+	(* temporary measure until all classes have been recompiled *)
+	^InitializerMethodSubject onModel: classMirror instanceSide initializer 
+	
 )
 isMinitestTestConfiguration = (
 	^isTopLevel and: [model classSide canUnderstand: #packageTestsUsing:]
 )
 isTopLevel = (
 	^model enclosingClass == nil
+)
+makeV8 = (
+	| appDefn dartAppPackager stream flatBlackMarket |
+	
+	appDefn:: Smalltalk at: model simpleName.
+
+	dartAppPackager:: (blackMarket NS2V8ApplicationPackaging packageUsing: blackMarket)
+		main: cachedPlatform args: {}.
+
+	flatBlackMarket:: dartAppPackager FlatBlackMarket usingSmalltalk: Smalltalk.
+	
+	stream:: blackMarket CrLfFileStream forceNewFileNamed: appDefn name , '.js'.
+
+	[stream nextPutAll: (String streamContents: [:bufferStream |
+	dartAppPackager compileAppDefn: appDefn usingNamespace: flatBlackMarket to: bufferStream])]
+		ensure: [stream close].
+		
+	stream:: blackMarket FileStream forceNewFileNamed: appDefn name , '.html'.
+	[stream nextPutAll: '<html><body><script type="text/javascript" src="'.
+	stream nextPutAll: appDefn name.
+	stream nextPutAll: '.js"> </script></body></html>']
+		ensure: [stream close].
 )
 methodCount = (
 
@@ -1008,18 +1014,25 @@ methodDetails = (
 )) : ()
 class InitializerMethodSubject onModel: m <MethodMirror> = MethodSubject onModel: m (
 (* WIP: Designed to handle synthetic initializer methods, including the primary  class factory, the instance initializer and its subparts *)|
-_classSubject  <ClassSubject | ClassHeaderSubject>
+_classSubject  <ClassSubject | ClassHeaderSubject> 
 |)
 ('as yet unclassified'
 changeCategoryTo: newName ifSuccess: successBlock ifFailure: failureBlock = (
    failureBlock value
 )
 classSubject ^ <ClassSubject> = (
-	_classSubject isNil ifTrue:[_classSubject:: (ClassSubject onModel: model definingMixin declaration)].
+	_classSubject isNil ifTrue:[_classSubject:: (ClassSubject onModel: methodMirror definingMixin declaration)].
 	^_classSubject
 )
 createPresenter ^ <Presenter> = (
-	^InitializerMethodPresenter onSubject: self
+	| presenterClass |
+	presenterClass:: 
+	  ide experimental 
+	    		ifTrue: [ExemplarMethodPresenter] 		
+			ifFalse: [InitializerMethodPresenter].
+	
+	^(presenterClass onSubject: self)	(*
+	^InitializerMethodPresenter onSubject: self.*)
 )
 deleteMethodIfSuccess: successBlock ifFailure: failureBlock = (
   (* do nothing for now. Should report an error, or better yet,
@@ -1047,13 +1060,16 @@ messages ^ <List[Symbol]> = (
 
 	allInitializers do:[: i |
 		i  messages do:[:each | accumulator add: each]].
-	^accumulator asMutableArrayList
+	^accumulator asMutableArrayList select:[:n | (n includes: $`) not]
 )
 methodCategory ^<String> = (
 	^'<instance initializer>'
 )
+selector = (
+	^methodMirror definingMixin declaration header primaryFactoryName
+)
 source ^ <String> = (
-	^classSubject model header 
+	^classSubject model header source
 )
 variableBindingKeys ^ <List[Symbol]> = (
 	| accumulator <Set[Symbol]> = Set new. |
@@ -1064,13 +1080,12 @@ variableBindingKeys ^ <List[Symbol]> = (
 			[accumulator add: each key]]].
 	^accumulator asMutableArrayList
 )'private'
-allInitializers ^ <Collection[MethodMirror]> = (
+allInitializers ^ <Collection[CompiledMethod]> = (
 	(* get all the methods that represent instance initializer code.
 	A principled way of doing this is needed, so that we don't rely on the
 	conventions of the compiler here. Perhaps mirrors should support this?
 	*)
-	 #BOGUS yourself.
-	^{model reflectee} (* need to replace this by the synthetic initializers *)
+	^classSubject model reflectee methodDict values select:[:m | m properties includesKey: #isSubinitializer ]
 )) : ()
 class MethodGroupPresenter onSubject: s = MirrorGroupPresenter onSubject: s (
 (* Presents the subject, an NSMethodGroup, as a column of presenters for the methods in the group. Automatically gets updated after the subject mirror group. Anything that has to do with adding, editing or deleting NS methods goes here. *)| groupedByCategory::=false. |)
@@ -1372,6 +1387,17 @@ compiledMethod = (
 
 	^methodMirror reflectee
 )
+createPresenter = (
+	| presenterClass |
+	presenterClass:: 
+	  (ide experimental 
+		and: [implementingClass language isNewspeakLanguage3 
+		and: [isSynthetic not]])
+	    		ifTrue: [ExemplarMethodPresenter] 		
+			ifFalse: [ExpandableMethodPresenter].
+	
+	^(presenterClass onSubject: self)	
+)
 deleteMethodIfSuccess: successBlock ifFailure: failureBlock = (
 	| builder |
 	builder:: MixinBuilder reflecting: methodMirror definingMixin reflectee.
@@ -1487,7 +1513,7 @@ elements ^<Collection[Subject]> = (
 )
 modelMirrorCollection ^<Collection[Mirror]> = (
 
-	^(model collect: [:x|x]) asOrderedCollection
+	^(model collect: [:x|x]) asMutableArrayList
 )'initialize-release'
 model: mirrorGroup = (
 

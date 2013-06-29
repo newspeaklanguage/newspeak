@@ -3,7 +3,9 @@ Newspeak3
 class Newspeak2DartCompilation usingPlatform: platform
  parsing: parsing
  generation: generation
- mirrors: mirrors = (
+ mirrors: mirrors = NewspeakCompilation
+ usingPlatform: platform
+ asts: parsing ASTModule (
 (* Does the interesting work in Newspeak-to-Dart translation.
 
 Throughout this module, the type annotation <Node> means a Dart AST, a subclass of DartGeneration`Syntax`Node.
@@ -72,16 +74,10 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 	lastRuntimeReps
 |)
 (
-class ClassSymbolTableEntry for: datum = SymbolTableEntry for: datum ()
-('as yet unclassified'
-isClassDeclaration ^<Boolean> = (
-	^true
-)) : ()
-class Compiler = (
+class Compiler = super Compiler (
 (* Translates Newspeak ASTs into Dart ASTs in three phases. First, scopes are computed and associated with ASTs. Second, ASTs are rewritten to capture information such as whether an implicit receiver send is an outer send or a self send, message sends that are reads and writes to locals, messages sends that are inlinable, and implied block-local returns. Third, the rewritten ASTs are translated into Dart ASTs. 
 
 Dart ASTs are always constructed with names already mangled. *)|
-	scopeMap <Map[AST,Scope]> ::= Dictionary new.
 	scopeStack <List[Scope]> ::= OrderedCollection new.
 	currentDepth <Integer>
 	currentMixinClassName <String>
@@ -450,7 +446,7 @@ do: n <Integer> timesRepeat: block <BlockAST>
 	(* introduce counter variable *)
 	loopVarName:: '.i' asSymbol.
 	var:: (ParameterAST name: loopVarName type: nil) start: block start; end: block end.	
-	skope at: loopVarName put: (SemanticVarDecl decl:{var. 0}) ifThere: [ halt ].
+	skope at: loopVarName put: (SlotEntry forDeclaration: var atDepth: 0) ifThere: [ halt ].
 	assert:[block body parameters isEmpty].
 	block body parameters add: var.
 
@@ -496,7 +492,7 @@ from: first <AST> to: last <AST> by: step <AST> do: block <BlockAST>
 			limitVar:: TemporaryAST name: limitName type: nil.
 			limitVar start: block start; end: block end.
 			prologue temporaries add: limitVar.
-			blockScope at: limitName put: (SemanticVarDecl decl: {limitVar. 0}) ifThere: [ assert:[false] ].
+			blockScope at: limitName put: (SlotEntry forDeclaration: limitVar atDepth: 0) ifThere: [ assert:[false] ].
 			limit:: TemporaryVariableAST name: limitName start: block start end: block end.
 		].
 	
@@ -552,6 +548,13 @@ repeat: block <BlockAST>
     isWhileTrue:: true.
     body:: nil
 )
+while: v <Boolean> do: b <BlockAST>
+ = (
+    assert: [b isBlockNode].
+    cond:: b body.
+    isWhileTrue:: v.
+    body:: nil
+)
 while: b1 <BlockAST>  is: v <Boolean> do: b2 <BlockAST>
  = (
     assert: [b1 isBlockNode].
@@ -559,13 +562,6 @@ while: b1 <BlockAST>  is: v <Boolean> do: b2 <BlockAST>
     cond:: b1 body.
     isWhileTrue:: v.
     body:: b2 body
-)
-while: v <Boolean> do: b <BlockAST>
- = (
-    assert: [b isBlockNode].
-    cond:: b body.
-    isWhileTrue:: v.
-    body:: nil
 )) : ()
 class NilAST = VariableAST (
 (*  *))
@@ -1001,7 +997,7 @@ rewriteInlinedBlockNode: node <BlockAST> forValue: forValue <Boolean> ^ <BlockAS
 		[:p <VarDeclAST> |
 		(ParameterAST name: p name type: p type)  start: p start; end: p end].
 	bodyScope:: scopeMap at: node body.
-	params do: [:each | (bodyScope at: each name) data: each].
+	params do: [:each | (bodyScope at: each name) ast: each].
 	rewrittenNode:: BlockAST new body: (rewriteBody: node body forValue: forValue).
 	rewrittenNode start: node start; end: node end.
 	rewrittenNode body parameters: params.
@@ -1085,7 +1081,7 @@ codeBodyNode: node <CodeBodyAST> ^ <CodeBodyAST> = (
 		].
 	bodyScope:: scopeMap at: node.
 	temps do:
-		[:t | (bodyScope at: t name)  data: t].
+		[:t | (bodyScope at: t name) ast: t].
 	node temporaries with: temps do: 
 		[:varDecl <VarDeclAST> :temp <TemporaryAST> |
 		temp initializer: (varDecl initializer ifNotNil: [:it | self applyForValueTo: it])
@@ -1141,7 +1137,7 @@ messagePatternNode: node <MessagePatternAST> ^ <MessagePatternAST> = (
 			end: p end].
 	patternScope:: scopeMap at: node.
 	params do:
-		[:p | (patternScope at: p name) data: p].
+		[:p | (patternScope at: p name) ast: p].
 	^MessagePatternAST new
 		selector: node selector parameters: params;
 		start: node start;
@@ -1284,7 +1280,7 @@ setterSendNode: node <SetterSendAST> ^ <AST> = (
 	blockScope:: Scope new.
 	blockScope
 		superScope: currentScope;
-		at: setterBlockArgName put: (SemanticVarDecl decl: {blockParam}).
+		at: setterBlockArgName put: (SlotEntry forDeclaration: blockParam atDepth: nil).
 	scopeMap at: block put: blockScope.
 	scopeMap at: block body put: blockScope.
 	(* [:a | setter: a. a] value: expr *)
@@ -1421,238 +1417,6 @@ variableFrom: message <MessageAST> decl: declaration <VarDeclAST>  ^ <VariableNo
 REFACTORING = (
 	(* This rewritter and the one used for JavaScript are likely to continue to have very similar requirements and should someday be factored out, rather than duplicated. *)
 ))
-class ScopeBuilder nestedIn: initialScope <Scope> atLevel: initialDepth <Integer> = ASTTool ((* The scope builder is a visitor on the AST. It computes a tree of scopes that shadows the AST itself.  More precisely, it computes a mapping from ASTs to their scopes. This allows us to get to the appropriate scope for an abstract syntax node without pollluting the AST with extraneous data like scopes.
-
-We could associate each node in the AST with the scope in which it is found, but this would be overkill. Instead, only nodes that actually introduce new scopes (such as class sides, message patterns, code bodies and blocks) actually get mapped in this manner. The intent is that later phases of compilation will visit the tree and look up the scopes at the points where they are introduced.
-
-The builder starts at a given node, in the context of some mixin, described by a mirror.  This is because, in an incremental environment, we may not have the complete AST for a module, but instead be asked to process a part of that module, such as a nested class, slot definition or method. The surrounding scope can be computed from the mirror representing the immediately enclosing mixin.
-
-Then we traverse the tree, creating and populating new scopes as needed. We maintain a stack of scopes (scopeStack) that initially contains only the surrounding scope.  Scopes get pushed on to the stack when we encounter a node that introduces a scope, and popped when we finish with that node. The scopes are chained to their super scopes (the scope below them on the stack).
-
-A possible optimization is to avoid a traversal of an entire side of a class.
-One can process only a side without its subtrees (i.e., methods and nested classes). These can be visited later,  as long as we ensure that the processing of the subtree begins with a proper super scope on top of the scope stack. *)| 
-  scopeStack = OrderedCollection new.
-  
-  currentDepth ::= initialDepth. (* The lexical nesting level of the class declaration currently 
-						being visited; top level classes are level 0 *)
-|pushScope: initialScope)
-('as yet unclassified'
-blockNode: aNode <BlockAST> = (
-	| ps <Scope> |
-	ps:: Scope new.
-	(* establish parameter scope *)
-	aNode parameters do:[:p <VarDeclAST> | ps at: p name put: (SemanticVarDecl decl: {p. currentDepth})].
-	nestScope: ps.
-	(* visit body *)
-	aNode body apply: self.
-	scopeMap at: aNode put: (scopeMap at: aNode body).
-	popScope (* pop the parameter scope, ps *)
-)
-buildScopeFor: m <MixinMirror> ^ <Scope> = (
-	^prvtScopeFor: m.
-)
-cascadedSendNode: aNode <CascadedSendAST> = (
-(* generic traversal code *)
-(* visit receiver and messages *)
-	aNode prevSend apply: self.
-	aNode msg apply: self.
-)
-charNode: aNode <CharAST> = (
-(* do nothing *)
-)
-classHeaderNode: aNode = (
-	aNode constructor apply: self.
-	aNode slots do: [:s |  s initializer ifNotNil: [:i | i apply: self]].
-	aNode initExprs do: [: e | e apply: self].
-)
-classNode: aNode <ClassDeclarationAST> = (
-	| vs <Scope> |
-	currentScope
-		at: aNode name 
-		put: (ClassSymbolTableEntry for: {MessagePatternAST new selector: aNode name. currentDepth}).
-	vs:: Scope new. (* establish instance side scope *)
-	currentDepth:: currentDepth + 1.
-	aNode hdr slots do:
-		[:v <SlotDeclAST> | 
-		vs at: v name put: (SymbolTableEntry for: {MessagePatternAST new selector: v name. currentDepth}).
-		v isMutable ifTrue:
-			[vs at: (v name asString, ':') asSymbol
-				put: (SymbolTableEntry for: {MessagePatternAST new selector: (v name asString, ':') asSymbol. currentDepth}) (* setter *)]
-    	 ].
-	self nestScope: vs.
-  		aNode instanceSide apply: self.
-	popScope.
-	self nestScope: Scope new. (* establish class side scope *)
-  		aNode classSide apply: self.
-	popScope.
-	currentDepth:: currentDepth - 1.
-)
-codeBodyNode: aNode <CodeBodyAST> = (
-	| ts <Scope> |
-	(* establish local slot scope *)
-	ts:: Scope new.
-	aNode temporaries do:
-		[:t <SlotDefAST> |  | svd |
-		svd:: SemanticVarDecl decl:{t slotDecl. currentDepth}.
-		ts at: t name put: svd. (* getter *)
-		ts at: ('setOnce`',t name) asSymbol put: svd. (* trick so lookups of the initializer for immutables will find the right slot *)
-		ts at: (setterSelectorFor: t) put: t slotDecl (* setter *)].
-	nestScope: ts.
-	scopeMap at: aNode put: ts.
-	(* visit statements *)
-	aNode temporaries do: [:t | 	t initializer isNil ifFalse: [t initializer apply: self]].
-	aNode statements do:[: s <ReturnStatementAST | SendAST>  | s apply: self].
-	popScope.
-)
-currentScope ^ <Scope> = (
-	^scopeStack last
-)
-enclosingMixinsOf: m <MixinMirror> ^ <Collection[MixinMirror]> = (
-	| e enclosers |
-	^m enclosingClassStencil enclosingClassStencils collect: [:stencil | stencil mixin]
-)
-isPseudoVariableNode: aNode <VariableAST> ^ <Boolean> = (
-	^aNode name = #self or:
-		[aNode name = #super or:
-		[aNode name = #outer or:
-		[aNode name = #thisContext]]]
-)
-messageNode: aNode <MessageAST> = (
-(* generic traversal code *)
-(* visit arguments *)
-	aNode args do: [:a <SendAST> | a apply: self]
-)
-messagePatternNode: aNode <MessagePatternAST> = (
-	| ps <Scope> |
-	ps:: Scope new.
-	(* establish parameter scope *)
-	aNode parameters do:
-		[:p <VarDeclAST> |
-		ps at: p name put: (SemanticVarDecl decl: {p. currentDepth})].
-	nestScope: ps.
-	scopeMap at: aNode put: ps.
-	(* the pattern scope, ps, must be popped by the caller *)
-	(* establish type parameter scope - skip for now *)
-)
-methodNode: aNode <MethodAST> = (
-	(* register method in current scope *)
-	currentScope
-		at: aNode pattern selector
-		put: (SymbolTableEntry for: {aNode pattern. currentDepth}).
-	(* visit pattern *)
-	aNode pattern apply: self.
-	(* visit body *)
-	aNode body apply: self.
-	scopeMap
-		at: aNode
-		put: (scopeMap at: aNode body).
-	popScope (* Pop pattern scope *)
-)
-mixinApplication: node <MixinApplicationAST> = (
-	node mixinExpr apply: self.
-	node superclassExpr apply: self
-)
-mixinClassNode: aNode = (
-	(* do nothing *)
-)
-nestScope: s <Scope> = (
-(* Hook up a new lexically nested scope, and push onto the scope stack *)
-	s superScope: currentScope.
-	pushScope: s
-)
-normalSendNode: aNode <NormalSendAST> = (
-(* generic traversal code *)
-(* visit recvr and msg *)
-	aNode recv apply: self.
-	aNode msg apply: self.
-)
-numberNode: aNode <NumberAST> = (
-(* do nothing *)
-)
-popScope ^ <Scope> = (
-	^scopeStack removeLast
-)
-prvtScopeFor: c <MixinMirror> ^<Scope> = (
-(* When incrementally compiling a nested class, we need to reconstruct its scope. *)
-	| 
-	s <Scope> 
-	outerMixins <Collection[MixinMirror]>
-	depth <Integer>
-	|
-	outerMixins:: enclosingMixinsOf: c.(* should use a cleaner API *)
-	currentDepth:: outerMixins size - 1.
-	depth:: 0.
-	outerMixins do: [:o |
-		s:: Scope new superScope: s.
-		(selectorsFor: o) do:
-			[: sel |
-			s at: sel 
-				put: (SymbolTableEntry for:{MessagePatternAST new selector: sel. depth})].
-		depth:: depth + 1].
-	^s
-)
-pushScope: s <Scope> = (
-	scopeStack addLast: s
-)
-returnStatNode: aNode <ReturnStatAST> = (
-(* generic traversal code *)
-	(* visit expression *)
-	aNode expr apply: self
-)
-selectorsFor: m <MixinMirror> ^ <Collection[Symbol]> = (
-(* Should add a convenience method to mirrors to do this *)
-	| result <Collection[Symbol]> |
-	result:: m methods asOrderedCollection collect:[:s <MethodMirror> | s name].
-	result addAll: (m slots asOrderedCollection collect:[: s <SlotMirror> | s name]).
-	result addAll: 
-		((m slots asOrderedCollection select:[: s | s isMutable]) 
-			collect:[: s <SlotMirror> | s name, ':']).
-	result addAll: (m classes asOrderedCollection collect:[:s <ClassStencilMirror> | s name]).
-	^result
-)
-setterSendNode: aNode <SetterSendAST> = (
-	aNode recv apply: self.
-	aNode msg apply: self.
-)
-sideNode: aNode <SideAST> = (
-	scopeMap at: aNode put: currentScope.
-	(* visit methods *)
-	aNode categories do:
-		[: c <CategoryAST> | c methods do:[:m <MethodAST> | m apply: self]].
-	(* visit nested classes *)
-	aNode nestedClasses do: [:nc <ClassDeclarationAST> | nc apply: self].
-)
-stringNode: aNode <StringAST> = (
-(* do nothing *)
-)
-symbolNode: aNode <SymbolAST> = (
-(* do nothing *)
-)
-tupleNode: aNode <TupleAST> = (
-(* visit elements *)
-	aNode elements do: [:e <SendAST> | e apply: self]
-)
-varDeclNode: aNode <VarDeclAST> = (
-(* Do nothing. It could arguably add aNode's data to current scope - but in practice, the context knows better how to do this *)
-)
-variableNode: aNode <VariableAST> = (
-	assert: [aNode name = #'@here' or: [isPseudoVariableNode: aNode]]
-		message: 'Unexpected variable name'.
-)
-visitMethod: aNode <MethodAST> within: m <MixinMirror> ^ <Dictionary[AST, Scope]> = (
-	^visitNode: aNode within: m
-)
-visitNode: aNode <AST> within: m <MixinMirror> ^ <Dictionary[AST, Scope]> = (
-	pushScope: (buildScopeFor: m).
-	aNode apply: self.
-	^scopeMap
-)) : ('as yet unclassified'
-REFACTORING = (
-	(* The scope builders for all the Newspeak compilation modules should someday be factored out, rather than duplicated. *)
-)
-new ^ <Instance> = (
-	^self nestedIn: Scope new atLevel: 0
-))
 class Translator = ASTTool (
 (* Visits nodes of an NS AST to produce a Dart AST. The usual translation unit is a method. Translation is initiated by sending the translateMethodNode: message. The argument is the method to translate, the returned value is the translation. *)|
 	scopeStack
@@ -1696,6 +1460,7 @@ class SendGuards = (|
 		at: #ifFalse:ifTrue: put: #guardIfFalseIfTrue:to:;
 		at: #ln put: #guardLn:to:;
 		at: #exp put: #guardExp:to:;
+		at: #sqrt put: #guardSqrt:to:;
 		at: #printString put: #guardPrintString:to:;
 		at: #timesRepeat: put: #guardTimesRepeat:to:;
 		at: #to: put: #guardTo:to:;
@@ -1898,6 +1663,13 @@ guardSign: msg <MessageAST> to: rcvr <AST> = (
 		with: {guardTemp})
 	otherwiseSend: msg
 )
+guardSqrt: msg <MessageAST> to: rcvr <AST> = (
+
+	^if: rcvr
+	is: 'num'
+	do: (dart on: (dart ident: 'Math') invoke: (dart ident: 'sqrt') with: {guardTemp})
+	otherwiseSend: msg
+)
 guardStarStar: msg <MessageAST> to: rcvr <AST> = (
 	^dart
 		invoke: (dart ident: 'guard_starstar')
@@ -1933,7 +1705,6 @@ guardToDo: msg <MessageAST> to: rcvr <AST> = (
 	otherwiseSend: msg
 )
 guardValue0: msg <MessageAST> to: rcvr <AST> = (
-
 	^if: rcvr
 	is: 'Function'
 	do: (dart
@@ -1942,7 +1713,6 @@ guardValue0: msg <MessageAST> to: rcvr <AST> = (
 	otherwiseSend: msg
 )
 guardValue1: msg <MessageAST> to: rcvr <AST> = (
-
 	^if: rcvr
 	is: 'Function'
 	do: (dart
@@ -2044,11 +1814,8 @@ bitOr: a with: b = (
 bitXor: a with: b = (
 	^dart operator: '^' with: a and: b
 )
-classOf: o = (
-	^dart memberOf: o at: 'klass_'
-)
 codePointOfString: str = (
-	^dart on: str invoke: (dart ident: 'charCodeAt') with: {dart literal: 0}
+	^dart on: str invoke: (dart ident: 'codeUnitAt') with: {dart literal: 0}
 )
 compare: a to: b = (
 	^dart on: a invoke: (dart ident: 'compareTo') with: {b}
@@ -2080,9 +1847,6 @@ fromLibraryMirror: libMir getClassNamed: clsName = (
 		with: {libMir. clsName}
 )
 hashOf: o = (
-	^dart on: o invoke: (dart ident: 'hashCode') with: {} 
-)
-identityHashOf: o = (
 	^dart memberOf: o at: 'hashCode'
 )
 intDivide: a by: b = (
@@ -2118,9 +1882,6 @@ is: a greaterOrEqual: b = (
 )
 is: a greaterThan: b = (
 	^asNsBoolean: (dart operator: '>' with: a and: b)
-)
-is: a identicalTo: b = (
-	^asNsBoolean: (dart operator: '===' with: a and: b)
 )
 is: a lessOrEqual: b = (
 	^asNsBoolean: (dart operator: '<=' with: a and: b)
@@ -2160,17 +1921,17 @@ ln: x= (
 	^dart on: (dart ident: 'Math') invoke: (dart ident: 'log') with: {x}
 )
 millisecondClockValue = (
-	^dart verbatim: 'new Date.now().millisecondsSinceEpoch'
-)
-mirror: classMirror invokeConstructor: sel with: args = (
-	^dart 
-		invoke: (dart ident: '_mirrorInvokeConstructor')
-		with: {classMirror. sel. args}
+	^dart verbatim: 'new DateTime.now().millisecondsSinceEpoch'
 )
 mirror: mirror invoke: sel with: args = (
 	^dart 
 		invoke: (dart ident: '_mirrorInvoke')
 		with: {mirror. sel. args}
+)
+mirror: classMirror invokeConstructor: sel with: args = (
+	^dart 
+		invoke: (dart ident: '_mirrorInvokeConstructor')
+		with: {classMirror. sel. args}
 )
 mirrorForLibraryNamed: libName = (
 	^dart 
@@ -2190,9 +1951,6 @@ on: rcvr invoke: sel with: args = (
 	^dart 
 		invoke: (dart ident: 'INVOKE')
 		with: {rcvr. sel. args}
-)
-print: obj = (
-	^dart invoke: (dart ident: 'print') with: {obj}
 )
 simpleNameOf: mirror = (
 	^dart memberOf: mirror at: 'simpleName'
@@ -2254,7 +2012,7 @@ try: tryblock on: expectedclass do: catchblock = (
 						) asBlock
 				) asBlock.
 			
-			(dart throw: (dart ident: 'e_'))
+			(dart rethrow: (dart ident: 'e_'))
 		})
 )
 whileFalse: cond do: block = (
@@ -2465,7 +2223,16 @@ parameterDeclNode: node <ParameterAST> = (
 parameterNode: node <ParameterVariableAST> = (
 	^dart ident: (names mangleSelector: node name)
 )
-processIntrinsic: message = (
+processIntrinsic: msg <MessageAST> = (
+	^dart perform: msg sel 
+		withArguments: (msg args collect: [:arg | processIntrinsicArg: arg]) asArray.
+)
+processIntrinsicArg: arg <AST> = (
+	arg isTupleNode ifTrue: [^(arg elements collect: [:el | processIntrinsicArg: el]) asArray].
+	arg isLiteralNode ifTrue: [^arg val].
+	^arg apply: self
+)
+processOldIntrinsic: message = (
 
 	^vmmirror 
 		perform: message sel
@@ -2497,9 +2264,13 @@ processSend: message to: receiver = (
 	#FLAG. (* Yucky pattern matching *)
 	enableIntrinsics ifTrue: [
 		receiver isMethodInvocation ifTrue: [
+			receiver method = (dart ident: 'dart') ifTrue: [
+				^processIntrinsic: message]]].
+	enableIntrinsics ifTrue: [
+		receiver isMethodInvocation ifTrue: [
 			receiver target = (dart ident: 'this') ifTrue: [
 				receiver method name = 'vmmirror' ifTrue: [
-					^processIntrinsic: message]]]].
+					^processOldIntrinsic: message]]]].
 	
 	(guards isGuardedSelector: message sel) ifTrue:
 		[containsGuardedSend:: true.
@@ -2572,7 +2343,7 @@ wrapBodyForNlrHandling: body <Block> = (
 			(dart block: {
 				dart if: (dart operator: '===' with: nlrVarNode and: nlrParamNode)
 					then: (dart return: (dart memberOf: nlrParamNode at: nlrValueName))
-					else: (dart throw: nlrParamNode)
+					else: (dart rethrow: nlrParamNode)
 			})
 	}
 )
@@ -2587,7 +2358,7 @@ accessorForNestedClass: classDecl <ClassDeclarationAST> within: mixinMirror = (
 	simpleName = classDecl hdr name.
 	fullName = names fullyQualifySimpleName: simpleName with: mixinMirror name.
 	slotName = names mangleSlotName: fullName.
-	superclass = accessorForSuperclass: classDecl hdr superclassName inScope:  (scopeMap at: classDecl instanceSide).
+	superclass = accessorForSuperclass: classDecl hdr superclassCall inScope:  (scopeMap at: classDecl instanceSide).
 	metamixin = dart ident: (names metamixinClassNameFor: fullName).
 	mixin = dart ident: (names metamixinClassNameFor: fullName).
 	
@@ -2712,25 +2483,14 @@ and: (dart on: (dart ident: 'superclass') invoke: (dart ident: (names mangleSele
 			dart return: (dart ident: slotName).
 	})
 )
-accessorForSuperclass: superclassName <String> inScope: s <Scope> ^<Node> = (
+accessorForSuperclass: superclassCall <AST> inScope: s <Scope> ^<Node> = (
 	| send scopeBuilder |
-	send:: NormalSendAST new
-		to: hereNode
-		send: (MessageAST new
-			send: superclassName
-			with: {}).
-	
 	rewriter pushScope: s.
-	send:: send apply: rewriter.
+	send:: superclassCall apply: rewriter.
 	rewriter popScope.
 	
 	translator beginNewTranslationCycle.
 	^send apply: translator
-	
-	(* ^dart 
-		on: (dart ident: 'this')
-		invoke: (dart ident: (mangleSelector: superclassName))
-		with: {}. *)
 )
 canResolveSuperclassOf: node <ClassDeclarationAST> ^<String> = (
 	(* Try to find the fully qualified name of the mixin of the superclass of the given class declaration. This cannot be done in general statically. Additionally, the scopes do not have enough information to tell us whether the binding is actually a class declaration, or a method or slot. If the latter two, the compiler will hum along but the Dart compiler will complain when the mixin class tries to inherit from a nonexistent class. *)
@@ -2739,6 +2499,7 @@ canResolveSuperclassOf: node <ClassDeclarationAST> ^<String> = (
 	
 	tokens:: node hdr name findTokens: $`.
 	scope:: scopeMap at: node instanceSide.
+	(rewriter isHereNode: node hdr superclassCall recv) ifFalse: [^false].
 	binding:: scope at: node hdr superclassName ifAbsent: [
 		
 		name = 'Top' ifTrue: [^true].
@@ -2797,6 +2558,7 @@ resolveSuperclassOf: node <ClassDeclarationAST> ^<String> = (
 	
 	tokens:: node hdr name findTokens: $`.
 	scope:: scopeMap at: node instanceSide.
+	(rewriter isHereNode: node hdr superclassCall recv) ifFalse: [^'KernelForDart`Object' (* Dynamic mixin *)].
 	binding:: scope at: node hdr superclassName ifAbsent: [
 		
 		name = 'Top' ifTrue: [^'Top'].
@@ -2900,11 +2662,10 @@ initializerFor: node <ClassHeaderAST> ^<MethodAST> = (
 		parameters: params;
 		start: start; end: end. 
 	(* set up scope with constructor parameters *)
-	stmts:: (node slots reject: [:slot | slot initializer isNil])
-		collect: [:slot <SlotDefAST> | | aMsg <MessageAST> |
+	stmts:: node slots collect: [:slot <SlotDefAST> | | aMsg <MessageAST> |
 		aMsg:: MessageAST new
 			send: (setterSelectorFor: slot) asSymbol
-			with: {slot initializer apply: copier};
+			with: {(slot initializer ifNil: [parser hereSendFromMsg: (MessageAST new send: #nil with: {})]) apply: copier};
 			start: slot start; end: slot end.
 		NormalSendAST new msg: aMsg; 
 			recv: (selfNode start: aMsg start; end: aMsg end);
@@ -3022,6 +2783,9 @@ superConstructorMethodFor: node <ClassHeaderAST> ^<MethodAST> = (
 superConstructorNameFor: node <ClassHeaderAST> ^<Symbol> = (
 	#FLAG. (* Needs full qualification *)
 	^'superInit`' , node name, '`', node constructor selector
+)'make visible lexically'
+scopeMap = (
+	^super scopeMap
 )'scopes'
 currentScope ^<Scope> = (
 	^scopeStack last
@@ -3427,6 +3191,9 @@ dart method: (dart ident: (names mangleSelector: name)) params: {} body: (dart b
 	})
 	]
 )
+appDefnName = (
+	 ^appModuleReps first first name
+)
 compileModules: modules <List[String]> enableIntrinsics: flag <Boolean> ^<List[MixinRep]> = (
 	(* Strictly speaking, these are module definitions not module (instances). *)
 	
@@ -3477,7 +3244,6 @@ mixinapply(
   applicationName, 
   enclosingObjects )
 {
-	throw new Exception("Dart_New is stalling");
 	var supermixinclassname = superclass.dartname_();
 	var mixinclassname = "${protomixinclassname}${uniqueSuffix}";
 	var metamixinclassname = "${protometamixinclassname}${uniqueSuffix}";
@@ -3492,8 +3258,8 @@ mixinapply(
 	var getenclosingobjects = "enclosingObjects_() { return ${protometamixinclassname}_enclosingObjects; }";	
 		
 	//print("$mixinclassname = $protomixinclassname |> $supermixinclassname");
-
 	var newsource = 
+	"part of ',libraryName,'; \n"
 	"class ${mixinclassname} extends ${supermixinclassname} \n "
 	" { ${mixinbody} ${constructor} } \n"
 	"class ${metamixinclassname} extends KernelForDart_Class_mixin \n"
@@ -3551,21 +3317,20 @@ globals ^<List[Node]> = (
 	dart var: 'platform_global'.
 	}
 )
-imports ^<List[Node]> = (
+libraryAndImports ^<List[Node]> = (
 	^{
-	dart verbatim: 'import "dart:mirrors";'.
+	dart verbatim: 'library ',libraryName,';'.
 	dart verbatim: 'import "dart-ext:ns2dart_extension";'.
+	dart verbatim: 'import "dart:mirrors" as Mirrors;'.
 	dart verbatim: 'import "dart:math" as Math;'.
+	dart verbatim: 'import "dart:io";'.
+	dart verbatim: 'import "dart:uri";'.
 	}
 )
+libraryName ^<String> = (
+	^appDefnName
+)
 mainFunction = (
-
-	|
-	appDefnName = appModuleReps first first name.
-	runtimeDefnName = runtimeModuleReps first first name.
-	|
-
-	#REFACTORING. #FLAG. (* This is brittle: it duplicates decisions about naming *)
 
 	^dart verbatim: 
 'main(){
@@ -3574,7 +3339,7 @@ mainFunction = (
 	platform_global = runtime.using__(nil_);
 	var app = ns.',appDefnName,'().packageUsing__(ns);
 	var args = Array_global.wrapping__(
-		new Options().arguments.map((arg)=>String_global.wrapping__(arg)));
+		new Options().arguments.map((arg)=>String_global.wrapping__(arg)).toList(growable:false));
 	app.main__args__(platform_global, args);
 }'
 )
@@ -3812,50 +3577,52 @@ nlrClass ^<Node> = (
 reflectionHelpers ^<List[Node]> = (
 	^{
 '_slotnamesof(klass){
+  var mirrors = Mirrors.currentMirrorSystem();
   var classname = klass.protodartname_();
-  var c = currentMirrorSystem().rootLibrary.classes()[classname];
+  var l = mirrors.findLibrary(new Symbol("',libraryName,'")).first;
+  var c =  l.classes[new Symbol(classname)];
   var nsstrings = new List();
-  c.variables().forEach( (varName,varMirror){
+  c.variables.forEach( (varName,varMirror){
     if(!varMirror.isStatic) 
-      nsstrings.add(String_global.wrapping__(varName));
+      nsstrings.add(String_global.wrapping__(Mirrors.MirrorSystem.getName(varName)));
   });
   return Array_global.wrapping__(nsstrings);
 }'.
 
 '_getslot(obj, slotname){
-  var m = currentMirrorSystem().mirrorOf(obj);
-  var val = m.getField(slotname).value.reflectee;
+  var m = Mirrors.reflect(obj);
+  var val = m.getField(new Symbol(slotname)).reflectee;
   return val === null ? nil_ : val;
 }'.
 
 '_setslot(obj, slotname, newval){
-  var valm = currentMirrorSystem().mirrorOf(newval);
-  var m = currentMirrorSystem().mirrorOf(obj);
-  return m.setField(slotname, valm).value.reflectee;
+  var m = Mirrors.reflect(obj);
+  return m.setField(new Symbol(slotname), newval).reflectee;
 }'.
 
 '_mirrorInvoke(mirror, sel, args){
-  var mirrors = currentMirrorSystem();
-  var argMirrors = args.map( (x){ return mirrors.mirrorOf(x); } );
-  return mirror.invoke(sel,argMirrors).value.reflectee;
+  //var argMirrors = args.map( (x){ return Mirrors.reflect(x); } ).toList(growable:false);
+  return mirror.invoke(new Symbol(sel),args).reflectee;
 }'.
 
 '_mirrorInvokeConstructor(mirror, sel, args){
-  var mirrors = currentMirrorSystem();
-  var argMirrors = args.map( (x){ return mirrors.mirrorOf(x); } );
-  return mirror.newInstance(sel,argMirrors).value.reflectee;
+  //var argMirrors = args.map( (x){ return Mirrors.reflect(x); } ).toList(growable:false);
+  return mirror.newInstance(new Symbol(sel),args).reflectee;
 }'.
 
 '_libgetclassnamed(libMirror, clsName){
-  var clsMirror = libMirror.classes()[clsName];
+  var clsMirror = libMirror.classes[new Symbol(clsName)];
   return clsMirror === null ? nil_ : clsMirror;
 }'.
 
 '_libnamed(libName){
-  var libMirror = currentMirrorSystem().libraries()[libName];
+  var libMirror = Mirrors.currentMirrorSystem().libraries[Uri.parse(libName)];
   return libMirror === null ? nil_ : libMirror;
 }'.
 	} collect: [:ea | dart verbatim: ea].
+)
+runtimeDefnName = (
+	 ^runtimeModuleReps first first name
 )
 seqexpHelpers ^<List[Node]> = (
 	^{
@@ -3933,7 +3700,7 @@ seqexpHelpers ^<List[Node]> = (
 {
 	try {
 		return tryblock(); 
-	} catch( KernelForDart_Error_mixin ex ) {
+	} on KernelForDart_Error_mixin catch(  ex ) {
 		for(var c = ex.klass_; c !== nil_ && c !== null; c=c.superclass_slot){
 			if(c==exceptionclass) return catchblock(ex);
 		}
@@ -3952,7 +3719,7 @@ seqexpHelpers ^<List[Node]> = (
 }'.
 
 'seqexp_numArgs(a) {
-	if(a is Function) return currentMirrorSystem().mirrorOf(a).function().parameters().length;
+	if(a is Function) return Mirrors.reflect(a).function.parameters.length;
 	return a.numArgs();
 }'.
 
@@ -3971,6 +3738,7 @@ seqexpHelpers ^<List[Node]> = (
     if(b.length == 8) return a(b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7]);
     if(b.length == 9) return a(b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],b[8]);
 
+	throw "seqexp_valueWithArgs";
     // Handle the general case reflectively
     var mirrors = currentMirrorSystem();
     var args = b.map( (x){ return mirrors.mirrorOf(x); } );
@@ -4004,7 +3772,7 @@ topInitNew ^<Node> = (
 )
 topLevelMembers ^<List[Node]> = (
 
-	^imports, 
+	^libraryAndImports, 
 		{topClass. nlrClass}, mixinClasses, 
 		mixinSources, globals, 
 		seqexpHelpers, reflectionHelpers, dynamicMixinHelpers,
@@ -4023,8 +3791,11 @@ topNoSuchMethod ^<Node> = (
 				on: (dart ident: names Message)
 				invoke: (dart ident: (names mangleSelector: 'selector:arguments:'))
 				with: {
-					dart on: (dart ident: names String) invoke: (dart ident: 'wrapping__') with: {dart memberOf: (dart ident: 'invocation') at: 'memberName'}.
-					dart on: (dart ident: names Array) invoke: (dart ident: 'wrapping__') with: {dart memberOf: (dart ident: 'invocation') at: 'positionalArguments'} 
+					dart on: (dart ident: names String) invoke: (dart ident: 'wrapping__') with: {
+						(dart on: (dart memberOf: (dart ident: 'Mirrors') at: 'MirrorSystem') invoke: (dart ident: 'getName') with: {
+						dart memberOf: (dart ident: 'invocation') at: 'memberName' })}.
+					dart on: (dart ident: names Array) invoke: (dart ident: 'wrapping__') with: {
+						dart memberOf: (dart ident: 'invocation') at: 'positionalArguments'} 
 				}
 			})
 		
@@ -4078,115 +3849,16 @@ simpleName ^ <Symbol> = (
 )) : ('as yet unclassified'
 REFACTORING = (
 	(* Maybe this should be the class called LowLevelMethodMirror and live in the mirrors module. *)
-))
-class Scope = (
-(* A generic scope facility. *)|
-superScope <Scope>
-bindings <Map[Symbol,SymbolTableEntry]> = Dictionary new.
-|)
-('access'
-at: aKey put: aValue = (
-	^self bindings at: aKey put: aValue
-)
-at: aKey put: aValue ifThere: aBlock = (
-
-    (* Associates aValue with aKey and answers aValue if aKey
-    was absent. Otherwise answers the value of aBlock. *)
-    | wasAbsent |
-    self assert: [aKey isSymbol] 
-	message:['Attempt to ok up non-symbol ',aKey printString, ' in scope'].
-    wasAbsent:: false.
-    bindings at: aKey ifAbsent: [bindings at: aKey put: aValue. wasAbsent:: true].
-    ^ wasAbsent
-        ifTrue: [aValue]
-        ifFalse: [aBlock value]
-)
-at: key = (
-	(* Answers the value associated with aKey in this or one the super scopes or fails if aKey is absent. *)
-	^self at: key ifAbsent: [Error signal: 'Key ', key, ' not found!']
-)
-at: key ifAbsent: blk = (
-
-    (* Answers the value associated with aKey in this or one of the superScopes or the value of aBlock if aKey is absent. *)
-
-	(* Optimization note: This is written using [nil] blocks to avoid passing 
-		non-clean blocks dynamically down the scope structure. *)
-
-	| val <T> |
-	(val:: self bindings at: key ifAbsent: [ nil ]) notNil
-		ifTrue: [ ^val ].
-	self superScope isNil
-		ifTrue: [ ^blk value ].
-	(val:: self superScope at: key ifAbsent: [ nil ]) notNil
-		ifTrue: [ ^val ].
-	^blk value
-)
-clear = (
-
-
-self bindings keys do:[:k | self bindings removeKey: k].
-)
-includesIndex: key = (
-(* should this search the superscope? *)
-    ^ self bindings includesKey: key
-)
-includesIndexLocally: key <NameType > ^ <Boolean> = (
-
-
-^self bindings includesKey: key.
-)
-removeKey: key = (
-
-
-self bindings removeKey: key
-)
-removeKey: key ifAbsent: blk = (
-
-
-self bindings removeKey: key ifAbsent: blk
-)
-within: scope = (
-    (* Creates and initializes a new (sub)scope within scope. *)
-      self superScope: scope.
-  )'as yet unclassified'
-depth ^ <Integer> = (
-	superScope ifNil:[^0].
-	^superScope depth + 1.
-)) : ('as yet unclassified'
-REFACTORING = (
-	(* This should be factored out along with ScopeBuilder. Perhaps it should also become nested within ScopeBuilder. *)
-))
-class SemanticVarDecl decl: d <VarDeclAST> = SymbolTableEntry for: d (
-(* Semantic info for a variable: slot, local or parameter. *)|
-  offset <Integer>
-  remote ::= false.
-  remoteVector <SemanticVarDecl>
-|)
-('as yet unclassified'
-isTemporaryAST ^ <Boolean> = (
-	^data isTemporaryAST
-)
-setIndex: i <Integer> InVector: v <VarDeclAST> = (
-	assert: remote message: 'Var Decl is not remote'.
-	remoteVector:: v.
-	offset:: i.
-)
-variableClass ^ <Class> = (
-	^data variableClass
-)) : ()
-class SymbolTableEntry for: datum = (
-(* An entry in a scope. *)| 
-  sym  
-  data ::= datum first.
-  depth = datum last.
-|)
-('as yet unclassified'
-isMethodNode = (^self data  isMethodNode)'testing'
-isMessagePatternNode = (^self data  isMessagePatternNode)
-isVarDeclNode = (^self data isVarDeclNode)) : ()'as yet unclassified'
+))'as yet unclassified'
 MutableString = (
 	#FLAG.
 	^String
+)'make lexically visible'
+Scope = (
+	^super Scope
+)
+SlotEntry = (
+	^super SlotEntry
 )'private'
 REFACTORING = (
 	(* Rewriter, Translator, Writer are stateful visitors that have a method to reset their state. It would be less error prone if they had no such reset methods and instead a new instance was created for each use.

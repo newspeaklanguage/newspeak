@@ -94,6 +94,8 @@ Dart ASTs are always constructed with names already mangled. *)|
 	inlineOperators ::= true.
 	inlineLoops ::= true.
 
+	interceptedSelectors
+	
 	useCrawlingHereSends ::= false.
 	|)
 (
@@ -144,6 +146,9 @@ See also Translator's binaryOperatorMappings. *)|
 ('as yet unclassified'
 fullyQualifySimpleName: simpleName <Symbol> with: fullyQualifiedPackage <Symbol> = (
 	^fullyQualifiedPackage, '`', simpleName
+)
+mangleInterceptedSelector: selector <String> ^<String> = (
+	^'intercept$', (mangleSelector: selector)
 )'compiler temps'
 cascadeReceiverTemp ^<String> = (
 	^'cascadeReceiver_'
@@ -1424,8 +1429,10 @@ class Translator = ASTTool (
 (* Visits nodes of an NS AST to produce a Dart AST. The usual translation unit is a method. Translation is initiated by sending the translateMethodNode: message. The argument is the method to translate, the returned value is the translation. *)|
 	scopeStack
 	currentSelector
+	isIntercepted
 	protected containsNonLocalReturn <Boolean> (* Set to false at the beginning of translating a method. The code that emits a non-local return sets this to true. The top-level code checks the value to see whether to emit a try-catch wrapper for an NLR. *)
 	protected usesDefiningClass <Boolean>
+	guardTemp = dart ident: names guardTemp.
 	protected containsGuardedSend <Boolean>
 	
 	(* We map some Newspeak selectors onto Dart operators to speed arithmetic and comparisons, which become native Dart operations if the operands are unwrapped built-ins. *)
@@ -1448,338 +1455,9 @@ class Translator = ASTTool (
 		at: '>>' put: '>>';
 		yourself.		
 
-	guards = SendGuards new.
 	vmmirror = VMMirrorIntrinsics new.
 |#FLAG)
 (
-class SendGuards = (|
-	private guardTemp = dart ident: names guardTemp.
-	private guardedSelectors = Dictionary new
-		at: #not put: #guardNot:to:;
-		at: #& put: #guardAmp:to:;
-		at: #ifTrue:ifFalse: put: #guardIfTrueIfFalse:to:;
-		at: #ifTrue: put: #guardIfTrue:to:;
-		at: #ifFalse: put: #guardIfFalse:to:;
-		at: #ifFalse:ifTrue: put: #guardIfFalseIfTrue:to:;
-		at: #ln put: #guardLn:to:;
-		at: #exp put: #guardExp:to:;
-		at: #sqrt put: #guardSqrt:to:;
-		at: #printString put: #guardPrintString:to:;
-		at: #timesRepeat: put: #guardTimesRepeat:to:;
-		at: #to: put: #guardTo:to:;
-		at: #to:do: put: #guardToDo:to:;
-		at: #// put: #guardOverOver:to:;
-		at: #\\ put: #guardBackBack:to:;
-		at: #rem: put: #guardRem:to:;
-		at: #max: put: #guardMax:to:;
-		at: #min: put: #guardMin:to:;
-		at: #sign put: #guardSign:to:;
-		at: #between:and: put: #guardBetweenAnd:to:;
-		at: #value put: #guardValue0:to:;
-		at: #value: put: #guardValue1:to:;
-		at: #value:value: put: #guardValue2:to:;
-		at: #isBlock put: #guardIsBlock:to:;
-		at: #on:do: put: #guardOnDo:to:;
-		at: #asFloat put: #guardAsFloat:to:;
-		at: #== put: #guardIdentical:to:;
-		at: #numArgs put: #guardNumArgs:to:;
-		at: #valueWithArguments: put: #guardValueWithArguments:to:;
-		at: #yourself put: #guardYourself:to:;
-		at: #isNil put: #guardIsNil:to:;
-		at: #** put: #guardStarStar:to:;
-		yourself.
-|)
-('as yet unclassified'
-guardAmp: msg <MessageAST> to: rcvr <AST> = (
-	(* a & b =>  (t=a) is bool ? b&&a : a.amp_(b) *)
-
-	#FLAG. (* Does this produce evaluting conjunction? *)
-
-	^if: rcvr
-	is: 'bool'
-	do: (dart operator: '&&' with: (msg args first apply: translator) and: guardTemp)
-	otherwiseSend: msg
-)
-guardAsFloat: msg <MessageAST> to: rcvr <AST> = (
-
-	^if: rcvr
-	is: 'num'
-	do: (dart on: guardTemp invoke: (dart ident: 'toDouble') with: {})
-	otherwiseSend: msg
-)
-guardBackBack: msg <MessageAST> to: rcvr <AST> = (
-
-	^if: rcvr
-	is: 'num'
-	do: (dart
-		invoke: (dart ident: 'seqexp_backBack')
-		with: {guardTemp. msg args first apply: outer Translator})
-	otherwiseSend: msg
-)
-guardBetweenAnd: msg <MessageAST> to: rcvr <AST> = (
-
-	^if: rcvr
-	is: 'num'
-	do: (dart
-		invoke: (dart ident: 'seqexp_betweenAnd')
-		with: {guardTemp. 
-			msg args first apply: outer Translator.
-			(msg args at: 2) apply: outer Translator})
-	otherwiseSend: msg
-)
-guardExp: msg <MessageAST> to: rcvr <AST> = (
-
-	^if: rcvr
-	is: 'num'
-	do: (dart on: (dart ident: 'Math') invoke: (dart ident: 'exp') with: {guardTemp})
-	otherwiseSend: msg
-)
-guardIdentical: msg <MessageAST> to: rcvr <AST> = (
-	^dart
-		invoke: (dart ident: 'seqexp_identical')
-		with: {rcvr. msg args first apply: outer Translator}
-)
-guardIfFalse: msg <MessageAST> to: rcvr <AST> = (
-	^self 
-		to: rcvr
-		ifTrue: (dart ident: names nil)
-		ifFalse: (sendValueTo: (msg args at: 1))
-		ifNotBoolean: msg
-)
-guardIfFalseIfTrue: msg <MessageAST> to: rcvr <AST> = (
-	^self 
-		to: rcvr
-		ifTrue: (sendValueTo: (msg args at: 2))
-		ifFalse: (sendValueTo: (msg args at: 1)) 
-		ifNotBoolean: msg
-)
-guardIfTrue: msg <MessageAST> to: rcvr <AST> = (
-	^self 
-		to: rcvr
-		ifTrue: (sendValueTo: (msg args at: 1))
-		ifFalse: (dart ident: names nil)
-		ifNotBoolean: msg
-)
-guardIfTrueIfFalse: msg <MessageAST> to: rcvr <AST> = (
-	^self 
-		to: rcvr
-		ifTrue: (sendValueTo: (msg args at: 1))
-		ifFalse: (sendValueTo: (msg args at: 2)) 
-		ifNotBoolean: msg
-)
-guardIsBlock: msg <MessageAST> to: rcvr <AST> = (
-
-	^if: rcvr
-	is: 'Function'
-	do: (dart ident: 'true')
-	otherwiseSend: msg
-)
-guardIsNil: msg <MessageAST> to: rcvr <AST> = (
-
-	^if: rcvr
-	is: '! Top_mixin'
-	do: (dart ident: 'false')
-	otherwiseSend: msg
-)
-guardLn: msg <MessageAST> to: rcvr <AST> = (
-
-	^if: rcvr
-	is: 'num'
-	do: (dart on: (dart ident: 'Math') invoke: (dart ident: 'log') with: {guardTemp})
-	otherwiseSend: msg
-)
-guardMax: msg <MessageAST> to: rcvr <AST> = (
-
-	^if: rcvr
-	is: 'num'
-	do: (dart
-		invoke: (dart ident: 'seqexp_max')
-		with: {guardTemp. msg args first apply: outer Translator})
-	otherwiseSend: msg
-)
-guardMin: msg <MessageAST> to: rcvr <AST> = (
-
-	^if: rcvr
-	is: 'num'
-	do: (dart
-		invoke: (dart ident: 'seqexp_min')
-		with: {guardTemp. msg args first apply: outer Translator})
-	otherwiseSend: msg
-)
-guardNot: msg <MessageAST> to: rcvr <AST> = (
-
-	^if: rcvr
-	is: 'bool'
-	do: (dart prefixOperator: '!' on: guardTemp)
-	otherwiseSend: msg	
-)
-guardNumArgs: msg <MessageAST> to: rcvr <AST> = (
-	^dart
-		invoke: (dart ident: 'seqexp_numArgs')
-		with: {rcvr}
-)
-guardOnDo: msg <MessageAST> to: rcvr <AST> = (
-
-	^if: rcvr
-	is: 'Function'
-	do: (dart
-		invoke: (dart ident: 'seqexp_ondo')
-		with: {guardTemp. 
-			msg args first apply: outer Translator.
-			(msg args at: 2) apply: outer Translator})
-	otherwiseSend: msg
-)
-guardOverOver: msg <MessageAST> to: rcvr <AST> = (
-
-	^if: rcvr
-	is: 'num'
-	do: (dart
-		invoke: (dart ident: 'seqexp_overOver')
-		with: {guardTemp. msg args first apply: outer Translator})
-	otherwiseSend: msg
-)
-guardPrintString: msg <MessageAST> to: rcvr <AST> = (
-
-	^if: rcvr
-	is: '! Top_mixin'
-	do: (dart
-		on: (dart ident: names String)
-		invoke: (dart ident: (names mangleSelector: 'wrapping:'))
-		with: {dart on: guardTemp invoke: (dart ident: 'toString') with: {}})
-	otherwiseSend: msg
-)
-guardRem: msg <MessageAST> to: rcvr <AST> = (
-
-	^if: rcvr
-	is: 'num'
-	do: (dart
-		invoke: (dart ident: 'seqexp_rem')
-		with: {guardTemp. msg args first apply: outer Translator})
-	otherwiseSend: msg
-)
-guardSign: msg <MessageAST> to: rcvr <AST> = (
-
-	^if: rcvr
-	is: 'num'
-	do: (dart
-		invoke: (dart ident: 'seqexp_sign')
-		with: {guardTemp})
-	otherwiseSend: msg
-)
-guardSqrt: msg <MessageAST> to: rcvr <AST> = (
-
-	^if: rcvr
-	is: 'num'
-	do: (dart on: (dart ident: 'Math') invoke: (dart ident: 'sqrt') with: {guardTemp})
-	otherwiseSend: msg
-)
-guardStarStar: msg <MessageAST> to: rcvr <AST> = (
-	^dart
-		invoke: (dart ident: 'guard_starstar')
-		with: {rcvr. msg args first apply: outer Translator}
-)
-guardTimesRepeat: msg <MessageAST> to: rcvr <AST> = (
-
-	^if: rcvr
-	is: 'num'
-	do: (dart
-		invoke: (dart ident: 'seqexp_timesRepeat')
-		with: {guardTemp. msg args first apply: outer Translator})
-	otherwiseSend: msg
-)
-guardTo: msg <MessageAST> to: rcvr <AST> = (
-
-	^if: rcvr
-	is: 'num'
-	do: (dart
-		invoke: (dart ident: 'seqexp_to')
-		with: {guardTemp. msg args first apply: outer Translator})
-	otherwiseSend: msg
-)
-guardToDo: msg <MessageAST> to: rcvr <AST> = (
-
-	^if: rcvr
-	is: 'num'
-	do: (dart
-		invoke: (dart ident: 'seqexp_toDo')
-		with: {guardTemp. 
-			msg args first apply: outer Translator.
-			(msg args at: 2) apply: outer Translator})
-	otherwiseSend: msg
-)
-guardValue0: msg <MessageAST> to: rcvr <AST> = (
-	^if: rcvr
-	is: 'Function'
-	do: (dart
-		invoke: (guardTemp)
-		with: {})
-	otherwiseSend: msg
-)
-guardValue1: msg <MessageAST> to: rcvr <AST> = (
-	^if: rcvr
-	is: 'Function'
-	do: (dart
-		invoke: (guardTemp)
-		with: {msg args first apply: outer Translator})
-	otherwiseSend: msg
-)
-guardValue2: msg <MessageAST> to: rcvr <AST> = (
-
-	^if: rcvr
-	is: 'Function'
-	do: (dart
-		invoke: (guardTemp)
-		with: {
-			msg args first apply: outer Translator.
-			(msg args at: 2) apply: outer Translator})
-	otherwiseSend: msg
-)
-guardValueWithArguments: msg <MessageAST> to: rcvr <AST> = (
-	^dart
-		invoke: (dart ident: 'seqexp_valueWithArgs')
-		with: {rcvr. msg args first apply: outer Translator}
-)
-guardYourself: msg <MessageAST> to: rcvr <AST> = (
-
-	^if: rcvr
-	is: '! Top_mixin'
-	do: guardTemp
-	otherwiseSend: msg
-)
-if: rcvr is: type do: fastpath otherwiseSend: msg = (
-	^dart
-		ternaryIf: (dart operator: 'is' with: (dart assign: guardTemp toBe: rcvr) and: (dart verbatim: type))
-		then: fastpath
-		else: (processUnguardedSend: msg to: guardTemp).
-)
-isGuardedSelector: selector <String> ^<Boolean> = (
-	^guardedSelectors includesKey: selector
-)
-processGuardedSend: message <MessageAST> to: receiver <AST> = (
-
-	(* If the receiver is super or self, we know it won't be an unwrapped basic type. We must not guard super sends since they cannot be split into testing the type of super then normal sending to the guard temp. *)
-	(receiver = (dart ident: 'super') or: [receiver = (dart ident: 'this')])
-		ifTrue: [^processUnguardedSend: message to: receiver].
-
-	^self perform: (guardedSelectors at: message sel) with: message with: receiver
-)
-sendValueTo: ast = (
-	^dart invoke: (ast apply: translator) with: {}
-)
-to: boolExp ifTrue: trueExp ifFalse: falseExp ifNotBoolean: originalMessage = (
-
-	^(dart
-		ternaryIf: boolExp
-		then: trueExp
-		else: falseExp)
-	(* ^if: boolExp
-	is: 'bool'
-	do: (dart
-		ternaryIf: guardTemp
-		then: trueExp
-		else: falseExp)
-	otherwiseSend: originalMessage *)
-)) : ()
 class VMMirrorIntrinsics = (
 (* When compiling the runtime modules, all sends to the receiver 'vmmirror' are evaluated at compile time. They are sent to an instance of this class, which answers Dart ASTs. *)|
 |)
@@ -1804,9 +1482,6 @@ Object = (
 )
 String = (
 	^dart ident: names String
-)
-codePointOfString: str = (
-	^dart on: str invoke: (dart ident: 'codeUnitAt') with: {dart literal: 0}
 )
 compare: a to: b = (
 	^dart on: a invoke: (dart ident: 'compareTo') with: {b}
@@ -1925,8 +1600,7 @@ try: tryblock on: expectedclass do: catchblock = (
 							with: {dart ident: 'e_'}))
 						) asBlock
 				) asBlock.
-			
-			(dart rethrow: (dart ident: 'e_'))
+			dart rethrow
 		})
 )
 whileFalse: cond do: block = (
@@ -1958,6 +1632,7 @@ beginNewTranslationCycle = (
 	containsNonLocalReturn:: false.
 	usesDefiningClass:: false.
 	containsGuardedSend:: false.
+	isIntercepted:: false.
 )
 blockLocalReturnNode: node <BlockLocalReturnAST> = (
 (*	(node expr isNormalSendNode and: [isInlinableConditionalNode: node expr]) ifTrue:
@@ -1996,10 +1671,7 @@ cascadedSendNodeUsingClosure: node <CascadedSendAST> = (
 )
 charNode: node <CharAST> = (
 	(* Dart has no characters, only strings. Newspeak will probably move in this direction as well. *)
-	^dart
-		on: vmmirror String
-		invoke: (dart ident: (names mangleSelector: 'wrapping:'))
-		with: {dart literal: node val asString}
+	^dart literal: node val asString
 )
 codeBodyNode: node <CodeBodyAST> = (
 	| locals statements |
@@ -2068,7 +1740,7 @@ loopNode: node <LoopAST> = (
 	condStatements = node condOnlyStatments apply: self.
 	body = node body ifNil: [dart block: {}] ifNotNil: [:it | it apply: self].
 	
-	(* Split the condition is it isn't a single expression *)
+	(* Split the condition if it isn't a single expression *)
 	condExpression ::= condStatements statements last.
 	condPrologue = condStatements statements asOrderedCollection removeLast; yourself.
 	|
@@ -2095,23 +1767,29 @@ messageNode: node = (
 	^(names mangleSelector: node sel)
 )
 messagePatternNode: node <MessagePatternAST> ^<List[String]> = (
-	currentSelector:: names mangleSelector: node selector.
-	^node parameters collect: [:each | each apply: self]
+	isIntercepted:: interceptedSelectors includes: node selector.
+	isIntercepted
+		ifTrue: [
+			currentSelector:: names mangleInterceptedSelector: node selector.
+			^{'$this'}, (node parameters collect: [:each | each apply: self])]
+		ifFalse: [
+			currentSelector:: names mangleSelector: node selector.
+			^node parameters collect: [:each | each apply: self]].
 )
 methodNode: node <MethodAST> ^<Node> = (
-	| translatedBody methodName |
+	| translatedParams translatedBody methodName |
+	translatedParams:: (node pattern apply: self) asArray.
 	translatedBody:: node body apply: self.
 	
-	methodName:: node pattern selector.
 	methodName:: 
 		in: binaryOperatorMappings
-		at: methodName
+		at: currentSelector
 		ifPresent: [:op | dart verbatim: 'operator ', op]
-		ifAbsent: [names mangleSelector: methodName].
+		ifAbsent: [currentSelector].
 		
 	^dart
 		method: methodName
-		params: (node pattern apply: self) asArray
+		params: translatedParams
 		body: (containsNonLocalReturn
 			ifTrue: [wrapBodyForNlrHandling: translatedBody]
 			ifFalse: [wrapBodyNoNlrHandling: translatedBody]).
@@ -2137,6 +1815,17 @@ parameterDeclNode: node <ParameterAST> = (
 parameterNode: node <ParameterVariableAST> = (
 	^dart ident: (names mangleSelector: node name)
 )
+processGuardedSend: message <MessageAST> to: receiver <AST> = (
+	| interceptor |
+	containsGuardedSend: true.
+	
+	^dart 
+		on: (dart 
+			invoke: (dart ident: '$interceptorFor')
+			with: {(dart assign: guardTemp toBe: receiver)})
+		invoke: (dart ident: (names mangleInterceptedSelector: message sel))
+		with: ({guardTemp}, (message args collect: [:each | each apply: self])) asArray
+)
 processIntrinsic: msg <MessageAST> = (
 	^dart perform: msg sel 
 		withArguments: (msg args collect: [:arg | processIntrinsicArg: arg]) asArray.
@@ -2154,7 +1843,7 @@ processOldIntrinsic: message = (
 )
 processOuterReceiverAtDepth: depth <Integer> = (
 	| exp |
-	depth = 0 ifTrue: [^dart ident: 'this'].
+	depth = 0 ifTrue: [^self receiverNode: nil].
 	
 	(* Since nesting chains are typically short, it seems like the simplicity of following them directly won't be too expensive. Possibly for depths 1 and 2 this is faster than the enclosing objects array scheme. *)
 	useCrawlingHereSends ifFalse: [
@@ -2186,9 +1875,8 @@ processSend: message to: receiver = (
 				receiver method name = 'vmmirror' ifTrue: [
 					^processOldIntrinsic: message]]]].
 	
-	(guards isGuardedSelector: message sel) ifTrue:
-		[containsGuardedSend:: true.
-		^guards processGuardedSend: message to: receiver].
+	(interceptedSelectors includes: message sel) ifTrue:
+		[^processGuardedSend: message to: receiver].
 
 	^processUnguardedSend: message to: receiver
 )
@@ -2206,7 +1894,7 @@ processUnguardedSend: message to: receiver = (
 		with: (message args collect: [:each | each apply: self]) asArray]
 )
 receiverNode: node <ReceiverAST> = (
-	^dart ident: 'this'
+	^dart ident: (isIntercepted ifTrue: ['$this'] ifFalse: ['this'])
 )
 returnStatNode: node <ReturnAST> = (
 	containsNonLocalReturn:: true.
@@ -2217,10 +1905,11 @@ returnStatNode: node <ReturnAST> = (
 )
 stringNode: node <StringAST> = (
 	#FLAG. (* Eventually Newspeak will not have syntax for symbol literals and treat all string literals as symbols (interned strings) *)
-	^dart
+	(*^dart
 		on: vmmirror String
 		invoke: (dart ident: (names mangleSelector: 'wrapping:'))
-		with: {dart literal: node val}
+		with: {dart literal: node val}*)
+	^dart literal: node val
 )
 superSendNode: node <SuperSendAST> = (
 	^processSend: node msg to: (dart ident: 'super')
@@ -2239,10 +1928,7 @@ temporaryNode: node <TemporaryVariableAST> = (
 	^dart ident: (names mangleSelector: node name)
 )
 tupleNode: node <TupleAST> = (
-	^dart
-		on: vmmirror Array
-		invoke: (dart ident: (names mangleSelector: 'wrapping:'))
-		with: {dart list: (node elements collect: [:ea | ea apply: self])}
+	^dart list: (node elements collect: [:ea | ea apply: self])
 )
 wrapBodyForNlrHandling: body <Block> = (
 	| nlrVarNode nlrParamName nlrParamNode |
@@ -2253,11 +1939,11 @@ wrapBodyForNlrHandling: body <Block> = (
 		definingClassTempOrEmpty,
 		guardTempOrEmpty, {
 		dart var: names nlrTemp value: (dart new: (dart ident: names NLR) with: {}).
-		dart try: body on: (dart ident: names NLR) catch: nlrParamNode with:
+		dart try: body on: nil catch: nlrParamNode with:
 			(dart block: {
 				dart if: (dart operator: '==' with: nlrVarNode and: nlrParamNode)
 					then: (dart return: (dart memberOf: nlrParamNode at: nlrValueName))
-					else: (dart rethrow: nlrParamNode)
+					else: (dart rethrow)
 			})
 	}
 )
@@ -2306,7 +1992,8 @@ accessorForNestedClass: classDecl <ClassDeclarationAST> within: mixinMirror = (
 		}).
 	
 	(canResolveSuperclassOf: classDecl) ifFalse: [	
-	^dart method: (dart ident: (names mangleSelector: simpleName)) params: {} body: (dart block: {dart
+	^maybeRewriteForInterception: (
+	dart method: (dart ident: (names mangleSelector: simpleName)) params: {} body: (dart block: {dart
 		if: (dart 
 			operator: '=='
 			with: (dart ident: slotName)
@@ -2320,10 +2007,11 @@ accessorForNestedClass: classDecl <ClassDeclarationAST> within: mixinMirror = (
 			 theDynamicWay.	
 			}).
 		dart return: (dart ident: slotName).
-		}).
+		})).
 	].
 	
-	^dart method: (dart ident: (names mangleSelector: simpleName)) params: {} body: (dart block: {dart
+	^maybeRewriteForInterception: (
+	dart method: (dart ident: (names mangleSelector: simpleName)) params: {} body: (dart block: {dart
 		if: (dart 
 			operator: '=='
 			with: (dart ident: slotName)
@@ -2395,7 +2083,7 @@ and: (dart on: (dart ident: 'superclass') invoke: (dart ident: (names mangleSele
 			}).
 			
 			dart return: (dart ident: slotName).
-	})
+	}))
 )
 accessorForSuperclass: superclassCall <AST> inScope: s <Scope> ^<Node> = (
 	| send scopeBuilder |
@@ -2424,6 +2112,21 @@ canResolveSuperclassOf: node <ClassDeclarationAST> ^<String> = (
 	].
 	binding isClassDeclaration ifFalse: [^false].
 	^true
+)
+collectInterceptedSelectorsFrom: sources = (
+	| trees |
+	interceptedSelectors:: Set new.
+	sources do: [:ea | collectInterceptedSelectorsFromAst: (parser classDefinition parse: ea readStream)].
+	interceptedSelectors out
+)
+collectInterceptedSelectorsFromAst: tree = (
+	(in: tree classSide categories anySatisfy: [:category |
+		in: category methods anySatisfy: [:method |
+			method selector = #INTERCEPTOR]]) ifTrue: [
+				tree instanceSide categories do: [:category | 
+					category methods do: [:method | 
+						interceptedSelectors add: method selector]]].
+	tree instanceSide nestedClasses do: [:nc | collectInterceptedSelectorsFromAst: nc]
 )
 createNestedClassAccessorFrom: classDecl <ClassDeclarationAST> within: mixinMirror <LowLevelMixinMirror> = (
 (* Create an accessor method for the nested class represented by the incoming class tree.
@@ -2455,6 +2158,10 @@ hereSendFrom: arg <VarDeclAST> ^<MessageNode> = (
 )
 language = (
 	^#Newspeak3
+)
+maybeRewriteForInterception: x = (
+	#BOGUS.
+	^x
 )
 nestedMixinWrapperFor: nested <ClassDeclarationAST> in: outerClass <MixinMirror>  ^ <ClassDeclarationAST> = (
 (* Wrap a class declaration to make it look like a nested mixin within outerClass should. This includes making the name be the fully qualified name, and hiding the superclass. *)
@@ -2604,7 +2311,7 @@ initializerSelectorNameFor: selector <Symbol> ^<Symbol> = (
 	^'initializer`', selector
 )
 processFactoryFor: node <ClassAST> in: mixinMirror <LowLevelMixinMirror> = (
-	| accessor <MethdMirror> argNames ast initializerName basicNew |
+	| isIntercepted accessor <MethdMirror> argNames ast initializerName basicNew |
 	accessor:: MethodMirror named: node hdr constructor selector.
 	argNames:: (node hdr constructor parameters collect: [:each | translator mangleVarName: each name]) asArray.
 	initializerName:: initializerSelectorNameFor: node hdr constructor selector.
@@ -2614,9 +2321,12 @@ processFactoryFor: node <ClassAST> in: mixinMirror <LowLevelMixinMirror> = (
 					with: {dart ident: 'this'}. *)
 	basicNew:: dart on: (dart ident: 'this') invoke: (dart ident: 'basicNew_') with: {}.
 	
+	isIntercepted:: interceptedSelectors includes: node hdr constructor selector.
 	ast:: dart
-		method: (names mangleSelector: node hdr constructor selector)
-		params: argNames
+		method: (isIntercepted
+			ifTrue: [names mangleInterceptedSelector: node hdr constructor selector]
+			ifFalse: [names mangleSelector: node hdr constructor selector])
+		params: (isIntercepted ifTrue: [{'$this'}] ifFalse: [{}]), argNames
 		body: (dart block: {
 			dart return: (dart
 				on: basicNew
@@ -2833,6 +2543,8 @@ generateSlotAccessorsFor: m <MixinMirror>  = (
 	(* We need accessor METHODS so we can call them uniformly. Dart's special getters and setters won't do. *)
 	m instVars do: [:iv <InstanceVariableMirror> | 
 		|
+		interceptGetter <Boolean>
+		interceptSetter <Boolean>
 		getterName <String>
 		setterName <String>
 		ivName <String>
@@ -2841,12 +2553,19 @@ generateSlotAccessorsFor: m <MixinMirror>  = (
 		setter <MethodMirror>
 		setterDart <Node>
 		|
-		getterName:: names mangleSelector: iv name.
-		setterName:: names mangleSelector: (setterSelectorFor: iv).
+		interceptGetter:: interceptedSelectors includes: iv name.
+		interceptSetter:: interceptedSelectors includes: (setterSelectorFor: iv).
+		
+		getterName:: interceptGetter
+			ifTrue: [names mangleInterceptedSelector: iv name] 
+			ifFalse: [names mangleSelector: iv name].
+		setterName:: interceptSetter
+			ifTrue: [names mangleInterceptedSelector: (setterSelectorFor: iv)] 
+			ifFalse: [names mangleSelector: (setterSelectorFor: iv)].
 		ivName:: names mangleSlotName: iv name.
 		
 		getter:: MethodMirror named: getterName.
-		getterDart:: dart method: getterName params: {} body: (dart block: {
+		getterDart:: dart method: getterName params: (interceptGetter ifTrue: [{'$this'}] ifFalse: [{}]) body: (dart block: {
 			dart return: (dart memberOf: (dart ident: 'this') at: ivName)
 			}).
 		getter method: getterDart.	
@@ -2854,7 +2573,7 @@ generateSlotAccessorsFor: m <MixinMirror>  = (
 		m methods addMirror:  getter.
 		
 		setter:: MethodMirror named: setterName.
-		setterDart:: dart method: setterName params: {'v'} body: (dart block: {
+		setterDart:: dart method: setterName params: (interceptSetter ifTrue: [{'$this'. 'v'}] ifFalse: [{'v'}]) body: (dart block: {
 			(dart assign: (dart memberOf: (dart ident: 'this') at: ivName)
 				toBe: (dart ident: 'v')).
 			dart return: (dart ident: 'this')
@@ -3016,10 +2735,11 @@ platform:: runtime using: nil.
 application:: ApplicationDefinition packageUsing: namespace.
 application main: platform args: {}.
 *)|
-	compiler = Compiler new.
+	compiler = Compiler new collectInterceptedSelectorsFrom: runtimeSources.
 
-	appModuleReps = compileModules: appSources enableIntrinsics: false.
 	runtimeModuleReps = compileModules: runtimeSources enableIntrinsics: true.
+	appModuleReps = compileModules: appSources enableIntrinsics: false.
+	
 
 	names = compiler names.
 	writer = DartWriter new.
@@ -3137,14 +2857,14 @@ var uniqueSuffix = 1;
 
 mixinapply2( mixinclass, superclass )
 {
-
+	var t;
 	return mixinapply(
 		mixinclass.protodartname_(),
 		GET_GLOBAL("${mixinclass.protodartname_()}_body"),
 		mixinclass.protometadartname_(),
 		GET_GLOBAL("${mixinclass.protometadartname_()}_body"),
 		superclass,
-		mixinclass.name().comma_(superclass.name()), //could do better 
+		$interceptorFor(t=mixinclass.name()).intercept$comma_(t, superclass.name()), //could do better 
 		mixinclass.enclosingObjects_()
 	);
 }
@@ -3213,18 +2933,17 @@ fieldsForTopLevelClasses = (
 )
 globals ^<List[Node]> = (
 	^{
-	dart var: names true.
-	dart var: names false.
 	dart var: names nil.
 	
 	dart var: names Object.
 	dart var: names Class.
 	dart var: names Metaclass.
 	
-	dart var: names String.
-	dart var: names Number.
-	dart var: names Block.
-	dart var: names Array.
+	dart var: '$String$interceptor'.
+	dart var: '$Block$interceptor'.
+	dart var: '$Number$interceptor'.
+	dart var: '$Array$interceptor'.
+	dart var: '$Boolean$interceptor'.
 	
 	dart var: names Message.
 	
@@ -3246,13 +2965,28 @@ libraryName ^<String> = (
 mainFunction = (
 
 	^dart verbatim: 
-'main(){
+'
+$interceptorFor(r) {
+	if(r is num) return $Number$interceptor;
+	if(r is bool) return $Boolean$interceptor;
+	if(r is String) return $String$interceptor;
+	if(r is List) return $Array$interceptor;
+	if(r is Function) return $Block$interceptor;
+	return r;
+}
+
+main(){
+	$String$interceptor = new KernelForDart_String_mixin(null);
+	$Block$interceptor = new KernelForDart_Block_mixin(null);
+	$Number$interceptor = new KernelForDart_Number_mixin(null);
+	$Array$interceptor = new KernelForDart_Array_mixin(null);
+	$Boolean$interceptor = new KernelForDart_Boolean_mixin(null);
+	
 	var ns = new Namespace_();
 	var runtime = ns.',runtimeDefnName,'().packageUsing__(ns);
 	platform_global = runtime.using__(nil_);
 	var app = ns.',appDefnName,'().packageUsing__(ns);
-	var args = Array_global.wrapping__(
-		new Options().arguments.map((arg)=>String_global.wrapping__(arg)).toList(growable:false));
+	var args = new Options().arguments;
 	app.main__args__(platform_global, args);
 }'
 )
@@ -3297,30 +3031,24 @@ Namespace_(){
 	//class, superclass, enclosingObject, name/thisClass
 
 	kernel.KernelForDart_Metaclass_slot = new KernelForDart_Metaclass_metamixin(null);
-	kernel.KernelForDart_False_slot = new KernelForDart_False_metamixin(null);
 	kernel.KernelForDart_Boolean_slot = new KernelForDart_Boolean_metamixin(null);
-	//kernel.KernelForDart_Error_slot = new KernelForDart_Error_metamixin(null);
 	kernel.KernelForDart_Block_slot = new KernelForDart_Block_metamixin(null);
 	kernel.KernelForDart_Number_slot = new KernelForDart_Number_metamixin(null);
 	kernel.KernelForDart_Array_slot = new KernelForDart_Array_metamixin(null);
 	kernel.KernelForDart_UndefinedObject_slot = new KernelForDart_UndefinedObject_metamixin(null);
 	kernel.KernelForDart_Object_slot = new KernelForDart_Object_metamixin(null);
 	kernel.KernelForDart_Behavior_slot = new KernelForDart_Behavior_metamixin(null);
-	//kernel.KernelForDart_MessageNotUnderstood_slot = new KernelForDart_MessageNotUnderstood_metamixin(null);
 	kernel.KernelForDart_String_slot = new KernelForDart_String_metamixin(null);
 	kernel.KernelForDart_Class_slot = new KernelForDart_Class_metamixin(null);
-	kernel.KernelForDart_True_slot = new KernelForDart_True_metamixin(null);
 	kernel.KernelForDart_Message_slot = new KernelForDart_Message_metamixin(null);
 
-	true_ = new KernelForDart_True_mixin(kernel.KernelForDart_True_slot);
-	false_ = new KernelForDart_False_mixin(kernel.KernelForDart_False_slot);
 	nil_ = new KernelForDart_UndefinedObject_mixin(kernel.KernelForDart_UndefinedObject_slot);
 
 	KernelForDart_mixin.KernelForDart_mixin_enclosingObjects = [];
 	KernelForDart_metamixin.KernelForDart_metamixin_enclosingObjects = [];
 
 	kernel.KernelForDart_Object_slot.superclass_slot = nil_;
-	kernel.KernelForDart_Object_slot.name_slot = kernel.KernelForDart_String_slot.wrapping__("Object");
+	kernel.KernelForDart_Object_slot.name_slot = "Object";
 	kernel.KernelForDart_Object_slot.enclosingObject_slot = kernel;
 	kernel.KernelForDart_Object_slot.hasStaticChain_slot = true;
 	kernel.KernelForDart_Object_slot.klass_ = kernel.KernelForDart_Metaclass_slot.new_();
@@ -3331,7 +3059,7 @@ Namespace_(){
 	KernelForDart_Object_metamixin.KernelForDart_Object_metamixin_enclosingObjects = [kernel];
 
 	kernel.KernelForDart_Metaclass_slot.superclass_slot = kernel.KernelForDart_Behavior_slot;
-	kernel.KernelForDart_Metaclass_slot.name_slot = kernel.KernelForDart_String_slot.wrapping__("Metaclass");
+	kernel.KernelForDart_Metaclass_slot.name_slot = "Metaclass";
 	kernel.KernelForDart_Metaclass_slot.enclosingObject_slot = kernel;
 	kernel.KernelForDart_Metaclass_slot.hasStaticChain_slot = true;
 	kernel.KernelForDart_Metaclass_slot.klass_ = kernel.KernelForDart_Metaclass_slot.new_();
@@ -3341,19 +3069,8 @@ Namespace_(){
 	KernelForDart_Metaclass_mixin.KernelForDart_Metaclass_mixin_enclosingObjects = [kernel];
 	KernelForDart_Metaclass_metamixin.KernelForDart_Metaclass_metamixin_enclosingObjects = [kernel];
 
-	kernel.KernelForDart_False_slot.superclass_slot = kernel.KernelForDart_Boolean_slot;
-	kernel.KernelForDart_False_slot.name_slot = kernel.KernelForDart_String_slot.wrapping__("False");
-	kernel.KernelForDart_False_slot.enclosingObject_slot = kernel;
-	kernel.KernelForDart_False_slot.hasStaticChain_slot = true;
-	kernel.KernelForDart_False_slot.klass_ = kernel.KernelForDart_Metaclass_slot.new_();
-	kernel.KernelForDart_False_slot.klass_.superclass_slot = kernel.KernelForDart_Class_slot;
-	kernel.KernelForDart_False_slot.klass_.thisClass_slot = kernel.KernelForDart_False_slot;
-	kernel.KernelForDart_False_slot.klass_.enclosingObject_slot = kernel;
-	KernelForDart_False_mixin.KernelForDart_False_mixin_enclosingObjects = [kernel];
-	KernelForDart_False_metamixin.KernelForDart_False_metamixin_enclosingObjects = [kernel];
-
 	kernel.KernelForDart_Boolean_slot.superclass_slot = kernel.KernelForDart_Object_slot;
-	kernel.KernelForDart_Boolean_slot.name_slot = kernel.KernelForDart_String_slot.wrapping__("Boolean");
+	kernel.KernelForDart_Boolean_slot.name_slot = "Boolean";
 	kernel.KernelForDart_Boolean_slot.enclosingObject_slot = kernel;
 	kernel.KernelForDart_Boolean_slot.hasStaticChain_slot = true;
 	kernel.KernelForDart_Boolean_slot.klass_ = kernel.KernelForDart_Metaclass_slot.new_();
@@ -3364,7 +3081,7 @@ Namespace_(){
 	KernelForDart_Boolean_metamixin.KernelForDart_Boolean_metamixin_enclosingObjects = [kernel];
 
 	kernel.KernelForDart_Block_slot.superclass_slot = kernel.KernelForDart_Object_slot;
-	kernel.KernelForDart_Block_slot.name_slot = kernel.KernelForDart_String_slot.wrapping__("Block");
+	kernel.KernelForDart_Block_slot.name_slot = "Block";
 	kernel.KernelForDart_Block_slot.enclosingObject_slot = kernel;
 	kernel.KernelForDart_Block_slot.hasStaticChain_slot = true;
 	kernel.KernelForDart_Block_slot.klass_ = kernel.KernelForDart_Metaclass_slot.new_();
@@ -3375,7 +3092,7 @@ Namespace_(){
 	KernelForDart_Block_metamixin.KernelForDart_Block_metamixin_enclosingObjects = [kernel];
 	
 	kernel.KernelForDart_Number_slot.superclass_slot = kernel.KernelForDart_Object_slot;
-	kernel.KernelForDart_Number_slot.name_slot = kernel.KernelForDart_String_slot.wrapping__("Number");
+	kernel.KernelForDart_Number_slot.name_slot = "Number";
 	kernel.KernelForDart_Number_slot.enclosingObject_slot = kernel;
 	kernel.KernelForDart_Number_slot.hasStaticChain_slot = true;
 	kernel.KernelForDart_Number_slot.klass_ = kernel.KernelForDart_Metaclass_slot.new_();
@@ -3386,7 +3103,7 @@ Namespace_(){
 	KernelForDart_Number_metamixin.KernelForDart_Number_metamixin_enclosingObjects = [kernel];
 	
 	kernel.KernelForDart_Array_slot.superclass_slot = kernel.KernelForDart_Object_slot;
-	kernel.KernelForDart_Array_slot.name_slot = kernel.KernelForDart_String_slot.wrapping__("Array");
+	kernel.KernelForDart_Array_slot.name_slot = "Array";
 	kernel.KernelForDart_Array_slot.enclosingObject_slot = kernel;
 	kernel.KernelForDart_Array_slot.hasStaticChain_slot = true;
 	kernel.KernelForDart_Array_slot.klass_ = kernel.KernelForDart_Metaclass_slot.new_();
@@ -3397,7 +3114,7 @@ Namespace_(){
 	KernelForDart_Array_metamixin.KernelForDart_Array_metamixin_enclosingObjects = [kernel];
 
 	kernel.KernelForDart_UndefinedObject_slot.superclass_slot = kernel.KernelForDart_Object_slot;
-	kernel.KernelForDart_UndefinedObject_slot.name_slot = kernel.KernelForDart_String_slot.wrapping__("UndefinedObject");
+	kernel.KernelForDart_UndefinedObject_slot.name_slot = "UndefinedObject";
 	kernel.KernelForDart_UndefinedObject_slot.enclosingObject_slot = kernel;
 	kernel.KernelForDart_UndefinedObject_slot.hasStaticChain_slot = true;
 	kernel.KernelForDart_UndefinedObject_slot.klass_ = kernel.KernelForDart_Metaclass_slot.new_();
@@ -3408,7 +3125,7 @@ Namespace_(){
 	KernelForDart_UndefinedObject_metamixin.KernelForDart_UndefinedObject_metamixin_enclosingObjects = [kernel];
 	
 	kernel.KernelForDart_Behavior_slot.superclass_slot = kernel.KernelForDart_Object_slot;
-	kernel.KernelForDart_Behavior_slot.name_slot = kernel.KernelForDart_String_slot.wrapping__("Behavior");
+	kernel.KernelForDart_Behavior_slot.name_slot = "Behavior";
 	kernel.KernelForDart_Behavior_slot.enclosingObject_slot = kernel;
 	kernel.KernelForDart_Behavior_slot.hasStaticChain_slot = true;
 	kernel.KernelForDart_Behavior_slot.klass_ = kernel.KernelForDart_Metaclass_slot.new_();
@@ -3419,7 +3136,7 @@ Namespace_(){
 	KernelForDart_Behavior_metamixin.KernelForDart_Behavior_metamixin_enclosingObjects = [kernel];
 	
 	kernel.KernelForDart_String_slot.superclass_slot = kernel.KernelForDart_Object_slot;
-	kernel.KernelForDart_String_slot.name_slot = kernel.KernelForDart_String_slot.wrapping__("String");
+	kernel.KernelForDart_String_slot.name_slot = "String";
 	kernel.KernelForDart_String_slot.enclosingObject_slot = kernel;
 	kernel.KernelForDart_String_slot.hasStaticChain_slot = true;
 	kernel.KernelForDart_String_slot.klass_ = kernel.KernelForDart_Metaclass_slot.new_();
@@ -3430,7 +3147,7 @@ Namespace_(){
 	KernelForDart_String_metamixin.KernelForDart_String_metamixin_enclosingObjects = [kernel];
 
 	kernel.KernelForDart_Class_slot.superclass_slot = kernel.KernelForDart_Behavior_slot;
-	kernel.KernelForDart_Class_slot.name_slot = kernel.KernelForDart_String_slot.wrapping__("Class");
+	kernel.KernelForDart_Class_slot.name_slot = "Class";
 	kernel.KernelForDart_Class_slot.enclosingObject_slot = kernel;
 	kernel.KernelForDart_Class_slot.hasStaticChain_slot = true;
 	kernel.KernelForDart_Class_slot.klass_ = kernel.KernelForDart_Metaclass_slot.new_();
@@ -3440,19 +3157,8 @@ Namespace_(){
 	KernelForDart_Class_mixin.KernelForDart_Class_mixin_enclosingObjects = [kernel];
 	KernelForDart_Class_metamixin.KernelForDart_Class_metamixin_enclosingObjects = [kernel];
 	
-	kernel.KernelForDart_True_slot.superclass_slot = kernel.KernelForDart_Boolean_slot;
-	kernel.KernelForDart_True_slot.name_slot = kernel.KernelForDart_String_slot.wrapping__("True");
-	kernel.KernelForDart_True_slot.enclosingObject_slot = kernel;
-	kernel.KernelForDart_True_slot.hasStaticChain_slot = true;
-	kernel.KernelForDart_True_slot.klass_ = kernel.KernelForDart_Metaclass_slot.new_();
-	kernel.KernelForDart_True_slot.klass_.superclass_slot = kernel.KernelForDart_Class_slot;
-	kernel.KernelForDart_True_slot.klass_.thisClass_slot = kernel.KernelForDart_True_slot;
-	kernel.KernelForDart_True_slot.klass_.enclosingObject_slot = kernel;
-	KernelForDart_True_mixin.KernelForDart_True_mixin_enclosingObjects = [kernel];
-	KernelForDart_True_metamixin.KernelForDart_True_metamixin_enclosingObjects = [kernel];
-	
 	kernel.KernelForDart_Message_slot.superclass_slot = kernel.KernelForDart_Object_slot;
-	kernel.KernelForDart_Message_slot.name_slot = kernel.KernelForDart_String_slot.wrapping__("Message");
+	kernel.KernelForDart_Message_slot.name_slot = "Message";
 	kernel.KernelForDart_Message_slot.enclosingObject_slot = kernel;
 	kernel.KernelForDart_Message_slot.hasStaticChain_slot = true;
 	kernel.KernelForDart_Message_slot.klass_ = kernel.KernelForDart_Metaclass_slot.new_();
@@ -3466,12 +3172,6 @@ Namespace_(){
 	Object_global = kernel.KernelForDart_Object_slot;
 	Class_global = kernel.KernelForDart_Class_slot;
 	Metaclass_global = kernel.KernelForDart_Metaclass_slot;
-
-	//Used by literal re-writes. In principle replaceable with here sends.
-	String_global = kernel.KernelForDart_String_slot;
-	Number_global = kernel.KernelForDart_Number_slot;
-	Block_global = kernel.KernelForDart_Block_slot;
-	Array_global = kernel.KernelForDart_Array_slot;
 
 	//Needed by Top noSuchMethod
 	Message_global = kernel.KernelForDart_Message_slot;
@@ -3539,127 +3239,12 @@ runtimeDefnName = (
 )
 seqexpHelpers ^<List[Node]> = (
 	^{
-'seqexp_timesRepeat(n, block){
-	if(block is Function) for(var i=1; i<=n; i++) block();
-	else for(var i=1; i<=n; i++) block.value();
-	return n;
-}'.
-
-'seqexp_to(start, stop){
-	return platform_global.collections().Interval().from__to__(start,stop);
-}'.
-
-'seqexp_toDo(start, stop, block){
-	if(block is Function) for(var i=start; i<=stop; i++) block(i);
-	else for(var i=start; i<=stop; i++) block.value__(i);
-	return nil_;
-}'.
-
-'seqexp_overOver(rcvr, arg){
-	//from VMMaker by way of Primordial Soup
-	var posArg, posRcvr, result;
-	if(rcvr > 0)
-	{
-		if(arg > 0) result = rcvr ~/ arg;
-		else {
-			posArg = 0 - arg;
-			result = 0 - ((rcvr + (posArg - 1)) ~/ posArg);
-		 }
-	}else{
-		posRcvr = 0 - rcvr;
-		if( arg > 0 ) result = 0 - ((posRcvr + (arg - 1)) ~/ arg);
-		else{
-			posArg = 0 - arg;
-			result = posRcvr ~/ posArg;
-		}
-	}
-	return result;
-}'.
-
-'seqexp_backBack(rcvr, arg){
-	return rcvr - (seqexp_overOver(rcvr, arg) * arg);
-}'.
-
-'seqexp_rem(rcvr, arg){
-	return rcvr - ((rcvr ~/ arg) * arg);
-}'.
-
-'seqexp_max(rcvr, arg){
-	return rcvr > arg ? rcvr : arg;
-}'.
-
-'seqexp_min(rcvr, arg){
-	return rcvr < arg ? rcvr : arg;
-}'.
-
-'seqexp_betweenAnd(rcvr, min, max){
-	return rcvr >= min && rcvr <= max;
-}'.
-
-'seqexp_sign(rcvr){
-	if(rcvr > 0) return 1;
-	if(rcvr < 0) return -1;
-	return 0;
-}'.
-
 'seqexp_prepend(element, list){
   var newlist = new List(list.length + 1);
   newlist[0] = element;
   for(var i=0; i<list.length; i++) newlist[i+1] = list[i];
   return newlist;
 }'.
-
-'seqexp_ondo(tryblock,exceptionclass,catchblock)
-{
-	try {
-		return tryblock(); 
-	} on KernelForDart_Error_mixin catch(  ex ) {
-		for(var c = ex.klass_; c !== nil_ && c !== null; c=c.superclass_slot){
-			if(c==exceptionclass) return catchblock(ex);
-		}
-		throw ex;
-	}
-}'.
-
-'seqexp_identical(a,b){
-	if(a is ',(names mixinClassNameFor: 'Top'),') return a.identical_(b);
-	return identical(a, b);
-}'.
-
-'guard_starstar(a,b){
-	if(a is num) return Math.pow(a,b);
-	return a.starstar_(b);
-}'.
-
-'seqexp_numArgs(a) {
-	if(a is Function) return Mirrors.reflect(a).function.parameters.length;
-	return a.numArgs();
-}'.
-
-'seqexp_valueWithArgs(a, b) {
-  if(a is Function) {
-    // Prefer a direct invocation to get better stack traces.
-    b = b.dartList();
-    if(b.length == 0) return a();
-    if(b.length == 1) return a(b[0]);
-    if(b.length == 2) return a(b[0],b[1]);
-    if(b.length == 3) return a(b[0],b[1],b[2]);
-    if(b.length == 4) return a(b[0],b[1],b[2],b[3]);
-    if(b.length == 5) return a(b[0],b[1],b[2],b[3],b[4]);
-    if(b.length == 6) return a(b[0],b[1],b[2],b[3],b[4],b[5]);
-    if(b.length == 7) return a(b[0],b[1],b[2],b[3],b[4],b[5],b[6]);
-    if(b.length == 8) return a(b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7]);
-    if(b.length == 9) return a(b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],b[8]);
-
-	throw "seqexp_valueWithArgs";
-    // Handle the general case reflectively
-    var mirrors = currentMirrorSystem();
-    var args = b.map( (x){ return mirrors.mirrorOf(x); } );
-    return mirrors.mirrorOf(a).apply(args).value.reflectee;
-  }
-  return a.valueWithArguments__(b);
-}'.
-
 	} collect: [:ea | dart verbatim: ea].
 )
 topClass ^<Node> = (
@@ -3704,11 +3289,8 @@ topNoSuchMethod ^<Node> = (
 				on: (dart ident: names Message)
 				invoke: (dart ident: (names mangleSelector: 'selector:arguments:'))
 				with: {
-					dart on: (dart ident: names String) invoke: (dart ident: 'wrapping__') with: {
-						(dart on: (dart memberOf: (dart ident: 'Mirrors') at: 'MirrorSystem') invoke: (dart ident: 'getName') with: {
-						dart memberOf: (dart ident: 'invocation') at: 'memberName' })}.
-					dart on: (dart ident: names Array) invoke: (dart ident: 'wrapping__') with: {
-						dart memberOf: (dart ident: 'invocation') at: 'positionalArguments'} 
+					dart memberOf: (dart ident: 'invocation') at: 'memberName'.
+					dart memberOf: (dart ident: 'invocation') at: 'positionalArguments'
 				}
 			})
 		
@@ -3719,13 +3301,10 @@ topToString ^<Node> = (
 	method: 'toString'
 	params: {}
 	body: (dart block: {
-		dart return: (dart 
-			on: (dart 
+		dart return:  (dart 
 				on: (dart ident: 'this')
-				invoke: (dart ident: (names mangleSelector: 'printString'))
-				with: {})
-			invoke: (dart ident: (names mangleSelector: 'dartString'))
-			with: {})}).
+				invoke: (dart ident: (names mangleInterceptedSelector: 'printString'))
+				with: {dart ident: 'this'})}).
 )) : ()
 class MethodMirror named: s <Symbol> = LowLevelMirror (
 (* A descriptor for a Dart method. *)| 
@@ -3766,6 +3345,10 @@ REFACTORING = (
 MutableString = (
 	#FLAG.
 	^String
+)
+in: collection anySatisfy: predicate = (
+	collection do: [:ea | (predicate value: ea) ifTrue: [^true]].
+	^false
 )'make lexically visible'
 Scope = (
 	^super Scope

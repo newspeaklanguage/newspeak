@@ -52,6 +52,9 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. *)|
 	TextColor = platform blackMarket Collections TextColor.
 	TextEmphasis = platform blackMarket Collections TextEmphasis.
 	UnhandledError = platform blackMarket Exceptions UnhandledError.
+	
+	Semaphore = platform blackMarket Semaphore.
+	blackMarket = platform blackMarket yourself.
 
 	errorReportBlock ::= [:activation | defaultErrorReportFor: activation].
 	methodSourceRatio = 1.6.
@@ -464,22 +467,49 @@ activationMirror = (
 createPresenter = (
 	^ActivationStatePresenter onSubject: self
 )
-evaluate: expression ifCompilerError: onCompilerError <[:String]> ifError: onError <[:NewspeakDebugging ThreadSubject :Exception]> ^<ObjectMirror> = (
-	| result compilerError |
-	compilerError:: {nil}.
-	result:: registry
-		do: [activationMirror
-			evaluate: expression
-			withBlackMarket: ide inspection blackMarket yourself
-			ifFail: [:msg | compilerError at: 1 put: msg]]
-		name: 'Evaluating ', expression
-		ifError:
-			[:exception :process |
-			onError value: (registry subjectFor: exception in: process) value: exception].
-	compilerError first ifNotNil:
-		[:message |
-		^onCompilerError valueWithPossibleArgument: message].
-	^result
+evaluate: expression <String>
+ifCompilerError: onCompilerError <[:String]> 
+ifError: onError <[:NewspeakDebugging ThreadSubject :Exception]> ^<ObjectMirror> = (
+	| compilerError failed sem result process |
+	failed:: false.
+	sem:: Semaphore new.
+	process::
+		[
+			[result:: activationMirror
+				evaluate: expression
+				withBlackMarket: blackMarket
+				ifCompilerError: [:ex <Exception> |
+					compilerError:: ex.
+					sem signal.
+					process suspend]
+				ifError: [:ex <Exception> | 
+					failed:: true.
+					result:: ex.
+					sem signal.
+					process suspend].
+			sem signal]
+				on: UnhandledError
+				do:	[:ex | 
+					failed ifTrue: [ex pass]. (* don't fire twice *)
+					failed:: true.
+					result:: ex exception.
+					sem signal.
+					process suspend].
+		] newProcess.
+	process
+		name: 'Evaluating ', expression asString;
+		resume.
+	sem wait.
+	process offList.
+	compilerError ifNotNil:
+		[^onCompilerError value: compilerError description].
+	failed ifFalse:
+		[^result].
+	(* position the process to continue in the signalerContext *)
+	process suspendedContext unwindTo: result signalerContext.
+	result signalerContext push: result.
+	process suspendedContext: result signalerContext.
+	^onError value: (registry subjectFor: result in: process) value: result
 )
 localNamesWithValuesCollect: action <[:Integer :ObjectMirror | T]> ^<SequenceableCollection[T]>= (
 	^Array streamContents:
@@ -661,7 +691,11 @@ returnNil = (
 	return: activationMirror nilMirror
 )
 returnWith: expression ifFail: onFail = (
-	return:: activationMirror evaluate: expression ifFail: [:msg | ^onFail value: msg]
+	return:: activationMirror
+		evaluate: expression
+		withBlackMarket: blackMarket
+		ifCompilerError: [:e | ^onFail value: e description]
+		ifError: [:e | ^onFail value: e description]
 )
 selector = (
 	^model selector
@@ -818,10 +852,11 @@ mirrorOnValue = (
 	^model localVariableValueMirror: name
 )
 setValue: expression <String> ifFail: block = (
-| newValue |
-     newValue:: model evaluate: expression 
-		withBlackMarket: ide inspection blackMarket yourself 
-		ifFail: block.
+	| newValue <ObjectMirror> |
+	newValue:: model evaluate: expression 
+		withBlackMarket: blackMarket yourself 
+		ifCompilerError: block
+		ifError: block.
 	model setLocalVariable: name toValue: newValue reflectee ifFail: block
 )
 valueStringLimitedTo: numberOfCharacters <Integer> = (

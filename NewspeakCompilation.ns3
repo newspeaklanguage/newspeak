@@ -29,11 +29,30 @@ isClassDeclaration ^<Boolean> = (
 )) : ()
 class Compiler = (| protected scopeMap <Dictionary[AST, Scope]> ::= Dictionary new. |)
 (
-class RewriterWIP = ASTTool (|
+class RewriterWIP = ASTTool (
+(* This class is intended to become a common rewriter for the Squeak, Dart and JavaScript compilers. It should handle
+
+*self/super/outer/implicitReceiver/ordinary send or local read/write.
+*local/non-local return.
+*implicit return self
+*slot initializers
+*simultaneous slots rewrite.
+*setter temp.
+*tuples? 
+*inlined messages?
+
+The common rewriter should be sufficient for Dart and JavaScript. Squeak will require a second rewrite phase for closure analysis, which should be simpler than the current implementation because determining which locals need to be indirected or copied down will be easier when the tree already has distinguished sends that are reads/writes to locals.
+*)|
 	scopeStack <OrderedCollection[Scope]> = OrderedCollection new.
 	valueExpected <Boolean> ::= true.
+	inClosure <Boolean> ::= false.
 |)
 (
+class BlockLocalReturnAST = ReturnAST ()
+('as yet unclassified'
+apply: visitor = (
+	^visitor blockLocalReturn: self
+)) : ()
 class ConditionalAST = AST (|
 	condition <ExpressionAST>
 	then <CodeBodyAST>
@@ -82,6 +101,18 @@ isExpressionNode ^<Boolean> = (
 apply: aTool <ASTTool> = (
 	^aTool loopNode: self
 )) : ()
+class MethodLocalReturnAST = ReturnAST ()
+('as yet unclassified'
+apply: visitor = (
+	^visitor methodLocalReturn: self
+)) : ()
+class NonLocalReturnAST = ()
+('as yet unclassified'
+apply: visitor = (
+	^visitor blockLocalReturn: self
+)) : ()
+class OrdinarySendAST = AST (||)
+() : ()
 class OuterSendAST = SendAST (|
 depth <Integer>
 |)
@@ -92,10 +123,31 @@ apply: aTool <ASTTool> = (
 class ParameterDeclarationAST = (|
 |)
 () : ()
+class ReceiverAST = AST ()
+('as yet unclassified'
+apply: tool = (
+	^tool receiverNode: self
+)
+isExpressionNode = (
+	^true
+)) : ()
+class ReturnAST = (|
+expression <AST>
+|)
+('as yet unclassified'
+isExpressionNode = (
+	^false
+)) : ()
 class SelfSendAST = SendAST ()
 ('visiting'
 apply: aTool <ASTTool> = (
 	^aTool selfSendNode: self
+)) : ()
+class SendAST = AST (|
+|)
+('as yet unclassified'
+isExpressionNode = (
+	^true
 )) : ()
 class SuperSendAST = SendAST ()
 ('visiting'
@@ -104,6 +156,81 @@ apply: aTool <ASTTool> = (
 )) : ()
 class TemporaryDeclarationAST = ()
 () : ()'as yet unclassified'
+applyForEffectTo: node <Node> = (
+	| original result |
+	original:: valueExpected.
+	valueExpected:: false.
+	result:: node apply: self.
+	valueExpected:: original.
+	^result
+)
+applyForValueTo: node <Node> = (
+	| original result |
+	original:: valueExpected.
+	valueExpected:: true.
+	result:: node apply: self.
+	valueExpected:: original.
+	^result
+)
+codeBodyNode: node <CodeBodyAST> = (
+	(* Move slot initializers to statements. Simultaneous slots. *)
+	
+	| parameters temporaries statements |
+	pushScopeForNode: node.
+	
+	temporaries:: node temporaries collect: 
+		[:t <VarDeclAST> |
+		(TemporaryDeclarationAST name: t name type: t type) 
+			start: t start; end: t end].
+	temporaries do: 
+		[:t <TemporaryDeclarationAST> | 
+		(bodyScope at: t name) ast: t].
+	
+	statements:: OrderedCollection new.
+	node temporaries with: temporaries do: 
+		[:varDecl <VarDeclAST> :temp <TemporaryDeclarationAST> |
+		varDecl initializer ifNotNil: [:it <ExpressionAST> |
+			statements add: (AssignmentAST new
+				variable: temp
+				value: (self applyForValueTo: it))]].
+	
+	statements:: OrderedCollection new.
+	node statements keysAndValuesDo:
+		[:index :statement | 
+		| rewritten |
+		rewritten:: (index = node statements size and: [valueExpected])
+			ifTrue: [applyForValueTo: statement]
+			ifFalse: [applyForEffectTo: statement].
+	].
+
+	popScope.
+	^CodeBodyAST new
+		parameters: p
+		temporaries: t
+		statements: s
+)
+isHereNode: node <AST> ^<Boolean> = (
+	node isVariableNode ifFalse: [^false].
+	^node name = #'@here'
+)
+messagePatternNode: node <MessagePatternAST> = (
+	#BOGUS.
+	^node
+)
+methodNode: node <MethodAST> = (
+	(* Need setter temp? Implicit ^self? *)
+	| pattern body accessModifier |
+	pattern:: node pattern apply: self.
+	body:: node body apply: self.
+	(body statements isEmpty or: [body statements last isReturnStatNode not]) 
+		ifTrue:	[body statements add:
+					(MethodLocalReturnAST new expression: ReceiverAST new)].
+	assert: [inClosure not] message: ''.
+	^MethodAST new
+		pattern: pattern
+		body: body
+		accessModifier: node visibility
+)
 normalSendNode: node <NormalSendAST> ^<AST> = (
 	
 	(isHereNode: node recv)
@@ -120,8 +247,15 @@ normalSendNode: node <NormalSendAST> ^<AST> = (
 		to: (node recv apply: self) send: (node msg apply: self);
 		start: node start; end: node end
 )
+numberNode: node <NumberAST> = (
+	^node
+)
 processHereSend: msg <MessageAST> = (
 	(* implicit outer, local variable, debug mapped variable, true/false/nil *)
+)
+returnStatNode: node <ReturnStatAST> = (
+	^(inClosure ifTrue: [NonLocalReturnAST] ifFalse: [MethodLocalReturnAST])
+		new expression: (applyForValueTo: node expr)
 )'scopes'
 currentScope ^<Scope> = (
 	^scopeStack last
@@ -422,6 +556,10 @@ new ^<Instance> = (
 ))'as yet unclassified'
 setterSelectorFor: slot <SlotDefAST | InstanceVariableMirror> ^<Symbol> = (
 	subclassResponsibility
+)
+test: tree <MethodAST> = (
+ 	tree apply: (ScopeBuilder nestedIn: Scope new atLevel: 0).
+	^tree apply: RewriterWIP new
 )) : ()
 class MethodEntry forDeclaration: decl atDepth: d = SymbolTableEntry forAST: decl atDepth: d (|
 |)
@@ -501,6 +639,9 @@ class SlotEntry forDeclaration: decl <VarDeclAST> atDepth: d <Integer> = SymbolT
 offset <Integer>
 remote <Boolean> ::= false.
 remoteVector <SlotEntry>
+
+written <Boolean> ::= false.
+readBeforeWritten <Boolean> ::= false.
 |)
 ('as yet unclassified'
 isTemporaryAST ^<Boolean> = (

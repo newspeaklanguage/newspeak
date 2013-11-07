@@ -87,7 +87,10 @@ class ConditionalAST if: cond is: ifTrue_ then: t else: e = AST (|
 	then <CodeBodyAST> = t.
 	else <CodeBodyAST> = e.
 	forValue <Boolean>
-|)
+|assert: [then isCodeBodyNode] message: ''.
+	assert: [else isCodeBodyNode] message: ''.
+	assert: [then parameters size = 0] message: ''.
+	assert: [else parameters size = 0] message: '')
 ('as yet unclassified'
 cond = (
 	^condition
@@ -106,8 +109,14 @@ emptyBlock = (
 	scopeMap at: block body put: nil.
 	^block
 )
+emptyBody = (
+	| body |
+	body:: CodeBodyAST new parameters: {}; temporaries: {}; statements: {NilAST new}.
+	scopeMap at: body put: nil.
+	^body
+)
 if: cond <ExpressionAST> is: val <Boolean> then: t <BlockAST> ^<Instance> = (
-	^self if: cond is: val then: t else: emptyBlock
+	^self if: cond is: val then: t else: emptyBody
 ))
 class EnclosingObjectAST = AST (
 (* See mailing list for debate over 'outer Foo' as an expression. *)| depth <Integer> |)
@@ -142,6 +151,9 @@ class LocalWriteAST to: var assign: val = AST (|
 ('as yet unclassified'
 apply: visitor = (
 	^visitor localWriteNode: self
+)
+name = (
+	^variable ast name
 )) : ()
 class LoopAST = AST (
 (* This node represents a while loop. The general form of the loop is:
@@ -259,25 +271,25 @@ from: first <AST> to: last <AST> by: step <AST> do: block <BlockAST> = (
 from: first <AST> to: last <AST> do: block <BlockAST> = (
 	from: first to: last by: (NumberAST new val: 1) do: block
 )
-repeat: block <BlockAST> = (
-    assert: [block isBlockNode].
-    condition:: block body.
+repeat: b = (
+    assert: [b isCodeBodyNode].
+    condition:: b.
     condition statements add: ((BooleanAST withValue: true) start: condition end; end: condition end).
     isWhileTrue:: true.
     body:: nil
 )
 while: v <Boolean> do: b <BlockAST> = (
-    assert: [b isBlockNode].
-    condition:: b body.
+    assert: [b isCodeBodyNode].
+    condition:: b.
     isWhileTrue:: v.
     body:: nil
 )
-while: b1 <BlockAST>  is: v <Boolean> do: b2 <BlockAST> = (
-    assert: [b1 isBlockNode].
-    assert: [b2 isBlockNode].
-    condition:: b1 body.
+while: b1  is: v <Boolean> do: b2 = (
+    assert: [b1 isCodeBodyNode].
+    assert: [b2 isCodeBodyNode].
+    condition:: b1.
     isWhileTrue:: v.
-    body:: b2 body
+    body:: b2.
 )'testing'
 isExpressionNode ^<Boolean> = (
 	^forValue
@@ -412,7 +424,7 @@ applyForValueTo: node <Node> = (
 blockNode: node <BlockAST> = (
 	| rewrittenBlock <BlockAST> last <AST> |
 	inClosureDuring:
-		[rewrittenBlock:: rewriteInlinedBlockNode: node forValue: true.
+		[rewrittenBlock:: rewriteBlockNode: node forValue: true.
 		last:: rewrittenBlock body statements last.
 		(last isReturnStatNode or: [last isBlockLocalReturnAST]) ifFalse:
 			[(* The last expression in a block is returned by it. *)
@@ -434,20 +446,20 @@ codeBodyNode: node <CodeBodyAST> = (
 	bodyScope:: pushScopeForNode: node.
 	
 	temporaries:: node temporaries collect: 
-		[:t <VarDeclAST> |
-		(TemporaryAST name: t name type: t type) 
-			start: t start; end: t end].
+		[:varDecl <VarDeclAST> |
+		(TemporaryAST name: varDecl name type: varDecl type) 
+			start: varDecl start; end: varDecl end].
 	temporaries do: 
 		[:t <TemporaryAST> | 
 		(bodyScope at: t name) ast: t].
 	
 	statements:: OrderedCollection new.
 	#TODO. (* siml slots rewrite *)
-	node temporaries with: temporaries do: 
-		[:varDecl <VarDeclAST> :temp <TemporaryAST> |
+	node temporaries do: 
+		[:varDecl <VarDeclAST> |
 		varDecl initializer ifNotNil: [:it <ExpressionAST> |
-			statements add: (AssignmentAST
-				to: temp
+			statements add: (LocalWriteAST
+				to: (bodyScope at: varDecl name)
 				assign: (self applyForValueTo: it))]].
 	node statements keysAndValuesDo:
 		[:index :statement | 
@@ -542,6 +554,7 @@ methodNode: node <MethodAST> = (
 	(body statements isEmpty or: [body statements last isReturnStatNode not]) 
 		ifTrue:	[body statements add:
 					(MethodLocalReturnAST expression: ReceiverAST new)].
+	body parameters: pattern parameters.
 	assert: [inClosure not] message: ''.
 	result:: MethodAST new
 		pattern: pattern
@@ -686,17 +699,11 @@ processLocalRead: message <MessageAST> from: declaration <SlotEntry> = (
 		start: message start;
 		end: message end
 )
-processLocalWrite: message <MessageAST> to: declaration <VarDeclAST> = (
-	| var <VariableAST> varName <String> |
+processLocalWrite: message <MessageAST> to: declaration = (
 	assert: [message args size = 1] message: ''.
-	varName:: (message selector asString copyWithSize: (message selector size -1)) asSymbol.
-	assert: [(currentScope at: varName) isTemporaryAST] message: ''.
-	
-	var:: (TemporaryAST name: varName)
-		start: message start; end: message end.
-
-	^(AssignmentAST
-		to: var assign: (applyForValueTo: message args first))
+	assert: [declaration isTemporaryAST] message: ''.
+	^(LocalWriteAST
+		to: declaration assign: (applyForValueTo: message args first))
 		start: message start;
 		end: message end    
 )
@@ -707,7 +714,7 @@ processOuterSend: node <NormalSendAST> = (
 		at: node msg sel
 		ifAbsent: [Error signal: 'No outer class named ', node msg sel].
 	(* assert:[binding data  isClassDeclarationAST]. *)
-	depth: currentDepth - binding depth -1.
+	depth: outer Compiler currentDepth - binding depth -1.
 	
 	^EnclosingObjectAST new
 		depth: depth;
@@ -722,7 +729,7 @@ returnStatNode: node <ReturnStatAST> = (
 	^(inClosure ifTrue: [NonlocalReturnAST] ifFalse: [MethodLocalReturnAST])
 		expression: (applyForValueTo: node expr)
 )
-rewriteInlinedBlockNode: node <BlockAST> forValue: forValue <Boolean> ^ <BlockAST> = (
+rewriteBlockNode: node <BlockAST> forValue: forValue <Boolean> ^ <BlockAST> = (
 (* An empty block evaluates to nil when called. This method performs the necessary transformation if the block is empty; otherwise it recursively rewrites the block body. This rewrite is done on all blocks, regardless of whether they are inlined. *)
 	| 
 	rewrittenNode <BlockAST> 
@@ -746,6 +753,10 @@ rewriteInlinedBlockNode: node <BlockAST> forValue: forValue <Boolean> ^ <BlockAS
 		[rewrittenNode body statements add: (NilAST new start: node body start; end: node body end)].
 	scopeMap at: rewrittenNode put: (scopeMap at: node).
 	^rewrittenNode
+)
+rewriteInlinedBlockNode: node <BlockAST> forValue: forValue <Boolean> ^ <CodeBodyAST> = (
+(* An empty block evaluates to nil when called. This method performs the necessary transformation if the block is empty; otherwise it recursively rewrites the block body. This rewrite is done on all blocks, regardless of whether they are inlined. *)
+	^(rewriteBlockNode: node forValue: forValue) body
 )
 setterSendNode: node <SetterSendAST> ^<AST> = (
 	|
@@ -787,7 +798,7 @@ symbolNode: node <SymbolAST> = (
 	^node
 )
 tupleNode: node <TupleAST> = (
-	node elements size > 10 ifTrue: [halt].
+	node elements size > 10 ifTrue: [foo].
 	^TupleAST new elements: (node elements collect: [:e | applyForValueTo: e])
 )
 variableNode: aNode <VariableAST> = (
@@ -967,7 +978,7 @@ codeBodyNode: aNode <CodeBodyAST> = (
 		|svd|
 		svd:: SlotEntry forDeclaration: t slotDecl atDepth: currentDepth.
 		ts at: t name put: svd. (* getter *)
-		ts at: (setterSelectorFor: t) put: t slotDecl. (* setter *)
+		ts at: (setterSelectorFor: t) put: svd. (* setter *)
 		ts at: ('setOnce`',t name) asSymbol put: svd. (* trick so lookups of the initializer for immutables will find the right slot *)].
 
 	nestScope: ts.

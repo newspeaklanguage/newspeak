@@ -448,16 +448,21 @@ charNode: node <CharAST> = (
 codeBodyNode: node <CodeBodyAST> = (
 	(* Move slot initializers to statements. Simultaneous slots. *)
 	
-	| bodyScope temporaries statements result |
+	| bodyScope temporaries setterEntry statements result |
 	bodyScope:: pushScopeForNode: node.
 	
-	temporaries:: node temporaries collect: 
-		[:varDecl <VarDeclAST> |
-		(TemporaryAST name: varDecl name type: varDecl type) 
-			start: varDecl start; end: varDecl end].
-	temporaries do: 
-		[:t <TemporaryAST> | 
-		(bodyScope at: t name) ast: t].
+	temporaries:: OrderedCollection new.
+	node temporaries do: 
+		[:varDecl <VarDeclAST> | | t |
+		t:: (TemporaryAST name: varDecl name type: varDecl type) 
+			start: varDecl start; end: varDecl end.
+		(bodyScope at: t name) ast: t.
+		temporaries add: t].
+
+	setterEntry:: SlotEntry	forDeclaration: (TemporaryAST name: namer setterTemp type: nil) atDepth: nil.
+	bodyScope at: namer setterTemp put: setterEntry.
+	bodyScope at: (namer setterTemp, ':') asSymbol put: setterEntry.
+	temporaries add: setterEntry ast.
 	
 	statements:: OrderedCollection new.
 	assert: [node isSeq ~= false] message: 'Simulatenous slots as-yet-unimplemented'.
@@ -474,6 +479,11 @@ codeBodyNode: node <CodeBodyAST> = (
 			ifTrue: [applyForValueTo: statement]
 			ifFalse: [applyForEffectTo: statement].
 		statements add: rewritten].
+	
+	setterEntry used ifFalse: 
+		[bodyScope at: namer setterTemp put: nil.
+		bodyScope at: (namer setterTemp, ':') asSymbol put: nil.
+		temporaries remove: setterEntry ast].
 
 	popScope.
 	result:: CodeBodyAST new
@@ -777,11 +787,13 @@ rewriteInlinedBlockNode: node <BlockAST> forValue: forValue <Boolean> ^ <CodeBod
 setterSendNode: node <SetterSendAST> ^<AST> = (
 	|
 	setterBinding <AST>
-	sTemp <TemporaryVariableAST> 
-	sTempAssign <AssignmentAST> 
+	setterTempEntry
+	setterTempRead
+	setterTempWrite
 	message <MessageAST> 
-	send <NormalSendAST>  
-	cb <CodeBodyAST>  
+	send <NormalSendAST>
+	depth
+	body <CodeBodyAST>  
 	|
 	setterBinding:: currentScope at: node msg sel ifAbsent: [MessageAST new].
 	setterBinding isVarDeclNode
@@ -794,18 +806,32 @@ setterSendNode: node <SetterSendAST> ^<AST> = (
 		t:=exp. setter: t. t
 	This is much less wasteful than creating a block etc. per the spec. *)
 
-	sTemp:: (TemporaryAST name: namer setterTemp) start: 0; end: 0.
-	sTempAssign:: AssignmentAST to: sTemp assign: (node msg args first apply: self).  
+	setterTempEntry:: currentScope at: namer setterTemp.
+	setterTempEntry used: true.
+	
 	(* t := exp *)
-	message:: MessageAST new sel: node msg sel; args: {sTemp}.
-	send:: (NormalSendAST new to: node recv send: message) apply: self.
+	setterTempWrite:: LocalWriteAST
+		to: setterTempEntry
+		assign: (node msg args first apply: self). 
+
 	(* setter: t *)
-	cb:: (CodeBodyAST new 
-			parameters: OrderedCollection new;
-			temporaries: {};
-			statements: {sTempAssign. send. sTemp}).(* t:=exp. setter: t. t *)
-	scopeMap at: cb put: currentScope.
-	^cb
+	setterTempRead:: LocalReadAST of: setterTempEntry. 
+	message:: MessageAST new sel: node msg sel; args: {setterTempRead}.
+	assert: [isHereNode: node recv] message: 'Setter send receiver should be implicit'.
+	depth:: setterBinding isMessageNode
+		ifTrue: [0]
+		ifFalse: [depth: outer Compiler currentDepth - setterBinding depth -1].
+	send:: ImplicitReceiverSendAST new
+		depth: depth;
+		message: message. (* Do not rewrite message twice *)
+
+	(* t:=exp. setter: t. t *)
+	body:: CodeBodyAST new 
+		parameters: OrderedCollection new;
+		temporaries: {};
+		statements: {setterTempWrite. send. setterTempRead}.
+	scopeMap at: body put: currentScope.
+	^body
 )
 stringNode: node <StringAST> = (
 	^node

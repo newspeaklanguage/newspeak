@@ -39,6 +39,9 @@ enclosingClass <ClassEntry> (* Currently unused. The intention is to fill this i
 ('as yet unclassified'
 isClassDeclaration ^<Boolean> = (
 	^true
+)
+name = (
+	^ast selector
 )) : ()
 class Compiler = (| protected scopeMap <Dictionary[AST, Scope]> ::= Dictionary new. |)
 (
@@ -519,6 +522,14 @@ emptyBody = (
 	scopeMap at: body put: nil.
 	^body
 )
+enclosingClassNamed: name <Symbol> ^<ClassEntry> = (
+	| entry <ClassEntry> |
+	entry:: currentScope at: #'@currentClass'.
+	[entry isNil] whileFalse:
+		[entry name = name ifTrue: [^entry].
+		entry:: entry enclosingClass].
+	Error signal: 'No enclosing class named "', name, '"'
+)
 futureFor: expression <ExpressionAST> ^<ExpressionAST> = (
 	(* @here Future computing: [expression] *)
 	| 
@@ -776,10 +787,7 @@ processLocalWrite: message <MessageAST> to: declaration = (
 processOuterSend: node <NormalSendAST> = (
 	| binding <AST> depth <integer> |
 	assert: [node msg args isEmpty] message: ''. (* this had better be a unary message *)
-	binding:: currentScope 
-		at: node msg sel
-		ifAbsent: [Error signal: 'No outer class named ', node msg sel].
-	(* assert:[binding data  isClassDeclarationAST]. *)
+	binding:: enclosingClassNamed: node msg sel.
 	depth: outer Compiler currentDepth - binding depth -1.
 	
 	^EnclosingObjectAST new
@@ -942,7 +950,7 @@ buildScopeFor: cd <ClassDeclarationMirror> ^<Scope> = (
 	^prvtScopeFor: cd.
 )
 enclosingMixinsOf: m <ClassDeclarationMirror> ^<Collection[ClassDeclarationMirror]> = (
-	(* top to bottom *)
+	(* Outermost first. *)
 	| current mixins |
 	mixins:: OrderedCollection new.
 	current:: m.
@@ -952,50 +960,29 @@ enclosingMixinsOf: m <ClassDeclarationMirror> ^<Collection[ClassDeclarationMirro
 	^mixins
 )
 prvtScopeFor: c <ClassDeclarationMirror> ^<Scope> = (
-	(* When incrementally compiling a nested class, we need to reconstruct its scope. *)
+	(* When incrementally compiling a nested class, we need to reconstruct its scope. Note this only constructs enough of a scope to resolve outer classes. If NS2Squeak used the depth information when compiling implicit receiver sends, we would have to build the full scope. *)
 	| 
-	scope <Scope> 
+	scope <Scope>
+	currentClass <ClassEntry>
 	outerMixins <Collection[ClassDeclarationMirror]>
 	depth <Integer>
 	|
 
 	outerMixins:: enclosingMixinsOf: c. (* Should use a cleaner API *)
-	currentDepth:: outerMixins size - 1.
 	depth:: 0.
-	
+
 	outerMixins do:
 		[:o <ClassDeclarationMirror> |
 		scope:: Scope new superScope: scope.
-	
-		depth = 0 ifTrue: [
-			(* Top level to pretend it has an accessor at a level enclosing it. *)
-			scope
-			at: o simpleName asSymbol
-			put: (SymbolTableEntry
-				forMessage: o simpleName asSymbol
-				atDepth: depth-1)].
-	
-		(selectorsFor: o) do: 
-			[:sel |
-			scope
-			at: sel 
-			put: (SymbolTableEntry forMessage: sel atDepth: depth)].
-		
+		currentClass:: (ClassEntry
+			forDeclaration: (MessagePatternAST new selector: o simpleName)
+			atDepth: depth) 
+				enclosingClass: currentClass.
+		scope at: currentClass name put: currentClass.
+		scope at: #'@currentClass' put: currentClass.
 		depth:: depth + 1].
 	
 	^scope
-)
-selectorsFor: m <ClassDeclarationMirror> ^ <Collection[Symbol]> = (
-	(* Should add a convenience method to mirrors to do this *)
-	| result <Collection[Symbol]> |
-	result:: OrderedCollection new.
-	result addAll: (m instanceSide methods collect: [:s <MethodMirror> | s name]).
-	result addAll: (m instanceSide slots collect: [:s <SlotMirror> | s name]).
-	result addAll: ((m instanceSide slots select: [:s | s isMutable]) 
-	                         collect: [:s <SlotMirror> | s name, ':']).
-	result addAll: (m instanceSide nestedClasses
-		collect: [:s <ClassDeclarationMirror> | s simpleName]).
-	^result
 )'node traversal'
 blockNode: aNode <BlockAST> = (
 	| parameterScope <Scope> |
@@ -1033,12 +1020,14 @@ classHeaderNode: aNode = (
 	aNode initExprs do: [:e | e apply: self].
 )
 classNode: aNode <ClassDeclarationAST> = (
-
-	| vs <Scope> |
+	| thisClass <ClassEntry> vs <Scope> |
 	
-	currentScope
-		at: aNode name 
-		put: (ClassEntry forDeclaration: (MessagePatternAST new selector: aNode name) atDepth: currentDepth).
+	thisClass:: ClassEntry
+		forDeclaration: (MessagePatternAST new selector: aNode name)
+		atDepth: currentDepth.
+	thisClass enclosingClass: (currentScope at: #'@currentClass' ifAbsent: [nil]).
+	
+	currentScope at: aNode name put: thisClass.
 		
 	vs:: Scope new. (* establish instance side scope *)
 	currentDepth:: currentDepth + 1.
@@ -1048,9 +1037,11 @@ classNode: aNode <ClassDeclarationAST> = (
 		vs at: (namer setterSelectorFor: v) put: se. (* setter *)].
 		
 	self nestScope: vs.
+		currentScope at: #'@currentClass' put: thisClass.
   		aNode instanceSide apply: self.
 	popScope.
 	self nestScope: Scope new. (* establish class side scope *)
+		currentScope at: #'@currentClass' put: thisClass.
   		aNode classSide apply: self.
 	popScope.
 	currentDepth:: currentDepth - 1.

@@ -1932,49 +1932,42 @@ variableWrite: var = (
 )) : ()
 class IndirectionAnalyzer for: node <CodeBodyAST> = ASTTraverser (|
 	depth ::= 0.	
-	shadowing = Dictionary new.
-	needsIndirection ::= Set new.
+	candidates = Set new.
+	needsIndirection = Set new.
 	hasNestedRead = Set new.
 
-	|node apply: self.
-	needsIndirection:: needsIndirection 
-		select: [:ea | in: node temporaries anySatisfy: [:t | ea = t name]].
-	needsIndirection remove: namer setterTemp ifAbsent: [])
+	|node apply: self)
 ('as yet unclassified'
 codeBodyNode: node <CodeBodyNode> = (
 	depth:: depth + 1.
 	
-	depth > 1 ifTrue:
-		[node parameters do: [:each | self shadow: each name].
-		node temporaries do: [:each | self shadow: each name]].
+	depth = 1 ifTrue:
+		[ | scope = scopeMap at: node. |
+		scope isNil ifFalse: [
+		(* Parameters are immutable, so they never need indirection. *)
+		node temporaries do: [:temp | candidates add: (scope at: temp name)]]].
 	
 	node statements
 		do: [:each | each apply: self].
 	
 	depth:: depth - 1.
 )
-isShadowed: var <Symbol> ^<Boolean> = (
-	^(shadowing at: var ifAbsent: [^false]) <= depth
-)
 localReadNode: node <LocalReadAST> = (
-	self variableRead: node name
+	self variableRead: node variable
 )
 localWriteNode: node <LocalWriteAST> = (
 	node value apply: self. (* This happens first! *)
-	self variableWrite: node name
+	self variableWrite: node variable
 )
-shadow: var <Symbol> = (
-	(* ('shadowing ' , var , ' at ', depth printString ) out. *)
-	shadowing at: var ifPresent: [:e|] ifAbsentPut: [depth]
-)
-variableRead: var <Symbol> = (
-	(isShadowed: var) ifTrue: [(* ('skipping shadowed read ', var) out. *) ^nil].
+variableRead: var <SlotEntry> = (
+	(candidates includes: var) ifFalse: [^self].
+	
 	depth > 1 ifTrue: [hasNestedRead add: var].
 )
-variableWrite: var <Symbol> = (
-	(isShadowed: var) ifTrue: [(* ('skipping shadowed write ', var) out. *) ^nil].
+variableWrite: var <SlotEntry> = (
+	(candidates includes: var) ifFalse: [^self].
 	
-	(* one being the code body that declaring the variable we're considering *)
+	(* Depth 1 being the code body that declaring the variables we're considering. *)
 	depth > 1 ifTrue: [ 
 		(* this is a nested write, must indirect *)
 		needsIndirection add: var.
@@ -2065,7 +2058,7 @@ codeBodyNode: node <CodeBodyAST> ^ <CodeBodyAST> = (
 	temps <OrderedCollection[TemporaryAST]> 
 	result <CodeBodyAST>
 	itv <TemporaryAST>
-	entry
+	itvEntry <SlotEntry>
 	i <Integer>
 	finder <NeedsIndirectionFinder>
 	|
@@ -2081,25 +2074,25 @@ codeBodyNode: node <CodeBodyAST> ^ <CodeBodyAST> = (
 		itv:: rewriter TemporaryAST
 			name: ('@indirectionVector',scopeStack size printString) asSymbol
 			type: nil.
-		entry:: SlotEntry forDeclaration: itv atDepth: currentDepth.
+		itvEntry:: SlotEntry forDeclaration: itv atDepth: currentDepth.
 		bodyScope
-			at: itv name put: entry; (* getter *)
-			at: (itv name,':') asSymbol put: entry. (* setter *)
+			at: itv name put: itvEntry; (* getter *)
+			at: (itv name,':') asSymbol put: itvEntry. (* setter *)
 		temps addLast: itv. (* N.B. addLAST, copied values must be at beginning *)
 		
 		(* initialize itv in the very first statement *)
 		statements add: (rewriter LocalWriteAST
-			to: entry
+			to: itvEntry
 			assign: (ArrayAST new size: finder needsIndirection size)).
 	].
 
 	i::0.
-	finder needsIndirection do: [:varname <Symbol> |
-		assert: [(bodyScope at: varname) remote not].
-		(bodyScope at: varname)
-					remote: true;
-					remoteVector: entry;
-					offset: i.
+	finder needsIndirection do: [:tempEntry <SlotEntry> |
+		assert: [tempEntry remote not].
+		tempEntry
+			remote: true;
+			remoteVector: itvEntry;
+			offset: i.
 		i:: i+1.
 	].
 
@@ -2121,8 +2114,8 @@ conditionalNode: node <ConditionalAST> = (
 	^(rewriter ConditionalAST
 		if: (node condition apply: self)
 		is: node ifTrue
-		then: (node then apply: self)
-		else: (node else apply: self))
+		then: (inlinedCodeBodyNode: node then)
+		else: (inlinedCodeBodyNode: node else))
 		copyPositionFrom: node
 )
 contextNode: node <ContextAST> = (
@@ -2137,6 +2130,24 @@ implicitReceiverSendNode: node <ImplicitReceiverSendAST> = (
 		message: (node message apply: self))
 		copyPositionFrom: node
 )
+inlinedCodeBodyNode: node <CodeBodyAST> ^ <CodeBodyAST> = (
+	| 
+	bodyScope <Scope>
+	result <CodeBodyAST>
+	|
+	pushScopeForNode: node. 
+	bodyScope:: scopeMap at: node.
+	
+	result:: CodeBodyAST new
+            parameters: node parameters
+            temporaries: node temporaries
+            statements: (node statements collect: [:stat | stat apply: self]);
+		literalMessages: node literalMessages;
+            start: node start; end: node end.
+	popScope.
+	scopeMap at: result put: bodyScope.
+	^result copyPositionFrom: node
+)
 localReadNode: node <LocalReadAST> = (
 	^node
 )
@@ -2147,10 +2158,10 @@ localWriteNode: node <LocalWriteAST> = (
 )
 loopNode: node <LoopAST> = (
 	^rewriter LoopAST new
-		prologue: (node prologue apply: self);
-		condition: (node condition apply: self);
+		prologue: (inlinedCodeBodyNode: node prologue);
+		condition: (inlinedCodeBodyNode: node condition);
 		isWhileTrue: node isWhileTrue;
-		body: (node body apply: self)
+		body: (inlinedCodeBodyNode: node body)
 )
 messageNode: node <MessageAST> = (
 	addLiteral: node sel.

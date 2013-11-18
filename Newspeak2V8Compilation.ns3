@@ -203,7 +203,173 @@ class Compiler = super Compiler (
 	enableIntrinsics ::= true.
 |)
 (
-class Rewriter = ASTTool (
+class Rewriter = super Rewriter (|
+	protected inlinableOperators <Dictionary[String, String]> = Dictionary new.
+	protected inlinableNumericOperators <Dictionary[String, String]> = Dictionary new.
+|inlinableOperators
+		at: #+ put: '+';
+		at: #- put: '-';
+		at: #* put: '*';
+		at: #/ put: '/';
+		at: #'==' put: '==='.
+	inlinableNumericOperators	
+		at: #'<' put: '<';
+		at: #'<=' put: '<=';
+		at: #'>' put: '>';
+		at: #'>=' put: '>=')
+(
+class InlinedOperatorAST = NormalSendAST (
+(* When the inlineOperators mode is on, message sends with certain selectors are replaced with this node. Javascript code generated for those nodes uses native Javascript operators instead of real message sends. The selector of the message of this AST is not a real Newspeak selector but rather the Javascript operator such as &&. *)|
+|)
+('as yet unclassified'
+apply: aTool <ASTTool> ^ <Self> = (
+	^aTool inlinedOperatorNode: self
+)) : ()'as yet unclassified'
+__isInlinableAsExpressionConditional: node <NormalSendAST> ^ <Boolean> = (
+	((conditionalSelectors includes: node msg sel) and: [valueExpected]) ifFalse: [^false].
+	node msg args do:
+		[:each <AST> |
+		((isRemovableBlock: each withArgs: 0)
+			and: [each body statements size = 1
+			and: [each body statements first isReturnStatNode not]])
+				ifFalse: [^false]].
+	^true
+)
+canInlineSeqexps ^<Boolean> = (
+	^false
+)
+currentScope = (
+	^super currentScope
+)
+depthOfExplicit: binding = (
+	| depth |
+	#BOGUS. (* Should be the same as depthOfImplicit: *)
+	depth:: outer Compiler currentDepth - binding depth - 1.
+	assert: [depth >= 0] message: 'Invalid enclosing object index'.
+	^depth
+)
+depthOfImplicit: binding = (
+	| depth |
+	#BOGUS. (* Should be the same as depthOfExplicit: *)
+	depth:: outer Compiler currentDepth - binding depth.
+	assert: [depth >= 0] message: 'Invalid enclosing object index'.
+	^depth
+)
+inline: node as: sendClass selector: selector rewriteArgsAs: argRewriteBlock = (
+	| receiver message |
+	receiver:: applyForValueTo: node recv.
+	message:: MessageAST new
+		send: selector
+		with: (node msg args collect: argRewriteBlock).
+	^sendClass new
+		to: receiver send: message;
+		start: node start;
+		end: node end
+)
+isInlinableBooleanOperator: node <NormalSendAST> = (
+	| selector |
+	selector:: node msg sel.
+	^(selector = 'or:' or: [selector = 'and:'])
+		and: [node msg args size = 1
+		and: [node msg args first isBlockNode
+		and: [node msg args first body statements size = 1]]]
+)
+isInlinableNumericOperator: node <NormalSendAST> = (
+	| args |
+	args:: node msg args.
+	args size = 1 ifFalse: [^false].
+	(inlinableNumericOperators includesKey: node msg sel) ifFalse: [^false].
+	(node recv isLiteralNode and: [node recv val isNumber]) ifTrue: [^true].
+	(args first isLiteralNode and: [args first val isNumber]) ifTrue: [^true].
+	^false
+)
+isInlinableOperator: node <NormalSendAST> = (
+	^(inlinableOperators includesKey: node msg sel)
+		and: [node msg args size = 1]
+)
+normalSendNode: node <NormalSendAST> ^ <AST> = (
+
+	(inlineOperators and: [isInlinableNumericOperator: node]) ifTrue:
+		[^inline: node as: InlinedOperatorAST
+			selector: (inlinableNumericOperators at: node msg sel)
+			rewriteArgsAs: [:each | applyForValueTo: each]].
+	(inlineOperators and: [isInlinableOperator: node]) ifTrue:
+		[^inline: node as: InlinedOperatorAST
+			selector: (inlinableOperators at: node msg sel)
+			rewriteArgsAs: [:each | applyForValueTo: each]].
+	(inlineOperators and: [isInlinableBooleanOperator: node]) ifTrue:
+		[^inline: node as: InlinedOperatorAST
+			selector: (node msg sel = 'and:' ifTrue: ['&&'] ifFalse: ['||']) (* BOGUS *)
+			rewriteArgsAs: [:each <BlockAST> | applyForValueTo: each body statements first]].
+	
+	^super normalSendNode: node
+)
+propertyCallNode: node <PropertyCallAST> ^ <PropertyCallAST> = (
+	| args |
+	assert: [node isMessageNode].
+	args:: OrderedCollection new.
+	node args do: [:each | args add: (applyForValueTo: each)].
+	^PropertyCallAST new
+		send: node sel with: args;
+		start: node start;
+		end: node end
+)
+setterBlockArgName = (
+	^ ('setter_arg') asSymbol
+)
+setterSendNode: node <SetterSendAST> ^ <AST> = (
+(* Rewrite a double-colon setter send. The value of the entire expression should be the value of the argument of the send, NOT the value returned by the setter method. This general case is somewhat inefficient, but in most cases the value of the expression is ignored by the parent so we can use a cheaper regular message send. *)
+	| binding block blockArg blockParam blockScope send rewrittenSetterSend |
+	binding:: currentScope at: node msg sel ifAbsent: [MessageAST new].
+	binding isVarDeclNode ifTrue:
+		(* This is an assignment to a temporary; no special handling is needed
+		as the value of the expression is the value being assigned. *)
+		[^processLocalAccess: node msg of: binding].
+	valueExpected ifFalse:
+		(* The parent ignores the expression value; use a plain cheap here message send. *)
+		[^processImplicitReceiverSend: node].
+
+	(* The value is used by the parent; rewrite the whole thing as
+		setter:: expr  =>  [:a | setter: a. a] value: expr *)
+	(* a -- ok to use a constant name as long as it cannot collide with a user's name *)
+	blockArg:: NormalSendAST new
+		to: implicitReceiverNode
+		send: (MessageAST new send: setterBlockArgName with: {}).
+	blockParam:: ParameterAST name: setterBlockArgName type: nil.
+	(* setter: a *)
+	send:: NormalSendAST new to: node recv send:
+		(MessageAST new sel: node msg sel; args: {blockArg};
+		start: node msg start; end: node msg end; yourself);
+		start: node  start; end: node  end.
+	(* [:a | setter: a. a] *)
+	block:: BlockAST new body:
+		(CodeBodyAST new
+			parameters: {blockParam}
+			temporaries: {}
+			statements: {
+				send.
+				blockArg
+			};			
+			start: node start; end: node end);
+			start: node start; end: node end.
+	blockScope:: Scope new.
+	blockScope
+		superScope: currentScope;
+		at: setterBlockArgName put: (SlotEntry forDeclaration: blockParam atDepth: nil).
+	scopeMap at: block put: blockScope.
+	scopeMap at: block body put: blockScope.
+	(* [:a | setter: a. a] value: expr *)
+	rewrittenSetterSend::
+		NormalSendAST new
+			to: block
+			send: (MessageAST new
+				sel: #value:;
+				args: {node msg args first};
+				start: node msg start; end: node msg end);
+				start: node  start; end: node  end.
+	^applyForValueTo: rewrittenSetterSend
+)) : ()
+class Rewriter2 = ASTTool (
 (* A visitor that rewrites the AST into a form more suitable for compilation to Javascript. It may be possible to combine the pass that constructs the scopes with the rewriting pass, but this may be messy once we start inlining blocks etc. *)| 
 	scopeStack <OrderedCollection[Scope]> = OrderedCollection new.
 	
@@ -1692,9 +1858,6 @@ methodNode: node <MethodAST> ^<Node> = (
 		body: (containsNonLocalReturn
 			ifTrue: [wrapBodyForNlrHandling: translatedBody]
 			ifFalse: [wrapBodyNoNlrHandling: translatedBody]).
-)
-parameterNode: node <ParameterAST> = (
-	^js ident: (names mangleLocal: node name)
 )'accessing'
 translateMethodNode: node <MethodAST> ^<Node> = (
 	| translation |
@@ -1713,6 +1876,7 @@ addCascadedSend: node to: statements = (
 			with: (node msg args collect: [:each | each apply: self]) asArray). 
 )
 assignmentNode: node = (
+	halt.
 	^js assign: (node var apply: self) toBe: (node expr apply: self)
 )
 astForBlock: node <BlockAST> ^ <Node> = (
@@ -1785,13 +1949,23 @@ codeBodyNode: node <CodeBodyAST> = (
 	statements:: node statements collect: [:each | each apply: self].
 	^js block: (locals asArray, statements) asArray
 )
+conditionalNode: node <ConditionalAST> = (
+	^inlinableConditionalNode: node
+)
+enclosingObjectNode: node <EnclosingObjectAST> = (
+	^processOuterReceiverAtDepth: node depth
+)
 explicitOuterReceiverNode: node <ExplicitOuterReceiverAST> = (
 	^processOuterReceiverAtDepth: node depth
 )
 freeNamesOf: block  <BlockAST> ^ <Set[Symbol]> = (
 	^(FreeVariableDetector for: block body) freeNames
 )
+implicitReceiverSendNode: node <ImplicitReceiverSendAST> = (
+	^processSend: node msg to: (processOuterReceiverAtDepth: node depth) with: node msg args
+)
 implicitSendNode: node <ImplicitRcvrSendNode> = (
+	halt.
 	^processSend: node msg to: (processOuterReceiverAtDepth: node depth) with: node msg args
 )
 inlinableAsExpressionConditionalNode: node <InlinableConditionalAST> = (
@@ -1815,14 +1989,13 @@ inlinableAsExpressionConditionalNode: node <InlinableConditionalAST> = (
 	^js ternaryIf: condition then: truePath else: falsePath
 )
 inlinableConditionalNode: node <InlinableConditionalAST> = (
-	| selector inverseCondition hasElseClause condition |
-	selector:: node msg sel.
-	inverseCondition:: selector = 'ifFalse:ifTrue:' or: [selector = 'ifFalse:'].
-	hasElseClause:: node msg args size = 2.
-	condition:: node recv apply: self.
+	| inverseCondition hasElseClause condition |
+	inverseCondition:: node ifTrue not.
+	hasElseClause:: node else isNil not.
+	condition:: node condition apply: self.
 	^js if: (inverseCondition ifTrue: [js prefixOperator: '!' on: condition] ifFalse: [condition])
-		then: (node msg args first body apply: self)
-		else: (hasElseClause ifTrue: [(node msg args at: 2) body apply: self] ifFalse: [nil])
+		then: (node then apply: self)
+		else: (hasElseClause ifTrue: [node else apply: self] ifFalse: [nil])
 )
 inlinedOperatorNode: node <InlinedOperatorAST> = (
 	(* We are not modeling JS operator precedence, so just parenthesize everything. *)
@@ -1830,13 +2003,19 @@ inlinedOperatorNode: node <InlinedOperatorAST> = (
 		with: (node recv apply: self)
 		and: (node msg args first apply: self)
 )
+localReadNode: node <LocalReadAST> = (
+	^js ident: (names mangleLocal: node name)
+)
+localWriteNode: node <LocalWriteAST> = (
+	^js assign: (js ident: (names mangleLocal: node name)) toBe: (node value apply: self)
+)
 loopNode: node <LoopAST> = (
 
 	(* prologue; while(cond==whileTrue) {body}; *)
 
 	|
 	prologue = node prologue apply: self.
-	cond = node cond apply: self.
+	cond = node condition apply: self.
 	body = node body ifNil: [js block: {}] ifNotNil: [:it | it apply: self].
 	
 	(* Split the condition is it isn't a single expression *)
@@ -1862,6 +2041,9 @@ messageNode: node = (
 	sentSelectors add: node sel.
 	^js literal: (names mangleSelector: node sel)
 )
+methodLocalReturnNode: node <MethodLocalReturnAST> = (
+	^blockLocalReturnNode: node
+)
 nilNode: node = (
 	^js ident: 'nil'
 )
@@ -1871,16 +2053,19 @@ nlrName = (
 nlrValuePropertyName = (
 	^'value'
 )
-normalSendNode: node <NormalSendNode> = (
-	enableIntrinsics ifTrue: [
-		node recv isNormalSendNode ifTrue: [
-			node recv msg sel = 'js' ifTrue: [^processIntrinsic: node msg]]].
-
-	^processSend: node msg to: (node recv apply: self) with: node msg args
+nonLocalReturnNode: node <NonlocalReturnAST> = (
+	^returnStatNode: node
 )
 numberNode: node <NumberAST> = (
 	assert: [node isNumberNode].
 	^js literal: node val
+)
+ordinarySendNode: node <OrdinarySendAST> = (
+	enableIntrinsics ifTrue: [
+		node recv isImplicitReceiverSendNode ifTrue: [
+			node recv msg sel = 'js' ifTrue: [^processIntrinsic: node msg]]].
+
+	^processSend: node msg to: (node recv apply: self) with: node msg args
 )
 parameterDeclNode: node <ParameterAST> = (
 	^names mangleLocal: node name
@@ -1899,7 +2084,7 @@ processOuterReceiverAtDepth: depth <Integer> = (
 	depth = 0 ifTrue: [^js ident: 'self'].
 	slotName:: names mangleSelector: 'enclosingObjects`', currentMixinUID.
 	^js propertyOf: (js propertyOf: (js ident: 'self') at: (js literal: slotName))
-		at: (js literal: depth - 1) (* adjust for JS's 0-based indexing *)
+		at: (js literal: depth - 1) (* Adjust for self not being in the enclosing objects array. *)
 )
 processSend: message to: receiver with: args = (
 	^js 
@@ -1948,12 +2133,7 @@ symbolNode: node <SymbolAST> = (
 )
 temporaryDeclNode: node <ParameterAST> ^<String> = (
 	^js var: (names mangleLocal: node name)
-		value: (node initializer = nil
-			ifTrue: [js ident: 'nil']
-			ifFalse: [ node initializer apply: self])
-)
-temporaryNode: node <TemporaryVariableAST> = (
-	^js ident: (names mangleLocal: node name)
+		value: (js ident: 'nil')
 )
 tupleNode: node <TupleAST> = (
 	^js array: (node elements collect: [:ea | ea apply: self])
@@ -1963,6 +2143,7 @@ varDeclNode: node <VarDeclNode> = (
 	^js var: (names mangleLocal: node name)
 )
 variableNode: node <VariableAST> = (
+	halt.
 	^js ident: (names mangleLocal: node name)
 )
 wrapBodyForNlrHandling: body <Block> = (

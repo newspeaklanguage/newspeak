@@ -1,0 +1,249 @@
+Newspeak3
+'Actors'
+class Pastime usingPlatform: platform usingDispatcher: d = (
+(*Actor Futures. The way they were meant to be.*)|
+	private MutableArrayList = platform collections MutableArrayList.
+
+	private dispatcher = d.
+|)
+(
+class Bender = (
+(*A future consists of a Promise and a Resolver, which are the two facets of the Future object in the 
+capability-based security model and POLA as described by Mark Miller.
+The Promise represents the 'use facet' and the Resolver the 'control facet.*)|
+	public promise = Promise new.
+	public resolver = Resolver forPromise: promise.
+|)
+() : ()
+class Promise = (
+(*A Promise is an unresolved eventual reference that buffers 
+messages eventual-sent to it and eventually-sends them upon resolution.
+
+FIXME When setClass gets implemented:
+Remove the state slot and split this class into 3 classes:
+	UnresolvedPromise
+	ResolvedPromise
+	SmashedPromise
+Then use an ObjectMirror to change UnresolvedPromise's class upon resolution.
+*)|
+	private resolution <Object|Exception>
+
+	(*unresolved, resolved, smashed*)
+	protected state <Symbol> ::= 'unresolved'.
+
+	(*A list of messages pending delivery upon promise resolution.
+	There are two kinds of messages:
+	- Chained messages have a known receiver (a closure) and selector (value:), but unknown argument (the resolution). 
+	Chained messages are listeners registered via whenResolved: [block].
+	- Pipelined messages have an unknown receiver (the resolution), but known selector and arguments.
+	Pipelined messages are messages eventually-sent to the promise before its resolution and intended for its resolution.*)
+	private pendingMessages <List[PromiseMessage]> ::= MutableArrayList new.
+|)
+(
+class ChainMessage when: w <[]> catch: c <[] | nil> resolver: r <Resolver | nil> = PromiseMessage resolver: r (
+(*Holds a chained listener to be notified with the resolution of the Promise upon resolution.*)|
+	private whenHandler = w.
+	private catchHandler = c.
+|)
+('as yet unclassified'
+dispatch: catchListener <[]> = (
+	invokeWhen: whenHandler catch: catchHandler resolver: resolver catchListener: catchListener.
+)
+isChainMessage = (
+	^true.
+)) : ()
+class PipelineMessage selector: s <String> args: a <{}> resolver: r <Resolver | nil> = PromiseMessage resolver: r (
+(*Holds a pipelined message to be delivered to the resolution of the Promise upon resolution.*)|
+	private selector = s.
+	private args = a.
+|)
+('as yet unclassified'
+dispatch: catchListener <[]> = (
+	state == 'resolved' ifTrue: [
+		(*The resolution is guaranteed NOT to be a Promise.*)
+		postMessageTo: resolution selector: selector args: args resolver: resolver.
+		^self.
+	].
+	state == 'smashed' ifTrue: [
+		(*Conceptually this would involve an eventual-send to a broken ref stored in the resolution slot 
+		that would in turn signal an Error and smash the resolver.
+		Here we short-circuit that and smash the resolver directly.*)
+		(*Note: the resolver is guaranteed to be near.*)
+		resolver isNil ifFalse: [ resolver smash: resolution. ].
+		^self.
+	].
+	Error signal: 'Invalid state: ', state.
+)
+isPipelineMessage = (
+	^true.
+)) : ()
+class PromiseMessage resolver: r <Resolver | nil> = (
+(*An abstract class represeting a pending message buffered in an unresolved Promise.*)|
+	protected resolver = r.
+|)
+('as yet unclassified'
+dispatch: catchListener <[]> = (
+	subclassResponsibility.
+)) : ()'accessing'
+doesNotUnderstand: msg <MessageMirror> ^ <Object> = (
+	state == 'resolved' ifTrue: [ ^msg sendTo: resolution ].
+	state == 'smashed' ifTrue: [
+		| sel |
+		(*For debugger inspection support: ignore is* messages, like Object does.*)
+		sel: msg selector.
+		sel isUnary ifTrue: [(sel startsWith: 'is') ifTrue: [^false]].
+		Error signal: 'Promise smashed with: ', resolution.
+	].
+	state == 'unresolved' ifTrue: [
+		| sel |
+		(*For debugger inspection support: ignore is* messages, like Object does.*)
+		sel: msg selector.
+		sel isUnary ifTrue: [(sel startsWith: 'is') ifTrue: [^false]].
+		Error signal: 'Cannot immediate-send ', msg, ' to an eventual reference. Promises only accept eventual-sends'.
+	].
+	Error signal: 'Illegal state: ', state.
+)
+whenResolved: whenHandler <[]> ^ <Promise> = (
+	^whenResolved: whenHandler catch: nil.
+)
+whenResolved: whenHandler <[]> catch: catchHandler <[] | nil> ^ <Promise> = (
+	| future = Bender new. |
+
+	whenResolved: whenHandler catch: catchHandler resolver: future resolver.
+
+	^future promise.
+)'as yet unclassified'
+, other <Promise> ^ <PromiseGroup> = (
+	state == 'resolved' ifTrue: [ ^resolution , other. ].
+	state == 'smashed' ifTrue: [ Error signal: 'Promise smashed with: ', resolution. ].
+	state == 'unresolved' ifTrue: [ ^PromiseGroup for: other head: (PromiseGroup for: self). ].
+	Error signal: 'Illegal state: ', state.
+)
+protected invokeWhen: whenHandler <[]> catch: catchHandler <[] | nil> resolver: resolver <Resolver | nil> catchListener: cl <[]> = (
+	state == 'resolved' ifTrue: [
+		postMessageTo: whenHandler selector: 'valueWithPossibleArgument:' args: { resolution } resolver: resolver.
+		^self.
+	].
+	state == 'smashed' ifTrue: [
+		(*Note: we notify the catchListener (cl) if the exception is handled to allow unhandled exceptions to be resignalled.
+		See also the Promise`doResolve:type: method, where unhandled exceptions are signalled.
+		See also the Promise`ChainMesage`dispatch: method, which passes through the catchListener.*)
+		catchHandler isNil
+			(*- Eventual-send the error to the exception handler*)
+			ifFalse: [ postMessageTo: catchHandler selector: 'valueWithPossibleArgument:' args: { resolution } resolver: resolver. cl value. ]
+			(*- Rethrow the exception by passing it along the chain. Note: the resolver is guaranteed to be near.*)
+			ifTrue: [ resolver isNil ifFalse: [ resolver smash: resolution. cl value. ] ].
+		^self.
+	].
+	Error signal: 'Invalid state: ',state.
+)
+whenResolved: whenHandler <[]> catch: catchHandler <[] | nil> resolver: resolver <Resolver | nil> = (
+	state == 'unresolved'
+		ifTrue: [ pendingMessages add: (ChainMessage when: whenHandler catch: catchHandler resolver: resolver) ]
+		ifFalse: [ invokeWhen: whenHandler catch: catchHandler resolver: resolver catchListener: []. ].
+)'internal'
+protected doResolve: r <Object> type: t <Symbol> = (
+	| exceptionHandled ::= false. |
+	resolution: r.
+	state: t. (*resolved / smashed*)
+
+	(*Forward all buffered messages.*)
+	pendingMessages do: [ :msg <PromiseMessage> | msg dispatch: [ exceptionHandled: true. ]. ].
+	pendingMessages: nil.
+
+	(*Re-signal unahndled exceptions.*)
+	(t = 'smashed' and: [ exceptionHandled not ]) ifTrue: [ r passForDebug ].
+)
+protected postMessage: selector <String> args: args <{}> resolver: resolver <Resolver | nil> = (
+	state == 'resolved' ifTrue: [
+		postMessageTo: resolution selector: selector args: args resolver: resolver. ^self.
+	].
+	state == 'smashed' ifTrue: [
+		(*Note: the resolver is always near*)
+		resolver isNil ifFalse: [ resolver smash: resolution. ^self. ].
+	].
+	state == 'unresolved' ifTrue: [
+		pendingMessages add: (PipelineMessage selector: selector args: args resolver: resolver). ^self.
+	].
+)) : ()
+class PromiseGroup for: p head: h <PromiseGroup | nil> = (
+(*A PromiseGroup represents a combined promise for a list of promises that is lazily initialized.*)|
+	private previous <PromiseGroup | nil> = h.
+	private promise <Promise> = p.
+	private lazyAll <Promise> (*lazily initialized*)
+|)
+('as yet unclassified'
+, other <Promise> = (
+	^PromiseGroup for: other head: self.
+)
+all = (
+	(lazyAll == nil) ifTrue: [
+		| future = Bender new. counter ::= 0. |
+		do: [ :it |
+			counter:: counter + 1.
+			it whenResolved: [ 
+				((counter:: counter - 1) = 0) ifTrue: [ future resolver resolve: self. ].
+			] catch: [ :ex |
+				future resolver smash: ex.
+			].
+		].
+		lazyAll:: future promise.
+	].
+	^lazyAll
+)
+do: block = (
+	| it ::= self. |
+	[ it == nil ] whileFalse: [
+		block value: it promise.
+		it:: it previous.
+	].
+)
+doesNotUnderstand: msg <MessageMirror> ^ <Object> = (
+	^msg sendTo: all.
+)) : ('as yet unclassified'
+for: p <Promise> = (
+	^PromiseGroup for: p head: nil.
+))
+class Resolver forPromise: p <Promise> = (
+(*A Resolver represents the authority to resolve a Promise and is the control facet of the promise's eventual resolution.*)|
+	private promise = p.
+|)
+('accessing'
+resolve: resolution <Object> ^ <Boolean> = (
+	| unresolved = promise state == 'unresolved'. |
+	unresolved ifTrue: [
+		(isPromise: resolution) ifTrue: [
+			(*Detect divergence.*)
+			resolution == promise ifTrue: [ Error signal: 'Attempting to resolve a promise to itself.' ].
+			resolution whenResolved: [ :finalResolution | resolve: finalResolution ] catch: [ :error | smash: error ] resolver: nil.
+		]
+		ifFalse: [
+			promise doResolve: resolution type: 'resolved'.
+		].
+	].
+	^unresolved.
+)
+smash: error <Error> ^ <Boolean> = (
+	| unresolved = promise state == 'unresolved'. |
+	unresolved ifTrue: [
+		promise doResolve: error type: 'smashed'.
+	].
+	^unresolved.
+)) : ()'as yet unclassified'
+isBrokenRef: ref <Object> = (
+	^(isPromise: ref) && [ref state == 'smashed'].
+)
+unwrapPromise: o <Object> ^ <Object> = (
+	(*Smashed promises are broken refs and should NOT be unwrapped.*)
+	^((isPromise: o) and: [ o state == 'resolved' ]) ifTrue: [ ^o resolution ] ifFalse: [ ^o ].
+)'private'
+isPromise: o <Object> = (
+	(*Check the class instead of asking the object in order to prevent user code from emulating Promises.*)
+	^o class == Promise.
+)
+postMessageTo: receiver <Object> selector: selector <String> args: args <{}> resolver: resolver <Resolver | nil> = (
+	(*Note: resolver is always near.*)
+	(isPromise: receiver)
+		ifTrue: [ receiver postMessage: selector args: args resolver: resolver. ]
+		ifFalse: [ dispatcher postMessageTo: receiver selector: selector args: args resolver: resolver. ].
+)) : ()

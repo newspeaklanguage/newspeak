@@ -81,7 +81,7 @@ Copyright 2012-2013 Gilad Bracha, Ryan Macnak and Cadence Design Systems
 	internalParser = ns3Parser InternalParser new.
 	|)
 (
-class Compiler = super Compiler ((* The compiler has three main entry points: compileClassSource:Within:, compileClassHeader: within: and compileMethodSource:within:. These compile an entire class declaration, a class header, and a method, respectively. 
+class Compiler  = super Compiler ((* The compiler has three main entry points: compileClassSource:Within:, compileClassHeader: within: and compileMethodSource:within:. These compile an entire class declaration, a class header, and a method, respectively. 
 
 The compiler returns low level (e.g., VM level) objects representing the results of compilation.
 These results are described in some detail in the individual methods. The results are never installed by the compiler. The compiler does not know or care whether it is running in the service of a live system. If the compiler is invoked from such a system, the caller may choose to install the results. This should be done as an atomic modification, since the results may be interdependent (e.g., a nested class and its enclosing class). 
@@ -2696,7 +2696,6 @@ mixinInitializerFor: aNode <ClassHeaderAST> ^ <MethodAST> = (
 		[:ie <ExpressionAST> | stmts add: (ie apply: copier)]. 
 	start:: stmts isEmpty ifTrue:[0] ifFalse:[stmts first start].
 	end:: stmts isEmpty ifTrue:[0] ifFalse:[stmts last end].
-	end::  aNode  superConstructorCall end.
 	body:: CodeBodyAST new
 		temporaries: OrderedCollection new
 		statements: stmts;
@@ -2705,9 +2704,12 @@ mixinInitializerFor: aNode <ClassHeaderAST> ^ <MethodAST> = (
 		pattern: initHdr body: body accessModifier: #public;
 		start: start; end: end.
 )
+mixinInitializerSelectorNameFor: selector <Symbol> ^<Symbol> = (
+	^('mixinInitializer`', selector) asSymbol
+)
 perClassInitializerFor: aNode <ClassHeaderAST> ^ <MethodAST> = (
-
-	(* Instance initializer for a class. This  initializer routine first calls the superclass's main initializer, then calls the mixin initializer to set all the slots, and execute any initialization code in the header. *)
+(* Looks like this could be hoisted up to the common superclass: NewspeakCompiler`Compiler*)
+	(* Instance initializer for a class. This initializer routine first calls the superclass's main initializer, then calls the mixin initializer to set all the slots, and execute any initialization code in the header. *)
 	| 
 	start <integer>
 	end <Integer>
@@ -2720,6 +2722,7 @@ perClassInitializerFor: aNode <ClassHeaderAST> ^ <MethodAST> = (
 	start:: aNode superConstructorCall start.
 	end::  aNode  superConstructorCall end.
 	copier:: ASTCopier new.
+	
 	initHdr:: aNode constructor apply: copier. (* set up scope with constructor parameters *)
 	initHdr selector: (initializerSelectorNameFor: initHdr selector).	
 
@@ -2728,7 +2731,6 @@ perClassInitializerFor: aNode <ClassHeaderAST> ^ <MethodAST> = (
 	stmts add: (superConstructorCallFor: aNode). 
 	(* then call the mixin initializer *)
 	stmts add: (mixinInitializerFor: aNode). 
-
 	body:: CodeBodyAST new
 		temporaries: OrderedCollection new
 		statements: stmts;
@@ -2787,6 +2789,62 @@ sourceForNode: node <AST> ^ <String> = (
 	input next: len into: s startingAt:1.
 	input position: savedPos.
 	^s
+)
+splitMixinInitializersFor: aNode <ClassHeaderAST> ^<Collection[MethodAST]> = (
+
+	(* Because the init sequence may not fit in a single method, because too many literals are needed for all the setters and getters, we produce an init method that calls a number of private sub-initializers. This main initializer routine first calls the superclass's main initializer, then calls the subinitializers to set all the slots, and then any initialization code in the header. Answers a collection of MethodASTs including the main and sub intializers. *)
+	| 
+	start <integer>
+	end <Integer>
+	stmts <List[StmtAST]> 
+	initHdr <MessagePatternAST>
+	body <CodeBodyAST>  
+	slots <Collection[StmtAST]>
+	subs <Collection[MethodAST]>
+	copier <ASTCopier>
+	|
+
+	copier:: ASTCopier new.
+	initHdr:: aNode constructor apply: copier. (* set up scope with constructor parameters *)
+	initHdr selector: (initializerSelectorNameFor: initHdr selector).	
+	subs:: subInitializersFor: aNode. (* compute (empty) subinitializers *)
+	
+	slots:: (aNode slots reject: [:slot | slot initializer isNil]) collect: 
+		[:slot <SlotDefAST> |
+		| aMsg <MessageAST> slotInitializer <ExpressionAST> |
+		slotInitializer:: slot initializer apply: copier.
+		aNode isSeq ifFalse: [slotInitializer:: futureFor: slotInitializer].
+		aMsg:: MessageAST new 
+			send: (setterSelectorFor: slot) with:  {slotInitializer};
+			start: slot start;
+			end: slot end.
+		NormalSendAST new msg: aMsg; 
+			recv: (selfNode start: aMsg start; end: aMsg end);
+			start: aMsg start; end: aMsg end].
+
+	(* populate subinit methods with slot initialization code *)
+	(1 to: slots size) with: slots do: [:n :stmt |
+		(subs at: n  // methodCompiler slotsPerMethod + 1) body statements add: stmt]. 
+
+	stmts:: OrderedCollection new.
+	(* Call the subinitializers for the slots *)
+	1 to: subs size -1 do: 
+		[:i | stmts add: (sendForSub: (subs at: i))].
+	start:: stmts isEmpty ifTrue:[0] ifFalse:[stmts first start].
+	end:: stmts isEmpty ifTrue:[0] ifFalse:[stmts last end].
+	(* then the initializer code *)
+	aNode initExprs do:
+		[:ie <ExpressionAST> | stmts add: (ie apply: copier)]. 
+
+	body:: CodeBodyAST new
+		temporaries: OrderedCollection new
+		statements: stmts;
+		start: start; end: end.
+	subs at: subs size put: (MethodAST new 
+		pattern: initHdr body: body accessModifier: #public;
+		start: start; end: end).
+
+	^subs
 )
 syntheticNameSeparator ^ <String> = (
   ^Language syntheticNameSeparator	

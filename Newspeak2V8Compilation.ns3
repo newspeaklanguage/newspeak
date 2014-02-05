@@ -1,6 +1,6 @@
 Newspeak3
 'NS2V8'
- class Newspeak2V8Compilation usingPlatform: platform
+class Newspeak2V8Compilation usingPlatform: platform
  parsing: parsing
  generation: generation
  mirrors: mirrors = NewspeakCompilation
@@ -185,7 +185,9 @@ invoke = (
 				toBe: (js ident: 'enclosingObjects').
 			js assign: (js propertyOf: (js ident: 'this') at: (js literal: (names mangleSelector: 'super`',name)))
 				toBe: (js ident: 'runtimeSuperclass').
-			js assign: (js propertyOf: (js ident: 'this') at: (js literal: 'basicNew')) toBe: basicNew.
+			(* This first assignment causes devtools to use the class's name as the short name for its instances. *)
+			js assign: (js propertyOf: (js ident: 'this') at: (js literal: name)) toBe: basicNew.
+			js assign: (js propertyOf: (js ident: 'this') at: (js literal: 'basicNew')) toBe: (js propertyOf: (js ident: 'this') at: (js literal: name)).
 			js verbatim: 'this.basicNew.prototype = this'.
 			js verbatim: 'this.meta = null'.
 			js verbatim: 'this.newspeakClass = null'.
@@ -963,6 +965,9 @@ checkForDuplicateNames: aNode = (
 )
 classNode: aNode <ClassDeclarationAST> ^ <ClassDeclarationIR> = (
 	| ir <ClassDeclarationIR> priorMixinUID <String> |
+	aNode name = #Newspeak2V8Compilation ifTrue: [
+		#BOGUS. (* The flaw in the js intrinsic scheme. *)
+		enableIntrinsics: false].
 	checkForDuplicateNames: aNode.
 	ir:: computeMixinFrom: aNode hdr.
 	priorMixinUID:: currentMixinUID.
@@ -985,6 +990,39 @@ compileClassSource: source <ReadStream> within: enclosing <MixinMirror> ^<Compil
 	mixinRep:: classNode: tree.
 	scopeMap:: Dictionary new.
 	^enclosing isNil ifTrue:[mixinRep] ifFalse:[{enclosing. mixinRep}].
+)
+compileExpressionSource: stm <ReadStream> inMixin: enclosing <MixinMirror> ^<MethodIR> = (
+	|
+	body <CodeBodyAST>
+	method <MethodAST>
+	result <LowLevelMethodMirror>
+	|
+	
+	(* Parse as a code body *)
+	body:: parser doItExpression parse: stm.
+	
+	(* Ensure last statement is a return statement *)
+	body statements isEmpty ifFalse:
+		[body statements last isReturnStatNode ifFalse:
+			[| last |
+			last:: body statements removeLast.
+			body statements add: (ReturnStatAST new 
+				expr: last; start: last start; end: last end)]].
+
+	(* Put into a method *)
+	method:: MethodAST new
+		pattern: (MessagePatternAST new selector: #DoIt parameters: {});
+		body: body;
+		accessModifier: #public.
+	
+	(* Build scope *)
+	setScopeFor: method in: enclosing.
+	currentMixinUID: enclosing name.
+	
+	(* Rewrite and compile *)
+ 	result:: methodNode: method.
+	scopeMap:: Dictionary new.
+	^result
 )
 compileMethodSource: source <ReadStream> within: enclosing <MixinMirror> ^<MethodMirror> = (
 	| tree <AST> |
@@ -1080,6 +1118,20 @@ createSlotsFor: aNode <ClassHeaderAST> ^ <String> = (
 )
 currentScope ^<Scope> = (
 	^scopeStack last
+)
+dnuHandlers = (
+	^js function: 'installDnuHandlersOn' of: {js ident: 'p'} body: (js block: (
+	sentSelectors collect: [:selector | 
+		| args = ((1 to: (numArgs: selector)) collect: [:i | js ident: 'a',i printString]). |
+		js assign: (js propertyOf: (js ident: 'p') at: (js literal: (names mangleSelector: selector))) toBe:
+		(js functionOf: args body: (js block: {
+			js return: (js call: (js propertyOf: (js ident: 'this') at: (js literal: (names mangleSelector: #doesNotUnderstand:)))
+			 with: {js call: (js verbatim: 'vmmirror.kernel.$Message().$selector$arguments$') 
+				with: {js literal: (names mangleSelector: selector). js array: args} })
+		}))
+	]))
+	
+	(* sel (a1,a2){  this.dnu(kernel.Message().selector$arguments$('sel', [a1, a2]) )  } *)
 )
 emptyMethodForSelector: selector = (
 
@@ -1198,16 +1250,16 @@ methodNode: aNode <MethodAST> ^ <MethodMirror> = (
 	(* pop scope? *)
 	^((MethodIR named: translator currentSelector)
 		function: jsTree)
-			src: (sourceForNode: aNode)
+			(* src: (sourceForNode: aNode) *)
 )
 mixinNamespace = (
 
 	^ 'globalMixinNamespace'
 )
-nestScope: scope <Scope> = (
+nestScope: s <Scope> = (
 	(* Hook up a new lexically nested scope, and push onto the scope stack *)
-	scope superScope: currentScope.
-	pushScope: scope
+	s setSuperScope: currentScope.
+	pushScope: s
 )
 nestedMixinWrapperFor: nested <ClassDeclarationAST> in: outerClass <MixinMirror>  ^ <ClassDeclarationAST> = (
 (* Wrap a class declaration to make it look like a nested mixin within outerClass should. This includes making the name be the fully qualified name, and hiding the superclass. *)
@@ -1217,6 +1269,12 @@ nestedMixinWrapperFor: nested <ClassDeclarationAST> in: outerClass <MixinMirror>
 	wrapper hdr: nested hdr clone.
 	wrapper hdr name: (fullyQualifySimpleName: nested name with: outerClass name).
 	^wrapper
+)
+numArgs: selector = (
+	| n ::= 0. |
+	('+-*/\<>~=@%|&?!,' includes: selector first) ifTrue: [^1].
+	selector do: [:char | char = $: ifTrue: [n:: n + 1]].
+	^n
 )
 outputClass: mixinRep <MixinRep> toNamespace: namespace <FilePattern> = (
 
@@ -1317,8 +1375,8 @@ setInput: source <ReadStream> = (
 setScopeFor: node <AST> in: enclosing <MixinMirror | nil> = (
 	| scopeBuilder |
 	pushScope: Scope new.
-	enclosing notNil ifTrue: [nestScope:: ScopeBuilder new buildScopeFor: enclosing].
-	currentDepth:: currentScope depth - 1.
+	enclosing isNil ifFalse: [nestScope:: ScopeBuilder new buildScopeFor: enclosing].
+	currentDepth:: currentScope depth.
 	scopeBuilder:: ScopeBuilder nestedIn: currentScope atLevel: currentDepth.
 	node apply: scopeBuilder
 )
@@ -1550,20 +1608,6 @@ public applicationSources: sources <List[String]> = (
 	mixins addAll: results.
 	applicationConfiguration: results first.
 )
-private dnuHandlers = (
-	^js function: 'installDnuHandlersOn' of: {js ident: 'p'} body: (js block: (
-	compiler sentSelectors collect: [:selector | 
-		| args = ((1 to: selector numArgs) collect: [:i | js ident: 'a',i printString]). |
-		js assign: (js propertyOf: (js ident: 'p') at: (js literal: (names mangleSelector: selector))) toBe:
-		(js functionOf: args body: (js block: {
-			js return: (js call: (js propertyOf: (js ident: 'this') at: (js literal: (names mangleSelector: #doesNotUnderstand:)))
-			 with: {js call: (js verbatim: 'vmmirror.kernel.$Message().$selector$arguments$') 
-				with: {js literal: (names mangleSelector: selector). js array: args} })
-		}))
-	]))
-	
-	(* sel (a1,a2){  this.dnu(kernel.Message().selector$arguments$('sel', [a1, a2]) )  } *)
-)
 private main = (
 	^js verbatim: 
 'var runtime = ns.$',runtimeConfiguration name,'().$packageUsing$(ns);
@@ -1596,13 +1640,15 @@ private runtimeMixinNamespace = (
 public runtimeSources: sources <List[String]> = (
 	| results |
 	sources = lastRuntimeSources ifTrue: 
-		[compiler sentSelectors: lastSentSelectors copy.
+		[#BOGUS. (* Should cache on a per-module basis. *)
+		compiler sentSelectors: lastSentSelectors copy.
 		mixins addAll: lastRuntimeReps.
 		runtimeConfiguration: lastRuntimeReps first.
 		^self].
 	
-	compiler enableIntrinsics: true.
 	results:: sources collect: [:source |
+		#BOGUS. (* Resetting per module is a side-effect of a special case to disable the intrinsic when compiling this module itself. *)
+		compiler enableIntrinsics: true.
 		compiler compileClassSource: source readStream within: nil].
 	mixins addAll: results.
 	runtimeConfiguration: results first.
@@ -1619,7 +1665,7 @@ private script = (
 		js var: 'mixins' value: runtimeMixinNamespace.
 		vmmirror.
 		namespace.
-		dnuHandlers.
+		compiler dnuHandlers.
 		main}
 )
 private vmmirror = (
@@ -1633,6 +1679,7 @@ var vmmirror = new function(){
 			this.debug = "Runtime class for ImplementationBase";
 			this.basicNew = function(){};
 			this.$instance$initializer = function(){};
+			this.toString = function(){ return this.$printString(); }
 		};
 	};
 	this.$ImplementationBase = function(){return this.ImplementationBase$slot;};

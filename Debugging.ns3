@@ -39,31 +39,36 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. *)|
 	IDEWindow = ide tools IDEWindow.
 	MethodSubject = ide browsing MethodSubject.
 	NSMethodInheritanceSubject = ide browsingNS3 MethodInheritanceSubject.
+	InitializerMethodSubject = ide browsingNS3 InitializerMethodSubject.
 	OneLineDefinitionTemplate = ide tools OneLineDefinitionTemplate.
 	ProgrammingPresenter = ide tools ProgrammingPresenter.
 	private ObjectSubject = ide inspection ObjectSubject.
 	private ExceptionalResultPresenter = ide inspection ExceptionalResultPresenter.
 	ide = ide.
 
-	Color = platform blackMarket Graphics Color.
+	Color = platform graphics Color.
 	OrderedCollection = platform collections OrderedCollection.
 	SqueakDebugger = platform blackMarket Tools Debugger.
 	TextColor = platform blackMarket Collections TextColor.
 	TextEmphasis = platform blackMarket Collections TextEmphasis.
 	UnhandledError = platform blackMarket Exceptions UnhandledError.
+	
+	Semaphore = platform blackMarket Semaphore.
+	blackMarket = platform blackMarket yourself.
 
 	errorReportBlock ::= [:activation | defaultErrorReportFor: activation].
 	methodSourceRatio = 1.6.
 |)
 (
 class Debugger thread: thread <ThreadMirror> activation: activation <ActivationMirror> = (
-(* A an instance of Debugger is created to manage a specific debug session represented by (mirrors on) the interrupted thread and its top activation passed as primary factory parameters. *)|
+(* An instance of Debugger is created to manage a specific debug session represented by (mirrors on) the interrupted thread and its top activation passed as primary factory parameters. *)|
 	public thread <ThreadMirror> ::= thread.
 	public activation <ThreadMirror> ::= activation.
 	public description <String>
 	
 	protected registry
 	protected debuggerHopscotchWindow
+	protected InitializerActivationSubject = InitializerMethodSubject mixin |> ActivationSubject.
 |)
 (
 class ActivationPresenter onSubject: subj <ActivationSubject> = ExpandableMethodPresenter onSubject: subj (|
@@ -108,7 +113,7 @@ buildActions = (
 buildExceptionDetails: exception <Exception> in: thread <NewspeakDebugging ThreadSubject> = (
 	^column: {
 		ExceptionalResultPresenter on: exception in: thread.
-		(ObjectSubject onModel: (vmMirror reflectOn: exception)) presenter.
+		(ObjectSubject onModel: (ide mirrors ObjectMirror reflecting: exception)) presenter.
 	}
 )
 buildLocalVariables = (
@@ -128,7 +133,7 @@ buildReturnInterestingValue = (
 		[:it |
 		^row: {
 			smallBlank.
-			button: '^', (it reflecteePrintStringLimitedTo: 10) action: [respondToReturnValue: it].
+			button: '^', (it safePrintStringLimitedTo: 10) action: [respondToReturnValue: it].
 		}].
 	^nothing
 )
@@ -367,6 +372,10 @@ selectorAndContainment = (
 			ifFalse: [methodClassLink].
 		}
 )
+sendersOfSubjectPresenter = (
+	(* Override to hide in the debugger. *)
+	^nothing
+)
 showClassLink = (
 	^true
 )
@@ -386,7 +395,9 @@ additionalResultFragment: fragmentConsumer <[:Fragment]> for: result <[:ObjectMi
 )
 definition = (
 	^list: [{
-		interactionDefinition.
+		ide experimental
+			ifTrue: [nothing] 
+			ifFalse: [interactionDefinition].
 		selfFragment:: selfDefinition.
 	}, (localVarPresenters:: localVarDefinitions)
 	, (expressionStackPresenters:: expressionStackDefinition)]
@@ -406,7 +417,7 @@ headingForLocalVariableNamed: variableName value: object = (
 	^row: {
 		label: variableName asText allBold.
 		smallBlank.
-		link: (object reflecteePrintStringLimitedTo: 39) action:
+		link: (object safePrintStringLimitedTo: 39) action:
 			[inspectObjectMirror: object].
 	}
 )
@@ -460,22 +471,49 @@ activationMirror = (
 createPresenter = (
 	^ActivationStatePresenter onSubject: self
 )
-evaluate: expression ifCompilerError: onCompilerError <[:String]> ifError: onError <[:NewspeakDebugging ThreadSubject :Exception]> ^<ObjectMirror> = (
-	| result compilerError |
-	compilerError:: {nil}.
-	result:: registry
-		do: [activationMirror
-			evaluate: expression
-			withBlackMarket: ide inspection blackMarket
-			ifFail: [:msg | compilerError at: 1 put: msg]]
-		name: 'Evaluating ', expression
-		ifError:
-			[:exception :process |
-			onError value: (registry subjectFor: exception in: process) value: exception].
-	compilerError first ifNotNil:
-		[:message |
-		^onCompilerError valueWithPossibleArgument: message].
-	^result
+evaluate: expression <String>
+ifCompilerError: onCompilerError <[:String]> 
+ifError: onError <[:NewspeakDebugging ThreadSubject :Exception]> ^<ObjectMirror> = (
+	| compilerError failed sem result process |
+	failed:: false.
+	sem:: Semaphore new.
+	process::
+		[
+			[result:: activationMirror
+				evaluate: expression
+				withBlackMarket: blackMarket
+				ifCompilerError: [:ex <Exception> |
+					compilerError:: ex.
+					sem signal.
+					process suspend]
+				ifError: [:ex <Exception> | 
+					failed:: true.
+					result:: ex.
+					sem signal.
+					process suspend].
+			sem signal]
+				on: UnhandledError
+				do:	[:ex | 
+					failed ifTrue: [ex pass]. (* don't fire twice *)
+					failed:: true.
+					result:: ex exception.
+					sem signal.
+					process suspend].
+		] newProcess.
+	process
+		name: 'Evaluating ', expression asString;
+		resume.
+	sem wait.
+	process offList.
+	compilerError ifNotNil:
+		[^onCompilerError value: compilerError description].
+	failed ifFalse:
+		[^result].
+	(* position the process to continue in the signalerContext *)
+	process suspendedContext unwindTo: result signalerContext.
+	result signalerContext push: result.
+	process suspendedContext: result signalerContext.
+	^onError value: (registry subjectFor: result in: process) value: result
 )
 localNamesWithValuesCollect: action <[:Integer :ObjectMirror | T]> ^<SequenceableCollection[T]>= (
 	^Array streamContents:
@@ -574,9 +612,6 @@ compileNewSource: newSource <String> ifSuccess: onSuccess ifNewMethod: onNewMeth
 createPresenter = (
 	^ActivationPresenter onSubject: self
 )
-hasLegacyMirror = (
-	^methodMirror enclosingClassStencil isLegacyMirror
-)
 hash ^<SmallInteger> = (
 	^self class hash bitXor: model hash
 )
@@ -590,14 +625,14 @@ isAnOverride = (
 isBlockActivation = (
 	^activationMirror isBlockMirror
 )
+isInitializer ^ <Boolean> = (
+	^methodMirror isInitializer
+)
 isMessageNotUnderstood = (
 	^activationMirror isMessageNotUnderstood
 )
 isOverridden = (
 	^false
-)
-isPrivate = (
-	^methodMirror isPrivate
 )
 isValid = (
 	^true
@@ -607,11 +642,11 @@ lastInterestingValueOnStack ^<ObjectMirror | nil> = (
 	activationMirror stackIndicesWithValuesDo:
 		(* Prefer topmost value which comes first *)
 		[:ignored :current |
-		current reflecteeIsNil ifFalse: [^current]].
+		current reflectee == nil ifFalse: [^current]].
 	model localNamesWithValuesDo:
 		(* Prefer last argument which comes last *)
 		[:ignored :current |
-		current reflecteeIsNil ifFalse: [mirror:: current]].
+		current reflectee == nil ifFalse: [mirror:: current]].
 	^mirror
 )
 localNames = (
@@ -654,7 +689,11 @@ returnNil = (
 	return: activationMirror nilMirror
 )
 returnWith: expression ifFail: onFail = (
-	return:: activationMirror evaluate: expression ifFail: [:msg | ^onFail value: msg]
+	return:: activationMirror
+		evaluate: expression
+		withBlackMarket: blackMarket
+		ifCompilerError: [:e | ^onFail value: e description]
+		ifError: [:e | ^onFail value: e description]
 )
 selector = (
 	^model selector
@@ -811,10 +850,15 @@ mirrorOnValue = (
 	^model localVariableValueMirror: name
 )
 setValue: expression <String> ifFail: block = (
-	model setLocalVariable: name to: expression ifFail: block
+	| newValue <ObjectMirror> |
+	newValue:: model evaluate: expression 
+		withBlackMarket: blackMarket yourself 
+		ifCompilerError: block
+		ifError: block.
+	model setLocalVariable: name toValue: newValue reflectee ifFail: block
 )
 valueStringLimitedTo: numberOfCharacters <Integer> = (
-	^mirrorOnValue reflecteePrintStringLimitedTo: numberOfCharacters 
+	^mirrorOnValue safePrintStringLimitedTo: numberOfCharacters
 )) : ()
 class ThreadPresenter onSubject: subj <ThreadSubject> = ProgrammingPresenter onSubject: subj (|
 	protected activations <PresenterList>
@@ -852,6 +896,13 @@ ifFailed: onFail <[:String]> = (
 definition = (
 	isAlive ifFalse:
 		[^nothing].
+	
+	(ide experimental and: [definitionForActivationsList presenters size = 1]) ifTrue:
+		[definitionHolder:: 
+			holder: definitionForSingleFrame.
+		expandTopActivation.	
+		^definitionHolder].
+	
 	^definitionHolder::
 		holder: definitionForMainContent.
 )
@@ -1124,6 +1175,13 @@ withTopChunkOfActivationsAndMoreLinkDo: binaryBlock = (
 )) : ()
 class ThreadSubject onModel: t <ThreadMirror> = Subject onModel: t ()
 ('as yet unclassified'
+activationSubjectOnModel: m = (
+	| subjectClass = m isInitializer
+	   ifTrue:[InitializerActivationSubject]
+	   ifFalse:[ActivationSubject].
+	|
+	^subjectClass oModel: m
+)
 activationsDo: action = (
 	(* The debugger does quite a bit of forking UI activity. From time to time (with debugger tests), activation is nil. So, the folliwing check was added. *)
 	activation ifNotNil: [:it | it activationsDo: action]

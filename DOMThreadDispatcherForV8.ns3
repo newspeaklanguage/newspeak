@@ -1,0 +1,195 @@
+Newspeak3
+'Actors'
+class DOMThreadDispatcherForV8 usingPlatform: platform usingPastime: past = (|
+	private pastime = past.
+	private window = platform aliens global at: 'window'.
+	
+	currentActor ::= nil.
+|)
+(
+class Actor = (|
+|)
+('as yet unclassified'
+postMessage: message <ActorMessage> = (
+
+	(* Schedule a callback on the DOM thread. *)
+	(* Is the DOM thread fair? Will busy actors starve UI events or periodic timers? *)
+	(* This provides TOTAL ORDER, no? *)
+	window setTimeout: 0 with:
+		[currentActor: self.
+		message dispatchMessage.
+		currentActor: nil].
+)) : ()
+class ActorException cause: c <Exception> = (
+(*A wrapper exception class that can pass through as a value object.*)|
+	private cause = c.
+|)
+('as yet unclassified'
+doesNotUnderstand: msg <MessageMirror> ^ <Object> = (
+	^msg sendTo: cause. (*direct proxy to underlying exception for now.*)
+)
+isValueObject = (
+	^true.
+)
+passForDebug = (
+	(* The debugger demands that a context to be debugged belong to the active process. Here we create a new Process and stick in the context that triggered the exception. We then invoke defaultAction, which will start an UnhandledError that will eventually create a debugger. *)
+	[thisContext privSender: cause signalerContext.
+	cause defaultAction] fork.
+)) : ()
+class ActorMessage selector: s <String> args: a <{}> resolver: r <Resolver | FarReference[Resolver] | nil> = EventLoopMessage (
+(*An abstract class that knows how to dispatch eventual-sends.*)|
+	private selector = s.
+	private args = a.
+	private resolver = r.
+|)
+('as yet unclassified'
+dispatchMessage = (
+	| result tryContext |
+	[
+		tryContext:: thisContext.
+		result:: receiverNearRef perform: selector withArguments: args.
+	] on: exceptionFilter do: [ :error |
+		resolver isNil ifFalse: [
+			
+			(* Insert 'Processor terminateActive' beneath the dispatch of this message so if one continues passed the exception in the debugger it eventually terminates cleanly. *)
+			tryContext privSender: terminateContext.
+				
+			postMessageTo: resolver 
+				selector: 'smash:' 
+				args: { ActorException cause: error }
+				resolver: nil
+		] ifTrue: [
+			error pass. (*Let unhandled exceptions surface.*)
+		].
+		(* Arrange to return from our home context, while leaving the stack above the home context intact. We MUST NOT use an NLR because we do not want to trigger any of the handler contexts between this context and its home context. In effect, this is like an unguarded NLR. *)
+		thisContext privSender: thisContext home sender.
+	].
+	resolver isNil ifFalse: [
+		postMessageTo: resolver selector: 'resolve:' args: { result } resolver: nil.
+	].
+)
+receiverNearRef = (
+	subclassResponsibility
+)
+terminateContext = (
+	^[Processor terminateActive] asContext
+)) : ()
+class ActorMessageToFarRef selector: s <String> args: a <{}> resolver: r <FarReference[Resolver] | nil>
+	receiver: receiver <FarReference> = ActorMessage selector: s args: a resolver: r (
+(*A message whose receiver is a far reference. Both the receiver's actor and near-ref are stored in the FarReference and do not need to be duplicated.*)|
+	private receiverFarRef = receiver.
+|)
+('as yet unclassified'
+receiverActor = (
+	^receiverFarRef actor
+)
+receiverNearRef = (
+	^receiverFarRef target
+)) : ()
+class ActorMessageToNearRef selector: s <String> args: a <{}> resolver: r <Resolver | nil>
+	receiver: receiver <Object> inActor: actor = ActorMessage selector: s args: a resolver: r (
+(*A message whose receiver is a near reference. Must also hold the actor reference.*)|
+	receiverActor = actor.
+	receiverNearRef = receiver.
+|)
+() : ()
+class EventLoopMessage = (
+(*An abstract class for event loop messages.*)|
+|)
+('as yet unclassified'
+dispatchMessage = (
+	subclassResponsibility
+)
+receiverActor = (
+	subclassResponsibility
+)) : ()
+class FarReference to: t inActor: a = (
+(*A far reference is one that crosses actor boundaries. It knows about its actor and target object.*)|
+	target = t.
+	actor = a.
+|)
+('as yet unclassified'
+doesNotUnderstand: msg <MessageMirror> ^ <Object> = (
+	| sel |
+	(*For debugger inspection support: ignore is* messages, like Object does.*)
+	sel: msg selector.
+	sel isUnary ifTrue: [(sel startsWith: 'is') ifTrue: [^false]].
+
+	Error signal: 'Cannot immediate-send ', msg, ' to an eventual reference. Far references only accept eventual-sends.'.
+)
+isNil = (
+	^false. (*far reference can never have a nil target. nil is a value object.*)
+)) : ()'actor-system'
+isValueObject: o <Object> ^ <Boolean> = (
+	(*Quick and dirty hack for value objects - nil, numbers, strings, bools, chars, or self-proclaimed.*)
+	(*Note: arrays are NOT value objects. If you need arrays as data, create a wrapper class.*)
+	(*Value objects alone constitue at least one SJSU Master's theses in scope.*)
+	^o == nil or: [ o isNumber or: [ o isString or: [ o == true or: [ o == false or: [ o isCharacter or: [ o isValueObject ] ] ] ] ] ]
+)
+postMessageTo: receiver <Object> selector: selector <String> args: args <{}> resolver: resolver <Resolver | nil> = (
+	| srcActor = currentActor. targetActor message |
+	(isFarReference: receiver)
+		ifTrue: [
+			targetActor: receiver actor.
+			message:: ActorMessageToFarRef selector: selector args: (wrapArgs: args from: srcActor to: targetActor)
+				resolver: (resolver isNil ifTrue: [ nil ] ifFalse: [ FarReference to: resolver inActor: srcActor ]) receiver: receiver ]
+		ifFalse: [
+			targetActor: srcActor.
+			message:: ActorMessageToNearRef selector: selector args: args 
+				resolver: resolver receiver: receiver inActor: srcActor ].
+	targetActor postMessage: message.
+)
+wrapArgs: args <{}> from: srcActor <Actor> to: targetActor <Actor> ^ <{}> = (
+	^args collect: [ :rawArg | | arg = pastime unwrapPromise: rawArg. |
+		(*1) Handle far references*)
+		(isFarReference: arg) ifTrue: [
+			arg actor == targetActor 
+				(*unwrap far reference to object in target actor's heap (far reference becomes near reference)*)
+				ifTrue: [ arg target ]
+				(*pass along far references to objects in other actors as-is (Granovetter introduction)*)
+				ifFalse: [ arg ]
+		]
+		ifFalse: [
+			(*2) Handle promises*)
+			(pastime isPromise: arg) ifTrue: [
+				(*The future lives in the target actor!
+				The closures passed to arg also live in the target actor.
+				The promise arg, however, lives in the source actor.
+				Therefore we must pass the closures as far references.*)
+				| targetFuture = pastime Bender new. targetResolver |
+				targetResolver: targetFuture resolver.
+				(*Effectively an eventual-send from targetActor to arg whenResolved:catch: in source actor.*)
+				(*TODO smashed promise will trigger extraneous message send here. can be optimized.*)
+				(*TODO eventually we need a distinction between near and far unresolved promises. 
+				this is the point where a near unresolved promise would be `serialized` as a far unresolved
+				promise and a far unresolved promise to the target actor will deserialize as a near unresolved
+				promise, just like we do for far references above. This kind of distinction enables true
+				promise pipelining in the E sense as described by Mark Miller.*)
+				arg whenResolved: (FarReference to: [ :r | targetResolver resolve: r ] inActor: targetActor)
+					catch: (FarReference to: [ :e | targetResolver smash: e ] inActor: targetActor)
+					resolver: nil.
+				targetFuture promise.
+			]
+			ifFalse: [
+				(*3) Handle value objects*)
+				(isValueObject: arg)
+					ifTrue: [ arg ] (*pass by value*)
+					ifFalse: [ FarReference to: arg inActor: srcActor ] (*pass by far reference*)
+			]
+		]
+	].
+)'as yet unclassified'
+createActorFromValue: v <Value> ^ <EventualReference[Value]> = (
+	^FarReference to: v inActor: Actor new.
+)'dispatcher'
+createActor: mixin <Mixin> ^ <EventualReference[Class]> = (
+
+	^createActorFromValue: (mixin apply: Object)
+)
+isFarReference: o <Object> ^ <Boolean> = (
+	(*Check the class instead of asking the object directly in order to prevent user code from emulating FarReference.*)
+	^o class == FarReference
+)
+startDispatcher = (
+	(* No-op, always running. *)
+)) : ()

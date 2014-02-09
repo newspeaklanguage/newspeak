@@ -71,6 +71,7 @@ Copyright 2012-2013 Gilad Bracha, Ryan Macnak and Cadence Design Systems
 	SystemMetadata = mirrors SystemMetadata.
 	CompiledMixinMirror = mirrors CompiledMixinMirror.
 	LowLevelMixinMirror = mirrors LowLevelMixinMirror.
+	LowLevelMixinApplicationMirror = mirrors LowLevelMixinApplicationMirror. 
 	LowLevelMethodMirror = mirrors LowLevelMethodMirror.
 	InstanceVariableMirror = mirrors InstanceVariableMirror.
 
@@ -2430,65 +2431,6 @@ where <classTree> is the AST that computes the class.
 			statements: {if. return});
 		start: 1; end: 1
 )
-accessorASTForNestedClassNamed: simpleName <String> fullName: nestedName <String> superCall: superCall <NormalSendAST> accessModifier: am <Symbol> ^<MethodAST> = (
-(* To be removed *)
-(* Build an AST for a method that would lazily create a nested class via mixin application, and cache it. The generated code has the form
-
-simpleName = (
-	self nestedName`slot isNil ifTrue: [self nestedName`slot: (
-		((<methodClassAssociation> value nestedMixins at: nestedName)
-			apply: <superCall>
-			with: ('nestedName`' , self hash asString) asSymbol
-		) enclosingObjectSlot: self
-	)].
-	^self nestedName`slot
-)	
-
-where <methodClassAssociation> is the final literal in the method, an association whose value points to the defining mixin.
-*)
-
-	|  nestedClassSlot mixinApplication
-	  setEnclosingObject assignSlot nilCheck block if return |
-
-	nestedClassSlot:: NormalSendAST new
-		to: selfNode
-		send: (SystemMetadata mixinSlotNameFor: nestedName) asSymbol with: {}.	
-	mixinApplication:: astForComputingClassDeclaration: simpleName fullName: nestedName superCall: superCall.
-	(* Set for both the class and the metaclass! *)
-	setEnclosingObject:: NormalSendAST new
-		to: mixinApplication
-		send: #setEnclosingObjectSlot:
-		with: {selfNode}.
-	assignSlot:: NormalSendAST new
-		to: selfNode
-		send: ((SystemMetadata mixinSlotNameFor: nestedName), ':') asSymbol
-		with: {setEnclosingObject}.
-	nilCheck:: NormalSendAST new
-		to: nestedClassSlot
-		send: #isNil
-		with: {}.
-	block:: BlockAST new
-		body: (CodeBodyAST new
-			parameters: {}
-			temporaries: {}
-			statements: {assignSlot}).
-	if:: NormalSendAST new
-		to: nilCheck
-		send: #ifTrue:
-		with: {block}.	
-	return:: ReturnStatAST new expr: nestedClassSlot.
-		
-	^MethodAST new
-		accessModifier: am;
-		pattern: (MessagePatternAST new 
-			selector:  simpleName asSymbol
-			parameters: {});
-		body: (CodeBodyAST new
-		 	parameters: {}
-			temporaries: {}
-			statements: {if. return});
-		start: 1; end: 1
-)
 astForComputingClassDeclaration: simpleName <String> fullName: nestedName <String> superCall: superCall <NormalSendAST> ^ <NormalSendAST> = (
 	| mixin nestedMixins nestedMixin 
 	  setEnclosingObject  |
@@ -2528,24 +2470,44 @@ astForComputingMixinApplicationClassDeclaration: simpleName <String> fullName: n
 	| mixin nestedMixins nestedMixin 
 	  setEnclosingObject  |
 
-	mixin:: NormalSendAST new
-		to: MixinClassNode new
-		send: #value
-		with: {}.
-	nestedMixins:: NormalSendAST new
-		to: mixin
-		send: #nestedMixins
-		with: {}.
-	nestedMixin:: NormalSendAST new
-		to: nestedMixins
-		send: #at:
-		with: {SymbolAST new val: 
-			(SystemMetadata mixinNameOfClassNamed: nestedName)}.
+
 	^NormalSendAST new
 		to: nestedMixin
 		send: #apply:withName:
 		with: {
 			superCall.
+			NormalSendAST new
+				to: (NormalSendAST new
+					to: (SymbolAST new val: nestedName, '`')
+					send: #,
+					with: {NormalSendAST new
+						to: (NormalSendAST new to: selfNode send: #hash with: {})
+						send: #asString
+						with: {}})
+				send: #asSymbol
+				with: {}
+			}.	
+)
+astForComputingMixinApplicationClassDeclaration: simpleName <String> 
+fullName: nestedName <String> 
+superCall: superCall <NormalSendAST> 
+iList: iList <List[SendAST]> ^ <NormalSendAST> = (
+(* Returns a tree representing the computation of a mixin application
+class. First we compute the chain of anonymous mixin applications that
+constitutes the superclass of the desired mixin application class using
+#inheritanceASTWIthSuperclass:iList: and then we define a named mixin
+application by applying the last element of the inheritance chain to that
+superclass.
+.*)
+	| mixin nestedMixins nestedMixin 
+	  setEnclosingObject  superChain |
+
+	superChain:: inheritanceASTWIthSuperclass: ( superCall recv)  iList:  iList allButLast.
+	^NormalSendAST new
+		to: (mixinSendTreeFor: iList last recv)
+		send: #apply:withName:
+		with: {
+			superChain.
 			NormalSendAST new
 				to: (NormalSendAST new
 					to: (SymbolAST new val: nestedName, '`')
@@ -2592,7 +2554,23 @@ checkForDuplicateNames: node <ClassDeclarationAST> = (
 			s nextPutAll: '.'.].
 		assert: [false] message: message].
 )
-classInitializerFor: classDef <ClassDeclarationAST | MixinApplicationClassAST> basedOn: mixinInitializer <MethodAST> = (
+classInitializerFor: classDef <MixinApplicationClassAST> = (
+(* Probably migrate to superclass *)
+	| 
+	pattern = classDef constructor apply: ASTCopier new.
+	stmts = OrderedCollection new.
+	body = CodeBodyAST new temporaries: {} statements: stmts.
+	mtd = MethodAST new pattern: pattern body: body accessModifier: #public.
+	iList = classDef inheritanceChain.
+	|
+	pattern selector: (initializerSelectorNameFor: pattern selector).
+	iList size to: 2 by: -1 do:[:i | stmts addFirst: (mixinCall: i inheritanceList: iList)].
+	stmts addFirst: (superFactoryCallFor: iList first).
+	body start: stmts first start; end: stmts last end.
+	mtd start: pattern start; end: body end.
+	^mtd.
+)
+classInitializerFor: classDef <ClassDeclarationAST> basedOn: mixinInitializer <MethodAST> = (
 (* Probably migrate to superclass *)
 	| 
 	mtd = mixinInitializer apply: ASTCopier new. 
@@ -2766,6 +2744,25 @@ generateSlotAccessorsFor: m <MixinMirror> = (
     m methods addMirror: (iv generateGetterForSlot: n).
     m methods addMirror: (iv generateSetterForSlot: n)]
 )
+inheritanceASTWIthSuperclass: sc <ExpressionAST>  iList:  iList <List[SendAST]> ^ <NormalSendAST> = (
+(*
+Produce an AST representing a series of mixin applications corresponding 
+to the contents of the inheritance chain described by iList, applied to
+the tree representing the superclass clause sc.
+Each mixin application is provided an index according to its position in
+the list. This index is used as a suffix when renaming the instance initializer
+of the mxin application, in order to ensure that none of the instance initializers
+of the various mixin applications produced conflict with each other.
+*)
+	^(iList inject: {sc. 1} into:[:nsc <{ExpressionAST. Integer}> :m <SendAST> | 
+		{NormalSendAST new
+				to: (mixinSendTreeFor: m)
+				send: #applyAnonymouslyTo:index:
+				with: {nsc first. NumberAST new val: nsc last}.
+		nsc last + 1
+		}
+		]) first.
+)
 methodNode: aNode <MethodAST> ^ <LowLevelMethodMirror> = (
 
 	| tree <AST> |
@@ -2774,6 +2771,21 @@ methodNode: aNode <MethodAST> ^ <LowLevelMethodMirror> = (
 	tree apply: methodCompiler. (* final pass: visit rewritten ast *)
 	(* pop scope? *)
 	^(methodCompiler result) src: (sourceForNode: aNode)
+)
+mixinApplicationClassNode: nc <MixinApplicationClassAST> 
+	in: mixinMirror <LowLevelMixinMirror> category: cat <String>  ^ <MixinRep> = (
+	
+	| 
+	dummyLlm = LowLevelMixinMirror named: #dummy isMeta: false.
+	scope <Scope> = scopeMap at: nc. 
+	init <LowLevelMethodMirror>  = processMethod: (classInitializerFor: nc) inScope: scope in: dummyLlm.
+	llmam <LowLevelMixinApplicationMirror>  
+	|
+	llmam:: LowLevelMixinApplicationMirror 
+		named: nc name 
+		initializer: init method
+		category: cat.
+	^{llmam. {}}
 )
 mixinCall: number <Integer> inheritanceList: iList <Collection[SendAST]>  ^ <NormalSendAST> = (
 	(* Probably migrate to superclass *)
@@ -2785,12 +2797,12 @@ mixinCall: number <Integer> inheritanceList: iList <Collection[SendAST]>  ^ <Nor
 	send <NormalSendAST> = NormalSendAST new to: var send: superMsg; start: aNode start; end: aNode end.
 	|
 
-      superMsg selector: (superMixinInitializerSelectorFor:superMsg selector number: number).
+      superMsg sel: (superMixinInitializerSelectorFor:superMsg selector number: number).
 	^send
 )
 mixinInitializerFor: aNode <ClassHeaderAST> ^ <MethodAST> = (
 
-	(* WIP: Creates the instance initializer method for the mixin. This the code shared by all invocations of the mixin defined by the argument *)
+	(* WIP: Creates the instance initializer method for the mixin. This code is shared by all invocations of the mixin defined by the argument *)
 	| 
 	start <integer>
 	end <Integer>
@@ -2834,37 +2846,11 @@ mixinInitializerFor: aNode <ClassHeaderAST> ^ <MethodAST> = (
 mixinInitializerSelectorNameFor: selector <Symbol> ^<Symbol> = (
 	^('mixinInitializer`', selector) asSymbol
 )
-perClassInitializerFor: aNode <ClassHeaderAST> ^ <MethodAST> = (
-(* Looks like this could be hoisted up to the common superclass: NewspeakCompiler`Compiler*)
-	(* Instance initializer for a class. This initializer routine first calls the superclass's main initializer, then calls the mixin initializer to set all the slots, and execute any initialization code in the header. *)
-	| 
-	start <integer>
-	end <Integer>
-	stmts <List[StmtAST]> 
-	initHdr <MessagePatternAST>
-	body <CodeBodyAST>  
-	copier <ASTCopier>
-	|
-
-	start:: aNode superConstructorCall start.
-	end::  aNode  superConstructorCall end.
-	copier:: ASTCopier new.
-	
-	initHdr:: aNode constructor apply: copier. (* set up scope with constructor parameters *)
-	initHdr selector: (initializerSelectorNameFor: initHdr selector).	
-
-	stmts:: OrderedCollection new.
-	(* first call the superclass initializer *)
-	stmts add: (superConstructorCallFor: aNode). 
-	(* then call the mixin initializer *)
-	stmts add: (mixinInitializerFor: aNode). 
-	body:: CodeBodyAST new
-		temporaries: OrderedCollection new
-		statements: stmts;
-		start: start; end: end.
-	^MethodAST new 
-		pattern: initHdr body: body accessModifier: #public;
-		start: start; end: end.
+mixinSendTreeFor: c <ExpressionAST> ^ <NormalSendAST> = (
+	^NormalSendAST new 
+		to: c 
+		send: (MessageAST new send: #mixin with: {}); 
+		start: c start; end: c end
 )
 processClassSideOf: aNode <ClassAST> ofMixin: mixinMirror <LowLevelMixinMirror> = (
 | primaryFactory <MethodMirror> factoryAST <MethodAST> |
@@ -2878,7 +2864,8 @@ processInstanceSideOf: aNode <ClassAST> ofMixin: mixinMirror <LowLevelMixinMirro
 	processSide: side ofMixin: mixinMirror. (* compile instance methods *)
 	^compileNestedClassesOf: side within: mixinMirror. (* gather nested classes *)
 )
-processMethod: aNode <MethodAST> inScope: s <Scope>  in: mixinMirror <LowLevelMixinMirror> = (
+processMethod: aNode <MethodAST> 
+inScope: s <Scope>  in: mixinMirror <LowLevelMixinMirror> ^ <LowLevelMethodMirror> = (
 |  scopeBuilder <ScopeBuilder> method <LowLevelMethodMirror> |
 
 	scopeBuilder:: ScopeBuilder nestedIn: s atLevel: currentDepth.
@@ -3195,18 +3182,20 @@ scopeMap = (
 )'nested classes - private'
 compileNestedClasses: nestedClasses <Collection[ClassDeclarationAST | MixinApplicationClassAST]> within: mixinMirror <LowLevelMixinMirror> ^ <List[MixinRep]> = (
 
-| results <List[MixinRep]> |
-      results:: OrderedCollection new.
+| results <List[MixinRep]> = OrderedCollection new. cat <String> = mixinMirror category, '-nested'.  |
 	nestedClasses do:
 		[ :nc <ClassDeclarationAST | MixinApplicationClassAST> |  | nSlotName <String> |
-		nc hdr category: mixinMirror category, '-nested'.
+		nc category: cat.
 		nSlotName:: slotNameForNestedClassNamed: nc name 
 		                   within: mixinMirror name.
 		mixinMirror instVars addMirror: (InstanceVariableMirror named: nSlotName mutable: true accessModifier: #private).
 		 nc isClassDeclarationNode ifTrue:[
 			results add: (classNode: (nestedMixinWrapperFor: nc in: mixinMirror)). 
-			(* make 'mixin' (a Smalltalk subclass of ProtoObject) for nested class *)
-			].
+			(* make 'mixin' for nested class *)
+			]
+			ifFalse: [
+				results add: (mixinApplicationClassNode: nc in: mixinMirror category: cat).
+				].
 		createNestedClassAccessorFrom: nc within: mixinMirror 
 		].
 	^results
@@ -3220,17 +3209,28 @@ createNestedClassAccessorFrom: classDecl <ClassDeclarationAST | MixinApplication
 (* Create an accessor method for the nested class represented by the incoming class tree.
 This accessor will lazily generate the nested class when its enclosing instance is first asked for it.
 *)
-| n <String>  accessorString <String> ast <MethodAST> nestedName <String> hdr <ClassHeaderAST> classTree <NormalSendAST> |
+| n <String>  accessorString <String> ast <MethodAST> nestedName <String> hdr <ClassHeaderAST> classTree <NormalSendAST>  scope <Scope> |
 
-hdr:: classDecl hdr.
 n:: classDecl name.
 nestedName:: fullyQualifySimpleName: n with: mixinMirror name.
-classTree:: astForComputingClassDeclaration: n fullName: nestedName superCall: hdr superclassCall.
+classTree:: classDecl isMixinApplicationClassAST
+	ifTrue:[
+		scope:: scopeMap at: classDecl.
+		astForComputingMixinApplicationClassDeclaration: n  
+			fullName: nestedName 
+			superCall: classDecl inheritanceChain first  
+			iList: classDecl inheritanceChain tail
+		]
+	ifFalse:[
+		hdr:: classDecl hdr.
+		scope:: (scopeMap at: classDecl instanceSide) superScope.
+		astForComputingClassDeclaration: n fullName: nestedName superCall: hdr superclassCall.
+		].
 ast:: accessorASTForNestedClassNamed: n
 		fullName: nestedName
 		classTree: classTree
 		accessModifier: classDecl accessModifier.
-(processMethod: ast inScope: (scopeMap at: classDecl instanceSide) superScope in: mixinMirror)
+(processMethod: ast inScope: scope  in: mixinMirror)
 	metadata at: #isNestedClassAccessor put: true.
 )
 fullyQualifySimpleName: sn <Symbol> with: fqp <Symbol> ^ <Symbol> = (

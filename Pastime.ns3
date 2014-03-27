@@ -7,9 +7,27 @@ class Pastime usingPlatform: platform usingDispatcher: d = (
 	private dispatcher = d.
 |)
 (
-class Bender = (
+class ChainMessage when: w <[]> catch: c <[] | nil> targetResolver: r sourceFuture: f = PromiseMessage targetResolver: r sourceFuture: f (
+(*Holds a chained listener to be notified with the resolution of the Promise upon resolution.*)|
+	private whenHandler = w.
+	private catchHandler = c.
+|)
+('as yet unclassified'
+dispatch: catchListener <[]> = (
+	sourceFuture
+		invokeWhen: whenHandler
+		catch: catchHandler
+		resolver: sourceFuture resolver (* BOGUS? *)
+		catchListener: catchListener.
+)
+isChainMessage = (
+	^true.
+)) : ()
+class Future = (
 (* A future consists of a Promise and a Resolver, which are the two facets of the Future object in the 
-capability-based security model and POLA as described by Mark Miller. The Promise represents the 'use facet' and the Resolver the 'control facet. *)|
+capability-based security model and POLA as described by Mark Miller. The Promise represents the 'use facet' and the Resolver the 'control facet'.
+
+The future used for actors/asynchrony is a 'push future'. The future used for simulatenous slots/laziness is a 'pull future'. *)|
 
 	public resolution <Object | Exception>
 	
@@ -69,34 +87,22 @@ public postMessage: selector <String> args: args <{}> resolver: resolver <Resolv
 		^self
 	].
 	state == #unresolved ifTrue: [
-		pendingMessages add: (PipelineMessage selector: selector args: args resolver: resolver bender: self).
+		pendingMessages add: (PipelineMessage selector: selector args: args targetResolver: resolver sourceFuture: self).
 		^self
 	].
 	Error signal: 'Invalid state: ',state.
 )) : ()
-class ChainMessage when: w <[]> catch: c <[] | nil> resolver: r <Resolver | nil> bender: b = PromiseMessage resolver: r bender: b (
-(*Holds a chained listener to be notified with the resolution of the Promise upon resolution.*)|
-	private whenHandler = w.
-	private catchHandler = c.
-|)
-('as yet unclassified'
-dispatch: catchListener <[]> = (
-	bender invokeWhen: whenHandler catch: catchHandler resolver: bender resolver catchListener: catchListener.
-)
-isChainMessage = (
-	^true.
-)) : ()
-class PipelineMessage selector: s <String> args: a <{}> resolver: r <Resolver | nil> bender: b = PromiseMessage resolver: r bender: b (
+class PipelineMessage selector: s <String> args: a <{}> targetResolver: r sourceFuture: f = PromiseMessage targetResolver: r sourceFuture: f (
 (*Holds a pipelined message to be delivered to the resolution of the Promise upon resolution.*)|
 	private selector = s.
 	private args = a.
 |)
 ('as yet unclassified'
 dispatch: catchListener <[]> = (
-	| state = bender state. | 
-	state == 'resolved' ifTrue: [
+	| state = sourceFuture state. | 
+	state == #resolved ifTrue: [
 		(*The resolution is guaranteed NOT to be a Promise.*)
-		postMessageTo: bender resolution selector: selector args: args resolver: resolver.
+		postMessageTo: sourceFuture resolution selector: selector args: args resolver: targetResolver.
 		^self.
 	].
 	state == 'smashed' ifTrue: [
@@ -104,7 +110,7 @@ dispatch: catchListener <[]> = (
 		that would in turn signal an Error and smash the resolver.
 		Here we short-circuit that and smash the resolver directly.*)
 		(*Note: the resolver is guaranteed to be near.*)
-		resolver isNil ifFalse: [ resolver smash: bender resolution ].
+		targetResolver isNil ifFalse: [ targetResolver smash: sourceFuture resolution ].
 		^self.
 	].
 	Error signal: 'Invalid state: ', state.
@@ -112,21 +118,20 @@ dispatch: catchListener <[]> = (
 isPipelineMessage = (
 	^true.
 )) : ()
-class Promise for: b = (
-(* A Promise is an unresolved eventual reference that buffers 
-messages eventual-sent to it and eventually-sends them upon resolution. *)|
-	private bender <Bender> = b.
+class Promise for: f = (
+(* A Promise is an unresolved eventual reference that buffers messages eventual-sent to it and eventually-sends them upon resolution. *)|
+	private future <Future> = f.
 |)
 ('accessing'
 protected doesNotUnderstand: msg <MessageMirror> ^ <Object> = (
-	| state = bender state. |
-	state == #resolved ifTrue: [ ^msg sendTo: bender resolution ].
+	| state = future state. |
+	state == #resolved ifTrue: [ ^msg sendTo: future resolution ].
 	state == #smashed ifTrue: [
 		| sel |
 		(* For debugger inspection support: ignore is* messages, like Object does. *)
 		sel: msg selector.
 		sel isUnary ifTrue: [(sel startsWith: 'is') ifTrue: [^false]].
-		^Error signal: 'Promise smashed with: ', bender resolution.
+		^Error signal: 'Promise smashed with: ', future resolution.
 	].
 	state == #unresolved ifTrue: [
 		| sel |
@@ -141,14 +146,14 @@ public whenResolved: whenHandler <[]> ^ <Promise> = (
 	^self whenResolved: whenHandler catch: nil.
 )
 public whenResolved: whenHandler <[]> catch: catchHandler <[] | nil> ^ <Promise> = (
-	| future = Bender new. |
-	self whenResolved: whenHandler catch: catchHandler resolver: future resolver.
-	^future promise
+	| chainedFuture = Future new. |
+	self whenResolved: whenHandler catch: catchHandler resolver: chainedFuture resolver.
+	^chainedFuture promise
 )'as yet unclassified'
 public , other <Promise> ^ <PromiseGroup> = (
-	| state = bender state. |
-	state == #resolved ifTrue: [ ^bender resolution , other ].
-	state == #smashed ifTrue: [ Error signal: 'Promise smashed with: ', bender resolution ].
+	| state = future state. |
+	state == #resolved ifTrue: [ ^future resolution , other ].
+	state == #smashed ifTrue: [ Error signal: 'Promise smashed with: ', future resolution ].
 	state == #unresolved ifTrue: [ ^PromiseGroup for: other head: (PromiseGroup for: self) ].
 	Error signal: 'Illegal state: ', state.
 )
@@ -156,9 +161,9 @@ public ESEND = (
 	^dispatcher mirrors EventualSendProxy for: self
 )
 whenResolved: whenHandler <[]> catch: catchHandler <[] | nil> resolver: resolver <Resolver | nil> = (
-	bender state == 'unresolved'
-		ifTrue: [ bender pendingMessages add: (ChainMessage when: whenHandler catch: catchHandler resolver: resolver bender: bender) ]
-		ifFalse: [ bender invokeWhen: whenHandler catch: catchHandler resolver: resolver catchListener: []. ].
+	future state == #unresolved
+		ifTrue: [ future pendingMessages add: (ChainMessage when: whenHandler catch: catchHandler targetResolver: resolver sourceFuture: future) ]
+		ifFalse: [ future invokeWhen: whenHandler catch: catchHandler resolver: resolver catchListener: []. ].
 )) : ()
 class PromiseGroup for: p head: h <PromiseGroup | nil> = (
 (*A PromiseGroup represents a combined promise for a list of promises that is lazily initialized.*)|
@@ -172,7 +177,7 @@ class PromiseGroup for: p head: h <PromiseGroup | nil> = (
 )
 all = (
 	(lazyAll == nil) ifTrue: [
-		| future = Bender new. counter ::= 0. |
+		| future = Future new. counter ::= 0. |
 		do: [ :it |
 			counter:: counter + 1.
 			it whenResolved: [ 
@@ -198,42 +203,42 @@ doesNotUnderstand: msg <MessageMirror> ^ <Object> = (
 for: p <Promise> = (
 	^PromiseGroup for: p head: nil.
 ))
-class PromiseMessage resolver: r <Resolver | nil> bender: b = (
+class PromiseMessage targetResolver: r sourceFuture: f = (
 (*An abstract class represeting a pending message buffered in an unresolved Promise.*)|
 	
 	(* Resolver for the promise which is the result of the pipelined/chained message. *)
-	protected resolver = r.
+	protected targetResolver = r.
 	
 	(* The future on which the pipelined/chained message is waiting. *)
-	protected bender = b.
+	protected sourceFuture = f.
 |)
 ('as yet unclassified'
 dispatch: catchListener <[]> = (
 	subclassResponsibility.
 )) : ()
-class Resolver for: b<Bender> = (
+class Resolver for: f <Future> = (
 (*A Resolver represents the authority to resolve a Promise and is the control facet of the promise's eventual resolution.*)|
-	private bender = b.
+	private future = f.
 |)
 ('accessing'
-resolve: resolution <Object> ^ <Boolean> = (
-	| unresolved = bender state == #unresolved. |
+public resolve: resolution <Object> ^ <Boolean> = (
+	| unresolved = future state == #unresolved. |
 	unresolved ifTrue: [
 		(isPromise: resolution) ifTrue: [
 			(*Detect divergence.*)
-			resolution == bender promise ifTrue: [ Error signal: 'Attempting to resolve a promise to itself.' ].
+			resolution == future promise ifTrue: [ Error signal: 'Attempting to resolve a promise to itself.' ].
 			resolution whenResolved: [ :finalResolution | resolve: finalResolution ] catch: [ :error | smash: error ] resolver: nil.
 		]
 		ifFalse: [
-			bender doResolve: resolution type: #resolved.
+			future doResolve: resolution type: #resolved.
 		].
 	].
 	^unresolved.
 )
-smash: error <Error> ^ <Boolean> = (
-	| unresolved = bender state == #unresolved. |
+public smash: error <Error> ^ <Boolean> = (
+	| unresolved = future state == #unresolved. |
 	unresolved ifTrue: [
-		bender doResolve: error type: #smashed.
+		future doResolve: error type: #smashed.
 	].
 	^unresolved.
 )) : ()'as yet unclassified'
@@ -242,9 +247,9 @@ isBrokenRef: ref <Object> = (
 )
 unwrapPromise: o <Object> ^ <Object> = (
 	(*Smashed promises are broken refs and should NOT be unwrapped.*)
-	#BOGUS. (* Accessing private slot #bender. *)
-	((isPromise: o) and: [ o bender state == 'resolved' ])
-		ifTrue: [ ^o bender resolution ] 
+	#BOGUS. (* Accessing private slot #future. *)
+	((isPromise: o) and: [ o future state == #resolved ])
+		ifTrue: [ ^o future resolution ] 
 		ifFalse: [ ^o ].
 )'private'
 isPromise: o <Object> = (
@@ -253,8 +258,8 @@ isPromise: o <Object> = (
 )
 postMessageTo: receiver <Object> selector: selector <String> args: args <{}> resolver: resolver <Resolver | nil> = (
 	(* Note: resolver is always near. *)
-	#BOGUS. (* Accessing private slot #bender. *)
+	#BOGUS. (* Accessing private slot #future. *)
 	(isPromise: receiver)
-		ifTrue: [ receiver bender postMessage: selector args: args resolver: resolver. ]
+		ifTrue: [ receiver future postMessage: selector args: args resolver: resolver. ]
 		ifFalse: [ dispatcher postMessageTo: receiver selector: selector args: args resolver: resolver. ].
 )) : ()

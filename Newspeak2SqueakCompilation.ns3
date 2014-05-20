@@ -351,7 +351,7 @@ normalSend: selector numArgs: numArgs = (
 	|
 	index ::= specialSelectors indexOf: selector.
 	|
-	decrementStackDepthBy: numArgs + 1 (* the receiver *).
+	decrementStackDepthBy: selector numArgs + 1 (* the receiver *).
 	incrementStackDepthBy: 1.
 		
 	(* Special selector? *)
@@ -714,7 +714,7 @@ normalSend: selector numArgs: numArgs = (
 	extendedIndex extendedNArgs
 	|
 	
-	decrementStackDepthBy: numArgs + 1 (* the receiver *).
+	decrementStackDepthBy: selector numArgs + 1 (* the receiver *).
 	incrementStackDepthBy: 1.
 	
 	(specialSelectors includes: selector) ifTrue:
@@ -2446,21 +2446,55 @@ checkForDuplicateNames: node <ClassDeclarationAST> = (
 			s nextPutAll: '.'.].
 		assert: [false] message: message].
 )
-classInitializerFor: classDef <MixinApplicationClassAST> = (
-(* Probably migrate to superclass *)
+private classDeclarationInitializerFor: aNode <ClassHeaderAST> ^<MethodAST> = (
+
 	| 
-	pattern = classDef constructor apply: ASTCopier new.
-	stmts = OrderedCollection new.
-	body = CodeBodyAST new temporaries: {} statements: stmts.
-	mtd = MethodAST new pattern: pattern body: body accessModifier: #public.
-	iList = classDef inheritanceChain.
+	start <integer>
+	end <Integer>
+	stmts <List[StmtAST]> 
+	initHdr <MessagePatternAST>
+	body <CodeBodyAST>  
+	slots <Collection[StmtAST]>
+	copier <ASTCopier>
 	|
-	pattern selector: (initializerSelectorNameFor: pattern selector).
-	iList size to: 2 by: -1 do:[:i | stmts addFirst: (mixinCall: i inheritanceList: iList)].
-	stmts addFirst: (superFactoryCallFor: iList first).
-	body start: stmts first start; end: stmts last end.
-	mtd start: pattern start; end: body end.
-	^mtd.
+
+	start:: aNode superConstructorCall start.
+	end::  aNode  superConstructorCall end.
+	copier:: ASTCopier new.
+	initHdr:: aNode constructor apply: copier. (* set up scope with constructor parameters *)
+	initHdr selector: (initializerSelectorNameFor: initHdr selector).	
+		
+	(* Call super initializers *)
+	stmts:: mixinInitializationCallsFor: aNode inheritanceChain.
+
+     (* run slot initializers *)
+	slots:: (aNode slots reject: [:slot | slot initializer isNil]) collect: 
+		[:slot <SlotDefAST> |
+		| aMsg <MessageAST> slotInitializer <ExpressionAST> |
+		slotInitializer:: slot initializer apply: copier.
+		aNode isSeq ifFalse: [slotInitializer:: futureFor: slotInitializer].
+		aMsg:: MessageAST new 
+			send: (setterSelectorFor: slot) with:  {slotInitializer};
+			start: slot start;
+			end: slot end.
+		NormalSendAST new msg: aMsg; 
+			recv: (selfNode start: aMsg start; end: aMsg end);
+			start: aMsg start; end: aMsg end].
+
+	stmts addAll: slots.
+	
+	(*  run init expressions *)
+	aNode initExprs do:
+		[:ie <ExpressionAST> | stmts add: (ie apply: copier)]. 
+	
+	body:: CodeBodyAST new
+		parameters: initHdr parameters
+		temporaries: OrderedCollection new
+		statements: stmts;
+		start: start; end: end.
+	^MethodAST new 
+		pattern: initHdr body: body accessModifier: #public;
+		start: start; end: end
 )
 public compileClassSource: src <ReadStream> within: enclosing <MixinMirror> ^  <MixinRep>   = (
 (* the input is source code for a class declaration and a mirror on the enclosing class of the class to be
@@ -2576,6 +2610,20 @@ compileNestedClassAST: tree <ClassDeclarationAST | MixinApplicationClassAST> int
 		^ { enclosingMirror . nestedClassMixinReps }.
 		(* what about other nested classes of enclosing? Not the compiler's responsibility; they are unchanged, and the surrounding reflection system should add them to the mixin rep *)
 )
+computeSlotInitializersFor: aNode <ClassHeaderAST> ^ <Collection[StmtAST]> = (
+	^(aNode slots reject: [:slot | slot initializer isNil]) collect: 
+		[:slot <SlotDefAST> |
+		| aMsg <MessageAST> slotInitializer <ExpressionAST> |
+		slotInitializer:: slot initializer apply: ASTCopier new.
+		aNode isSeq ifFalse: [slotInitializer:: futureFor: slotInitializer].
+		aMsg:: MessageAST new 
+			send: (setterSelectorFor: slot) with:  {slotInitializer};
+			start: slot start;
+			end: slot end.
+		NormalSendAST new msg: aMsg; 
+			recv: (selfNode start: aMsg start; end: aMsg end);
+			start: aMsg start; end: aMsg end].
+)
 doitBlackMarketArgumentName = (
 	^'`'
 )
@@ -2660,7 +2708,7 @@ mixinApplicationClassNode: nc <MixinApplicationClassAST>
 		named: (namer fullyQualifySimpleName: nc name with: mixinMirror name) isMeta: false.
 	scope <Scope> = scopeMap at: nc. 
 	init <LowLevelMethodMirror>  = 
-		processMethod: (classInitializerFor: nc) inScope: scope in: llmam.
+		processMethod: (mixinApplicationInitializerFor: nc) inScope: scope in: llmam.
 	
 	cmm <CompiledMixinMirror> = (CompiledMixinMirror header: '' mirror: llmam)
 					category: cat;
@@ -2670,6 +2718,20 @@ mixinApplicationClassNode: nc <MixinApplicationClassAST>
 	llmam methods addMirror: init.
 	processFactoryFor: nc inScope: scope in: llmam classMixin.
 	^{cmm. {}}
+)
+mixinApplicationInitializerFor: classDef <MixinApplicationClassAST> = (
+(* Probably migrate to superclass *)
+	| 
+	pattern = classDef constructor apply: ASTCopier new.
+	iList = classDef inheritanceChain.
+	stmts = mixinInitializationCallsFor: iList.
+	body = CodeBodyAST new temporaries: {} statements: stmts.
+	mtd = MethodAST new pattern: pattern body: body accessModifier: #public.
+	|
+	pattern selector: (initializerSelectorNameFor: pattern selector).
+	body start: stmts first start; end: stmts last end.
+	mtd start: pattern start; end: body end.
+	^mtd.
 )
 mixinCall: number <Integer> inheritanceList: iList <Collection[SendAST]>  ^ <NormalSendAST> = (
 	(* Probably migrate to superclass *)
@@ -2683,6 +2745,12 @@ mixinCall: number <Integer> inheritanceList: iList <Collection[SendAST]>  ^ <Nor
 
       mixinMsg sel: (superMixinInitializerSelectorFor: mixinMsg selector number: number -1).
 	^send
+)
+mixinInitializationCallsFor: iList <List[SendAST]>  ^ <List[StmtAST]> = (
+      | stmts <List[StmtAST]> = OrderedCollection new. |
+	iList size to: 2 by: -1 do:[:i | stmts addFirst: (mixinCall: i inheritanceList: iList)].
+	stmts addFirst: (superFactoryCallFor: iList first).
+	^stmts
 )
 private mixinInitializerFor: aNode <ClassHeaderAST> ^ <MethodAST> = (
 
@@ -2857,7 +2925,7 @@ superFactoryCallFor: aNode <SendAST> ^ <NormalSendAST> = (
 	^send
 )
 superMixinInitializerSelectorFor: selector <Symbol> number: i <Integer> ^<Symbol> = (
-	^('mixinInitializer`', selector, '`',  i printString) asSymbol
+	^('mixinInitializer`',  i printString, '`', selector ) asSymbol
 )
 syntheticNameSeparator ^ <String> = (
   ^Language syntheticNameSeparator	
@@ -2936,7 +3004,7 @@ private allInitializersFor: aNode <ClassHeaderAST> ^<Collection[MethodAST]> = (
 
 	^aNode slots size > methodCompiler slotsPerMethod
 	   ifTrue: [splitInitializersFor: aNode]
-	   ifFalse: [{singleInitializerFor: aNode. mixinInitializerFor: aNode}]
+	   ifFalse: [{classDeclarationInitializerFor: aNode. mixinInitializerFor: aNode}]
 )
 initializerSelectorNameFor: selector <Symbol> ^<Symbol> = (
 	^('initializer`', selector) asSymbol
@@ -3219,11 +3287,11 @@ private astForComputingClassDeclaration: simpleName <String> fullName: nestedNam
 (* WIP. Compute the tree for an ordinary class declaration whose superclass is a generalized mixin application. *)
 	| 	
 	nestedMixin = nestedMixinASTFor: nestedName.  
-	superChain = inheritanceASTWIthSuperclass: ( superCall recv)  iList:  iList allButLast.	
+	superChain = inheritanceASTWIthSuperclass: superCall recv iList: iList.	
 	|
 
 	^NormalSendAST new
-		to: (mixinSendTreeFor: iList last recv)
+		to: nestedMixin
 		send: #apply:withName:
 		with: {
 			superChain.
@@ -3284,7 +3352,10 @@ classTree:: classDecl isMixinApplicationClassAST
 	ifFalse:[
 		hdr:: classDecl hdr.
 		scope:: (scopeMap at: classDecl instanceSide) superScope.
-		astForComputingClassDeclaration: n fullName: nestedName superCall: hdr superclassCall.
+		astForComputingClassDeclaration: n 
+			fullName: nestedName 
+			superCall: hdr superCall
+			iList: hdr inheritanceChain allButFirst.
 		].
 ast:: accessorASTForNestedClassNamed: n
 		fullName: nestedName

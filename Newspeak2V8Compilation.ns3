@@ -146,6 +146,7 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 (
 class ClassDeclarationIR = (|
 	name
+	headerSource
 	instanceSide = MixinIR for: self isMeta: false.
 	classSide = MixinIR for: self isMeta: true.
 |)
@@ -169,14 +170,12 @@ basicNewMeta = (
 	))
 )
 classMethodsMetadata = (
-	^js array: ((classSide methods reject: [:method | method isSynthetic]) collect: [:method | js literal: method name])
-)
-classSourcesMetadata = (
-	| sources = js objectLiteral. |
-	classSide methods do:
-		[:method | method isSynthetic 
-			ifFalse: [sources addSlot: method name value: (js literal: (method src ifNil: ['missing']))]].
-	^sources
+	^js array: (classSide methods collect:
+		[:method | js new: (js ident: 'MM') with: {
+			js literal: method name.
+			js literal: method isSynthetic.
+			method src ifNil: [js ident: 'null'] ifNotNil: [:src | js literal: src]
+		}])
 )
 invoke = (
 	^js functionOf: {js ident: 'runtimeSuperclass'. js ident: 'enclosingObjects'} body: (js block: {
@@ -232,7 +231,12 @@ makeMixin: rm = (
 	^js call: (js propertyOf: (js ident: 'Mixin') at: (js literal: 'fromRuntimeMixin')) with: {rm}
 )
 methodsMetadata = (
-	^js array: ((instanceSide methods reject: [:method | method isSynthetic]) collect: [:method | js literal: method name])
+	^js array: (instanceSide methods collect:
+		[:method | js new: (js ident: 'MM') with: {
+			js literal: method name.
+			js literal: method isSynthetic.
+			method src ifNil: [js ident: 'null'] ifNotNil: [:src | js literal: src]
+		}])
 )
 nestedClassesMetadata = (
 	^js array: (instanceSide nestedClasses collect: [:nc | js literal: nc name])
@@ -249,9 +253,7 @@ runtimeMetamixin = (
 		js assign: (js propertyOf: (js ident: 'this') at: (js literal: 'debug')) toBe: (js literal: 'Runtime meta mixin for ', name).
 		js assign: (js propertyOf: (js ident: 'this') at: (js literal: 'slots')) toBe: (js array: {}).
 		js assign: (js propertyOf: (js ident: 'this') at: (js literal: 'methods')) toBe: classMethodsMetadata.
-		js assign: (js propertyOf: (js ident: 'this') at: (js literal: 'factory')) toBe: (js literal: (classSide methods detect: [:e | e isFactory]) name).
 		js assign: (js propertyOf: (js ident: 'this') at: (js literal: 'nestedClasses')) toBe: (js array: {}).
-		js assign: (js propertyOf: (js ident: 'this') at: (js literal: 'sources')) toBe: classSourcesMetadata.
 		},
 		(classSide methods collect: [:m | 
 			js assign: (js propertyOf: (js ident: 'this') at: (js literal: (names mangleSelector: m name))) toBe: m function]),
@@ -266,10 +268,11 @@ runtimeMixin = (
 		js var: '$' value: (js ident: 'this').
 		js assign: (js propertyOf: (js ident: 'this') at: (js literal: 'debug')) toBe: (js literal: 'Runtime mixin for ', name).
 		js assign: (js propertyOf: (js ident: 'this') at: (js literal: 'name')) toBe: (js literal: name).
+		js assign: (js propertyOf: (js ident: 'this') at: (js literal: 'header')) toBe: (js literal: headerSource).
 		js assign: (js propertyOf: (js ident: 'this') at: (js literal: 'slots')) toBe: slotsMetadata.
 		js assign: (js propertyOf: (js ident: 'this') at: (js literal: 'methods')) toBe: methodsMetadata.
 		js assign: (js propertyOf: (js ident: 'this') at: (js literal: 'nestedClasses')) toBe: nestedClassesMetadata.
-		js assign: (js propertyOf: (js ident: 'this') at: (js literal: 'sources')) toBe: sourcesMetadata.
+		js assign: (js propertyOf: (js ident: 'this') at: (js literal: 'applications')) toBe: (js array: {}).
 		},
 		(instanceSide methods collect: [:m | 
 			js assign: (js propertyOf: (js ident: 'this') at: (js literal: (names mangleSelector: m name))) toBe: m function]),
@@ -285,14 +288,12 @@ runtimeMixin = (
 	))) with: {}
 )
 slotsMetadata = (
-	^js array: ((instanceSide slots reject: [:slot | slot isSynthetic]) collect: [:slot | js literal: slot name])
-)
-sourcesMetadata = (
-	| sources = js objectLiteral. |
-	instanceSide methods do:
-		[:method | method isSynthetic 
-			ifFalse: [sources addSlot: method name value: (js literal: (method src ifNil: ['missing']))]].
-	^sources
+	^js array: (instanceSide slots collect:
+		[:slot | js new: (js ident: 'SM') with: {
+			js literal: slot name.
+			js literal: slot isMutable.
+			js literal: slot isSynthetic
+	}]).
 )) : ()
 class Compiler = super Compiler ((* A work-in-progress Compiler reimplementation, with Javascript AST as the output. This makes automated testing easier and provides control over formatting (for example, placing every expression on its own line to allow for precise breakpoint placement in substandard JS debugger implementations). *)|
 	scopeStack ::= OrderedCollection new.
@@ -346,20 +347,6 @@ canInlineSeqexps ^<Boolean> = (
 )
 currentScope = (
 	^super currentScope
-)
-depthOfExplicit: binding = (
-	| depth |
-	#BOGUS. (* Should be the same as depthOfImplicit: *)
-	depth:: outer Compiler currentDepth - binding depth - 1.
-	assert: [depth >= 0] message: 'Invalid enclosing object index'.
-	^depth
-)
-depthOfImplicit: binding = (
-	| depth |
-	#BOGUS. (* Should be the same as depthOfExplicit: *)
-	depth:: outer Compiler currentDepth - binding depth.
-	assert: [depth >= 0] message: 'Invalid enclosing object index'.
-	^depth
 )
 inline: node as: sendClass selector: selector rewriteArgsAs: argRewriteBlock = (
 	| receiver message |
@@ -1017,7 +1004,8 @@ compileExpressionSource: stm <ReadStream> inMixin: enclosing <MixinMirror> ^<Met
 	
 	(* Parse as a code body *)
 	body:: parser doItExpression parse: stm.
-	
+	input:: stm.
+
 	(* Ensure last statement is a return statement *)
 	body statements isEmpty ifFalse:
 		[body statements last isReturnStatNode ifFalse:
@@ -1034,7 +1022,7 @@ compileExpressionSource: stm <ReadStream> inMixin: enclosing <MixinMirror> ^<Met
 	
 	(* Build scope *)
 	setScopeFor: method in: enclosing.
-	currentMixinUID: enclosing name.
+	currentMixinUID: enclosing declaration name.
 	
 	(* Rewrite and compile *)
  	result:: methodNode: method.
@@ -1046,7 +1034,8 @@ compileMethodSource: source <ReadStream> within: enclosing <MixinMirror> ^<Metho
 	tree:: parser methodDecl parse: source.
 	setInput: source.
 	setScopeFor: tree in: enclosing.
-	jsTree:: translateMethodNode: tree.
+	currentMixinUID: enclosing declaration name.
+	jsTree:: methodNode: tree.
 	scopeMap:: Dictionary new.
 	^jsTree
 )
@@ -1067,28 +1056,6 @@ compileNestedClassesOf: aNode <SideAST> within: mixinMirror <LowLevelMixinMirror
 	(* where do we check that nested classes do not conflict with each other, or with methods or slots? *)
 	^compileNestedClasses: aNode nestedClasses within: mixinMirror
 )
-compileWithFullInfoTopLevelClassSource: source <ReadStream> = (
-	| tree rep mixinAst ast output |
-	tree:: parser classDefinition parse: source.
-	setInput: source.
-	setScopeFor: tree in: nil.
-	(*sentSelectors:: Set new.*)
-	rep:: classNode: tree.
-	mixinAst:: translateMixinRep: rep. 
-	ast:: js
-		propertyOf: (js
-			call: (js ident: 'makeTopLevelClass')
-			with: {mixinAst})
-		at: (js literal: 'factory').
-	output:: WriteStream on: (MutableString new: 100).
-	jsWriter generateSourceFor: ast on: output.
-	^{	output contents.
-		jsWriter nsIntervals.
-		jsWriter jsIntervals.
-		tree.
-		ast
-	}
-)
 computeMethod: aNode <MethodAST> inScope: s <Scope> = (
 	|  scopeBuilder <ScopeBuilder>  |
 	scopeBuilder:: ScopeBuilder nestedIn: s atLevel: currentDepth.
@@ -1104,8 +1071,8 @@ computeMixinFrom: aNode <ClassHeaderAST> ^ <ClassDeclarationIR> = (
 	ir name: aNode name.
 	aNode slots do: [:s |
 		ir instanceSide slots add: (SlotIR named: s name mutable: s isMutable)].
-	(* ir headerSource: (input contents copyFrom: aNode start to: aNode end).
-	ir factorySelector: aNode constructor selector. *)
+	ir headerSource: (input contents copyFrom: aNode start to: aNode end).
+	(* ir factorySelector: aNode constructor selector. *)
 	^ir
 )
 createNestedClassAccessorFrom: classDecl <ClassDeclarationAST> within: mixinMirror <LowLevelMixinMirror> = (
@@ -1257,14 +1224,6 @@ params <List[VarDeclAST]>
 language = (
 	^#NewspeakLanguage2
 )
-makeCreateSlotsFor: hdr <ClassHeaderAST>  within: mixinMirror <LowLevelMixinMirror> ^ <MethodAST> = (
-(* Create the method that initializes the slots defined by the class declaration to nil *)
-	| accessor <MethdMirror>  |
-	accessor:: MethodMirror named: #createSlots.
-	accessor method: (createSlotsFor: hdr).
-	accessor isSynthetic: true.
-	mixinMirror methods addMirror: accessor.
-)
 methodNode: aNode <MethodAST> ^ <MethodMirror> = (
 	| tree <AST> jsTree |
 	tree:: aNode apply: rewriter.  (* rewrite ast *)
@@ -1315,22 +1274,6 @@ outputClass: mixinRep <MixinRep> toNamespace: namespace <FilePattern> = (
 	(namespace / (simpleName, '.js')) stream: [:stream |
 		jsWriter generateSourceFor: ast on: stream].
 	
-)
-outputCreationOfClass: mixinRep <MixinRep> to: stream<[:WriteStream]> = (
-
-	| ast |
-	ast:: js
-		propertyOf: (js
-			call: (js ident: 'makeTopLevelClass')
-			with: {js propertyOf: (js ident: mixinNamespace) at: (js literal: mixinRep first name)})
-		at: (js literal: 'factory').
-
-	jsWriter generateSourceFor: ast on: stream
-)
-outputInfrastructureCodeTo: stream = (
-
-	InfrastructureFunctions new outputTo: stream.
-	Phase1Platform new outputTo: stream.
 )
 outputTopLevelClass: rep <MixinRep> to: stream <WriteStream> = (
 	| mixinAst ast |
@@ -1414,16 +1357,7 @@ slotNameForNestedClassNamed: ncn <String> within: outerName <String> ^ <String> 
 )
 sourceForNode: node <AST> ^ <String> = (
 	| savedPos <Integer> pos <Integer> len <Integer> s <String> |
-	(* ^String withAll: (input copyFrom: node start to: node end *)
-	savedPos:: input position.
-	len: (node end - node start) + 1.
-	s:: MutableString new: len.
-	input position: node start -1.
-	1 to: len do:
-		[:index |
-		s at: index put: input next].	
-	input position: savedPos.
-	^s
+	^input contents copyFrom: node start to: node end
 )
 superConstructorCallFor: aNode <ClassHeaderAST> ^<NormalSendAST> = (
 	
@@ -1490,12 +1424,6 @@ args <List>
 )
 superConstructorNameFor: aNode <ClassHeaderAST> ^ <Symbol> = (
 	^'superInit`', aNode name
-)
-translateMethodNode: method <MethodAST> = (
-	| tree <AST> |
-	tree:: method apply: rewriter.
-	translator beginNewTranslationCycle.
-	^tree apply: translator.
 )
 translateMixinRep: mixin <MixinRep> = (
 	| mirror <LowLevelMixinMirror> object |
@@ -1688,6 +1616,8 @@ private script = (
 		{js literal: 'use strict'.
 		js var: 'nil' value: (js literal: 'patch me with nil').
 		js var: 'theGlobalObject' value: (js ident: 'this').
+		js verbatim: 'function SM(n,m,s){this.name=n; this.isMutable=m; this.isSynthetic=s; }'.
+		js verbatim: 'function MM(n,sy,src){this.name=n; this.isSynthetic=sy; this.source=src; }'.
 		js var: 'mixins' value: runtimeMixinNamespace.
 		vmmirror.
 		namespace.
@@ -1905,7 +1835,8 @@ var vmmirror = new function(){
 		newspeakClass.$enclosingObjects$slot = enclosingObjects;
 		newspeakClass.$name$slot = runtimeMixin.name;
 		newspeakClass.runtimeClass = runtimeClass;
-		
+
+		runtimeMixin.applications.push(runtimeClass);
 		return newspeakClass;
 	};
 	

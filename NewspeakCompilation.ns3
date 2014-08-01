@@ -534,12 +534,6 @@ codeBodyNode: node <CodeBodyAST> = (
 	scopeMap at: result put: bodyScope.
 	^result
 )
-depthOfExplicit: binding = (
-	^outer Compiler currentDepth - binding depth -1
-)
-depthOfImplicit: binding = (
-	^outer Compiler currentDepth - binding depth -1
-)
 emptyBody = (
 	| body |
 	#BOGUS. (* Should be able to use immutable collections. *)
@@ -549,14 +543,6 @@ emptyBody = (
 		statements: (OrderedCollection with: NilAST new).
 	scopeMap at: body put: nil.
 	^body
-)
-enclosingClassNamed: name <Symbol> ^<ClassEntry> = (
-	| entry <ClassEntry> |
-	entry:: currentScope at: #'@currentClass'.
-	[entry isNil] whileFalse:
-		[entry name = name ifTrue: [^entry].
-		entry:: entry enclosingClass].
-	Error signal: 'No enclosing class named "', name, '"'
 )
 futureFor: expression <ExpressionAST> ^<ExpressionAST> = (
 	(* @here Future computing: [expression] *)
@@ -708,6 +694,24 @@ normalSendNode: node <NormalSendAST> ^<AST> = (
 numberNode: node <NumberAST> = (
 	^node
 )
+offsetOfEnclosingObjectForClass: name <Symbol> ^<Integer> = (
+	| entry <ClassEntry> |
+	entry:: currentScope at: #'@currentClass'.
+	[entry isNil] whileFalse:
+		[entry name = name ifTrue: [
+			| offset = outer Compiler currentDepth - entry depth - 1. |
+			assert: [offset >= 0] message: 'Invalid enclosing object index'.
+			^offset].
+		entry:: entry enclosingClass].
+	Error signal: 'No enclosing class named "', name, '"'
+)
+offsetOfImplicitReceiverTarget: binding <SymbolTableEntry> ^<Integer> = (
+	(* Note this calculation differs from the one used by explicit outer sends by a factor of one. This is because an explicit outer send needs the depth of the enclosing object with for a class whose name is a given selector, whereas an implicit receiver send needs the depth of the enclosing object for the class that defined a given selector. *)
+	| depth |
+	depth:: outer Compiler currentDepth - binding depth.
+	assert: [depth >= 0] message: 'Invalid enclosing object index'.
+	^depth
+)
 processEventualSend: node <NormalSendAST> = (
 	| esendProxy |
 	esendProxy:: OrdinarySendAST
@@ -724,7 +728,7 @@ processImplicitReceiverSend: node <NormalSendAST> = (
 	
 	binding isMessagePatternNode ifTrue:
 		[ (* This is a message send for a lexically defined method. *)
-		^processImplicitReceiverSend: node msg atDepth: (depthOfImplicit: binding)].
+		^processImplicitReceiverSend: node msg atDepth: (offsetOfImplicitReceiverTarget: binding)].
 	
 	binding isVarDeclNode
 		ifTrue: [^processLocalAccess: node msg of: binding].
@@ -835,18 +839,14 @@ processLocalWrite: message <MessageAST> to: declaration = (
 		end: message end    
 )
 processOuterExpression: node <NormalSendAST> = (
-	| binding <AST> |
-	binding:: enclosingClassNamed: node msg sel.
 	^EnclosingObjectAST new
-		depth: (depthOfExplicit: binding);
+		depth: (offsetOfEnclosingObjectForClass: node msg sel);
 		start: node recv start;
 		end: node msg end
 )
 processOuterSend: node <NormalSendAST> = (
-	| binding <AST> |
-	binding:: enclosingClassNamed: node recv msg sel.
 	^OuterSendAST new
-		depth: (depthOfExplicit: binding);
+		depth: (offsetOfEnclosingObjectForClass: node recv msg sel);
 		message: (node msg apply: self);
 		start: node recv recv start;
 		end: node msg end
@@ -999,24 +999,41 @@ One can process only a side without its subtrees (i.e., methods and nested class
 scopeStack <OrderedCollection[Scope]> = OrderedCollection new.
 currentDepth <Integer> ::= initialDepth. (* The lexical nesting level of the class declaration currently being visited; top-level classes are level 0. *)
 |pushScope: initialScope)
-('access'
-visitNode: aNode <AST> within: m <ClassDeclarationMirror> ^ <Dictionary[AST, Scope]> = (
-   pushScope: (buildScopeFor: m).
-   aNode apply: self.
-   ^scopeMap
-)'as yet unclassified'
-buildScopeFor: cd <ClassDeclarationMirror> ^<Scope> = (
-	^prvtScopeFor: cd.
+('as yet unclassified'
+buildScopeFor: mm <MixinMirror> ^<Scope> = (
+	assert: [mm isMixinMirror] message: ''.
+	^incrementalScopeFor: mm.
 )
-enclosingMixinsOf: m <ClassDeclarationMirror> ^<Collection[ClassDeclarationMirror]> = (
-	(* Outermost first. *)
-	| current mixins |
-	mixins:: OrderedCollection new.
-	current:: m.
-	[current isNil] whileFalse:
-		[mixins addFirst: current.
-		current: current enclosingClass].
-	^mixins
+incrementalScopeFor: mm <MixinMirror> ^<Scope> = (
+	|
+	enclosingScope <Scope>
+	scope <Scope>
+	currentClass <ClassEntry>
+	depth
+	|
+	mm declaration enclosingClass 
+		ifNil: [enclosingScope:: Scope new]
+		ifNotNil: [:it | enclosingScope:: incrementalScopeFor: it instanceSide].
+	scope:: Scope new superScope: enclosingScope.
+	depth:: scope depth.
+	currentClass:: ClassEntry 
+		forDeclaration: (MessagePatternAST new selector: mm declaration simpleName)
+		atDepth: depth.
+	currentClass enclosingClass: (scope at: #'@currentClass' ifAbsent: [nil]).
+	scope at: #'@currentClass' put: currentClass.
+	depth:: depth + 1.
+	mm slots do: [:s | 
+		| se = SlotEntry forDeclaration: (MessagePatternAST new selector: s name) atDepth: depth. |
+		scope at: s name put: se. (* getter *)
+		scope at: (namer setterSelectorFor: s) put: se. (* setter *)].
+	mm methods do: [:m | 
+		| me = MethodEntry forDeclaration: (MessagePatternAST new selector: m name) atDepth: depth. |
+		scope at: m name put: me].
+	mm nestedClasses do: [:c | 
+		| ce = ClassEntry forDeclaration: (MessagePatternAST new selector: c simpleName) atDepth: depth. |
+		ce enclosingClass: currentClass.
+		scope at: c simpleName put: ce].
+	^scope
 )
 mixinApplicationClass: aNode <MixinApplicationClassAST> = (
 	| thisClass <ClassEntry> vs <Scope> |
@@ -1028,31 +1045,6 @@ mixinApplicationClass: aNode <MixinApplicationClassAST> = (
 	
 	currentScope at: aNode name put: thisClass.
 	scopeMap at: aNode put: currentScope.
-)
-prvtScopeFor: c <ClassDeclarationMirror> ^<Scope> = (
-	(* When incrementally compiling a nested class, we need to reconstruct its scope. Note this only constructs enough of a scope to resolve outer classes. If NS2Squeak used the depth information when compiling implicit receiver sends, we would have to build the full scope. *)
-	| 
-	scope <Scope>
-	currentClass <ClassEntry>
-	outerMixins <Collection[ClassDeclarationMirror]>
-	depth <Integer>
-	|
-
-	outerMixins:: enclosingMixinsOf: c. (* Should use a cleaner API *)
-	depth:: 0.
-
-	outerMixins do:
-		[:o <ClassDeclarationMirror> |
-		scope:: Scope new superScope: scope.
-		currentClass:: (ClassEntry
-			forDeclaration: (MessagePatternAST new selector: o simpleName)
-			atDepth: depth) 
-				enclosingClass: currentClass.
-		scope at: currentClass name put: currentClass.
-		scope at: #'@currentClass' put: currentClass.
-		depth:: depth + 1].
-	
-	^scope
 )'node traversal'
 blockNode: aNode <BlockAST> = (
 	| parameterScope <Scope> |

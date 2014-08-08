@@ -4,23 +4,53 @@ class ActorTesting usingPlatform: p actors: a minitest: m = (|
 	private TestContext = m TestContext.
 	private Semaphore = p squeak Semaphore.
 	private Timer = p time Timer.
+	private Resolver = a Resolver.
+	private List = p collections OrderedCollection.
 	private actors = a.
 |)
 (
-class ActorTests = TestContext (|
-|)
+class ActorTests = TestContext (
+(*
+PromiseKind = { NearEsend, FarEsend, PromiseEsend, WhenClause, UserPromise }
+PromiseState = { Unresolved, Resolved, Smashed }
+PromiseResolution = { Value, PromiseKind x PromiseState, Exception }
+For each PromiseKind, test turn result is PromiseResolution.
+
+Test FIFO delivery order.
+Test FIFO fail stop.
+Test far reference equality.
+*)||)
 (
+class Bob meet: a = (| private alice = a. |)
+('as yet unclassified'
+answerFarRef = (
+	^alice
+)
+answerNearRef = (
+	^self
+)
+answerValue = (
+	^42
+)
+raiseException = (
+	^Error signal
+)) : ()
+class DeepChain = ()
+('as yet unclassified'
+nestedResolutionWithDepth: n = (
+	^n > 0 ifTrue: [self <-: nestedResolutionWithDepth: n -1] ifFalse: ['done']
+)) : ()
 class Math = (|
 |)
 ('as yet unclassified'
 factorial: n <Integer> ^ <Integer> = (
 	n = 0 ifTrue: [ ^1 ]. 
-	^(self ESEND factorial: n - 1) ESEND * n
+	^(self <-: factorial: n - 1) <-: * n
 )
 fibonacci: n = (
 	n = 0 ifTrue: [ ^0 ].
 	n = 1 ifTrue: [ ^1 ].
-	^(self ESEND fibonacci: n - 1) ESEND + (self ESEND fibonacci: n - 2)
+	^(self <-: fibonacci: n - 1) <-: + (self <-: fibonacci: n - 2)
 )
 isPositive: n = (
 	^n > 0
@@ -31,33 +61,119 @@ other
 ('as yet unclassified'
 pong: n sum: m = (
 	n <= 0 ifTrue: [^m].
-	^other ESEND ping: n - 1 sum: n + m
+	^other <-: ping: n - 1 sum: n + m
 )
 start = (
-	^other ESEND ping: 10 sum: 0
+	^other <-: ping: 10 sum: 0
 )) : ()
 class Pong = (|
 other
 |)
 ('as yet unclassified'
 ping: n sum: m = (
-	^other ESEND pong: n - 1 sum: n + m
+	^other <-: pong: n - 1 sum: n + m
+)) : ()
+class Recorder = (|
+recording ::= ''.
+|)
+('as yet unclassified'
+append: x = (
+	recording: recording , x.
+	^recording size
+)
+fail = (
+	Error signal
 )) : ()'as yet unclassified'
+assert: promise resolvedWith: expectedResolution = (
+	|
+	state ::= #unresolved.
+	actualResolution
+	sem = Semaphore new.
+	|
+	promise
+		whenResolved: [:r | state:: #resolved. actualResolution:: r. sem signal]
+		whenSmashed: [:e | state:: #smashed. actualResolution:: e. sem signal].
+	sem waitTimeoutMSecs: 800.
+	state = #unresolved
+		ifTrue: [^failWithMessage: 'Timed out'].
+	state = #resolved
+		ifTrue: [^assert: actualResolution equals: expectedResolution].
+	state = #smashed
+		ifTrue: [^failWithMessage: 'Promise smashed with: ', actualResolution printString].
+	failWithMessage: 'Invalid state blocking on a promise: ', state.
+)
+assert: promise smashedWith: expectedErrorClass = (
+	|
+	state ::= #unresolved.
+	actualResolution
+	sem = Semaphore new.
+	|
+	promise
+		whenResolved: [:r | state:: #resolved. actualResolution:: r. sem signal]
+		whenSmashed: [:e | state:: #smashed. actualResolution:: e. sem signal].
+	sem waitTimeoutMSecs: 300.
+	state = #unresolved
+		ifTrue: [^failWithMessage: 'Timed out: ', promise printString].
+	state = #resolved
+		ifTrue: [^failWithMessage: 'Promise resolved with: ', actualResolution printString].
+	state = #smashed
+		ifTrue: [^assert: actualResolution class equals: expectedErrorClass].
+	failWithMessage: 'Invalid state blocking on a promise: ', state.
+)
+createActorFromMixin: m = (
+	^actors createActor: m
+)
+testDeeplyChainedResolution = (
+	(* A good implementation should handle this in constant rather than linear space. *)
+	| r = (actors createActor: DeepChain mixin) <-: new. |
+	assert: (r <-: nestedResolutionWithDepth: 100000) resolvedWith: 'done'.
+)
 testFactorial = (
 	|
 	math = (actors createActorFromValue: Math) <-: new.
-	result
 	|
-	result:: waitFor: (math <-: factorial: 9).
-	assert: [result = 362880].
+	assert: (math <-: factorial: 9) resolvedWith: 362880.
 )
 testFibonacci = (
 	|
 	math = (actors createActorFromValue: Math) <-: new.
 	result
 	|
-	result:: waitFor: (math <-: fibonacci: 9).
-	assert: [result = 34].
+	(* result:: waitFor: (math <-: fibonacci: 9).
+	assert: [result = 34]. *)
+)
+testFifo = (
+	|
+	recorder = (createActorFromMixin: Recorder mixin) <-: new.
+	r1 r2 r3 r4
+	|
+	r1:: recorder <-: append: 'a'.
+	r2:: recorder <-: append: 'b'.
+	r3:: recorder <-: append: 'c'.
+	r4:: recorder <-: append: 'd'.
+	assert: (recorder <-: recording) resolvedWith: 'abcd'.
+	assert: r1 resolvedWith: 1.
+	assert: r2 resolvedWith: 2.
+	assert: r3 resolvedWith: 3.
+	assert: r4 resolvedWith: 4.
+)
+testFifoFailstop = (
+	|
+	recorder = (createActorFromMixin: Recorder mixin) <-: new.
+	recorderFork = recorder <-: yourself.
+	r1 r2 r3 r4 r5
+	|
+	r1:: recorder <-: append: 'a'.
+	r2:: recorder <-: append: 'b'.
+	r3:: recorder <-: fail.
+	r4:: recorder <-: append: 'c'.
+	r5:: recorder <-: append: 'd'.
+	assert: r3 smashedWith: Error. (* Do this first because our asserts are blocking and we need to register the error handler before the next turn. *)
+	assert: (recorderFork <-: recording) resolvedWith: 'abcd'.
+	assert: r1 resolvedWith: 1.
+	assert: r2 resolvedWith: 2.
+	assert: r4 smashedWith: Error.
+	assert: r5 smashedWith: Error.
 )
 testIfTrue = (
 	|
@@ -69,6 +185,39 @@ testIfTrue = (
 	assert: [result = 7].
 	assert: [tookTruePath].
 )
+testNestedResolutionOrder = (
+	|
+	a = actors Resolver new.
+	b = actors Resolver new.
+	last = actors Resolver new.
+	x = List new.
+	|
+	a promise whenResolved: [x add: 'a1'].
+	b promise whenResolved: [x add: 'b2'].
+	(a promise whenResolved: [x add: 'a3'])
+		whenResolved: [x add: 'a3a'];
+		whenResolved: [x add: 'a3b'].
+	(b promise whenResolved: [x add: 'b4'])
+		whenResolved: [x add: 'b4a'];
+		whenResolved: [x add: 'b4b'].
+	b resolve: a promise.
+	(a promise whenResolved: [x add: 'a5'])
+		whenResolved: [x add: 'a5a'];
+		whenResolved: [x add: 'a5b'].
+	(b promise whenResolved: [x add: 'b6'])
+		whenResolved: [x add: 'b6a'];
+		whenResolved: [x add: 'b6b'].
+	(a promise whenResolved: [x add: 'a7'])
+		whenResolved: [x add: 'a7a'];
+		whenResolved: [x add: 'a7b'].
+	(b promise whenResolved: [x add: 'b8'])
+		whenResolved: [x add: 'b8a'];
+		whenResolved: [x add: 'b8b'. last resolve: x asArray].
+	a resolve: nil.
+
+	(* Needs review *)
+	assert: last promise resolvedWith: {#a1 . #a3 . #a5 . #a7 . #b2 . #b4 . #b6 . #b8 . #a3a . #a3b . #a5a . #a5b . #a7a . #a7b . #b4a . #b4b . #b6a . #b6b . #b8a . #b8b}
+)
 testPingPong = (
 	|
 	ping = (actors createActorFromValue: Ping) <-: new.
@@ -77,8 +226,7 @@ testPingPong = (
 	|
 	ping <-: other: pong.
 	pong <-: other: ping.
-	result:: waitFor: ping <-: start.
-	assert: [result = 55].
+	assert: (ping <-: start) resolvedWith: 55.
 )
 testPromiseGroup = (
 	| mathClass = actors createActor: Math mixin. math r2 r3 r4 g1 g2 |
@@ -97,14 +245,42 @@ testTimer = (
 	| result |
 	(* Creating an actor this way is cheating. Closures are not value objects. *)
 	result:: waitFor: (actors createActorFromValue: [
-		| bender ticks repeating |
-		bender:: actors pastime Bender new.
+		| resolver ticks repeating |
+		resolver:: actors Resolver new.
 		ticks:: 0.
 		repeating:: Timer every: 20 do: [ticks:: ticks + 1].
-		Timer after: 50 do: [repeating cancel. bender resolver resolve: ticks].
-		bender promise
+		Timer after: 50 do: [repeating cancel. resolver resolve: ticks].
+		resolver promise
 	]) <-: value.
 	assert: [result = 2].
+)
+testTurnResultsInException = (
+	|
+	bob = (createActorFromMixin: Bob mixin) <-: meet: self.
+	|
+	assert: (bob <-: raiseException) smashedWith: Error.
+)
+testTurnResultsInFarRef= (
+	|
+	bob <Promise[Bob]> = (createActorFromMixin: Bob mixin) <-: meet: self.
+	|
+	assert: bob <-: answerFarRef resolvedWith: self.
+)
+testTurnResultsInNearRef= (
+	|
+	bobP <Promise[Bob]> = (createActorFromMixin: Bob mixin) <-: meet: self.
+	r
+	|
+	r:: bobP 
+		whenResolved: [:bob <FarRef[Bob]> | (bob <-: answerNearRef) 
+		whenResolved: [:bob2 <FarRef[Bob]> | bob2 = bob ]].
+	assert: r resolvedWith: true.
+)
+testTurnResultsInValue = (
+	|
+	bob = (createActorFromMixin: Bob mixin) <-: meet: self.
+	|
+	assert: (bob <-: answerValue) resolvedWith: 42.
 )
 waitFor: promise = (
 	|

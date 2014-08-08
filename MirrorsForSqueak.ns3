@@ -1,7 +1,7 @@
 Newspeak3
 'Mirrors'
 class MirrorsForSqueak usingPlatform: platform <Platform> vmMirror: vmm <VMMirror> = (
-(* The new Newspeak mirrors API. It is a work in progress that attempts to address weaknesses of the current API and of past mirror APIs. The mirrors here are high level mirrors: they represent language constructs in NS2 and above.
+ (* The new Newspeak mirrors API. It is a work in progress that attempts to address weaknesses of the current API and of past mirror APIs. The mirrors here are high level mirrors: they represent language constructs in NS2 and above.
 
 The API follows several general guidelines:
 
@@ -37,7 +37,6 @@ private Duct = platform ducts Duct.
 private WeakStorage = platform ducts WeakStorage.
 
 private Metaclass = platform kernel Metaclass.
-private SystemMetadata = platform blackMarket NewsqueakMixins SystemMetadata.
 private Language = platform blackMarket NsMultilanguage Language.
 private SystemChangeNotifier = platform blackMarket SystemChangeNotifier.
 
@@ -137,16 +136,18 @@ headerFromSource: newHeader <String> = (
 		
 		Currently, this takes 'Foo = ()' instead of 'class Foo = ()'.  Perhaps we should do the latter since an access modifier might be specified?
 	*)
-	compiledResults:: compiler compileClassHeader: ('Newspeak3 ''', header category, ''' class ', newHeader) readStream of: self.
 
 	lazyIsTopLevel ifTrue: [
 		(* Result directly corresponds to me *)
+		compiledResults:: compiler compileClassHeader: ('Newspeak3 ''', header category, ''' ', (addMissingClass: newHeader)) readStream of: self.
 		checkForSlotConflicts: compiledResults first.
 		checkForNameChange: compiledResults first.
 		prvtCompiledMixinMirror: compiledResults first.
 	] ifFalse: [
 		(* Result corresponds to my enclosing class, since my slot/accessor may have been adjusted *)
-		| newRep <MixinRep> = onlyElementOf: compiledResults last. |
+		| newRep <MixinRep> |
+		compiledResults:: compiler compileClassHeader: (addMissingClass: newHeader) readStream of: self.
+		newRep:: onlyElementOf: compiledResults last.
 		checkForSlotConflicts: newRep first.
 		checkForNameChange: newRep first.
 		enclosingClass prvtCompiledMixinMirror: compiledResults first.	
@@ -171,6 +172,16 @@ simpleName ^<Symbol> = (
 )'as yet unclassifed'
 printOn: stm = (
 	stm nextPutAll: 'ClassDeclarationBuilder:'; nextPutAll: fullyQualifiedName
+)'as yet unclassified'
+accessModifier = (
+	(*TODO: we might want to change an access modifier. Currently this is only a getter reading from the old existing mixin. *)
+	^ prvtExistingMixin accessModifier
+)
+addMissingClass: classHeader = (
+	(* the classHeader might start with 'class' 'protected class' etc. - prepend 'class' if not *)
+	^ ((1 to: 11) includes: (classHeader findString: 'class '))
+	ifTrue: [ classHeader ]
+	ifFalse: [ 'class ', classHeader]
 )'private'
 checkForNameChange: newCompiledMixinMirror = (
 	
@@ -247,7 +258,7 @@ fromUnitSource: src <String> ^<ClassDeclarationBuilder> = (
 )
 reflecting: mixin <InstanceMixin> ^<ClassDeclarationBuilder> = (
 	assert: [mixin isMixin & mixin isMeta not] message: 'Provide an instance-side mixin'.
-	^self 
+	^self
 		fromMixinRep: (mixinRepFor: mixin)
 		forExistingMixin: mixin
 ))
@@ -276,6 +287,9 @@ fullyQualifiedName ^ <Symbol> = (
 header ^ <ClassHeaderMirror> = (
 	^ClassHeaderMirror reflecting: reflectee
 )
+initializerSource = (
+	^ accessModifierIfNecessary, 'class ', (header source)
+)
 instanceSide ^ <MixinMirror> = (
 	instanceSideLazy ifNil: [
 		instanceSideLazy:: MixinMirror reflecting: reflectee].
@@ -288,7 +302,22 @@ simpleName ^ <Symbol> = (
 	^fullyQualifiedNameToSimple: fullyQualifiedName
 )
 source ^ <String> = (
-	^String streamContents: [ :s | reflectee printClassOn: s ]	
+	^ (* accessModifierIfNecessary, *) (String streamContents: [ :s | reflectee printClassOn: s ]	)
+)'as yet unclassified'
+accessModifier ^ <Symbol>= (
+	(*	Finding the accessModifier of a class Declaration is hell. ClassDeclarationBuilders are
+		constructed from a mixin. Mixins, by definition, do not know with which accessModifier they
+		are applied with. So, we ask the enclosing mixin instead and assume that top-level mixins can
+		only be applied as public. *)
+	^ reflectee accessModifier
+)
+accessModifierIfNecessary = (
+	^ reflectee accessModifierIfNecessary
+)
+hasBody ^ <Boolean> = (
+ (* Does my reflectee have a class body *)
+	(* A bit of a hack, until we have clean per-mixin metadata *)
+	^instanceSide initializer metadata at: #hasBody ifAbsent:[true].
 )'restricted'
 compiledMixinMirror = (
 	(* Used by the compiler.  Polymorphic with ClassDeclarationBuilder, which must answer the one that represents edits in progress. *)
@@ -308,7 +337,8 @@ category: c <Symbol | String> = (
 	prvtDeclaration prvtCompiledMixinMirror category: c asSymbol
 )
 classComment ^<String> = (
-	^prvtDeclaration prvtCompiledMixinMirror commentString
+	^(compilation parser classHeader 
+		parse: prvtDeclaration prvtCompiledMixinMirror header readStream) classComment
 )
 classComment: newClassComment <String> = (
 	| ast token newHeaderSource |
@@ -332,7 +362,7 @@ name ^<Symbol> = (
 name: newSimpleName <Symbol> = (
 	|
 	token
-	newHeaderSource
+	newClassSource
 	compiledResults <MixinRep>
 	|
 
@@ -351,17 +381,20 @@ name: newSimpleName <Symbol> = (
 
 	(* patch header source with the new name *)
 	token:: (grammar TypedNS3Grammar new classHeader parse: source readStream) first.
-	newHeaderSource:: 
-		(source copyFrom: 1 to: token start - 1) , 
-		newSimpleName , 
+	newClassSource::
+		(prvtDeclaration lazyIsTopLevel
+			(* only top-level classes can specify categories *)
+			ifTrue: [ 'Newspeak3 ''', category, ''' class ' ]
+			ifFalse: [ prvtDeclaration accessModifier,  ' class ' ]),
+		(source copyFrom: 1 to: token start - 1) ,
+		newSimpleName ,
 		(source copyFrom: token end + 1 to: source size).
 
 
 	(* compile etc *)
-
-	compiledResults:: compiler 
-		compileClassHeader: ('Newspeak3 ''', category, ''' class ', newHeaderSource) readStream
-		of: prvtDeclaration.	
+	compiledResults:: compiler
+		compileClassHeader: newClassSource readStream
+		of: prvtDeclaration.
 	
 	prvtDeclaration lazyIsTopLevel ifTrue: [
 		(* Result directly corresponds to me *)
@@ -371,7 +404,7 @@ name: newSimpleName <Symbol> = (
 		(* Result corresponds to my enclosing class, since my slot/accessor may have been adjusted *)
 		| newRep <MixinRep> = onlyElementOf: compiledResults last. |
 		prvtDeclaration checkForSlotConflicts: newRep first.
-		prvtDeclaration enclosingClass prvtCompiledMixinMirror: compiledResults first.	
+		prvtDeclaration enclosingClass prvtCompiledMixinMirror: compiledResults first.
 		prvtDeclaration prvtCompiledMixinMirror: newRep first.
 	].
 )
@@ -398,7 +431,8 @@ category ^ <Symbol> = (
 	^reflectee category
 )
 classComment ^ <String> = (
-	^reflectee classComment
+	^(compilation parser classHeader 
+		parse: source readStream) classComment
 )
 declaration ^<ClassDeclarationMirror> = (
 	^ClassDeclarationMirror reflecting: self reflectee
@@ -411,6 +445,16 @@ primaryFactory ^ <MethodMirror> = (
 source ^ <String> = (
 	^ reflectee cachedHeaderSource
 )'as yet unclassified'
+initializer = (
+	#BOGUS.
+	reflectee methodDict values do: 
+		[:cm | (cm properties includesKey: #isSubinitializer)
+			ifTrue: [^MethodMirror reflecting: cm]].
+	halt.
+)
+isClassHeaderMirror ^<Boolean> = (
+	^true
+)
 name ^ <Symbol> = (
 	^reflectee name
 )
@@ -422,6 +466,20 @@ preamble ^<Symbol> = (
 )
 primaryFactoryName ^ <Symbol> = (
 	^reflectee cachedConstructorName
+)
+sendsSelector: sel <Symbol> ^<Boolean> = (
+	(* This is incomplete for the quick send selectors. *)
+	(* Look through instance initializers. *)
+	reflectee methodDictionary valuesDo: [:cm | 
+		(cm properties includesKey: #isSubinitializer) 
+			ifTrue: [(cm hasLiteral: sel) ifTrue: [^true]]].
+	(* Look at the nested class accessor, if nested. *)
+	reflectee enclosingMixin ifNotNil: [:parent | 
+		((parent compiledMethodAt: simpleName) hasLiteral: sel) ifTrue: [^true]].
+	^false
+)
+simpleName ^ <Symbol> = (
+	^fullyQualifiedNameToSimple: name
 )
 slotDecls ^ <MirrorGroup[SlotDefMirror]> = (
 	
@@ -462,6 +520,9 @@ THE SOFTWARE.
 
 |)
 ('as yet unclassified'
+accessModifier = (
+	^ mixin accessModifier
+)
 allSuperclasses ^ <List[ClassMirror]> = (
 	| klass <Class> superclasses <List[Class]> |
 	superclasses:: MutableList new.
@@ -578,6 +639,9 @@ details so that tools like the IDE need not be aware of them.
 
  *))
 ('as yet unclassified'
+isInitializerMethodMirror ^ <Boolean> = (
+	^true
+)
 source ^ <String> = (
 	^definingMixin declaration header source
 )) : ()
@@ -646,8 +710,18 @@ definingMixin ^<MixinMirror> = (
 isInitializer ^ <Boolean> = (
 	^reflectee properties isNil not and:[reflectee properties at: #isSubinitializer ifAbsent:[false]].
 )
+isMethodMirror ^<Boolean> = (
+	^true
+)
+metadata = (
+	^reflectee properties
+)
 name ^<Symbol> = (
 	^reflectee selector
+)
+sendsSelector: sel <Symbol> ^<Boolean> = (
+	(* This is incomplete for the quick send selectors. *)
+	^reflectee hasLiteral: sel
 )
 simpleName = (
 	^ name
@@ -768,6 +842,9 @@ slots ^ <ImmutableMirrorGroup[SlotMirror]> = (
 				reject: [:each <SlotMirror> | each name includes: $`].
 	].
 	^ImmutableMirrorGroup group: slotMirrors
+)'as yet unclassified'
+public isMixinMirror ^<Boolean> = (
+	^true
 )'private'
 checkNameConflictsForMethod: selector <Symbol> = (
 	(nestedClasses includesMirrorNamed: selector)
@@ -832,8 +909,9 @@ What about mirroring the initializer?
 
 Need to decide who does these things - the class declaration mirror or the mixin mirror. One should delegate to the other. *)|
 	slotsLazy
-	methodsLazy 
-	nestedClassesLazy 
+	methodsLazy
+	nestedClassesLazy
+	accessModifierLazy
 |mixinBasedMirrors add: self)
 ('accessing'
 applications ^<Set[ClassMirror]> = (
@@ -888,10 +966,18 @@ slots ^ <MirrorGroup[SlotMirror]> = (
 		slotsLazy:: ImmutableMirrorGroupInMixin group: computeSlots in: self].
 	^slotsLazy
 )'as yet unclassified'
+accessModifier ^ <Symbol> = (
+	accessModifierLazy ifNil: [
+		accessModifierLazy:: computeAccessModifiers].
+	^ accessModifierLazy
+)
 classMixin ^ <MixinMirror> = (
 	isMeta 
 		ifFalse:[^MixinMirror reflecting: reflectee classMixin]
 		ifTrue:[^MixinMirror reflecting: Metaclass mixin].
+)
+computeAccessModifiers = (
+	^ ((ClassDeclarationMirror reflecting: reflectee) accessModifier)
 )
 computeMethods ^ <Collection[MethodMirror]> = (
 
@@ -929,6 +1015,7 @@ mixinChanged = (
 	slotsLazy ifNotNil: [:it | it updateToContain: computeSlots].
 	methodsLazy ifNotNil: [:it | it updateToContain: computeMethods].
 	nestedClassesLazy ifNotNil: [:it | it updateToContain: computeNestedClasses].
+	accessModifierLazy ifNotNil: [:it | accessModifierLazy:: computeAccessModifiers].
 )) : ()
 class MutableMethodGroup group: mirrors within: mb = MutableMirrorGroup group: mirrors within: mb (
 (*  *)|
@@ -942,7 +1029,7 @@ addFromSource: s <String> = (
 	|
 	result:: compiler
 		compileMethodSource: s readStream 
-		within: enclosingMixin declaration.
+		within: enclosingMixin.
 	
 	cat:: (findMirrorNamed: result simpleName)
 		ifNil: [#'as yet unclassified']
@@ -1027,8 +1114,8 @@ addFromSource: source <String> ^<ClassDeclarationBuilder> = (
 	enclosingDeclaration:: enclosingMixin declaration.
 	
 	compiledResults:: compiler 
-		compileClassSource: ('Newspeak3 ''', enclosingDeclaration header category, ''' ', source) readStream
-		within: enclosingDeclaration.
+		compileClassSource: (addMissingClass: source) readStream
+		within: enclosingMixin.
 		
 	enclosingDeclaration prvtCompiledMixinMirror: compiledResults first.
 	nestedReps:: compiledResults last.
@@ -1050,6 +1137,12 @@ addMirror: m <ClassDeclarationBuilder> = (
 	super addMirror: m.
 	^m
 )'as yet unclassified'
+addMissingClass: classHeader = (
+	(* the classHeader might start with 'class' 'protected class' etc. - prepend 'class' if not *)
+	^ ((1 to: 11) includes: (classHeader findString: 'class '))
+	ifTrue: [ classHeader ]
+	ifFalse: [ 'class ', classHeader]
+)
 removeMirror: victim <ClassDeclarationBuilder> = (
 	|
 	victimName
@@ -1141,7 +1234,7 @@ ifError: evalErrorHandler <[:Error]> ^<ObjectMirror> = (
 	mtdMirror:: compiler
 		compileExpressionSource: expression readStream
 		inContext: nil
-		inMixin: mxn declaration. 
+		inMixin: mxn. 
 		
 	mtdMirror metadata at: #category put: 'DoIts'.
 	mtdMirror klass: cls mixin definingClass.
@@ -1174,7 +1267,7 @@ ifError: evalErrorHandler <[:Error]> ^<ObjectMirror> = (
 	mtdMirror:: compiler
 		compileExpressionSource: expression readStream
 		inContext: nil
-		inMixin: mxn declaration
+		inMixin: mxn
 		allowBlackMarket: true.
 		
 	mtdMirror metadata at: #category put: 'DoIts'.
@@ -1342,9 +1435,7 @@ mirrors installAtomically: {a. b}
 	^builders collect: [:b | ClassDeclarationMirror reflecting: b reflectee]
 )'as yet unclassified'
 compiler ^ <Newspeak3Compilation Compiler> = (
-	storedCompiler ifNil:[
-			storedCompiler:: compilation Compiler new.
-			storedCompiler language: Language newspeak3.	].
+	storedCompiler ifNil: [storedCompiler:: compilation Compiler new].
 	^storedCompiler
 )
 fullyQualifiedNameToSimple: name = (
@@ -1385,12 +1476,9 @@ isNestedClassAccessorSelector: sel forMixin: mxn = (
 				and: [mxn nestedClasses includesMirrorNamed: (ts at: ts size - 1)]]]
 )
 makeCompiledMixinMirrorFor: lowLevelMixinMirror <LowLevelMixinMirror> from: mixin <Mixin> = (
-
-	^(CompiledMixinMirror 
-		language: mixin language
+	^CompiledMixinMirror
 		header:  mixin cachedHeaderSource
-		mirror: lowLevelMixinMirror)
-	comment: mixin classComment.	
+		mirror: lowLevelMixinMirror
 )
 makeCompiledMixinMirrorForMixin: mixin <Mixin> = (
 	^ makeCompiledMixinMirrorFor: (makeLowLevelMixinMirrorFor: mixin) from: mixin.

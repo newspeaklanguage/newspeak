@@ -26,6 +26,7 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 	protected MethodAST = asts MethodAST.
 	protected NormalSendAST = asts NormalSendAST.
 	protected NumberAST = asts NumberAST.
+	protected ReturnStatAST = asts ReturnStatAST.
 	protected TupleAST = asts TupleAST.
 	protected VariableAST = asts VariableAST.
 	
@@ -514,7 +515,7 @@ codeBodyNode: node <CodeBodyAST> = (
 	node statements keysAndValuesDo:
 		[:index :statement | 
 		| rewritten |
-		rewritten:: (index = node statements size and: [valueExpected] and: [inClosure])
+		rewritten:: (index = node statements size and: [valueExpected])
 			ifTrue: [applyForValueTo: statement]
 			ifFalse: [applyForEffectTo: statement].
 		statements add: rewritten].
@@ -533,12 +534,6 @@ codeBodyNode: node <CodeBodyAST> = (
 	scopeMap at: result put: bodyScope.
 	^result
 )
-depthOfExplicit: binding = (
-	^outer Compiler currentDepth - binding depth -1
-)
-depthOfImplicit: binding = (
-	^outer Compiler currentDepth - binding depth -1
-)
 emptyBody = (
 	| body |
 	#BOGUS. (* Should be able to use immutable collections. *)
@@ -548,14 +543,6 @@ emptyBody = (
 		statements: (OrderedCollection with: NilAST new).
 	scopeMap at: body put: nil.
 	^body
-)
-enclosingClassNamed: name <Symbol> ^<ClassEntry> = (
-	| entry <ClassEntry> |
-	entry:: currentScope at: #'@currentClass'.
-	[entry isNil] whileFalse:
-		[entry name = name ifTrue: [^entry].
-		entry:: entry enclosingClass].
-	Error signal: 'No enclosing class named "', name, '"'
 )
 futureFor: expression <ExpressionAST> ^<ExpressionAST> = (
 	(* @here Future computing: [expression] *)
@@ -667,10 +654,11 @@ methodNode: node <MethodAST> = (
 	(* Need setter temp? Implicit ^self? *)
 	| pattern body accessModifier result |
 	pattern:: node pattern apply: self.
+	(* We add the implicit ^self before rewritting the body to ensure the last non-return statment is rewritten for effect. *)
+	(node body statements isEmpty or: [node body statements last isReturnStatNode not])
+		ifTrue:	[node body statements add:
+					(ReturnStatAST new expr: (VariableAST new name: #self))].
 	body:: node body apply: self.
-	(body statements isEmpty or: [body statements last isReturnStatNode not]) 
-		ifTrue:	[body statements add:
-					(MethodLocalReturnAST expression: ReceiverAST new)].
 	body parameters: pattern parameters.
 	assert: [inClosure not] message: ''.
 	result:: MethodAST new
@@ -706,6 +694,24 @@ normalSendNode: node <NormalSendAST> ^<AST> = (
 numberNode: node <NumberAST> = (
 	^node
 )
+offsetOfEnclosingObjectForClass: name <Symbol> ^<Integer> = (
+	| entry <ClassEntry> |
+	entry:: currentScope at: #'@currentClass'.
+	[entry isNil] whileFalse:
+		[entry name = name ifTrue: [
+			| offset = outer Compiler currentDepth - entry depth - 1. |
+			assert: [offset >= 0] message: 'Invalid enclosing object index'.
+			^offset].
+		entry:: entry enclosingClass].
+	Error signal: 'No enclosing class named "', name, '"'
+)
+offsetOfImplicitReceiverTarget: binding <SymbolTableEntry> ^<Integer> = (
+	(* Note this calculation differs from the one used by explicit outer sends by a factor of one. This is because an explicit outer send needs the depth of the enclosing object with for a class whose name is a given selector, whereas an implicit receiver send needs the depth of the enclosing object for the class that defined a given selector. *)
+	| depth |
+	depth:: outer Compiler currentDepth - binding depth.
+	assert: [depth >= 0] message: 'Invalid enclosing object index'.
+	^depth
+)
 processEventualSend: node <NormalSendAST> = (
 	| esendProxy |
 	esendProxy:: OrdinarySendAST
@@ -722,7 +728,7 @@ processImplicitReceiverSend: node <NormalSendAST> = (
 	
 	binding isMessagePatternNode ifTrue:
 		[ (* This is a message send for a lexically defined method. *)
-		^processImplicitReceiverSend: node msg atDepth: (depthOfImplicit: binding)].
+		^processImplicitReceiverSend: node msg atDepth: (offsetOfImplicitReceiverTarget: binding)].
 	
 	binding isVarDeclNode
 		ifTrue: [^processLocalAccess: node msg of: binding].
@@ -833,18 +839,14 @@ processLocalWrite: message <MessageAST> to: declaration = (
 		end: message end    
 )
 processOuterExpression: node <NormalSendAST> = (
-	| binding <AST> |
-	binding:: enclosingClassNamed: node msg sel.
 	^EnclosingObjectAST new
-		depth: (depthOfExplicit: binding);
+		depth: (offsetOfEnclosingObjectForClass: node msg sel);
 		start: node recv start;
 		end: node msg end
 )
 processOuterSend: node <NormalSendAST> = (
-	| binding <AST> |
-	binding:: enclosingClassNamed: node recv msg sel.
 	^OuterSendAST new
-		depth: (depthOfExplicit: binding);
+		depth: (offsetOfEnclosingObjectForClass: node recv msg sel);
 		message: (node msg apply: self);
 		start: node recv recv start;
 		end: node msg end
@@ -880,7 +882,8 @@ rewriteBlockNode: node <BlockAST> forValue: forValue <Boolean> ^ <BlockAST> = (
 		(ParameterAST name: p name type: p type) start: p start; end: p end].
 	bodyScope:: scopeMap at: node body.
 	params do: [:each | (bodyScope at: each name) ast: each].
-	rewrittenNode:: BlockAST new body: (node body apply: self).
+	rewrittenNode:: BlockAST new body: 
+		(forValue ifTrue: [applyForValueTo: node body] ifFalse: [applyForEffectTo: node body]).
 	rewrittenNode start: node start; end: node end.
 	rewrittenNode body parameters: params.
 	node body statements isEmpty ifTrue:
@@ -996,24 +999,41 @@ One can process only a side without its subtrees (i.e., methods and nested class
 scopeStack <OrderedCollection[Scope]> = OrderedCollection new.
 currentDepth <Integer> ::= initialDepth. (* The lexical nesting level of the class declaration currently being visited; top-level classes are level 0. *)
 |pushScope: initialScope)
-('access'
-visitNode: aNode <AST> within: m <ClassDeclarationMirror> ^ <Dictionary[AST, Scope]> = (
-   pushScope: (buildScopeFor: m).
-   aNode apply: self.
-   ^scopeMap
-)'as yet unclassified'
-buildScopeFor: cd <ClassDeclarationMirror> ^<Scope> = (
-	^prvtScopeFor: cd.
+('as yet unclassified'
+buildScopeFor: mm <MixinMirror> ^<Scope> = (
+	assert: [mm isMixinMirror] message: ''.
+	^incrementalScopeFor: mm.
 )
-enclosingMixinsOf: m <ClassDeclarationMirror> ^<Collection[ClassDeclarationMirror]> = (
-	(* Outermost first. *)
-	| current mixins |
-	mixins:: OrderedCollection new.
-	current:: m.
-	[current isNil] whileFalse:
-		[mixins addFirst: current.
-		current: current enclosingClass].
-	^mixins
+incrementalScopeFor: mm <MixinMirror> ^<Scope> = (
+	|
+	enclosingScope <Scope>
+	scope <Scope>
+	currentClass <ClassEntry>
+	depth
+	|
+	mm declaration enclosingClass 
+		ifNil: [enclosingScope:: Scope new]
+		ifNotNil: [:it | enclosingScope:: incrementalScopeFor: it instanceSide].
+	scope:: Scope new superScope: enclosingScope.
+	depth:: scope depth.
+	currentClass:: ClassEntry 
+		forDeclaration: (MessagePatternAST new selector: mm declaration simpleName)
+		atDepth: depth.
+	currentClass enclosingClass: (scope at: #'@currentClass' ifAbsent: [nil]).
+	scope at: #'@currentClass' put: currentClass.
+	depth:: depth + 1.
+	mm slots do: [:s | 
+		| se = SlotEntry forDeclaration: (MessagePatternAST new selector: s name) atDepth: depth. |
+		scope at: s name put: se. (* getter *)
+		scope at: (namer setterSelectorFor: s) put: se. (* setter *)].
+	mm methods do: [:m | 
+		| me = MethodEntry forDeclaration: (MessagePatternAST new selector: m name) atDepth: depth. |
+		scope at: m name put: me].
+	mm nestedClasses do: [:c | 
+		| ce = ClassEntry forDeclaration: (MessagePatternAST new selector: c simpleName) atDepth: depth. |
+		ce enclosingClass: currentClass.
+		scope at: c simpleName put: ce].
+	^scope
 )
 mixinApplicationClass: aNode <MixinApplicationClassAST> = (
 	| thisClass <ClassEntry> vs <Scope> |
@@ -1024,31 +1044,7 @@ mixinApplicationClass: aNode <MixinApplicationClassAST> = (
 	thisClass enclosingClass: (currentScope at: #'@currentClass' ifAbsent: [nil]).
 	
 	currentScope at: aNode name put: thisClass.
-)
-prvtScopeFor: c <ClassDeclarationMirror> ^<Scope> = (
-	(* When incrementally compiling a nested class, we need to reconstruct its scope. Note this only constructs enough of a scope to resolve outer classes. If NS2Squeak used the depth information when compiling implicit receiver sends, we would have to build the full scope. *)
-	| 
-	scope <Scope>
-	currentClass <ClassEntry>
-	outerMixins <Collection[ClassDeclarationMirror]>
-	depth <Integer>
-	|
-
-	outerMixins:: enclosingMixinsOf: c. (* Should use a cleaner API *)
-	depth:: 0.
-
-	outerMixins do:
-		[:o <ClassDeclarationMirror> |
-		scope:: Scope new superScope: scope.
-		currentClass:: (ClassEntry
-			forDeclaration: (MessagePatternAST new selector: o simpleName)
-			atDepth: depth) 
-				enclosingClass: currentClass.
-		scope at: currentClass name put: currentClass.
-		scope at: #'@currentClass' put: currentClass.
-		depth:: depth + 1].
-	
-	^scope
+	scopeMap at: aNode put: currentScope.
 )'node traversal'
 blockNode: aNode <BlockAST> = (
 	| parameterScope <Scope> |
@@ -1272,14 +1268,39 @@ class MethodEntry forDeclaration: decl atDepth: d = SymbolTableEntry forAST: dec
 () : ()
 class Namer = ()
 ('as yet unclassified'
+fullyQualifySimpleName: sn with: fqp = (
+	^(fqp, syntheticNameSeparator, sn) asSymbol
+)
 isReservedWord: selector = (
 	^{#self. #super. #outer. #true. #false. #nil. #thisContext} includes: selector
+)
+mixinNameOfClassNamed: className = (
+	|
+	simpleNames
+	rawNames
+	|
+	rawNames:: className subStrings: syntheticNameSeparator. 
+	rawNames size =1 ifTrue:[^className].
+	simpleNames:: rawNames select: [:n | n initialIntegerOrNil isNil].
+	assert: [simpleNames size >= 2] message: ''.
+	^(simpleNames fold: [:sn1 :sn2 | sn1, syntheticNameSeparator, sn2]) asSymbol
+)
+mixinSlotNameFor: nestedName = (
+	| mixinName |
+	mixinName:: self mixinNameOfClassNamed: nestedName.
+	^(mixinName, syntheticNameSeparator, 'slot') asSymbol
 )
 setterSelectorFor: slot <SlotDefAST | InstanceVariableMirror> ^<Symbol> = (
 	^((slot isMutableSlot ifTrue: [ '' ] ifFalse: [ 'setOnce`' ]), slot name, ':') asSymbol.
 )
 setterTemp = (
 	^#'@setterTemp'
+)
+slotNameForNestedClassNamed: ncn <String> within: outerName <String> ^ <String> = (
+	^mixinSlotNameFor: (fullyQualifySimpleName: ncn with: outerName).
+)
+syntheticNameSeparator = (
+	^'`'
 )) : ()
 class Scope = ((* A generic scope facility. *)|
 superScope <Scope>

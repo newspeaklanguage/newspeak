@@ -22,6 +22,7 @@ class Backend = AbstractBackend ()
 class LocalRepository onRepositoryId: repositoryId = AbstractLocalRepository onRepositoryId: repositoryId ()
 (
 class Command = SuperCommand (|
+	cachedCommonAncestors ::= Map new.
 |)
 ('as yet unclassified'
 addStream: stream asFileNamed: filename = (
@@ -33,6 +34,13 @@ checkoutBranch: branchName = (
 
 	(* Don't convert branchName to a local ref, otherwise git will detach HEAD *)
 	launcher run: {'checkout'. branchName}
+)
+commonAncestorOf: revA and: revB = (
+
+	^ cachedCommonAncestors
+		at: {revA. revB}
+		ifAbsentPut: [
+			super commonAncestorOf: revA and: revB]
 )
 createEmptyRepository = (
 
@@ -151,10 +159,13 @@ trackedHistorian: otherHistorian = (
 		to: otherHistorian name
 		on: otherHistorian repository name
 )) : ()
-class RepositoryVersionAccessing = AbstractRepositoryVersionAccessing ()
+class RepositoryVersionAccessing = AbstractRepositoryVersionAccessing (|
+private cachedVersionAtInternalId = Map new.
+|)
 (
 class RepositoryVersion = AbstractRepositoryVersion (|
 	parentInternalIds
+	cachedMirrors
 |)
 ('accessing'
 commonAncestorWith: version = (
@@ -165,6 +176,7 @@ commonAncestorWith: version = (
 )
 mirrors ^<Map[String, SourceMirror]> = (
 	| files mirrorMap |
+	nil = cachedMirrors ifFalse: [^cachedMirrors].
 	files:: repository command listFilesIn: internalId.
 	mirrorMap:: Map new.
 	files do: [:file |
@@ -172,7 +184,7 @@ mirrors ^<Map[String, SourceMirror]> = (
 		stream:: repository command streamFile: file atInternalId: internalId.
 		mirror:: sourceMirrors mirrorForStream: stream name: file.
 		mirror isNil ifFalse: [mirrorMap at: file put: mirror]].
-	^mirrorMap
+	^cachedMirrors:: mirrorMap
 )) : ()
 class RepositoryVersionStream onStream: stream = AbstractRepositoryVersionStream onStream: stream (|
 |)
@@ -190,11 +202,16 @@ next = (
 		author: author;
 		message: message;
 		yourself.
+		internalId out.
 	^ commit
 )) : ()'accessing'
 versionAtInternalId: internalId = (
-
-	^ (RepositoryVersionStream onStream: (repository command streamAtInternalId: internalId)) next
+	(* ^ (RepositoryVersionStream onStream: (repository command streamAtInternalId: internalId)) next *)
+	^ cachedVersionAtInternalId
+		at: internalId
+		ifAbsent: [
+			cacheAllVersionsFrom: internalId.
+			cachedVersionAtInternalId at: internalId]
 )'actions'
 exportVersionId: internalId to: remoteRepository = (
 
@@ -204,6 +221,17 @@ exportVersionId: internalId to: remoteRepository = (
 importVersionId: internalId from: remoteRepository = (
 
 	repository command fetchFromRepository: remoteRepository repositoryId
+)'as yet unclassified'
+cacheAllVersionsFrom: internalId = (
+
+	| stream |
+	stream:: RepositoryVersionStream onStream:(
+		command streamFromInternalId: internalId).
+	[stream atEnd] whileFalse: [ | version |
+		version:: stream next.
+		cachedVersionAtInternalId
+			at: version internalId
+			put: version]
 )) : ()'accessing'
 SuperCommand = (
 
@@ -252,6 +280,7 @@ defaultArguments = (
 	^ super defaultArguments, {'--work-tree=', repository localRepository repositoryDirectory fullName. '--git-dir=', repository localRepository repositoryDirectory fullName, '/.git'}
 )) : ()
 class Historian named: historianName versionId: vId = AbstractRemoteHistorian named: historianName versionId: vId (|
+private cachedVersion
 |)
 ('as yet unclassified'
 setTo: newVersion ifFail: failBlock  = (
@@ -260,6 +289,12 @@ setTo: newVersion ifFail: failBlock  = (
 		onRepository: repositoryId
 		to: newVersion internalId
 		ifFail: failBlock 
+)
+version = (
+
+	nil = cachedVersion ifTrue: [
+		cachedVersion:: super version].
+	^ cachedVersion
 )) : ('factory'
 named: historianName version: version = (
 
@@ -321,7 +356,7 @@ currentBranchNameIfNone: block = (
 
 	| lines line |
 	lines:: launcher runLines: {'branch'. '-a'}.
-	line:: lines detect: [:each | each first =  $*] ifNone: [^ block value].
+	line:: lines detect: [:each | each first =  "*"] ifNone: [^ block value].
 	(* We should check whether there is a better way than to check for the presence of
 	'(no branch)'. This is going to break in the case of internationalization. *)
 	line = '* (no branch)' ifTrue: [^ block value].
@@ -380,7 +415,10 @@ streamAtInternalId: internalId = (
 )
 streamFile: file atInternalId: internalId = (
 
-	^ launcher runStream: {'show' . internalId asString, ':', file}
+	^ launcher runBinaryStream: {'show' . internalId asString, ':', file}
+)
+streamFromInternalId: internalId = (
+	^ launcher runStream: {'log'. logTemplate. internalId asString}
 )
 toLocalRef: branchName = (
 

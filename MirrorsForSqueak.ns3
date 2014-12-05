@@ -42,13 +42,9 @@ private SystemChangeNotifier = platform blackMarket SystemChangeNotifier.
 
 private atomicInstaller = platform namespace AtomicInstaller usingPlatform: platform vmMirror: vmm.
 
-private lowLevelMirrors = platform namespace LowLevelMirrors usingLib: platform.
-private LowLevelMirror = lowLevelMirrors Mirror.
-private CompiledMixinMirror = lowLevelMirrors CompiledMixinMirror.
-private LowLevelMixinMirror = lowLevelMirrors LowLevelMixinMirror.
-private LowLevelMethodMirror = lowLevelMirrors LowLevelMethodMirror.
-private InstanceVariableMirror = lowLevelMirrors InstanceVariableMirror.
-private ImmutableMirrorGroup = (platform namespace MirrorGroups usingLib: platform) ImmutableMirrorGroup.
+private groups = platform namespace MirrorGroups usingLib: platform.
+private intermediates = platform namespace Intermediates usingPlatform: platform.
+private ImmutableMirrorGroup = groups ImmutableMirrorGroup.
 
 private vmmirror = vmm.
 
@@ -64,14 +60,14 @@ parsing = Future computing: [platform namespace NewspeakParsing
 compilation = Future computing: [platform namespace Newspeak2SqueakCompilation
 	usingPlatform: platform 
 	newspeakParser: parsing
-	mirrorLib: platform mirrors].
+	intermediates: intermediates].
 
 protected storedCompiler (* cached compiler and module *)
 
 private mixinBasedMirrors <WeakIdentitySet[MixinMirror]> = WeakStorage new.
 |)
 (
-public class ClassDeclarationBuilder fromMixinRep: rep <MixinRep> forExistingMixin: mixin <InstanceMixin> = (
+public class ClassDeclarationBuilder fromIntermediate: ir <IntermediateClassDeclaration> forExistingMixin: mixin <InstanceMixin> = (
 (*Builders do not give an ordinary mirror representing their current state: ask the builder itself. (Although this could be done: submit to atomic install without a namespace, don't install into Smalltalk, don't update the existingMixin, and reflect on the result.)
 
 Builders internally keep a CompiledMixinMirror that reflects the current state, including edits made but not yet installed. Queries reflect the state of this CMM.
@@ -86,16 +82,12 @@ Builders are connected up and down.  If you get a builder on a declaration, if y
 	
 	(* Eager. Simplifies CDB on installed CD versus new CD.  This must be computed anyway to install. *)
 	public instanceSide <MixinBuilder> = MixinBuilder 
-		forClassDeclaration: self
-		lowLevelMixin: rep first lowLevelMirror
-		withNestedReps: rep last.
+		forClassDeclaration: self intermediate: ir instanceSide.
 		
 	public classSide <MixinBuilder> = MixinBuilder 
-		forClassDeclaration: self
-		lowLevelMixin: rep first lowLevelMirror classMixin
-		withNestedReps: {}.
+		forClassDeclaration: self intermediate: ir classSide.
 	
-	prvtCompiledMixinMirror <CompiledMixinMirror> ::= rep first.
+	prvtIntermediate <CompiledMixinMirror> ::= ir.
 	
 	public header <ClassHeaderBuilder> = ClassHeaderBuilder forClassDeclaration: self.
 |)
@@ -111,18 +103,20 @@ public enclosingClass ^<ClassDeclarationBuilder> = (
 		prvtExistingMixin isNil ifTrue: [^nil].
 		
 		enclosing:: prvtExistingMixin enclosingMixin.
-		enclosing ifNil:[^nil].
+		enclosing ifNil: [^nil].
 		
 		prvtEnclosingDeclaration:: ClassDeclarationBuilder reflecting: enclosing.
 		
-		prvtEnclosingDeclaration instanceSide nestedClasses addMirror: self
+		prvtEnclosingDeclaration prvtIntermediate instanceSide nestedClasses
+			removeAllSuchThat: [:e | e simpleName = prvtIntermediate simpleName].
+		prvtEnclosingDeclaration prvtIntermediate instanceSide nestedClasses
+			add: prvtIntermediate.
+		prvtEnclosingDeclaration instanceSide nestedClasses addMirror: self.
 	].
 	^prvtEnclosingDeclaration
 )
 public headerFromSource: newHeader <String> = (
-	|
-	compiledResults <MixinRep>
-	|
+	| prefix res |
 	
 	#BOGUS yourself.
 	(* API:
@@ -137,23 +131,25 @@ public headerFromSource: newHeader <String> = (
 		
 		Currently, this takes 'Foo = ()' instead of 'class Foo = ()'.  Perhaps we should do the latter since an access modifier might be specified?
 	*)
-
-	lazyIsTopLevel ifTrue: [
-		(* Result directly corresponds to me *)
-		compiledResults:: compiler compileClassHeader: ('Newspeak3 ''', header category, ''' ', (addMissingClass: newHeader)) readStream of: self.
-		checkForSlotConflicts: compiledResults first.
+	prefix:: (lazyIsTopLevel
+			(* only top-level classes can specify categories *)
+			ifTrue: [ 'Newspeak3 ''', header category, ''' ' ]
+			ifFalse: [ accessModifier,  ' ' ]).
+			
+	res:: compiler
+		compileClassHeader: (prefix, (addMissingClass: newHeader)) readStream
+		of: self
+		into: prvtIntermediate
+		within: (enclosingClass ifNotNil: [:it | it prvtIntermediate]).
+	prvtIntermediate:: res.
+	instanceSide prvtIntermediate: res instanceSide.
+	classSide prvtIntermediate: res classSide.
+	
+	checkForSlotConflicts: res.
+		(* 
 		checkForNameChange: compiledResults first.
-		prvtCompiledMixinMirror: compiledResults first.
-	] ifFalse: [
-		(* Result corresponds to my enclosing class, since my slot/accessor may have been adjusted *)
-		| newRep <MixinRep> |
-		compiledResults:: compiler compileClassHeader: (addMissingClass: newHeader) readStream of: self.
-		newRep:: onlyElementOf: compiledResults last.
-		checkForSlotConflicts: newRep first.
-		checkForNameChange: newRep first.
-		enclosingClass prvtCompiledMixinMirror: compiledResults first.	
-		prvtCompiledMixinMirror: newRep first.
-	].
+		restory category
+		*)
 )
 public install ^<ClassDeclarationMirror> = (
 	
@@ -174,36 +170,21 @@ public simpleName ^<Symbol> = (
 public printOn: stm = (
 	stm nextPutAll: 'ClassDeclarationBuilder:'; nextPutAll: qualifiedName
 )'as yet unclassified'
-addMissingClass: classHeader = (
-	(* the classHeader might start with 'class' 'protected class' etc. - prepend 'class' if not *)
-	^ ((1 to: 11) includes: (classHeader findString: 'class '))
-	ifTrue: [ classHeader ]
-	ifFalse: [ 'class ', classHeader]
-)
 public qualifiedName ^<Symbol> = (
-	^prvtCompiledMixinMirror name
+	^prvtIntermediate qualifiedName
 )'private'
 checkForNameChange: newCompiledMixinMirror = (
 	
 	(fullyQualifiedNameToSimple: newCompiledMixinMirror name) = self simpleName
 		ifFalse: [Error signal: 'Cannot change name this way'].
 )
-checkForSlotConflicts: newCompiledMixinMirror = (
+checkForSlotConflicts: newIntermediate <IntermediateClassDeclaration> = (
 	
-	newCompiledMixinMirror lowLevelMirror instVars do:
-		[:each <InstanceVariableMirror> | 
+	newIntermediate instanceSide slots do:
+		[:slot <IntermediateSlotDeclaration> | 
 		instanceSide
-			checkNameConflictsForSlot: each name
-			mutable: each mutable].
-)
-collectMixinRepInto: dict <IdentityMap[MixinRep,Mixin]> ^<MixinRep> = (
-	| rep |
-	rep: {
-		prvtCompiledMixinMirror.
-		instanceSide nestedClasses collect: [:ea | ea collectMixinRepInto: dict].
-	}.
-	prvtExistingMixin ifNotNil: [dict at: rep put: prvtExistingMixin].
-	^rep
+			checkNameConflictsForSlot: slot name
+			mutable: slot isMutable].
 )
 compiledMixinMirror = (
 	(* Asked for by compiler *)
@@ -221,6 +202,11 @@ notifyExistingMirrors = (
 	instanceSide notifyExistingMirrors.
 	classSide notifyExistingMirrors.
 )'restricted'
+collectExistingMixinsInto: map <Map[IntermediateClassDeclaration, InstanceMixin]> ^<IntermediateClassDeclaration> = (
+	prvtExistingMixin ifNotNil: [map at: prvtIntermediate put: prvtExistingMixin].
+	instanceSide nestedClasses do: [:ea | ea collectExistingMixinsInto: map].
+	^prvtIntermediate
+)
 extractReflecteeFrom: mixin <Mixin> = (
 
 	(* For builders that already had a non-nil reflectee, this is not necessary since the old reflectee has been become:d to the new one (at least if atomic install is working right...).  But this is required for builders that have been created from source and didn't have a reflectee yet.  This will connect them to their reflectees. *)
@@ -249,17 +235,15 @@ public isClassDeclarationMirror ^<Boolean> = (
 public fromSource: src <String> ^<ClassDeclarationBuilder> = (
 	^self fromUnitSource: 'Newspeak3 ''Uncategorized'' ', src
 )'as yet unclassified'
-public fromUnitSource: src <String> ^<ClassDeclarationBuilder> = (
-	| rep <MixinRep> |
-	rep:: compiler
-		compileClassSource: src readStream
-		within: nil.
-	^self fromMixinRep: rep forExistingMixin: nil
+public fromUnitSource: source <String> ^<ClassDeclarationBuilder> = (
+	| ir <IntermediateClassDeclaration> |
+	ir:: compiler compileClassSource: source readStream within: nil.
+	^self fromIntermediate: ir forExistingMixin: nil
 )
 public reflecting: mixin <InstanceMixin> ^<ClassDeclarationBuilder> = (
 	assert: [mixin isMixin & mixin isMeta not] message: 'Provide an instance-side mixin'.
 	^self
-		fromMixinRep: (mixinRepFor: mixin)
+		fromIntermediate: (buildIntermediateFor: mixin)
 		forExistingMixin: mixin
 ))
 public class ClassDeclarationMirror reflecting: mixin <Mixin> = Mirror reflecting: mixin (
@@ -331,7 +315,7 @@ class ClassHeaderBuilder forClassDeclaration: decl = (|
 |)
 ('as yet unclassified'
 public category ^<Symbol> = (
-	^prvtDeclaration prvtCompiledMixinMirror category ifNil: ['Uncategorized']
+	^prvtDeclaration prvtIntermediate category ifNil: ['Uncategorized']
 )
 public category: c <Symbol | String> = (
 	prvtDeclaration prvtCompiledMixinMirror category: c asSymbol
@@ -360,11 +344,7 @@ public name ^<Symbol> = (
 	^prvtDeclaration name
 )
 public name: newSimpleName <Symbol> = (
-	|
-	token
-	newClassSource
-	compiledResults <MixinRep>
-	|
+	| token newClassSource res |
 
 	(* check for name conflict with sibling members *)
 	prvtDeclaration lazyIsTopLevel ifFalse: [
@@ -374,8 +354,8 @@ public name: newSimpleName <Symbol> = (
 			ifFalse: [Error signal: 'A sibling already exists with the name ',newSimpleName].
 
 		(* remove old accessors *)
-		prvtDeclaration enclosingClass instanceSide nestedClasses
-			removeSlotAndAccessorOf: prvtDeclaration.
+		(* prvtDeclaration enclosingClass instanceSide nestedClasses
+			removeSlotAndAccessorOf: prvtDeclaration. *)
 	].
 
 
@@ -392,21 +372,19 @@ public name: newSimpleName <Symbol> = (
 
 
 	(* compile etc *)
-	compiledResults:: compiler
+	res:: compiler
 		compileClassHeader: newClassSource readStream
-		of: prvtDeclaration.
+		of: self prvtDeclaration
+		into: prvtDeclaration prvtIntermediate
+		within: (prvtDeclaration enclosingClass ifNotNil: [:it | it prvtIntermediate]).
+		
+	prvtDeclaration prvtIntermediate: res.
+	prvtDeclaration instanceSide prvtIntermediate: res instanceSide.
+	prvtDeclaration classSide prvtIntermediate: res classSide.
 	
-	prvtDeclaration lazyIsTopLevel ifTrue: [
-		(* Result directly corresponds to me *)
-		prvtDeclaration checkForSlotConflicts: compiledResults first.
-		prvtDeclaration prvtCompiledMixinMirror: compiledResults first.
-	] ifFalse: [
-		(* Result corresponds to my enclosing class, since my slot/accessor may have been adjusted *)
-		| newRep <MixinRep> = onlyElementOf: compiledResults last. |
-		prvtDeclaration checkForSlotConflicts: newRep first.
-		prvtDeclaration enclosingClass prvtCompiledMixinMirror: compiledResults first.
-		prvtDeclaration prvtCompiledMixinMirror: newRep first.
-	].
+	(* prvtDeclaration checkForSlotConflicts: compiledResults first. *)
+	
+	prvtDeclaration enclosingClass ifNotNil: [:it | it instanceSide nestedClasses addMirror: prvtDeclaration].
 )
 public primaryFactory ^ <MethodBuiler> = (
 
@@ -418,7 +396,7 @@ public primaryFactory ^ <MethodBuiler> = (
 	^MethodBuilder reflecting: lowLevelMethodMirror in: prvtDeclaration classSide
 )
 public source ^<String> = (
-	^prvtDeclaration prvtCompiledMixinMirror header
+	^prvtDeclaration prvtIntermediate headerSource
 )
 public source: newHeaderSource <String> = (
 	prvtDeclaration headerFromSource: newHeaderSource
@@ -615,26 +593,25 @@ public isInitializerMethodMirror ^ <Boolean> = (
 public source ^ <String> = (
 	^definingMixin declaration header source
 )) : ()
-class MethodBuilder reflecting: llm in: mb = (
-(* Describe the class in this comment. *)|
-	prvtLowLevelMethodMirror = llm.
-	prvtMixinBuilder = mb.
+class MethodBuilder reflecting: ir in: mb = (|
+	prvtIntermediate <IntermediateMethod> = ir.
+	prvtMixinBuilder <MixinBuilder> = mb.
 |)
 ('as yet unclassified'
 public accessModifier ^<Symbol> = (
-	^prvtLowLevelMethodMirror accessModifier
+	^prvtIntermediate accessModifier
 )
 public category ^<Symbol> = (
-	^prvtLowLevelMethodMirror metadata at: #category
+	^prvtIntermediate category
 )
 public category: cat <String | Symbol> = (
-	^prvtLowLevelMethodMirror metadata at: #category put: cat asSymbol
+	^prvtIntermediate category: cat asSymbol
 )
 public definingMixin ^<MixinBuilder> = (
 	^prvtMixinBuilder
 )
 public name ^<Symbol> = (
-	^prvtLowLevelMethodMirror selector
+	^prvtIntermediate selector
 )
 public reflectee ^<CompiledMethod> = (
 	#BOGUS yourself.
@@ -649,8 +626,8 @@ public simpleName ^<Symbol> = (
 	^name
 )
 public source ^<String> = (
-	^prvtLowLevelMethodMirror method 
-		ifNil: [prvtLowLevelMethodMirror src]
+	^prvtIntermediate method 
+		ifNil: [prvtIntermediate src]
 		ifNotNil: [:it | it getSource]
 )) : ()
 class MethodMirror mirroring: m <CompiledMethod> = Mirror reflecting: m (
@@ -754,12 +731,13 @@ class MirrorReplacedEvent from: oldM to: newM = MirrorEvent (
 isMirrorReplacedEvent ^<Boolean> = (
 	^true
 )) : ()
-public class MixinBuilder forClassDeclaration: cbd lowLevelMixin: llm withNestedReps: reps = (
+public class MixinBuilder forClassDeclaration: cbd intermediate: mixinIR = (
 (* The mirror builder for mixins.  See MixinMirror. *)|
+	private prvtIntermediate <IntermediateMixin> ::= mixinIR.
 	public declaration <ClassDeclarationBuilder> = cbd.
-	public isMeta <Boolean> = llm isMeta.
-	public methods <MutableMethodGroup> = MutableMethodGroup group: (methodsFrom: llm) within: self.
-	public nestedClasses <MutableNestedClassGroup> = MutableNestedClassGroup group: (nestedClassesFrom: reps) within: self.
+	public isMeta <Boolean> = mixinIR isMeta.
+	public methods <MutableMethodGroup> = MutableMethodGroup group: (methodsFrom: mixinIR) within: self.
+	public nestedClasses <MutableNestedClassGroup> = MutableNestedClassGroup group: (nestedClassesFrom: mixinIR) within: self.
 |)
 ('accessing'
 canUnderstand: selector <Symbol> ^<Boolean> = (
@@ -780,11 +758,14 @@ canUnderstand: selector <Symbol> ^<Boolean> = (
 )
 slots ^ <ImmutableMirrorGroup[SlotMirror]> = (
 	| slotMirrors <Collection[SlotMirror]> | 
-	isMeta ifTrue: [ slotMirrors:: {} ] ifFalse: [
-		slotMirrors:: (declaration prvtCompiledMixinMirror lowLevelMirror instVars 
-			collect: [:each <InstanceVariableMirror> | SlotDeclarationMirror named: each name mutable: each isMutableSlot accessModifier: each accessModifier])
-				reject: [:each <SlotMirror> | each name includes: "`"].
-	].
+	slotMirrors:: (prvtIntermediate slots collect:
+		[:each <IntermediateSlotDeclaration> |
+		SlotDeclarationMirror
+			named: each name
+			mutable: each isMutable
+			accessModifier: each accessModifier])
+		reject:
+		[:each <SlotDeclarationMirror> | each name includes: "`"].
 	^ImmutableMirrorGroup group: slotMirrors
 )'as yet unclassified'
 public isMixinMirror ^<Boolean> = (
@@ -814,23 +795,22 @@ checkNameConflictsForSlot: slotName <Symbol> mutable: isMutable <Boolean> = (
 	(isMutable and: [methods includesMirrorNamed: slotName, ':'])
 		ifTrue:[^Error signal: 'Class already has method named ', slotName].
 )
-methodsFrom: llm <LowLevelMixinMirror> ^<List[MethodBuilder]> = (
-	^(llm methods 
-		select: [:m <LowLevelMethodMirror> | m isSynthetic not])
+methodsFrom: mixinIR <IntermediateMixin> ^<List[MethodBuilder]> = (
+	^(mixinIR methods 
+		reject: [:m <LowLevelMethodMirror> | m isSynthetic])
 			collect: [:m <LowLevelMethodMirror> | MethodBuilder reflecting: m in: self]
 )
-nestedClassesFrom: reps <List[MixinRep]> ^<List[ClassDeclarationBuilder]> = (
-	^reps collect: [:rep <MixinRep> | | nc nestedMixin |
+nestedClassesFrom: mixinIR <IntermediateMixin> ^<List[ClassDeclarationBuilder]> = (
+	^mixinIR nestedClasses collect: [:nestedClassIR <IntermediateNestedClass> | | nc nestedMixin |
 		
 		(* The existingMixin will be nil if this is a new (uninstalled) class declaration. *)
 		(* MUST COMPUTE THIS BEFORE CONSTRUCTING! Cannot be filled in after constructing the nested CDB or CDs with more than one level of nested will not be attached to their existing mixin! *)
 		declaration reflectee ifNotNil: [:mixin |
-			nestedMixin:: mixin nestedMixins at: rep first name.
+			nestedMixin:: mixin nestedMixins at: nestedClassIR qualifiedName.
 		].
 		
-		nc:: (ClassDeclarationBuilder fromMixinRep: rep forExistingMixin: nestedMixin).
+		nc:: (ClassDeclarationBuilder fromIntermediate: nestedClassIR forExistingMixin: nestedMixin).
 		nc prvtEnclosingDeclaration: declaration.
-		
 		nc
 	]
 )
@@ -982,7 +962,7 @@ public addFromSource: s <String> = (
 		ifNil: [#'as yet unclassified']
 		ifNotNil: [:oldMirror | oldMirror category].
 	
-	result metadata at: #category put: cat.
+	result category: cat.
 	(* Category must be set or it will think it's synthetic and lose the source *)
 	
 	newM:: MethodBuilder reflecting: result in: enclosingMixin.
@@ -996,13 +976,13 @@ addMirror: m <MethodBuilder>= (
 	enclosingMixin checkNameConflictsForMethod: m name.
 	
 	super addMirror: m.
-	lowLevelMixin methods addMirror: m prvtLowLevelMethodMirror.
+	enclosingMixin prvtIntermediate methods add: m prvtIntermediate.
 	^m
 )
 removeMirror: m = (
 
 	super removeMirror: m.
-	lowLevelMixin methods removeMirror: m prvtLowLevelMethodMirror.
+	enclosingMixin prvtIntermediate methods remove: m prvtIntermediate.
 )'private'
 lowLevelMixin = (
 	(* Cannot cache from instantiation: might be replaced by editing class header or add/remove nested class. *)	
@@ -1052,25 +1032,15 @@ class MutableNestedClassGroup group: mirrors within: mb = MutableMirrorGroup gro
 |)
 ('accessing'
 public addFromSource: source <String> ^<ClassDeclarationBuilder> = (
-	|
-	enclosingDeclaration
-	compiledResults <MixinRep>
-	nestedReps
-	newCDB
-	|
-	enclosingDeclaration:: enclosingMixin declaration.
-	
-	compiledResults:: compiler 
-		compileClassSource: (addMissingClass: source) readStream
+	| result newCDB |
+	result:: compiler 
+		compileClassSource: source readStream
 		within: enclosingMixin.
 		
-	enclosingDeclaration prvtCompiledMixinMirror: compiledResults first.
-	nestedReps:: compiledResults last.
+	(* enclosingDeclaration prvtCompiledMixinMirror: compiledResults first. *)
 	
-	assert: [nestedReps size = 1] message: 'Does it only answer with me and not my siblings?'.
-	
-	newCDB:: ClassDeclarationBuilder fromMixinRep: nestedReps first forExistingMixin: nil.
-	newCDB prvtEnclosingDeclaration: enclosingDeclaration.
+	newCDB:: ClassDeclarationBuilder fromIntermediate: result forExistingMixin: nil.
+	newCDB prvtEnclosingDeclaration: enclosingMixin declaration.
 		
 	addMirror: newCDB.
 	^newCDB
@@ -1082,14 +1052,9 @@ addMirror: m <ClassDeclarationBuilder> = (
 
 	enclosingMixin checkNameConflictsForNestedClass: m simpleName.
 	super addMirror: m.
+	enclosingMixin prvtIntermediate nestedClasses include: m prvtIntermediate.
 	^m
 )'as yet unclassified'
-addMissingClass: classHeader = (
-	(* the classHeader might start with 'class' 'protected class' etc. - prepend 'class' if not *)
-	^ ((1 to: 11) includes: (classHeader findString: 'class '))
-	ifTrue: [ classHeader ]
-	ifFalse: [ 'class ', classHeader]
-)
 removeMirror: victim <ClassDeclarationBuilder> = (
 	|
 	victimName
@@ -1097,6 +1062,7 @@ removeMirror: victim <ClassDeclarationBuilder> = (
 	|
 	(* Must patch the enclosing class of the victim *)
 	removeSlotAndAccessorOf: victim.
+	enclosingMixin prvtIntermediate nestedClasses remove: victim prvtIntermediate.
 	
 	super removeMirror: victim.
 )
@@ -1104,22 +1070,18 @@ removeSlotAndAccessorOf: victim <ClassDeclarationBuilder> = (
 	|
 	victimName
 	sep
+	mixinIR
 	|
 	victimName: victim qualifiedName.
 	sep:: Language newspeak3 syntheticNameSeparator.
-	lowLevelMixin methods removeMirrorNamed: victimName,sep,'slot'.
-	lowLevelMixin methods removeMirrorNamed: victimName,sep,'slot:'.
-	lowLevelMixin methods removeMirrorNamed: victim simpleName.
-	lowLevelMixin instVars removeMirrorNamed: victimName,sep,'slot'.
+	mixinIR:: enclosingMixin prvtIntermediate.
+	mixinIR methods removeAllSuchThat: [:e | e simpleName = (victimName,sep,'slot')].
+	mixinIR methods removeAllSuchThat: [:e | e simpleName =  (victimName,sep,'slot:')].
+	mixinIR methods removeAllSuchThat: [:e | e simpleName =  (victim simpleName)].
+	mixinIR slots removeAllSuchThat: [:e | e simpleName = (victimName,sep,'slot')].
 	
 	(* Indices can change if the victim's slot is not the last one *)
-	compiler generateSlotAccessorsFor: lowLevelMixin.
-)'private'
-lowLevelMixin = (
-	(* Cannot cache from instaniation: might be replaced by editing class header or add/remove nested class. *)
-	^enclosingMixin isMeta
-		ifTrue: [enclosingMixin declaration compiledMixinMirror lowLevelMirror classMixin]
-		ifFalse: [enclosingMixin declaration compiledMixinMirror lowLevelMirror].
+	compiler generateSlotAccessorsFor: mixinIR declaration.
 )) : ()
 public class ObjectMirror reflecting: r <Object> = Mirror reflecting: r (
 (* A high level mirror on local objects. The API for a Newspeak object mirror is exceedingly simple. One can view or change its reflectee's class; one can send the reflectee a message; one can set the reflectee's slots; and one can request access to the reflectee.  We may later extend this with printing/safe printing, the ability to execute an arbitrary method on the reflectee, or generalized super-object access.
@@ -1176,7 +1138,7 @@ ifError: evalErrorHandler <[:Error]> ^<ObjectMirror> = (
 		inContext: nil
 		inMixin: mxn. 
 		
-	mtdMirror metadata at: #category put: 'DoIts'.
+	mtdMirror category: 'DoIts'.
 	mtdMirror klass: cls mixin definingClass.
 	mtdMirror compiledMethod properties
 		at: #source put: expression;
@@ -1210,7 +1172,7 @@ ifError: evalErrorHandler <[:Error]> ^<ObjectMirror> = (
 		inMixin: mxn
 		allowBlackMarket: true.
 		
-	mtdMirror metadata at: #category put: 'DoIts'.
+	mtdMirror category: 'DoIts'.
 	mtdMirror klass: cls mixin definingClass.
 	mtdMirror compiledMethod properties
 		at: #source put: expression;
@@ -1339,7 +1301,7 @@ mirrors installAtomically: {a. b}
 	#BOGUS. (* We should check that the set of builders is disjoint *)
 	
 	(* Have builders construct their new MixinRep and fill in existing mixins *)
-	reps:: topmostBuilders collect: [:b | b collectMixinRepInto: existingMixinMap].
+	reps:: topmostBuilders collect: [:b | b collectExistingMixinsInto: existingMixinMap].
 
 	(* Submit to atomic install *)
 	mixinResults:: atomicInstaller install: reps withExistingMixins: existingMixinMap.
@@ -1360,6 +1322,12 @@ mirrors installAtomically: {a. b}
 	
 	^builders collect: [:b | ClassDeclarationMirror reflecting: b reflectee]
 )'as yet unclassified'
+addMissingClass: classHeader = (
+	(* the classHeader might start with 'class' 'protected class' etc. - prepend 'class' if not *)
+	^ ((1 to: 11) includes: (classHeader findString: 'class '))
+	ifTrue: [ classHeader ]
+	ifFalse: [ 'class ', classHeader]
+)
 compiler ^ <Newspeak3Compilation Compiler> = (
 	storedCompiler ifNil: [storedCompiler:: compilation Compiler new].
 	^storedCompiler
@@ -1370,131 +1338,59 @@ fullyQualifiedNameToSimple: name = (
 mixinChanged: mixin = (
 	mixinBasedMirrors do: [:mirror | 
 		mirror reflectee = mixin ifTrue: [mirror mixinChanged]].
-)
-onlyElementOf: tuple = (
-	assert: [tuple size = 1] message: 'The tuple does not have a single item.'.
-	^tuple first
-)'construct-mixinrep'
-isConstructorSelector: sel forMixin: mxn = (
-	^mxn declaration header primaryFactoryName = sel
-	(* ^ (sel = 'new') 
-		ifTrue: [ true ]
-		ifFalse: [ | src <Yield> impl | 
-			impl:: mxn isMeta
-			ifFalse: [ mxn implementationMirror ]
-			ifTrue: [ | klass <Class> |
-				klass:: mxn implementationMirror implementationClass.
-				(reflectionClass new mixinFor: klass theNonMetaClass) implementationMirror
-			].
-		src:: impl classHeader constructor.
-		src isNil 
-			ifTrue: [ false ]
-			ifFalse: [ | mp <MessagePatternAST> |
-				mp:: parserInstance messagePattern parse: src contents readStream.
-				sel = mp selector]]. *)
-)
-isNestedClassAccessorSelector: sel forMixin: mxn = (
-	| ts <OrderedCollection[String]> |
-	ts:: sel findTokens: syntheticNameSeparator.
-	^ (ts size = 1 and: [mxn nestedClasses includesMirrorNamed: ts anyOne])
-		or: [ ts size > 2 
-			and: [(ts last = 'slot' or: [ts last = 'slot:']) 
-				and: [mxn nestedClasses includesMirrorNamed: (ts at: ts size - 1)]]]
-)
-makeCompiledMixinMirrorFor: lowLevelMixinMirror <LowLevelMixinMirror> from: mixin <Mixin> = (
-	^CompiledMixinMirror
-		header:  mixin cachedHeaderSource
-		mirror: lowLevelMixinMirror
-)
-makeCompiledMixinMirrorForMixin: mixin <Mixin> = (
-	^ makeCompiledMixinMirrorFor: (makeLowLevelMixinMirrorFor: mixin) from: mixin.
-)
-makeLowLevelMixinMirrorFor: mixin <Mixin> = (
-	| llm <LowLevelMixinMirror> llcm | 
-	assert:[mixin isMeta not] message: ''.
+)'construct-intermediate'
+buildIntermediate: i <IntermediateMixin> from: mixin <AbstractMixin> = (
 	
-	llm:: LowLevelMixinMirror named: mixin name isMeta: false.
-
-	(* instance variables -- n.b. slot accessors need to be generated *)
-	mixin slots do: [:slot <{Name.Mutable}> | 
-		llm instVars addMirror: (lowLevelMirrors InstanceVariableMirror named: slot first mutable: slot second accessModifier: slot last)
-	].
-
-	(* methods *)
-	mixin methodDictionary keysAndValuesDo: [ :selector :method |
-		| methodMirror |
-		methodMirror:: LowLevelMethodMirror new.
-		methodMirror method: method. 
-		methodMirror klass: mixin.
-		methodMirror selector: selector.
-		methodMirror accessModifier: method accessModifier.
-		llm methods addMirror: methodMirror.
-	].
-	setMetadataForMixinMirror: llm inMixin: mixin .
-
-	(* category *)
-	llm category: (mixin category ifNil:['Uncategorized']).
+	mixin methodDictionary keysAndValuesDo: 
+		[:selector :method |
+		|
+		imethod = intermediates IntermediateMethod new.
+		category = mixin organization categoryOfElement: selector.
+		|
+		imethod method: method. 
+		imethod klass: mixin.
+		imethod selector: selector.
+		imethod accessModifier: method accessModifier.
+		imethod isSynthetic: category isNil.
+		imethod category: category.
+		imethod isSynthetic ifTrue: 
+			[imethod isNestedClassAccessor: (isNestedClassAccessorSelector: selector forMixin: mixin).
+			imethod isConstructor: (isConstructorSelector: selector forMixin: mixin)].
+		i methods add: imethod].
 	
-	(* meta class / class side *)
-	llcm:: lowLevelMirrors LowLevelMixinMirror named: mixin classMixin name isMeta: true.
-	mixin classMixin methodDictionary keysAndValuesDo: [ :selector :method |
-		| methodMirror |
-		methodMirror:: LowLevelMethodMirror new.
-		methodMirror method: method. 
-		methodMirror klass: mixin classMixin.
-		methodMirror selector: selector.
-		llcm methods addMirror: methodMirror.
-	].
-	setMetadataForMixinMirror: llcm inMixin: mixin classMixin.
-	llm cachedClassMixin: llcm.
+	mixin isMeta ifTrue: [^self].
 	
-	^llm
+	mixin slots do:
+		[:tuple |
+		| slot = intermediates IntermediateSlotDeclaration new. |
+		slot name: (tuple at: 1).
+		slot isMutable: (tuple at: 2).
+		slot accessModifier: (tuple at: 3).
+		i slots add: slot.].
+	
+	mixin nestedMixins valuesDo:
+		[:nestedMixin <InstanceMixin> |
+		i nestedClasses add: (buildIntermediateFor: nestedMixin)].
 )
-mixinRepFor: mixin <Mixin> ^ <MixinRep> = (
-	^{
-	makeCompiledMixinMirrorForMixin: mixin. 
-	mixin nestedMixins values collect: [ :nc <Class> | mixinRepFor: nc ].
-	}
+buildIntermediateFor: mixin <InstanceMixin> ^<IntermediateClassDeclaration> = (
+	| i = intermediates IntermediateClassDeclaration new. |
+	i simpleName: mixin simpleName.
+	i qualifiedName: mixin name.
+	i headerSource: mixin cachedHeaderSource.
+	i factoryName: mixin cachedConstructorName.
+	i comment: nil.
+	i category: mixin category.
+	buildIntermediate: i instanceSide from: mixin.
+	buildIntermediate: i classSide from: mixin classMixin.
+	^i
 )
-setMetadataForMethodMirror: mirror <LowLevelMethodMirror> inMixin: mixin <Mixin|ClassMixin> = (
-	| category <String> |
-
-	category:: (mixin organization categoryOfElement: mirror selector).
-	mirror metadata at: #isSynthetic put: category isNil.
-	mirror metadata at: #category put: category.
-	category ifNil: [ setMetadataForSyntheticMethod: mirror inMixin: mixin ].
+isConstructorSelector: selector forMixin: mixin <AbstractMixin> = (
+	mixin isMeta ifFalse: [^false].
+	^mixin instanceMixin cachedConstructorName = selector
 )
-setMetadataForMixinMirror: mirror <LowLevelMixinMirror> inMixin: mixin <Mixin|ClassMixin> = (
-
-	mirror methods do: [ :mm <LowLevelMethodMirror> |
-		setMetadataForMethodMirror: mm inMixin: mixin.
-	].
-)
-setMetadataForSyntheticMethod: mtd <LowLevelMethodMirror> inMixin: mixin <Mixin|ClassMixin> = (
-	| selector meta mxn |
-
-	mxn:: MixinMirror reflecting: mixin.
-	selector:: mtd selector.
-
-	meta:: mtd metadata.
-	(* meta at: #isSuperConstructor put: false.
-	meta at: #isSubInitializer put: false.
-	meta at: #isConstructor put: false.
-	meta at: #isSlotAccessor put: false.
-	meta at: #isNestedClassAccessor put: false. *)
-
-	(* mutually exclusive, therefore shortcut semantics *)
-	(* (isSuperConstructorSelector: selector)
-		ifTrue: [ meta at: #isSuperConstructor put: true. ^ mtd]. *) (* unused *)
-	(* (isSubInitializerSelector: selector) 
-		ifTrue: [meta at: #isSubInitializer put: true. ^ mtd]. *) (* unused *)
-	(* (isSlotAccessorSelector: selector forMixin: mxn)
-		ifTrue: [meta at: #isSlotAccessor put: true. ^ mtd]. *) (* unused *)
-	(isNestedClassAccessorSelector: selector forMixin: mxn)
-		ifTrue: [meta at: #isNestedClassAccessor put: true. ^ mtd]. (* important. used in recompiling headers *)
-	(isConstructorSelector: selector forMixin: mxn)
-		ifTrue: [meta at: #isConstructor put: true. ^ mtd]. (* used by these mirrors. should rewrite *)
-)
-syntheticNameSeparator = (
-	^ Language syntheticNameSeparator.
+isNestedClassAccessorSelector: selector forMixin: mixin <AbstractMixin> = (
+	mixin isMeta ifTrue: [^false].
+	#BOGUS. (* Consult namer *)
+	(selector endsWith: '`slot') ifTrue: [^true].
+	^mixin nestedMixins includesKey: (mixin name, '`', selector)
 )) : ()

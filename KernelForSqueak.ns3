@@ -1,7 +1,7 @@
 Newspeak3
 'NS2Squeak'
 class KernelForSqueak usingPlatform: p vmMirror: vmm = (
- (* N.B.: Although Newspeak classes and mixins are represented by the Behavior and Mixin classes of this module, not all code here is live in the system.  In particular, true, false and nil are not instances of the True, False and UndefinedObject defined here but still instances of the corresponding Squeak classes.
+(* N.B.: Although Newspeak classes and mixins are represented by the Behavior and Mixin classes of this module, not all code here is live in the system.  In particular, true, false and nil are not instances of the True, False and UndefinedObject defined here but still instances of the corresponding Squeak classes.
 
 This code was derived in part by converting the Strongtalk Magnitude, Boolean and  UndefinedObject classes to Newspeak. For those classes, the Sun Microsystems copyright and BSD license below applies.
 
@@ -53,7 +53,7 @@ DAMAGE. *)|
 	private SymbolSlot = Symbol.
 |)
 (
-class AbstractMixin = (
+public class AbstractMixin = (
 (* A mixin is the difference between a class and its superclass: a set of additional methods, slots and nested class declarations.  Newspeak class declarations implicitly define instance-side and class-side pairs of mixins, and Newspeak classes (other than Top) are all mixin applications.
 
 Most of the methods of this class are to allow mixins to behave like Smalltalk classes when we must deal with Squeak, since Newspeak classes do reside in Squeak's system dictionary, mostly source control (the changes file) and IDE utilities like senders/implementors. These methods are not part of a mature Newspeak system.
@@ -252,7 +252,7 @@ whichSelectorsReferTo: literal special: specialFlag byte: specialByte thorough: 
 			who add: selector ] ].
 	^who
 )) : ()
-class Behavior = (
+public class Behavior = (
 (* My instances describe the behavior of other objects. I provide the minimum state necessary for creating and running instances. Most objects are created as instances of the more fully supported subclass, Class, but I am a good starting point for providing instance-specific behavior (as in Metaclass).
 
 At this time, and for the foreseeable future, this class is polluted by a large number of methods necessary to support interaction with the surrounding Squeak Smalltalk implementation. In a pure Newspeak setting, these methods would be handled by mirrors exclusively.  The data in the slots would be private.
@@ -309,9 +309,6 @@ classSide = (
 enclosingClass = (
 	#BOGUS. (* Used by syntax highlighter. *)
 	^self enclosingObjectSlot == nil ifFalse: [self enclosingObjectSlot class]
-)
-identityHash = (
-	^vmmirror behaviorHashOf: self
 )
 instVarNamesAndOffsetsDo: aBinaryBlock = (
 	(* This is part of the interface between the compiler and a class's instance or field names.
@@ -397,6 +394,21 @@ whichClassIncludesSelector: aSymbol = (
 	superclass == nil
 		ifTrue: [^ nil].
 	^ superclass whichClassIncludesSelector: aSymbol
+)'comparing'
+identityHash = (
+	(*
+	 Answer a SmallInteger whose value is related to the receiver's identity.
+	 Behavior implements identityHash to allow the VM to use an object representation which
+	 does not use a direct reference to an object's class.  If the VM is using this implementation
+	 then classes are held in a class table and instances refer to their index in the table.  This is
+	 more compact because the index field in the object header is less than a full word in size,
+	 and this simplifies a just-in-time compiler's in-line cache management because class indices
+	 are not updated by the garbage collector.  A class's class table index is its identityHash so
+	 that an instance can be created without searching the table for a class's index.  The VM uses
+	 this primitive to enter the class into the class table, assigning its identityHash with an as-yet
+	 unused class table index. *)
+
+	^vmmirror behaviorHashOf: self
 )'initialize-release'
 superclass: sc methodDictionary: md format: fmt = (
 	superclass: sc.
@@ -443,9 +455,12 @@ allInstancesDo: aBlock = (
 	
 	Because aBlock might change the class of inst (for example, using become:),
 	it is essential to compute next before aBlock value: inst. *)
-	| inst next |
+	| instancesOrNil inst next |
+	instancesOrNil:: vmmirror allInstancesOf: self.
+	nil == instancesOrNil ifFalse: [instancesOrNil do: aBlock. ^self].
+	(* Bulk instances primitive failed, fall back to old iterative primitive. *)
 	inst: self someInstance.
-	[inst == nil]
+	[nil == inst]
 		whileFalse:
 		[
 		next: inst nextInstance.
@@ -568,26 +583,72 @@ whichSelectorsReferTo: literal special: specialFlag byte: specialByte thorough: 
 	^who
 )'testing'
 instSize = (
-	isSpur ifTrue: [^format bitAnd: 16rFFFF].
-	^((format bitShift: -10) bitAnd: 16rC0) + ((format bitShift: -1) bitAnd: 16r3F) - 1
+	(* Answer the number of named instance variables
+	(as opposed to indexed variables) of the receiver.
+	 Above Cog Spur the class format is
+		<5 bits inst spec><16 bits inst size> *)
+	^format bitAnd: 16rFFFF
 )
 instSpec = (
-	isSpur ifTrue: [^(format bitShift: -16) bitAnd: 16r1F].
-	^(format bitShift: -7) bitAnd: 16rF
+	(* Answer the instance specification part of the format that defines what kind of object
+	 an instance of the receiver is.  The formats are
+		0 = 0 sized objects (UndefinedObject True False et al)
+		1 = non-indexable objects with inst vars (Point et al)
+		2 = indexable objects with no inst vars (Array et al)
+		3 = indexable objects with inst vars (MethodContext AdditionalMethodState et al)
+		4 = weak indexable objects with inst vars (WeakArray et al)
+		5 = weak non-indexable objects with inst vars (ephemerons) (Ephemeron)
+		6 unused, reserved for exotic pointer objects?
+		7 reserved by the VM
+		8 unused, reserved for exotic non-pointer objects?
+		9 (?) 64-bit indexable
+		10 - 11 32-bit indexable
+		12 - 15 16-bit indexable
+		16 - 23 byte indexable
+		24 - 31 compiled method *)
+	^(format bitShift: -16) bitAnd: 16r1F
 )
 isBehavior = (
 	(* Return true if the receiver is a behavior *)
 	^true
 )
 isBits = (
-	(* Answer whether the receiver contains just bits (not pointers). *)
-	isSpur ifTrue: [^self instSpec >= 7].
-	^ self instSpec >= 6
+	(* Answer whether the receiver contains just bits (not pointers).
+	 Above Cog Spur the class format is
+		<5 bits inst spec><16 bits inst size>
+	 where the 5-bit inst spec is
+		 0 = 0 sized objects (UndefinedObject True False et al)
+		 1 = non-indexable objects with inst vars (Point et al)
+		 2 = indexable objects with no inst vars (Array et al)
+		 3 = indexable objects with inst vars (MethodContext AdditionalMethodState et al)
+		 4 = weak indexable objects with inst vars (WeakArray et al)
+		 5 = weak non-indexable objects with inst vars (ephemerons) (Ephemeron)
+		 6,7,8 unused
+		 9 (?) 64-bit indexable
+		 10 - 11 32-bit indexable
+		 12 - 15 16-bit indexable
+		 16 - 23 byte indexable
+		 24 - 31 compiled method *)
+	^self instSpec >= 9
 )
 isBytes = (
-	(* Answer whether the receiver has 8-bit instance variables. *)
-	isSpur ifTrue: [^self instSpec >= 16].
-	^ self instSpec >= 8
+	(* Answer whether the receiver has 8-bit instance variables.
+	 Above Cog Spur the class format is
+		<5 bits inst spec><16 bits inst size>
+	 where the 5-bit inst spec is
+		 0 = 0 sized objects (UndefinedObject True False et al)
+		 1 = non-indexable objects with inst vars (Point et al)
+		 2 = indexable objects with no inst vars (Array et al)
+		 3 = indexable objects with inst vars (MethodContext AdditionalMethodState et al)
+		 4 = weak indexable objects with inst vars (WeakArray et al)
+		 5 = weak non-indexable objects with inst vars (ephemerons) (Ephemeron)
+		 6,7,8 unused
+		 9 (?) 64-bit indexable
+		 10 - 11 32-bit indexable
+		 12 - 15 16-bit indexable
+		 16 - 23 byte indexable
+		 24 - 31 compiled method *)
+	^self instSpec >= 16
 )
 isFixed = (
 	(* Answer whether the receiver does not have a variable (indexable) part. *)
@@ -606,10 +667,25 @@ isPointers = (
 	^self isBits not
 )
 isVariable = (
-	(* Answer whether the receiver has indexable variables. *)
-	| instSpecLocal = self instSpec. |
-	isSpur ifTrue: [^instSpecLocal >= 2 and: [instSpecLocal ~= 5]].
-	^instSpecLocal >= 2
+	(* Answer whether the receiver has indexable variables.
+	 Above Cog Spur the class format is
+		<5 bits inst spec><16 bits inst size>
+	 where the 5-bit inst spec is
+		 0 = 0 sized objects (UndefinedObject True False et al)
+		 1 = non-indexable objects with inst vars (Point et al)
+		 2 = indexable objects with no inst vars (Array et al)
+		 3 = indexable objects with inst vars (MethodContext AdditionalMethodState et al)
+		 4 = weak indexable objects with inst vars (WeakArray et al)
+		 5 = weak non-indexable objects with inst vars (ephemerons) (Ephemeron)
+		 6,7,8 unused
+		 9 (?) 64-bit indexable
+		 10 - 11 32-bit indexable
+		 12 - 15 16-bit indexable
+		 16 - 23 byte indexable
+		 24 - 31 compiled method *)
+	| instSpec |
+	instSpec:: self instSpec.
+	^instSpec >= 2 and: [instSpec ~= 5]
 )
 isWeak = (
 	(* Answer whether the receiver has contains weak references. *)
@@ -619,7 +695,7 @@ isWords = (
 	(* Answer whether the receiver has 16-bit instance variables. *)
 	^self isBytes not
 )) : ()
-class Boolean = Value (
+public class Boolean = Value (
 (* Boolean is an abstract class defining the protocol for logic testing operations and conditional control structures for the logical values represented by the instances of its subclasses True and False. *)self error: 'You may not create any more Booleans - this is two-valued logic')
 ('as yet unclassified'
 asAlien ^ <Integer> = (
@@ -712,7 +788,7 @@ onTrue: blk <[Object]>  ^<Boolean> = (
 
 	self subclassResponsibility
 )) : ()
-class Class = Behavior (
+public class Class = Behavior (
 (* My instances describe the representation and behavior of objects.  Except for Top, my instances are the result of mixin applications.
 
 The slot 'subclasses' is a redundant structure.  It is never used during execution, but is used by the development system to simplify or speed certain operations.
@@ -752,7 +828,7 @@ mixin = (
 )
 mixinApply: superklass = (
 	| application |
-	application:: self mixin apply: superklass.
+	application:: self mixin apply: superklass withName: (self simpleName, 'mixinApply: ', superclass name).
 	application setEnclosingObjectSlot: self enclosingObjectSlot.
 	application class setEnclosingObjectSlot: self class enclosingObjectSlot.
 	^application
@@ -791,7 +867,7 @@ theNonMetaClass = (
 fuelAccept: aVisitor = (
 	aVisitor visitClassOrTrait: self
 )) : ()
-class ClassMixin = AbstractMixin (
+public class ClassMixin = AbstractMixin (
 (* A class-side mixin is the difference between a metaclass and Class. (In Newspeak metaclasses are direct subclasses of Class, unlike Smalltalk where they are subclasses of the class's superclass's metaclass.) Note that class-side mixins can only introduce additional methods, unlike instance-side mixins which can introduce slots, methods and nested classes. Because of this, module definitions (top-level classes) are always stateless.
 *)|
 	organization <ClassOrganizer>
@@ -830,7 +906,7 @@ theMetaClass = (
 theNonMetaClass = (
 	^instanceMixin
 )) : ()
-class False = Boolean ((* False defines the behavior of its single instance, false -- logical negation. Notice how the truth-value checks become direct message sends, without the need for explicit testing.
+public class False = Boolean ((* False defines the behavior of its single instance, false -- logical negation. Notice how the truth-value checks become direct message sends, without the need for explicit testing.
 
 Be aware however that most of these methods are not sent as real messages in normal use. Most are inline coded by the compiler as test and jump bytecodes - avoiding the overhead of the full message sends. So simply redefining these methods here will have no effect. *))
 ('as yet unclassified'
@@ -878,7 +954,7 @@ onFalse: blk <[Object]> ^ <Boolean> = (
 onTrue: blk <[Object]> ^ <Boolean> = (
 	^self
 )) : ()
-class Future computing: block <[E]> = (
+public class Future computing: block <[E]> = (
 (* A deferred computation. Used for simulatenous slots. It evalutes its closure in response to nearly every message.
 
 The future used for actors/asynchrony is a 'push future'. The future used for simulatenous slots/laziness is a 'pull future'.
@@ -892,8 +968,8 @@ TODO: Rename to something like Deferred? Even if actor futures and lazy futures 
 	private state000 <Symbol> ::= #unresolved.
 |)
 ('as yet unclassified'
-Future = (
-	(* When access control is enforced the inherited method won't be activated by other objects sending #Future and this stub can be removed. *)
+Future = (	
+	(* When access control is enforced the inherited method won't be activated by other objects sending #Future and this stub can be removed. *)	
 	^resolve Future
 )
 protected doesNotUnderstand: message = (
@@ -921,7 +997,7 @@ public yourself = (
 computation: block = (
 	^self computing: block
 ))
-class InstanceMixin = AbstractMixin (
+public class InstanceMixin = AbstractMixin (
 (* An instance-side mixin is the difference between a (non-meta) class and its superclass: a set of additional methods, slots and nested class declarations.
 
 All of my members except methods to invoke mixin application should be hidden, and be only accessible by mirrors. *)|
@@ -940,22 +1016,6 @@ organization <ClassOrganizer> (* Yuck *)
 ('accessing'
 apply: superklass <Class> ^ <Class> = (
 	^self |> superklass
-)
-apply: superclassArg <Class> withName: n <String> ^ <Class> = (
-
-	| superClass <Class> invocation <Class> offset <Integer>  |
-
-	superClass:: superclassArg yourself. (* Extract real object from potential Delay *)
-      superClass isNil ifTrue:[superClass:: Object].
-	#BOGUS yourself. (* Use named supplied as arg *)
-	invocation:: self invokeWithSuperclass: superClass withName: n.
-	(* invocation basicCategory: #'Irrelevant-Mixin-applications'. *)
-
-	offset:: superClass instSize.
-	offset ~= 0 ifTrue:[self generateAccessorsFor: invocation offset: offset].
-
-	applications add: invocation.
-	^invocation
 )
 isMeta ^<Boolean> = (
 	^false
@@ -984,12 +1044,6 @@ accessModifierIfNecessary = (
 		ifTrue: [ '' ]
 		ifFalse: [ accessModifier, ' ' ]
 )
-apply: superklass <Class> index: index <Integer> ^ <Class> = (
-	^renameMixinInitializerOf: (apply: superklass) index: index
-)
-apply: superklass <Class> withName: n <String>  index: index <Integer> ^ <Class> = (
-	^renameMixinInitializerOf: (apply: superklass withName: n) index: index
-)
 constructorName = (
 	^cachedConstructorName
 )
@@ -999,6 +1053,13 @@ definingModule = (
 hasBody ^ <Boolean> = (
       #BOGUS yourself.
 	^cachedHeaderSource last ~= $.
+)
+private isMixedInto: klass = (
+	| k ::= klass. |
+	[nil == k] whileFalse:
+		[self == k mixin ifTrue: [^true].
+		k:: k superclass].
+	^false
 )
 isTopLevel = (
 	^ enclosingMixin isNil
@@ -1075,6 +1136,68 @@ Many mixin applications need to have the instance initializer of the mixin renam
 simpleName = (
 	^(name subStrings: {$`}) last asSymbol
 )
+spurFormat: nInstVars <Integer> variable: isVar <Boolean> words: isWords <Boolean> pointers: isPointers <Boolean> weak: isWeak <Boolean> ^ <Integer> = (
+	(* This method was derived from the same method in ClassBuilder.
+
+	Answer the instance specification part of the format that defines what kind of object
+	 an instance of the receiver is.  The formats are
+			0	= 0 sized objects (UndefinedObject True False et al)
+			1	= non-indexable objects with inst vars (Point et al)
+			2	= indexable objects with no inst vars (Array et al)
+			3	= indexable objects with inst vars (MethodContext AdditionalMethodState et al)
+			4	= weak indexable objects with inst vars (WeakArray et al)
+			5	= weak non-indexable objects with inst vars (ephemerons) (Ephemeron)
+			6	= unused
+			7	= immediates (SmallInteger, Character)
+			8	= unused
+			9	= 64-bit indexable
+		10-11	= 32-bit indexable (Bitmap)
+		12-15	= 16-bit indexable
+		16-23	= 8-bit indexable
+		24-31	= compiled methods (CompiledMethod)
+	*)
+	| instSpec |
+	instSpec:: isWeak
+					ifTrue: [4]
+					ifFalse:
+						[isPointers
+							ifTrue:
+								[isVar
+									ifTrue: [nInstVars > 0 ifTrue: [3] ifFalse: [2]]
+									ifFalse: [nInstVars > 0 ifTrue: [1] ifFalse: [0]]]
+							ifFalse: [isWords ifTrue: [12] ifFalse: [16]]].
+	^(instSpec bitShift: 16) + nInstVars
+)
+squeakV3format: nInstVars <Integer> variable: isVar <Boolean> words: isWords <Boolean> pointers: isPointers <Boolean> weak: isWeak <Boolean> ^ <Integer> = (
+	(* This method was derived from the same method in ClassBuilder, and
+	somwewhat cleaned up
+	
+	Compute the format for the given instance specification.
+	nInstVars - the number of named inst vars (e.g. Point's x,y => nInstVars = 2).
+	isVar  true if indexable inst vars.
+	isWords  true for bit objects not organized as bytes (Float wpould you believe)
+	isPointers  true for pointer objects (except CompiledMethod) false otherwise
+	isWeak, true if indexable, named weak collection
+	*)
+	| cClass instSpec sizeHiBits fmt |
+(*	NOTE: This code supports the backward-compatible extension to 8 bits of instSize. The format word is...
+		<2 bits=instSize//64><5 bits=cClass><4 bits=instSpec><6 bits=instSize\\64><1 bit=0> *)
+	sizeHiBits:: (nInstVars+1) // 64.
+	cClass:: 0.  (* for now *)
+	instSpec:: isWeak
+		ifTrue:[4]
+		ifFalse:[isPointers
+				ifTrue: [isVar
+						ifTrue: [nInstVars>0 ifTrue: [3] ifFalse: [2]]
+						ifFalse: [nInstVars>0 ifTrue: [1] ifFalse: [0]]]
+				ifFalse: [isWords ifTrue: [6] ifFalse: [8]]].
+	fmt:: sizeHiBits.
+	fmt:: (fmt bitShift: 5) + cClass.
+	fmt:: (fmt bitShift: 4) + instSpec.
+	fmt:: (fmt bitShift: 6) + ((nInstVars+1)\\64).  (* +1 since prim size field includes header *)
+	fmt:: (fmt bitShift: 1). (* This shift plus integer bit lets wordSize work like byteSize *)
+	^fmt
+)
 traitComposition = (
 	^{}
 )
@@ -1091,40 +1214,24 @@ writeOrganizationOf: mxn on: aStream = (
 		sels:: org listAtCategoryNamed: cat.
 		sels asSortedCollection do: [ :sel | aStream nextPutAll: (mxn compiledMethodAt: sel) getSource; cr; cr ]]
 )
-|> superclassArg <Class> ^ <Class> = (
-	| superklass = superclassArg yourself. | (* Extract real object from potential Delay *)
-	^self apply: superklass withName: (self simpleName, ' mixin |>', superklass name)
+|> superclass <Class> ^<Class> = (
+	assert: [enclosingMixin isNil] message: 'Nested mixins must be applied with an enclosing object'.
+	^self apply: superclass withName: (self simpleName, ' mixin |>', superclass name)
 )'private'
 format: nInstVars <Integer> variable: isVar <Boolean> words: isWords <Boolean> pointers: isPointers <Boolean> weak: isWeak <Boolean> ^ <Integer> = (
-	| cClass instSpec sizeHiBits fmt |
-	isSpur ifTrue: [
-		instSpec:: isWeak
-					ifTrue: [4]
-					ifFalse:
-						[isPointers
-							ifTrue:
-								[isVar
-									ifTrue: [nInstVars > 0 ifTrue: [3] ifFalse: [2]]
-									ifFalse: [nInstVars > 0 ifTrue: [1] ifFalse: [0]]]
-							ifFalse: [isWords ifTrue: [12] ifFalse: [16]]].
-		^(instSpec bitShift: 16) + nInstVars	
-	].
-	
-	sizeHiBits:: (nInstVars+1) // 64.
-	cClass:: 0.  (* for now *)
-	instSpec:: isWeak
-		ifTrue:[4]
-		ifFalse:[isPointers
-				ifTrue: [isVar
-						ifTrue: [nInstVars>0 ifTrue: [3] ifFalse: [2]]
-						ifFalse: [nInstVars>0 ifTrue: [1] ifFalse: [0]]]
-				ifFalse: [isWords ifTrue: [6] ifFalse: [8]]].
-	fmt:: sizeHiBits.
-	fmt:: (fmt bitShift: 5) + cClass.
-	fmt:: (fmt bitShift: 4) + instSpec.
-	fmt:: (fmt bitShift: 6) + ((nInstVars+1)\\64).  (* +1 since prim size field includes header *)
-	fmt:: (fmt bitShift: 1). (* This shift plus integer bit lets wordSize work like byteSize *)
-	^fmt
+	(* 
+	Compute the format for the given instance specification.
+	nInstVars - the number of named inst vars (e.g. Point's x,y => nInstVars = 2).
+	isVar  true if indexable inst vars.
+	isWords  true for bit objects not organized as bytes (Float would you believe)
+	isPointers  true for pointer objects (except CompiledMethod) false otherwise
+	isWeak, true if indexable, named weak collection.
+
+	Switch-hit depending on the underlying VM implementation.
+	*)
+	^vmmirror isSpur
+		ifTrue: [self spurFormat: nInstVars variable: isVar words: isWords pointers: isPointers weak: isWeak]
+		ifFalse: [self squeakV3format: nInstVars variable: isVar words: isWords pointers: isPointers weak: isWeak]
 )
 generateAccessorsFor: invocation <Class> offset: offset <Integer> = (
 	| ivs <Collection[String]> mtds <MethodDictionary> |
@@ -1167,15 +1274,30 @@ invokeWithSuperclass: superClass <Class> withName: n  <String> ^<Class> = (
 	
 	^newClass
 )
-private isMixedInto: klass = (
-	| k ::= klass. |
-	[nil == k] whileFalse:
-		[self == k mixin ifTrue: [^true].
-		k:: k superclass].
-	^false
-)
 pointerFormatNumberOfInstVars: n <Integer> ^ <Integer> = (
 	^self format: n variable: false words: false pointers: true weak: false
+)'restricted'
+apply: superklass <Class> index: index <Integer> ^ <Class> = (
+	| application = apply: superklass withName: self simpleName, ' mixin |>', superclass name. |
+	^renameMixinInitializerOf: application index: index
+)
+apply: superclassArg <Class> withName: n <String> ^ <Class> = (
+
+	| superClass <Class> invocation <Class> offset <Integer>  |
+
+	superClass:: superclassArg yourself. (* Extract real object from potential Delay *)
+      superClass isNil ifTrue: [superClass:: Object].
+
+	invocation:: self invokeWithSuperclass: superClass withName: n.
+
+	offset:: superClass instSize.
+	offset ~= 0 ifTrue: [self generateAccessorsFor: invocation offset: offset].
+
+	applications add: invocation.
+	^invocation
+)
+apply: superklass <Class> withName: n <String>  index: index <Integer> ^ <Class> = (
+	^renameMixinInitializerOf: (apply: superklass withName: n) index: index
 )'squeak-interoperability'
 addSelector: selector withMethod: compiledMethod = (
 	^self basicAddSelector: selector withMethod: compiledMethod
@@ -1235,7 +1357,7 @@ theMetaClass = (
 theNonMetaClass = (
 	^self
 )) : ()
-class Magnitude = (
+public class Magnitude = (
 (* A Magnitude[M] is an object that has a linear relationship with objects of type M, such
 that they can be compared using the relational operations <,>,<=,>=.
 
@@ -1315,7 +1437,7 @@ defaultSort ^<[:X:M | Boolean]> = (
 	^(* guaranteed <[X,M,^Boolean]> *)
 		[ :m1 <Magnitude[M]> :m2 <M> | m1 <= m2 ]
 ))
-class Metaclass = Behavior (
+public class Metaclass = Behavior (
 (* Each class is an instance of a unique metaclass. All metaclasses are instances
 of Metaclass, and are direct subclasses of Class. This differs from Smalltalk, where the metaclass would be a subclass of the metaclass of the class's superclass.
 See comments in Behavior regarding problems wrt IDE suppport and security.
@@ -1367,7 +1489,7 @@ fuelAccept: aVisitor = (
 setEnclosingObjectSlot: e = (
 	enclosingObjectSlot: e
 )) : ()
-class Object = ImplementationBase (
+public class Object = ImplementationBase (
 (* Object is the root of the object hierarchy in the Newspeak programming language, and provides behavior common to all objects.  The superclass of Object is the empty class Top.  The purpose of Top is to allow all code to live in mixins.
 
 For each protocol P in the system, this class provides a method 'isP' which answers true if and only if the receiver is an instance of a class which implements the protocol P.
@@ -1441,24 +1563,25 @@ public identityHash ^<Integer> = (
 	(* Answers the identity hash code of the reciever. *)
 	^vmmirror identityHashOf: self
 )
-public ~= anObject <Object> ^<Boolean> = (
+public ~= anObject = (
 	^(self = anObject) not
 )
-public ~~ anObject <Object> ^<Boolean> = (
+public ~~ anObject = (
 	^(self == anObject) not
 )'message not understood'
 protected doesNotUnderstand: message = (
 	| sel exception resumptionValue |
 	sel: message selector.
-	sel isUnary ifTrue: [(sel startsWith: 'is') ifTrue: [
-		| m = CompiledMethod newMethod: 4 header: 1282. |
+	sel isUnary ifTrue: [(sel startsWith: 'is') ifTrue:
+		[(* 2 = LdFalse - LdSelf, i.e. this is a ^false method *)
+		| m = CompiledMethod toReturnConstant: 2 trailerBytes: CompiledMethodTrailer empty. |
 		m selector: sel.
 		m methodClass: Object.
 		(* :bug: This should be added to the receiver class to avoid making the behavior of proxies dependent whether an isFoo message has already been sent to another class. *)
 		Object addSelectorSilently: sel withMethod: m.
 		^false]].
 
-	(sel startsWith: 'initializer`') ifTrue: [
+	(sel startsWith: 'initializer`') ifTrue: [ 
 		message setSelector: (sel allButFirst: 12) asSymbol.
 		^message sentTo: self.
 	].
@@ -1536,13 +1659,13 @@ protected assert: condition <[Boolean]> message: message = (
 	condition isBlock ifFalse: [Error signal: 'Block required'].
 	condition value ifFalse: [Error signal: message]
 )'testing'
-public isImmutable ^<Boolean> = (
+public isImmutable (* ^<Boolean> *) = (
 	(* Answer true if and only if the receiver is immutable.
 	Should not be overridden in subclasses. *)
 	(* To be removed. *)
 	^vmmirror isImmutable: self
 )) : ()
-class True = Boolean (
+public class True = Boolean (
 (* True defines the behavior of its single instance, true -- logical assertion. Notice how the truth-value checks become direct message sends, without the need for explicit testing.
 
 Be aware however that most of these methods are not sent as real messages in normal use. Most are inline coded by the compiler as test and jump bytecodes - avoiding the overhead of the full message sends. So simply redefining these methods here will have no effect. *))
@@ -1591,7 +1714,7 @@ onTrue: blk <[Object]> ^ <Boolean> = (
 	blk value.
 	^self
 )) : ()
-class UndefinedObject = Value (
+public class UndefinedObject = Value (
 (* UndefinedObject's sole instance is nil. nil represents a prior value for variables that have not been initialized, or for results which are meaningless. *))
 ('comparing'
 = other <Object> ^<Boolean> = (
@@ -1610,7 +1733,7 @@ isNil ^<Boolean> = (
 notNil ^<Boolean> = (
 	^false
 )) : ()
-class Value = (
+public class Value = (
 (* Some objects cannot change after they are created. They are deeply immutable and known as value objects. A value object is globally unique, in the sense that no other object is equal to it.
 
 An object o is a value object iff, under the assumption that o is a value object, it can be shown that:
@@ -1622,10 +1745,14 @@ Examples of such objects are numbers, booleans, characters, literal strings, sym
 ('as yet unclassified'
 public copy ^<Instance> = (
 	^self
-)) : ()'as yet unclassified'
+)) : () 'as yet unclassified'
 CompiledMethod = (
 	(* Must be referred to indirectly so it is not serialized. *)
 	^Smalltalk at: #CompiledMethod
+)
+CompiledMethodTrailer = (
+	(* Must be referred to indirectly so it is not serialized. *)
+	^Smalltalk at: #CompiledMethodTrailer
 )
 MessageNotUnderstood = (
 	(* Must be referred to indirectly so it is not serialized. *)
@@ -1647,7 +1774,7 @@ TODO = (
 	Mark private methods/slots.
 	*)
 )
-isSpur ^<Boolean> = (
+isSpur = (
 	^$A class instSize == 0
 )
 patternMatching = (

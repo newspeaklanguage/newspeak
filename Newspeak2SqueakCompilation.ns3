@@ -41,7 +41,6 @@ Copyright 2012-2013 Gilad Bracha, Ryan Macnak and Cadence Design Systems
 	ASTTool = astModule ASTTool.
       ASTCopier = astModule ASTCopier.
 	ASTTraverser = astModule ASTTraverser.
-      SuperFalseVisitor = astModule FalseVisitor.
 
       AST = astModule AST.
 	AssignmentAST = astModule AssignmentAST.
@@ -63,9 +62,10 @@ Copyright 2012-2013 Gilad Bracha, Ryan Macnak and Cadence Design Systems
       VarDeclAST = astModule VarDeclAST.
 	VariableAST = astModule VariableAST.
 	
-	Language = platform blackMarket NsMultilanguage Language.
-	LanguageCompiler = platform blackMarket NsMultilanguage LanguageCompiler.
-	Pragma = platform blackMarket Pragma.
+	Language = platform squeak Language.
+	LanguageCompiler = platform squeak LanguageCompiler.
+	Pragma = platform squeak Pragma.
+	ProcessorAssociation = platform squeak Smalltalk associationAt: #Processor.
 
 	CompiledMixinMirror = mirrors CompiledMixinMirror.
 	LowLevelMixinMirror = mirrors LowLevelMixinMirror. 
@@ -198,7 +198,7 @@ argCount: n <Integer> = (
 )
 bci ^<Integer> = (
 	(* Answers the current bytecode index. Used for calculating jump lengths. Note this is NOT the pc. *)
-	^code size
+	^code bci
 )
 close ^<LowLevelMethodMirror> = (
 	(* To be called at the end of code generation. *)
@@ -240,295 +240,6 @@ incrementStackDepthBy: n = (
 	currentStackDepth:: currentStackDepth + n.
 	maxStackDepth:: maxStackDepth max: currentStackDepth.
 )) : ()
-class CodeGeneratorV3 = CodeGenerator (
-(* We do not use the quick send bytecode for #== or #class because they hardwire the definitions appropriate for Object, but we expect Values and proxies to override #== and #class respectively. *)|
-dontUse = Object new.
-specialSelectors = 
-	{#+. #-. #<. #>. #<=. #>=. #=. #~=. #*. #/. #\\. #@. 
-	#bitShift:. #//. #bitAnd:. #bitOr:. 
-	#at:. #at:put:. #size. #next. #nextPut:. #atEnd.
-	dontUse. (* #==. *)
-	dontUse. (* #class. *) 
-	#blockCopy:. #value. #value:. #do:. #new. #new:. #x. #y}.
-|)
-('as yet unclassified'
-indexForLiteral: literal = (
-	^literalTable at: literal
-)
-patchJumpIfAt: index <Integer> with: targetData <Integer> = (
-	code byteAt: index - 1 
-	      put: ((code byteAt: index - 1) bitOr: ((targetData bitAnd: 16r300)  >> 8)).
-	code byteAt: index
-		put: ((code byteAt: index) bitOr: (targetData bitAnd: 16rFF))
-)
-pushRemoteTemporary: index inVector: vectorIndex = (
-	assert: [index between: 0 and: 255]
-		message: 'Temp index out of range'.
-	assert: [vectorIndex between: 0 and: 255]
-		message: 'Temp vector index out of range'.
-	
-	code byte: 140; byte: index; byte: vectorIndex.
-	incrementStackDepthBy: 1.
-)
-sizeOfBackJump = (
-	^2
-)
-storeIntoRemoteTemporary: index inVector: vectorIndex = (
-	assert: [index between: 0 and: 255]
-		message: 'Temp index out of range'.
-	assert: [vectorIndex between: 0 and: 255]
-		message: 'Temp vector index out of range'.
-	
-	code byte: 141; byte: index; byte: vectorIndex.
-)'jumps'
-jumpBy: distance <Integer>  = (
-
-	(* always generates long jumps *)
-
-	assert: [distance between: -1024 and: 1023]
-		message: 'Unconditional jump distance out of range'.
-      code
-		byte: 160 + (distance + 1024 bitShift: -8);
-		byte: distance + 1024 \\ 256.
-)
-jumpIf: bool <Boolean> by: distance <Integer> = (
-
-	(* always generates long jumps *)
-
-	| popAndJump <Integer> |
-	assert: [distance between: 0 and: 1023]
-		message: 'Conditional jump distance out of bounds'.
-	decrementStackDepthBy: 1.
-	popAndJump:: bool ifTrue: [168] ifFalse: [172].
-	code 
-		byte: popAndJump + (distance bitShift: -8);
-		byte: (distance bitAnd: 16rFF).
-)
-patchClosureJumpAt: index <Integer> with: targetData <Integer> = (
-
-	code byteAt: index - 1 
-		put: ((code byteAt: index - 1) bitOr: ((targetData bitAnd: 16r700)  >> 8)).
-	code byteAt: index 
-		put: ((code byteAt: index) bitOr: (targetData bitAnd: 16rFF)).
-)
-patchJumpAt: index <Integer> with: targetData <Integer> = (
-
-	code byteAt: index - 1 
-		put: ((code byteAt: index - 1) bitOr: ((targetData bitAnd: 16r700)  >> 8)).
-	code byteAt: index 
-		put: ((code byteAt: index) bitOr: (targetData bitAnd: 16rFF)).
-)'private'
-pushInteger: value = (
-	code byte: 112 + 3 + 2 + value.
-	incrementStackDepthBy: 1.
-)
-pushLiteralWithIndex: index = (
-
-	assert: [index between: 0 and: 255]
-		message: 'Literal index out of range'.
-		
-	incrementStackDepthBy: 1.
-	
-	index < 32 ifTrue: [code byte: 32 + index. ^self].
-	index < 64 ifTrue: [code byte: 128; byte: 128 + index. ^self].
-	code byte: 132; byte: 96; byte: index.
-)'returns'
-returnBooleanFromMethod: bool = (
-	code byte: (bool ifTrue: [121] ifFalse: [122]).
-)
-returnFromBlock = (
-	code byte: 125.
-	decrementStackDepthBy: 1.
-)
-returnFromMethod = (
-	code byte: 124.
-	decrementStackDepthBy: 1.
-)
-returnSelfFromMethod = (
-	code byte: 120.
-)'sends'
-normalSend: selector numArgs: numArgs = (
-	|
-	index ::= specialSelectors indexOf: selector.
-	|
-	decrementStackDepthBy: numArgs + 1 (* the receiver *).
-	incrementStackDepthBy: 1.
-		
-	(* Special selector? *)
-	index = 0 ifFalse: 
-		[code byte: 175 + index.
-		^self].
-	index:: indexForLiteral: selector.
-	
-	assert: [numArgs between: 0 and: 31]
-		message: 'numArgs out of range'.
-	assert: [index between: 0 and: 255]
-		message: 'selector literal index out of range'.
-	
-	(index < 16 and: [numArgs < 3]) ifTrue:
-		[code byte: 208 + (numArgs * 16) + index.
-		^self].
-	
-	(index < 32 and: [numArgs < 8]) ifTrue: 
-		[code byte: 131; byte: ((numArgs bitShift: 5) + index).
-		^self].
-	
-	(index < 64 and: [numArgs < 4]) ifTrue: 
-	 	[code
-			byte: 134;
-			byte: ((numArgs bitShift: 6) + index).
-		 ^self].
-	
-	code byte: 132; byte: numArgs; byte: index.
-)
-superSend: selector numArgs: numArgs = (
-	|
-	selectorIndex = indexForLiteral: selector.
-	|
-	assert: [selectorIndex between: 0 and: 255]
-		message: 'Selector index out of range'.
-	assert: [numArgs between: 0 and: 255]
-		message: 'Message arity out of range'.
-		
-	decrementStackDepthBy: numArgs + 1 (* the receiver *).
-	incrementStackDepthBy: 1.
-	
-	code byte: 126; byte: numArgs; byte: selectorIndex.
-)'stack'
-dup = (
-	code byte: 136.
-	incrementStackDepthBy: 1.	
-)
-pop = (
-	code byte: 135.
-	decrementStackDepthBy: 1.	
-)'temporaries'
-popIntoRemoteTemporary: index inVector: vectorIndex = (
-	assert: [index between: 0 and: 255]
-		message: 'Temp index out of range'.
-	assert: [vectorIndex between: 0 and: 255]
-		message: 'Temp vector index out of range'.
-	
-	code byte: 142; byte: index; byte: vectorIndex.
-	decrementStackDepthBy: 1.
-)
-popIntoTemporary: index = (
-	assert: [index between: 0 and: 63] message: 'Temp index out of range'.
-		
-	index < 8 ifTrue:
-		[code byte: 104 + index.
-		decrementStackDepthBy: 1.
-		^self].
-	
-	code byte: 130; byte: 64 + index.
-	decrementStackDepthBy: 1.
-)
-pushTemporary: index = (
-	assert: [index between: 0 and: 63] message: 'Temp index out of range'.
-	
-	index < 16 ifTrue:
-		[incrementStackDepthBy: 1.
-		code byte: 16 + index.
-		^self].
-	
-	incrementStackDepthBy: 1.
-	code byte: 128; byte: 64 + index.
-)
-storeIntoTemporary: index = (
-	assert: [index between: 0 and: 63] message: 'Temp index out of range'.
-	
-	code byte: 129; byte: 64 + index.
-)'testing'
-hasSpecialReturnBoolean = (
-	^true yourself
-)
-isImplicitReceiverSendAbsentReceiver = (
-	^false
-)
-isSuperSendAbsentReceiver = (
-	^false
-)'values'
-createClosureOfArity: numArgs copying: numCopied length: jumpSize = (
-
-	| numExtensions numCopiedMod8 numArgsMod8 extA |
-	
-	decrementStackDepthBy: numCopied.
-	incrementStackDepthBy: 1.
-	
-	assert: [jumpSize between: 0 and: 65535]
-		message: 'Closure jump out of range'.
-	assert: [numCopied between: 0 and: 15]
-		message: 'Too many copied values in closure'.
-	assert: [numArgs between: 0 and: 15]
-		message: 'Too many args in closure'.
-	
-	code
-		byte: 143;
-		byte: numArgs + (numCopied bitShift: 4);
-		byte: (jumpSize bitShift: -8);
-		byte: (jumpSize bitAnd: 16rFF)
-)
-createEmptyArray: size = (
-	assert: [size between: 0 and: 127] message: 'Array size must be < 128'.
-	incrementStackDepthBy: 1.
-	code byte: 138; byte: size.
-)
-createFullArray: size = (
-	assert: [size between: 0 and: 127] message: 'Array size must be < 128'.
-	decrementStackDepthBy: size.
-	incrementStackDepthBy: 1.
-	code byte: 138; byte: 128 + size.
-)
-pushEnclosingObject: depth = (
-	assert: [depth between: 0 and: 127]
-		message: 'Enclosing object depth out of range'.
-	
-	depth = 0 ifTrue: [^pushSelf].
-	
-	incrementStackDepthBy: 1.
-	
-	code byte: 139; byte: (indexForLiteral: depth). (*What?!*)
-)
-pushFalse = (
-	code byte: 114.
-	incrementStackDepthBy: 1.
-)
-pushImplicitReceiver: selector  = (
-
-	| index = indexForLiteral: selector. |
-	assert: [index between: 0 and: 255]
-		message: 'Selector index out of bounds'.
-	
-	incrementStackDepthBy: 1.
-	code byte: 127; byte: index.
-)
-pushLiteral: value = (
-	value == true ifTrue: [^pushTrue].
-	value == false ifTrue: [^pushFalse].
-	value == nil ifTrue: [^pushNil].
-	(value isInteger and: [value between: -1 and: 2])
-		ifTrue: [^pushInteger: value].
-	^pushLiteralWithIndex: (indexForLiteral: value).
-)
-pushNil = (
-	code byte: 115.
-	incrementStackDepthBy: 1.
-)
-pushSelf = (
-	code byte: 112.
-	incrementStackDepthBy: 1.
-)
-pushThisContext = (
-	code byte: 137.
-	incrementStackDepthBy: 1.
-)
-pushTrue = (
-	code byte: 113.
-	incrementStackDepthBy: 1.
-)) : ('as yet unclassified'
-slotsPerMethod = (
-	^64
-))
 class CodeGeneratorV4 = CodeGenerator (
 (* We do not use the quick send bytecode for #== or #class because they hardwire the definitions appropriate for Object, but we expect Values and proxies to override #== and #class respectively. *)|
 dontUse = Object new.
@@ -541,10 +252,6 @@ specialSelectors =
 	#blockCopy:. #value. #value:. #do:. #new. #new:. #x. #y}.
 |)
 ('as yet unclassified'
-close ^<LowLevelMethodMirror> = (
-	code usesAlternateBytecodeSet: true.
-	^super close
-)
 indexForLiteral: literal = (
 	^literalTable at: literal
 )
@@ -558,6 +265,21 @@ patchClosureJumpAt: blockBci <Integer> with: distance <Integer> = (
 	assert: [(code byteAt: blockBci-2) = 253] message: 'Not really a closure?'.
 	(*blockBci-1*)
 	code byteAt: blockBci put: (distance bitAnd: 255)
+)
+pushLiteralVariable: association = (
+	| index = indexForLiteral: association. extendedIndex |
+	
+	assert: [index between: 0 and: 65535]
+		message: 'Literal index out of range'.
+		
+	incrementStackDepthBy: 1.
+	
+	index < 16 ifTrue: [code byte: 16 + index. ^self].
+	
+	(extendedIndex:: index) > 255 ifTrue:
+		[unsignedSingleExtendA: extendedIndex // 256.
+		extendedIndex:: extendedIndex \\ 256].
+	code byte: 227; byte: extendedIndex.
 )
 signedSingleExtendB: extendedIndex = (
 
@@ -742,11 +464,54 @@ normalSend: selector numArgs: numArgs = (
 		byte: 238;
 		byte: extendedNArgs + (extendedIndex * 8)
 )
-outerSend: selector depth: depth numArgs: numArgs = (
-	Error signal: 'Absent receiver outer sends unimplemented'.
+outerSend: selector numArgs: numArgs depth: depth = (
+	|
+	selectorIndex = indexForLiteral: selector.
+	extendedIndex extendedNArgs
+	|
+	assert: [selectorIndex between: 0 and: 65535]
+		message: 'Selector index out of range'.
+	assert: [numArgs between: 0 and: 31]
+		message: 'Message arity out of range'.
+	assert: [depth between: 0 and: 255]
+		message: 'Lexical depth out of range'.
+
+	decrementStackDepthBy: numArgs.
+	incrementStackDepthBy: 1.
+	
+	(extendedIndex:: selectorIndex) > 31 ifTrue:
+		[unsignedSingleExtendA: extendedIndex // 32.
+		 extendedIndex:: extendedIndex \\ 32].
+	(extendedNArgs:: numArgs) > 7 ifTrue:
+		[self unsignedSingleExtendB: extendedNArgs // 8.
+		 extendedNArgs:: extendedNArgs \\ 8].
+	code
+		byte: 254;
+		byte: extendedNArgs + (extendedIndex * 8);
+		byte: depth
 )
 selfSend: selector numArgs: numArgs = (
-	Error signal: 'Absent receiver self sends unimplemented'.
+	|
+	selectorIndex = indexForLiteral: selector.
+	extendedIndex extendedNArgs
+	|
+	assert: [selectorIndex between: 0 and: 65535]
+		message: 'Selector index out of range'.
+	assert: [numArgs between: 0 and: 31]
+		message: 'Message arity out of range'.
+		
+	decrementStackDepthBy: numArgs.
+	incrementStackDepthBy: 1.
+	
+	(extendedIndex:: selectorIndex) > 31 ifTrue:
+		[unsignedSingleExtendA: extendedIndex // 32.
+		 extendedIndex:: extendedIndex \\ 32].
+	(extendedNArgs:: numArgs) > 7 ifTrue:
+		[self unsignedSingleExtendB: extendedNArgs // 8.
+		 extendedNArgs:: extendedNArgs \\ 8].
+	code
+		byte: 245;
+		byte: extendedNArgs + (extendedIndex * 8)
 )
 superSend: selector numArgs: numArgs = (
 	|
@@ -998,21 +763,21 @@ astForContextAtDepth: targetDepth <Integer> ^<AST> = (
 	myDepth >= targetDepth ifFalse: [deny].
 	
 	returnContext:: NormalSendAST new
-		recv: hereNode;
-		msg: (MessageAST new
-			sel: doitContextArgumentName;
-			args: {}).
+		receiver: hereNode;
+		message: (MessageAST new
+			selector: doitContextArgumentName;
+			arguments: {}).
 		
 	(myDepth - targetDepth) timesRepeat: [
 		returnContext:: NormalSendAST new
-			recv: (NormalSendAST new
-				recv: returnContext;
-				msg: (MessageAST new 
-					sel: #closure;
-					args: {}));
-			msg: (MessageAST new 
-				sel: #outerContext;
-				args: {})].
+			receiver: (NormalSendAST new
+				receiver: returnContext;
+				message: (MessageAST new 
+					selector: #closure;
+					arguments: {}));
+			message: (MessageAST new 
+				selector: #outerContext;
+				arguments: {})].
 	^returnContext	
 )
 contextAtDepth: targetDepth <Integer> ^<MethodContext> = (
@@ -1061,25 +826,25 @@ getterAstFor: varName <Symbol> ^<SendAST> = (
 	
 	^info remoteVector isNil
 		ifTrue:  [NormalSendAST new 
-			recv: (astForContextAtDepth: info contextDepth);
-			msg: (MessageAST new
-				sel: #tempAt:;
-				args: {NumberAST new val: info zeroOriginOffset + 1})]
+			receiver: (astForContextAtDepth: info contextDepth);
+			message: (MessageAST new
+				selector: #tempAt:;
+				arguments: {NumberAST new value: info zeroOriginOffset + 1})]
 		ifFalse: [NormalSendAST new
-			recv: (leastLocalGetterAstFor: info remoteVector);
-			msg: (MessageAST new
-				sel: #at:;
-				args: {NumberAST new val: info zeroOriginOffset + 1})]
+			receiver: (leastLocalGetterAstFor: info remoteVector);
+			message: (MessageAST new
+				selector: #at:;
+				arguments: {NumberAST new value: info zeroOriginOffset + 1})]
 )
 leastLocalGetterAstFor: varName <Symbol> ^<SendAST> = (
 	| info |
 	info:: leastLocalInfoFor: varName.
 	assert: [info remoteVector isNil].
 	^NormalSendAST new 
-		recv: (astForContextAtDepth: info contextDepth);
-		msg: (MessageAST new
-				sel: #tempAt:;
-				args: {NumberAST new val: info zeroOriginOffset + 1})
+		receiver: (astForContextAtDepth: info contextDepth);
+		message: (MessageAST new
+				selector: #tempAt:;
+				arguments: {NumberAST new value: info zeroOriginOffset + 1})
 )
 leastLocalInfoFor: varName <Symbol> ^<LocalVarDebugInfo> = (
 	
@@ -1121,17 +886,17 @@ setterAstFor: varName <Symbol> putting: newVal <AST> ^<SendAST> = (
 	
 	^info remoteVector isNil
 		ifTrue:  [NormalSendAST new 
-			recv: (astForContextAtDepth: info contextDepth);
-			msg: (MessageAST new
-				sel: #tempAt:put:;
-				args: {
-					NumberAST new val: info zeroOriginOffset + 1.
+			receiver: (astForContextAtDepth: info contextDepth);
+			message: (MessageAST new
+				selector: #tempAt:put:;
+				arguments: {
+					NumberAST new value: info zeroOriginOffset + 1.
 					newVal})]
 		ifFalse: [NormalSendAST new
-			recv: (leastLocalGetterAstFor: info remoteVector);
-			msg: (MessageAST new
-				sel: #at:put:;
-				args: {NumberAST new val: info zeroOriginOffset + 1.
+			receiver: (leastLocalGetterAstFor: info remoteVector);
+			message: (MessageAST new
+				selector: #at:put:;
+				arguments: {NumberAST new value: info zeroOriginOffset + 1.
 					newVal})]
 )) : ()
 class LocalVariableDebugInfo = ((* Debugger information for a local. *)|
@@ -1190,13 +955,13 @@ applyShouldPopTo: node = (
 cascadeNormal: node <SendAST> = (
 
 	node isCascadedSendNode
-		ifTrue: [cascadeNormal: node prevSend]
-		ifFalse: [self applyShouldNotPopTo: node recv].
+		ifTrue: [cascadeNormal: node previousSend]
+		ifFalse: [self applyShouldNotPopTo: node receiver].
 	
 	cgen dup.
-	self applyShouldNotPopTo: node msg.
-	addDebugInfo: (node msg start to: node msg end).
-	cgen normalSend: node msg sel numArgs: node msg args size.
+	self applyShouldNotPopTo: node message.
+	addDebugInfo: (node message start to: node message end).
+	cgen normalSend: node message selector numArgs: node message arguments size.
 	cgen pop.
 )
 cleanup = (
@@ -1210,56 +975,9 @@ cleanup = (
 
 	offsetStack: nil.
 )
-conditionalNode: node <IfAST> = (
-	| ifPos <Integer> endThen <Integer> depth <Integer> thenDepth <Integer> |
-
-	(* cond. branch(L1). then. jump(L2). L1: else. L2: *)
-	(* cond. branch(L1). then. L1: *)
-	
-	(* issues: utilizing short jumps; nested blocks and popping *)
-	
-	self applyShouldNotPopTo: node condition.
-	cgen jumpIf: node ifTrue not by: 0. (* jump to else (but needs patching) *)
-
-	ifPos: cgen bci. (* remember patch address *)
-	depth: cgen currentStackDepth.
-
-	assert: [node then isCodeBodyNode and: [node then parameters isEmpty]]
-		message: 'Nullary block expected for then clause'.
-	pushScope:: scopeMap at: node then.
-	node then apply: self.
-	thenDepth: cgen currentStackDepth.
-	popScope.
-	
-	node else isNil
-		ifTrue: [endThen: cgen bci.]
-		ifFalse:
-			[assert:[node else isCodeBodyNode and:[node else parameters isEmpty]]
-				message: 'Nullary block expected for else clause'.
-			cgen currentStackDepth: depth.
-			cgen jumpBy: 0.
-			(* need jump over else segment (but needs patching) *)
-			endThen:: cgen bci.
-			pushScope:: scopeMap at: node else.
-			node else apply: self.
-			popScope.
-			cgen patchJumpAt: endThen with: cgen bci - endThen.
-			(* patch jump over else *)].
-		
-	cgen patchJumpIfAt: ifPos with: endThen - ifPos.
-	(* patch the jump after the test so it comes to end of the then block *)
-	cgen currentStackDepth: (thenDepth max: cgen currentStackDepth).
-	(* if one of the branches did a non-local return, the operand stack depth will differ between them. The smaller is the NLR, which doesn't matter, as control will leave the method, so we keep the larger one. *)
-	shouldPop ifFalse:
-		[cgen currentStackDepth: (cgen currentStackDepth max: depth+1)].
-	(* If shouldPop is false we  want to assume the if left a result on the stack, even if it did not because both branches ended in an NLR *)
-)
 currentMethod ^ <SemanticMethod> = (
 	#BOGUS.
 	^currentScope at: #'`currentMethod'
-)
-enclosingObjectNode: node <EnclosingObjectAST> = (
-	cgen pushEnclosingObject: node depth.
 )
 literalArray ^  <Array[Character | Number | String | Symbol]> = (
 	| literals <Array[Character | Number | String | Symbol]> |
@@ -1267,51 +985,11 @@ literalArray ^  <Array[Character | Number | String | Symbol]> = (
 	literalTable keysAndValuesDo:[:k : v | literals at: v + 1 put: k].
 	^literals
 )
-localReadNode: node <LocalReadAST> = (
-	temporaryNode: node
-)
-localWriteNode: node <LocalWriteAST> = (
-	self applyShouldNotPopTo: node value.
-	(* addDebugInfo: (node variable start to: node value end). *)
-	addDebugInfo: (node value start to: node value end).
-      shouldPop
-		ifTrue: [popAndStoreInto: node variable]
-		ifFalse: [storeInto: node variable] .
-)
-methodLocalReturnNode: node <MethodLocalReturnAST> = (
-	^self returnStatNode: node
-)
 nextOffset = (
 	|  next |
 	next:: offsetStack removeLast.
 	offsetStack addLast: next + 1.
 	^next
-)
-nonLocalReturnNode: node <NonlocalReturnAST> = (
-	^self returnStatNode: node
-)
-ordinarySendNode: node <NormalSendAST> = (
-
-	node recv isReceiverNode ifTrue: [^selfSendNode: node].
-	node recv isExplicitRcvrNode ifTrue: [^outerSendNode: node].
-
-	self applyShouldNotPopTo: node recv.
-	self applyShouldNotPopTo: node msg.
-	addDebugInfo: (node msg start to: node msg end).
-	cgen normalSend: node msg sel numArgs: node msg args size.
-)
-outerSendNode: node <OuterSendAST> = (
-	
-	cgen isOuterSendAbsentReceiver
-		ifTrue: 
-			[self applyShouldNotPopTo: node msg.
-			addDebugInfo: (node msg start to: node msg end).
-			cgen outerSend: node msg sel depth: node depth numArgs: node msg args size]
-		ifFalse:
-			[cgen pushEnclosingObject: node depth.
-			self applyShouldNotPopTo: node msg.
-			addDebugInfo: (node msg start to: node msg end).
-			cgen normalSend: node msg sel numArgs: node msg args size].
 )
 pc = (
 	^cgen code compiledMethodSize + 1
@@ -1330,9 +1008,9 @@ processLiteralMessagesOf: node <MethodAST> = (
 	node body literalMessages ifNotNil: [:bodyLitMessages |
 		bodyLitMessages do: [:messageAST |
 			pragmas add: (Pragma
-				keyword: messageAST sel
-				arguments: (messageAST args collect: 
-					[:symbolAST | symbolAST val]) asArray)
+				keyword: messageAST selector
+				arguments: (messageAST arguments collect: 
+					[:symbolAST | symbolAST value]) asArray)
 		].
 	].
 
@@ -1363,7 +1041,7 @@ setup = (
 	offsetStack: OrderedCollection new.
 	contextDepth: 0.
 )'node traversal'
-arrayNode: node <ArrayAST> = (
+public arrayNode: node <ArrayAST> = (
 	node elements isNil
 		ifTrue: 
 			[cgen createEmptyArray: node size]
@@ -1371,24 +1049,25 @@ arrayNode: node <ArrayAST> = (
 			[node elements do: [:ea | self applyShouldNotPopTo: ea].
 			cgen createFullArray: node size].
 )
-blockLocalReturnNode: node <BlockLocalReturnAST> = (
-
-	self applyShouldNotPopTo: node expr.
+public blockLocalReturnNode: node <BlockLocalReturnAST> = (
+	self applyShouldNotPopTo: node expression.
+	addDebugInfo: (node start to: node end).
 	cgen returnFromBlock.
 )
-boolNode: node <BoolAST> = (
-	cgen pushLiteral: node val
+public boolNode: node <BoolAST> = (
+	addDebugInfo: (node start to: node end).
+	cgen pushLiteral: node value
 )
-cascadedSendNode: node <CascadedSendAST> = (
+public cascadedSendNode: node <CascadedSendAST> = (
 	
 	| baseSend ::= node. |
 	[baseSend isCascadedSendNode]
-		whileTrue: [baseSend: baseSend prevSend].
+		whileTrue: [baseSend: baseSend previousSend].
 
-	baseSend recv isReceiverNode ifTrue:
+	baseSend receiver isReceiverNode ifTrue:
 		[#BOGUS. (* May need special handling once we have absent receiver self sends. *)].
 	
-	baseSend recv isExplicitRcvrNode ifTrue:
+	baseSend receiver isExplicitRcvrNode ifTrue:
 		[outerCascadeNotSupported.
 		^self].
 	
@@ -1399,15 +1078,16 @@ cascadedSendNode: node <CascadedSendAST> = (
 	assert: [baseSend isNormalSendNode or: [baseSend isSelfSendNode]]
 		message: 'Unknown type of cascade'.
 	
-	cascadeNormal: node prevSend.
-	self applyShouldNotPopTo: node msg.
-	addDebugInfo: (node msg start to: node msg end).
-	cgen normalSend: node msg sel numArgs: node msg args size.
+	cascadeNormal: node previousSend.
+	self applyShouldNotPopTo: node message.
+	addDebugInfo: (node message start to: node message end).
+	cgen normalSend: node message selector numArgs: node message arguments size.
 )
-charNode: node <CharAST> = (
-	cgen pushLiteral: node val
+public charNode: node <CharAST> = (
+	addDebugInfo: (node start to: node end).
+	cgen pushLiteral: node value
 )
-closureNode: node <ClosureAST> = (
+public closureNode: node <ClosureAST> = (
 	| blockPos <Integer> savedStackDepth <Integer> savedStackMax <Integer> |
 
 	node copiedValues do: [:each | self applyShouldNotPopTo: each].
@@ -1440,7 +1120,7 @@ closureNode: node <ClosureAST> = (
 
 	popScope. popOffsetCounter. contextDepth: contextDepth - 1.
 )
-codeBodyNode: node <CodeBodyAST> = (
+public codeBodyNode: node <CodeBodyAST> = (
 	|
 	stmtCount <Integer>
 	stmtSize <Integer> 
@@ -1494,23 +1174,85 @@ codeBodyNode: node <CodeBodyAST> = (
 	localVariableDebugInfos do: [:each | each validPCRange: validPCRange].
 	^localVariableDebugInfos
 )
-contextNode: node <ContextAST> = (
+public conditionalNode: node <IfAST> = (
+	| ifPos <Integer> endThen <Integer> depth <Integer> thenDepth <Integer> |
+
+	(* cond. branch(L1). then. jump(L2). L1: else. L2: *)
+	(* cond. branch(L1). then. L1: *)
+	
+	(* issues: utilizing short jumps; nested blocks and popping *)
+	
+	self applyShouldNotPopTo: node condition.
+	cgen jumpIf: node ifTrue not by: 0. (* jump to else (but needs patching) *)
+
+	ifPos: cgen bci. (* remember patch address *)
+	depth: cgen currentStackDepth.
+
+	assert: [node then isCodeBodyNode and: [node then parameters isEmpty]]
+		message: 'Nullary block expected for then clause'.
+	pushScope:: scopeMap at: node then.
+	node then apply: self.
+	thenDepth: cgen currentStackDepth.
+	popScope.
+	
+	node else isNil
+		ifTrue: [endThen: cgen bci.]
+		ifFalse:
+			[assert:[node else isCodeBodyNode and:[node else parameters isEmpty]]
+				message: 'Nullary block expected for else clause'.
+			cgen currentStackDepth: depth.
+			cgen jumpBy: 0.
+			(* need jump over else segment (but needs patching) *)
+			endThen:: cgen bci.
+			pushScope:: scopeMap at: node else.
+			node else apply: self.
+			popScope.
+			cgen patchJumpAt: endThen with: cgen bci - endThen.
+			(* patch jump over else *)].
+		
+	cgen patchJumpIfAt: ifPos with: endThen - ifPos.
+	(* patch the jump after the test so it comes to end of the then block *)
+	cgen currentStackDepth: (thenDepth max: cgen currentStackDepth).
+	(* if one of the branches did a non-local return, the operand stack depth will differ between them. The smaller is the NLR, which doesn't matter, as control will leave the method, so we keep the larger one. *)
+	shouldPop ifFalse:
+		[cgen currentStackDepth: (cgen currentStackDepth max: depth+1)].
+	(* If shouldPop is false we  want to assume the if left a result on the stack, even if it did not because both branches ended in an NLR *)
+)
+public contextNode: node <ContextAST> = (
+	addDebugInfo: (node start to: node end).
 	cgen pushThisContext
 )
-implicitReceiverSendNode: node <ImplicitReceiverSendAST> = (
+public enclosingObjectNode: node <EnclosingObjectAST> = (
+	addDebugInfo: (node start to: node end).
+	cgen pushEnclosingObject: node depth.
+)
+public globalNode: node <GlobalAST>  = (
+	cgen pushLiteralVariable: node association.
+)
+public implicitReceiverSendNode: node <ImplicitReceiverSendAST> = (
 
 	cgen isImplicitReceiverSendAbsentReceiver
 		ifTrue: 
-			[self applyShouldNotPopTo: node msg.
-			addDebugInfo: (node msg start to: node msg end).
-			cgen implicitReceiverSend: node msg sel numArgs: node msg args size]
+			[self applyShouldNotPopTo: node message.
+			addDebugInfo: (node message start to: node message end).
+			cgen implicitReceiverSend: node message selector numArgs: node message arguments size]
 		ifFalse:
-			[cgen pushImplicitReceiver: node msg sel.
-			self applyShouldNotPopTo: node msg.
-			addDebugInfo: (node msg start to: node msg end).
-			cgen normalSend: node msg sel numArgs: node msg args size].
+			[cgen pushImplicitReceiver: node message selector.
+			self applyShouldNotPopTo: node message.
+			addDebugInfo: (node message start to: node message end).
+			cgen normalSend: node message selector numArgs: node message arguments size].
 )
-loopNode: node <LoopAST> = (
+public localReadNode: node <LocalReadAST> = (
+	temporaryNode: node
+)
+public localWriteNode: node <LocalWriteAST> = (
+	self applyShouldNotPopTo: node value.
+	addDebugInfo: (node start to: node end).
+	shouldPop
+		ifTrue: [popAndStoreInto: node variable]
+		ifFalse: [storeInto: node variable] .
+)
+public loopNode: node <LoopAST> = (
 
 	(* prologue. L1: cond. branch(L2). body. jump(L1). L2: *)
 
@@ -1555,15 +1297,18 @@ loopNode: node <LoopAST> = (
 	
 	localVariableDebugInfos do: [:each | each validPCRange: (each validPCRange first to: pc - 1)].
 )
-messageNode: message <MessageAST> = (
+public messageNode: message <MessageAST> = (
 	shouldPop ifTrue: [halt].
-	message args do: [:arg <ExpressionAST> | arg apply: self].
+	message arguments do: [:arg <ExpressionAST> | arg apply: self].
 )
-messagePatternNode: node <MessagePatternAST> = (
+public messagePatternNode: node <MessagePatternAST> = (
 	halt.
 	node parameters do: [:p | addLocalVar: p]
 )
-methodNode: node <MethodAST> = (
+public methodLocalReturnNode: node <MethodLocalReturnAST> = (
+	^self returnStatNode: node
+)
+public methodNode: node <MethodAST> = (
 	(* Create a compiled method, whose body is the result of compiling the node's body. *)
 	(* | result <LowLevelMethodMirror> | *)
 	setup.
@@ -1587,75 +1332,98 @@ methodNode: node <MethodAST> = (
 	cleanup.
 	^result
 )
-mixinClassNode: node  = (
+public mixinClassNode: node  = (
 	cgen pushMixinClass.
 )
-nilNode: node = (
+public nilNode: node = (
+	addDebugInfo: (node start to: node end).
 	cgen pushNil.
 )
-numberNode: node <NumberAST>  = (
-	cgen pushLiteral: node val.
+public nonLocalReturnNode: node <NonlocalReturnAST> = (
+	^self returnStatNode: node
 )
-parameterNode: node <ParameterAST> = (
+public numberNode: node <NumberAST>  = (
+	addDebugInfo: (node start to: node end).
+	cgen pushLiteral: node value.
+)
+public ordinarySendNode: node <NormalSendAST> = (
+
+	node receiver isReceiverNode ifTrue: [^selfSendNode: node].
+	node receiver isExplicitRcvrNode ifTrue: [^outerSendNode: node].
+
+	self applyShouldNotPopTo: node receiver.
+	self applyShouldNotPopTo: node message.
+	addDebugInfo: (node message start to: node message end).
+	cgen normalSend: node message selector numArgs: node message arguments size.
+)
+public outerSendNode: node <OuterSendAST> = (
+	
+	cgen isOuterSendAbsentReceiver
+		ifTrue: 
+			[self applyShouldNotPopTo: node message.
+			addDebugInfo: (node message start to: node message end).
+			cgen outerSend: node message selector numArgs: node message arguments size depth: node depth ]
+		ifFalse:
+			[cgen pushEnclosingObject: node depth.
+			self applyShouldNotPopTo: node message.
+			addDebugInfo: (node message start to: node message end).
+			cgen normalSend: node message selector numArgs: node message arguments size].
+)
+public parameterNode: node <ParameterAST> = (
 	cgen pushTemporary: (indexOfVar: node).
 )
-receiverNode: node = (
+public receiverNode: node = (
+	addDebugInfo: (node start to: node end).
 	cgen pushSelf.
 )
-returnSelfMethodNode: node <ReturnSelfMethodAST> ^ <LowLevelMethodMirror>  = (
-  (* create an empty compiled method with appropriate flags *)
-   result:: LowLevelMethodMirror new selector: node selector; 
-                                                         returnOnlySelf: currentMethodSource.
-   ^result
-)
-returnStatNode: node <ReturnStatAST> = (
+public returnStatNode: node <ReturnStatAST> = (
 
 	(* if expr is self, true, false or nil do something special *)
-	(node expr isReceiverNode) ifTrue:
+	(node expression isReceiverNode) ifTrue:
 		[(* implicit return selfs at end of method have no source range *)
-		node expr start == nil ifFalse:
-			[addDebugInfo:  (node expr start to: node expr end)].
+		node expression start == nil ifFalse:
+			[addDebugInfo: (node start to: node end)].
 		^cgen returnSelfFromMethod].
-	(cgen hasSpecialReturnBoolean & node expr isBoolNode) ifTrue:
-		[addDebugInfo:  (node expr start to: node expr end).
-		^cgen returnBooleanFromMethod: node expr val].
-	(false & node expr isNilNode) ifTrue:
-		[addDebugInfo:  (node expr start to: node expr end).
+	(cgen hasSpecialReturnBoolean & node expression isBoolNode) ifTrue:
+		[addDebugInfo: (node start to: node end).
+		^cgen returnBooleanFromMethod: node expression value].
+	(false & node expression isNilNode) ifTrue:
+		[addDebugInfo: (node start to: node end).
 		^cgen returnNilObj].
 
-	self applyShouldNotPopTo: node expr.
-	addDebugInfo: (node expr start to: node expr end).
-	#BOGUS yourself. (*block returns don't add this debug info. should they, or is it unnecessary here?*)
-	
+	self applyShouldNotPopTo: node expression.
+	addDebugInfo: (node start to: node end).
 	cgen returnFromMethod.
 )
-selfSendNode: node <SendAST> = (
+public selfSendNode: node <SendAST> = (
 
 	cgen isSelfSendAbsentReceiver
 		ifTrue:
-			[self applyShouldNotPopTo: node msg.
-			addDebugInfo: (node msg start to: node msg end).
-			cgen selfSend: node msg sel numArgs: node msg args size]
+			[self applyShouldNotPopTo: node message.
+			addDebugInfo: (node message start to: node message end).
+			cgen selfSend: node message selector numArgs: node message arguments size]
 		ifFalse:
 			[cgen pushSelf.
-			self applyShouldNotPopTo: node msg.
-			addDebugInfo: (node msg start to: node msg end).
-			cgen normalSend: node msg sel numArgs: node msg args size].
+			self applyShouldNotPopTo: node message.
+			addDebugInfo: (node message start to: node message end).
+			cgen normalSend: node message selector numArgs: node message arguments size].
 )
-stringNode: node <StringAST>  = (
-	cgen pushLiteral: node val.
+public stringNode: node <StringAST>  = (
+	addDebugInfo: (node start to: node end).
+	cgen pushLiteral: node value.
 )
-superSendNode: node <SuperSendNode> = (
+public superSendNode: node <SuperSendNode> = (
 	
 	cgen isSuperSendAbsentReceiver ifFalse: [cgen pushSelf].
-	self applyShouldNotPopTo: node msg.
-	addDebugInfo: (node msg start to: node msg end).
-	cgen superSend: node msg sel numArgs: node msg args size.
+	self applyShouldNotPopTo: node message.
+	addDebugInfo: (node message start to: node message end).
+	cgen superSend: node message selector numArgs: node message arguments size.
 )
-symbolNode: node <SymbolAST>  = (
-	cgen pushLiteral: node val.
+public symbolNode: node <SymbolAST>  = (
+	addDebugInfo: (node start to: node end).
+	cgen pushLiteral: node value.
 )
-temporaryNode: node <TemporaryVariableAST> = (
+public temporaryNode: node <TemporaryVariableAST> = (
 	(isRemote: node) 
 		ifFalse: [cgen pushTemporary: (indexOfVar: node)]
 		ifTrue:
@@ -1663,36 +1431,43 @@ temporaryNode: node <TemporaryVariableAST> = (
 				pushRemoteTemporary: (indexOfVar: node)
 				inVector: (indexOfVar: (vectorOf: node))].
 )'private'
-currentMethodSource ^ <String> = (
-	^outer Compiler input contents
-)
 indexOfVar: v <VarDeclAST> ^ <Integer> = (
 	^(currentScope at: v name asSymbol) offset
 )
 isRemote: node ^ <Boolean> = (
 	^(currentScope at: node name asSymbol) remote
 )
-popAndStoreInto: node <VarDeclAST> = (
-	(isRemote: node)
-		ifFalse: [cgen popIntoTemporary: (indexOfVar: node)]
+popAndStoreInto: var <SlotEntry> = (
+	(isRemote: var)
+		ifFalse: [cgen popIntoTemporary: (indexOfVar: var)]
 		ifTrue:
 			[cgen
-				popIntoRemoteTemporary: (indexOfVar: node)
-				inVector: (indexOfVar: (vectorOf: node))]
+				popIntoRemoteTemporary: (indexOfVar: var)
+				inVector: (indexOfVar: (vectorOf: var))]
 )
-storeInto: node <VarDeclAST> = (
-	(isRemote: node)
-		ifFalse: [cgen storeIntoTemporary: (indexOfVar: node)]
+storeInto: var <SlotEntry> = (
+	(isRemote: var)
+		ifFalse: [cgen storeIntoTemporary: (indexOfVar: var)]
 		ifTrue:
 			[cgen
-				storeIntoRemoteTemporary: (indexOfVar: node)
-				inVector: (indexOfVar: (vectorOf: node))]
+				storeIntoRemoteTemporary: (indexOfVar: var)
+				inVector: (indexOfVar: (vectorOf: var))]
 )
 vectorOf: v <VarDeclAST> ^<VarDelcAST> = (
 	^(currentScope at: v name asSymbol) remoteVector
 )'scopes'
 currentScope ^ <Scope> = (
 	^scopeStack last
+)) : ()
+class GlobalAST association: a = (|
+public association <Association[Symbol, Object]> = a.
+|)
+('as yet unclassified'
+public apply: tool <ASTTool > = (
+	^tool globalNode: self
+)
+public isExpressionNode ^<Boolean> = (
+	^true	
 )) : ()
 class MixinClassNode = AST ((* A special AST node to represent access to the mixin class stored in a method. Recall that outer classes have accessors for their nested classes; these lazily manufacture the class, cache it, and later access the cached value.
 
@@ -1708,7 +1483,7 @@ The rewriter leaves this node untouched, while the lower layers of the compiler 
 
 *))
 ('as yet unclassified'
-apply: aTool <ASTTool > ^ <Self> = (
+public apply: aTool <ASTTool > ^ <Self> = (
 	^aTool mixinClassNode: self
 )
 isExpressionNode = (
@@ -1729,26 +1504,26 @@ where n is the size of the tuple. The above scheme requires that 1 through n are
 	tup <NormalSendAST>
 	index <Integer>
 	|
-	len:: NumberAST new val: aNode elements size.
+	len:: NumberAST new value: aNode elements size.
 	len start: aNode start; end: aNode end.
 	
 	array:: NormalSendAST new
 		to: (NormalSendAST new 
 			to: implicitReceiverNode 
-			send:  (MessageAST new sel:#Array; args:{}; start: aNode start; end: aNode end) (* Array *)) 
-		send: (MessageAST new sel: #braceStream:; args: {len}; start: aNode start; end: aNode end). (* Array braceStream: n *)
+			send:  (MessageAST new selector: #Array; arguments: {}; start: aNode start; end: aNode end) (* Array *)) 
+		send: (MessageAST new selector: #braceStream:; arguments: {len}; start: aNode start; end: aNode end). (* Array braceStream: n *)
 	array start: aNode start; end: aNode end.
 	
 	aNode elements size = 0 ifTrue:
 		[^(NormalSendAST new
 			to: array
-			send: (MessageAST new sel: #contents; args: {})) apply: self].
+			send: (MessageAST new selector: #contents; arguments: {})) apply: self].
 
 	index:: 0.
 	tup:: aNode elements inject: array into: [:r :e |  | msg <MessageAST> |
 	      index:: index + 1.
-	      msg:: MessageAST new sel: #nextPut:; 
-								args: {e}.
+	      msg:: MessageAST new selector: #nextPut:; 
+								arguments: {e}.
 		msg start: aNode start; end: aNode end.
 	      index = 1 
 			ifTrue: [NormalSendAST new to: r send: msg; start: aNode start; end: aNode end] 
@@ -1758,22 +1533,38 @@ where n is the size of the tuple. The above scheme requires that 1 through n are
 	
 	^((CascadedSendAST new
 		to: tup
-		cascade: (MessageAST new sel: #contents; args:{}; start: aNode start; end: aNode end)) start: aNode start; end: aNode end)
+		cascade: (MessageAST new selector: #contents; arguments: {}; start: aNode start; end: aNode end)) start: aNode start; end: aNode end)
 	(* (Array braceStream: n) nextPut: e1; ... nextPut: en; contents *)
 	 apply: self
 	(* visit elements *)
 )
-mixinClassNode: node <MixinClassNode> = (
-	^node
+processEventualSend: node <NormalSendAST> = (
+	| Processor receiver selector arguments |
+	Processor:: GlobalAST association: ProcessorAssociation.
+		
+	receiver:: node receiver apply: self.
+	selector:: (SymbolAST new value: node message selector) apply: self.
+	arguments:: (TupleAST new elements: node message arguments) apply: self.
+
+	^(OrdinarySendAST
+		to: Processor
+		send: ((MessageAST new
+			send: #eventualSendTo:selector:arguments: 
+			with: {receiver. selector. arguments})
+				copyPositionFrom: node message))
+		copyPositionFrom: node
 )
 processMappedVariable: msg decl: binding = (
 	^(msg selector last = $: 
-		ifTrue:[binding setterAst: msg args first]
+		ifTrue:[binding setterAst: msg arguments first]
 		ifFalse:[binding getterAst])
 			apply: self
+)'node traversal'
+public mixinClassNode: node <MixinClassNode> = (
+	^node
 )
-tupleNode: node <TupleAST> = (
-	(* We can only use pushConsArray for tuples small enough to fit all elements on the operand stack. The optimial limit is the large frame size minus the current stack depth. We don't track the current depth here, so an arbitrary conservative limit is used. *)
+public tupleNode: node <TupleAST> = (
+	(* We can only use pushConsArray for tuples small enough to fit all elements on the operand stack. The optimial limit is the large frame size minus the current stack depth. We don't track the current depth here, so an arbitrary conservative limit is used. *) 
 	node elements size > 7 ifTrue: [^self largeTupleNode: node].
 	^super tupleNode: node
 )) : ()
@@ -1782,24 +1573,24 @@ class SqueakRewriter = ((* Closure indirection, literal tables, ?long tuples. *)
 |)
 (
 class ASTTraverser = ()
-('as yet unclassified'
-blockLocalReturnNode: node <BlockLocalReturnAST> = (
+('node traversal'
+public blockLocalReturnNode: node <BlockLocalReturnAST> = (
 	node expression apply: self.
 )
-blockNode: node <BlockAST> = (
+public blockNode: node <BlockAST> = (
 	node body apply: self.
 )
-boolNode: node <BooleanAST> = (
+public boolNode: node <BooleanAST> = (
 	(* Leaf *)
 )
-cascadedSendNode: node <CascadedSendAST> = (
-	node prevSend apply: self.
-	node msg apply: self.
+public cascadedSendNode: node <CascadedSendAST> = (
+	node previousSend apply: self.
+	node message apply: self.
 )
-charNode: node <CharAST> = (
+public charNode: node <CharAST> = (
 	(* Leaf *)
 )
-conditionalNode: node <ConditionalAST> = (
+public conditionalNode: node <ConditionalAST> = (
 	node condition apply: self.
 
 	depth:: depth - 1.
@@ -1807,16 +1598,19 @@ conditionalNode: node <ConditionalAST> = (
 	node else apply: self.
 	depth:: depth + 1.
 )
-contextNode: node <ContextAST> = (
+public contextNode: node <ContextAST> = (
 	(* Leaf *)
 )
-enclosingObjectNode: node <EnclosingObjectAST> = (
+public enclosingObjectNode: node <EnclosingObjectAST> = (
 	(* Leaf *)
 )
-implicitReceiverSendNode: node <ImplicitReceiverSendAST> = (
+public globalNode: node <GlobalAST> = (
+	(* Leaf *)
+)
+public implicitReceiverSendNode: node <ImplicitReceiverSendAST> = (
 	node message apply: self.
 )
-loopNode: node <LoopAST> = (
+public loopNode: node <LoopAST> = (
 	depth:: depth - 1.
 	assert: [node prologue isCodeBodyNode] message: ''.
 	assert: [node condition isCodeBodyNode] message: ''.
@@ -1826,54 +1620,54 @@ loopNode: node <LoopAST> = (
 	node body apply: self.
 	depth:: depth + 1.
 )
-messageNode: node <MessageAST> = (
-	node args do: [:each | each apply: self].
+public messageNode: node <MessageAST> = (
+	node arguments do: [:each | each apply: self].
 )
-messagePatternNode: node <MessagePatternAST> = (
+public messagePatternNode: node <MessagePatternAST> = (
 	(* Leaf *)
 )
-methodLocalReturnNode: node <MethodLocalReturnAST> = (
+public methodLocalReturnNode: node <MethodLocalReturnAST> = (
 	node expression apply: self.
 )
-methodNode: node <MethodAST> = (
+public methodNode: node <MethodAST> = (
 	node pattern apply: self.
 	node body apply: self.
 )
-mixinClassNode: node <MixinClassNode> = (
+public mixinClassNode: node <MixinClassNode> = (
 	(* Leaf *)
 )
-nilNode: node <NilAST> = (
+public nilNode: node <NilAST> = (
 	(* Leaf *)
 )
-nonLocalReturnNode: node <NonlocalReturnAST> = (
+public nonLocalReturnNode: node <NonlocalReturnAST> = (
 	node expression apply: self.
 )
-numberNode: node <NumberAST> = (
+public numberNode: node <NumberAST> = (
 	(* Leaf *)
 )
-ordinarySendNode: node <OrdinarySendAST> = (
+public ordinarySendNode: node <OrdinarySendAST> = (
 	node receiver apply: self.
 	node message apply: self.
 )
-outerSendNode: node <OuterSendAST> = (
+public outerSendNode: node <OuterSendAST> = (
 	node message apply: self.
 )
-receiverNode: node <ReceiverAST> = (
+public receiverNode: node <ReceiverAST> = (
 	(* Leaf *)
 )
-selfSendNode: node <SelfSendAST> = (
+public selfSendNode: node <SelfSendAST> = (
 	node message apply: self.
 )
-stringNode: node <StringAST> = (
+public stringNode: node <StringAST> = (
 	(* Leaf *)
 )
-superSendNode: node <SuperSendAST> = (
+public superSendNode: node <SuperSendAST> = (
 	node message apply: self.
 )
-symbolNode: node <SymbolAST> = (
+public symbolNode: node <SymbolAST> = (
 	(* Leaf *)
 )
-tupleNode: node <TupleAST> = (
+public tupleNode: node <TupleAST> = (
 	node elements do: [:each | each apply: self]
 )) : ()
 class ArrayAST = AST ((* To use pushFullArray/pushEmptyArray *)|
@@ -1881,7 +1675,7 @@ class ArrayAST = AST ((* To use pushFullArray/pushEmptyArray *)|
 	size <Integer>
 |)
 ('as yet unclassified'
-apply: tool = (
+public apply: tool = (
 	^tool arrayNode: self.
 )
 isExpressionNode = (
@@ -1892,7 +1686,7 @@ class CogClosureAST = BlockAST (|
 	pushNilCount
 |)
 ('as yet unclassified'
-apply: aTool = (
+public apply: aTool = (
 	^aTool closureNode: self
 )) : ()
 class CopyDownAnalyzer for: node <CodeBodyAST> = ASTTraverser ((* A closure needs to copy variables that are read but defined in the outer scope.  At the point of this anaylsis, indirection has already been added so there should be no reads to an order context and (if this block is nested) outer closures have already copied what they need, so outer reads should only be one level out. *)|
@@ -1902,29 +1696,8 @@ class CopyDownAnalyzer for: node <CodeBodyAST> = ASTTraverser ((* A closure need
 	pushNilCount ::= 0.
 	|node apply: self)
 ('as yet unclassified'
-codeBodyNode: node <CodeBodyNode> = (
-	depth:: depth + 1.
-
-	node parameters do: [:each | self shadow: each name].
-	node temporaries do: [:each | self shadow: each name].
-	
-	depth = 1 ifTrue: [pushNilCount: pushNilCount + node temporaries size].
-
-
-	node statements
-		do: [:each | each apply: self].
-
-	depth:: depth - 1.
-)
 isShadowed: var <Symbol> ^<Boolean> = (
 	^(shadowing at: var ifAbsent: [^false]) <= depth
-)
-localReadNode: node <LocalReadAST> = (
-	variableRead: node variable
-)
-localWriteNode: node <LocalWriteAST> = (
-	node value apply: self. (* This happens first! *)
-	variableWrite: node variable
 )
 shadow: var <Symbol> = (
 	(* ('shadowing ' , var , ' at ', depth printString) out. *)
@@ -1941,6 +1714,27 @@ variableWrite: var = (
 	var remote ifTrue: [^variableRead: var remoteVector].
 	assert: [false] message: var name, ' should have been made indirect'.
 	needsToCopy add: var name.
+)'node traversal'
+public codeBodyNode: node <CodeBodyNode> = (
+	depth:: depth + 1.
+
+	node parameters do: [:each | self shadow: each name].
+	node temporaries do: [:each | self shadow: each name].
+	
+	depth = 1 ifTrue: [pushNilCount: pushNilCount + node temporaries size].
+
+
+	node statements
+		do: [:each | each apply: self].
+
+	depth:: depth - 1.
+)
+public localReadNode: node <LocalReadAST> = (
+	variableRead: node variable
+)
+public localWriteNode: node <LocalWriteAST> = (
+	node value apply: self. (* This happens first! *)
+	variableWrite: node variable
 )) : ()
 class IndirectionAnalyzer for: node <CodeBodyAST> = ASTTraverser (|
 	depth ::= 0.	
@@ -1950,27 +1744,6 @@ class IndirectionAnalyzer for: node <CodeBodyAST> = ASTTraverser (|
 
 	|node apply: self)
 ('as yet unclassified'
-codeBodyNode: node <CodeBodyNode> = (
-	depth:: depth + 1.
-	
-	depth = 1 ifTrue:
-		[ | scope = scopeMap at: node. |
-		scope isNil ifFalse: [
-		(* Parameters are immutable, so they never need indirection. *)
-		node temporaries do: [:temp | candidates add: (scope at: temp name)]]].
-	
-	node statements
-		do: [:each | each apply: self].
-	
-	depth:: depth - 1.
-)
-localReadNode: node <LocalReadAST> = (
-	self variableRead: node variable
-)
-localWriteNode: node <LocalWriteAST> = (
-	node value apply: self. (* This happens first! *)
-	self variableWrite: node variable
-)
 variableRead: var <SlotEntry> = (
 	(candidates includes: var) ifFalse: [^self].
 	
@@ -1991,14 +1764,42 @@ variableWrite: var <SlotEntry> = (
 			needsIndirection add: var.
 		].
 	].
+)'node traversal'
+public codeBodyNode: node <CodeBodyNode> = (
+	depth:: depth + 1.
+	
+	depth = 1 ifTrue:
+		[ | scope = scopeMap at: node. |
+		scope isNil ifFalse: [
+		(* Parameters are immutable, so they never need indirection. *)
+		node temporaries do: [:temp | candidates add: (scope at: temp name)]]].
+	
+	node statements
+		do: [:each | each apply: self].
+	
+	depth:: depth - 1.
+)
+public localReadNode: node <LocalReadAST> = (
+	self variableRead: node variable
+)
+public localWriteNode: node <LocalWriteAST> = (
+	node value apply: self. (* This happens first! *)
+	self variableWrite: node variable
 )) : ()'as yet unclassified'
 addLiteral: s <Character | Number | String | Symbol> = ( 
 	(literalTable includesKey: s) ifFalse: [literalTable at: s put: literalTable size].
 )
-blockLocalReturnNode: node <BlockLocalReturnAST> = (
-	^rewriter BlockLocalReturnAST expression: (node expression apply: self)
+pushScope: s <Scope> = (
+	^scopeStack addLast: s
 )
-blockNode: node <BlockAST> ^ <ClosureAST> = (
+pushScopeForNode: node <AST> = (
+	^scopeStack addLast: (scopeMap at: node)
+)'node traversal'
+public blockLocalReturnNode: node <BlockLocalReturnAST> = (
+	^(rewriter BlockLocalReturnAST expression: (node expression apply: self))
+		copyPositionFrom: node
+)
+public blockNode: node <BlockAST> ^ <ClosureAST> = (
 (* This method should only be called on a block that is not going to be inlined.
 
 There are two things that require rewriting in blocks.
@@ -2032,7 +1833,7 @@ The reason for this separation is that step (1) is always needed; step (2) is on
 					initializer: nil
 			).
 			(scopeMap at: node) at: var put:
-				(SlotEntry
+				(LocalEntry
 					forDeclaration: (rewriter TemporaryAST name: var type: nil)
 					atDepth: nil)].
 		
@@ -2049,21 +1850,21 @@ The reason for this separation is that step (1) is always needed; step (2) is on
 	scopeMap at: result put: (scopeMap at: node).
 	^result copyPositionFrom: node
 )
-boolNode: node <BooleanAST> = (
+public boolNode: node <BooleanAST> = (
 	(* No need to add literal: true and false are quick literals in both bytecode sets. *)
 	^node
 )
-cascadedSendNode: node <CascadedSendAST> = (
+public cascadedSendNode: node <CascadedSendAST> = (
 	^(CascadedSendAST new
-		to: (node prevSend apply: self)
-		cascade: (node msg apply: self))
+		to: (node previousSend apply: self)
+		cascade: (node message apply: self))
 		copyPositionFrom: node
 )
-charNode: node <CharAST> = (
-	addLiteral: node val.
+public charNode: node <CharAST> = (
+	addLiteral: node value.
 	^node
 )
-codeBodyNode: node <CodeBodyAST> ^ <CodeBodyAST> = (
+public codeBodyNode: node <CodeBodyAST> ^ <CodeBodyAST> = (
 	| 
 	bodyScope <Scope>
 	statements <OrderedCollection[StatementAST]>
@@ -2086,7 +1887,7 @@ codeBodyNode: node <CodeBodyAST> ^ <CodeBodyAST> = (
 		itv:: rewriter TemporaryAST
 			name: ('@indirectionVector',scopeStack size printString) asSymbol
 			type: nil.
-		itvEntry:: SlotEntry forDeclaration: itv atDepth: currentDepth.
+		itvEntry:: LocalEntry forDeclaration: itv atDepth: currentDepth.
 		bodyScope
 			at: itv name put: itvEntry; (* getter *)
 			at: (itv name,':') asSymbol put: itvEntry. (* setter *)
@@ -2122,7 +1923,7 @@ codeBodyNode: node <CodeBodyAST> ^ <CodeBodyAST> = (
 	scopeMap at: result put: bodyScope.
 	^result copyPositionFrom: node
 )
-conditionalNode: node <ConditionalAST> = (
+public conditionalNode: node <ConditionalAST> = (
 	^(rewriter ConditionalAST
 		if: (node condition apply: self)
 		is: node ifTrue
@@ -2130,21 +1931,25 @@ conditionalNode: node <ConditionalAST> = (
 		else: (inlinedCodeBodyNode: node else))
 		copyPositionFrom: node
 )
-contextNode: node <ContextAST> = (
+public contextNode: node <ContextAST> = (
 	^node
 )
-enclosingObjectNode: node <EnclosingObjectAST> = (
+public enclosingObjectNode: node <EnclosingObjectAST> = (
 	(* The V3 bytecode set must find the depth in the literal table. *)
 	useAlternateBytecodeSet ifFalse: [addLiteral: node depth].
 	^node
 )
-implicitReceiverSendNode: node <ImplicitReceiverSendAST> = (
+public globalNode: node <GlobalAST> = (
+	addLiteral: node association.
+	^node
+)
+public implicitReceiverSendNode: node <ImplicitReceiverSendAST> = (
 	^(rewriter ImplicitReceiverSendAST new
 		message: (node message apply: self);
 		depth: node depth)
 		copyPositionFrom: node
 )
-inlinedCodeBodyNode: node <CodeBodyAST> ^ <CodeBodyAST> = (
+public inlinedCodeBodyNode: node <CodeBodyAST> ^ <CodeBodyAST> = (
 	| 
 	bodyScope <Scope>
 	result <CodeBodyAST>
@@ -2162,35 +1967,37 @@ inlinedCodeBodyNode: node <CodeBodyAST> ^ <CodeBodyAST> = (
 	scopeMap at: result put: bodyScope.
 	^result copyPositionFrom: node
 )
-localReadNode: node <LocalReadAST> = (
+public localReadNode: node <LocalReadAST> = (
 	^node
 )
-localWriteNode: node <LocalWriteAST> = (
-	^rewriter LocalWriteAST
+public localWriteNode: node <LocalWriteAST> = (
+	^(rewriter LocalWriteAST
 		to: node variable
-		assign: (node value apply: self)
+		assign: (node value apply: self))
+		copyPositionFrom: node
 )
-loopNode: node <LoopAST> = (
+public loopNode: node <LoopAST> = (
 	^rewriter LoopAST new
 		prologue: (inlinedCodeBodyNode: node prologue);
 		condition: (inlinedCodeBodyNode: node condition);
 		isWhileTrue: node isWhileTrue;
 		body: (inlinedCodeBodyNode: node body)
 )
-messageNode: node <MessageAST> = (
-	addLiteral: node sel.
+public messageNode: node <MessageAST> = (
+	addLiteral: node selector.
 	^(MessageAST new
-		send: node sel
-		with: (node args collect: [:ea | ea apply: self]))
+		send: node selector
+		with: (node arguments collect: [:ea | ea apply: self]))
 		copyPositionFrom: node
 )
-messagePatternNode: node <MessagePatternAST> ^ <MessagePatternAST> = (
+public messagePatternNode: node <MessagePatternAST> ^ <MessagePatternAST> = (
 	^node
 )
-methodLocalReturnNode: node <MethodLocalReturnAST> = (
-	^rewriter MethodLocalReturnAST expression: (node expression apply: self)
+public methodLocalReturnNode: node <MethodLocalReturnAST> = (
+	^(rewriter MethodLocalReturnAST expression: (node expression apply: self))
+		copyPositionFrom: node
 )
-methodNode: node <MethodAST> = (
+public methodNode: node <MethodAST> = (
 	| pattern body result |
 	literalTable:: Dictionary new.
 	
@@ -2204,27 +2011,28 @@ methodNode: node <MethodAST> = (
 	scopeMap at: result put: (scopeMap at: node).
 	^result
 )
-mixinClassNode: node <MixinClassNode> = (
+public mixinClassNode: node <MixinClassNode> = (
 	^node
 )
-nilNode: node <NilAST> = (
+public nilNode: node <NilAST> = (
 	(* No need to add literal: nil is a quick literal in both bytecode sets. *)
 	^node
 )
-nonLocalReturnNode: node <NonlocalReturnAST> = (
-	^rewriter NonlocalReturnAST expression: (node expression apply: self)
+public nonLocalReturnNode: node <NonlocalReturnAST> = (
+	^(rewriter NonlocalReturnAST expression: (node expression apply: self))
+		copyPositionFrom: node
 )
-numberNode: node <NumberAST> = (
-	addLiteral: node val.
+public numberNode: node <NumberAST> = (
+	addLiteral: node value.
 	^node
 )
-ordinarySendNode: node <OrdinarySendAST> = (
+public ordinarySendNode: node <OrdinarySendAST> = (
 	^(rewriter OrdinarySendAST
 		to: (node receiver apply: self)
 		send: (node message apply: self))
 		copyPositionFrom: node
 )
-outerSendNode: node <OuterSendAST> = (
+public outerSendNode: node <OuterSendAST> = (
 	(* The V3 bytecode set must find the depth in the literal table. *)
 	useAlternateBytecodeSet ifFalse: [addLiteral: node depth].
 	^(rewriter OuterSendAST new
@@ -2232,35 +2040,29 @@ outerSendNode: node <OuterSendAST> = (
 		depth: node depth)
 		copyPositionFrom: node
 )
-pushScope: s <Scope> = (
-	^scopeStack addLast: s
-)
-pushScopeForNode: node <AST> = (
-	^scopeStack addLast: (scopeMap at: node)
-)
-receiverNode: node <ReceiverAST> = (
+public receiverNode: node <ReceiverAST> = (
 	^node
 )
-selfSendNode: node <SelfSendAST> = (
+public selfSendNode: node <SelfSendAST> = (
 	^(rewriter SelfSendAST new
 		message: (node message apply: self))
 		copyPositionFrom: node
 )
-stringNode: node <StringAST> = (
+public stringNode: node <StringAST> = (
 	(* Note we treat it as a symbol. *)
-	addLiteral: node val asSymbol.
+	addLiteral: node value asSymbol.
 	^node
 )
-superSendNode: node <SuperSendAST> = (
+public superSendNode: node <SuperSendAST> = (
 	^(rewriter SuperSendAST new
 		message: (node message apply: self))
 		copyPositionFrom: node
 )
-symbolNode: node <SymbolAST> = (
-	addLiteral: node val.
+public symbolNode: node <SymbolAST> = (
+	addLiteral: node value.
 	^node
 )
-tupleNode: node <TupleAST> = (
+public tupleNode: node <TupleAST> = (
 	^ArrayAST new 
 		elements: (node elements collect: [:ea | ea apply: self]);
 		size: node elements size 
@@ -2301,8 +2103,8 @@ splitInitializersFor: aNode <ClassHeaderAST> ^ <Collection[MethodAST]> = (
 			send: (setterSelectorFor: slot) with:  {slotInitializer};
 			start: slot start;
 			end: slot end.
-		NormalSendAST new msg: aMsg; 
-			recv: (selfNode start: aMsg start; end: aMsg end);
+		NormalSendAST new message: aMsg; 
+			receiver: (selfNode start: aMsg start; end: aMsg end);
 			start: aMsg start; end: aMsg end].
 
 	(* populate subinit methods with slot initialization code *)
@@ -2343,15 +2145,15 @@ superclass.
 .*)
 	|  
 	nestedMixin = nestedMixinASTFor: nestedName.
-	superChain = inheritanceASTWIthSuperclass: ( superCall recv)  iList:  iList allButLast.
+	superChain = inheritanceASTWIthSuperclass: (superCall receiver)  iList:  iList allButLast.
 	mixinApp = NormalSendAST new
-		to: (mixinSendTreeFor: iList last recv)
+		to: (mixinSendTreeFor: iList last receiver)
 		send: #apply:withName:index:
 		with: {
 			superChain.
 			NormalSendAST new
 				to: (NormalSendAST new
-					to: (SymbolAST new val: nestedName, '`')
+					to: (SymbolAST new value: nestedName, '`')
 					send: #,
 					with: {NormalSendAST new
 						to: (NormalSendAST new to: selfNode send: #hash with: {})
@@ -2359,7 +2161,7 @@ superclass.
 						with: {}})
 				send: #asSymbol
 				with: {}.
-				NumberAST new val: iList size
+				NumberAST new value: iList size
 				}.
 	|
 	
@@ -2374,7 +2176,7 @@ checkForDuplicateNames: node <ClassDeclarationAST> = (
 	node instanceSide categories do: [:cat |
 		cat methods do: [:each | namesWithDuplicates add: each selector]].
 	
-	node hdr slots do: [:each |
+	node header slots do: [:each |
 		namesWithDuplicates add: each name.
 		each isMutable ifTrue: [namesWithDuplicates add: each name, ':']].
 	
@@ -2500,7 +2302,7 @@ public compileExpressionSource: src <ReadStream | String> inContext: aContext <M
 			[| last |
 			last:: body statements removeLast.
 			body statements add: (ReturnStatAST new 
-				expr: last; start: last start; end: last end)]].
+				expression: last; start: last start; end: last end)]].
 
 	(* Put into a method *)
 	method:: MethodAST new
@@ -2543,11 +2345,8 @@ public compileExpressionSource: src <ReadStream | String> inContext: aContext <M
  	result: methodCompiler result.
 	result src: stm contents.
 	scopeMap:: Dictionary new.
+	result pragmas: {#isExpression -> true}.
 	^result
-)
-public compileInitializerSource: src <ReadStream> within: enclosing <MixinMirror>  ^<LowLevelMethodMirror> = (
-	| tree <AST> result <LowLevelMethodMirror> stm <ReadStream> | 
-	^compileClassSource: (src contents, '()') readStream within: nil.
 )
 compileNestedClassAST: tree <ClassDeclarationAST | MixinApplicationClassAST> into: enclosingClass <ClassDeclarationMirror> ^ <MixinRep> = (
 	| 
@@ -2576,8 +2375,8 @@ computeSlotInitializersFor: aNode <ClassHeaderAST> ^ <Collection[StmtAST]> = (
 			send: (setterSelectorFor: slot) with:  {slotInitializer};
 			start: slot start;
 			end: slot end.
-		NormalSendAST new msg: aMsg; 
-			recv: (selfNode start: aMsg start; end: aMsg end);
+		NormalSendAST new message: aMsg; 
+			receiver: (selfNode start: aMsg start; end: aMsg end);
 			start: aMsg start; end: aMsg end].
 )
 doitBlackMarketArgumentName = (
@@ -2602,12 +2401,14 @@ futureFor: expression <ExpressionAST> ^<ExpressionAST> = (
 	sscope superScope: currentScope.
 	
 	futureExp:: NormalSendAST new
-		recv: (NormalSendAST new recv: hereNode; msg: (MessageAST new sel: #Future; args: {}));
-		msg: (MessageAST new sel: #computing:; args: {
+		receiver: (NormalSendAST new
+			receiver: hereNode;
+			message: (MessageAST new selector: #Future; arguments: {}));
+		message: (MessageAST new selector: #computing:; arguments: {
 			block:: BlockAST new body: (
 				 codebody:: CodeBodyAST new
 					parameters: OrderedCollection new;
-					 temporaries: OrderedCollection new;
+					temporaries: OrderedCollection new;
 					statements: {expression}
 			)
 		}).
@@ -2640,9 +2441,9 @@ of the various mixin applications produced conflict with each other.
 *)
 	^(iList inject: {sc. 1} into:[:nsc <{ExpressionAST. Integer}> :m <SendAST> | 
 		{NormalSendAST new
-				to: (mixinSendTreeFor: m recv)
+				to: (mixinSendTreeFor: m receiver)
 				send: #apply:index:
-				with: {nsc first. NumberAST new val: nsc last}.
+				with: {nsc first. NumberAST new value: nsc last}.
 		nsc last + 1
 		}
 		]) first.
@@ -2703,11 +2504,11 @@ mixinCall: number <Integer> inheritanceList: iList <Collection[SendAST]>  ^ <Nor
 	|
 	aNode <SendAST> = iList at: number.
 	var  <VariableAST> = VariableAST new name: #self; start: aNode start; end: aNode end.
-	mixinMsg <MessageAST> = aNode msg apply: ASTCopier new.
+	mixinMsg <MessageAST> = aNode message apply: ASTCopier new.
 	send <NormalSendAST> = NormalSendAST new to: var send: mixinMsg; start: aNode start; end: aNode end.
 	|
 
-      mixinMsg sel: (superMixinInitializerSelectorFor: mixinMsg selector number: number -1).
+      mixinMsg selector: (superMixinInitializerSelectorFor: mixinMsg selector number: number -1).
 	^send
 )
 mixinInitializationCallsFor: iList <List[SendAST]>  ^ <List[StmtAST]> = (
@@ -2742,8 +2543,9 @@ private mixinInitializerFor: aNode <ClassHeaderAST> ^ <MethodAST> = (
 			send: (setterSelectorFor: slot) with:  {slotInitializer};
 			start: slot start;
 			end: slot end.
-		NormalSendAST new msg: aMsg; 
-			recv: (selfNode start: aMsg start; end: aMsg end);
+		NormalSendAST new
+			message: aMsg; 
+			receiver: (selfNode start: aMsg start; end: aMsg end);
 			start: aMsg start; end: aMsg end].
 
 	(* then add the initializer code *)
@@ -2820,72 +2622,15 @@ sourceForNode: node <AST> ^ <String> = (
 	input position: savedPos.
 	^s
 )
-splitMixinInitializersFor: aNode <ClassHeaderAST> ^ <Collection[MethodAST]> = (
-
-	(* Because the init sequence may not fit in a single method, because too many literals are needed for all the setters and getters, we produce an init method that calls a number of private sub-initializers. This main initializer routine first calls the superclass's main initializer, then calls the subinitializers to set all the slots, and then any initialization code in the header. Answers a collection of MethodASTs including the main and sub intializers. *)
-	| 
-	start <integer>
-	end <Integer>
-	stmts <List[StmtAST]> 
-	initHdr <MessagePatternAST>
-	body <CodeBodyAST>  
-	slots <Collection[StmtAST]>
-	subs <Collection[MethodAST]>
-	copier <ASTCopier>
-	|
-
-	copier:: ASTCopier new.
-	initHdr:: aNode constructor apply: copier. (* set up scope with constructor parameters *)
-	initHdr selector: (initializerSelectorNameFor: initHdr selector).	
-	subs:: subInitializersFor: aNode. (* compute (empty) subinitializers *)
-	
-	slots:: (aNode slots reject: [:slot | slot initializer isNil]) collect: 
-		[:slot <SlotDefAST> |
-		| aMsg <MessageAST> slotInitializer <ExpressionAST> |
-		slotInitializer:: slot initializer apply: copier.
-		aNode isSeq ifFalse: [slotInitializer:: futureFor: slotInitializer].
-		aMsg:: MessageAST new 
-			send: (setterSelectorFor: slot) with:  {slotInitializer};
-			start: slot start;
-			end: slot end.
-		NormalSendAST new msg: aMsg; 
-			recv: (selfNode start: aMsg start; end: aMsg end);
-			start: aMsg start; end: aMsg end].
-
-	(* populate subinit methods with slot initialization code *)
-	(1 to: slots size) with: slots do: [:n :stmt |
-		(subs at: n  // methodCompiler slotsPerMethod + 1) body statements add: stmt]. 
-
-	stmts:: OrderedCollection new.
-	(* Call the subinitializers for the slots *)
-	1 to: subs size -1 do: 
-		[:i | stmts add: (sendForSub: (subs at: i))].
-	start:: stmts isEmpty ifTrue:[0] ifFalse:[stmts first start].
-	end:: stmts isEmpty ifTrue:[0] ifFalse:[stmts last end].
-	(* then the initializer code *)
-	aNode initExprs do:
-		[:ie <ExpressionAST> | stmts add: (ie apply: copier)]. 
-
-	body:: CodeBodyAST new
-		temporaries: OrderedCollection new
-		statements: stmts;
-		start: start; end: end.
-		(* need to add per-class initializer as well *)
-	subs at: subs size put: (MethodAST new 
-		pattern: initHdr body: body accessModifier: #public;
-		start: start; end: end).
-
-	^subs
-)
 superFactoryCallFor: aNode <SendAST> ^ <NormalSendAST> = (
 	(* Probably migrate to superclass *)
 	(* create call to superclass initializer *)
 	|
 	var  <VariableAST> = VariableAST new name: #super; start: aNode start; end: aNode end.
-	superInitMsg <MessageAST> = aNode msg apply: ASTCopier new.
+	superInitMsg <MessageAST> = aNode message apply: ASTCopier new.
 	send <NormalSendAST> = NormalSendAST new to: var send: superInitMsg; start: aNode start; end: aNode end.
 	|
-      superInitMsg sel: (initializerSelectorNameFor: superInitMsg sel).
+      superInitMsg selector: (initializerSelectorNameFor: superInitMsg selector).
 	^send
 )
 superMixinInitializerSelectorFor: selector <Symbol> number: i <Integer> ^<Symbol> = (
@@ -2937,7 +2682,7 @@ makePrimaryFactoryFor: hdr <ClassHeaderAST> ^<MethodAST> = (
 	msgFromConstructor start: start; end: end.
 
 	stmts:: OrderedCollection new 
-		add: (ReturnStatAST new expr: 
+		add: (ReturnStatAST new expression: 
 			(NormalSendAST new 
 				to: newInstance 
 				send: msgFromConstructor;
@@ -2955,7 +2700,7 @@ makePrimaryFactoryFor: hdr <ClassHeaderAST> ^<MethodAST> = (
 		start: start; end: end.
 )
 private processFactoryFor: aNode <ClassAST> in: mixinMirror <LowLevelMixinMirror> = (
-	processFactoryFor: aNode hdr inScope: (scopeMap at: aNode classSide) in: mixinMirror.
+	processFactoryFor: aNode header inScope: (scopeMap at: aNode classSide) in: mixinMirror.
 )
 private processFactoryFor: aNode <ClassHeaderAST> inScope: s in: mixinMirror <LowLevelMixinMirror> = (
 	
@@ -2974,7 +2719,7 @@ initializerSelectorNameFor: selector <Symbol> ^<Symbol> = (
 	^('initializer`', selector) asSymbol
 )
 private processInitializerFor: aNode <ClassAST> in: mixinMirror <LowLevelMixinMirror> = (
-	processInitializerFor: aNode hdr inScope: (scopeMap at: aNode instanceSide) in: mixinMirror.
+	processInitializerFor: aNode header inScope: (scopeMap at: aNode instanceSide) in: mixinMirror.
 )
 private processInitializerFor: aNode <ClassHeaderAST> inScope: s <Scope> in: mixinMirror <LowLevelMixinMirror> = (
 
@@ -3079,7 +2824,7 @@ superConstructorMethodFor: aNode <ClassHeaderAST> ^<MethodAST> = (
 	stmts:: OrderedCollection new. 
 	var:: VariableAST new name: #super; start: start; end: end.
 	superMsg:: aNode superConstructorCall apply: copier.
-	superMsg sel: (initializerSelectorNameFor: superMsg sel).
+	superMsg selector: (initializerSelectorNameFor: superMsg selector).
 	send:: NormalSendAST new to: var send: superMsg; start: start; end: end. 
 	stmts addFirst: send.
 	body:: CodeBodyAST new
@@ -3140,11 +2885,11 @@ where <classTree> is the AST that computes the class.
 		to: nilCheck
 		send: #ifTrue:
 		with: {block}.	
-	return:: ReturnStatAST new expr: nestedClassSlot.
+	return:: ReturnStatAST new expression: nestedClassSlot.
 		
 	^MethodAST new
-		accessModifier: am;
-		pattern: (MessagePatternAST new 
+		pattern: (MessagePatternAST new
+			accessModifier: am;
 			selector:  simpleName asSymbol
 			parameters: {});
 		body: (CodeBodyAST new
@@ -3196,14 +2941,14 @@ mixinAppClass2 = NormalSendAST new to: mixinAppVar5 send: classMessage.
 classMtds = NormalSendAST new to: mixinAppClass send: methodDictMessage3. 
 (* mixinApp class methodDictionary*)
 instMtds = NormalSendAST new to: mixinAppVar3 send: methodDictMessage4. (* mixinApp methodDictionary*)
-initName = SymbolAST new val: (initializerSelectorNameFor: facName). (* #'initializer`factoryName' *)
+initName = SymbolAST new value: (initializerSelectorNameFor: facName). (* #'initializer`factoryName' *)
 initMethod = NormalSendAST new to: mixinInstMtds send: #at: with:{initName}. 
 (* nestedMixin methodDictionary at: #'initializer`factoryName' *)
 initMethodClone =  NormalSendAST new to: initMethod send: #clone with:{}.
 (* (nestedMixin methodDictionary at: #'initializer`factoryName') clone *)
 initMethodCopy = NormalSendAST new to: initMethodClone send: #methodClass: with: {mixinAppVar4}.
 (* (nestedMixin methodDictionary at: #'initializer`factoryName') clone methodClass: mixinApp *) 
-factoryName = SymbolAST new val: facName.  (* #factoryName *)
+factoryName = SymbolAST new value: facName.  (* #factoryName *)
 factoryMethod = NormalSendAST new to: mixinClassMtds send: #at: with:{factoryName}.
 (* nestedMixin classMixin methodDictionary at: #'factoryName *)
 factoryMethodClone =  NormalSendAST new to: factoryMethod send: #clone with:{}.
@@ -3231,7 +2976,7 @@ private astForComputingClassDeclaration: simpleName <String> fullName: nestedNam
 (* Compute the tree for an ordinary class declaration whose superclass is a generalized mixin application. *)
 	| 	
 	nestedMixin = nestedMixinASTFor: nestedName.  
-	superChain = inheritanceASTWIthSuperclass: superCall recv iList: iList.	
+	superChain = inheritanceASTWIthSuperclass: superCall receiver iList: iList.	
 	|
 
 	^NormalSendAST new
@@ -3241,7 +2986,7 @@ private astForComputingClassDeclaration: simpleName <String> fullName: nestedNam
 			superChain.
 			NormalSendAST new
 				to: (NormalSendAST new
-					to: (SymbolAST new val: nestedName, '`')
+					to: (SymbolAST new value: nestedName, '`')
 					send: #,
 					with: {NormalSendAST new
 						to: (NormalSendAST new to: selfNode send: #hash with: {})
@@ -3294,7 +3039,7 @@ classTree:: classDecl isMixinApplicationClassAST
 			factoryName: classDecl constructor selector
 		]
 	ifFalse:[
-		hdr:: classDecl hdr.
+		hdr:: classDecl header.
 		scope:: (scopeMap at: classDecl instanceSide) superScope.
 		astForComputingClassDeclaration: n 
 			fullName: nestedName 
@@ -3322,7 +3067,7 @@ private nestedMixinASTFor: nestedName <String> ^ <NormalSendAST> = (
 ^NormalSendAST new
 		to: nestedMixins
 		send: #at:
-		with: {SymbolAST new val: 
+		with: {SymbolAST new value: 
 			(namer mixinNameOfClassNamed: nestedName)}.
 )
 nestedMixinWrapperFor: nested <ClassDeclarationAST> in: outerClass <MixinMirror>  ^ <ClassDeclarationAST> = (
@@ -3331,8 +3076,8 @@ nestedMixinWrapperFor: nested <ClassDeclarationAST> in: outerClass <MixinMirror>
 | wrapper <ClassDeclarationAST> |
 
 wrapper:: nested clone.
-wrapper hdr: nested hdr clone.
-wrapper hdr name: (namer fullyQualifySimpleName: nested name with: outerClass name).
+wrapper header: nested header clone.
+wrapper header name: (namer fullyQualifySimpleName: nested name with: outerClass name).
 ^wrapper
 )'private'
 computeMixinFrom: aNode <ClassHeaderAST> ^ <CompiledMixinMirror> = (
@@ -3380,10 +3125,10 @@ classNode: node <ClassDeclarationAST> ^ <MixinRep> = (
 	mixinMirror <LowLevelMixinMirror>
 	nestedClasses <Collection[MixinRep]>
 	|
-	assert: [node hdr category notNil] message: 'No category for class header'.
-	node hdr slots do: [:each | checkForReservedWord: each name].
+	assert: [node header category notNil] message: 'No category for class header'.
+	node header slots do: [:each | checkForReservedWord: each name].
 	checkForDuplicateNames: node.
-	mixinMirror:: computeMixinFrom: node hdr.
+	mixinMirror:: computeMixinFrom: node header.
 
 	currentDepth::currentDepth + 1.
 	nestedClasses:: processInstanceSideOf: node ofMixin: mixinMirror lowLevelMirror.
@@ -3480,9 +3225,6 @@ isDebugMappedLocalEntry = (
 isMessagePatternNode = (
 	^false
 )
-isMethodNode = (
-	^false
-)
 isVarDeclNode = (
 	^false
 )
@@ -3491,7 +3233,6 @@ setterAst: newVal = (
 )) : ()'as yet unclassified'
 PERFORMANCE_NOTE = (
 	(* The compiler could generate better code in the following areas:
-	* Setter sends evaluated for effect.
 	* Literals evaluated for effect (e.g., the BOGUS marker).
 	* Inlining ifNil: etc
 	* Inlining and:/or:
@@ -3502,11 +3243,11 @@ PERFORMANCE_NOTE = (
 assert: c = (
 	self assert: c message: 'Assert failed'.
 )'make lexically visible'
+LocalEntry = (
+	^super LocalEntry
+)
 Scope = (
 	^super Scope
-)
-SlotEntry = (
-	^super SlotEntry
 )
 SymbolTableEntry = (
 	^super SymbolTableEntry

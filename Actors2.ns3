@@ -1,0 +1,184 @@
+Newspeak3
+'Actors'
+class Actors2 usingPlatform: p vm: vm = (|
+private SharedQueue2 = p squeak SharedQueue2.
+private WeakMap = p squeak WeakKeyDictionary.
+
+private Processor <ProcessScheduler> = p squeak Processor.
+private primitives <VMMirror> = vm.
+
+private internalFarReferences <WeakMap[FarReference, InternalReferenceBacking]> = WeakMap new.
+private internalFutures <WeakMap[Promise, InternalFuture]> = WeakMap new.
+|) (
+protected class Actor named: n = (|
+	public name <String> = n.
+	public process <Process>
+	public messageQueue <SharedQueue> = SharedQueue2 new.
+|) (
+'as yet unclassified'
+public doOneTurn = (
+	| message = messageQueue next. |
+	message dispatch.
+)
+public printOn: stream = (
+	stream nextPutAll: 'Actor('; nextPutAll: name; nextPutAll: ')'.
+)
+public startEventLoop = (
+	process:: [[self doOneTurn] repeat] newProcess.
+	process name: 'Event loop for ', name.
+	process priority: Processor userBackgroundPriority.
+	process instVarAt: 7 put: self.
+	process resume.
+)
+) : (
+)
+protected class FarReference = ((* A far reference is one that crosses actor boundaries. *)) (
+'as yet unclassified'
+protected doesNotUnderstand: message <Message> = (
+	(* For the debugger/inspector. Questionable. *)
+	(* Should probably override public method of Object as well. *)
+	0 = message arguments size ifTrue: [(message selector startsWith: 'is') ifTrue: [^false]].
+
+	^Error signal: 'Cannot immediate-send to an eventual reference.'.
+)
+public isPromise ^<Boolean> = (
+	^false
+)
+) : (
+)
+protected class InternalFarReference to: t inActor: a = (|
+public target = t.
+public actor <Actor> = a.
+|) (
+) : (
+)
+protected class InternalFuture withResolver: r = (|
+	public resolution
+	public state ::= #unresolved.
+
+	public pendingMessages
+
+	public resolver = r.	
+	public promise = Promise withFuture: self.
+|internalFutures at: promise put: self) (
+) : (
+)
+protected class Promise withFuture: f = (|
+private future <Future> = f.
+|) (
+'as yet unclassified'
+protected doesNotUnderstand: message <Message> = (
+	(* For the debugger/inspector. Questionable. *)
+	(* Should probably override public method of Object as well. *)
+	0 = message arguments size ifTrue: [(message selector startsWith: 'is') ifTrue: [^false]].
+	
+	^Error signal: 'Cannot immediate-send to an eventual reference.'.
+)
+public isPromise ^<Boolean> = (
+	self flag: 'How transparent should promises be?'.
+	^true
+)
+public whenResolved: onValue <[:V | V2 def]> ^<Promise[V2, E]>= (
+	
+)
+public whenResolved: onValue <[:V | V2 def]> whenSmashed: onError <[:E | E2 def]> ^<Promise[V2, E2]> = (
+	
+)
+) : (
+)
+public class Resolver = (
+(*A Resolver represents the authority to resolve a Promise and is the control facet of the promise's eventual resolution.*)|
+	private future = InternalFuture withResolver: self.
+|) (
+'as yet unclassified'
+public isPromise ^<Boolean> = (
+	^false
+)
+public isResolver ^<Boolean> = (
+	^true
+)
+public promise ^<Promise[V, E]> = (
+	^future promise
+)
+public resolve: value <V> = (
+	halt
+)
+public smash: error <E> = (
+	halt
+)
+) : (
+)
+'as yet unclassified'
+public createActor: value <Value> name: debugName <String> ^<FarReference[Value]> = (
+	(isValueObject: value) ifFalse: [Error signal: 'Cannot create an actor from a non-Value.'].
+	^createFarReferenceTo: value in: (Actor named: debugName) startEventLoop.
+)
+private createFarReferenceTo: target in: targetActor = (
+	| internal external |
+	internal:: InternalFarReference to: target inActor: targetActor.
+	external:: FarReference new.
+	internalFarReferences at: external put: internal.
+	^external
+)
+private eventualSendTo: receiver selector: selector arguments: arguments ^<Promise> = (
+	| message |
+
+	(isPromise: receiver) ifTrue:
+		[^(internalFutures at: receiver) eventualSend: selector arguments: arguments].
+	
+	(isFarReference: receiver) ifTrue:
+		[ | internalFarRef = internalFarReferences at: receiver. |
+		message:: MessageToFarRef
+			receiver: internalFarRef target
+			selector: selector
+			arguments: (wrapArguments: arguments from: currentActor to: internalFarRef actor)
+			resolver: r.
+		internalFarRef actor postMessage: message.
+		^r promise].
+	
+	(* Otherwise, a near reference. *)
+	message:: MessageToNearRef
+		receiver: receiver
+		selector: selector
+		arguments: arguments
+		resolver: r.
+	currentActor postMessage: message.
+	^r promise
+)
+private isFarReference: object <Object> ^<Boolean> = (
+	^FarReference == (primitives classOf: object)
+)
+private isPromise: object <Object> ^<Boolean> = (
+	^Promise == (primitives classOf: object)
+)
+private isValueObject: object <Object> ^<Boolean> = (
+	nil == object ifTrue: [^true].
+	true == object ifTrue: [^true].
+	false == object ifTrue: [^true].
+	object isString ifTrue: [^true].
+	object isNumber ifTrue: [^true].
+	object isCharacter ifTrue: [^true].
+	^false
+)
+private wrapArgument: argument from: sourceActor to: targetActor = (
+	(* [argument] lives in [sourceActor], answer the corresponding proxy that lives in [targetActor] *)
+
+	(isFarReference: argument) ifTrue:
+		[ | internalFarRef = internalFarReferences at: argument. |
+		^internalFarRef actor == targetActor
+			ifTrue: [internalFarRef target (* Unwrap far ref to object in target's heap: far ref becomes near ref. *)]
+			ifFalse: [argument (* Pass along far ref to objects in other actors as-is (Granovetter introduction). *)]].
+		
+	(isPromise: argument) ifTrue:
+		[halt. (* Hm. *)].
+	
+	(* Near ref *)
+	^(isValueObject: argument)
+		ifTrue: [argument]
+		ifFalse: [createFarReferenceTo: argument in: sourceActor].
+)
+private wrapArguments: arguments from: sourceActor to: targetActor = (
+	^arguments collect: [:argument | wrapArgument: argument from: sourceActor to: targetActor].
+)
+) : (
+)

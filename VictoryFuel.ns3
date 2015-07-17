@@ -28,8 +28,6 @@ NOF Des     279.4ms +- 4.95%      900.3ms +- 0.90%     882.2ms +- 0.88%
 NOF/VF                6.15                        8.28                          8.11
 
 TODO:
-- Handle Floats specially so they are portable between 32 and 64 bit images.
-- Handle Integers up to 64 bits specially for portability.
 - Use mirror primitives to allocate/trace/fill compiled methods.
 - Write an identity map in Newspeak that uses mirror primitives for == and identityHash.
 - The size of a WeakSet can change between analysis and writing edges to do a major GC, introducing an unanalyzed integer. How does Fuel deal with this?
@@ -40,17 +38,29 @@ Unless required by applicable law or agreed to in writing, software distributed 
 	private List = p squeak OrderedCollection.
 	private IdentityMap = p squeak IdentityDictionary.
 	private CompiledMethod = p squeak CompiledMethod. (* Replace with mirror primitive for allocation. *)
-	private WideString = p squeak WideString.
+
+	(* Classes which require special handling because they have immediate instances, may switch representation between 32- and 64-bit images, or must be canonicalized. *)
+	private SmallInteger = p squeak SmallInteger.
+	private LargePositiveInteger = p squeak LargePositiveInteger.
+	private LargeNegativeInteger = p squeak LargeNegativeInteger.
+	private Character = p squeak Character.
+	private ImmediateFloat = p squeak Smalltalk at: #SmallFloat64 ifAbsent: [nil].
+	private BoxedFloat = p squeak Smalltalk at: #BoxedFloat64 ifAbsent: [p squeak Float].
+	private ByteSymbol = p squeak ByteSymbol.
 	private WideSymbol = p squeak WideSymbol.
+	
+	private WideString = p squeak WideString. (* To deserialize WideSymbols. *)
+
 	private processorAssociation = p squeak Smalltalk associationAt: #Processor.
 	private vmmirror = vm.
 	
-	private SmiPsuedoFormat = -1.
-	private CharPsuedoFormat = -2.
-	private SymbolPsuedoFormat = -3.
-	private WideSymbolPsuedoFormat = -4.
-	private GlobalsPsuedoFormat = -5.
-	private Version = 2.
+	private IntegerPsuedoFormat = -1.
+	private FloatPsuedoFormat = -2.
+	private CharPsuedoFormat = -3.
+	private SymbolPsuedoFormat = -4.
+	private WideSymbolPsuedoFormat = -5.
+	private GlobalsPsuedoFormat = -6.
+	private Version = 3.
 |) (
 public class Deserializer over: stream_ <ReadStream> withGlobals: globals_ <Map[Symbol, Object]> = (|
 stream <ReadStream> = stream_.
@@ -174,6 +184,26 @@ public readNodes = (
 )
 ) : (
 )
+class FloatCluster = () (
+'as yet unclassified'
+public adoptInstances = (
+)
+public doRehash = (
+)
+public readEdges = (
+)
+public readNodes = (
+	| numInstances |
+	numInstances:: stream uint16.
+	numInstances timesRepeat:
+		[ | object = BoxedFloat new. |
+		(* Big-endian. Sub-optimial, but we don't currently have the right primitives to use little-endian encoding. *)
+		object basicAt: 1 put: stream uint32.
+		object basicAt: 2 put: stream uint32.
+		registerBackRef: object (* normalize *)].
+)
+) : (
+)
 class GlobalsCluster = () (
 'as yet unclassified'
 public adoptInstances = (
@@ -195,7 +225,7 @@ public readNodes = (
 )
 ) : (
 )
-class SmallIntegerCluster = () (
+class IntegerCluster = () (
 'as yet unclassified'
 public adoptInstances = (
 )
@@ -204,10 +234,20 @@ public doRehash = (
 public readEdges = (
 )
 public readNodes = (
-	| numInstances |
-	numInstances:: stream uint16.
-	numInstances timesRepeat:
+	| numSmall numLargePositive numLargeNegative |
+	numSmall:: stream uint16.
+	numLargePositive:: stream uint16.
+	numLargeNegative:: stream uint16.
+	numSmall timesRepeat:
 		[registerBackRef: stream int32].
+	numLargePositive timesRepeat:
+		[ | digits = stream uint16. object = LargePositiveInteger new: digits. |
+		1 to: digits do: [:index | object digitAt: index put: stream next].
+		registerBackRef: object normalize].
+	numLargeNegative timesRepeat:
+		[ | digits = stream uint16. object = LargeNegativeInteger new: digits. |
+		1 to: digits do: [:index | object digitAt: index put: stream next].
+		registerBackRef: object normalize].
 )
 ) : (
 )
@@ -403,7 +443,8 @@ readBackRef = (
 readCluster = (
 	| format = readFormat. instSpec |
 	
-	format == SmiPsuedoFormat ifTrue: [^SmallIntegerCluster new].
+	format == IntegerPsuedoFormat ifTrue: [^IntegerCluster new].
+	format == FloatPsuedoFormat ifTrue: [^FloatCluster new].
 	format == CharPsuedoFormat ifTrue: [^CharacterCluster new].
 	format == SymbolPsuedoFormat ifTrue: [^SymbolCluster new].
 	format == WideSymbolPsuedoFormat ifTrue: [^WideSymbolCluster new].
@@ -438,9 +479,9 @@ stack = List new: 32.
 backRefs = IdentityMap new: 4096.
 nextBackRef
 reverseGlobals = IdentityMap new.
-|globals_ keysAndValuesDo: [:k :v | reverseGlobals at: v put: k]) (
-class CharacterCluster for: cls = (|
-klass = cls.
+|createPsuedoClassClusters.
+	globals_ keysAndValuesDo: [:k :v | reverseGlobals at: v put: k]) (
+class CharacterCluster = (|
 objects = List new.
 |) (
 'as yet unclassified'
@@ -524,6 +565,26 @@ public writeNodes = (
 )
 ) : (
 )
+class FloatCluster = (|
+objects = List new.
+|) (
+'as yet unclassified'
+public analyze: object <Integer> = (
+	objects add: object.
+)
+public writeEdges = (
+)
+public writeNodes = (
+	writeFormat: FloatPsuedoFormat.
+	stream uint16: objects size.
+	objects do: [:object |
+		registerBackRef: object.
+		(* Big-endian. Sub-optimial, but we don't currently have the right primitives to use little-endian encoding. *)
+		stream uint32: (object basicAt: 1).
+		stream uint32: (object basicAt: 2)].
+)
+) : (
+)
 class GlobalsCluster new = (|
 	klass
 	objects = List new.
@@ -548,27 +609,45 @@ public writeNodes = (
 )
 ) : (
 )
-class SmallIntegerCluster for: cls = (|
-klass = cls.
-objects = List new.
+class IntegerCluster = (|
+small = List new.
+largePositive = List new.
+largeNegative = List new.
 |) (
 'as yet unclassified'
-public analyze: object <SmallInteger> = (
-	objects add: object.
+public analyze: object <SmallInteger | LargePositiveInteger | LargeNegativeInteger> = (
+	(* Bucket into signed 31-bit, larger positive and larger negative integers. *)
+	object <= 1073741823 (* 1 << 30 - 1*)
+		ifTrue:
+			[object >= -1073741824 (* -1 << 30 *)
+				ifTrue: [small add: object]
+				ifFalse: [largeNegative add: object]]
+		ifFalse:
+			[largePositive add: object].
 )
 public writeEdges = (
 )
 public writeNodes = (
-	writeFormat: SmiPsuedoFormat.
-	stream uint16: objects size.
-	objects do: [:object |
+	writeFormat: IntegerPsuedoFormat.
+	stream uint16: small size.
+	stream uint16: largePositive size.
+	stream uint16: largeNegative size.
+	
+	small do: [:object |
 		registerBackRef: object.
 		stream int32: object].
+	largePositive do: [:object |
+		registerBackRef: object.
+		stream uint16: object digitLength.
+		1 to: object digitLength do: [:index | stream nextPut: (object digitAt: index)]].
+	largeNegative do: [:object |
+		registerBackRef: object.
+		stream uint16: object digitLength.
+		1 to: object digitLength do: [:index | stream nextPut: (object digitAt: index)]].
 )
 ) : (
 )
-class SymbolCluster for: cls = (|
-klass = cls.
+class SymbolCluster = (|
 objects = List new.
 |) (
 'as yet unclassified'
@@ -714,8 +793,7 @@ public writeNodes = (
 )
 ) : (
 )
-class WideSymbolCluster for: cls = (|
-klass = cls.
+class WideSymbolCluster = (|
 objects = List new.
 |) (
 'as yet unclassified'
@@ -745,19 +823,31 @@ clusterFor: object = (
 clusterForClass: klass = (
 	^clusters at: klass ifAbsentPut: [newClusterForClass: klass].
 )
+createPsuedoClassClusters = (
+	| intCluster floatCluster |
+	
+	intCluster:: IntegerCluster new.
+	clusters at: SmallInteger put: intCluster.
+	clusters at: LargePositiveInteger put: intCluster.
+	clusters at: LargeNegativeInteger put: intCluster.
+	
+	floatCluster:: FloatCluster new.
+	clusters at: BoxedFloat put: floatCluster.
+	clusters at: ImmediateFloat put: floatCluster.
+	
+	clusters at: Character put: CharacterCluster new.
+	
+	clusters at: ByteSymbol put: SymbolCluster new.
+	clusters at: WideSymbol put: WideSymbolCluster new.
+	
+	clusters at: nil put: GlobalsCluster new. (* Do this last to override any nil entry from, e.g. missing ImmediateFloat. *)
+)
 enqueue: object = (
 	backRefs at: object ifAbsentPut: [stack add: object. 0].
 )
 newClusterForClass: klass = (
 	| instSpec |
-	nil == klass ifTrue: [^GlobalsCluster new].
-	
 	enqueue: klass.
-
-	0 class == klass ifTrue: [^SmallIntegerCluster for: klass].
-	$a class == klass ifTrue: [^CharacterCluster for: klass].
-	#hi class == klass ifTrue: [^SymbolCluster for: klass].
-	WideSymbol == klass ifTrue: [^WideSymbolCluster for: klass].
 
 	instSpec:: klass instSpec.
 	instSpec <= 1 ifTrue: [^FixedPointersCluster for: klass].

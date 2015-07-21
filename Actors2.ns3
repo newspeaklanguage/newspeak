@@ -3,22 +3,34 @@ Newspeak3
 class Actors2 usingPlatform: p vm: vm = (|
 private SharedQueue2 = p squeak SharedQueue2.
 private WeakMap = p squeak WeakKeyDictionary.
+private List = p collections OrderedCollection.
 
 private Processor <ProcessScheduler> = p squeak Processor.
+private uiProcess <Process> = p squeak Project uiProcess.
 private primitives <VMMirror> = vm.
+
+private brazil = p brazil.
+public (* bogus - temporary access to a default actor *) uiActor = UIActor new.
 
 private internalFarReferences <WeakMap[FarReference, InternalReferenceBacking]> = WeakMap new.
 private internalFutures <WeakMap[Promise, InternalFuture]> = WeakMap new.
-|) (
+
+private debugOwnership <WeakMap[Promise | Resolver, Actor]> = WeakMap new.
+|uiProcess actor: uiActor.
+p actors2: self) (
 protected class Actor named: n = (|
 	public name <String> = n.
 	public process <Process>
-	public messageQueue <SharedQueue> = SharedQueue2 new.
-|) (
+	messageQueue <SharedQueue> = SharedQueue2 new.
+|halt) (
 'as yet unclassified'
-public doOneTurn = (
+doOneTurn = (
 	| message = messageQueue next. |
-	message dispatch.
+	message deliver.
+)
+public enqueueMessage: actorMessage = (
+	actorMessage postedTo: self.
+	messageQueue nextPut: actorMessage
 )
 public printOn: stream = (
 	stream nextPutAll: 'Actor('; nextPutAll: name; nextPutAll: ')'.
@@ -29,6 +41,35 @@ public startEventLoop = (
 	process priority: Processor userBackgroundPriority.
 	process instVarAt: 7 put: self.
 	process resume.
+)
+) : (
+)
+class BufferedEventualSend = (|
+public selector
+public arguments
+public sourceFuture <InternalFuture>
+public targetFuture <InternalFuture>
+|) (
+'as yet unclassified'
+public enqueue = (
+	| msg |
+	sourceFuture state == #forwarded ifTrue: [halt].
+	
+	sourceFuture state == #resolved
+		ifTrue:
+			[msg:: NearEventualSend new.
+			msg nearReceiver: sourceFuture resolution.
+			msg selector: selector.
+			msg nearArguments: arguments.
+			msg targetFuture: targetFuture]
+		ifFalse: 
+			[ (* contagion *)
+			msg:: NearEventualReturn new.
+			msg targetFuture: targetFuture.
+			msg type: #smashed.
+			msg resolution: sourceFuture resolution].
+	
+	currentActor  (* BOGUS: targetFuture actor *) enqueueMessage: msg.
 )
 ) : (
 )
@@ -52,20 +93,132 @@ public actor <Actor> = a.
 |) (
 ) : (
 )
-protected class InternalFuture withResolver: r = (|
+protected class InternalFuture = (|
 	public resolution
-	public state ::= #unresolved.
-
-	public pendingMessages
-
-	public resolver = r.	
-	public promise = Promise withFuture: self.
-|internalFutures at: promise put: self) (
+	public state ::= #unresolved. (* unresolved, forwarded, resolved, smashed *)
+	protected pendingMessages (* use linked list for randomizing scheduler? *)
+|) (
+'as yet unclassified'
+public addPendingMessage: msg = (
+	msg sourceFuture: self.
+	
+	state == #resolved ifTrue:
+		[^msg enqueue].
+	state == #smashed ifTrue:
+		[^msg enqueue].
+	state == #forwarded ifTrue: 
+		[^resolution addPendingMessage: msg].
+	state == #unresolved ifTrue:
+		[nil == pendingMessages ifTrue: [pendingMessages:: List new].
+		pendingMessages add: msg.
+		^self].
+	
+	halt.
+)
+public compressResolution = (
+	state == #unresolved ifTrue: [^self].
+	state == #forwarded ifTrue: [^resolution compressResolution].
+	state == #resolved ifTrue: [^self].
+	state == #smashed ifTrue: [^self].
+	halt.
+)
+public doNearResolve: r type: type = (
+	assert: [state == #unresolved] message: 'State error'.
+	
+	(isPromise: r) ifTrue:
+		[ | furtherFuture = (internalFutures at: r) compressResolution. |
+		(* BOGUS - check actor of furtherFuture *)
+		state:: #forwarded.
+		nil == pendingMessages ifFalse:
+			[pendingMessages do: [:msg | furtherFuture addPendingMessage: msg].
+			pendingMessages:: nil].
+		resolution:: furtherFuture.
+		^self].
+	
+	resolution: r.
+	state: type.
+	
+	nil == pendingMessages ifFalse:
+		[pendingMessages do: [:msg | msg enqueue].
+		pendingMessages:: nil].
+)
+public eventualSend: selector arguments: arguments ^<Promise> = (
+	| buffered = BufferedEventualSend new. |
+	buffered selector: selector.
+	buffered arguments: arguments.
+	buffered targetFuture: InternalFuture new.
+	self addPendingMessage: buffered.
+	^Promise withFuture: buffered targetFuture
+)
+public whenResolved: onValue <[:V | V2 def]> whenSmashed: onError <[:E | E2 def]> ^<Promise[V2, E2]> = (
+	| when = WhenMessage new. |
+	when onValue: onValue.
+	when onError: onError.
+	when targetFuture: InternalFuture new.
+	self addPendingMessage: when.
+	^Promise withFuture: when targetFuture
+)
+) : (
+)
+class NearEventualReturn = (|
+public targetFuture <InternalFuture>
+public type
+public resolution
+|) (
+'as yet unclassified'
+public deliver = (
+	targetFuture doNearResolve: resolution type: type
+)
+public postedTo: actor = (
+	check: resolution allowedIn: actor.
+	
+	(* ('NearEventualReturn ', type, ' ', resolution printString) out. *)
+)
+public printOn: stm = (
+	stm nextPutAll: 'Return '; nextPutAll: type.
+	resolution printOn: stm.
+)
+) : (
+)
+class NearEventualSend = (|
+public nearReceiver
+public selector
+public nearArguments
+public targetFuture
+|) (
+'as yet unclassified'
+public deliver = (
+	assert: [nil ~= targetFuture] message: ['Missing target'].
+	
+	[
+		| value msg |
+		(* BOGUS: Don't rely on perform not being overridden. *)
+		value:: nearReceiver perform: selector withArguments: nearArguments.
+		msg:: NearEventualReturn new.
+		msg targetFuture: targetFuture.
+		msg type: #resolved.
+		msg resolution: value.
+		currentActor enqueueMessage: msg.
+	] on: Error (* BOGUS: Exception? *) do: [:error |
+		| msg |
+		msg:: NearEventualReturn new.
+		msg targetFuture: targetFuture.
+		msg type: #smashed.
+		msg resolution: error.
+		currentActor enqueueMessage: msg.
+	].
+)
+public postedTo: actor = (
+	check: nearReceiver allowedIn: actor.
+	nearArguments do: [:arg | check: arg allowedIn: actor].
+	
+	(* ('NearEventualSend ', nearReceiver printString, ' #', selector, ' ', nearArguments printString) out. *)
+)
 ) : (
 )
 protected class Promise withFuture: f = (|
-private future <Future> = f.
-|) (
+	private internalFuture <InternalFuture> = f.
+|internalFutures at: self put: f) (
 'as yet unclassified'
 protected doesNotUnderstand: message <Message> = (
 	(* For the debugger/inspector. Questionable. *)
@@ -79,16 +232,17 @@ public isPromise ^<Boolean> = (
 	^true
 )
 public whenResolved: onValue <[:V | V2 def]> ^<Promise[V2, E]>= (
-	
+	^internalFuture whenResolved: onValue whenSmashed: [:e | e signal]
 )
 public whenResolved: onValue <[:V | V2 def]> whenSmashed: onError <[:E | E2 def]> ^<Promise[V2, E2]> = (
-	
+	^internalFuture whenResolved: onValue whenSmashed: onError
 )
 ) : (
 )
 public class Resolver = (
 (*A Resolver represents the authority to resolve a Promise and is the control facet of the promise's eventual resolution.*)|
-	private future = InternalFuture withResolver: self.
+	private internalFuture = InternalFuture new.
+	public promise <Promise[V, E]> = Promise withFuture: internalFuture.
 |) (
 'as yet unclassified'
 public isPromise ^<Boolean> = (
@@ -97,18 +251,98 @@ public isPromise ^<Boolean> = (
 public isResolver ^<Boolean> = (
 	^true
 )
-public promise ^<Promise[V, E]> = (
-	^future promise
-)
 public resolve: value <V> = (
-	halt
+	| msg |
+	msg:: NearEventualReturn new.
+	msg targetFuture: internalFuture.
+	msg type: #resolved.
+	msg resolution: value.
+	currentActor enqueueMessage: msg.
 )
 public smash: error <E> = (
-	halt
+	| msg |
+	msg:: NearEventualReturn new.
+	msg targetFuture: internalFuture.
+	msg type: #smashed.
+	msg resolution: error.
+	currentActor enqueueMessage: msg.
+)
+) : (
+)
+protected class UIActor = () (
+'as yet unclassified'
+public currentActor = (
+	(* BOGUS. Polymorphic with other actor system. *)
+	^self
+)
+public enqueueMessage: actorMessage = (
+	actorMessage postedTo: self.
+	
+	(* bogus - should drain an explicit queue to allow for a randomizing scheduler *)
+	brazil theDesktop scheduleUIAction: [actorMessage deliver].
+)
+public eventualSendTo: receiver selector: selector arguments: arguments ^<Promise> = (
+	(* Send from translation of <-: *)
+
+	| message |
+
+	(isPromise: receiver) ifTrue:
+		[^(internalFutures at: receiver ifAbsent: [halt]) eventualSend: selector arguments: arguments].
+	
+	(isFarReference: receiver) ifTrue:
+		[ | internalFarRef = internalFarReferences at: receiver. |
+		halt. (* Unimplemented. *)
+		message:: MessageToFarRef
+			receiver: internalFarRef target
+			selector: selector
+			arguments: (wrapArguments: arguments from: self to: internalFarRef actor)
+			resolver: r.
+		internalFarRef actor enqueueMessage: message.
+		^r promise].
+	
+	(* Otherwise, a near reference. *)
+	message:: NearEventualSend new.
+	message nearReceiver: receiver.
+	message selector: selector.
+	message nearArguments: arguments.
+	message targetFuture: InternalFuture new.
+	enqueueMessage: message.
+	^Promise withFuture: message targetFuture
+)
+) : (
+)
+class WhenMessage = (|
+public onValue <[:V] | []>
+public onError <[:E] | []>
+public sourceFuture <InternalFuture[V, E]>
+public targetFuture <InternalFuture>
+|) (
+'as yet unclassified'
+public enqueue = (
+	| msg |
+	msg:: NearEventualSend new.
+	sourceFuture state == #forwarded ifTrue: [halt].
+	sourceFuture state == #unresolved ifTrue: [halt].
+	msg nearReceiver: (sourceFuture state == #resolved ifTrue: [onValue] ifFalse: [onError]).
+	msg selector: #cull:.
+	msg nearArguments: {sourceFuture resolution}.
+	msg targetFuture: targetFuture.
+	
+	currentActor  (* BOGUS: targetFuture actor *) enqueueMessage: msg.
 )
 ) : (
 )
 'as yet unclassified'
+private check: object allowedIn: actor = (
+	assert: [nil ~= actor] message: 'Invalid actor'.
+	
+	(* (isPromise: object) |
+	(isFarReference: object) ifTrue:
+		[ | owner = debugOwnership at: object ifAbsent: [halt]. |
+		assert: [owner = actor] message: 'Wrong actor']. *)
+
+	(* Otherwise near reference *)
+)
 public createActor: value <Value> name: debugName <String> ^<FarReference[Value]> = (
 	(isValueObject: value) ifFalse: [Error signal: 'Cannot create an actor from a non-Value.'].
 	^createFarReferenceTo: value in: (Actor named: debugName) startEventLoop.
@@ -120,30 +354,8 @@ private createFarReferenceTo: target in: targetActor = (
 	internalFarReferences at: external put: internal.
 	^external
 )
-private eventualSendTo: receiver selector: selector arguments: arguments ^<Promise> = (
-	| message |
-
-	(isPromise: receiver) ifTrue:
-		[^(internalFutures at: receiver) eventualSend: selector arguments: arguments].
-	
-	(isFarReference: receiver) ifTrue:
-		[ | internalFarRef = internalFarReferences at: receiver. |
-		message:: MessageToFarRef
-			receiver: internalFarRef target
-			selector: selector
-			arguments: (wrapArguments: arguments from: currentActor to: internalFarRef actor)
-			resolver: r.
-		internalFarRef actor postMessage: message.
-		^r promise].
-	
-	(* Otherwise, a near reference. *)
-	message:: MessageToNearRef
-		receiver: receiver
-		selector: selector
-		arguments: arguments
-		resolver: r.
-	currentActor postMessage: message.
-	^r promise
+private currentActor = (
+	^Processor activeProcess actor ifNil: [uiActor].
 )
 private isFarReference: object <Object> ^<Boolean> = (
 	^FarReference == (primitives classOf: object)
@@ -165,12 +377,13 @@ private wrapArgument: argument from: sourceActor to: targetActor = (
 
 	(isFarReference: argument) ifTrue:
 		[ | internalFarRef = internalFarReferences at: argument. |
+		halt. (* Unimplemented. *)
 		^internalFarRef actor == targetActor
 			ifTrue: [internalFarRef target (* Unwrap far ref to object in target's heap: far ref becomes near ref. *)]
 			ifFalse: [argument (* Pass along far ref to objects in other actors as-is (Granovetter introduction). *)]].
 		
 	(isPromise: argument) ifTrue:
-		[halt. (* Hm. *)].
+		[halt. (* Unimplemented. *)].
 	
 	(* Near ref *)
 	^(isValueObject: argument)

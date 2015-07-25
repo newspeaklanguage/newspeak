@@ -1,6 +1,6 @@
 Newspeak3
 'Actors'
- class Actors2 usingPlatform: p vm: vm =  (|
+class Actors2 usingPlatform: p vm: vm = (|
 private SharedQueue2 = p squeak SharedQueue2.
 private WeakMap = p squeak WeakKeyDictionary.
 private List = p collections OrderedCollection.
@@ -58,6 +58,18 @@ protected arguments <Array> = a.
 protected resolver <InternalResolver> = r.
 |) (
 'as yet unclassified'
+public reactBroken: error = (
+	(* Broken promise contagion. *)	
+	resolver __owner == currentActor ifFalse: [halt].
+	(* Should this be immediate? *)
+	(* resolver internalBreak: error. ? *)
+	currentActor enqueueMessage:
+		(PendingDelivery
+			receiver: resolver
+			selector: #internalBreak:
+			arguments: {error}
+			resolver: nil)
+)
 public reactResolved: value = (
 	resolver __owner == currentActor ifFalse: [halt].
 	currentActor
@@ -65,19 +77,6 @@ public reactResolved: value = (
 		selector: selector
 		arguments: arguments
 		resolver: resolver. 
-)
-public reactSmashed: error = (
-	(* Broken promise contagion. *)	
-	(* Should this be immediate? *)
-	| msg |
-	msg:: PendingDelivery
-		receiver: resolver
-		selector: #internalSmash:
-		arguments: {error}
-		resolver: nil.
-		
-	resolver __owner == currentActor ifFalse: [halt].
-	currentActor enqueueMessage: msg
 )
 ) : (
 )
@@ -95,7 +94,7 @@ public isPromise ^<Boolean> = (
 )
 ) : (
 )
-protected class InternalFarReference to: t inActor: a =  (|
+protected class InternalFarReference to: t inActor: a = (|
 public target = t.
 public actor <Actor> = a.
 |) (
@@ -140,8 +139,8 @@ protected class InternalResolver __owner: o = (|
 public addReactor: msg = (	
 	state == #resolved ifTrue:
 		[^msg reactResolved: resolution].
-	state == #smashed ifTrue:
-		[^msg reactSmashed: resolution].
+	state == #broken ifTrue:
+		[^msg reactBroken: resolution].
 	state == #forwarded ifTrue: 
 		[resolution:: resolution shortenResolution.
 		^resolution addReactor: msg].
@@ -162,6 +161,16 @@ public eventualSend: selector arguments: arguments resolver: resolver ^<Promise>
 	__owner == currentActor ifFalse: [halt].	
 	self addReactor: (EventualSendReactor selector: selector arguments: arguments resolver: resolver).
 )
+public internalBreak: error = (
+	assert: [state == #unresolved] message: 'State error'.
+
+	resolution:: error.
+	state:: #broken.
+	
+	nil == reactors ifFalse:
+		[reactors do: [:msg | msg reactBroken: error].
+		reactors:: nil].
+)
 public internalResolve: value = (
 	assert: [state == #unresolved] message: 'State error'.
 
@@ -174,16 +183,6 @@ public internalResolve: value = (
 		[reactors do: [:msg | msg reactResolved: value].
 		reactors:: nil].
 )
-public internalSmash: error = (
-	assert: [state == #unresolved] message: 'State error'.
-
-	resolution:: error.
-	state:: #smashed.
-	
-	nil == reactors ifFalse:
-		[reactors do: [:msg | msg reactSmashed: error].
-		reactors:: nil].
-)
 public printOn: stream = (
 	stream nextPutAll: 'InternalResolver#'.
 	identityHash printOn: stream.
@@ -192,10 +191,10 @@ public shortenResolution = (
 	state == #unresolved ifTrue: [^self].
 	state == #forwarded ifTrue: [^resolution shortenResolution].
 	state == #resolved ifTrue: [^self].
-	state == #smashed ifTrue: [^self].
+	state == #broken ifTrue: [^self].
 	halt.
 )
-public whenResolved: onValue <[:V | V2 def]> whenSmashed: onError <[:E | E2 def]> ^<Promise[V2, E2]> = (
+public whenResolved: onValue <[:V | V2 def]> whenBroken: onError <[:E | E2 def]> ^<Promise[V2, E2]> = (
 	| resolver = InternalResolver __owner: __owner. |
 	__owner == currentActor ifFalse: [halt].
 	self addReactor: (WhenReactor onValue: onValue onError: onError resolver: resolver).
@@ -224,14 +223,14 @@ public deliverIn: fastCurrentActor = (
 		on: Error (* BOGUS: Exception? *) 
 		do: [:error | 
 			resolution:: error.
-			type:: #internalSmash:].
+			type:: #internalBreak:].
 
 	(* Transcript show: {resolver. type. resolution}; cr. *)
 
 	nil == resolver ifTrue: [^self].
 	type == #internalResolve:
 		ifTrue: [resolver internalResolve: resolution]
-		ifFalse: [resolver internalSmash: resolution].
+		ifFalse: [resolver internalBreak: resolution].
 )
 public postedTo: actor = (
 	(isFarReference: receiver) ifTrue: [halt].
@@ -301,10 +300,10 @@ public isPromise ^<Boolean> = (
 public whenResolved: onValue <[:V | V2 def]> ^<Promise[V2, E]>= (
 	^internalResolver
 		whenResolved: onValue
-		whenSmashed: [:e | e signal] (* Should we make this the behavior of a nil catch-clause instead? *)
+		whenBroken: [:e | e signal] (* Should we make this the behavior of a nil catch-clause instead? *)
 )
-public whenResolved: onValue <[:V | V2 def]> whenSmashed: onError <[:E | E2 def]> ^<Promise[V2, E2]> = (
-	^internalResolver whenResolved: onValue whenSmashed: onError
+public whenResolved: onValue <[:V | V2 def]> whenBroken: onError <[:E | E2 def]> ^<Promise[V2, E2]> = (
+	^internalResolver whenResolved: onValue whenBroken: onError
 )
 ) : (
 )
@@ -315,22 +314,22 @@ protected destinationActor <Actor> = d.
 protected resolver <InternalResolver>  = r.
 |) (
 'as yet unclassified'
+public reactBroken: r = (
+	| msg |
+	currentActor == sourceActor ifFalse: [halt].
+	msg:: PendingDelivery
+		receiver: resolver
+		selector: #internalBreak:
+		arguments: {wrapArgument: r from: sourceActor to: destinationActor}
+		resolver: nil.
+	destinationActor enqueueMessage: msg.
+)
 public reactResolved: r = (
 	| msg |
 	currentActor == sourceActor ifFalse: [halt].
 	msg:: PendingDelivery
 		receiver: resolver
 		selector: #internalResolve:
-		arguments: {wrapArgument: r from: sourceActor to: destinationActor}
-		resolver: nil.
-	destinationActor enqueueMessage: msg.
-)
-public reactSmashed: r = (
-	| msg |
-	currentActor == sourceActor ifFalse: [halt].
-	msg:: PendingDelivery
-		receiver: resolver
-		selector: #internalSmash:
 		arguments: {wrapArgument: r from: sourceActor to: destinationActor}
 		resolver: nil.
 	destinationActor enqueueMessage: msg.
@@ -343,6 +342,13 @@ public class Resolver = (
 	public promise <Promise[V, E]> = Promise withFuture: internalResolver __owner: currentActor.
 |) (
 'as yet unclassified'
+public break: error <E> = (
+	| msg |
+	internalResolver __owner == currentActor ifFalse: [halt].
+	#unresolved == internalResolver state 
+		ifTrue: [internalResolver internalBreak: error]
+		ifFalse: [Error signal: 'Already resolved'].
+)
 public isPromise ^<Boolean> = (
 	^false
 )
@@ -354,13 +360,6 @@ public resolve: value <V> = (
 	internalResolver __owner == currentActor ifFalse: [halt].
 	#unresolved == internalResolver state 
 		ifTrue: [internalResolver internalResolve: value]
-		ifFalse: [Error signal: 'Already resolved'].
-)
-public smash: error <E> = (
-	| msg |
-	internalResolver __owner == currentActor ifFalse: [halt].
-	#unresolved == internalResolver state 
-		ifTrue: [internalResolver internalSmash: error]
 		ifFalse: [Error signal: 'Already resolved'].
 )
 ) : (
@@ -447,20 +446,20 @@ Note that all slots contain objects that belong to the actor which sent #whenRes
 	protected resolver <InternalResolver> = r.
 |) (
 'as yet unclassified'
+public reactBroken: value = (
+	resolver __owner == currentActor ifFalse: [halt].
+	currentActor enqueueMessage:
+		(PendingDelivery 
+			receiver: onError
+			selector: #cull:
+			arguments: {value}
+			resolver: resolver).
+)
 public reactResolved: value = (
 	resolver __owner == currentActor ifFalse: [halt].
 	currentActor enqueueMessage:
 		(PendingDelivery 
 			receiver: onValue
-			selector: #cull:
-			arguments: {value}
-			resolver: resolver).
-)
-public reactSmashed: value = (
-	resolver __owner == currentActor ifFalse: [halt].
-	currentActor enqueueMessage:
-		(PendingDelivery 
-			receiver: onError
 			selector: #cull:
 			arguments: {value}
 			resolver: resolver).

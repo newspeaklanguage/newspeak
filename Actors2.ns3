@@ -50,7 +50,7 @@ public eventualSendTo: receiver selector: selector arguments: arguments resolver
 ) : (
 )
 protected class EventualSendReactor selector: s arguments: a resolver: r = (
-(* An eventual-send to a promise. 
+(* An eventual-send to a promise.
 
 Note that all slots contain objects that belong to the actor which performed the eventual send. *)|
 protected selector <Symbol> = s.
@@ -130,8 +130,8 @@ public farEventualSend: selector arguments: arguments from: sourceActor resolver
 )
 protected class InternalResolver __owner: o = (|
 	public __owner <Actor> = o. (* For assertions only. *)
-	protected resolution
-	protected state ::= #unresolved. (* unresolved, forwarded, resolved, smashed *)
+	public resolution
+	public state ::= #unresolved. (* unresolved, forwarded, resolved, smashed *)
 	protected reactors <List[WhenReactor | EventualSendReactor | RedirectingReactor]> (* use linked list for randomizing scheduler? *)
 |) (
 'as yet unclassified'
@@ -226,13 +226,10 @@ public deliverIn: fastCurrentActor = (
 
 	(* Transcript show: {resolver. type. resolution}; cr. *)
 
-	nil == resolver ifFalse:
-		[msg:: PendingDelivery
-			receiver: resolver
-			selector: type
-			arguments: {resolution}
-			resolver: nil.
-		fastCurrentActor enqueueMessage: msg].
+	nil == resolver ifTrue: [^self].
+	type == #internalResolve:
+		ifTrue: [resolver internalResolve: resolution]
+		ifFalse: [resolver internalSmash: resolution].
 )
 public postedTo: actor = (
 	(isFarReference: receiver) ifTrue: [halt].
@@ -280,15 +277,18 @@ public startEventLoop = (
 )
 ) : (
 )
-protected class Promise withFuture: f __owner: o = (|
-	private internalFuture <InternalFuture> = f.
+protected class Promise withFuture: r __owner: o = (|
+	private internalResolver <InternalResolver> = r.
 	public __owner <Actor> = o.  (* For assertions only. *)
-|internalResolvers at: self put: f) (
+|internalResolvers at: self put: r) (
 'as yet unclassified'
 protected doesNotUnderstand: message <Message> = (
 	(* For the debugger/inspector. Questionable. *)
 	(* Should probably override public method of Object as well. *)
 	0 = message arguments size ifTrue: [(message selector startsWith: 'is') ifTrue: [^false]].
+	
+	internalResolver state == #resolved ifTrue:
+		[^message sendTo: internalResolver resolution].
 	
 	^Error signal: 'Cannot immediate-send to an eventual reference: ', message selector.
 )
@@ -297,12 +297,12 @@ public isPromise ^<Boolean> = (
 	^true
 )
 public whenResolved: onValue <[:V | V2 def]> ^<Promise[V2, E]>= (
-	^internalFuture
+	^internalResolver
 		whenResolved: onValue
 		whenSmashed: [:e | e signal] (* Should we make this the behavior of a nil catch-clause instead? *)
 )
 public whenResolved: onValue <[:V | V2 def]> whenSmashed: onError <[:E | E2 def]> ^<Promise[V2, E2]> = (
-	^internalFuture whenResolved: onValue whenSmashed: onError
+	^internalResolver whenResolved: onValue whenSmashed: onError
 )
 ) : (
 )
@@ -337,8 +337,8 @@ public reactSmashed: r = (
 )
 public class Resolver = (
 (*A Resolver represents the authority to resolve a Promise and is the control facet of the promise's eventual resolution.*)|
-	private internalFuture = InternalResolver __owner: currentActor.
-	public promise <Promise[V, E]> = Promise withFuture: internalFuture __owner: currentActor.
+	private (* N.B. We must not leak access to an InternalResolver via subobjects. *) internalResolver = InternalResolver __owner: currentActor.
+	public promise <Promise[V, E]> = Promise withFuture: internalResolver __owner: currentActor.
 |) (
 'as yet unclassified'
 public isPromise ^<Boolean> = (
@@ -349,27 +349,17 @@ public isResolver ^<Boolean> = (
 )
 public resolve: value <V> = (
 	| msg |
-	internalFuture __owner == currentActor ifFalse: [halt].
-	
-	(* Should this be immediate? *)
-	msg:: PendingDelivery 
-		receiver: internalFuture
-		selector: #internalResolve:
-		arguments: {value}
-		resolver: nil.
-	currentActor enqueueMessage: msg
+	internalResolver __owner == currentActor ifFalse: [halt].
+	#unresolved == internalResolver state 
+		ifTrue: [internalResolver internalResolve: value]
+		ifFalse: [Error signal: 'Already resolved'].
 )
 public smash: error <E> = (
 	| msg |
-	internalFuture __owner == currentActor ifFalse: [halt].
-
-	(* Should this be immediate? *)
-	msg:: PendingDelivery
-		receiver: internalFuture
-		selector: #internalSmash:
-		arguments: {error}
-		resolver: nil.
-	currentActor enqueueMessage: msg
+	internalResolver __owner == currentActor ifFalse: [halt].
+	#unresolved == internalResolver state 
+		ifTrue: [internalResolver internalSmash: error]
+		ifFalse: [Error signal: 'Already resolved'].
 )
 ) : (
 )
@@ -446,31 +436,32 @@ public printOn: stream = (
 )
 ) : (
 )
-protected class WhenReactor onValue: v onError: e resolver: r = (|
-protected onValue <[:V] | []> = v.
-protected onError <[:E] | []> = e.
-protected resolver = r.
+protected class WhenReactor onValue: v onError: e resolver: r = (
+(* A when-catch for a promise.
+
+Note that all slots contain objects that belong to the actor which sent #whenResolved:. *)|
+	protected onValue <[:V] | []> = v.
+	protected onError <[:E] | []> = e.
+	protected resolver <InternalResolver> = r.
 |) (
 'as yet unclassified'
 public reactResolved: value = (
-	| msg nearResolution |	
-	msg:: PendingDelivery 
-		receiver: onValue
-		selector: #cull:
-		arguments: {value}
-		resolver: resolver.
 	resolver __owner == currentActor ifFalse: [halt].
-	currentActor enqueueMessage: msg.
+	currentActor enqueueMessage:
+		(PendingDelivery 
+			receiver: onValue
+			selector: #cull:
+			arguments: {value}
+			resolver: resolver).
 )
 public reactSmashed: value = (
-	| msg nearResolution |	
-	msg:: PendingDelivery 
-		receiver: onError
-		selector: #cull:
-		arguments: {value}
-		resolver: resolver.
 	resolver __owner == currentActor ifFalse: [halt].
-	currentActor enqueueMessage: msg.
+	currentActor enqueueMessage:
+		(PendingDelivery 
+			receiver: onError
+			selector: #cull:
+			arguments: {value}
+			resolver: resolver).
 )
 ) : (
 )

@@ -212,9 +212,6 @@ public maxLocals: n <Integer> = (
 public methodName: n <Symbol> = (
 	code selector: n
 )
-public pc = (
-	^code compiledMethodSize + 1
-)
 public pushMixinClass = (
 	(* The mixin class will be stored in the final literal -added after the end of the literal array *)
 	pushLiteralWithIndex: literalTable size + 1
@@ -722,7 +719,7 @@ public slotsPerMethod = (
 )
 )
 class DebugInfo = ((* Debugger information. *)|
-	public sourceMapping <MutableMap[Integer, Interval]> = Dictionary new.
+	public bciSourceMapping <MutableMap[Integer, Interval]> = Dictionary new.
 	public localVariables <MutableList[LocalVariableDebugInfo]> = OrderedCollection new.
 |) (
 'as yet unclassified'
@@ -746,20 +743,11 @@ public addInfoForRemote: varInfo <SemanticVarDecl> in: remoteVarInfo <SemanticVa
 	info contextDepth: contextDepth.
 	^localVariables addLast: info.
 )
-public mapPC: pc <Integer> to: src <interval> = (
-	sourceMapping at: pc put: src
+public mapBCI: bci <Integer> to: src <interval> = (
+	bciSourceMapping at: bci put: src
 )
 public mapperForContext: ctxt = (
 	^DebugMapper forContext: ctxt usingDebugInfo: self.
-)
-sourceMap ^ <SortedList[Association[Integer, Interval]]> = (
-	| assocs <List[Association[Integer, Interval]]> |
-	assocs:: sourceMapping associations.
-	^(SortedList 
-		new: assocs size 
-		sortBlock:[:a <Association[Integer, Interval]> :b <Association[Integer, Interval]> | 
-			a key < b key
-			]) addAll: assocs; yourself
 )
 ) : (
 )
@@ -792,6 +780,9 @@ astForContextAtDepth: targetDepth <Integer> ^<AST> = (
 				selector: #outerContext;
 				arguments: {})].
 	^returnContext	
+)
+bci = (
+	^context pc - context method initialPC
 )
 contextAtDepth: targetDepth <Integer> ^<MethodContext> = (
 	|
@@ -863,7 +854,7 @@ leastLocalInfoFor: varName <Symbol> ^<LocalVarDebugInfo> = (
 	
 	| bestInfo |
 	debugInfo localVariables do: [:info |
-		(info name = varName and: [info validPCRange includes: pc]) ifTrue: [
+		(info name = varName and: [info validBCIRange includes: bci]) ifTrue: [
 			(bestInfo isNil or: [info contextDepth < bestInfo contextDepth]) ifTrue: [
 				bestInfo:: info]]].
 	bestInfo notNil ifFalse: [deny].
@@ -871,10 +862,12 @@ leastLocalInfoFor: varName <Symbol> ^<LocalVarDebugInfo> = (
 )
 public localNames = (
 	| names |
+	#BOGUS. (* The pc needs to be adjusted the same way we do for the source range. *)
+	
 	names: OrderedCollection new.
 
 	debugInfo localVariables do: [:info |
-		((info validPCRange includes: pc)
+		((info validBCIRange includes: bci)
 		and: [info isSynthetic not
 		and: [myDepth >= info contextDepth]]) ifTrue: [
 			names include: info name ]].
@@ -884,14 +877,11 @@ mostLocalInfoFor: varName <Symbol> ^<LocalVarDebugInfo> = (
 	
 	| bestInfo |
 	debugInfo localVariables do: [:info |
-		(info name = varName and: [info validPCRange includes: pc]) ifTrue: [
+		(info name = varName and: [info validBCIRange includes: bci]) ifTrue: [
 			(bestInfo isNil or: [info contextDepth > bestInfo contextDepth]) ifTrue: [
 				bestInfo:: info]]].
 	bestInfo notNil ifFalse: [deny].
 	^bestInfo
-)
-pc = (
-	^context pc
 )
 public setterAstFor: varName <Symbol> putting: newVal <AST> ^<SendAST> = (
 	| info |
@@ -916,7 +906,7 @@ public setterAstFor: varName <Symbol> putting: newVal <AST> ^<SendAST> = (
 )
 class LocalVariableDebugInfo = ((* Debugger information for a local. *)|
 	public name <Symbol>
-	public validPCRange <Interval>
+	public validBCIRange <Interval>
 	public zeroOriginOffset <Integer> (* in remoteVector if not nil, otherwise in context *)
 	public remoteVector <Symbol | nil>
 	public contextDepth <Integer> (* 0 = method, 1 = closure, 2 = nested closure, ... *)
@@ -933,7 +923,7 @@ addDebugInfo: sourceInterval <Interval> = (
 	(* Byte to map is first byte of e.g. send, which is the next, i.e. pc.
 	Hence this must be sent immediately before generating the send or store bytecode.
 	Can't send after generating the bytecode because there may be multiple bytes and mapping the last byte is wrong. *)
-	debugInfo mapPC: pc to: sourceInterval
+	debugInfo mapBCI: cgen bci to: sourceInterval
 )
 addLocalVar: var <VarDeclAST> = (
 	| offset <Integer> localVariableDebugInfo |
@@ -1007,9 +997,6 @@ nextOffset = (
 	next:: offsetStack removeLast.
 	offsetStack addLast: next + 1.
 	^next
-)
-pc = (
-	^cgen pc
 )
 popOffsetCounter = (
 	offsetStack removeLast.
@@ -1146,15 +1133,15 @@ public codeBodyNode: node <CodeBodyAST> = (
 
 	baselineStackDepth <Integer>
 	localVariableDebugInfos
-	startPC
-	validPCRange
+	startBCI
+	validBCIRange
 	|
 
 	(* This could be a method body, a closure body, part of an inlined block, or a setter send.  Each method body and closure body needs to have separate indexing for temps because their activations will be separate MethodContexts.  Inlined blocks and setter sends should continue to use the same indexing as their enclosing method or closure.  To accomplish this, we use a stack of counters. *)
 	
 	localVariableDebugInfos:: OrderedCollection new.
-	startPC:: pc.
-	
+	startBCI:: cgen bci.
+
 	localVariableDebugInfos addAll:
 		(node parameters collect: [:param | addLocalVar: param]).
 		
@@ -1189,8 +1176,8 @@ public codeBodyNode: node <CodeBodyAST> = (
 		stmtCount:: stmtCount + 1.
 	].
 	
-	validPCRange:: startPC to: pc - 1.
-	localVariableDebugInfos do: [:each | each validPCRange: validPCRange].
+	validBCIRange:: startBCI to: cgen bci - 1.
+	localVariableDebugInfos do: [:each | each validBCIRange: validBCIRange].
 	^localVariableDebugInfos
 )
 public conditionalNode: node <IfAST> = (
@@ -1314,7 +1301,7 @@ public loopNode: node <LoopAST> = (
 	
 	shouldPop ifFalse: [cgen pushNil]. (* Result of loop message. Technically wrong, but Squeak makes the same mistake, and loops are almost never evaluated for value. *)
 	
-	localVariableDebugInfos do: [:each | each validPCRange: (each validPCRange first to: pc - 1)].
+	localVariableDebugInfos do: [:each | each validBCIRange: (each validBCIRange first to: cgen bci - 1)].
 )
 public messageNode: message <MessageAST> = (
 	shouldPop ifTrue: [halt].

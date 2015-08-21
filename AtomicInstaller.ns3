@@ -36,24 +36,20 @@ If the layout of a class has changed, we also process all its instances. For eac
 
 At this point, we can do the one way become:  and the installation is complete.
 
-(Somewhat out of date: 
-One concern is the involvement of this class with metadata issues such as the class organization. For new code,  AtomicInstaller produces an organization based on the information available in the mirrors provided.  For existing ones it copies the information that was already in place.  
 
-Now it seems that, ideally, a higher level layer should be dealing with this kind of metadata and AtomicInstaller should be completely oblivious to it.  Alas, it isn't quite so simple.
+Some care is needed to ensure atomic install works with shape changes to InstanceMixin, ClassMixin, Class or Metaclass. Installing such changes involves processing their instances twice: first to create the new definition and second to reallocate to the new shape, which requires the new definition.
 
-The installer processes classes whose mixin has not been modified, it is important that it clones them in their entirety so that their organization does not get lost.  Higher level layers aren't in a good position to deal with these classes without replicating much of the installer's work.  
+Let A be the old definition
+Let B be the new definition with the old shape
+Let C be the new definition with the new shape
+Let D be the old definition with the new shape
 
-Likewise, high level layers aren't really well situated to track down mixin applications of mixins that have been modified.  They only deal with the mixins themselves. However, the organization of a mixin invocation is a special object that actually bases its definitions on the organization of the defining class. So copying these is ok as well.
+We need the bulk become to include, in order,
 
-In principle, metadata should be kept at the mixin level, and individual classes should just refer to their mixin for it. In that case, higher level mirrors could deal with the metadata, and the installer would not have to do anything at all about it  - neither for new or old code.
-In that scenario, even if a class has unique metadata, then it would only change of the class itself were changed individually (which amounts to changing its superclass) and then the higher layers would know about it and deal with it.
+B -> C
+A -> C
 
-Until that happy day, it looks like the installer has no choice but to take care of this. That is why low level squeak mirrors carry metadata such as category information with them, making it available to the installer. 
-
-What could be improved is the handling of new mixins. Higher level mirrors could take care of setting up the organization of these.  This is part of the pending overall mirror reform.  Then we could take #setOrganizationOfClass;BasedOn: out of AtomicInstaller, along with the import of ClassOrganizer.
-)
- 
-With the new mixin and class resentation (Kernel`Mixin and Class), Newspeak classes now delegate their category and organization to the mixin.
+They must appear in this order so C adopts the identity hash (and possible class index) of A rather than that of B. We must also not include A -> D, as it makes no sense to forward an identity to two objects.
 
 
 ( * :bug: Rename doesn't propagate down.
@@ -91,9 +87,9 @@ private ClassOrganizer = p squeak ClassOrganizer.
 
 private vmmirror = vmm.
 
-private updateMap <IdentityMap[OldObject,NewObject]>
+private updateMixinsAndClasses <IdentityMap[OldObject,NewObject]>
+private updateInstances <IdentityMap[OldObject,NewObject]>
 private existingClasses <IdentityMap[HierarchyDepth,Set[Class]]>
-private hadLayoutChange <Boolean>
 |) (
 'private'
 private augmentExistingMixinMap: map withNestedClasses: nestedClasses inExistingMixin: mixin  = (
@@ -109,31 +105,37 @@ private augmentExistingMixinMap: map withNestedClasses: nestedClasses inExisting
 				inExistingMixin: existingNestedMixin]]
 )
 private cleanup = (
-	updateMap: nil.
-	existingClasses: nil
+	updateMixinsAndClasses: nil.
+	updateInstances: nil.
+	existingClasses: nil.
 )
 private installAll = (
-
-	| oldObjects newObjects i |	
-	oldObjects:: Array new: updateMap size.
-	newObjects:: Array new: updateMap size.
-	i: 1.
-
-	updateMap keysAndValuesDo: [:oldObj :newObj |
-		oldObjects at: i put: oldObj.
-		newObjects at: i put: newObj.
-		i: i + 1.
-	].
-
+	| updateCount oldObjects newObjects index |
+	updateCount:: updateMixinsAndClasses size + updateInstances size.
+	oldObjects:: Array new: updateCount.
+	newObjects:: Array new: updateCount.
+	index: 1.
+	updateInstances keysAndValuesDo: 
+		[:old :new | 
+		oldObjects at: index put: old.
+		newObjects at: index put: new.
+		index: index + 1].
+	(* Put updated mixins and classes last, so A -> C follows B -> C (see class comment). *)
+	updateMixinsAndClasses keysAndValuesDo: 
+		[:old :new | 
+		oldObjects at: index put: old.
+		newObjects at: index put: (updateInstances at: old ifAbsent: [new]). (* Follow B to avoid B -> C, A -> B. *)
+		index: index + 1].
+	
 	oldObjects elementsForwardIdentityToEvenIfImmutable: newObjects.
 	
 	(* As of 2673, the VM ensures objects whose references are deleted in a one-way become cannot be resurrected by allInstances/allObjects.
 	hadLayoutChange ifTrue: [vmmirror fullGC]. (* Ensure that objects newly made unreachable by the one-way become will not be enumerated by future uses of someInstance/nextInstance. See discussion of issue #82 and comments in ClassBuilder update:to:. *) *)
 )
 private setup = (
-	updateMap: IdentityMap new.
+	updateMixinsAndClasses: IdentityMap new.
+	updateInstances: IdentityMap new.
 	existingClasses: IdentityMap new.
-	hadLayoutChange: false.
 )
 'private-classes'
 private depthFor: klassArg <Class> ^<Integer> = (
@@ -150,8 +152,8 @@ private newClassFor: oldClass <Class> ^<Class> = (
 	
 	| newSuperclass newMixin newClass |
 
-	newSuperclass:: updateMap at: oldClass superclass ifAbsent: [oldClass superclass].
-	newMixin:: updateMap at: oldClass mixin ifAbsent: [oldClass mixin].
+	newSuperclass:: updateMixinsAndClasses at: oldClass superclass ifAbsent: [oldClass superclass].
+	newMixin:: updateMixinsAndClasses at: oldClass mixin ifAbsent: [oldClass mixin].
 
 #BOGUS yourself. (* Name not quite right.  Should reflect new name, but should keep the same form as the old name if it's like This`9087#450 *)
 	newClass:: newMixin apply: newSuperclass withName: newMixin simpleName.
@@ -164,18 +166,20 @@ private processExistingClass: oldClass <Class> = (
 	| newClass <Class> |
 	newClass:: newClassFor: oldClass.
 	
-	updateMap at: oldClass put: newClass.
-	updateMap at: (vmmirror classOf: oldClass) put: (vmmirror classOf: newClass).
-		
-	(layoutHasChangedBetween: oldClass and: newClass) 
-		ifTrue: [processInstancesOf: oldClass withNewClass: newClass]
+	updateMixinsAndClasses at: oldClass put: newClass.
+	updateMixinsAndClasses at: (vmmirror classOf: oldClass) put: (vmmirror classOf: newClass).
 )
 private processExistingClasses = (
-	(* Process superclasses before subclasses *)
+	(* Process superclasses before subclasses. Create all new classes before remapping any instances. *)
 	existingClasses keys asSortedCollection do:
 		[:inheritanceDepth <Integer> |
 		(existingClasses at: inheritanceDepth) do:
-			[:c <Class> | processExistingClass: c]].
+			[:oldClass <Class> | processExistingClass: oldClass]].
+
+	existingClasses valuesDo:
+		[:depthSet <Set[Class]> |
+		depthSet do:
+			[:oldClass <Class> | processInstancesOf: oldClass]].
 )
 private sortClass: app <Class> = (
 	| classes depth |
@@ -185,35 +189,35 @@ private sortClass: app <Class> = (
 	app subclassesDo: [:sc | sortClass: sc].
 )
 'private-instances'
-private processInstancesOf: oldClass <Class> withNewClass: newClass <Class> = (
-
-	| oldInstVarNames newInstVarNames sharedInstVarNames |
+private processInstancesOf: oldClass <Class> = (
+	| 
+	newClass <Class> = updateMixinsAndClasses at: oldClass.
+	oldSlotNames <Array[Symbol]>
+	newSlotCount <Integer>
+	remapIndices <Array[Integer]>
+	|
+	(layoutHasChangedBetween: oldClass and: newClass) ifFalse: [^self].
 	
-	hadLayoutChange: true.
-	
-	oldInstVarNames:: oldClass allInstVarNames.
-	newInstVarNames:: newClass allInstVarNames.
-	
-	sharedInstVarNames:: oldInstVarNames
-		select: [:n <String> | newInstVarNames includes: n ].
-	(* find intersection of slots names between oldObj and newObj *)
+	(* Heuristic: choose the latter slot if a slot name is duplicated to favor overriding slots. *)
+	oldSlotNames:: oldClass allInstVarNames.
+	remapIndices:: newClass allInstVarNames collect:
+		[:newSlotName | oldSlotNames lastIndexOf: newSlotName ifAbsent: 0].
+	newSlotCount:: remapIndices size.
 
-	oldClass allInstancesDo: [:oldObj | | newObj |
-		
-		newObj:: newClass basicNew.
-		
-		(* copy state from oldObj to newObj *)
-		
-		sharedInstVarNames do: [:n <String> | 
-			| oldIndex newIndex val |
-			oldIndex:: oldInstVarNames lastIndexOf: n.
-			newIndex:: newInstVarNames lastIndexOf: n.
-			val:: vmmirror namedSlotOf: oldObj at: oldIndex ifFail: [self halt].
-			vmmirror namedSlotOf: newObj at: newIndex put: val ifFail: [self halt].
-		]. 
+	(vmmirror allInstancesOf: oldClass) do: 
+		[:oldInstance |
+		(* Avoid A -> D (see class comment). *)
+		(updateMixinsAndClasses includesKey: oldInstance) ifFalse:
+			[ | newInstance = vmmirror instantiateFixedClass: newClass. |
+			(* Copy state from oldInstance to newInstance. *)
+			1 to: newSlotCount do: [:newIndex |
+				| oldIndex value |
+				oldIndex:: remapIndices at: newIndex.
+				0 == oldIndex ifFalse: [
+					value:: vmmirror ifFail: [halt] namedSlotOf: oldInstance at: oldIndex.
+					vmmirror ifFail: [halt] namedSlotOf: newInstance at: newIndex put: value]]. 
 
-		updateMap at: oldObj put: newObj.
-	].
+			updateInstances at: oldInstance put: newInstance]].
 )
 'private-mixins'
 private methodDictionaryFor: mixin <AbstractMixin> from: imixin <IntermediateMixin> ^<MethodDictionary> = (
@@ -225,11 +229,10 @@ private methodDictionaryFor: mixin <AbstractMixin> from: imixin <IntermediateMix
 	^mdict
 )
 private noteUpdateOf: existingMixin <InstanceMixin | nil> to: newMixin <InstanceMixin> = (
-	
 	existingMixin isNil ifTrue: [^self].
 	
-	updateMap at: existingMixin put: newMixin.
-	updateMap at: existingMixin classMixin put: newMixin classMixin.
+	updateMixinsAndClasses at: existingMixin put: newMixin.
+	updateMixinsAndClasses at: existingMixin classMixin put: newMixin classMixin.
 	
 	existingMixin applications do: [:app | sortClass: app].
 )

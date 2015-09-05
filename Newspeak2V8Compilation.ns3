@@ -376,7 +376,7 @@ class Translator = ASTTool ((* Visits nodes of an NS AST to produce a Javascript
 	scopeStack
 	public currentSelector
 	protected containsNonLocalReturn <Boolean> (* Set to false at the beginning of translating a method. The code that emits a non-local return sets this to true. The top-level code checks the value to see whether to emit a try-catch wrapper for an NLR. *)
-
+	protected methodIsPrivate <Boolean>
 |) (
 'as yet unclassified'
 addCascadedSend: node to: statements = (
@@ -389,6 +389,11 @@ addCascadedSend: node to: statements = (
 public beginNewTranslationCycle = (
 	scopeStack:: OrderedCollection new.
 	containsNonLocalReturn:: false.
+)
+maybeCaptureReceiver = (
+	methodIsPrivate
+		ifTrue: [^{}]
+		ifFalse: [^{js var: selfName value: (js ident: 'this')}].
 )
 nlrName = (
 	^'NLR'
@@ -414,7 +419,7 @@ processLexicalSend: message to: jsReceiver binding: binding = (
 		definingMixin = js ident: '$', definingMixinDepth printString.
 		targetMethod = js propertyOf: definingMixin at: (publicMessage: message).
 		|
-		^js call: (js propertyOf: targetMethod at: (js literal: 'call'))
+		^js call: targetMethod (*(js propertyOf: targetMethod at: (js literal: 'call'))*)
 			with: {jsReceiver}, (message arguments collect: [:each | each apply: self]) asArray
 	].
 	
@@ -445,9 +450,8 @@ wrapBodyForNlrHandling: body <Block> = (
 	nlrVarNode:: js ident: nlrName.
 	nlrParamName:: nlrName, '_exception'.
 	nlrParamNode:: js ident: nlrParamName.
-	^js block: {
-		js var: selfName value: (js ident: 'this').
-		js var: nlrName value: (js new: (js ident: 'Object') with: {}).
+	^js block: maybeCaptureReceiver, 
+		{js var: nlrName value: (js new: (js ident: 'Object') with: {}).
 		js try: body catch: nlrParamName with:
 			(js block: {
 				js if: (js operator: '===' with: nlrVarNode and: nlrParamNode)
@@ -457,7 +461,7 @@ wrapBodyForNlrHandling: body <Block> = (
 	}
 )
 wrapBodyNoNlrHandling: body <Block> = (
-	^js block: {js var: selfName value: (js ident: 'this')}, body statements
+	^js block: maybeCaptureReceiver, body statements
 )
 'node traversal'
 public blockLocalReturnNode: node <BlockLocalReturnAST> = (
@@ -587,8 +591,12 @@ public messageNode: node = (
 	^js literal: (names mangleSelector: node selector)
 )
 public messagePatternNode: node <MessagePatternAST> ^<List[String]> = (
+	| jsParameters = OrderedCollection new. |
 	currentSelector:: node selector.
-	^node parameters collect: [:each | each apply: self]
+	methodIsPrivate:: node accessModifier = #private.
+	methodIsPrivate ifTrue: [jsParameters add: selfName].
+	node parameters do: [:each | jsParameters add: (each apply: self)].
+	^jsParameters
 )
 public methodLocalReturnNode: node <MethodLocalReturnAST> = (
 	^blockLocalReturnNode: node
@@ -902,51 +910,94 @@ public dnuHandlers = (
 	(* function() {  this.dnu(kernel.Message().selector$arguments$(selector, arguments) )  } *)
 )
 generateSlotAccessorsFor: mixinIR <MixinIR>  = (
-(* We need getter FUNCTIONS so we can call them uniformly with arguments (albeit empty ones) *)
-	mixinIR slots do: [:slotIR  | 
-		| initializer <MethodMirror> initializerJS <Node>
-		 getter <MethodMirror> getterJS <Node>
-		 setter <MethodMirror> setterJS <Node> slotName <String> fieldName |
-		slotName:: slotIR name.
-		fieldName:: names mangleSlot: slotName.
+	mixinIR slots do:
+		[:slotIR  |
+		generateSlotInitializerFor: slotIR in: mixinIR.
+		generateSlotGetterFor: slotIR in: mixinIR.
+		generateSlotSetterFor: slotIR in: mixinIR].
+)
+generateSlotGetterFor: slotIR <IntermediateSlot> in: mixinIR <IntermediateMixin>  = (
+	|
+	slotName <String> fieldName <String>
+	getter <MethodMirror> getterJS <Node>
+	|
+	slotName:: slotIR name.
+	fieldName:: names mangleSlot: slotName.
+	
+	slotIR accessModifier = #private
+		ifTrue:
+			[getterJS:: js functionOf: {'self'} body: (js block: {
+				js return: (js propertyOf: (js ident: 'self') at: (js literal: fieldName))})]
+		ifFalse:
+			[getterJS:: js functionOf: {} body: (js block: {
+				js return: (js propertyOf: (js ident: 'this') at: (js literal: fieldName))})].
+
+	getter:: IntermediateMethod
+		named: slotName
+		accessModifier: slotIR accessModifier
+		function: getterJS
+		source: nil.
+	getter isSynthetic: true.			
+	mixinIR methods add: getter.
+)
+generateSlotInitializerFor: slotIR <IntermediateSlot> in: mixinIR <IntermediateMixin>  = (
+	|
+	slotName <String> fieldName <String>
+	initializer <MethodMirror> initializerJS <Node>
+	|
+	slotName:: slotIR name.
+	fieldName:: names mangleSlot: slotName.
+	
+	slotIR accessModifier = #private
+		ifTrue:
+			[initializerJS:: js functionOf: {'self'. 'v'} body: (js block: {
+				(js assign: (js propertyOf: (js ident: 'self') at: (js literal: fieldName))
+					toBe: (js ident: 'v')).
+				js return: (js ident: 'self')}).]
+		ifFalse:
+			[initializerJS:: js functionOf: {'v'} body: (js block: {
+				(js assign: (js propertyOf: (js ident: 'this') at: (js literal: fieldName))
+					toBe: (js ident: 'v')).
+				js return: (js ident: 'this')}).].
 		
-		initializerJS:: js functionOf: {'v'} body: (js block: {
-			(js assign: (js propertyOf: (js ident: 'this') at: (js literal: fieldName))
-				toBe: (js ident: 'v')).
-			js return: (js ident: 'this')
-			}).
-		initializer:: IntermediateMethod 
-			named: (initializerSelectorForSlot: slotIR)
-			accessModifier: slotIR accessModifier (* Should be private. The scope representation needs to be adjusted to allow this to differ from the slot's access modifier. *)
-			function: initializerJS
-			source: nil.
-		initializer isSynthetic: true.	
-		mixinIR methods add: initializer.
-		
-		getterJS:: js functionOf: {} body: (js block: {
-			js return: (js propertyOf: (js ident: 'this') at: (js literal: fieldName))
-			}).
-		getter:: IntermediateMethod
-			named: slotName
-			accessModifier: slotIR accessModifier
-			function: getterJS
-			source: nil.
-		getter isSynthetic: true.			
-		mixinIR methods add: getter.
-		
-		slotIR isMutable ifTrue: [setterJS:: js functionOf: {'v'} body: (js block: {
-			(js assign: (js propertyOf: (js ident: 'this') at: (js literal: fieldName))
-				toBe: (js ident: 'v')).
-			js return: (js ident: 'this')
-			}).
-		setter:: IntermediateMethod 
-			named: (setterSelectorFor: slotIR)
-			accessModifier: slotIR accessModifier
-			function: setterJS
-			source: nil.
-		setter isSynthetic: true.	
-		mixinIR methods add: setter].
-		]	
+	initializer:: IntermediateMethod 
+		named: (initializerSelectorForSlot: slotIR)
+		accessModifier: slotIR accessModifier (* Should be private. The scope representation needs to be adjusted to allow this to differ from the slot's access modifier. *)
+		function: initializerJS
+		source: nil.
+	initializer isSynthetic: true.	
+	mixinIR methods add: initializer.
+)
+generateSlotSetterFor: slotIR <IntermediateSlot> in: mixinIR <IntermediateMixin>  = (
+	|
+	slotName <String> fieldName <String>
+	setter <MethodMirror> setterJS <Node> 
+	|
+
+	slotIR isMutable ifFalse: [^self].
+
+	slotName:: slotIR name.
+	fieldName:: names mangleSlot: slotName.
+	
+	slotIR accessModifier = #private
+		ifTrue:
+			[setterJS:: js functionOf: {'self'. 'v'} body: (js block: {
+				(js assign: (js propertyOf: (js ident: 'self') at: (js literal: fieldName))
+					toBe: (js ident: 'v')).
+				js return: (js ident: 'self')})]
+		ifFalse:
+			[setterJS:: js functionOf: {'v'} body: (js block: {
+				(js assign: (js propertyOf: (js ident: 'this') at: (js literal: fieldName))
+					toBe: (js ident: 'v')).
+				js return: (js ident: 'this')})].
+
+	setter:: IntermediateMethod 
+		named: (setterSelectorFor: slotIR)
+		accessModifier: slotIR accessModifier
+		function: setterJS
+		source: nil.
+	setter isSynthetic: true.	
+	mixinIR methods add: setter.
 )
 hereNode ^<VariableAST> = (
 	(* Generates an AST representing the implicit receiver. We use a string so that we can represent a name that is not a legal identier *)

@@ -61,7 +61,6 @@ Use and distribution of this software is subject to the terms of the attached so
 
 
 *)|
-
 (* imports *)
 OrderedCollection = p collections OrderedCollection.
 Map = p collections Map.
@@ -74,11 +73,14 @@ UnaryTypeOpAST = astModule UnaryTypeOpAST.
 
 ClassDeclarationMirror = mirrors ClassDeclarationMirror.
 
+Scope = ide compiler Scope.
+
 (* module variables *)
 
 namespace = ns.
 trail = Trail new.
 globalScope = ns.
+scopeStack <OrderedCollection[Scope]> = OrderedCollection new.
 typeBuilder = TypeBuilder new.
 currentClass <Class> (* mirror? *)
 currentTopLevelClass <Class>
@@ -117,6 +119,9 @@ class FunctionType domain: d <List[Type]> range: r <Type> = Type (
 public = o   = (
 	o isKindOfFunctionType ifFalse:[^false].
 	^domain = o domain and:[range = o range]
+)
+public hash ^ <Integer> = (
+	^(domain hash xor: range hash) bitXor: class hash
 )
 public isKindOfFunctionType ^ <Boolean> = (
 	^true
@@ -165,6 +170,9 @@ findMethod: selector <Symbol> ^ <Mirror> = (
 		actualType:: actualType superclass.
 		].
        ^errorType
+)
+public hash ^ <Integer> = (
+	^path hash bitXor: class hash
 )
 public isKindOfObjectType ^ <Boolean> = (
 	^true
@@ -220,6 +228,9 @@ public = o   = (
 	o isKindOfSignatureQuery ifFalse:[^false].
 	^type = o type and:[selector = o selector]
 )
+public hash ^ <Integer> = (
+	^(type hash bitXor: selector hash) bitXor: class hash
+)
 public isKindOfSignatureQuery ^ <Boolean> = (
 	^true
 )
@@ -234,6 +245,9 @@ class SubtypeQuery subtype: s <Type> supertype: t <Type> = Query (
 public = o  = (
 	o isKindOfSubtypeQuery ifFalse:[^false].
 	^subtype = o subtype and:[supertype = o supertype]
+)
+public hash ^ <Integer> = (
+	^(subtype hash bitXor: supertype hash) bitXor: class hash
 )
 public isKindOfSubtypeQuery ^ <Boolean> = (
 	^true
@@ -339,24 +353,29 @@ public end = p2.
 )
 class UnionType unifying: ts <List[Type]> = Type (
 (* The union of th etypes in ts *)|
-	elements <List[Type]> = ts.
+	public elements <List[Type]> = ts.
 |) (
 'as yet unclassified'
 public = o   = (
 	o isKindOfUnionType ifFalse:[^false].
 	^elements = o elements
 )
-isKindOfUnionType ^ <Boolean> = (
+public hash ^ <Integer> = (
+	^elements hash bitXor: class hash
+)
+public isKindOfUnionType ^ <Boolean> = (
 	^true
 )
 ) : (
 )
 'as yet unclassified'
 public blockNode: node ^ <ObjectType> = (    | tas <VarOrdCltn[ObjectType]>  |
+  nestScope: Scope new.
   tas:: OrderedCollection(*[ObjectType]*)  new.(* must add types of parameters *)
   node parameters do:[:p <VarDecl>  |  tas add:(p apply: self)].
   tas addLast: (node body apply: self). 
-  ^BlockApplicationType new apply: (TypeIdAST new setId: #Fun; scope: globalScope) to: tas.	
+  popScope.
+  ^BlockApplicationType new apply: (TypeIdAST new setId: #Fun) to: tas.	
 )
 public cascadedSendNode: node  ^ <ObjectType> = (
 	node previousSend apply: self.
@@ -369,6 +388,8 @@ public codeBodyNode: node ^ <ObjectType> = (
 
     | lastStatementType <ObjectType>  |
 
+    (* pushScope (if we have a map) or just nest a new one *)
+    nestScope: Scope new.
     node temporaries do:[:t <VarDecl>  | t apply: self].
 
 	(* Parameters are not typechecked here. For method bodies, the parameters are
@@ -378,10 +399,14 @@ public codeBodyNode: node ^ <ObjectType> = (
 
     lastStatementType:: (TypeIdAST setId: #Nil) apply: typeBuilder.
     node statements do:[:s <Statement>  | lastStatementType:: s apply: self].
+    popScope.
     ^lastStatementType.
 )
 currentConflictNamespace = (
 	^namespace at: (currentTopLevelClass simpleName, ' conflicts') asSymbol ifAbsent:[nil]
+)
+currentScope ^ <Scope> = (
+	^scopeStack last
 )
 error: msg <String> at: location <Pair[Integer]> = (
 	errorSet add: (TypeError message: msg start: location first end: location last).
@@ -446,11 +471,19 @@ public messagePatternNode: node ^ <MsgSignature> = (
       ^node apply: typeBuilder
     )
 public methodNode: node <MethodAST> ^ <MsgSignature>  = (
-   | signature <FunctionType> = node pattern apply: self. |
+   | signature <FunctionType> | 
+    pushScope: Scope new.
+    signature:: node pattern apply: self.
     currentReturnType:: signature range
     node body apply: self.
+    popScope.
     ^currentReturnType
     )
+nestScope: s <Scope> = (
+	(* Hook up a new lexically nested scope, and push onto the scope stack *)
+	s setSuperScope: currentScope.
+	pushScope: s
+)
 public normalSendNode: node <NormalSendASTNode> ^ <ObjectType> = (
     | functionType <FunctionType> domain <List[ObjectType]>  args <List[ObjectType]>  |
 
@@ -470,6 +503,12 @@ domain size != args size ifTrue:[
 )
 public numberNode: node = (
 	^literal: #Number
+)
+popScope ^ <Scope> = (
+  ^scopeStack removeLast
+)
+pushScope: scope <Scope> = (
+	scopeStack addLast: scope
 )
 public returnStatNode: node ^ <ObjectType> = (
     | returnType <ObjectType>   eType <ObjectType>  |
@@ -522,6 +561,9 @@ tupleType:: TupleAST new apply: tupleTarget to: tupleActuals.
 
 ^ProtocolMerge new type1: sqType type2: tupleType.
 )
+typeOfLocal: varName <Symbol> ^ <ObjectType> = (
+	 ^currentScope at: varName
+)
 typeOfSelf ^ <ObjectType> = (
 	^ObjectType forPath: (lookupPathForType: currentClass simpleName)
 )
@@ -539,16 +581,16 @@ public typecheckMethod: m <MethodAST> ofClass: c  ^ <Set[TypeError]>= (
 	^errorSet
 )
 public varDeclNode: node = (
-      ^node type apply: typeBuilder. 
+      ^currentScope at: node name put: (node type apply: typeBuilder). 
 )
-public variableNode: aNode <VariableAST> ^ <ObjectType> = (
+public variableNode: node <VariableAST> ^ <ObjectType> = (
 	(* need to deal with #'@here', #self, #super, #outer, temps and formals *)
 	| varName <Symbol> = node name. | 
 	varName = #'@here' ifTrue:[^typeOfHere].
 	varName = #self ifTrue:[^typeOfSelf].
 	varName = #super ifTrue:[^typeOfSuper].
 	varName = #outer ifTrue:[^typeOfOuter].
-	^typeOfLocal: varName
+	^typeOfLocal: varName (* do we ever get here? or are locals handled as here sends? *)
 )
 'visiting'
 literal: typeName <Symbol> ^ <ObjectType> = (

@@ -3,10 +3,7 @@ Newspeak3
 class NewspeakTypechecker usingPlatform: p ide: ide ast: astModule mirrors: mirrors namespace: ns = (
 (* A visitor that computes the type of a Newspeak program 
 
-Questions to resolve: is there a set of classes representing types, or do we just interpret the AST nodes
-for types as needed.  In some cases we need a semantic type - for example BottomType.
-
-Also, we need this typechecker to be incremental. The basic ideas go back as far as the Cecil typechecker, but are properly explained in the context of Scala optimization in the OOPSLA 2016 paper: Parallel Incremental Whole-Program Optimizations for Scala.js.
+We need this typechecker to be incremental. The basic ideas go back as far as the Cecil typechecker, but are properly explained in the context of Scala optimization in the OOPSLA 2016 paper: Parallel Incremental Whole-Program Optimizations for Scala.js.
 
 These principles are:
 
@@ -81,7 +78,7 @@ Scope = p mirrors compiler Scope.
 (* module variables *)
 
 namespace = ns.
-trail = Trail new.
+trail <Map[SubtypeQuery, Boolean]> = Map new.
 globalScope = ns.
 scopeStack <OrderedCollection[Scope]> = OrderedCollection new.
 typeBuilder = TypeBuilder new.
@@ -301,7 +298,7 @@ public genericInvocationNode: node <ParameterizedTypeAST> ^ <ParameterizedTypeAS
 		yourself
 )
 public typeIdNode: node <TypeIdAST> ^ <AST> = (
-	^substitution at: node name 
+	^substitution at: node name ifAbsent:[^node]
 )
 public unaryTypeOpNode: node <UnaryTypeOpAST> ^ <UnaryTypeOpAST> = (
 	^UnaryTypeOpAST new 
@@ -326,66 +323,6 @@ public hash ^ <Integer> = (
 )
 public isKindOfSubtypeQuery ^ <Boolean> = (
 	^true
-)
-) : (
-)
-class Trail = (
-(* The trail is implemented by this class. A single instance, held in the slot #trail, 
-exists at any point in time.
-
-The representation used here is simple. The slot 'dict'
-is a dictionary mapping type variables to dictionaries. Every type variable T
-that is known to be related to some other type has an entry in 'dict'
-(T being the key). The value of this entry is a dictionary D
-mapping types to Booleans. Each entry E_sigma in D
-corresponds to a type Sigma known to be related to to the type variable T.
-If T <= Sigma, then E_sigma value is True.  If T <# Sigma, then E_sigma
-value is False. Otherwise, T is unrelated to Sigma.
-*)| 
-dict = IdentityDictionary(*[ObjectType, IdentityDictionary[ObjectType, Boolean]]*)  new.
-|) (
-'Unclassified'
-answer: t1 <ObjectType >isSubtypeOf: t2 <ObjectType > ^ <Boolean> = (
-
-    ^(self dict at: t1 ifAbsent:[^false]) at: t2 ifAbsent:[^false]
-)
-answerTypeVar: t1 <ObjectType >isSubtypeOf: t2 <ObjectType > ^ <Boolean> = (
-
-(* Buggy!  We need to see if t1 is a subtype or inherited type of its bound.
-If it is a subtype, the code below works.
-If it is not, it only works provided the bound is monotonic (and what does that entail if the bound
-is another type variable?
-
-*)
-    ^(self typeVarBoundFor: t1) subtypeOf: t2 assuming: self.
-)
-assume: t1 <ObjectType >isSubtypeOf: t2 <ObjectType > ^ <Self> = (
-
-    | t1Dict <IdentityDictionary[ObjectType, Boolean]>  |
-
-t1Dict:: self dict at: t1
-                      ifAbsent:[self dict at: t1 put: IdentityDictionary(*[ObjectType, Boolean]*)  new].
-(t1Dict includesIndex: t2) ifFalse:[t1Dict at: t2 put: true]
-                                         ifTrue:[self error: 'Trail already contains entry for ', t1 name, ' subtype of ', t2 name].
-)
-forget: t1 <ObjectType >isSubtypeOf: t2 <ObjectType > ^ <Self> = (
-
-    | e1 <IdentityDictionary[ObjectType, Boolean]>  |
-
-
-(e1:: self dict at: t1 ifAbsent:[^self]) removeKey: t2 ifAbsent:[^self].
-e1 isEmpty ifTrue:[self dict removeKey: t1].
-)
-typeVarBoundFor: tv <TypeVar > ^ <ObjectType> = (
-
-    | tvDict <IdentityDictionary[ObjectType, Boolean]>  |
-
-(* The entry for a type variable should contain exactly one element, which is the known bound for the type variable.
-If no entry exists, we can always assume that the type variable is an Object
-(or should we treat this as an inconsistency?).
-*)
-tvDict:: self dict at: tv ifAbsent:[^DeltaTypeId new setId: #Object; scope: DeltaGlobals].
-tvDict associationsDo:[:a <Assoc[ObjectType,IdentityDictionary[ObjectType,Boolean]]> | ^a key].
 )
 ) : (
 )
@@ -507,10 +444,8 @@ functionTypeOf: node <SendASTNode> ^ <MsgSignature> = (
 	cachedType = nil ifTrue:[
 			cachedType:: receiverType at: selector.
 			cachedTypes at: query put: cachedType.
-			dependentDeclarations at: query put: Set new.
 			].
-	(dependentDeclarations at: query) add: currentDeclaration.
-	(dependentQueries at: currentDeclaration ifAbsent:[dependentQueries at: currentDeclaration put: Set new]) add: query.
+	registerDependenciesOfQuery: query.
 	^cachedType.
 )
 public genericInvocationNode: node ^ <ObjectType> = (
@@ -582,7 +517,7 @@ domain size != args size ifTrue:[
 	error: 'Arity mismatch' at: {node concreteStart. node concreteEnd}
 	].
 1 to: domain size do:[:i <Integer> | 
-	((args at: i) subtypeOf: domain at: i) ifFalse:[
+	(type: (args at: i) isSubtypeOf: (domain at: i)) ifFalse:[
 		error: 'Argument is not a subtype of corresponding formal'
 		at: {(args at: i) concreteStart. (args at: i) concreteEnd}
 		]
@@ -598,11 +533,15 @@ popScope ^ <Scope> = (
 pushScope: scope <Scope> = (
 	scopeStack addLast: scope
 )
+registerDependenciesOfQuery: q <Query> = (
+	(dependentDeclarations at: q ifAbsent:[dependentDeclarations at: q put: Set new]) add: currentDeclaration.
+	(dependentQueries at: currentDeclaration ifAbsent:[dependentQueries at: currentDeclaration put: Set new]) add: q.	
+)
 public returnStatNode: node ^ <ObjectType> = (
     | returnType <ObjectType>   eType <ObjectType>  |
 
 eType:: node expression apply: self.
-^(eType subtypeOf: currentReturnType assuming: trail)
+^(type: eType isSubtypeOf: currentReturnType)
     ifTrue:[BottomType new]
     ifFalse:[error: 'Type of returned expression is not a subtype of declared return type' at: {node concreteStart. node concreteEnd}]
     )
@@ -654,6 +593,14 @@ tupleType:: TupleAST new apply: tupleTarget to: tupleActuals.
 
 
 ^ProtocolMerge new type1: sqType type2: tupleType.
+)
+type: sub <Type> isSubtypeOf: sup <Type> ^ <Boolean> = (
+	| query |
+	query:: SubtypeQuery subtype: sub supertype: sup.
+	registerDependenciesOfQuery: query.
+	^trail at: query ifAbsent:[
+		trail at: query put: (sub subtypeOf: sup).		
+		].
 )
 typeOfLocal: varName <Symbol> ^ <ObjectType> = (
 	 ^currentScope at: varName

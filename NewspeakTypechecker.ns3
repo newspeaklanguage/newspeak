@@ -213,36 +213,46 @@ public subtypeOf: t <Type> ^ <Boolean>  = (
 )
 ) : (
 )
-class HereType for: m <MixinMirror> = PseudoType for: m path: (herePathFor: m) (
+class HereType for: c <ClassDeclarationMirror> = PseudoType for: c path: (herePathFor: c) (
 (* The type of the lexical scope. *)) (
 'as yet unclassified'
 public = o   = (
 	o isKindOfHereType ifFalse:[^false].
-	^mixin = o mixin
+	^classDeclaration = o classDeclaration
 )
 findMethod: selector <Symbol> ^ <Mirror> = (
-	| actualType <MixinMirror>  m <MethodMirror> localType <ObjectType> |
-	
+(* Return the mirror representing selector in 
+this type's classDeclaration. Check if it is a 
+reserved word, otherwise look for a method 
+defined on classDeclaration*)
 	selector = #nil
 		ifTrue:[^mirrorForObjectType: (literal: #Nil)]. 
 	({#true. #false} includes: selector) 
-		ifTrue:[^mirrorForObjectType: (literal: #Boolean)]. (* reserved words *)
+		ifTrue:[^mirrorForObjectType: (literal: #Boolean)]. 
+	(* check reserved words *)	
+	^findOwnMethod: selector
+)
+findOwnMethod: selector <Symbol> ^ <Mirror> = (
+(* Find the method named selector defined the this 
+type's classDeclaration. First check for local slots
+or formal parameters in the current method/block
+scope, otherwise climb the enclosing class hierarchy
+(lexical scope) and finally try the type of the 
+classDeclaration (i.e., "self" ). *)
+	| actualType <MixinMirror>  m <MethodMirror> localType <ObjectType> |
 	
 	localType:: typeOfLocal: selector.
 	nil ~= localType 
 		ifTrue:[^mirrorForObjectType: localType]. (* formal or temp *)
 		
-	actualType:: mixin.
+	actualType:: classDeclaration instanceSide.
 	 
 	 [nil ~= actualType] whileTrue:[
 		m:: actualType methods findMirrorNamed: selector.
 		nil ~= m ifTrue:[^m].
 		actualType:: actualType enclosingMixin.
-		].
-       ^nil	
-)
-public hash ^ <Integer> = (
-	^mixin hash bitXor: class hash
+		]. (* lexical scope *)
+	^(objectTypeFor: classDeclaration) at: selector. (* check self *)
 )
 public isKindOfHereType ^ <Boolean> = (
 	^true
@@ -355,12 +365,29 @@ supertype ^ <ObjectType> = (
 )
 ) : (
 )
-class OuterType for: m <MixinMirror> = PseudoType for: m path: {#@Outer} (
-(* The type of outer inside mixin m. *)) (
+class OuterType for: c <ClassDeclarationMirror> = PseudoType for: c path: {#@Outer} (
+(* The type of outer inside class declaration c. *)) (
 'as yet unclassified'
 public = o   = (
 	o isKindOfOuterType ifFalse:[^false].
-	^mixin = o mixin
+	^classDeclaration = o classDeclaration
+)
+findMethod: selector <Symbol> ^ <Mirror> = (
+(* Return a mirror representing 
+the outer class named selector in
+this type's classDeclaration *)
+| actualType <MixinMirror>  m <MethodMirror> |
+	actualType:: classDeclaration  enclosingClass.
+	 
+	 [nil ~= actualType] whileTrue:[
+		m:: actualType instanceSide nestedClasses findMirrorNamed: selector.
+		nil ~= m ifTrue:[^m].
+		actualType simpleName = selector ifTrue:[^actualType].
+		(* usually, we'd find it at the next level, but for the top level
+		   we need to check here *)
+		actualType:: actualType enclosingClass.
+		]. (* lexical scope *)
+	^nil
 )
 public isKindOfOuterType ^ <Boolean> = (
 	^true
@@ -369,6 +396,7 @@ public subtypeOf: t <Type> ^ <Boolean> = (
   ^ self = t
 )
 supertype ^ <ObjectType> = ( 
+(* No one should be asking an outer type for its supertype *) 
 	^ObjectType forPath: {#Object}
 )
 ) : (
@@ -391,16 +419,35 @@ public unaryTypeOpNode: node <UnaryTypeOpAST> ^ <List[Symbol]> = (
 )
 ) : (
 )
-class PseudoType for: m <MixinMirror> path: p <List[Symbol]> = ObjectType forPath: p (
-(* A type for pseudo variables like here and outer. *)|
-	public mixin <MixinMirror> = m.
+class PseudoType for: c <ClassDeclarationMirror> path: p <List[Symbol]> = ObjectType forPath: p (
+(* An abstract type for pseudo variables like here and outer. *)|
+	public classDeclaration <ClassDeclarationMirror> = c.
 |) (
 'as yet unclassified'
-public = o   = ( (* BOGUS *)
-   mixin = o mixin
+public = o   = ( 
+(* If we add any new subclass, must test for it here too
+so that we never answer true if one of these some how
+gets instantiated. *)
+   o isKindOfPseudoType ifFalse:[^false].
+   o isKindOfHereType ifTrue:[^false].
+   o is isKindOfOuterType ifTrue:[^false].
+   classDeclaration = o classDeclaration
+)
+public at: selector <Symbol> ^ <FunctionType> = (
+(* override superclass to avoid access check. Maybe we just want to create ab overridable access check to be called
+from ObjectType>>at: instead?  *)
+  | m <MethodMirror> =  findMethod: selector. signature <MessagePatternAST> |
+  
+  nil = m ifTrue:[^errorType].
+  signature:: parser messagePattern parse: m source. (* parse the message pattern *)
+  (* deal with substitution of Self, Instance? *)
+  ^(signature apply: selfSubstitution) apply: myTypeBuilder (* and build a function type *)
 )
 public hash ^ <Integer> = (
-	^mixin hash bitXor: class hash
+	^classDeclaration hash bitXor: class hash
+)
+public isKindOfPseudoType ^ <Boolean> = (
+	^true
 )
 ) : (
 )
@@ -692,6 +739,10 @@ invalidateDependenciesOn: declaration <Declaration> ^ <Set[Declaration]>  = (
 	^invalidDeclarations
 )
 lookupPathForType: typeName <Symbol> ^ <List[Symbol]> = (
+(* Compute path for a type name referenced in the class 
+currently being typechecked. first lookup in lexical scope; 
+if not found, check self; otherwise check surrounding 
+namespace *)
       | path <List[Symbol]> f <FunctionType> |
 
 	path:: pathFor: typeName inClass: currentClass.
@@ -708,6 +759,10 @@ lookupPathForType: typeName <Symbol> ^ <List[Symbol]> = (
 	    ].
 )
 lookupPathForType: typeName <Symbol> inClass: klass <ClassDeclarationMirror> ^ <List[Symbol]> = (
+(* Compute path for a type name referenced in the class 
+klass. first lookup in lexical scope of klass; 
+if not found, check klass (including supertypes); otherwise 
+check surrounding namespaces (conflict and regular)*)
       | path <List[Symbol]> f <FunctionType> otype <ObjectType> |
 
 	path:: pathFor: typeName inClass: klass.
@@ -721,14 +776,6 @@ lookupPathForType: typeName <Symbol> inClass: klass <ClassDeclarationMirror> ^ <
 			^namespaceLookupPathForType: typeName ofType:  (otype path first).
 			]
 		]
-)
-lookupType: typeName <Symbol>  = (
-| t |
-	^(currentConflictNamespace at: typeName) ifAbsent:[
-		t:: namespace at: typeName.
-		t isNamespace ifFalse:[^t].
-            assert: [false] message: 'Inconsistency: object type seeking non-existent entry for itself'
-		]	
 )
 public messageNode: node  <MessageAST> ^ <List[ObjectType]>= (
 	^node arguments collect:[:e <ExpressionAST> | e apply: self]
@@ -758,6 +805,13 @@ namespaceFor: typeName <Symbol> ^ <Map[Symbol, Object]> = (
 	^namespace at: (typeName, ' conflicts') asSymbol ifAbsent:[namespace]
 )
 namespaceLookupPathForType: typeName <Symbol> ofType: toplevelTypeName <Symbol> = (
+(* Given typeName, a simple name of a top level type 
+referenced by a top level class named toplevelTypeName, 
+compute a path for it.  Check if the namespace we are
+typechecking against includes a conflict namespace for
+toplevelTypeName, and if so if typeName is defined there.
+Otherwise, check the main namespace.
+*)
 	| 
 	conflictNamespaceName <Symbol> = (toplevelTypeName, ' conflicts') asSymbol.
 	conflictNamespace <Map[Symbol, Class]> 
@@ -797,19 +851,27 @@ objectTypeFor: c <ClassDeclarationMirror> ^ <ObjectType> = (
 	^ObjectType forPath: (pathForMixin: c instanceSide)
 )
 pathFor: typeName <Symbol> inClass: klass <ClassDeclarationMirror> ^ <List[Symbol]> = (
+(* Compute path for the name typeName referenced  in klass and
+defined in klasses'  lexical scope. Check klass, and if not found
+recurse up the enclosing class chain.
+*)
       nil = klass ifTrue:[^{}]. (* got to the top level *)
 	(typeSelector: typeName declaredIn: klass) ifTrue:[
 		(* is this a selector of the class we are looking at *)
-		^(pathForMixin: klass mixin) add: typeName
+		^(pathForMixin: klass mixin), {typeName}
 		(* if so , the path is the path for this class with the type name appended*)
 		].
 	^pathFor: typeName inClass: klass enclosingClass.
 	(* otherwise, recurse on the enclosing class *)
 )
 pathForMixin: mixin <MixinMirror> ^ <List[Symbol]> = (
+(* Compute the path for mixin *)
 	| enclosingMixin = mixin enclosingMixin. |
 	enclosingMixin = nil ifTrue: [^{mixin simpleName}].
-	^{pathForMixin: enclosingMixin} add: mixin simpleName
+	(* A top level mixin's path includes only its simple name *)
+	^(pathForMixin: enclosingMixin), {mixin simpleName}
+	(* Otherwise, it is the path of its enclosing mixin with
+	its simple name appended *)
 )
 popScope ^ <Scope> = (
   ^scopeStack removeLast
@@ -893,7 +955,7 @@ type: sub <Type> isSubtypeOf: sup <Type> ^ <Boolean> = (
 		].
 )
 typeOfHere ^ <ObjectType> = (
-	^HereType for: currentClass instanceSide
+	^HereType for: currentClass 
 )
 typeOfLocal: varName <Symbol> ^ <ObjectType> = (
 	 ^currentScope at: varName ifAbsent:[]

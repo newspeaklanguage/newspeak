@@ -18,7 +18,7 @@ e. UnionType, defined by a list of types that are acceptable at a given point.
 f. GenericType, defined by an object type representing the generic, and a list of type arguments. For the time being, we largely ignore generics.
 g. TypeVariable, defined by a path that starts with its name, and a bound, which is a type.
 
-In addition, there are pseudo types used to represent the types of the lexical scope (the here of here sends) and of outer.
+In addition, there are pseudo types used to represent the receiver types of self, super, here and outer sends.  Each such type captures the special lookup rules of the corresponding send, especially wrt access control. This ensures that for each kind of send, the type corresponds to methods that are valid.
 
 The typechecker is designed to be incremental. The basic ideas go back as far as the Cecil typechecker, but are properly explained in the context of Scala optimization in the OOPSLA 2016 paper: Parallel Incremental Whole-Program Optimizations for Scala.js.
 
@@ -78,6 +78,7 @@ private ParameterizedTypeAST = astModule ParameterizedTypeAST.
 private UnaryTypeOpAST = astModule UnaryTypeOpAST.
 private BinaryTypeOpAST = astModule BinaryTypeOpAST.
 private MessagePatternAST = astModule MessagePatternAST.
+private VarDeclAST = astModule VarDeclAST.
 
 private ClassDeclarationMirror = p mirrors ClassDeclarationMirror.
 private MixinMirror = p mirrors MixinMirror.
@@ -220,7 +221,7 @@ public = o   = (
 	o isKindOfHereType ifFalse:[^false].
 	^classDeclaration = o classDeclaration
 )
-findMethod: selector <Symbol> ^ <Mirror> = (
+findMember: selector <Symbol> ^ <Mirror> = (
 (* Return the mirror representing selector in 
 this type's classDeclaration. Check if it is a 
 reserved word, otherwise look for a method 
@@ -230,10 +231,10 @@ defined on classDeclaration*)
 	({#true. #false} includes: selector) 
 		ifTrue:[^mirrorForObjectType: (literal: #Boolean)]. 
 	(* check reserved words *)	
-	^findOwnMethod: selector
+	^findOwnMember: selector
 )
-findOwnMethod: selector <Symbol> ^ <Mirror> = (
-(* Find the method named selector defined the this 
+findOwnMember: selector <Symbol> ^ <Mirror> = (
+(* Find the method named selector defined in this 
 type's classDeclaration. First check for local slots
 or formal parameters in the current method/block
 scope, otherwise climb the enclosing class hierarchy
@@ -250,6 +251,10 @@ classDeclaration (i.e., "self" ). *)
 	 [nil ~= actualType] whileTrue:[
 		m:: actualType methods findMirrorNamed: selector.
 		nil ~= m ifTrue:[^m].
+		m:: actualType slots findMirrorNamed: selector.
+		m != nil ifTrue:[^m]. (* what about setters? *)
+		m:: actualType nestedClasses findMirrorNamed: selector.
+		m != nil ifTrue:[^m].
 		actualType:: actualType enclosingMixin.
 		]. (* lexical scope *)
 	^(objectTypeFor: classDeclaration) at: selector. (* check self *)
@@ -289,7 +294,7 @@ public = o ^ <Boolean> = (
 	^path = o path
 )
 public at: selector <Symbol> ^ <FunctionType> = (
-  | m <MethodMirror> =  findMember: selector. signature <MessagePatternAST> |
+  | m <Mirror> =  findMember: selector. signature <MessagePatternAST> |
   
   nil = m ifTrue:[^errorType].
   m accessModifier ~= #public ifTrue:[^accessErrorType].
@@ -298,18 +303,29 @@ public at: selector <Symbol> ^ <FunctionType> = (
   ^(signature apply: selfSubstitution) apply: myTypeBuilder (* and build a function type *)
 )
 findMember: selector <Symbol> ^ <Mirror> = (
-	| actualType <ClassDeclarationMirror> superklass <ClassDeclarationMirror> m <MethodMirror> |
+	| 
+	actualType <ClassDeclarationMirror> 
+	superklass <ClassDeclarationMirror> 
+	m <MethodMirror> 
+	truncated <Symbol> = selector allButLast asSymbol.
+	|
 	 actualType:: mirrorForObjectType: self.
 	 
 	 [actualType ~= nil] whileTrue:[
 		m:: actualType instanceSide methods findMirrorNamed: selector.
 		m != nil ifTrue:[^m].
-		m:: actualType instanceSide slots findMirrorNamed: selector.
-		m != nil ifTrue:[^m]. (* what about setters? *)
-		m:: actualType instanceSide nestedClasses findMirrorNamed: selector.
-		m != nil ifTrue:[^m].
-		actualType:: actualType superclass.
-		].
+		selector last asSymbol = ':' ifTrue:[ (* wasteful to test this at every level *)
+			m:: actualType instanceSide slots findMirrorNamed: truncated.
+			(* assume it's a setter and look for its slot *)
+			(m != nil and: [m isMutable]) ifTrue:[^m].
+			] ifFalse:[
+				m:: actualType instanceSide slots findMirrorNamed: selector.
+				m != nil ifTrue:[^m]. 
+				m:: actualType instanceSide nestedClasses findMirrorNamed: selector.
+				m != nil ifTrue:[^m].
+				actualType:: actualType superclass.
+				]
+			].
        ^errorType
 )
 public hash ^ <Integer> = (
@@ -345,6 +361,19 @@ selfIdAST  ^ <AST> = (
 selfSubstitution ^ <Substitutor> = ( (* we should cache these out the object type *)
 	 ^Substitutor forSubstitution: (Map new at: #Self put: selfIdAST)
 )
+setterSignatureForSlot: m <SlotDeclarationMirror> ^ <MessagePatternAST> = (
+	(* BOGUS. SlotDeclarationMirrors do not provide access to their true source with type declaration! *)
+	| ast <SlotDeclarationAST> = parser slotDeclaration parse: m source. slotType <AST> param |
+	slotType:: ast type.
+	nil = slotType ifTrue:[slotType:: errorType].
+	param = VarDeclAST name: m name type: slotType.
+	^MessagePatternAST new 
+		selector: m name; 
+		parameters: {param};
+		returnType: slotType; 
+		accessModifier: m accessModifier;
+		yourself
+)
 signatureFor: m <Mirror> ^ <MessagePatternAST> = (
 	
 	^m isKindOfMethodMirror ifTrue:[
@@ -365,19 +394,20 @@ signatureForNestedClass: m <ClassDeclarationMirror> ^ <MessagePatternAST> = (
 		selector: m name; 
 		parameters: {};
 		returnType: classType; 
-		accessModifier: m accessModiifer;
+		accessModifier: m accessModifier;
 		yourself
 )
 signatureForSlot: m <SlotDeclarationMirror> ^ <MessagePatternAST> = (
 	(* BOGUS. SlotDeclarationMirrors do not provide access to their true source with type declaration! *)
 	| ast <SlotDeclarationAST> = parser slotDeclaration parse: m source. slotType <AST>  |
+	m name last asSymbol = ':' ifTrue:[^setterSignatureForSlot: m].
 	slotType:: ast type.
 	nil = slotType ifTrue:[slotType:: errorType].
 	^MessagePatternAST new 
 		selector: m name; 
 		parameters: {};
 		returnType: slotType; 
-		accessModifier: m accessModiifer;
+		accessModifier: m accessModifier;
 		yourself
 )
 public subtypeOf: t <Type> ^ <Boolean> = (
@@ -411,11 +441,11 @@ public = o   = (
 	o isKindOfOuterType ifFalse:[^false].
 	^classDeclaration = o classDeclaration
 )
-findMethod: selector <Symbol> ^ <Mirror> = (
+findMember: selector <Symbol> ^ <ClassDeclarationMirror> = (
 (* Return a mirror representing 
 the outer class named selector in
 this type's classDeclaration *)
-| actualType <MixinMirror>  m <MethodMirror> |
+| actualType <ClassDeclarationMirror>  m <MethodMirror> |
 	actualType:: classDeclaration  enclosingClass.
 	 
 	 [nil ~= actualType] whileTrue:[
@@ -430,6 +460,18 @@ this type's classDeclaration *)
 )
 public isKindOfOuterType ^ <Boolean> = (
 	^true
+)
+signatureForNestedClass: m <ClassDeclarationMirror> ^ <MessagePatternAST> = (
+(* override superclass so that we get the instance side, not the class side.
+This is because outer N signifies a receiver that is an instance of N
+whereas normally, a nested class N, gives us a receiver of type N class.
+*)
+	^MessagePatternAST new 
+		selector: m name; 
+		parameters: {};
+		returnType: (TypeIdAST new name: m name; yourself); 
+		accessModifier: m accessModifier;
+		yourself
 )
 public subtypeOf: t <Type> ^ <Boolean> = (
   ^ self = t
@@ -475,7 +517,7 @@ gets instantiated. *)
 public at: selector <Symbol> ^ <FunctionType> = (
 (* override superclass to avoid access check. Maybe we just want to create an overridable access check to be called
 from ObjectType>>at: instead?  *)
-  | m <MethodMirror> =  findMember: selector. signature <MessagePatternAST> |
+  | m <Mirror> =  findMember: selector. signature <MessagePatternAST> |
   
   nil = m ifTrue:[^errorType].
   signature:: signatureFor: m.
@@ -495,6 +537,82 @@ class Query = (
 'as yet unclassified'
 public invalidate = (
 	subclassResponsibility
+)
+) : (
+)
+class SelfType for: c <ClassDeclarationMirror> path: p <List[Symbol]> = PseudoType for: c path: p (
+(* The type of the pseudovariable 'self'. As usual, the motivation is access control.
+Because self sends behave differently wrt access control, type enforcement must be 
+specialized as it is here.
+*)) (
+'as yet unclassified'
+public = o ^ <Boolean> = (
+	o isKindOfSelfType ifFalse:[^false].
+	^classDeclaration = o classDeclaration
+)
+public at: selector <Symbol> ^ <FunctionType> = (
+  | m <Mirror> =  findLocalMember: selector. signature <MessagePatternAST> |
+  
+	nil = m ifTrue:[
+		m::  findInheritedMember: selector.
+		nil = m ifTrue:[^errorType].
+		m accessModifier = #private ifTrue:[^accessErrorType].
+		].
+	signature:: signatureFor: m. 
+	 (* deal with substitution of Self, Instance? *)
+	^(signature apply: selfSubstitution) apply: myTypeBuilder (* and build a function type *)
+)
+findInheritedMember: selector <Symbol> ^ <Mirror> = (
+	| 
+	actualType <ClassDeclarationMirror> 
+	superklass <ClassDeclarationMirror> 
+	m <MethodMirror> 
+	truncated <Symbol> = selector allButLast asSymbol.
+	|
+	actualType:: classDeclaration superclass.
+	 
+	 [actualType ~= nil] whileTrue:[
+		m:: actualType instanceSide methods findMirrorNamed: selector.
+		m != nil ifTrue:[^m].
+		selector last asSymbol = ':' ifTrue:[ (* wasteful to test this at every level *)
+			m:: actualType instanceSide slots findMirrorNamed: truncated.
+			(* assume it's a setter and look for its slot *)
+			(m != nil and: [m isMutable]) ifTrue:[^m].
+			] ifFalse:[
+				m:: actualType instanceSide slots findMirrorNamed: selector.
+				m != nil ifTrue:[^m]. 
+				m:: actualType instanceSide nestedClasses findMirrorNamed: selector.
+				m != nil ifTrue:[^m].
+				actualType:: actualType superclass.
+				]
+			].
+       ^nil
+)
+findLocalMember: selector <Symbol> ^ <Mirror> = (
+	| 
+	actualType <ClassDeclarationMirror> 
+	superklass <ClassDeclarationMirror> 
+	m <MethodMirror> 
+	truncated <Symbol> = selector allButLast asSymbol.
+	|
+	actualType:: mirrorForObjectType: self.
+	m:: actualType instanceSide methods findMirrorNamed: selector.
+	m != nil ifTrue:[^m].
+	selector last asSymbol = ':' ifTrue:[ 
+		m:: actualType instanceSide slots findMirrorNamed: truncated.
+		(* assume it's a setter and look for its slot *)
+		(m != nil and: [m isMutable]) ifTrue:[^m].
+		] ifFalse:[
+		m:: actualType instanceSide slots findMirrorNamed: selector.
+		m != nil ifTrue:[^m]. 
+		m:: actualType instanceSide nestedClasses findMirrorNamed: selector.
+		m != nil ifTrue:[^m].
+		actualType:: actualType superclass.
+		].
+       ^nil
+)
+public isKindOfSelfType ^ <Boolean> = (
+	^true
 )
 ) : (
 )
@@ -581,6 +699,35 @@ public invalidate = (
 	trail removeKey: self
 )
 public isKindOfSubtypeQuery ^ <Boolean> = (
+	^true
+)
+) : (
+)
+class SuperType for: c <ClassDeclarationMirror> path: p <List[Symbol]> = PseudoType for: c path: p (
+(* The type of the pseudovariable super. Here, c represents the mirror on the superclass
+of the class being typechecked.
+
+The main reason for having a special type is to ensure correct access control,
+since super sends behave differenty than either self sends or normal sends.
+ *)) (
+'as yet unclassified'
+public = o   = (
+	o isKindOfSuperType ifFalse:[^false].
+	^classDeclaration = o classDeclaration
+)
+public at: selector <Symbol> ^ <FunctionType> = (
+  | m <Mirror> =  findMember: selector. signature <MessagePatternAST> |
+  
+  nil = m ifTrue:[^errorType].
+  m accessModifier = #private ifTrue:[^accessErrorType].
+(* protected or public access is ok *)
+  signature:: signatureFor: m. 
+  (* deal with substitution of Self, Instance? 
+These must be substituted with the appropriate values
+for the current class, not the the superclass *)
+  ^(signature apply: selfSubstitution) apply: myTypeBuilder (* and build a function type *)
+)
+public isKindOfSuperType ^ <Boolean> = (
 	^true
 )
 ) : (
@@ -1003,11 +1150,11 @@ typeOfOuter ^ <ObjectType> = (
 	^OuterType for: currentClass mixin
 )
 typeOfSelf ^ <ObjectType> = (
-      | currentType <ObjectType> = objectTypeFor: currentClass. |
+      | currentType <ObjectType> = SelfType for: currentClass path: (pathForMixin: currentClass instanceSide), {#self} . |
 	^TypeVariable named: #Self bound: currentType forType: currentType.
 )
 typeOfSuper ^ <ObjectType> = (
-	^ObjectType forPath: (lookupPathForType: currentClass superclass simpleName)
+	^SuperType for: currentClass superclass path: (lookupPathForType: currentClass simpleName), {#super}
 )
 typeSelector: typeName <Symbol> declaredIn: klass <ClassDeclarationMirror> ^ <Boolean> = (
 	| mixin <MixinMirror> = klass instanceSide. candidate <Mirror> |

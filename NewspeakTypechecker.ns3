@@ -3,11 +3,11 @@ Newspeak3
 class NewspeakTypechecker usingPlatform: p ide: ide ast: astModule namespace: ns = (
 (* A visitor that computes the type of a Newspeak program.
 
-Newspeak has no global namespace, but a nominal typechecker needs one. The typechecker takes a namespace as a parameter to its factory.  All types are identified by a fully qualified name that is rooted in a top level class that is stored in this namespace. If a class named C uses a type that conflicts with the top level namespace, then a special conflict namespace #'C conflicts' is added to the top level and is consulted before looking up things at the top level. The typechecker does not look into other nested namespaces.
+Newspeak has no global namespace, but a nominal typechecker needs one. The typechecker takes a namespace as a parameter to its factory.  All types are identified by a fully qualified name that is rooted in a top level class that is stored in this namespace. Well, almost.  If a class named C uses a type that conflicts with the top level namespace, then a special conflict namespace #'C conflicts' is added to the top level and is consulted before looking up things at the top level. The typechecker does not look into other nested namespaces.
 
 Fully qualified names are used to define object types (see below). The checker has utilities to convert between classes and object types.
 
-The Type hierarchy consists of:
+Types are represented via a class hierarchy that consists of:
 
 a. Type, the abstract class at the top of the hierarchy.
 b. ObjectType, which is defined by an immutable list of symbols that defines a class as a path of class names starting from a top level class (a fully qualified name).
@@ -17,8 +17,7 @@ d. ErrorType, the magical type that is a subtype and supertype of everything and
 e. UnionType, defined by a list of types that are acceptable at a given point.
 f. GenericType, defined by an object type representing the generic, and a list of type arguments. For the time being, we largely ignore generics.
 g. TypeVariable, defined by a path that starts with its name, and a bound, which is a type.
-
-In addition, there are pseudo types used to represent the receiver types of self, super, here and outer sends.  Each such type captures the special lookup rules of the corresponding send, especially wrt access control. This ensures that for each kind of send, the type corresponds to methods that are valid.
+h. Pseudo types (subclasses of PseudoType) used to represent the receiver types of self, super, here and outer sends (respectively SelfType, SuperType, HereType, OuterType).  Each such type captures the special lookup rules of the corresponding send, especially wrt access control. This ensures that for each kind of send, the type exposes  methods that are valid.
 
 The typechecker is designed to be incremental. The basic ideas go back as far as the Cecil typechecker, but are properly explained in the context of Scala optimization in the OOPSLA 2016 paper: Parallel Incremental Whole-Program Optimizations for Scala.js.
 
@@ -34,8 +33,10 @@ d. Query results are cached, and invalidated if the source code they depend on h
  1. Note when a given change is made and invalidate its dependent queries, or 
  2. Compute a diff when a typecheck starts, and use it to decide which changes have been made, and thus invalidate any dependent 
       queries.
-  Each kind of query has its results cached separately. Signature query results are stored in cachedTypes. Subtype query results are 
-  cached in trail (The term trail originates in algorithms dealing with recursive types, as far back as Algol 68).
+  There are two kinds of queries: SignatureQuery, representing signatures of members, and SubtypeQuery, representing the results of
+  subtype tests (more on these below). Each kind of query has its results cached separately. Signature query results are stored in
+  cachedTypes. Subtype query results are cached in trail (The term trail originates in algorithms dealing with recursive types, as far
+  back as Algol 68).
 
 e. Memory required grows linearly with program size, as both the number of methods and the queries about them are proportional to code size. 
 
@@ -51,7 +52,7 @@ We maintain three maps of dependencies:
 
 a. dependentDeclarations. A Map[Query, Set[Declaration]] which lists, for each query q, all declarations whose typecheck required q.
 b. dependentQueries. A Map[Declaration, Set[Query]] which lists, for each declaration d, all queries that refer to d.
-c. queriesOfDeclaration. A Map[Declaration, Set[Query]] which lists, for each declaration d, all queries that d used it its last typecheck.
+c. queriesOfDeclaration. A Map[Declaration, Set[Query]] which lists, for each declaration d, all queries that d used in its last typecheck.
 
 Declarations can be methods but also class headers.
 
@@ -492,11 +493,11 @@ public typeIdNode: node <TypeIdAST> ^ <List[Symbol]> = (
 	^lookupPathForType: node name inClass: surroundingClass
 )
 public unaryTypeOpNode: node <UnaryTypeOpAST> ^ <List[Symbol]> = (
-	| operator <Symbol> | (* what about qualified types? *)
+	| operator <Symbol> | 
 	operator:: node operator.
-	(operator = #class or:[operator = #instance or:[operator = #def and:[self target isTypeVar]]])
-		 ifFalse:[error: 'No unary type operator ', operator at: {node operand concreteEnd + 1. node concreteEnd}].
-	^(node operand apply: self) add: node operator
+	(operator = #class or: [operator = #instance or: [operator = #def and: [self target isTypeVar]]])
+		 ifFalse: [error: 'No unary type operator ', operator at: {node operand concreteEnd + 1. node concreteEnd}].
+	^(node operand apply: self), {node operator}
 )
 ) : (
 )
@@ -741,31 +742,33 @@ public subtypeOf: t <Type> ^ <Boolean> = (
 ) : (
 )
 class TypeBuilder forTypesIn: klass <ClassDeclarationMirror> = (
-(* A visitor that creates a Type from an AST representing a type. *)| surroundingClass <ClassDeclarationMirror> = klass. |assert:[klass isMirror] message: '') (
+(* A visitor that creates a Type from an AST representing a type. *)| 
+surroundingClass <ClassDeclarationMirror> = klass. 
+pathFinder <PathFinder> = PathFinder forTypesIn: surroundingClass.
+|assert: [klass isMirror] message: '') (
 'as yet unclassified'
 public binaryTypeOpNode: node <BinaryTypeOpAST> ^ <Type> = (
-	| l = node leftOperand apply: self. r = node rightOperand apply: self. operand |
-	operand:: node operand.
-	operand = '|' ifTrue:[^UnionType unifying: {l. r}].
+	| l = node leftOperand apply: self. r = node rightOperand apply: self. |
+	node operator = '|' ifTrue: [^UnionType unifying: {l. r}].
 	^errorType
 )
 public genericInvocationNode: node <GenericType> = (
 	| generic <ObjectType> tas <List[ObjectType]>  |
 	
 	generic:: node generic apply: self.
-	tas:: node arguments collect:[:a <AST> | a apply: self].
+	tas:: node arguments collect: [:a <AST> | a apply: self].
 	^GenericType generic: generic typeArguments: tas
 )
 public messagePatternNode: node <MessagePatternAST> ^ <FunctionType> = (
      ^ FunctionType 
-		domain:  (node parameters collect:[:p <VarDeclNode> | p type apply: self])
+		domain:  (node parameters collect: [:p <VarDeclNode> | p type apply: self])
 		range: ((returnTypeFor: node) apply: self)
 )
 public typeIdNode: node <TypeIdAST> ^ <Type> = (
 	^ObjectType forPath: (lookupPathForType: node name inClass: surroundingClass)
 )
 public unaryTypeOpNode: node <UnaryTypeOpAST> ^ <ObjectType> = (
-	^ObjectType forPath: (node apply: (PathFinder forTypesIn: surroundingClass))
+	^ObjectType forPath: (node apply: pathFinder)
 )
 ) : (
 )
@@ -838,7 +841,7 @@ public codeBodyNode: node ^ <ObjectType> = (
 
     (* pushScope (if we have a map) or just nest a new one *)
     nestScope: Scope new.
-    node temporaries do:[:t <VarDecl>  | t apply: self].
+    node temporaries do: [:t <VarDecl>  | t apply: self].
 
 	(* Parameters are not typechecked here. For method bodies, the parameters are
 	copied from the signature and are checked there. For block bodies, the parameters
@@ -846,15 +849,15 @@ public codeBodyNode: node ^ <ObjectType> = (
 	scopes are factored out of the ASTs.*)
 
     lastStatementType:: (TypeIdAST new name: #Nil) apply: typeBuilder.
-    node statements do:[:s <Statement>  | lastStatementType:: s apply: self].
+    node statements do: [:s <Statement>  | lastStatementType:: s apply: self].
     popScope.
     ^lastStatementType.
 )
 currentConflictNamespace = (
-	^namespace at: (currentTopLevelClass simpleName, ' conflicts') asSymbol ifAbsent:[Map new]
+	^namespace at: (currentTopLevelClass simpleName, ' conflicts') asSymbol ifAbsent: [Map new]
 )
 currentConflictNamespaceHasEntryFor: typeName <Symbol>  = (
-	namespace at: (currentTopLevelClass simpleName, ' conflicts') asSymbol ifAbsent:[^false].
+	namespace at: (currentTopLevelClass simpleName, ' conflicts') asSymbol ifAbsent: [^false].
 	^true
 )
 currentScope ^ <Scope> = (
@@ -876,14 +879,14 @@ functionTypeOf: node <SendASTNode> ^ <MsgSignature> = (
 	selector:: node message selector.
 	receiverType:: node receiver apply: self.
 	query:: SignatureQuery type: receiverType selector: selector.
-	cachedType:: cachedTypes at: query ifAbsent:[
+	cachedType:: cachedTypes at: query ifAbsent: [
 		cachedTypes at: query put: (receiverType at: selector).
 		].
 	registerDependenciesOfQuery: query.
-	cachedType isKindOfAccessErrorType ifTrue:[
+	cachedType isKindOfAccessErrorType ifTrue: [
 		error: selector, ' is defined, but is not publicly accessible' at: {node concreteStart. node concreteEnd}
-		] ifFalse:[
-		cachedType isKindOfErrorType ifTrue:[
+		] ifFalse: [
+		cachedType isKindOfErrorType ifTrue: [
 			error: selector, ' is not defined on type ', receiverType name at: {node concreteStart. node concreteEnd}
 			].
 		].
@@ -895,7 +898,7 @@ public genericInvocationNode: node ^ <ObjectType> = (
 (* This will have to change to accomodate generic terms that are not classes  - mixins, or (in the near future) reflective representatives of a types. We also need to verify that the target is a term. For the immediate future, this is sufficient to type generic classes only.
 *)
 
-myType:: UnaryTypeOpAST new target:(GenericApplicationType new apply: (TypeIdAST new setId: node target name) to: node actuals) selector: #class.
+myType:: UnaryTypeOpAST new target: (GenericApplicationType new apply: (TypeIdAST new setId: node target name) to: node actuals) selector: #class.
 myType wellFormed.
 ^myType
 )
@@ -918,7 +921,7 @@ invalidateDependenciesOn: declaration <Declaration> ^ <Set[Declaration]>  = (
 (* Will invalidate all queries that depended on the declaration. *)
       | queries <Set[Query]> invalidDeclarations <Set[Declaration]> = Set new. |
       queries:: dependentQueries at: declaration.
-	queries do:[:q <Query> | 
+	queries do: [:q <Query> | 
 		q invalidate.
 		invalidDeclarations addAll: (dependentDeclarations at: q)
 		].
@@ -933,38 +936,38 @@ namespace *)
 
 	path:: pathFor: typeName inClass: currentClass.
 	^path isEmpty
-	    ifFalse:[path]
-	    ifTrue:[
+	    ifFalse: [path]
+	    ifTrue: [
 		f:: typeOfSelf at: typeName. 
 		(* No lexical definition. Check self*)
-		f isKindOfErrorType ifTrue:[
-			namespace at: typeName ifAbsent:[^{}].
+		f isKindOfErrorType ifTrue: [
+			namespace at: typeName ifAbsent: [^{}].
 			^{typeName}
-			] ifFalse:[^(objectTypeFor:currentClass) path, {typeName}].
+			] ifFalse: [^(objectTypeFor: currentClass) path, {typeName}].
 		(* maybe use typeOfSelf bound? *)
 	    ].
 )
 lookupPathForType: typeName <Symbol> inClass: klass <ClassDeclarationMirror> ^ <List[Symbol]> = (
 (* Compute path for a type name referenced in the class 
-klass. first lookup in lexical scope of klass; 
+klass. First lookup in lexical scope of klass; 
 if not found, check klass (including supertypes); otherwise 
 check surrounding namespaces (conflict and regular)*)
       | path <List[Symbol]> f <FunctionType> otype <ObjectType> |
 
 	path:: pathFor: typeName inClass: klass.
 	^path isEmpty
-	    ifFalse:[path]
-	    ifTrue:[
+	    ifFalse: [path]
+	    ifTrue: [
 		otype:: objectTypeFor: klass.
 		f:: otype at: typeName. 
 		(*  No lexical definition. Check klass *)
-		f isKindOfErrorType ifTrue:[
-			^namespaceLookupPathForType: typeName ofType:  (otype path first).
-			]
+		^f isKindOfErrorType ifTrue: [
+			namespaceLookupPathForType: typeName ofType:  (otype path first).
+			] ifFalse: [otype path, {typeName}] (*Er, this won't be canonical *)
 		]
 )
 public messageNode: node  <MessageAST> ^ <List[ObjectType]>= (
-	^node arguments collect:[:e <ExpressionAST> | e apply: self]
+	^node arguments collect: [:e <ExpressionAST> | e apply: self]
 )
 public messagePatternNode: node ^ <FunctionType> = (
       ^node apply: typeBuilder
@@ -980,15 +983,15 @@ public methodNode: node <MethodAST> ^ <MsgSignature>  = (
     )
 mirrorForObjectType: o <ObjectType> ^ <ClassDeclarationMirror> = (
 	| topName <Symbol> = o path first. mirror <ClassDeclarationMirror> |
-	mirror:: ClassDeclarationMirror reflecting: (currentConflictNamespace at: topName ifAbsent:[namespace at: topName]) mixin. 
-	2 to: o path size do:[:i <Integer> | | id <Symbol> = o  path at: i. |
-		id = #'@Here' ifTrue:[^mirror].
+	mirror:: ClassDeclarationMirror reflecting: (currentConflictNamespace at: topName ifAbsent: [namespace at: topName]) mixin. 
+	2 to: o path size do: [:i <Integer> | | id <Symbol> = o  path at: i. |
+		id = #'@Here' ifTrue: [^mirror].
 		mirror:: mirror instanceSide nestedClasses findMirrorNamed: id.
 		].
 	^mirror
 )
 namespaceFor: typeName <Symbol> ^ <Map[Symbol, Object]> = (
-	^namespace at: (typeName, ' conflicts') asSymbol ifAbsent:[namespace]
+	^namespace at: (typeName, ' conflicts') asSymbol ifAbsent: [namespace]
 )
 namespaceLookupPathForType: typeName <Symbol> ofType: toplevelTypeName <Symbol> = (
 (* Given typeName, a simple name of a top level type 
@@ -1003,12 +1006,12 @@ Otherwise, check the main namespace.
 	conflictNamespace <Map[Symbol, Class]> 
 	conflictClass <Class>
 	|
-	conflictNamespace:: namespace at: conflictNamespaceName ifAbsent:[]. 
-	nil = conflictNamespace ifFalse:[
-		conflictClass:: conflictNamespace at: typeName ifAbsent:[].
-		nil = conflictClass ifFalse:[^{conflictNamespaceName. typeName}].
+	conflictNamespace:: namespace at: conflictNamespaceName ifAbsent: []. 
+	nil = conflictNamespace ifFalse: [
+		conflictClass:: conflictNamespace at: typeName ifAbsent: [].
+		nil = conflictClass ifFalse: [^{conflictNamespaceName. typeName}].
 		].
-	namespace at: typeName ifAbsent:[^{}].
+	namespace at: typeName ifAbsent: [^{}].
 	^{typeName}
 )
 nestScope: s <Scope> = (
@@ -1022,8 +1025,8 @@ public normalSendNode: node <NormalSendASTNode> ^ <ObjectType> = (
 functionType::  functionTypeOf: node.
 domain:: functionType domain.
 args:: node message apply: self.
-1 to: args size do:[:i <Integer> | 
-	(type: (args at: i) isSubtypeOf: (domain at: i)) ifFalse:[
+1 to: args size do: [:i <Integer> | 
+	(type: (args at: i) isSubtypeOf: (domain at: i)) ifFalse: [
 		error: 'Argument is not a subtype of corresponding formal'
 		at: {(args at: i) concreteStart. (args at: i) concreteEnd}
 		]
@@ -1041,8 +1044,8 @@ pathFor: typeName <Symbol> inClass: klass <ClassDeclarationMirror> ^ <List[Symbo
 defined in klasses'  lexical scope. Check klass, and if not found
 recurse up the enclosing class chain.
 *)
-      nil = klass ifTrue:[^{}]. (* got to the top level *)
-	(typeSelector: typeName declaredIn: klass) ifTrue:[
+      nil = klass ifTrue: [^{}]. (* got to the top level *)
+	(typeSelector: typeName declaredIn: klass) ifTrue: [
 		(* is this a selector of the class we are looking at *)
 		^(pathForMixin: klass mixin), {typeName}
 		(* if so , the path is the path for this class with the type name appended*)
@@ -1066,27 +1069,27 @@ pushScope: scope <Scope> = (
 	scopeStack addLast: scope
 )
 registerDependenciesOfQuery: q <Query> = (
-	(dependentDeclarations at: q ifAbsent:[dependentDeclarations at: q put: Set new]) add: currentDeclaration.
-	q declarations do:[: d | (dependentQueries at: d ifAbsent:[dependentQueries at: d put: Set new]) add: q.].
-	(queriesOfDeclaration at: currentDeclaration ifAbsent:[queriesOfDeclaration at: currentDeclaration put: Set new]) add: q.	
+	(dependentDeclarations at: q ifAbsent: [dependentDeclarations at: q put: Set new]) add: currentDeclaration.
+	q declarations do: [: d | (dependentQueries at: d ifAbsent: [dependentQueries at: d put: Set new]) add: q.].
+	(queriesOfDeclaration at: currentDeclaration ifAbsent: [queriesOfDeclaration at: currentDeclaration put: Set new]) add: q.	
 )
 removeDependenciesOf:  declaration = (
 (* Wipe clean the set of queries  declaration depends on *)
       
-	dependentDeclarations do:[:ds <Set[Declaration]> | ds remove: declaration].
+	dependentDeclarations do: [:ds <Set[Declaration]> | ds remove: declaration].
 )
 public returnStatNode: node ^ <ObjectType> = (
     | returnType <ObjectType>   eType <ObjectType>  |
 
 eType:: node expression apply: self.
 ^(type: eType isSubtypeOf: currentReturnType)
-    ifTrue:[BottomType new]
-    ifFalse:[error: 'Type of returned expression is not a subtype of declared return type' at: {node concreteStart. node concreteEnd}]
+    ifTrue: [BottomType new]
+    ifFalse: [error: 'Type of returned expression is not a subtype of declared return type' at: {node concreteStart. node concreteEnd}]
     )
 returnTypeFor: node <MessagePatternAST> ^ <AST> = (
 	| returnType <ObjectType> |
 	returnType:: node returnType.
-	returnType = nil ifTrue:[^ TypeIdAST new name: #Self]. 
+	returnType = nil ifTrue: [^ TypeIdAST new name: #Self]. 
 	^returnType
 )
 public setterSendNode: node ^ <Type> = (
@@ -1094,7 +1097,7 @@ public setterSendNode: node ^ <Type> = (
 
     etype:: node expr apply: self.
     (etype subtypeOf: (node var type apply: self) assuming: trail)
-       ifFalse:[error: etype name, ' is not a subtype of ', node var type name at: {node concreteStart. node concreteEnd}].
+       ifFalse: [error: etype name, ' is not a subtype of ', node var type name at: {node concreteStart. node concreteEnd}].
     ^etype
 )
 public stringNode: node = (
@@ -1116,10 +1119,10 @@ tupleType <TupleType>
 
 sqTarget:: TypeIdAST new setId: #SeqCltn;  start: 0; end: 0.
 sqActuals:: OrderedCollection(*[ObjectType]*)  new.
-tupleActuals:: node value collect:[:e <Literal>  | e apply: self].
+tupleActuals:: node value collect: [:e <Literal>  | e apply: self].
 
 tupleActuals isEmpty 
-   ifTrue:[tupleActuals add: (TypeIdAST new setId: #DoesNotMatter)].
+   ifTrue: [tupleActuals add: (TypeIdAST new setId: #DoesNotMatter)].
 
 sqActual:: UnionType unifying: tupleActuals asSet asOrderedCollection.
 
@@ -1136,7 +1139,7 @@ type: sub <Type> isSubtypeOf: sup <Type> ^ <Boolean> = (
 	| query |
 	query:: SubtypeQuery subtype: sub supertype: sup.
 	registerDependenciesOfQuery: query.
-	^trail at: query ifAbsent:[
+	^trail at: query ifAbsent: [
 		trail at: query put: (sub subtypeOf: sup).		
 		].
 )
@@ -1144,7 +1147,7 @@ typeOfHere ^ <ObjectType> = (
 	^HereType for: currentClass 
 )
 typeOfLocal: varName <Symbol> ^ <ObjectType> = (
-	 ^currentScope at: varName ifAbsent:[]
+	 ^currentScope at: varName ifAbsent: []
 )
 typeOfOuter ^ <ObjectType> = (
 	^OuterType for: currentClass mixin
@@ -1158,10 +1161,13 @@ typeOfSuper ^ <ObjectType> = (
 )
 typeSelector: typeName <Symbol> declaredIn: klass <ClassDeclarationMirror> ^ <Boolean> = (
 	| mixin <MixinMirror> = klass instanceSide. candidate <Mirror> |
+	
+	typeName = #Self ifTrue: [^true]. (* every klass has a self type *)
+	typeName = #Instance ifTrue: [^true]. (* and an Instance type (or only allow for metaclasses?) *)
 	candidate:: mixin nestedClasses findMirrorNamed: typeName.
-	nil ~= candidate ifTrue:[^true].
+	nil ~= candidate ifTrue: [^true].
 	candidate:: mixin methods findMirrorNamed: typeName. 
-	nil ~= candidate ifTrue:[^true].
+	nil ~= candidate ifTrue: [^true].
 	candidate:: mixin slots findMirrorNamed: typeName.
 	^nil ~= candidate.	
 )
@@ -1170,7 +1176,7 @@ public typecheckMethod: m <MethodAST> ofClass: c <Class> ^ <Set[TypeError]>= (
 	currentClass:: toplevelCandidate.
 	typeBuilder:: TypeBuilder forTypesIn: toplevelCandidate.
 	currentDeclaration:: m selector.
-      [toplevelCandidate enclosingClass ~= nil] whileTrue:[toplevelCandidate:: toplevelCandidate enclosingClass].
+      [toplevelCandidate enclosingClass ~= nil] whileTrue: [toplevelCandidate:: toplevelCandidate enclosingClass].
       currentTopLevelClass:: toplevelCandidate.
       errorSet:: Set new.
 	methodNode: m.
@@ -1187,10 +1193,10 @@ public varDeclNode: node = (
 public variableNode: node <VariableAST> ^ <ObjectType> = (
 	(* need to deal with #'@here', #self, #super, #outer *)
 	| varName <Symbol> = node name. | 
-	varName = #'@here' ifTrue:[^typeOfHere].
-	varName = #self ifTrue:[^typeOfSelf].
-	varName = #super ifTrue:[^typeOfSuper].
-	varName = #outer ifTrue:[^typeOfOuter].
+	varName = #'@here' ifTrue: [^typeOfHere].
+	varName = #self ifTrue: [^typeOfSelf].
+	varName = #super ifTrue: [^typeOfSuper].
+	varName = #outer ifTrue: [^typeOfOuter].
 	^assert: [false] message: varName, ' should never have been treated as a variable node'.
 )
 'visiting'

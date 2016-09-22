@@ -215,7 +215,7 @@ public subtypeOf: t <Type> ^ <Boolean>  = (
 )
 ) : (
 )
-class HereType for: c <ClassDeclarationMirror> = PseudoType for: c path: (herePathFor: c) (
+class HereType for: c <ClassDeclarationMirror> = PseudoType for: c path: (herePathFor: c instanceSide) (
 (* The type of the lexical scope. *)) (
 'as yet unclassified'
 public = o   = (
@@ -228,8 +228,8 @@ public at: selector <Symbol> ^ <FunctionType> = (
   
   nil = m ifTrue: [^errorType].
   signature:: signatureFor: m. 
-  (* deal with substitution of Self, Instance? *)
-  ^(signature apply: selfSubstitution) apply: myTypeBuilder (* and build a function type *)
+  ^(signature apply: selfSubstitution) apply: typeBuilder 
+  (* deal with substitution of Self, Instance? and build a function type *)
 )
 findMember: selector <Symbol> ^ <Mirror> = (
 (* Return the mirror representing selector in 
@@ -260,7 +260,7 @@ classDeclaration (i.e., "self" ). *)
 	 
 	 [nil ~= actualType] whileTrue: [
 		m:: memberOf: actualType selector: selector.
-		m ~= nil ifTrue: [^m].
+		nil ~= m ifTrue: [^m].
 		actualType:: actualType enclosingMixin.
 		]. (* lexical scope *)
 	^(objectTypeFor: classDeclaration) at: selector. (* check self *)
@@ -275,6 +275,9 @@ public isKindOfObjectType ^ <Boolean> = (
 )
 selfIdAST  ^ <AST>  = (
 	(* should be a type variable; definitely not the here type *)
+)
+selfSubstitution ^ <Substitutor> = ( (* we should cache these *)
+	 ^Substitutor forSubstitution: (Map new at: #Self put: typeOfSelf)
 )
 public subtypeOf: t <Type> ^ <Boolean> = (
 (* could use equality *)
@@ -299,9 +302,9 @@ public at: selector <Symbol> ^ <FunctionType> = (
   
   nil = m ifTrue: [^errorType].
   m accessModifier ~= #public ifTrue: [^accessErrorType].
-  signature:: signatureFor: m. 
-  (* deal with substitution of Self, Instance? *)
-  ^(signature apply: selfSubstitution) apply: myTypeBuilder (* and build a function type *)
+  signature:: signatureFor: m withSelector: selector. 
+  ^(signature apply: selfSubstitution) apply: myTypeBuilder   
+  (* deal with substitution of Self, Instance? and build a function type *)
 )
 findMember: selector <Symbol> ^ <Mirror> = (
 	| 
@@ -311,8 +314,8 @@ findMember: selector <Symbol> ^ <Mirror> = (
 	actualType:: mirrorForObjectType: self. 
 	[actualType ~= nil] whileTrue: [
 		m:: nonPrivateMemberOf: actualType instanceSide selector: selector.
-		m ~= nil ifTrue: [^m].
-		actualType:: actualType superclass.
+		nil ~= m ifTrue: [^m].
+		actualType:: superclassOf: actualType.
 		].
        ^nil
 )
@@ -324,7 +327,7 @@ public isKindOfObjectType ^ <Boolean> = (
 )
 myTypeBuilder ^ <TypeBuilder> = (
 (* really need to cache this somewhere *)
-	^TypeBuilder forTypesIn: (mirrorForObjectType: self)
+	^typeBuilderFor: (mirrorForObjectType: self)
 )
 public name ^ <String> = (
 	^(path inject: '' into: [:s <String> :e <Symbol> | s, e, ' ']) allButLast.
@@ -349,26 +352,13 @@ selfIdAST  ^ <AST> = (
 selfSubstitution ^ <Substitutor> = ( (* we should cache these out the object type *)
 	 ^Substitutor forSubstitution: (Map new at: #Self put: selfIdAST)
 )
-setterSignatureForSlot: m <SlotDeclarationMirror> ^ <MessagePatternAST> = (
-	(* BOGUS. SlotDeclarationMirrors do not provide access to their true source with type declaration! *)
-	| ast <SlotDeclarationAST> = parser slotDeclaration parse: m source. slotType <AST> param |
-	slotType:: ast type.
-	nil = slotType ifTrue: [slotType:: errorType].
-	param = VarDeclAST name: m name type: slotType. (* BOGUS *)
-	^MessagePatternAST new 
-		selector: m name; 
-		parameters: {param};
-		returnType: slotType; 
-		accessModifier: m accessModifier;
-		yourself
-)
-signatureFor: m <Mirror> ^ <MessagePatternAST> = (
+signatureFor: m <Mirror> withSelector: selector <Symbol> ^ <MessagePatternAST> = (
 	
 	^m isKindOfMethodMirror ifTrue: [
-		parser messagePattern parse: m source. (* parse the message pattern *)
+		parser messagePattern parseString: m source. (* parse the message pattern *)
 		] ifFalse: [
 		m isKindOfSlotDeclarationMirror 
-			ifTrue: [signatureForSlot: m] 
+			ifTrue: [signatureForSlot: m withSelector: selector] 
 			ifFalse: [signatureForNestedClass: m]
 		].
 )
@@ -385,16 +375,16 @@ signatureForNestedClass: m <ClassDeclarationMirror> ^ <MessagePatternAST> = (
 		accessModifier: m accessModifier;
 		yourself
 )
-signatureForSlot: m <SlotDeclarationMirror> ^ <MessagePatternAST> = (
-	(* BOGUS. SlotDeclarationMirrors do not provide access to their true source with type declaration! *)
-	| ast <SlotDeclarationAST> slotType <AST>  |
-	m name last asSymbol = ':' ifTrue: [^setterSignatureForSlot: m].
-	ast:: parser slotDeclaration parse: m source.
+signatureForSlot: m <SlotDeclarationMirror> withSelector: selector <Symbol> ^ <MessagePatternAST> = (
+	| ast <SlotDefAST> = parser slotDeclaration parse: m source. slotType <AST> params |
 	slotType:: ast type.
-	nil = slotType ifTrue: [slotType:: errorType]. (* BOGUS *)
+	nil = slotType ifTrue: [slotType:: errorType].
+	params =(selector last asSymbol = ':' 
+		ifTrue: [{VarDeclAST name: m name type: slotType}]
+		ifFalse: [{}]).
 	^MessagePatternAST new 
-		selector: m name; 
-		parameters: {};
+		selector: selector; 
+		parameters: params;
 		returnType: slotType; 
 		accessModifier: m accessModifier;
 		yourself
@@ -558,12 +548,12 @@ findInheritedMember: selector <Symbol> ^ <Mirror> = (
 	|
 	actualType:: classDeclaration superclass.
 	 
-	 [actualType ~= nil] whileTrue: [
+	 [nil ~= actualType] whileTrue: [
 		m:: nonPrivateMemberOf: actualType instanceSide selector: selector.
-		m ~= nil ifTrue: [^m].
-		actualType:: actualType superclass.
+		nil ~= m ifTrue: [^m].
+		actualType:: superclassOf: actualType.
 		].
-       ^memberOf: classDeclaration superclass selector: selector 
+       ^memberOf: (superclassOf: classDeclaration) instanceSide selector: selector 
         (* If we didn't find any non-private member, look for for private ones so 
             we can give a good error message *)
 )
@@ -621,7 +611,7 @@ public messagePatternNode: node <MessagePatternAST> = (
 	^MessagePatternAST new
 		selector: node selector;
 		accessModifier: node accessModifier;
-		parameters: (node parameters collect: [: p <AST> | p appy: self]);
+		parameters: (node parameters collect: [: p <AST> | p apply: self]);
 		returnType: (node returnType apply: self);
 		concreteStart: node concreteStart;
 		concreteEnd: node concreteEnd;
@@ -924,7 +914,7 @@ check surrounding namespaces (conflict and regular)*)
 			] ifFalse: [otype path, {typeName}] (*Er, this won't be canonical *)
 		]
 )
-memberOf: target selector: selector <Symbol> ^ <Mirror> = ( 
+memberOf: target <MixinMirror> selector: selector <Symbol> ^ <Mirror> = ( 
 | result <Mirror> |
 	result:: target methods findMirrorNamed: selector.
 	result ~= nil ifTrue: [^result].
@@ -960,7 +950,8 @@ mirrorForObjectType: o <ObjectType> ^ <ClassDeclarationMirror> = (
 	mirror:: ClassDeclarationMirror reflecting: (currentConflictNamespace at: topName ifAbsent: [namespace at: topName]) mixin. 
 	2 to: o path size do: [:i <Integer> | | id <Symbol> = o  path at: i. |
 		id = #'@Here' ifTrue: [^mirror].
-		mirror:: mirror instanceSide nestedClasses findMirrorNamed: id.
+		nil = mirror ifTrue: [^nil].
+		mirror:: mirror instanceSide nestedClasses findMirrorNamed: id. 
 		].
 	^mirror
 )
@@ -996,7 +987,7 @@ nestScope: s <Scope> = (
 nonPrivate: m <Mirror> ^ <Boolean> = (
 	^m ~= nil and: [m accessModifier ~= #private]
 )
-nonPrivateMemberOf: target selector: selector <Symbol> ^ <Mirror> = ( 
+nonPrivateMemberOf: target <MixinMirror> selector: selector <Symbol> ^ <Mirror> = ( 
 | result <Mirror> |
 	result:: target methods findMirrorNamed: selector.
 	(nonPrivate: result) ifTrue: [^result].
@@ -1098,6 +1089,17 @@ public setterSendNode: node ^ <Type> = (
 public stringNode: node = (
 	^literal: #String
 )
+public superclassOf: klass <ClassDeclarationMirror> ^ <ClassDeclarationMirror> = (
+     | superclassClause <SendAST> superclassClauseType <ObjectType> |
+      superclassClause:: klass header superclassClause.
+	superclassClauseType:: superclassClause apply: self.
+	superclassClauseType path last = #class ifFalse: [
+		error: 'Class type expected' at: {superclassClause start. superclassClause end}.
+		^mirrorForObjectType: (ObjectType forPath: {#Object})
+		].
+	(* the type should be of the form T class *)
+	^mirrorForObjectType: (ObjectType forPath: superclassClauseType path allButLast)
+)
 public symbolNode: node = (
 	^literal: #Symbol
 )
@@ -1138,6 +1140,10 @@ type: sub <Type> isSubtypeOf: sup <Type> ^ <Boolean> = (
 		trail at: query put: (sub subtypeOf: sup).		
 		].
 )
+typeBuilderFor: klass <ClassDeclarationMirror> ^ <TypeBuilder> = (
+(* really need to cache this somewhere *)
+	^TypeBuilder forTypesIn: klass
+)
 typeOfHere ^ <ObjectType> = (
 	^HereType for: currentClass 
 )
@@ -1171,7 +1177,7 @@ public typecheckMethod: m <MethodAST> ofClass: c <Class> ^ <Set[TypeError]>= (
 	currentClass:: toplevelCandidate.
 	typeBuilder:: TypeBuilder forTypesIn: toplevelCandidate.
 	currentDeclaration:: m selector.
-      [toplevelCandidate enclosingClass ~= nil] whileTrue: [toplevelCandidate:: toplevelCandidate enclosingClass].
+      [nil ~= toplevelCandidate enclosingClass] whileTrue: [toplevelCandidate:: toplevelCandidate enclosingClass].
       currentTopLevelClass:: toplevelCandidate.
       errorSet:: Set new.
 	methodNode: m.

@@ -1,0 +1,1217 @@
+Newspeak3
+'Newspeak'
+class NewspeakTypechecker usingPlatform: p ide: ide ast: astModule namespace: ns = (
+(* A visitor that computes the type of a Newspeak program.
+
+Newspeak has no global namespace, but a nominal typechecker needs one. The typechecker takes a namespace as a parameter to its factory.  All types are identified by a fully qualified name that is rooted in a top level class that is stored in this namespace. Well, almost.  If a class named C uses a type that conflicts with the top level namespace, then a special conflict namespace #'C conflicts' is added to the top level and is consulted before looking up things at the top level. The typechecker does not look into other nested namespaces.
+
+Fully qualified names are used to define object types (see below). The checker has utilities to convert between classes and object types.
+
+Types are represented via a class hierarchy that consists of:
+
+a. Type, the abstract class at the top of the hierarchy.
+b. ObjectType, which is defined by an immutable list of symbols that defines a class as a path of class names starting from a top level class (a fully qualified name).
+c. FunctionType, which is defined by a pair of a list of argument types and a return type.
+d. ErrorType, the magical type that is a subtype and supertype of everything and supports all methods. There is a special subclass
+    of ErrorType, AccessErrorType, for errors involving accessibility violations. We cache singleton instances for both.
+e. UnionType, defined by a list of types that are acceptable at a given point.
+f. GenericType, defined by an object type representing the generic, and a list of type arguments. For the time being, we largely ignore generics.
+g. TypeVariable, defined by a path that starts with its name, and a bound, which is a type.
+h. Pseudo types (subclasses of PseudoType) used to represent the receiver types of self, super, here and outer sends (respectively SelfType, SuperType, HereType, OuterType).  Each such type captures the special lookup rules of the corresponding send, especially wrt access control. This ensures that for each kind of send, the type exposes  methods that are valid.
+
+The typechecker is designed to be incremental. The basic ideas go back as far as the Cecil typechecker, but are properly explained in the context of Scala optimization in the OOPSLA 2016 paper: Parallel Incremental Whole-Program Optimizations for Scala.js.
+
+These principles are:
+
+a. Access to program structure beyond the method currently being typechecked must go through a query API. This API will track any dependencies of the method on types of other program components.
+
+b. These queries are pure functions of immutable data and the program. 
+
+c. We maintain dependencies between (previously) typechecked methods and queries.  We also maintain dependencies between queries and the program parts they describe.
+
+d. Query results are cached, and invalidated if the source code they depend on has changed. This means that we will need to either:
+ 1. Note when a given change is made and invalidate its dependent queries, or 
+ 2. Compute a diff when a typecheck starts, and use it to decide which changes have been made, and thus invalidate any dependent 
+      queries.
+  There are two kinds of queries: SignatureQuery, representing signatures of members, and SubtypeQuery, representing the results of
+  subtype tests (more on these below). Each kind of query has its results cached separately. Signature query results are stored in
+  cachedTypes. Subtype query results are cached in trail (The term trail originates in algorithms dealing with recursive types, as far
+  back as Algol 68).
+
+e. Memory required grows linearly with program size, as both the number of methods and the queries about them are proportional to code size. 
+
+f. Time is proportional to the size of the code being typechecked (especially if we note changes as they occur).  Initial typechecks may be slower, as they often require global program information like subtype relations, but this should not be an issue. We can also trade memory for time  by constructing cached subtype queries at type definition time if need be.
+
+The query hierarchy consists of:
+
+a. Query,  the abstract class at the top of the hierarchy.
+b. Subtype(T, S) where T and S are types, which answers whether T <: S.
+c. Signature(T, m) where T is a type and m is a selector, which yields the FunctionType of method m in type T, or Error if m is undefined.
+
+We maintain three maps of dependencies:
+
+a. dependentDeclarations. A Map[Query, Set[Declaration]] which lists, for each query q, all declarations whose typecheck required q.
+b. dependentQueries. A Map[Declaration, Set[Query]] which lists, for each declaration d, all queries that refer to d.
+c. queriesOfDeclaration. A Map[Declaration, Set[Query]] which lists, for each declaration d, all queries that d used in its last typecheck.
+
+Declarations can be methods but also class headers.
+
+All this is encapsulated in this module, which eventually needs to be fed into the IDE.  Even in an offline scenario where the typechecker is used as a service, the dependencies need to exist.  Other tools need to maintain the dependencies as code changes.
+
+Errors are reported by calling the error:at: method, which produces a TypeError object and adds it to a set that is returned by the typecheck. If the set is empty, typechecking succeeded. The client can then determine how to report the errors, which carry a message and source location information.
+
+
+ (c) 1995-1997 Sun Microsystems, Inc. ALL RIGHTS RESERVED. 
+ (c) Google Inc. 2016 - 2017.
+
+Use and distribution of this software is subject to the terms of the attached source license.
+
+
+*)|
+(* imports *)
+private OrderedCollection = p collections OrderedCollection.
+private Map = p collections Dictionary.
+private Set = p collections Set.
+
+private TypeIdAST = astModule TypeIdAST.
+private TupleAST = astModule TupleAST.
+private ParameterizedTypeAST = astModule ParameterizedTypeAST.
+private UnaryTypeOpAST = astModule UnaryTypeOpAST.
+private BinaryTypeOpAST = astModule BinaryTypeOpAST.
+private MessagePatternAST = astModule MessagePatternAST.
+private VarDeclAST = astModule VarDeclAST.
+
+private ClassDeclarationMirror = p mirrors ClassDeclarationMirror.
+private MixinMirror = p mirrors MixinMirror.
+
+private Scope = p mirrors compiler Scope.
+
+(* module variables *)
+
+parser <NewspeakParsing Parser> = p mirrors compilation parser.
+namespace <Map[Symbol, Object]> = ns.
+trail <Map[SubtypeQuery, Boolean]> = Map new.
+scopeStack <OrderedCollection[Scope]> = OrderedCollection new.
+typeBuilder <TypeBuilder>
+currentClass <ClassDeclarationMirror> 
+currentTopLevelClass <ClassDeclarationMirror>
+currentDeclaration <Symbol>
+currentReturnType <ObjectType>
+errorSet <Set>
+
+errorType <ErrorType> = ErrorType new.
+accessErrorType <AccessErrorType> = AccessErrorType new.
+bottom <BottomType> = BottomType new.
+dependentDeclarations <Map[Query, Set[Declaration]]> = Map new.
+queriesOfDeclaration <Map[Declaration, Set[Query]]> = Map new.
+dependentQueries <Map[Declaration, Set[Query]]> = Map new.
+cachedTypes <Map[Query, Type]> = Map new.
+|) (
+class AccessErrorType = ErrorType (
+(* A special type for access errors. These need to be reported whenever they come up, so they need to be preserved in caches. 
+   This, they are distinct from normal type errors.
+*)) (
+'as yet unclassified'
+isKindOfAccessErrorType ^ <Boolean> = (
+	^true
+)
+) : (
+)
+class BottomType = Type (
+(* The bottom of the type lattice. *)) (
+'as yet unclassified'
+public subtypeOf: t <Type> ^ <Boolean> = (
+	^true
+)
+) : (
+)
+class ErrorType = Type (
+(* The error type. *)) (
+'as yet unclassified'
+public at: o = (
+(* One can ask an error type for the type of any selector, or for the type of the nth argument for any n *)
+	^self
+)
+public domain = (
+	^self
+)
+public isKindOfErrorType ^ <Boolean> = (
+	^true
+)
+public range = (
+	^self
+)
+public subtypeOf: t <Type> ^ <Boolean> = (
+	^true
+)
+) : (
+)
+class FunctionType domain: d <List[Type]> range: r <Type> = Type (
+(* The type of a method. *)|
+	public domain <List[Type]> = d.
+	public range <Type> = r.
+|) (
+'as yet unclassified'
+public = o   = (
+	o isKindOfFunctionType ifFalse: [^false].
+	^domain = o domain and: [range = o range]
+)
+public hash ^ <Integer> = (
+	^(domain hash xor: range hash) bitXor: class hash
+)
+public isKindOfFunctionType ^ <Boolean> = (
+	^true
+)
+public subtypeOf: t <Type> ^ <Boolean> = (
+  | ft <FunctionType> ftd <List[Type]> |
+      t = errorType ifTrue: [^true].
+      t isKindOfFunctionType ifFalse: [^false] ifTrue: [ft:: t].
+
+	(range subtypeOf: ft range) ifFalse: [^false].
+	ftd:: ft domain.
+	domain size = ftd size ifFalse: [^false].
+	1 to: domain size do: [: i <Integer> |
+		((ftd at: i) subtypeOf: (domain at: i)) ifFalse: [^false]
+		].
+	^true.
+)
+) : (
+)
+class GenericType generic: g <ObjectType> typeArguments: tas <List[ObjectType]> = ObjectType forPath: g path (
+(* A generic (aka parameterized) type such as List[String]. *)|
+      generic <ObjectType> = g.
+	typeArguments <List[ObjectType]> = tas.
+|) (
+'as yet unclassified'
+public = o   = (
+	o isKindOfGenericType ifFalse: [^false].
+	^path = o path and: [typeArguments = o typeArguments]
+)
+public at: selector <Symbol> ^ <FunctionType>  = (
+	halt.
+)
+public hash ^ <Integer> = (
+	^(path hash bitXor: class hash) bitXor: typeArguments hash
+)
+public isKindOfGenericType ^ <Boolean> = (
+	^true
+)
+public isKindOfObjectType ^ <Boolean> = (
+	^false
+)
+public printOn: s = (
+	s nextPutAll: class name.
+	s nextPutAll: ' generic: '.
+	s nextPutAll:  path printString.
+	s nextPutAll: ' typeArguments: ['.
+	typeArguments do: [: ta <ObjectType> |
+		s nextPutAll: ta printString.
+		s nextPut: ' '.
+		].
+	s nextPut: ']'.
+)
+public subtypeOf: t <Type> ^ <Boolean>  = (
+	halt.
+)
+) : (
+)
+class HereType for: c <ClassDeclarationMirror> = PseudoType for: c path: (herePathFor: c instanceSide) (
+(* The type of the lexical scope. *)) (
+'as yet unclassified'
+public = o   = (
+	o isKindOfHereType ifFalse: [^false].
+	^classDeclaration = o classDeclaration
+)
+public at: selector <Symbol> ^ <FunctionType> = (
+(* Override so that we don't insist on public members only *)
+  | m <Mirror> =  findMember: selector. signature <MessagePatternAST> |
+  
+  nil = m ifTrue: [^errorType].
+  signature:: signatureFor: m. 
+  ^(signature apply: selfSubstitution) apply: typeBuilder 
+  (* deal with substitution of Self, Instance? and build a function type *)
+)
+findMember: selector <Symbol> ^ <Mirror> = (
+(* Return the mirror representing selector in 
+this type's classDeclaration. Check if it is a 
+reserved word, otherwise look for a method 
+defined on classDeclaration*)
+	selector = #nil
+		ifTrue: [^mirrorForObjectType: (literal: #Nil)]. 
+	({#true. #false} includes: selector) 
+		ifTrue: [^mirrorForObjectType: (literal: #Boolean)]. 
+	(* check reserved words *)	
+	^findOwnMember: selector
+)
+findOwnMember: selector <Symbol> ^ <Mirror> = (
+(* Find the method named selector defined in this 
+type's classDeclaration. First check for local slots
+or formal parameters in the current method/block
+scope, otherwise climb the enclosing class hierarchy
+(lexical scope) and finally try the type of the 
+classDeclaration (i.e., "self" ). *)
+	| actualType <MixinMirror>  m <MethodMirror> localType <ObjectType> |
+	
+	localType:: typeOfLocal: selector.
+	nil ~= localType 
+		ifTrue: [^mirrorForObjectType: localType]. (* formal or temp *)
+		
+	actualType:: classDeclaration instanceSide.
+	 
+	 [nil ~= actualType] whileTrue: [
+		m:: memberOf: actualType selector: selector.
+		nil ~= m ifTrue: [^m].
+		actualType:: actualType enclosingMixin.
+		]. (* lexical scope *)
+	^(objectTypeFor: classDeclaration) at: selector. (* check self *)
+)
+public isKindOfHereType ^ <Boolean> = (
+	^true
+)
+public isKindOfObjectType ^ <Boolean> = ( 
+(* Bogus. If we give it the right path and fix sub/supertype methods as suggested in comments,
+    we can get rid of this as well as = and hash*)
+	^false
+)
+selfIdAST  ^ <AST>  = (
+	(* should be a type variable; definitely not the here type *)
+)
+selfSubstitution ^ <Substitutor> = ( (* we should cache these *)
+	 ^Substitutor forSubstitution: (Map new at: #Self put: typeOfSelf)
+)
+public subtypeOf: t <Type> ^ <Boolean> = (
+(* could use equality *)
+	assert: [false] message: 'No one should ask a here type if it is a subtype of anything!'
+)
+supertype ^ <ObjectType> = ( (* Could return Object *)
+	assert: [false] message: 'Here types have no supertype, and no one should ask!'
+)
+) : (
+)
+class ObjectType forPath: ts <List[Symbol]> = Type (
+(* The type of an Object. *)|
+	public path <List[Symbol]> = ts.
+|) (
+'as yet unclassified'
+public = o ^ <Boolean> = (
+	o isKindOfObjectType ifFalse: [^false].
+	^path = o path
+)
+public at: selector <Symbol> ^ <FunctionType> = (
+  | m <Mirror> =  findMember: selector. signature <MessagePatternAST> |
+  
+  nil = m ifTrue: [^errorType].
+  m accessModifier ~= #public ifTrue: [^accessErrorType].
+  signature:: signatureFor: m withSelector: selector. 
+  ^(signature apply: selfSubstitution) apply: myTypeBuilder   
+  (* deal with substitution of Self, Instance? and build a function type *)
+)
+findMember: selector <Symbol> ^ <Mirror> = (
+	| 
+	actualType <ClassDeclarationMirror>  
+	m <MethodMirror> 
+	|
+	actualType:: mirrorForObjectType: self. 
+	[actualType ~= nil] whileTrue: [
+		m:: nonPrivateMemberOf: actualType instanceSide selector: selector.
+		nil ~= m ifTrue: [^m].
+		actualType:: superclassOf: actualType.
+		].
+       ^nil
+)
+public hash ^ <Integer> = (
+	^path hash bitXor: class hash
+)
+public isKindOfObjectType ^ <Boolean> = (
+	^true
+)
+myTypeBuilder ^ <TypeBuilder> = (
+(* really need to cache this somewhere *)
+	^typeBuilderFor: (mirrorForObjectType: self)
+)
+public name ^ <String> = (
+	^(path inject: '' into: [:s <String> :e <Symbol> | s, e, ' ']) allButLast.
+)
+public printOn: s = (
+	s nextPutAll: class name.
+	s nextPutAll: ' forPath: '.
+	s nextPutAll:  path printString
+)
+selfIdAST  ^ <AST> = (
+| tree <AST> |
+	assert: [path isEmpty not] message: 'Object type must have non-empty path'.
+	tree:: TypeIdAST new name: path first.
+	(2 to: path size) do: [: i | 
+		tree:: UnaryTypeOpAST new 
+				operand: tree; 
+				operator: (path at: i);
+				yourself.
+		].
+	^tree
+)
+selfSubstitution ^ <Substitutor> = ( (* we should cache these out the object type *)
+	 ^Substitutor forSubstitution: (Map new at: #Self put: selfIdAST)
+)
+signatureFor: m <Mirror> withSelector: selector <Symbol> ^ <MessagePatternAST> = (
+	
+	^m isKindOfMethodMirror ifTrue: [
+		parser messagePattern parseString: m source. (* parse the message pattern *)
+		] ifFalse: [
+		m isKindOfSlotDeclarationMirror 
+			ifTrue: [signatureForSlot: m withSelector: selector] 
+			ifFalse: [signatureForNestedClass: m]
+		].
+)
+signatureForNestedClass: m <ClassDeclarationMirror> ^ <MessagePatternAST> = (
+	| classType <UnaryTypeOpAST> |
+	classType = UnaryTypeOpAST new 
+		operand: (TypeIdAST new name: m name; yourself);
+		operator: #class;
+		yourself.
+	^MessagePatternAST new 
+		selector: m name; 
+		parameters: {};
+		returnType: classType; 
+		accessModifier: m accessModifier;
+		yourself
+)
+signatureForSlot: m <SlotDeclarationMirror> withSelector: selector <Symbol> ^ <MessagePatternAST> = (
+	| ast <SlotDefAST> = parser slotDeclaration parse: m source. slotType <AST> params |
+	slotType:: ast type.
+	nil = slotType ifTrue: [slotType:: errorType].
+	params =(selector last asSymbol = ':' 
+		ifTrue: [{VarDeclAST name: m name type: slotType}]
+		ifFalse: [{}]).
+	^MessagePatternAST new 
+		selector: selector; 
+		parameters: params;
+		returnType: slotType; 
+		accessModifier: m accessModifier;
+		yourself
+)
+public subtypeOf: t <Type> ^ <Boolean> = (
+	| ot <ObjectType>  |
+      t = errorType ifTrue: [^true].
+      t isKindOfObjectType ifFalse: [^false] ifTrue: [ot:: t].
+
+      path = ot path ifTrue: [^true].
+     (supertype subtypeOf: t) ifTrue: [^true].
+      ^false
+)
+supertype ^ <ObjectType> = (
+  | 
+  actualType <ClassDeclarationMirror> 
+  superklass <ClassDeclarationMirror> 
+  supertypePath <List[Symbol]> ::= {}. 
+  |
+
+  (* TODO: This could be a mixin application - but they have to be named *)
+  actualType::  mirrorForObjectType: self.
+  superklass:: actualType superclass.
+  supertypePath:: pathForMixin:  superklass instanceSide.
+  ^ObjectType forPath:  supertypePath.
+)
+) : (
+)
+class OuterType for: c <ClassDeclarationMirror> = PseudoType for: c path: {#@Outer} (
+(* The type of outer inside class declaration c. *)) (
+'as yet unclassified'
+public = o   = (
+	o isKindOfOuterType ifFalse: [^false].
+	^classDeclaration = o classDeclaration
+)
+findMember: selector <Symbol> ^ <ClassDeclarationMirror> = (
+(* Return a mirror representing 
+the outer class named selector in
+this type's classDeclaration *)
+| actualType <ClassDeclarationMirror>  m <MethodMirror> |
+	actualType:: classDeclaration  enclosingClass.
+	 
+	 [nil ~= actualType] whileTrue: [
+		m:: actualType instanceSide nestedClasses findMirrorNamed: selector.
+		nil ~= m ifTrue: [^m].
+		actualType simpleName = selector ifTrue: [^actualType].
+		(* usually, we'd find it at the next level, but for the top level
+		   we need to check here *)
+		actualType:: actualType enclosingClass.
+		]. (* lexical scope *)
+	^nil
+)
+public isKindOfOuterType ^ <Boolean> = (
+	^true
+)
+signatureForNestedClass: m <ClassDeclarationMirror> ^ <MessagePatternAST> = (
+(* override superclass so that we get the instance side, not the class side.
+This is because outer N signifies a receiver that is an instance of N
+whereas normally, a nested class N, gives us a receiver of type N class.
+*)
+	^MessagePatternAST new 
+		selector: m name; 
+		parameters: {};
+		returnType: (TypeIdAST new name: m name; yourself); 
+		accessModifier: m accessModifier;
+		yourself
+)
+public subtypeOf: t <Type> ^ <Boolean> = (
+  ^ self = t
+)
+supertype ^ <ObjectType> = ( 
+(* No one should be asking an outer type for its supertype *) 
+	^ObjectType forPath: {#Object}
+)
+) : (
+)
+class PathFinder forTypesIn: klass <ClassDeclarationMirror> = (
+(* A visitor on type expression ASTs that computes a path that defines the underlying ObjectType the type expression represents. *)| surroundingClass <ClassDeclarationMirror> = klass. |) (
+'as yet unclassified'
+public binaryTypeOpNode: node <BinaryTypeOpAST> ^ <List[Symbol]> = (
+	^{} (* return the empty path, which should be interpreted by the caller as an error type*)
+)
+public typeIdNode: node <TypeIdAST> ^ <List[Symbol]> = (
+	^lookupPathForType: node name inClass: surroundingClass
+)
+public unaryTypeOpNode: node <UnaryTypeOpAST> ^ <List[Symbol]> = (
+	| operator <Symbol> | 
+	operator:: node operator.
+	(operator = #class or: [operator = #instance or: [operator = #def and: [self target isTypeVar]]])
+		 ifFalse: [error: 'No unary type operator ', operator at: {node operand concreteEnd + 1. node concreteEnd}].
+	^(node operand apply: self), {node operator}
+)
+) : (
+)
+class PseudoType for: c <ClassDeclarationMirror> path: p <List[Symbol]> = ObjectType forPath: p (
+(* An abstract type for pseudo variables like here and outer. *)|
+	public classDeclaration <ClassDeclarationMirror> = c.
+|) (
+'as yet unclassified'
+public = o   = ( 
+(* If we add any new subclass, must test for it here too
+so that we never answer true if one of these somehow
+gets instantiated. *)
+   o isKindOfPseudoType ifFalse: [^false].
+   o isKindOfHereType ifTrue: [^false].
+   o is isKindOfOuterType ifTrue: [^false].
+   classDeclaration = o classDeclaration
+)
+public at: selector <Symbol> ^ <FunctionType> = (
+(* override superclass to avoid access check. Maybe we just want to create an overridable access check to be called
+from ObjectType>>at: instead?  *)
+  | m <Mirror> =  findMember: selector. signature <MessagePatternAST> |
+  
+  nil = m ifTrue: [^errorType].
+  signature:: signatureFor: m.
+  (* deal with substitution of Self, Instance? *)
+  ^(signature apply: selfSubstitution) apply: myTypeBuilder (* and build a function type *)
+)
+public hash ^ <Integer> = (
+	^classDeclaration hash bitXor: class hash
+)
+public isKindOfPseudoType ^ <Boolean> = (
+	^true
+)
+) : (
+)
+class Query = (
+(* Abstract class. The root of the query hierrachy. *)) (
+'as yet unclassified'
+public invalidate = (
+	subclassResponsibility
+)
+) : (
+)
+class SelfType for: c <ClassDeclarationMirror> path: p <List[Symbol]> = PseudoType for: c path: p (
+(* The type of the pseudovariable 'self'. As usual, the motivation is access control.
+Because self sends behave differently wrt access control, type enforcement must be 
+specialized as it is here.
+*)) (
+'as yet unclassified'
+public = o ^ <Boolean> = (
+	o isKindOfSelfType ifFalse: [^false].
+	^classDeclaration = o classDeclaration
+)
+public at: selector <Symbol> ^ <FunctionType> = (
+  | m <Mirror> =  findLocalMember: selector. signature <MessagePatternAST> |
+  
+	nil = m ifTrue: [
+		m::  findInheritedMember: selector.
+		nil = m ifTrue: [^errorType].
+		m accessModifier = #private ifTrue: [^accessErrorType].
+		].
+	signature:: signatureFor: m. 
+	 (* deal with substitution of Self, Instance? *)
+	^(signature apply: selfSubstitution) apply: myTypeBuilder (* and build a function type *)
+)
+findInheritedMember: selector <Symbol> ^ <Mirror> = (
+	| 
+	actualType <ClassDeclarationMirror> 
+	m <MethodMirror> 
+	|
+	actualType:: classDeclaration superclass.
+	 
+	 [nil ~= actualType] whileTrue: [
+		m:: nonPrivateMemberOf: actualType instanceSide selector: selector.
+		nil ~= m ifTrue: [^m].
+		actualType:: superclassOf: actualType.
+		].
+       ^memberOf: (superclassOf: classDeclaration) instanceSide selector: selector 
+        (* If we didn't find any non-private member, look for for private ones so 
+            we can give a good error message *)
+)
+findLocalMember: selector <Symbol> ^ <Mirror> = (
+	^memberOf: (mirrorForObjectType: self) instanceSide selector: selector.
+)
+public isKindOfSelfType ^ <Boolean> = (
+	^true
+)
+) : (
+)
+class SignatureQuery type: t <Type> selector: m <Symbol> = Query (
+(* What is the type of method m of class t? *)|
+	public type <Type> = t.
+	public selector <Symbol> = m.
+|) (
+'as yet unclassified'
+public = o   = (
+	o isKindOfSignatureQuery ifFalse: [^false].
+	^type = o type and: [selector = o selector]
+)
+public declarations ^ <List[ObjectType]> = (
+	^declarationsForSignatureQuery: self
+)
+public hash ^ <Integer> = (
+	^(type hash bitXor: selector hash) bitXor: class hash
+)
+public invalidate = (
+	cachedTypes removeKey: self
+)
+public isKindOfSignatureQuery ^ <Boolean> = (
+	^true
+)
+) : (
+)
+class Substitutor forSubstitution: s <Map[Symbol, AST]> = (
+(* A visitor that applies a substitution to an AST. *)|
+	substitution <Map[Symbol, AST]> = s.
+|) (
+'as yet unclassified'
+public binaryTypeOpNode: node <BinaryTypeOpAST> ^ <BinaryTypeOpAST> = (
+	^BinaryTypeOpAST new 
+		operator: node operator; 
+		leftOperand: (node leftOperand apply: self); 
+		rightOperand: (node rightOperand apply: self);
+		yourself
+)
+public genericInvocationNode: node <ParameterizedTypeAST> ^ <ParameterizedTypeAST> =(
+	^ParameterizedTypeAST new
+		generic: node generic;
+		arguments: (node arguments collect: [:ta <AST> | ta apply: self]);
+		yourself
+)
+public messagePatternNode: node <MessagePatternAST> = (
+	^MessagePatternAST new
+		selector: node selector;
+		accessModifier: node accessModifier;
+		parameters: (node parameters collect: [: p <AST> | p apply: self]);
+		returnType: (node returnType apply: self);
+		concreteStart: node concreteStart;
+		concreteEnd: node concreteEnd;
+		yourself	
+)
+public typeIdNode: node <TypeIdAST> ^ <AST> = (
+	^substitution at: node name ifAbsent: [^node]
+)
+public unaryTypeOpNode: node <UnaryTypeOpAST> ^ <UnaryTypeOpAST> = (
+	^UnaryTypeOpAST new 
+		operator: node operator; 
+		operand: (node operand apply: self); 
+		yourself
+)
+) : (
+)
+class SubtypeQuery subtype: s <Type> supertype: t <Type> = Query (
+(* Is s <: t ?. *)|
+	public subtype <Type> = s.
+	public supertype <Type> = t.
+|) (
+'as yet unclassified'
+public = o  = (
+	o isKindOfSubtypeQuery ifFalse: [^false].
+	^subtype = o subtype and: [supertype = o supertype]
+)
+public declarations ^ <List[ObjectType]> = (
+	^declarationsForSubtypeQuery: self
+)
+public hash ^ <Integer> = (
+	^(subtype hash bitXor: supertype hash) bitXor: class hash
+)
+public invalidate = (
+	trail removeKey: self
+)
+public isKindOfSubtypeQuery ^ <Boolean> = (
+	^true
+)
+) : (
+)
+class SuperType for: c <ClassDeclarationMirror> path: p <List[Symbol]> = PseudoType for: c path: p (
+(* The type of the pseudovariable super. Here, c represents the mirror on the superclass
+of the class being typechecked.
+
+The main reason for having a special type is to ensure correct access control,
+since super sends behave differenty than either self sends or normal sends.
+ *)) (
+'as yet unclassified'
+public = o   = (
+	o isKindOfSuperType ifFalse: [^false].
+	^classDeclaration = o classDeclaration
+)
+public at: selector <Symbol> ^ <FunctionType> = (
+  | m <Mirror> =  findMember: selector. signature <MessagePatternAST> |
+  
+  nil = m ifTrue: [^errorType].
+  m accessModifier = #private ifTrue: [^accessErrorType].
+(* protected or public access is ok *)
+  signature:: signatureFor: m. 
+  (* deal with substitution of Self, Instance? 
+These must be substituted with the appropriate values
+for the current class, not the the superclass *)
+  ^(signature apply: selfSubstitution) apply: myTypeBuilder (* and build a function type *)
+)
+public isKindOfSuperType ^ <Boolean> = (
+	^true
+)
+) : (
+)
+class Type = (
+(* Abstract class, root of the type hierarchy. *)) (
+'as yet unclassified'
+public subtypeOf: t <Type> ^ <Boolean> = (
+	subclassResponsibility
+)
+) : (
+)
+class TypeBuilder forTypesIn: klass <ClassDeclarationMirror> = (
+(* A visitor that creates a Type from an AST representing a type. *)| 
+surroundingClass <ClassDeclarationMirror> = klass. 
+pathFinder <PathFinder> = PathFinder forTypesIn: surroundingClass.
+|assert: [klass isMirror] message: '') (
+'as yet unclassified'
+public binaryTypeOpNode: node <BinaryTypeOpAST> ^ <Type> = (
+	| l = node leftOperand apply: self. r = node rightOperand apply: self. |
+	node operator = '|' ifTrue: [^UnionType unifying: {l. r}].
+	^errorType
+)
+public genericInvocationNode: node <GenericType> = (
+	| generic <ObjectType> tas <List[ObjectType]>  |
+	
+	generic:: node generic apply: self.
+	tas:: node arguments collect: [:a <AST> | a apply: self].
+	^GenericType generic: generic typeArguments: tas
+)
+public messagePatternNode: node <MessagePatternAST> ^ <FunctionType> = (
+     ^ FunctionType 
+		domain:  (node parameters collect: [:p <VarDeclNode> | p type apply: self])
+		range: ((returnTypeFor: node) apply: self)
+)
+public typeIdNode: node <TypeIdAST> ^ <Type> = (
+	^ObjectType forPath: (lookupPathForType: node name inClass: surroundingClass)
+)
+public unaryTypeOpNode: node <UnaryTypeOpAST> ^ <ObjectType> = (
+	^ObjectType forPath: (node apply: pathFinder)
+)
+) : (
+)
+class TypeError message: s <String> start: p1 end: p2 = Error (|
+public message = s.
+public start = p1.
+public end = p2.
+|) (
+) : (
+)
+class TypeVariable named: n <Symbol> bound: b <ObjectType> forType: t <ObjectType> = ObjectType forPath: t path, {n} (
+(* Type variables, such as Self, Instance or generics. *)|
+	bound <ObjectType> = b.
+|) (
+'as yet unclassified'
+public = o ^ <Boolean> = (
+	o isKindOfTypeVariable ifFalse: [^false].
+	^path = o path	
+)
+public at: selector <Symbol> ^ <FunctionType>  = (
+	^bound at: selector
+)
+public isKindOfTypeVariable ^ <Boolean>  = (
+	^true
+)
+public name ^ <Symbol> = (
+	^path first
+)
+public subtypeOf: t <Type> ^ <Boolean>  = (
+	^bound subtypeOf: t
+)
+) : (
+)
+class UnionType unifying: ts <List[Type]> = Type (
+(* The union of th etypes in ts *)|
+	public elements <List[Type]> = ts.
+|) (
+'as yet unclassified'
+public = o   = (
+	o isKindOfUnionType ifFalse: [^false].
+	^elements = o elements
+)
+public hash ^ <Integer> = (
+	^elements hash bitXor: class hash
+)
+public isKindOfUnionType ^ <Boolean> = (
+	^true
+)
+) : (
+)
+'as yet unclassified'
+public blockNode: node ^ <ObjectType> = (    
+| tas <VarOrdCltn[ObjectType]> = OrderedCollection(*[ObjectType]*)  new. |
+  nestScope: Scope new.
+  node parameters do: [:p <VarDecl>  |  tas add: (p apply: self)].
+  tas addLast: (node body apply: self). 
+  popScope.
+  ^BlockApplicationType new apply: (TypeIdAST new setId: #Fun) to: tas.	
+)
+public cascadedSendNode: node  ^ <ObjectType> = (
+	node previousSend apply: self.
+	^normalSendNode: node
+	)
+public charNode: node <CharAST> ^ <ObjectType>= (
+	^literal: #Character
+)
+public codeBodyNode: node ^ <ObjectType> = (
+
+    | lastStatementType <ObjectType>  |
+
+    (* pushScope (if we have a map) or just nest a new one *)
+    nestScope: Scope new.
+    node temporaries do: [:t <VarDecl>  | t apply: self].
+
+	(* Parameters are not typechecked here. For method bodies, the parameters are
+	copied from the signature and are checked there. For block bodies, the parameters
+	are checked in blockNode. The copying hack should go away when the code
+	scopes are factored out of the ASTs.*)
+
+    lastStatementType:: (TypeIdAST new name: #Nil) apply: typeBuilder.
+    node statements do: [:s <Statement>  | lastStatementType:: s apply: self].
+    popScope.
+    ^lastStatementType.
+)
+currentConflictNamespace = (
+	^namespace at: (currentTopLevelClass simpleName, ' conflicts') asSymbol ifAbsent: [Map new]
+)
+currentConflictNamespaceHasEntryFor: typeName <Symbol>  = (
+	namespace at: (currentTopLevelClass simpleName, ' conflicts') asSymbol ifAbsent: [^false].
+	^true
+)
+currentScope ^ <Scope> = (
+	^scopeStack last
+)
+declarationsForSignatureQuery: q <SignatureQuery> ^ <List[Declaration]> = ( 
+| result <Mirror>  truncated <Symbol> |
+	^{memberOf: (mirrorForObjectType: q type) instanceSide selector: q selector}
+)
+declarationsForSubtypeQuery: q <SubtypeQuery> ^ <List[Declaration]> = (
+	^{mirrorForObjectType: q subtype. mirrorForObjectType: q supertype}
+)
+error: msg <String> at: location <Pair[Integer]> = (
+	errorSet add: (TypeError message: msg start: location first end: location last).
+)
+functionTypeOf: node <SendASTNode> ^ <MsgSignature> = (
+	(* A query *)
+	| query <Query> receiverType <ObjectType> cachedType <Type> selector <Symbol> |
+	selector:: node message selector.
+	receiverType:: node receiver apply: self.
+	query:: SignatureQuery type: receiverType selector: selector.
+	registerDependenciesOfQuery: query.
+	cachedType:: cachedTypes at: query ifAbsent: [
+		cachedTypes at: query put: (receiverType at: selector).
+		].
+	cachedType isKindOfAccessErrorType ifTrue: [
+		error: selector, ' is defined, but is not accessible' at: {node concreteStart. node concreteEnd}
+		] ifFalse: [
+		cachedType isKindOfErrorType ifTrue: [
+			error: selector, ' is not defined on type ', receiverType name at: {node concreteStart. node concreteEnd}
+			].
+		].
+	^cachedType.
+)
+public genericInvocationNode: node ^ <ObjectType> = (
+    | myType <GenericApplicationType>  |
+
+(* This will have to change to accomodate generic terms that are not classes  - mixins, or (in the near future) reflective representatives of a types. We also need to verify that the target is a term. For the immediate future, this is sufficient to type generic classes only.
+*)
+
+myType:: UnaryTypeOpAST new target: (GenericApplicationType new apply: (TypeIdAST new setId: node target name) to: node actuals) selector: #class.
+myType wellFormed.
+^myType
+)
+public guaranteedNode: node ^ <Type> = (
+(* not supported in the grammar or parser yet *)
+  ^node expr type.
+)
+herePathFor: m <MixinMirror> ^ <List[Symbol]> = (
+	^(pathForMixin: m) asOrderedCollection addLast: #'@Here'; yourself
+)
+public invalidateDeclaration: declaration <Declaration> ^ <Set[Declaration]> = (
+(* To be called when declaration has changed.
+(a) Wipe clean the set of queries declaration depends on, because they were derived from an old version.
+(b) Invalidate all queries that depended on the old declaration and return the declarations that depend on them.
+ *)
+	removeDependenciesOf:  declaration.
+	^invalidateDependenciesOn: declaration.
+)
+invalidateDependenciesOn: declaration <Declaration> ^ <Set[Declaration]>  = (
+(* Will invalidate all queries that depended on the declaration. *)
+      | queries <Set[Query]> invalidDeclarations <Set[Declaration]> = Set new. |
+      queries:: dependentQueries at: declaration.
+	queries do: [:q <Query> | 
+		q invalidate.
+		invalidDeclarations addAll: (dependentDeclarations at: q)
+		].
+	^invalidDeclarations
+)
+lookupPathForType: typeName <Symbol> ^ <List[Symbol]> = (
+(* Compute path for a type name referenced in the class 
+currently being typechecked. first lookup in lexical scope; 
+if not found, check self; otherwise check surrounding 
+namespace *)
+      | path <List[Symbol]> f <FunctionType> |
+
+	path:: pathFor: typeName inClass: currentClass.
+	^path isEmpty
+	    ifFalse: [path]
+	    ifTrue: [
+		f:: typeOfSelf at: typeName. 
+		(* No lexical definition. Check self*)
+		f isKindOfErrorType ifTrue: [
+			namespace at: typeName ifAbsent: [^{}].
+			^{typeName}
+			] ifFalse: [^(objectTypeFor: currentClass) path, {typeName}].
+		(* maybe use typeOfSelf bound? *)
+	    ].
+)
+lookupPathForType: typeName <Symbol> inClass: klass <ClassDeclarationMirror> ^ <List[Symbol]> = (
+(* Compute path for a type name referenced in the class 
+klass. First lookup in lexical scope of klass; 
+if not found, check klass (including supertypes); otherwise 
+check surrounding namespaces (conflict and regular)*)
+      | path <List[Symbol]> f <FunctionType> otype <ObjectType> |
+
+	path:: pathFor: typeName inClass: klass.
+	^path isEmpty
+	    ifFalse: [path]
+	    ifTrue: [
+		otype:: objectTypeFor: klass.
+		f:: otype at: typeName. 
+		(*  No lexical definition. Check klass *)
+		^f isKindOfErrorType ifTrue: [
+			namespaceLookupPathForType: typeName ofType:  (otype path first).
+			] ifFalse: [otype path, {typeName}] (*Er, this won't be canonical *)
+		]
+)
+memberOf: target <MixinMirror> selector: selector <Symbol> ^ <Mirror> = ( 
+| result <Mirror> |
+	result:: target methods findMirrorNamed: selector.
+	result ~= nil ifTrue: [^result].
+	selector last asSymbol = ':' ifTrue: [ 
+			result:: target slots findMirrorNamed: selector allButLast asSymbol.
+			(* assume it's a setter and look for its slot *)
+			(result ~= nil and: [result isMutable]) ifTrue: [^result]
+			] ifFalse: [
+				result:: target nestedClasses findMirrorNamed: selector.
+				result ~= nil ifTrue: [^result].
+				result:: target slots findMirrorNamed: selector.
+				result ~= nil ifTrue: [^result].
+			].
+	^nil
+)
+public messageNode: node  <MessageAST> ^ <List[ObjectType]>= (
+	^node arguments collect: [:e <ExpressionAST> | e apply: self]
+)
+public messagePatternNode: node ^ <FunctionType> = (
+      ^node apply: typeBuilder
+    )
+public methodNode: node <MethodAST> ^ <MsgSignature>  = (
+   | signature <FunctionType> | 
+    pushScope: Scope new.
+    signature:: node pattern apply: self.
+halt.
+    currentReturnType:: signature range.
+halt.
+    node body apply: self.
+    popScope.
+    ^currentReturnType
+    )
+mirrorForObjectType: o <ObjectType> ^ <ClassDeclarationMirror> = (
+	| topName <Symbol> = o path first. mirror <ClassDeclarationMirror> |
+	mirror:: ClassDeclarationMirror reflecting: (currentConflictNamespace at: topName ifAbsent: [namespace at: topName]) mixin. 
+	2 to: o path size do: [:i <Integer> | | id <Symbol> = o  path at: i. |
+		id = #'@Here' ifTrue: [^mirror].
+		nil = mirror ifTrue: [^nil].
+		mirror:: mirror instanceSide nestedClasses findMirrorNamed: id. 
+		].
+	^mirror
+)
+namespaceFor: typeName <Symbol> ^ <Map[Symbol, Object]> = (
+	^namespace at: (typeName, ' conflicts') asSymbol ifAbsent: [namespace]
+)
+namespaceLookupPathForType: typeName <Symbol> ofType: toplevelTypeName <Symbol> = (
+(* Given typeName, a simple name of a top level type 
+referenced by a top level class named toplevelTypeName, 
+compute a path for it.  Check if the namespace we are
+typechecking against includes a conflict namespace for
+toplevelTypeName, and if so if typeName is defined there.
+Otherwise, check the main namespace.
+*)
+	| 
+	conflictNamespaceName <Symbol> = (toplevelTypeName, ' conflicts') asSymbol.
+	conflictNamespace <Map[Symbol, Class]> 
+	conflictClass <Class>
+	|
+	conflictNamespace:: namespace at: conflictNamespaceName ifAbsent: []. 
+	nil = conflictNamespace ifFalse: [
+		conflictClass:: conflictNamespace at: typeName ifAbsent: [].
+		nil = conflictClass ifFalse: [^{conflictNamespaceName. typeName}].
+		].
+	namespace at: typeName ifAbsent: [^{}].
+	^{typeName}
+)
+nestScope: s <Scope> = (
+	(* Hook up a new lexically nested scope, and push onto the scope stack *)
+	s setSuperScope: currentScope.
+	pushScope: s
+)
+nonPrivate: m <Mirror> ^ <Boolean> = (
+	^m ~= nil and: [m accessModifier ~= #private]
+)
+nonPrivateMemberOf: target <MixinMirror> selector: selector <Symbol> ^ <Mirror> = ( 
+| result <Mirror> |
+	result:: target methods findMirrorNamed: selector.
+	(nonPrivate: result) ifTrue: [^result].
+	selector last asSymbol = ':' ifTrue: [ 
+			result:: target slots findMirrorNamed: selector allButLast asSymbol.
+			(* assume it's a setter and look for its slot *)
+			((nonPrivate: result) and: [result isMutable]) ifTrue: [^result]
+			] ifFalse: [
+				result:: target nestedClasses findMirrorNamed: selector.
+				(nonPrivate: result) ifTrue: [^result].
+				result:: target slots findMirrorNamed: selector.
+				(nonPrivate: result) ifTrue: [^result].
+			].
+	^nil
+)
+public normalSendNode: node <NormalSendASTNode> ^ <ObjectType> = (
+    | functionType <FunctionType> domain <List[ObjectType]>  args <List[ObjectType]>  |
+
+functionType::  functionTypeOf: node.
+domain:: functionType domain.
+args:: node message apply: self.
+1 to: args size do: [:i <Integer> | 
+	(type: (args at: i) isSubtypeOf: (domain at: i)) ifFalse: [
+		error: 'Argument is not a subtype of corresponding formal'
+		at: {(args at: i) concreteStart. (args at: i) concreteEnd}
+		]
+	].
+^functionType range.
+)
+public numberNode: node = (
+	^literal: #Number
+)
+objectTypeFor: c <ClassDeclarationMirror> ^ <ObjectType> = (
+	^ObjectType forPath: (pathForMixin: c instanceSide)
+)
+pathFor: typeName <Symbol> inClass: klass <ClassDeclarationMirror> ^ <List[Symbol]> = (
+(* Compute path for the name typeName referenced  in klass and
+defined in klasses'  lexical scope. Check klass, and if not found
+recurse up the enclosing class chain.
+*)
+      nil = klass ifTrue: [^{}]. (* got to the top level *)
+	(typeSelector: typeName declaredIn: klass) ifTrue: [
+		(* is this a selector of the class we are looking at *)
+		^(pathForMixin: klass mixin), {typeName}
+		(* if so , the path is the path for this class with the type name appended*)
+		].
+	^pathFor: typeName inClass: klass enclosingClass.
+	(* otherwise, recurse on the enclosing class *)
+)
+pathForMixin: mixin <MixinMirror> ^ <List[Symbol]> = (
+(* Compute the path for mixin *)
+	| enclosingMixin = mixin enclosingMixin. |
+	enclosingMixin = nil ifTrue: [^{mixin simpleName}].
+	(* A top level mixin's path includes only its simple name *)
+	^(pathForMixin: enclosingMixin), {mixin simpleName}
+	(* Otherwise, it is the path of its enclosing mixin with
+	its simple name appended *)
+)
+popScope ^ <Scope> = (
+  ^scopeStack removeLast
+)
+pushScope: scope <Scope> = (
+	scopeStack addLast: scope
+)
+registerDependenciesOfQuery: q <Query> = (
+	(dependentDeclarations at: q ifAbsent: [dependentDeclarations at: q put: Set new]) add: currentDeclaration.
+	(* BOGUS, since currentDeclaration is just a symbol *)
+	q declarations do: [: d | (dependentQueries at: d ifAbsent: [dependentQueries at: d put: Set new]) add: q.].
+	(queriesOfDeclaration at: currentDeclaration ifAbsent: [queriesOfDeclaration at: currentDeclaration put: Set new]) add: q.
+	(* BOGUS, again since currentDeclaration is just a symbol *)	
+)
+removeDependenciesOf:  declaration = (
+(* Wipe clean the set of queries  declaration depends on *)
+      
+	dependentDeclarations do: [:ds <Set[Declaration]> | ds remove: declaration].
+)
+public returnStatNode: node ^ <ObjectType> = (
+    | returnType <ObjectType>   eType <ObjectType>  |
+
+eType:: node expression apply: self.
+^(type: eType isSubtypeOf: currentReturnType)
+    ifTrue: [BottomType new]
+    ifFalse: [error: 'Type of returned expression is not a subtype of declared return type' at: {node concreteStart. node concreteEnd}]
+    )
+returnTypeFor: node <MessagePatternAST> ^ <AST> = (
+	| returnType <ObjectType> |
+	returnType:: node returnType.
+	returnType = nil ifTrue: [^ TypeIdAST new name: #Self]. 
+	^returnType
+)
+setClass: klass <ClassDeclarationMirror> = (
+	currentClass:: klass.
+	typeBuilder:: TypeBuilder forTypesIn: klass.
+)
+public setterSendNode: node ^ <Type> = (
+    | etype <ObjectType>  |
+
+    etype:: node expr apply: self.
+    (type: etype isSubtypeOf: (node var type apply: self))
+       ifFalse: [error: etype name, ' is not a subtype of ', node var type name at: {node concreteStart. node concreteEnd}].
+    ^etype
+)
+public stringNode: node = (
+	^literal: #String
+)
+public superclassOf: klass <ClassDeclarationMirror> ^ <ClassDeclarationMirror> = (
+     | superclassClause <SendAST> superclassClauseType <ObjectType> |
+      superclassClause:: klass header superclassClause.
+      setClass: klass enclosingClass.
+     (*must move one lexical level out before evaluating superclass clause *)
+	superclassClauseType:: superclassClause apply: self.
+	setClass: klass.
+	superclassClauseType path last = #class ifFalse: [
+		error: 'Class type expected' at: {superclassClause start. superclassClause end}.
+		^mirrorForObjectType: (ObjectType forPath: {#Object})
+		].
+	(* the type should be of the form T class *)
+	^mirrorForObjectType: (ObjectType forPath: superclassClauseType path allButLast)
+)
+public symbolNode: node = (
+	^literal: #Symbol
+)
+public tupleNode: node ^ <ObjectType> = (
+    |
+sqTarget <TypeId> 
+sqActuals <VarOrdCltn[ObjectType]> 
+sqActual <ObjectType> 
+sqType <GenericTypeApplication>
+tupleTarget <TypeId> 
+tupleActuals <VarOrdCltn[ObjectType]> 
+tupleType <TupleType>
+|
+
+sqTarget:: TypeIdAST new setId: #SeqCltn;  start: 0; end: 0.
+sqActuals:: OrderedCollection(*[ObjectType]*)  new.
+tupleActuals:: node value collect: [:e <Literal>  | e apply: self].
+
+tupleActuals isEmpty 
+   ifTrue: [tupleActuals add: (TypeIdAST new setId: #DoesNotMatter)].
+
+sqActual:: UnionType unifying: tupleActuals asSet asOrderedCollection.
+
+sqActuals add: sqActual.
+sqType:: GenericApplicationType new apply: sqTarget to: sqActuals.
+
+tupleTarget:: TypeIdAST new setId: #Tuple.
+tupleType:: TupleAST new apply: tupleTarget to: tupleActuals.
+
+
+^ProtocolMerge new type1: sqType type2: tupleType.
+)
+type: sub <Type> isSubtypeOf: sup <Type> ^ <Boolean> = (
+	| query |
+	query:: SubtypeQuery subtype: sub supertype: sup.
+	registerDependenciesOfQuery: query.
+	^trail at: query ifAbsent: [
+		trail at: query put: (sub subtypeOf: sup).		
+		].
+)
+typeBuilderFor: klass <ClassDeclarationMirror> ^ <TypeBuilder> = (
+(* really need to cache this somewhere *)
+	^TypeBuilder forTypesIn: klass
+)
+typeOfHere ^ <ObjectType> = (
+	^HereType for: currentClass 
+)
+typeOfLocal: varName <Symbol> ^ <ObjectType> = (
+	 ^currentScope at: varName ifAbsent: []
+)
+typeOfOuter ^ <ObjectType> = (
+	^OuterType for: currentClass mixin
+)
+typeOfSelf ^ <ObjectType> = (
+      | currentType <ObjectType> = SelfType for: currentClass path: (pathForMixin: currentClass instanceSide), {#self} . |
+	^TypeVariable named: #Self bound: currentType forType: currentType.
+)
+typeOfSuper ^ <ObjectType> = (
+	^SuperType for: currentClass superclass path: (lookupPathForType: currentClass simpleName), {#super}
+)
+typeSelector: typeName <Symbol> declaredIn: klass <ClassDeclarationMirror> ^ <Boolean> = (
+	| mixin <MixinMirror> = klass instanceSide. candidate <Mirror> |
+	
+	typeName = #Self ifTrue: [^true]. (* every klass has a self type *)
+	typeName = #Instance ifTrue: [^true]. (* and an Instance type (or only allow for metaclasses?) *)
+	candidate:: mixin nestedClasses findMirrorNamed: typeName.
+	nil ~= candidate ifTrue: [^true].
+	candidate:: mixin methods findMirrorNamed: typeName. 
+	nil ~= candidate ifTrue: [^true].
+	candidate:: mixin slots findMirrorNamed: typeName.
+	^nil ~= candidate.	
+)
+public typecheckMethod: m <MethodAST> ofClass: c <Class> ^ <Set[TypeError]>= (
+     | toplevelCandidate <ClassDeclarationMirror> = ClassDeclarationMirror reflecting: c mixin. |
+	currentClass:: toplevelCandidate.
+	typeBuilder:: TypeBuilder forTypesIn: toplevelCandidate.
+	currentDeclaration:: m selector.
+      [nil ~= toplevelCandidate enclosingClass] whileTrue: [toplevelCandidate:: toplevelCandidate enclosingClass].
+      currentTopLevelClass:: toplevelCandidate.
+      errorSet:: Set new.
+	methodNode: m.
+	^errorSet
+)
+public typecheckMethodSource: src <String> ofClass: c <Class> ^ <Set[TypeError]>= (
+     | m <MethodAST> |
+	m:: parser methodDecl parseString: src.
+	^typecheckMethod: m ofClass: c.
+)
+public varDeclNode: node = (
+      ^currentScope at: node name put: (node type apply: typeBuilder). 
+)
+public variableNode: node <VariableAST> ^ <ObjectType> = (
+	(* need to deal with #'@here', #self, #super, #outer *)
+	| varName <Symbol> = node name. | 
+	varName = #'@here' ifTrue: [^typeOfHere].
+	varName = #self ifTrue: [^typeOfSelf].
+	varName = #super ifTrue: [^typeOfSuper].
+	varName = #outer ifTrue: [^typeOfOuter].
+	^assert: [false] message: varName, ' should never have been treated as a variable node'.
+)
+'visiting'
+literal: typeName <Symbol> ^ <ObjectType> = (
+    ^(TypeIdAST new name: typeName) apply: typeBuilder
+    )
+) : (
+)

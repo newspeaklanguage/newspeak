@@ -180,7 +180,7 @@ public class Compiler = super Compiler ((* A work-in-progress Compiler reimpleme
 	public enableIntrinsics ::= true.
 |) (
 class PropertyCallAST = MessageAST ((* Sepcialized node to represent applications of JS properties. In some cases (well, at least one) we need to generate ASTs that call javascript methods directly. These calls need to be translated slightly differently (their names must not be mangled). To distinguish these form normal message sends, we use this node. *)) (
-'node traversal'
+'as yet unclassified'
 public apply: tool <ASTTool> = (
 	^tool propertyCallNode: self
 )
@@ -264,26 +264,6 @@ isInlinableOperator: node <NormalSendAST> = (
 	^(inlinableOperators includesKey: node message selector)
 		and: [node message arguments size = 1]
 )
-processEventualSend: node <NormalSendAST> = (
-	| scheduler receiver selector arguments |
-	scheduler:: SchedulerAST new.
-		
-	receiver:: node receiver apply: self.
-	selector:: (SymbolAST new value: node message selector) apply: self.
-	arguments:: (TupleAST new elements: node message arguments) apply: self.
-
-	^(OrdinarySendAST
-		to: scheduler
-		send: ((MessageAST new
-			send: #eventualSendTo:selector:arguments: 
-			with: {receiver. selector. arguments})
-				copyPositionFrom: node message))
-		copyPositionFrom: node
-)
-setterBlockArgName = (
-	^ ('setter_arg') asSymbol
-)
-'node traversal'
 public normalSendNode: node <NormalSendAST> ^ <AST> = (
 	#BOGUS. (* Eventual sends trump inlining, but we shouldn't need to duplicate the eventual send check. Maybe the inlining should be deferred until we know it is an immediate ordinary send? *)
 	(node message isEventual)
@@ -304,6 +284,22 @@ public normalSendNode: node <NormalSendAST> ^ <AST> = (
 	
 	^super normalSendNode: node
 )
+processEventualSend: node <NormalSendAST> = (
+	| scheduler receiver selector arguments |
+	scheduler:: SchedulerAST new.
+		
+	receiver:: node receiver apply: self.
+	selector:: (SymbolAST new value: node message selector) apply: self.
+	arguments:: (TupleAST new elements: node message arguments) apply: self.
+
+	^(OrdinarySendAST
+		to: scheduler
+		send: ((MessageAST new
+			send: #eventualSendTo:selector:arguments: 
+			with: {receiver. selector. arguments})
+				copyPositionFrom: node message))
+		copyPositionFrom: node
+)
 public propertyCallNode: node <PropertyCallAST> ^ <PropertyCallAST> = (
 	| args |
 	assert: [node isMessageNode].
@@ -313,6 +309,9 @@ public propertyCallNode: node <PropertyCallAST> ^ <PropertyCallAST> = (
 		send: node selector with: args;
 		start: node start;
 		end: node end
+)
+setterBlockArgName = (
+	^ ('setter_arg') asSymbol
 )
 public setterSendNode: node <SetterSendAST> ^ <AST> = (
 (* Rewrite a double-colon setter send. The value of the entire expression should be the value of the argument of the send, NOT the value returned by the setter method. This general case is somewhat inefficient, but in most cases the value of the expression is ignored by the parent so we can use a cheaper regular message send. *)
@@ -397,80 +396,6 @@ public beginNewTranslationCycle = (
 	scopeStack:: List new.
 	containsNonLocalReturn:: false.
 )
-maybeCaptureReceiver = (
-	methodIsPrivate
-		ifTrue: [^{}]
-		ifFalse: [^{js var: selfName value: (js ident: 'this')}].
-)
-nlrName = (
-	^'NLR'
-)
-nlrValuePropertyName = (
-	^'value'
-)
-processIntrinsic: msg <MessageAST> = (
-	^js perform: msg selector
-		withArguments: (msg arguments collect: [:arg | processIntrinsicArg: arg]) asArray.
-)
-processIntrinsicArg: arg <AST> = (
-	arg isTupleNode ifTrue: [^(arg elements collect: [:el | processIntrinsicArg: el]) asArray].
-	arg isLiteralNode ifTrue: [^arg value].
-	^arg apply: self
-)
-processLexicalSend: message to: jsReceiver binding: binding = (
-	
-	(binding notNil and: [binding ast accessModifier = #private]) ifTrue: [
-		(* Do early binding. *)
-		|
-		definingMixinDepth = binding depth - 1.
-		definingMixin = js ident: '$', definingMixinDepth printString.
-		targetMethod = js propertyOf: definingMixin at: (publicMessage: message).
-		|
-		^js call: targetMethod (*(js propertyOf: targetMethod at: (js literal: 'call'))*)
-			with: {jsReceiver}, (message arguments collect: [:each | each apply: self]) asArray
-	].
-	
-	^js 
-		call: (js propertyOf: jsReceiver at: (protectedMessage: message))
-		with: (message arguments collect: [:each | each apply: self]) asArray
-)
-processOuterReceiverAtDepth: depth <Integer> = (
-	| slotName |
-	depth = 0 ifTrue: [^js ident: 'self'].
-	slotName:: names mangleSynthetic: 'enclosingObjects`', currentMixinUID.
-	^js propertyOf: (js propertyOf: (js ident: 'self') at: (js literal: slotName))
-		at: (js literal: depth - 1) (* Adjust for self not being in the enclosing objects array. *)
-)
-protectedMessage: node = (
-	sentSelectors add: node selector.
-	^js literal: (names mangleProtected: node selector)
-)
-publicMessage: node = (
-	sentSelectors add: node selector.
-	^js literal: (names manglePublic: node selector)
-)
-selfName = (
-	^'self'
-)
-wrapBodyForNlrHandling: body <Block> = (
-	| nlrVarNode nlrParamName nlrParamNode |
-	nlrVarNode:: js ident: nlrName.
-	nlrParamName:: nlrName, '_exception'.
-	nlrParamNode:: js ident: nlrParamName.
-	^js block: maybeCaptureReceiver, 
-		{js var: nlrName value: (js new: (js ident: 'Object') with: {}).
-		js try: body catch: nlrParamName with:
-			(js block: {
-				js if: (js operator: '===' with: nlrVarNode and: nlrParamNode)
-					then: (js return: (js propertyOf: nlrParamNode at: (js literal: nlrValuePropertyName)))
-					else: (js throw: nlrParamNode)
-			})
-	}
-)
-wrapBodyNoNlrHandling: body <Block> = (
-	^js block: maybeCaptureReceiver, body statements
-)
-'node traversal'
 public blockLocalReturnNode: node <BlockLocalReturnAST> = (
 	^js return: (node expression apply: self)
 )
@@ -586,6 +511,11 @@ public loopNode: node <LoopAST> = (
 			step: (js verbatim: '')
 			do: (js block: body statements, condPrologue)}
 )
+maybeCaptureReceiver = (
+	methodIsPrivate
+		ifTrue: [^{}]
+		ifFalse: [^{js var: selfName value: (js ident: 'this')}].
+)
 public messageNode: node = (
 	halt.
 	sentSelectors add: node selector.
@@ -621,6 +551,12 @@ public methodNode: node <MethodAST> ^<Node> = (
 public nilNode: node = (
 	^js ident: 'nil'
 )
+nlrName = (
+	^'NLR'
+)
+nlrValuePropertyName = (
+	^'value'
+)
 public nonLocalReturnNode: node <NonlocalReturnAST> = (
 	^returnStatNode: node
 )
@@ -643,8 +579,49 @@ public outerSendNode: node <OuterSendAST> = (
 public parameterDeclNode: node <ParameterAST> = (
 	^names mangleLocal: node name
 )
+processIntrinsic: msg <MessageAST> = (
+	^js perform: msg selector
+		withArguments: (msg arguments collect: [:arg | processIntrinsicArg: arg]) asArray.
+)
+processIntrinsicArg: arg <AST> = (
+	arg isTupleNode ifTrue: [^(arg elements collect: [:el | processIntrinsicArg: el]) asArray].
+	arg isLiteralNode ifTrue: [^arg value].
+	^arg apply: self
+)
+processLexicalSend: message to: jsReceiver binding: binding = (
+	
+	(binding notNil and: [binding ast accessModifier = #private]) ifTrue: [
+		(* Do early binding. *)
+		|
+		definingMixinDepth = binding depth - 1.
+		definingMixin = js ident: '$', definingMixinDepth printString.
+		targetMethod = js propertyOf: definingMixin at: (publicMessage: message).
+		|
+		^js call: targetMethod (*(js propertyOf: targetMethod at: (js literal: 'call'))*)
+			with: {jsReceiver}, (message arguments collect: [:each | each apply: self]) asArray
+	].
+	
+	^js 
+		call: (js propertyOf: jsReceiver at: (protectedMessage: message))
+		with: (message arguments collect: [:each | each apply: self]) asArray
+)
+processOuterReceiverAtDepth: depth <Integer> = (
+	| slotName |
+	depth = 0 ifTrue: [^js ident: 'self'].
+	slotName:: names mangleSynthetic: 'enclosingObjects`', currentMixinUID.
+	^js propertyOf: (js propertyOf: (js ident: 'self') at: (js literal: slotName))
+		at: (js literal: depth - 1) (* Adjust for self not being in the enclosing objects array. *)
+)
 public propertyCallNode: node <PropertyCallAST> = (
 	^js literal: (names mangleSelector: node selector)
+)
+protectedMessage: node = (
+	sentSelectors add: node selector.
+	^js literal: (names mangleProtected: node selector)
+)
+publicMessage: node = (
+	sentSelectors add: node selector.
+	^js literal: (names manglePublic: node selector)
 )
 public receiverNode: node <ReceiverNode> = (
 	^js ident: selfName
@@ -661,6 +638,9 @@ public returnStatNode: node <ReturnAST> = (
 )
 public schedulerNode: node <SchedulerAST> = (
 	^js ident: 'currentActor'
+)
+selfName = (
+	^'self'
 )
 public selfSendNode: node <SelfSendAST> = (
 	| receiver = js ident: selfName. |
@@ -697,6 +677,24 @@ public tupleNode: node <TupleAST> = (
 public varDeclNode: node <VarDeclNode> = (
 	(* Produce the corresponding local decl. *)
 	^js var: (names mangleLocal: node name)
+)
+wrapBodyForNlrHandling: body <Block> = (
+	| nlrVarNode nlrParamName nlrParamNode |
+	nlrVarNode:: js ident: nlrName.
+	nlrParamName:: nlrName, '_exception'.
+	nlrParamNode:: js ident: nlrParamName.
+	^js block: maybeCaptureReceiver, 
+		{js var: nlrName value: (js new: (js ident: 'Object') with: {}).
+		js try: body catch: nlrParamName with:
+			(js block: {
+				js if: (js operator: '===' with: nlrVarNode and: nlrParamNode)
+					then: (js return: (js propertyOf: nlrParamNode at: (js literal: nlrValuePropertyName)))
+					else: (js throw: nlrParamNode)
+			})
+	}
+)
+wrapBodyNoNlrHandling: body <Block> = (
+	^js block: maybeCaptureReceiver, body statements
 )
 ) : (
 )
@@ -1142,6 +1140,9 @@ processSide: side <SideAST> ofMixin: mixinIR <MixinIR> = (
 pushScope: scope <Scope> = (
 	scopeStack addLast: scope
 )
+scopeMap = (
+	^super scopeMap
+)
 selfNode ^ <VariableAST> = (
 	(* generate a an AST representing self; used for implicit self sends *)
 	^VariableAST new name: #self; start: 0; end: 0
@@ -1239,10 +1240,6 @@ args <List>
 superConstructorNameFor: aNode <ClassHeaderAST> ^ <Symbol> = (
 	#BOGUS. (* Should not rely on this running after currentMixinUID is set. *)
 	^'superInit`', currentMixinUID
-)
-'lexical export'
-scopeMap = (
-	^super scopeMap
 )
 ) : (
 )

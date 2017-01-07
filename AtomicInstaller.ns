@@ -91,7 +91,7 @@ private updateMixinsAndClasses <IdentityMap[OldObject,NewObject]>
 private updateInstances <IdentityMap[OldObject,NewObject]>
 private existingClasses <IdentityMap[HierarchyDepth,Set[Class]]>
 |) (
-'private'
+'as yet unclassified'
 private augmentExistingMixinMap: map withNestedClasses: nestedClasses inExistingMixin: mixin  = (
 	nestedClasses do:
 		[:nestedClass <IntermediateClassDeclaration> |
@@ -108,6 +108,32 @@ private cleanup = (
 	updateMixinsAndClasses: nil.
 	updateInstances: nil.
 	existingClasses: nil.
+)
+private depthFor: klassArg <Class> ^<Integer> = (
+	| klass d |
+	d: 0.
+	klass: klassArg.
+	[klass isNil] whileFalse: [klass: klass superclass. d: d+1].
+	^d
+)
+public install: intermediates <List[IntermediateClassDeclaration]>
+ withExistingMixins: existingMixinMap <Map[IntermediateClassDeclaration, InstanceMixin]> = (
+	
+	| results |
+	setup.
+	results:: intermediates collect: 
+		[:classDecl <IntermediateClassDeclaration> |
+		(existingMixinMap includesKey: classDecl) ifTrue:
+			[augmentExistingMixinMap: existingMixinMap
+				withNestedClasses: classDecl instanceSide nestedClasses
+				inExistingMixin: (existingMixinMap at: classDecl)].
+		processClassDeclaration: classDecl in: existingMixinMap].
+	processExistingClasses.
+	installAll.
+	vmmirror flushCache. (* Clear all lookup caches *)
+	cleanup.
+
+	^results (* <List[InstanceMixin]> *)
 )
 private installAll = (
 	| updateCount oldObjects newObjects index |
@@ -132,21 +158,20 @@ private installAll = (
 	(* As of 2673, the VM ensures objects whose references are deleted in a one-way become cannot be resurrected by allInstances/allObjects.
 	hadLayoutChange ifTrue: [vmmirror fullGC]. (* Ensure that objects newly made unreachable by the one-way become will not be enumerated by future uses of someInstance/nextInstance. See discussion of issue #82 and comments in ClassBuilder update:to:. *) *)
 )
-private setup = (
-	updateMixinsAndClasses: IdentityMap new.
-	updateInstances: IdentityMap new.
-	existingClasses: IdentityMap new.
-)
-'private-classes'
-private depthFor: klassArg <Class> ^<Integer> = (
-	| klass d |
-	d: 0.
-	klass: klassArg.
-	[klass isNil] whileFalse: [klass: klass superclass. d: d+1].
-	^d
-)
 private layoutHasChangedBetween: oldClass <Behavior> and: newClass <Behavior> ^<Boolean> = (
 	^oldClass allInstVarNames ~= newClass allInstVarNames
+)
+private methodDictionaryFor: mixin <AbstractMixin> from: imixin <IntermediateMixin> ^<MethodDictionary> = (
+	| 
+	methods = imixin assembleMethods. 
+	mdict = MethodDictionary new: methods size.
+	|
+	methods do:
+		[:imethod <IntermediateMethod> | 
+		imethod methodMixin: mixin.
+		(mdict includesKey: imethod selector) ifTrue: [conflictingMethods].
+		mdict at: imethod selector put: imethod compiledMethod].
+	^mdict
 )
 private newClassFor: oldClass <Class> ^<Class> = (
 	
@@ -161,76 +186,6 @@ private newClassFor: oldClass <Class> ^<Class> = (
 	(* organization and category: they live in the mixin *)
 
 	^newClass
-)
-private processExistingClass: oldClass <Class> = (
-	| newClass <Class> |
-	newClass:: newClassFor: oldClass.
-	
-	updateMixinsAndClasses at: oldClass put: newClass.
-	updateMixinsAndClasses at: (vmmirror classOf: oldClass) put: (vmmirror classOf: newClass).
-)
-private processExistingClasses = (
-	(* Process superclasses before subclasses. Create all new classes before remapping any instances. *)
-	existingClasses keys asSortedCollection do:
-		[:inheritanceDepth <Integer> |
-		(existingClasses at: inheritanceDepth) do:
-			[:oldClass <Class> | processExistingClass: oldClass]].
-
-	existingClasses valuesDo:
-		[:depthSet <Set[Class]> |
-		depthSet do:
-			[:oldClass <Class> | processInstancesOf: oldClass]].
-)
-private sortClass: app <Class> = (
-	| classes depth |
-	depth:: depthFor: app.
-	classes:: existingClasses at: depth ifAbsentPut: [List new].
-	classes add: app.
-	app subclassesDo: [:sc | sortClass: sc].
-)
-'private-instances'
-private processInstancesOf: oldClass <Class> = (
-	| 
-	newClass <Class> = updateMixinsAndClasses at: oldClass.
-	oldSlotNames <Array[Symbol]>
-	newSlotCount <Integer>
-	remapIndices <Array[Integer]>
-	|
-	(layoutHasChangedBetween: oldClass and: newClass) ifFalse: [^self].
-	
-	(* Heuristic: choose the latter slot if a slot name is duplicated to favor overriding slots. *)
-	oldSlotNames:: oldClass allInstVarNames.
-	remapIndices:: newClass allInstVarNames collect:
-		[:newSlotName | oldSlotNames lastIndexOf: newSlotName ifAbsent: 0].
-	newSlotCount:: remapIndices size.
-
-	(vmmirror allInstancesOf: oldClass) do: 
-		[:oldInstance |
-		(* Avoid A -> D (see class comment). *)
-		(updateMixinsAndClasses includesKey: oldInstance) ifFalse:
-			[ | newInstance = vmmirror instantiateFixedClass: newClass. |
-			(* Copy state from oldInstance to newInstance. *)
-			1 to: newSlotCount do: [:newIndex |
-				| oldIndex value |
-				oldIndex:: remapIndices at: newIndex.
-				0 == oldIndex ifFalse: [
-					value:: vmmirror ifFail: [halt] namedSlotOf: oldInstance at: oldIndex.
-					vmmirror ifFail: [halt] namedSlotOf: newInstance at: newIndex put: value]]. 
-
-			updateInstances at: oldInstance put: newInstance]].
-)
-'private-mixins'
-private methodDictionaryFor: mixin <AbstractMixin> from: imixin <IntermediateMixin> ^<MethodDictionary> = (
-	| 
-	methods = imixin assembleMethods. 
-	mdict = MethodDictionary new: methods size.
-	|
-	methods do:
-		[:imethod <IntermediateMethod> | 
-		imethod methodMixin: mixin.
-		(mdict includesKey: imethod selector) ifTrue: [conflictingMethods].
-		mdict at: imethod selector put: imethod compiledMethod].
-	^mdict
 )
 private noteUpdateOf: existingMixin <InstanceMixin | nil> to: newMixin <InstanceMixin> = (
 	existingMixin isNil ifTrue: [^self].
@@ -287,6 +242,55 @@ private processClassDeclaration: classDecl <IntermediateClassDeclaration>
 	
 	^mixin
 )
+private processExistingClass: oldClass <Class> = (
+	| newClass <Class> |
+	newClass:: newClassFor: oldClass.
+	
+	updateMixinsAndClasses at: oldClass put: newClass.
+	updateMixinsAndClasses at: (vmmirror classOf: oldClass) put: (vmmirror classOf: newClass).
+)
+private processExistingClasses = (
+	(* Process superclasses before subclasses. Create all new classes before remapping any instances. *)
+	existingClasses keys asSortedCollection do:
+		[:inheritanceDepth <Integer> |
+		(existingClasses at: inheritanceDepth) do:
+			[:oldClass <Class> | processExistingClass: oldClass]].
+
+	existingClasses valuesDo:
+		[:depthSet <Set[Class]> |
+		depthSet do:
+			[:oldClass <Class> | processInstancesOf: oldClass]].
+)
+private processInstancesOf: oldClass <Class> = (
+	| 
+	newClass <Class> = updateMixinsAndClasses at: oldClass.
+	oldSlotNames <Array[Symbol]>
+	newSlotCount <Integer>
+	remapIndices <Array[Integer]>
+	|
+	(layoutHasChangedBetween: oldClass and: newClass) ifFalse: [^self].
+	
+	(* Heuristic: choose the latter slot if a slot name is duplicated to favor overriding slots. *)
+	oldSlotNames:: oldClass allInstVarNames.
+	remapIndices:: newClass allInstVarNames collect:
+		[:newSlotName | oldSlotNames lastIndexOf: newSlotName ifAbsent: 0].
+	newSlotCount:: remapIndices size.
+
+	(vmmirror allInstancesOf: oldClass) do: 
+		[:oldInstance |
+		(* Avoid A -> D (see class comment). *)
+		(updateMixinsAndClasses includesKey: oldInstance) ifFalse:
+			[ | newInstance = vmmirror instantiateFixedClass: newClass. |
+			(* Copy state from oldInstance to newInstance. *)
+			1 to: newSlotCount do: [:newIndex |
+				| oldIndex value |
+				oldIndex:: remapIndices at: newIndex.
+				0 == oldIndex ifFalse: [
+					value:: vmmirror ifFail: [halt] namedSlotOf: oldInstance at: oldIndex.
+					vmmirror ifFail: [halt] namedSlotOf: newInstance at: newIndex put: value]]. 
+
+			updateInstances at: oldInstance put: newInstance]].
+)
 private setOrganizationFor: mixin <AbstractMixin> basedOn: intermediate <IntermediateMixin> = (
 	| org = ClassOrganizer defaultList: {}. |
 	intermediate methods do:
@@ -296,25 +300,17 @@ private setOrganizationFor: mixin <AbstractMixin> basedOn: intermediate <Interme
 			org classify: imethod selector under: imethod category.]].
 	mixin organization: org.
 )
-'public access'
-public install: intermediates <List[IntermediateClassDeclaration]>
- withExistingMixins: existingMixinMap <Map[IntermediateClassDeclaration, InstanceMixin]> = (
-	
-	| results |
-	setup.
-	results:: intermediates collect: 
-		[:classDecl <IntermediateClassDeclaration> |
-		(existingMixinMap includesKey: classDecl) ifTrue:
-			[augmentExistingMixinMap: existingMixinMap
-				withNestedClasses: classDecl instanceSide nestedClasses
-				inExistingMixin: (existingMixinMap at: classDecl)].
-		processClassDeclaration: classDecl in: existingMixinMap].
-	processExistingClasses.
-	installAll.
-	vmmirror flushCache. (* Clear all lookup caches *)
-	cleanup.
-
-	^results (* <List[InstanceMixin]> *)
+private setup = (
+	updateMixinsAndClasses: IdentityMap new.
+	updateInstances: IdentityMap new.
+	existingClasses: IdentityMap new.
+)
+private sortClass: app <Class> = (
+	| classes depth |
+	depth:: depthFor: app.
+	classes:: existingClasses at: depth ifAbsentPut: [List new].
+	classes add: app.
+	app subclassesDo: [:sc | sortClass: sc].
 )
 ) : (
 )

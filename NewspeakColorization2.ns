@@ -12,7 +12,16 @@ class NewspeakColorization2 usingPlatform: p = (|
   private TextString = p text TextString.
   private TextBlock = p text TextBlock.
   |) (
-public class NS3BrowserColorizer = NS3Colorizer (|
+public class NS3BrowserColorizer = NS3Colorizer (
+(* The colorizer maps different kinds of language constructs to different text properties via the mapping defined
+by computePropertiesMap, which it stores in propertiesMap. The parsing process defined by the superclass produces an
+a list of ranges in the source, where each range identifies the kind of construct in that range (see class Range in the surrounding module).  Not every section of text has a range computed for it; only sections that define constructs with special textual properties are computed. Later we will compute a set of text objects which covers the entire source, filling in the parts that lack an entry in the range list with text objects with default properties. 
+
+We convert the list to an array (incidental), rangeArray and sort it in ascending order of start indices.
+The ranges in the range list may overlap.  In consolidateRanges,  overlaps are eliminated by iterating over the sorted range list and comparing adjacent ranges pairwise. If they overlap, they may or may not have the same kind. If the kinds are the same, we merge the ranges into one. If they differ, we truncate the first range to eliminate the overlap.
+
+We then traverse the range array and, using propertiesMap, compute a corresponding set of text objects that have the appropriate properties, and filling in the gaps with text objects that have default properties, as described above.
+*)|
 	propertiesMap <Map[Symbol, TextProperties]> = computePropertiesMap.
 	textSegments <List[TextString]>
 	inputString <String>
@@ -20,10 +29,13 @@ public class NS3BrowserColorizer = NS3Colorizer (|
 	rangeArray <Array>
 |) (
 class Range kind: k start: s end: e = (
-(* Describe the class in this comment. *)|
-	public kind = k.
-	public start = s.
-	public end = e.
+(* 
+Instances of this class describe a range of text in the source. The start and end of the range are given as indices into the source.
+The kind is a descriptor for what sort of element the code describes - a type, an error, a literal etc. The kind will serve as a key for the colorizer to decide what color to use for the text described by the range.
+*)|
+	public kind <Symbol> = k.
+	public start <Integer> = s.
+	public end <Integer>= e.
 |) (
 ) : (
 )
@@ -146,9 +158,9 @@ computeTextSegments = (
 			properties: (propertiesMap at: r kind ifAbsent: [TextProperties new color: Color black; yourself]).
 		textSegments add: textString.
 		priorSegmentEnd:: r end + 1.	(* remember last marked range *)	
-		 ]
+		]
 	].
-      priorSegmentEnd < inputSize ifTrue: [
+      priorSegmentEnd < inputSize ifTrue: [ (* create a segment for the tail end of the source *)
 			textString:: TextString forString: (inputString copyFrom: priorSegmentEnd to: inputSize).
 			textSegments add: textString.
 	]
@@ -175,19 +187,8 @@ consolidateRangesAt: index <Integer> = (
 				rangeArray at: index put: (Range kind: e1 kind start: e1 start end: e2 start - 1).] 
 			]	
 )
-noteRange: kind from: start to: end = (
-
+noteRange: kind <Symbol> from: start <Integer> to: end <Integer> = (
    rangeMap add: (Range kind: kind start: (start max: 1) end: end).
-(* We assume that the code to be colorized is processed in order, with no overlaps. This is wrong. 
-      | textString <TextString> |
-      start > priorSegmentEnd ifTrue: [
-		textString:: TextString forString: (inputString copyFrom: priorSegmentEnd to: start - 1).
-		textSegments add: textString.
-	].
-	(* The range 0..size is degenerate and leads to errors in Squeak 5.0 Morphic layout of paragraphs. *)
-	textString:: TextString forString: (inputString copyFrom: (start max: 1) to: end) properties: (propertiesMap at: kind).
-	textSegments add: textString.
-	priorSegmentEnd:: end + 1.*)
 )
 public parseClassDecl: s <String> fromClass: c <Class> ^<Text> = (
 (* Questionable*)
@@ -256,7 +257,14 @@ setString: s class: c = (
 )
 ) : (
 )
-class NS3Colorizer = TypedNS3Grammar (|
+class NS3Colorizer = TypedNS3Grammar (
+(* 
+This class subclasses the grammar so that it can parse Newspeak source with specialized semantic actions that determine how to colorize the code. This is done by calling the noteRange:from:to: method of the enclosing class.
+
+Because colorization is used to identify shadowing and undefined names, a notion of scoping is needed. Therefore a stack of scopes, cachedScopeStack, is maintained. Scopes are represented by maps from symbols to symbols. The keys are names of declarations, and the values are kinds. 
+
+It might be better to produce an actual AST (or a subset thereof) and visit it in order to colorize. In the existing scheme, subexpressions may induce colorizations that are subsumed by their enclosing expressions or statements, and we are forced to explicitly account for these situations and withdraw colorizations. See for example the blockType method, or worse, binaryMsgPattern.
+*)|
 	cachedScopeStack
 	klass
 	rangeMap <List[Range]>
@@ -279,12 +287,20 @@ beginComment = (
 )
 binaryMsgPattern = (
 	^super binaryMsgPattern wrapper:
-		[:sel <Token> :p <Tuple[Token, Token]> |
+		[:sel <Token> :p <Tuple[Token, Token]> | | typeRange <Range> |
 		self pushScope.
 		self currentScope at: p first token put: #parameter.
+		(* The machinations around the ranges are especially nasty here.
+		The formal parameter is initially colored as a slot, but we may want to 
+		treat formals specially, so we retract its colorization. If the slot had a type,
+		we retract that too (because it is last) and later reinstate it. 
+		*)
+		p last isNil ifFalse: [typeRange:: rangeMap removeLast].
 		rangeMap removeLast.
-		self noteRange: #messagePatternDecl from: sel start to: sel end.
-		self noteRange: #patternArg from: p first start to: p first end].
+		noteRange: #messagePatternDecl from: sel start to: sel end.
+		noteRange: #patternArg from: p first start to: p first end.
+		p last isNil ifFalse: [rangeMap add: typeRange].
+		].
 )
 binarySelector = (
 	^super binarySelector wrap:
@@ -317,6 +333,13 @@ blockParameters = (
 		[:ps :vb  | self pushScope. 
 		ps do: [:p | self currentScope at: p first token put: #parameter].
 		{ps. vb}]
+)
+blockType = (
+(* The brackets around the block type will colorize themselves, but their 
+colorization is superceded by the surrounding type. Therefore we remove the last 
+two elements from the rangeMap. *)
+	^super blockType wrapper:
+		[:lb :t :rb | rangeMap removeLast; removeLast. t ]
 )
 braceLevelString = (
 	^self braceDepth = 1 ifTrue: [''] ifFalse: [self braceDepth printString]
@@ -409,7 +432,7 @@ keywordHereSend = (
 			ifNotInScope: [#undefinedKeyword] 
 			ifObsolete: [#obsoleteMessage].
 		kws do: 
-			[:kwp | self noteRange: kind from: kwp first start to: kwp first end]]
+			[:kwp | noteRange: kind from: kwp first start to: kwp first end]]
 )
 keywordMsg = (
 	^super keywordMsg wrapper:
@@ -473,6 +496,9 @@ nestedClassDecl = (
 		noteRange: #className from: ((tokens last) at: 2) start to: ((tokens last) at: 2) end.
 		tokens]
 )
+noteRange: kind from: start to: end  = (
+	subclassResponsibility
+)
 number = (
 	^super number wrap:
 		[:t | self noteRange: #number from: t start to: t end. t].
@@ -527,7 +553,7 @@ rparen = (
 		self noteRange: range from: t start to: t end. 
 		t]
 )
-scopeStack = (
+scopeStack = ( (* TODO: get rid of this, rename slot and initialize it*)
 	(* deal with forwarding reference *)
 	cachedScopeStack isCollection 
 		ifFalse: [cachedScopeStack:: List new].
@@ -633,9 +659,23 @@ temporaries = (
 		noteRange: #methodTempBar from: vb3 start to: vb4 end.
 		vds]
 )
+tupleType = (
+(* The braces around the tuple type will colorize themselves, but their 
+colorization is superceded by the surrounding type. Therefore we remove the last 
+two elements from the rangeMap. *)
+	^super tupleType wrapper:
+		[:lc :t :rc | rangeMap removeLast; removeLast. t ]
+)
 type = (
 	^super type wrapper:
 		[:lb :te :rb | self noteRange: #type from: lb start to: rb end. te]
+)
+typeArguments = (
+(* The brackets around the type arguments will colorize themselves, but their  
+colorization is superceded by the surrounding type. Therefore we remove the last 
+two elements from the rangeMap. *)
+	^super typeArguments wrapper:
+		[:lb :t :rb | rangeMap removeLast; removeLast. t ]
 )
 unaryMsgPattern = (
 	^super unaryMsgPattern wrap:

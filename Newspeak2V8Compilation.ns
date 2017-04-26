@@ -1,6 +1,161 @@
 Newspeak3
 'NS2V8'
-class Newspeak2V8Compilation usingPlatform: platform asts: asts parsing: parsing generation: generation mirrors: mirrors = NewspeakCompilation usingPlatform: platform asts: asts ((* This module provides a Newspeak-to-Javascript cross-compiler. It is a descendent of Newspeak2Javascript which takes care to generate code that is easier for V8 to optimize and which is easier to maintain because of a simpler bootstrapping story and strategy for including bits that need to be written directly in Javascript. The output is not V8-specific and should run in any Javascript implementation that supports apply(), call() and bind().The current compilation scheme does not address async sends or reified activation records. It priovides only limited support for refection. Also,  it does not provide generalized mixin application.At runtime, a Newspeak object O is represented as a Javascript object J with properties that correspond directly to the Newspeak slots. The prototype of J is a runtime-class JRC, whose properties correspond to the instance methods of O's class, including any necessary synthetic methods. The prototype of JRC is another runtime class object corresponding to the superclass of O's class, and so on up to Object. The prototype of the runtime class of Object is ImplementationBase, which is hand-written and contains stub implementations to end the upward recursion in basicNew and the instance initializers.JRC includes synthetic slots that refer to its runtime mixin, its enclosing object chain, and its metaclass or non-metaclass counterpart.The main output of the compiler is an object containing all of the runtime mixins corresponding to the top-level class declarations. A runtime mixin has properties containing the definitions of its Newspeak and synthetic methods and its nested mixins. It also has a function that takes a runtime superclass and produces a runtime class that represents the application of the mixin. This function produces either a runtime class or a runtime metaclass, not the pair.One synthetic method deserves particular attention: basicNew(). The prototype of basicNew is the runtime class. The body of basicNew calls the basicNew of the superclass using call(), then initializes properties corresponding to each Newspeak slot to nil.All mixin applications share the same Newspeak and synthetic functions, except basicNew.[PERFORMANCE NOTE] It is important that objects have all their slots initialized up front, rather than lazily. This ensures that all instances of the same Newspeak class go through the same transitions in the same order so V8 will give them all the same "hidden class" (what Self called a map).[PERFORMANCE NOTE] It is important that an object's methods are defined in a prototype, rather than in the constructor call. If they were defined in the constructor, they would be different objects with different contexts.[PERFORMANCE NOTE] The current structure where the functions for methods are defined in other deeply nested functions may produce functions that perform slower than if they had been defined at the top level. This is because of a need to give them contexts, even if they never access their free variables. This used to be an issue in V8, but it was fixed under pressure from dart2js (who wanted to nest all of their code at least one level to avoid polluting the global scope). It may still be the case in other Javascript engines.Object creation follows the same pattern as the Squeak and Dart implementations: basicNew is followed by running a synthetic instance initializer.Mixin application is implemented by a hand-written method on VMMirror. First a pair of runtime class and runtime metaclass are produced by applying the runtime mixin and runtime metamixin to the runtime class of the superclass and the runtime class of Class, respectively. Then an instance of Metaclass is created to represent the Newspeak metaclass, and an instance of the metaclass is created to represent the Newspeak class. Newspeak objects never directly interact with runtime classes or runtime mixins; the objects answered by #class are the Newspeak class or metaclass.Self sends and ordinary sends map to Javascript method invocation. Outer sends map to an invocation on an entry in the enclosing objects array at the correct depth. Implicit receiver sends are resolved either as the self sends or outer sends at compile-time. Super sends are implemented as call() applied to the corresponding property of the runtime superclass.Newspeak selectors are mangled into legal Javascript identifiers. The mangling differs according to the accessibility of the selector. Public selectors are always prefixed with$. In addition,  keyword selectors have each colon replaced with dollar. For binary selectors, they are the concatenation of a mapping for each of the special characters. Examples:yourself maps to $yourself.with:with: maps to $$with$with. +- maps to $$plus$minus.For protected selectors, the public mangling is preceded with an underscore. Hence yourself maps to _$yourself.with:with: maps to _$$with$with. +- maps to _$$plus$minus.The selector #doesNotUnderstand: is treated specially and mapped to dnu.A full description of the access control scheme is available at:  https://docs.google.com/document/d/1CHTjsOsamXv9AwGTvkhe871QVY5vpZP9sDfz6I40gaA/[PERFORMANCE NOTE] It is important that we use legal identifiers for our property names. The earlier NS2JS did not mangle selectors and instead used square bracket notation to access properties. For example, foo at: 1 put: 2 would become foo["#at:put:"](1,2) rather than foo.at$put$(1,2). V8 eagerly transitions objects like these to dictionary mode, which means they do not have fast property access. This is the most important difference between NS2JS and NS2V8.Non-local return is implemented using exceptions. The body of a method containing an NLR is wrapped in a try-catch block. At the beginning, an object is created to represent the current activation. When there is a non-local return, the return value is assigned to a property of this object and the object is thrown. The catch clause checks if the object thrown corresponds to its NLR object, and if so extracts the value and does a Javascript (local) return. Otherwise the object is re-thrown.[ENGINEERING NOTE]This is buggy, because if a closure returns after its home context has completed, the exception will not be caught and the entire program will crash (even when debugging in the IDE).  A method that contains an NLR must invalidate its NLR exception object when it exits, and closures must check the vaidity of the NLR exception before throwing; if it is in valid, a CannotReturn must be signaled. The best way to accomplish all this is to set the variable holding the NLR exception to nil upon home context exit, so that the closure can test for nil when executing an NLR. This will have very minor performance impact.Newspeak closures map to Javascript functions. Accesses to self do *not* map directly to "this". Rather the receiver must be captured in a local at the beginning of a method, and access must be through this local to get proper lexical scope.[UNIMPLEMENTED] This representation is not suitable for closure mirrors as there is no way in Javascript to get at the closure's free variables. To support closure mirrors, we would have create objects for each closure that took free variables and the enclosing context as arguments and stored them as slots that reflection could later access. dart2js follows this approach (but I believe this is to ensure they cannot be called with the wrong arity).To implement #doesNotUnderstand:, for every message sent the compiler emits a DNU catcher that creates a Message object from the arguments and forwards to #doesNotUnderstand:.  At bootstrap, these handlers are all installed into ImplementationBase under for both the public and protected manglings of the selector.[PERFORMANCE NOTE] It is important that these prototypes are all installed up-front, rather than the subset needed at each mixin application, to ensure the prototype chain is stable during the program's execution. Installing these catchers later would trigger deoptimizations.The basic types (number, array, block, boolean, string) are represented directly as their Javascript counterparts. Where the Javascript behavior differs from the Newspeak behavior, we monkey patch the Javascript prototypes.[ENGINEERING NOTE] These patches are all defined in classes of KernelForV8, using the js intrinsic described below. Unlike NS2JS, there is no need to look through several places and bootstrapping phases to find where such behavior is defined. Adding or modifying behavior for the basic types is as easy as adding or changing methods in these classes.[PERFORMANCE NOTE] It is important that these patches are labelled for strict mode to avoid automatic boxing.[ENGINEERING NOTE] We simply label the whole program for script mode, but if our output got wrapped in or otherwise mixed with other scripts, it wouldn't run in script mode.[ENGINEERING NOTE] dart2js does not use this technique because they want to interoperate with other Javascript code. Instead they use a technique called interceptors, and can avoid the cost in the common case through fancy type inference and inlining that make runtime modification very difficult. Newspeak doesn't want to go there and is content to monkey patch.[ENGINEERING NOTE] Like dart2js, we cave on the semantics of integers by directly representing our numbers as Javascript numbers, which are doubles.Nil is not represented as Javascript's null. We use a singleton instance of the Newspeak class UndefinedObject.Source code is not stored with the methods. Instead, each runtime class has an associated metadata structure that stores an index into an array of method sources. The metadata is stored in an array accessed via the property 'methods'. Each method has an entry with properties 'name', 'isSynthetic' and 'source'. This array is stored in the Javascript global variable 'sources'.  The deployment tools can place the code for initializing this array in a separate file, so deployments that do not wish to support debugging can easily avoid the space penalty for the source. Bootstrapping: the compiled Javascript starts by hand-initializing the classes of Kernel to deal with the circular references. Then a namespace is populated with the applications of each of the top-level mixins to Object. This namespace is passed to the factory of RuntimeForV8, and the returned object is passed the VMMirror. This causes the platform object to be created and initialized. As part of this process, the DNU catchers and basic type monkey patches are installed. The application configuration is then passed the namespace, and the returned app object is sent #main:args: with the platform.  (Newspeak2Dart follows the same pattern, though without DNU catcher or basic type patches.)[ENGINEERING NOTE] This is *way* simpler than whatever multi-phase thing NS2JS is doing.The js intrinsic: When compiling the platform sources, we evaluate sends to "js" at compile-time against a factory for Javascript ASTs (an instance of JavascriptGeneration`Factory). For instance,at: index = (  ^js propertyOf: (js ident: 'this') at: index - 1)translates tofunction $at$(index) { return this[index - 1]; }Note that arguments in messages to "js" can be arbitrary expressions (index - 1), which will be compiled like any other ordinary expression, allowing one to write implementations partially in the target language and partially in ordinary Newspeak in the same method.This scheme allows the implementations of primitives to be written in the methods they are implementing and without special language support like pragmas, externs or native clauses, which I think is pretty cool :)[UNIMPLEMENTED] Async sends[UNIMPLEMENTED] Reflective modificationThis brings up several issues. (1) Because implicit sends are resolved statically to self sends or outer sends, it is not sufficient to just add or remove methods. Potentially, the entire class must be recompiled if the change hides/unhides a method in the surrounding scope.(2) Adding a new selector requires adding a new DNU catcher in ImplementationBase, which may have very negative effects on performance.  We could try and rely on the ES6 handlers if we only care about new browsers.[UNIMPLEMENTED] Reified activation recordsThese are needed to provide a proper live debugger.Copyright 2008 Cadence Design Systems, Inc.Copyright 2009-2010 Gilad Bracha.Copyright 2012 SAP AG.Copyright 2012 Google Inc.Copyright 2013 Ryan MacnakCopyright 2014-2017 Google Inc.   Licensed under the Apache License, Version 2.0 (the ''License''); you may not use this file except in compliance with the License.  You may obtain a copy of the License at  http://www.apache.org/licenses/LICENSE-2.0 *)|	Collection = platform collections Collection.	Map = platform collections Map.	List = platform collections List.	Set = platform collections Set.	StringBuilder = platform kernel StringBuilder.		Parser = parsing Parser.		javascriptGeneration = generation.	JavascriptWriter = javascriptGeneration Writer.	js = javascriptGeneration factory.	public names = NameMangler new.	ASTTool = asts ASTTool.      ASTCopier = asts ASTCopier.      AST = asts AST.	BlockAST = asts BlockAST.	CascadedSendAST = asts CascadedSendAST.	CodeBodyAST = asts CodeBodyAST.	MessageAST = asts MessageAST.      MessagePatternAST = asts MessagePatternAST.	MethodAST = asts MethodAST.	UnresolvedSendAST = asts UnresolvedSendAST.	NumberAST = asts NumberAST.	ReturnStatAST = asts ReturnStatAST.      SendAST = asts SendAST.	SymbolAST = asts SymbolAST.	TupleAST = asts TupleAST.      VarDeclAST = asts VarDeclAST.	VariableAST = asts VariableAST.		public parser = Parser new.		cachedCompilations = Map new.	sourcesList ::= List new. (* Ick, should really belong to ProgramBuilder. *)|) (
+class Newspeak2V8Compilation usingPlatform: platform
+ asts: asts
+ parsing: parsing
+ generation: generation
+ mirrors: mirrors = NewspeakCompilation
+ usingPlatform: platform
+ asts: asts ((* This module provides a Newspeak-to-Javascript cross-compiler. It is a descendent of Newspeak2Javascript which takes care to generate code that is easier for V8 to optimize and which is easier to maintain because of a simpler bootstrapping story and strategy for including bits that need to be written directly in Javascript. The output is not V8-specific and should run in any Javascript implementation that supports apply(), call() and bind().
+
+The current compilation scheme does not address async sends or reified activation records. It priovides only limited support for refection. Also,  it does not provide generalized mixin application.
+
+At runtime, a Newspeak object O is represented as a Javascript object J with properties that correspond directly to the Newspeak slots. The prototype of J is a runtime-class JRC, whose properties correspond to the instance methods of O's class, including any necessary synthetic methods. The prototype of JRC is another runtime class object corresponding to the superclass of O's class, and so on up to Object. The prototype of the runtime class of Object is ImplementationBase, which is hand-written and contains stub implementations to end the upward recursion in basicNew and the instance initializers.
+
+JRC includes synthetic slots that refer to its runtime mixin, its enclosing object chain, and its metaclass or non-metaclass counterpart.
+
+The main output of the compiler is an object containing all of the runtime mixins corresponding to the top-level class declarations. A runtime mixin has properties containing the definitions of its Newspeak and synthetic methods and its nested mixins. It also has a function that takes a runtime superclass and produces a runtime class that represents the application of the mixin. This function produces either a runtime class or a runtime metaclass, not the pair.
+
+One synthetic method deserves particular attention: basicNew(). The prototype of basicNew is the runtime class. The body of basicNew calls the basicNew of the superclass using call(), then initializes properties corresponding to each Newspeak slot to nil.
+
+All mixin applications share the same Newspeak and synthetic functions, except basicNew.
+
+[PERFORMANCE NOTE] It is important that objects have all their slots initialized up front, rather than lazily. This ensures that all instances of the same Newspeak class go through the same transitions in the same order so V8 will give them all the same "hidden class" (what Self called a map).
+
+[PERFORMANCE NOTE] It is important that an object's methods are defined in a prototype, rather than in the constructor call. If they were defined in the constructor, they would be different objects with different contexts.
+
+[PERFORMANCE NOTE] The current structure where the functions for methods are defined in other deeply nested functions may produce functions that perform slower than if they had been defined at the top level. This is because of a need to give them contexts, even if they never access their free variables. This used to be an issue in V8, but it was fixed under pressure from dart2js (who wanted to nest all of their code at least one level to avoid polluting the global scope). It may still be the case in other Javascript engines.
+
+Object creation follows the same pattern as the Squeak and Dart implementations: basicNew is followed by running a synthetic instance initializer.
+
+Mixin application is implemented by a hand-written method on VMMirror. First a pair of runtime class and runtime metaclass are produced by applying the runtime mixin and runtime metamixin to the runtime class of the superclass and the runtime class of Class, respectively. Then an instance of Metaclass is created to represent the Newspeak metaclass, and an instance of the metaclass is created to represent the Newspeak class. Newspeak objects never directly interact with runtime classes or runtime mixins; the objects answered by #class are the Newspeak class or metaclass.
+
+Self sends and ordinary sends map to Javascript method invocation. Outer sends map to an invocation on an entry in the enclosing objects array at the correct depth. Implicit receiver sends are resolved either as the self sends or outer sends at compile-time. Super sends are implemented as call() applied to the corresponding property of the runtime superclass.
+
+Newspeak selectors are mangled into legal Javascript identifiers. The mangling differs according to the accessibility of the selector. Public selectors are always prefixed with$. In addition,  keyword selectors have each colon replaced with dollar. For binary selectors, they are the concatenation of a mapping for each of the special characters. Examples:
+
+yourself maps to $yourself.
+with:with: maps to $$with$with.
+ +- maps to $$plus$minus.
+
+For protected selectors, the public mangling is preceded with an underscore. Hence
+
+ yourself maps to _$yourself.
+with:with: maps to _$$with$with.
+ +- maps to _$$plus$minus.
+
+The selector #doesNotUnderstand: is treated specially and mapped to dnu.
+A full description of the access control scheme is available at:  https://docs.google.com/document/d/1CHTjsOsamXv9AwGTvkhe871QVY5vpZP9sDfz6I40gaA/
+
+[PERFORMANCE NOTE] It is important that we use legal identifiers for our property names. The earlier NS2JS did not mangle selectors and instead used square bracket notation to access properties. For example, foo at: 1 put: 2 would become foo["#at:put:"](1,2) rather than foo.at$put$(1,2). V8 eagerly transitions objects like these to dictionary mode, which means they do not have fast property access. This is the most important difference between NS2JS and NS2V8.
+
+Non-local return is implemented using exceptions. The body of a method containing an NLR is wrapped in a try-catch block. At the beginning, an object is created to represent the current activation. When there is a non-local return, the return value is assigned to a property of this object and the object is thrown. The catch clause checks if the object thrown corresponds to its NLR object, and if so extracts the value and does a Javascript (local) return. Otherwise the object is re-thrown.
+
+[ENGINEERING NOTE]
+This is buggy, because if a closure returns after its home context has completed, the exception will not be caught and the entire program will crash (even when debugging in the IDE).  A method that contains an NLR must invalidate its NLR exception object when it exits, and closures must check the vaidity of the NLR exception before throwing; if it is in valid, a CannotReturn must be signaled. The best way to accomplish all this is to set the variable holding the NLR exception to nil upon home context exit, so that the closure can test for nil when executing an NLR. This will have very minor performance impact.
+
+Newspeak closures map to Javascript functions. Accesses to self do *not* map directly to "this". Rather the receiver must be captured in a local at the beginning of a method, and access must be through this local to get proper lexical scope.
+
+[UNIMPLEMENTED] This representation is not suitable for closure mirrors as there is no way in Javascript to get at the closure's free variables. To support closure mirrors, we would have create objects for each closure that took free variables and the enclosing context as arguments and stored them as slots that reflection could later access. dart2js follows this approach (but I believe this is to ensure they cannot be called with the wrong arity).
+
+To implement #doesNotUnderstand:, for every message sent the compiler emits a DNU catcher that creates a Message object from the arguments and forwards to #doesNotUnderstand:.  At bootstrap, these handlers are all installed into ImplementationBase under for both the public and protected manglings of the selector.
+
+[PERFORMANCE NOTE] It is important that these prototypes are all installed up-front, rather than the subset needed at each mixin application, to ensure the prototype chain is stable during the program's execution. Installing these catchers later would trigger deoptimizations.
+
+The basic types (number, array, block, boolean, string) are represented directly as their Javascript counterparts. Where the Javascript behavior differs from the Newspeak behavior, we monkey patch the Javascript prototypes.
+
+[ENGINEERING NOTE] These patches are all defined in classes of KernelForV8, using the js intrinsic described below. Unlike NS2JS, there is no need to look through several places and bootstrapping phases to find where such behavior is defined. Adding or modifying behavior for the basic types is as easy as adding or changing methods in these classes.
+
+[PERFORMANCE NOTE] It is important that these patches are labelled for strict mode to avoid automatic boxing.
+
+[ENGINEERING NOTE] We simply label the whole program for script mode, but if our output got wrapped in or otherwise mixed with other scripts, it wouldn't run in script mode.
+
+[ENGINEERING NOTE] dart2js does not use this technique because they want to interoperate with other Javascript code. Instead they use a technique called interceptors, and can avoid the cost in the common case through fancy type inference and inlining that make runtime modification very difficult. Newspeak doesn't want to go there and is content to monkey patch.
+
+[ENGINEERING NOTE] Like dart2js, we cave on the semantics of integers by directly representing our numbers as Javascript numbers, which are doubles.
+
+Nil is not represented as Javascript's null. We use a singleton instance of the Newspeak class UndefinedObject.
+
+Source code is not stored with the methods. Instead, each runtime class has an associated metadata structure that stores an index into an array of method sources. The metadata is stored in an array accessed via the property 'methods'. Each method has an entry with properties 'name', 'isSynthetic' and 'source'. This array is stored in the Javascript global variable 'sources'.  The deployment tools can place the code for initializing this array in a separate file, so deployments that do not wish to support debugging can easily avoid the space penalty for the source. 
+
+Bootstrapping: the compiled Javascript starts by hand-initializing the classes of Kernel to deal with the circular references. Then a namespace is populated with the applications of each of the top-level mixins to Object. This namespace is passed to the factory of RuntimeForV8, and the returned object is passed the VMMirror. This causes the platform object to be created and initialized. As part of this process, the DNU catchers and basic type monkey patches are installed. The application configuration is then passed the namespace, and the returned app object is sent #main:args: with the platform.  (Newspeak2Dart follows the same pattern, though without DNU catcher or basic type patches.)
+
+[ENGINEERING NOTE] This is *way* simpler than whatever multi-phase thing NS2JS is doing.
+
+The js intrinsic: When compiling the platform sources, we evaluate sends to "js" at compile-time against a factory for Javascript ASTs (an instance of JavascriptGeneration`Factory). For instance,
+
+at: index = (
+  ^js propertyOf: (js ident: 'this') at: index - 1
+)
+
+translates to
+
+function $at$(index) { return this[index - 1]; }
+
+Note that arguments in messages to "js" can be arbitrary expressions (index - 1), which will be compiled like any other ordinary expression, allowing one to write implementations partially in the target language and partially in ordinary Newspeak in the same method.
+
+This scheme allows the implementations of primitives to be written in the methods they are implementing and without special language support like pragmas, externs or native clauses, which I think is pretty cool :)
+
+
+[UNIMPLEMENTED] Async sends
+
+[UNIMPLEMENTED] Reflective modification
+
+This brings up several issues. 
+(1) Because implicit sends are resolved statically to self sends or outer sends, it is not sufficient to just add or remove methods. Potentially, the entire class must be recompiled if the change hides/unhides a method in the surrounding scope.
+(2) Adding a new selector requires adding a new DNU catcher in ImplementationBase, which may have very negative effects on performance.  We could try and rely on the ES6 handlers if we only care about new browsers.
+
+
+[UNIMPLEMENTED] Reified activation records
+
+These are needed to provide a proper live debugger.
+
+
+Copyright 2008 Cadence Design Systems, Inc.
+Copyright 2009-2010 Gilad Bracha.
+Copyright 2012 SAP AG.
+Copyright 2012 Google Inc.
+Copyright 2013 Ryan Macnak
+Copyright 2014-2017 Google Inc.
+   
+Licensed under the Apache License, Version 2.0 (the ''License''); you may not use this file except in compliance with the License.  You may obtain a copy of the License at  http://www.apache.org/licenses/LICENSE-2.0 *)|
+	Collection = platform collections Collection.
+	Map = platform collections Map.
+	List = platform collections List.
+	Set = platform collections Set.
+	StringBuilder = platform kernel StringBuilder.
+	
+	Parser = parsing Parser.
+	
+	javascriptGeneration = generation.
+	JavascriptWriter = javascriptGeneration Writer.
+	js = javascriptGeneration factory.
+
+	public names = NameMangler new.
+
+	ASTTool = asts ASTTool.
+      ASTCopier = asts ASTCopier.
+      AST = asts AST.
+	BlockAST = asts BlockAST.
+	CascadedSendAST = asts CascadedSendAST.
+	CodeBodyAST = asts CodeBodyAST.
+	MessageAST = asts MessageAST.
+      MessagePatternAST = asts MessagePatternAST.
+	MethodAST = asts MethodAST.
+	UnresolvedSendAST = asts UnresolvedSendAST.
+	NumberAST = asts NumberAST.
+	ReturnStatAST = asts ReturnStatAST.
+      SendAST = asts SendAST.
+	SymbolAST = asts SymbolAST.
+	TupleAST = asts TupleAST.
+      VarDeclAST = asts VarDeclAST.
+	VariableAST = asts VariableAST.
+	
+	public parser = Parser new.
+	
+	cachedCompilations = Map new.
+	sourcesList ::= List new. (* Ick, should really belong to ProgramBuilder. *)
+|) (
 class CachedCompilation = (|
 	public source <String>
 	public enableIntrinsics <Boolean>
@@ -609,8 +764,44 @@ checkForDuplicateNames: aNode = (
 		assert: false message: message].
 
 )
-classNode: aNode <ClassDeclarationAST> within: mixinIR ^ <IntermediateClassDeclaration> = (	| ir <IntermediateClassDeclaration> priorMixinUID <String> |	aNode name = #Newspeak2V8Compilation ifTrue: [		#BOGUS. (* The flaw in the js intrinsic scheme. *)		enableIntrinsics: false].	checkForDuplicateNames: aNode.	ir:: computeMixinFrom: aNode header within: mixinIR.	ir accessModifier: aNode accessModifier.	priorMixinUID:: currentMixinUID.	currentMixinUID:: ir qualifiedName.	currentDepth:: currentDepth + 1.	processInstanceSideOf: aNode ofMixin: ir instanceSide.	generateSlotAccessorsFor:  ir instanceSide. 	(* must be called after nested classes are processed, so all synthetic slots have been added *)	processClassSideOf: aNode ofMixin: ir classSide.	currentDepth:: currentDepth - 1.	currentMixinUID:: priorMixinUID.	^ir)
-public compileClassSource: source <String> within: enclosing <MixinMirror> ^<CompiledMixinMirror> = (	| tree <AST> mixinRep <MixinRep> |	tree:: parser compilationUnit parseString: source.	setInput: source.	setScopeFor: tree in: enclosing.	(*sentSelectors:: Set new.*)	nil = enclosing ifFalse: [unimplemented].	mixinRep:: classNode: tree within: nil.	scopeMap:: Map new.	^enclosing isNil ifTrue: [mixinRep] ifFalse: [{enclosing. mixinRep}].)
+classNode: aNode <ClassDeclarationAST> within: mixinIR ^ <IntermediateClassDeclaration> = (
+	| ir <IntermediateClassDeclaration> priorMixinUID <String> |
+	aNode name = #Newspeak2V8Compilation ifTrue: [
+		#BOGUS. (* The flaw in the js intrinsic scheme. *)
+		enableIntrinsics: false].
+	checkForDuplicateNames: aNode.
+	ir:: computeMixinFrom: aNode header within: mixinIR.
+	ir accessModifier: aNode accessModifier.
+	priorMixinUID:: currentMixinUID.
+	currentMixinUID:: ir qualifiedName.
+	currentDepth:: currentDepth + 1.
+	processInstanceSideOf: aNode ofMixin: ir instanceSide.
+	generateSlotAccessorsFor:  ir instanceSide. 
+	(* must be called after nested classes are processed, so all synthetic slots have been added *)
+	processClassSideOf: aNode ofMixin: ir classSide.
+	currentDepth:: currentDepth - 1.
+	currentMixinUID:: priorMixinUID.
+	^ir
+)
+public compileClassSource: source <String> within: enclosingIR <IntermediateMixin> ^<IntermediateClassDeclaration> = (
+	| tree <AST> intermediate <IntermediateClassDeclaration> enclosingBuilder |
+	tree:: nil = enclosingIR
+		ifTrue: [parser compilationUnit parseString: source ]
+		ifFalse: [
+			parser classDecl parseString: source. 
+			enclosingBuilder:: enclosingIR builder
+			].
+		
+	setInput: source.
+	setScopeFor: tree in: enclosingBuilder.
+	(*sentSelectors:: Set new.*)
+	intermediate:: nil = enclosingIR 
+		ifTrue: [classNode: tree within: nil]
+		ifFalse: [compileNestedClassAST: tree into: enclosingIR].
+
+	scopeMap:: Map new.
+	^intermediate
+)
 public compileExpressionSource: expression <String> inMixin: enclosing <MixinMirror> ^<MethodIR> = (
 	|
 	body <CodeBodyAST>
@@ -659,7 +850,18 @@ compileNestedClassAST: tree <ClassDeclarationAST | MixinApplicationClassAST>
  into: enclosingIR <IntermediateMixin> ^<IntermediateClassDeclaration> = (
 	^(compileNestedClasses: {tree} within: enclosingIR) first
 )
-compileNestedClasses: nestedClasses <Collection[ClassDeclarationAST]> within: mixinIR <IntermediateMixin> = (		nestedClasses do:		[:nc <ClassDeclarationAST> |  		| nSlotName <String> nSlot <InstanceVariableMirror> |		nSlotName:: mixinIR declaration qualifiedName, '`', nc name.		nSlot:: IntermediateSlotDeclaration named: nSlotName mutable: true accessModifier: #public (* questionable*).		nSlot isSynthetic: true.		mixinIR slots add: nSlot.		mixinIR nestedClasses add: (classNode: nc within: mixinIR).		createNestedClassAccessorFrom: nc within: mixinIR].)
+compileNestedClasses: nestedClasses <Collection[ClassDeclarationAST]> within: mixinIR <IntermediateMixin> = (
+	
+	nestedClasses do:
+		[:nc <ClassDeclarationAST> |  
+		| nSlotName <String> nSlot <InstanceVariableMirror> |
+		nSlotName:: mixinIR declaration qualifiedName, '`', nc name.
+		nSlot:: IntermediateSlotDeclaration named: nSlotName mutable: true accessModifier: #public (* questionable*).
+		nSlot isSynthetic: true.
+		mixinIR slots add: nSlot.
+		mixinIR nestedClasses add: (classNode: nc within: mixinIR).
+		createNestedClassAccessorFrom: nc within: mixinIR].
+)
 compileNestedClassesOf: aNode <SideAST> within: mixinMirror <LowLevelMixinMirror> ^ <Collection[MixinRep]> = (
 	(* where do we check that nested classes do not conflict with each other, or with methods or slots? *)
 	^compileNestedClasses: aNode nestedClasses within: mixinMirror
@@ -671,7 +873,24 @@ computeMethod: aNode <MethodAST> inScope: s <Scope> = (
 	(* need to build scope for method before visiting it *)
 	^methodNode: aNode.
 )
-computeMixinFrom: aNode <ClassHeaderAST> within: mixinIR <IntermediateMixin> ^<IntermediateClassDeclaration> = (	| 	ir = IntermediateClassDeclaration new.	|	nil = mixinIR		ifTrue: [ir qualifiedName: aNode name]		ifFalse: [ir qualifiedName: (mixinIR qualifiedName, '`', aNode name)].	aNode slots do: [:s |		ir instanceSide slots add:			(IntermediateSlotDeclaration 				named: s name				mutable: s isMutable				accessModifier: s accessModifier)].	ir headerSource: (input copyFrom: aNode start to: aNode end).	ir depth: currentDepth.	ir factoryName: aNode constructor selector.	^ir)
+computeMixinFrom: aNode <ClassHeaderAST> within: mixinIR <IntermediateMixin> ^<IntermediateClassDeclaration> = (
+	| 
+	ir = IntermediateClassDeclaration new.
+	|
+	nil = mixinIR
+		ifTrue: [ir qualifiedName: aNode name]
+		ifFalse: [ir qualifiedName: (mixinIR qualifiedName, '`', aNode name)].
+	aNode slots do: [:s |
+		ir instanceSide slots add:
+			(IntermediateSlotDeclaration 
+				named: s name
+				mutable: s isMutable
+				accessModifier: s accessModifier)].
+	ir headerSource: (input copyFrom: aNode start to: aNode end).
+	ir depth: currentDepth.
+	ir factoryName: aNode constructor selector.
+	^ir
+)
 createNestedClassAccessorFrom: classDecl <ClassDeclarationAST> within: mixinMirror <LowLevelMixinMirror> = (
 (* Create an accessor method for the nested class represented by the incoming class tree.
 This accessor will lazily generate the nested class when its enclosing instance is first asked for it. *)

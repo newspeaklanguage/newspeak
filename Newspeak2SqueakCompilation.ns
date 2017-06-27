@@ -98,7 +98,6 @@ squeakRewriter = SqueakRewriter new.
 methodCompiler = AST2ByteCodeCompiler new.
 currentDepth <Integer> (* The lexical nesting level of the current class; 
 							top level classes are at level 0 *)
-useAlternateBytecodeSet <Boolean> ::= true.
 |) (
 class AST2ByteCodeCompiler = ASTTool ((* The compiler is a visitor on an AST that has been processed by the rewriter.
 It is a subtype of  ASTTool[Self] - that is, its methods do not return individual results, but instead
@@ -162,8 +161,6 @@ We don't do this yet.  What we do instead is often suboptimal, but sometimes ins
   maxClosureContextSize <Integer>
   offsetStack <List[Integer]> (* see codeBodyNode:  rename localOffsetAllocator? *)
   contextDepth <Integer> (* The number of outerContexts that need to be traversed to reach the method context.  E.g., 0=method, 1=closure, 2=closure in closure, and so on. Used for debug info. *)
-
-  public result <LowLevelMethodMirror> (* refactor me to be expected from methodNode: ! *)
 |) (
 class CodeGenerator = (|
 public code = IntermediateMethod new.
@@ -286,9 +283,6 @@ public dup = (
 	code byte: 219.
 	incrementStackDepthBy: 1.	
 )
-public hasSpecialReturnBoolean = (
-	^false
-)
 public implicitReceiverSend: selector numArgs: numArgs = (
 	|
 	selectorIndex = indexForLiteral: selector.
@@ -317,18 +311,6 @@ public implicitReceiverSend: selector numArgs: numArgs = (
 )
 public indexForLiteral: literal = (
 	^literalTable at: literal
-)
-public isImplicitReceiverSendAbsentReceiver = (
-	^true
-)
-public isOuterSendAbsentReceiver = (
-	^true
-)
-public isSelfSendAbsentReceiver = (
-	^true
-)
-public isSuperSendAbsentReceiver = (
-	^true
 )
 public jumpBy: distance <Integer> = (
 
@@ -1123,10 +1105,6 @@ public conditionalNode: node <IfAST> = (
 		[cgen currentStackDepth: (cgen currentStackDepth max: depth+1)].
 	(* If shouldPop is false we  want to assume the if left a result on the stack, even if it did not because both branches ended in an NLR *)
 )
-currentMethod ^ <SemanticMethod> = (
-	#BOGUS.
-	^currentScope at: #'`currentMethod'
-)
 currentScope ^ <Scope> = (
 	^scopeStack last
 )
@@ -1138,17 +1116,9 @@ public globalNode: node <GlobalAST>  = (
 	cgen pushLiteralVariable: node association.
 )
 public implicitReceiverSendNode: node <ImplicitReceiverSendAST> = (
-
-	cgen isImplicitReceiverSendAbsentReceiver
-		ifTrue: 
-			[self applyShouldNotPopTo: node message.
-			addDebugInfo: (node message start to: node message end).
-			cgen implicitReceiverSend: node message selector numArgs: node message arguments size]
-		ifFalse:
-			[cgen pushImplicitReceiver: node message selector.
-			self applyShouldNotPopTo: node message.
-			addDebugInfo: (node message start to: node message end).
-			cgen normalSend: node message selector numArgs: node message arguments size].
+	self applyShouldNotPopTo: node message.
+	addDebugInfo: (node message start to: node message end).
+	cgen implicitReceiverSend: node message selector numArgs: node message arguments size
 )
 indexOfVar: v <VarDeclAST> ^ <Integer> = (
 	^(currentScope at: v name asSymbol) offset
@@ -1156,15 +1126,21 @@ indexOfVar: v <VarDeclAST> ^ <Integer> = (
 isRemote: node ^ <Boolean> = (
 	^(currentScope at: node name asSymbol) remote
 )
-literalArray ^  <Array[Character | Number | String | Symbol]> = (
+literalArray ^<Array[Character | Number | String | Symbol]> = (
 	| literals <Array[Character | Number | String | Symbol]> |
 	literals:: Array new: literalTable size.
-	literalTable keysAndValuesDo:[:k : v | literals at: v + 1 put: k].
+	literalTable keysAndValuesDo: [:k :v | literals at: v + 1 put: k].
 	^literals
 )
 public localReadNode: node <LocalReadAST> = (
-	addDebugInfo: (node start to: node end).
-	temporaryNode: node
+	| var <LocalEntry> = node variable. |
+	addDebugInfo: (node start to: node end).	
+	(isRemote: var) 
+		ifFalse: [cgen pushTemporary: (indexOfVar: var)]
+		ifTrue:
+			[cgen
+				pushRemoteTemporary: (indexOfVar: var)
+				inVector: (indexOfVar: (vectorOf: var))].
 )
 public localWriteNode: node <LocalWriteAST> = (
 	self applyShouldNotPopTo: node value.
@@ -1231,24 +1207,25 @@ public methodLocalReturnNode: node <MethodLocalReturnAST> = (
 )
 public methodNode: node <MethodAST> = (
 	(* Create a compiled method, whose body is the result of compiling the node's body. *)
-	(* | result <LowLevelMethodMirror> | *)
+	| result <IntermediateMethod> |
 	setup.
-	pushScope: (scopeMap at: node). pushOffsetCounter.
-		(* currentScope at: #'`currentMethod' put: (SemanticMethod decl: node).  TODO: Is this used? By whom? *)
-		cgen
-			maxLocals: 0;
-			accessModifier: node accessModifier;
-			methodName: node pattern selector; 
-			argCount: node pattern parameters size;
-			literals: literalArray.
-                (* uncomment the following to make everything except  test...-methods public*)
-		(* (node pattern selector startsWith: 'test')
-			ifFalse: [cgen accessModifier: #public]. *)
-		node body apply: self.
-		cgen code debugInfo: debugInfo. (* set debug info *)
-		processLiteralMessagesOf: node.
-		(* currentMethod frameSize: cgen maxLocals. *)
-	popScope. popOffsetCounter.
+	pushScope: (scopeMap at: node). 
+	pushOffsetCounter.
+	
+	cgen
+		maxLocals: 0;
+		accessModifier: node accessModifier;
+		methodName: node pattern selector; 
+		argCount: node pattern parameters size;
+		literals: literalArray.
+	
+	node body apply: self.
+	cgen code debugInfo: debugInfo. (* set debug info *)
+	processLiteralMessagesOf: node.
+	(* currentMethod frameSize: cgen maxLocals. *)
+	
+	popOffsetCounter.
+	popScope.
 	result:: cgen close.
 	cleanup.
 	^result
@@ -1280,22 +1257,14 @@ public ordinarySendNode: node <NormalSendAST> = (
 	cgen normalSend: node message selector numArgs: node message arguments size.
 )
 public outerSendNode: node <OuterSendAST> = (
-	
-	cgen isOuterSendAbsentReceiver
-		ifTrue: 
-			[self applyShouldNotPopTo: node message.
-			addDebugInfo: (node message start to: node message end).
-			cgen outerSend: node message selector numArgs: node message arguments size depth: node depth ]
-		ifFalse:
-			[cgen pushEnclosingObject: node depth.
-			self applyShouldNotPopTo: node message.
-			addDebugInfo: (node message start to: node message end).
-			cgen normalSend: node message selector numArgs: node message arguments size].
+	self applyShouldNotPopTo: node message.
+	addDebugInfo: (node message start to: node message end).
+	cgen outerSend: node message selector numArgs: node message arguments size depth: node depth
 )
 public parameterNode: node <ParameterAST> = (
 	cgen pushTemporary: (indexOfVar: node).
 )
-popAndStoreInto: var <SlotEntry> = (
+popAndStoreInto: var <LocalEntry> = (
 	(isRemote: var)
 		ifFalse: [cgen popIntoTemporary: (indexOfVar: var)]
 		ifTrue:
@@ -1335,7 +1304,7 @@ public receiverNode: node = (
 	addDebugInfo: (node start to: node end).
 	cgen pushSelf.
 )
-public returnStatNode: node <ReturnStatAST> = (
+public returnStatNode: node <MethodLocalReturnAST | NonLocalReturnAST> = (
 
 	(* if expr is self, true, false or nil do something special *)
 	(node expression isReceiverNode) ifTrue:
@@ -1343,34 +1312,18 @@ public returnStatNode: node <ReturnStatAST> = (
 		nil = node expression start ifFalse:
 			[addDebugInfo: (node start to: node end)].
 		^cgen returnSelfFromMethod].
-	(cgen hasSpecialReturnBoolean & node expression isBoolNode) ifTrue:
-		[addDebugInfo: (node start to: node end).
-		^cgen returnBooleanFromMethod: node expression value].
-	(false & node expression isNilNode) ifTrue:
-		[addDebugInfo: (node start to: node end).
-		^cgen returnNilObj].
 
 	self applyShouldNotPopTo: node expression.
 	addDebugInfo: (node start to: node end).
 	cgen returnFromMethod.
 )
 public selfSendNode: node <SendAST> = (
-
-	cgen isSelfSendAbsentReceiver
-		ifTrue:
-			[self applyShouldNotPopTo: node message.
-			addDebugInfo: (node message start to: node message end).
-			cgen selfSend: node message selector numArgs: node message arguments size]
-		ifFalse:
-			[cgen pushSelf.
-			self applyShouldNotPopTo: node message.
-			addDebugInfo: (node message start to: node message end).
-			cgen normalSend: node message selector numArgs: node message arguments size].
+	self applyShouldNotPopTo: node message.
+	addDebugInfo: (node message start to: node message end).
+	cgen selfSend: node message selector numArgs: node message arguments size
 )
 setup = (
-	cgen:: useAlternateBytecodeSet
-		ifTrue: [CodeGeneratorV4 new] 
-		ifFalse: [CodeGeneratorV3 new].
+	cgen:: CodeGeneratorV4 new.
   	debugInfo: DebugInfo new.
 	contextDepth: 0.
 	
@@ -1382,11 +1335,9 @@ setup = (
 	contextDepth: 0.
 )
 public slotsPerMethod ^ <Integer> = (
-	^useAlternateBytecodeSet
-		ifTrue: [CodeGeneratorV4 slotsPerMethod]
-		ifFalse: [CodeGeneratorV3 slotsPerMethod]
+	^CodeGeneratorV4 slotsPerMethod
 )
-storeInto: var <SlotEntry> = (
+storeInto: var <LocalEntry> = (
 	(isRemote: var)
 		ifFalse: [cgen storeIntoTemporary: (indexOfVar: var)]
 		ifTrue:
@@ -1399,8 +1350,6 @@ public stringNode: node <StringAST>  = (
 	cgen pushLiteral: node value.
 )
 public superSendNode: node <SuperSendNode> = (
-	
-	cgen isSuperSendAbsentReceiver ifFalse: [cgen pushSelf].
 	self applyShouldNotPopTo: node message.
 	addDebugInfo: (node message start to: node message end).
 	cgen superSend: node message selector numArgs: node message arguments size.
@@ -1901,8 +1850,6 @@ currentScope ^ <Scope> = (
 	^scopeStack last
 )
 public enclosingObjectNode: node <EnclosingObjectAST> = (
-	(* The V3 bytecode set must find the depth in the literal table. *)
-	useAlternateBytecodeSet ifFalse: [addLiteral: node depth].
 	^node
 )
 public globalNode: node <GlobalAST> = (
@@ -1999,8 +1946,6 @@ public ordinarySendNode: node <OrdinarySendAST> = (
 		copyPositionFrom: node
 )
 public outerSendNode: node <OuterSendAST> = (
-	(* The V3 bytecode set must find the depth in the literal table. *)
-	useAlternateBytecodeSet ifFalse: [addLiteral: node depth].
 	^(rewriter OuterSendAST new
 		message: (node message apply: self);
 		depth: node depth)
@@ -2398,10 +2343,7 @@ public compileExpressionSource: src <String> debugMapper: debugMapper <MethodCon
 				(DebugMappedLocalEntry name: name mapper: debugMapper)]].
 	
 	(* Rewrite and compile *)
-	((method apply: rewriter) 
-		apply: squeakRewriter)
-			apply: methodCompiler.
- 	result: methodCompiler result.
+	result:: ((method apply: rewriter) apply: squeakRewriter) apply: methodCompiler.
 	result source: src.
 	scopeMap:: Map new.
 
@@ -2645,14 +2587,11 @@ makePrimaryFactoryFor: hdr <ClassHeaderAST> ^<MethodAST> = (
 		pattern: cons body: body accessModifier: #public; 
 		start: start; end: end.
 )
-methodNode: aNode <MethodAST> ^ <LowLevelMethodMirror> = (
-
-	| tree <AST> |
-	tree:: aNode apply: rewriter. (* rewrite ast *)
-	tree:: tree apply: squeakRewriter.
-	tree apply: methodCompiler. (* final pass: visit rewritten ast *)
-	(* pop scope? *)
-	^(methodCompiler result) source: (sourceForNode: aNode)
+methodNode: node <MethodAST> ^<IntermediateMethod> = (
+	| result <IntermediateMethod> |
+	result:: ((node apply: rewriter) apply: squeakRewriter) apply: methodCompiler.
+	result source: (sourceForNode: node).
+	^result
 )
 mixinApplicationClassNode: nc <MixinApplicationClassAST> 
  in: mixinIR <IntermediateMixin>

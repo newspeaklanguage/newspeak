@@ -59,7 +59,7 @@ class Rewriter = ASTTool ((* This class is intended to become a common rewriter 
 
 The common rewriter should be sufficient for Dart and JavaScript. Squeak will require a second rewrite phase for closure analysis, which should be simpler than the current implementation because determining which locals need to be indirected or copied down will be easier when the tree already has distinguished sends that are reads/writes to locals.
 *)|
-	scopeStack <List[Scope]> = List new.
+	currentScope <Scope> ::= nil.
 	valueExpected <Boolean> ::= true.
 	inClosure <Boolean> ::= false.
 |) (
@@ -541,9 +541,6 @@ public codeBodyNode: node <CodeBodyAST> = (
 	scopeMap at: result put: bodyScope.
 	^result
 )
-currentScope ^<Scope> = (
-	^scopeStack last
-)
 depthOfEnclosingClass: name <Symbol> ^<Integer> = (
 	| entry <ClassEntry> |
 	entry:: currentScope at: #'@currentClass'.
@@ -572,8 +569,7 @@ futureFor: expression <ExpressionAST> ^<ExpressionAST> = (
 	futureExp <ExpressionAST>
 	|
 	
-	scope:: Scope new.
-	scope superScope: currentScope.
+	scope:: Scope parent: currentScope.
 	
 	futureExp:: UnresolvedSendAST new
 		receiver: (UnresolvedSendAST new
@@ -711,7 +707,7 @@ offsetOfImplicitReceiverTarget: binding <SymbolTableEntry> ^<Integer> = (
 	^depth
 )
 public popScope ^<Scope> = (
-	^scopeStack removeLast
+	currentScope:: currentScope parent.
 )
 processEventualSend: node <NormalSendAST> = (
 	subclassResponsibility
@@ -909,7 +905,7 @@ processSuperSend: node <NormalSendAST> = (
 		copyPositionFrom: node
 )
 public pushScope: scope <Scope> = (
-	^scopeStack addLast: scope
+	^currentScope:: scope
 )
 pushScopeForNode: node <AST> = (
 	^pushScope: (scopeMap at: node)
@@ -1031,21 +1027,22 @@ Then we traverse the tree, creating and populating new scopes as needed. We main
 
 A possible optimization is to avoid a traversal of an entire side of a class.
 One can process only a side without its subtrees (i.e., methods and nested classes). These can be visited later, as long as we ensure that the processing of the subtree begins with a proper super scope on top of the scope stack. *)| 
-scopeStack <List[Scope]> = List new.
+currentScope ::= initialScope.
 currentDepth <Integer> ::= initialDepth. (* The lexical nesting level of the class declaration currently being visited; top-level classes are level 0. *)
-|pushScope: initialScope) (
+|
+) (
 public blockNode: aNode <BlockAST> = (
 	| parameterScope <Scope> |
-	parameterScope:: Scope new.
+	parameterScope:: Scope parent: currentScope.
 	(* establish parameter scope *)
 	aNode parameters do:
 		[:parameter <VarDeclAST> | 
-			parameterScope
+		 parameterScope
 			at: parameter name
 			put: (LocalEntry
 				forDeclaration: parameter
 				atDepth: currentDepth)].
-	nestScope: parameterScope.
+	pushScope: parameterScope.
 	
 	(* visit body *)
 	aNode body apply: self.
@@ -1074,7 +1071,7 @@ public classHeaderNode: aNode = (
 	aNode initExprs do: [:e | e apply: self].
 )
 public classNode: aNode <ClassDeclarationAST> = (
-	| thisClass <ClassEntry> vs <Scope> |
+	| thisClass <ClassEntry> instanceSideScope <Scope> classSideScope <Scope> |
 	
 	thisClass:: ClassEntry
 		forDeclaration: (MessagePatternAST new selector: aNode name; accessModifier: aNode accessModifier)
@@ -1083,47 +1080,46 @@ public classNode: aNode <ClassDeclarationAST> = (
 	
 	currentScope at: aNode name put: thisClass.
 		
-	vs:: Scope new. (* establish instance side scope *)
 	currentDepth:: currentDepth + 1.
+	
+	instanceSideScope:: Scope parent: currentScope. (* establish instance side scope *)
+	pushScope: instanceSideScope.
 	aNode header slots do: [:v <SlotDeclAST> | 
 		| se = SlotEntry
 			forDeclaration: (MessagePatternAST new selector: v name; accessModifier: v accessModifier)
 			atDepth: currentDepth. |
-		vs at: v name put: se. (* getter *)
-		vs at: (namer initializerSelectorForSlot: v) put: se.
-		v isMutable ifTrue: [vs at: (namer setterSelectorFor: v) put: se]. (* setter *)].
-		
-	self nestScope: vs.
-		currentScope at: #'@currentClass' put: thisClass.
-  		aNode instanceSide apply: self.
+		instanceSideScope at: v name put: se. (* getter *)
+		instanceSideScope at: (namer initializerSelectorForSlot: v) put: se.
+		v isMutable ifTrue: [instanceSideScope at: (namer setterSelectorFor: v) put: se]. (* setter *)].
+	instanceSideScope at: #'@currentClass' put: thisClass.
+	aNode instanceSide apply: self.
 	popScope.
-	self nestScope: Scope new. (* establish class side scope *)
-		currentScope at: #'@currentClass' put: thisClass.
-  		aNode classSide apply: self.
+
+	classSideScope:: (Scope parent: currentScope). (* establish class side scope *)
+	pushScope: classSideScope.
+	classSideScope at: #'@currentClass' put: thisClass.
+	aNode classSide apply: self.
 	popScope.
+
 	currentDepth:: currentDepth - 1.
 )
 public codeBodyNode: aNode <CodeBodyAST> = (
-	| ts <Scope> |
-	(* establish local slot scope *)
+	| bodyScope <Scope> |
 
-	ts:: Scope new.
-	aNode temporaries do:[:t <SlotDefAST> | 
-		|svd|
-		svd:: LocalEntry forDeclaration: t slotDecl atDepth: currentDepth.
-		ts at: t name put: svd. (* getter *)
-		ts at: (namer initializerSelectorForSlot: t) put: svd. (* setter *)
-		t isMutable ifTrue: [ts at: (setterSelectorFor: t) put: svd. (* setter *)]].
+	bodyScope:: Scope parent: currentScope.
+	aNode temporaries do: 
+		[:t <SlotDefAST> | | local |
+		 local:: LocalEntry forDeclaration: t slotDecl atDepth: currentDepth.
+		 bodyScope at: t name put: local. (* getter *)
+		 bodyScope at: (namer initializerSelectorForSlot: t) put: local. (* setter *)
+		 t isMutable ifTrue: [bodyScope at: (setterSelectorFor: t) put: local. (* setter *)]].
 
-	nestScope: ts.
-	scopeMap at: aNode put: ts.
+	pushScope: bodyScope.
+	scopeMap at: aNode put: bodyScope.
 	(* visit statements *)
 	aNode temporaries do: [:t | t initializer isNil ifFalse: [t initializer apply: self]].
 	aNode statements do: [:statement | statement apply: self].
 	popScope.
-)
-currentScope ^ <Scope> = (
-	^scopeStack last
 )
 incrementalScopeFor: mm <MixinMirror> ^<Scope> = (
 	|
@@ -1137,7 +1133,7 @@ incrementalScopeFor: mm <MixinMirror> ^<Scope> = (
 	nil = enclosingMixin 
 		ifTrue: [enclosingScope:: Scope new]
 		ifFalse: [enclosingScope:: incrementalScopeFor: enclosingMixin instanceSide].
-	scope:: Scope new superScope: enclosingScope.
+	scope:: Scope parent: enclosingScope.
 	depth:: scope depth.
 	currentClass:: ClassEntry 
 		forDeclaration: (MessagePatternAST new selector: mm declaration name)
@@ -1184,7 +1180,7 @@ public messageNode: aNode <MessageAST> = (
 public messagePatternNode: aNode <MessagePatternAST> = (
 
 	| parameterScope <Scope> |
-	parameterScope:: Scope new.
+	parameterScope:: Scope parent: currentScope.
 	(* establish parameter scope *)
 	aNode parameters do:
 		[:parameter <VarDeclAST> | 
@@ -1194,7 +1190,7 @@ public messagePatternNode: aNode <MessagePatternAST> = (
 			forDeclaration: parameter
 			atDepth: currentDepth)].
 	
-	nestScope: parameterScope.
+	pushScope: parameterScope.
 	scopeMap at: aNode put: parameterScope.
 	(* the pattern scope, ps, must be popped by the caller *)
 	(* establish type parameter scope - skip for now *)
@@ -1236,19 +1232,14 @@ public mixinApplicationClass: aNode <MixinApplicationClassAST> = (
 public mixinClassNode: aNode = (
 	(* leaf, do nothing *)
 )
-nestScope: s <Scope> = (
-	(* Hook up a new lexically nested scope, and push onto the scope stack *)
-	s superScope: currentScope.
-	pushScope: s
-)
 public numberNode: aNode <NumberAST> = (
 	(* leaf, do nothing *)
 )
 popScope ^<Scope> = (
-	^scopeStack removeLast
+	^currentScope:: currentScope parent
 )
-pushScope: s <Scope> = (
-	scopeStack addLast: s
+pushScope: scope <Scope> = (
+	^currentScope:: scope
 )
 public returnStatNode: aNode <ReturnStatAST> = (
 	(* generic traversal code *)
@@ -1395,9 +1386,9 @@ public syntheticNameSeparator = (
 )
 ) : (
 )
-public class Scope = ((* A generic scope facility. *)|
-public superScope <Scope>
-bindings <Map[Symbol, SymbolTableEntry]> = Map new.
+public class Scope parent: p = (|
+	public parent <Scope> = p.
+	protected bindings <Map[Symbol, SymbolTableEntry]> = Map new.
 |) (
 public at: key <Symbol> ^<SymbolTableEntry> = (
 	(* Answers the value associated with aKey in this or one the super scopes or fails if aKey is absent. *)
@@ -1405,9 +1396,9 @@ public at: key <Symbol> ^<SymbolTableEntry> = (
 )
 public at: key depth: d = (
 	depth = d ifFalse: [
-		nil = superScope
+		nil = parent
 			ifTrue: [^nil]
-			ifFalse: [^superScope at: key depth: d]].
+			ifFalse: [^parent at: key depth: d]].
 	^bindings at: key ifAbsent: [nil]
 )
 public at: key <Symbol> ifAbsent: blk <[X def]> ^<SymbolTableEntry | X> = (
@@ -1417,8 +1408,8 @@ public at: key <Symbol> ifAbsent: blk <[X def]> ^<SymbolTableEntry | X> = (
 	| val <T> |
 	val:: self bindings at: key ifAbsent: [nil].
 	nil = val ifFalse: [^val].
-	nil = self superScope ifTrue: [^blk value].
-	val:: self superScope at: key ifAbsent: [nil].
+	nil = self parent ifTrue: [^blk value].
+	val:: self parent at: key ifAbsent: [nil].
 	nil = val ifFalse: [^val].
 	^blk value
 )
@@ -1436,8 +1427,8 @@ public at: key <Symbol> put: value <SymbolTableEntry> ifThere: aBlock <[X def]> 
 		ifFalse: [aBlock value]
 )
 public depth ^<Integer> = (
-	superScope isNil ifTrue: [^0].
-	^superScope depth + 1.
+	parent isNil ifTrue: [^0].
+	^parent depth + 1.
 )
 public printOn: stm = (
 	stm nextPutAll: 'Scope('.
@@ -1445,14 +1436,12 @@ public printOn: stm = (
 		do: [:key | stm nextPutAll: key]
 		separatedBy: [ stm nextPutAll: ', '].
 	stm nextPutAll: ') in '.
-	superScope printOn: stm.
-)
-public setSuperScope: sc = (
-	superScope isNil
-		ifTrue: [superScope: sc]
-		ifFalse: [superScope setSuperScope: sc]
+	parent printOn: stm.
 )
 ) : (
+public new = (
+	^self parent: nil
+)
 )
 class SlotEntry forDeclaration: decl <VarDeclAST> atDepth: d <Integer> = SymbolTableEntry forAST: decl atDepth: d () (
 public isSlotBinding ^<Boolean> = (

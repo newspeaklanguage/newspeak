@@ -64,7 +64,7 @@ Copyright 2012-2013 Gilad Bracha, Ryan Macnak and Cadence Design Systems
 	private IntermediateSlotDeclaration = i IntermediateSlotDeclaration.
 	private IntermediateMethod = i IntermediateMethod.
 	private IntermediateMixin = i IntermediateMixin.
-
+	private IntermediateTransientSlot = i IntermediateTransientSlot.
 	protected parser <CommonParser> = ns3Parser CommonParser new.
 |) (
 public class Compiler = super Compiler ((* The compiler has three main entry points: compileClassSource:Within:, compileClassHeader: within: and compileMethodSource:within:. These compile an entire class declaration, a class header, and a method, respectively. 
@@ -2263,6 +2263,9 @@ classNode: node <ClassDeclarationAST> ^<IntermediateClassDeclaration> = (
 	
 	^classDecl
 )
+public compileAllowingBacktickMethodSource: src <String> within: enclosing <MixinMirror>  ^<IntermediateMethod> = (
+	^ compileMethodSource: src within: enclosing parsingWith: [:x |  parser parseMethodDeclarationAllowBacktick: x] .
+)
 compileBodylessInitializerSource: src <String> within: enclosing <MixinMirror>  ^<LowLevelMethodMirror> = (
 	| 
 	nc <MixinApplicationClassAST> = parser nestedClassDecl parseString: src.
@@ -2350,8 +2353,11 @@ public compileExpressionSource: src <String> debugMapper: debugMapper <MethodCon
 	^result
 )
 public compileMethodSource: src <String> within: enclosing <MixinMirror>  ^<IntermediateMethod> = (
+	^ compileMethodSource: src within: enclosing parsingWith: [:x |  parser parseMethodDeclaration: x] .
+)
+public compileMethodSource: src <String> within: enclosing <MixinMirror> parsingWith: parserBlock  ^<IntermediateMethod> = (
 	| tree <AST> result <LowLevelMethodMirror> | 
-	tree:: parser parseMethodDeclaration: src.
+	tree:: parserBlock value: src.
 	saveInput: src.
 	setScopeFor: tree in: enclosing.
 	result:: methodNode: tree.
@@ -2381,6 +2387,63 @@ compileNestedClasses: nestedClasses <{ClassDeclarationAST | MixinApplicationClas
 )
 compileNestedClassesOf: aNode <SideAST> within: mixinIR <IntermediateMixin> = (
 	^compileNestedClasses: aNode nestedClasses within: mixinIR
+)
+compileTransientSlotAST: tree  into: enclosingIR <IntermediateMixin>
+ ^<TrnasientSlotIR> = (
+
+	| intermediateTS treeMainMethod mixinIR name initMethod mainMethod category source  |
+
+
+	category:: #'transientslots'.
+	mixinIR: enclosingIR .
+
+	name: tree name.
+	intermediateTS:: IntermediateTransientSlot new.
+	source:: sourceForNode: tree.
+
+	(* cache slot is created by IntermediateTransientSlot   *)
+
+	(* init method  *)
+	 createInitMethodTreeForTransientSlot: tree do: [:treeInitMethod :newSource | 
+		initMethod:: processMethod: treeInitMethod inScope: currentScope in: mixinIR.
+		initMethod isSynthetic: false.
+		initMethod category:  category.
+		initMethod source: newSource.
+		intermediateTS intermediateInitMethod: initMethod.
+	].
+ 
+	(* main method  *)
+      treeMainMethod:: createMainMethodTreeForTransientSlot: tree.
+	mainMethod:: processMethod: treeMainMethod inScope: currentScope in: mixinIR.
+	mainMethod isSynthetic: false.
+	mainMethod category:  category.
+	mainMethod source: source.
+	intermediateTS intermediateMainMethod: mainMethod.
+ 
+	(* setter Method*)
+	(* it is important to remove the setter when the user decides to change the slot from mutable to immutable *)
+	(* mixinIR methods removeAllSuchThat: [:ea | ea selector = (name, ':') asSymbol  ].  *)
+	tree isMutable ifTrue: [
+		| treeSetterMethod setterMethod |
+	     treeSetterMethod:: createSetterMethodTreeForTransientSlot: tree.
+		setterMethod:: processMethod: treeSetterMethod inScope: currentScope in: mixinIR.
+		setterMethod isSynthetic: false.
+		setterMethod category:  category.
+		intermediateTS intermediateSetterMethod: setterMethod.
+	].
+
+	^intermediateTS
+
+)
+public compileTransientSlotSource: src <String> within: enclosingIR <IntermediateMixin>  ^<IntermediateTransientSlot> = (
+	| tree <AST>  intermediate | 
+	tree:: parser parseTransientSlotDeclaration: src.
+	saveInput: src.  
+	setScopeFor: tree in: enclosingIR builder.  
+	intermediate:: compileTransientSlotAST: tree into: enclosingIR.
+	scopeMap:: Map new.
+	^intermediate.
+	
 )
 computeMixinFrom: headerNode <ClassHeaderAST> ^ <CompiledMixinMirror> = (
 	|
@@ -2414,6 +2477,109 @@ computeSlotInitializersFor: aNode <ClassHeaderAST> ^ <Collection[StmtAST]> = (
 		UnresolvedSendAST new message: aMsg; 
 			receiver: (selfNode start: aMsg start; end: aMsg end);
 			start: aMsg start; end: aMsg end].
+)
+createInitMethodTreeForTransientSlot: tree do: astAndSourceBlock = (
+	|  initializer initMethodName selector messagePattern body return newAST newSource  | 
+	
+
+	selector:: tree name.
+	initializer:: tree initializer.
+	
+	initMethodName:: IntermediateTransientSlot initMethodNameForTransientSlotNamed: selector.  
+	
+	messagePattern:: (MessagePatternAST new
+		selector: initMethodName;
+		accessModifier: #protected;
+		parameters: {} asMutableArrayList).
+
+	return:: ReturnStatAST new 
+		expression: initializer;
+		yourself.
+	
+	
+	body:: (CodeBodyAST new
+		parameters: {} asMutableArrayList 
+		temporaries: {} asMutableArrayList 
+	      statements:  { return } asMutableArrayList).
+
+	
+	newAST:: MethodAST new
+		pattern: messagePattern;
+		body: body;
+		start:1;
+		end:1.
+		
+(*	newSource::  messagePattern accessModifier , ' ', 'zzzz', ' = ( ^ ', (sourceForNode: initializer), ' )'  .    *)
+	newSource::  messagePattern accessModifier , ' ', messagePattern selector, ' = ( ^ ', (sourceForNode: initializer), ' )'  .  
+	astAndSourceBlock value: newAST value: newSource.
+
+	
+
+)
+createMainMethodTreeForTransientSlot: tree = (
+(* Build an AST for a method that would lazily create a execute the expression in a transient  slot, and cache it. The generated code has the form
+
+simpleName = (
+	self simpleName`slot isNil ifTrue: 
+		[self simpleName`slot: initTransientSlotExpression].
+	^self simpleName`slot
+)	
+
+*)
+
+	|  initMethodName cacheSlotName selector cacheSlot  assignSlot nilCheck block if return initValue | 
+	
+	selector:: tree name asSymbol.
+		
+	initMethodName:: IntermediateTransientSlot initMethodNameForTransientSlotNamed: selector.  
+	cacheSlotName:: IntermediateTransientSlot slotNameForTransientSlotNamed: selector.
+
+	cacheSlot:: UnresolvedSendAST new
+		to: selfNode
+		send: cacheSlotName with: {}.	
+
+
+	initValue:: UnresolvedSendAST new
+		to: selfNode
+		send: initMethodName
+		with: {}.
+
+
+	assignSlot:: UnresolvedSendAST new
+		to: selfNode
+		send: (cacheSlotName, ':') asSymbol
+		with: {initValue}.
+
+	nilCheck:: UnresolvedSendAST new
+		to: cacheSlot
+		send: #isNil
+		with: {}.
+
+	block:: BlockAST new
+		body: (CodeBodyAST new
+			parameters: {}
+			temporaries: {}
+			statements: {assignSlot}).
+
+	if:: UnresolvedSendAST new
+		to: nilCheck
+		send: #ifTrue:
+		with: {block}.	
+	return:: ReturnStatAST new expression: cacheSlot.
+		
+
+	^MethodAST new
+		pattern: (MessagePatternAST new
+			accessModifier: tree accessModifier;
+			selector: selector
+			parameters: {});
+		body: (CodeBodyAST new
+		 	parameters: {}
+			temporaries: {}
+			statements: {if. return});
+		start: 1; end: 1	
+
+
 )
 private createNestedClassAccessorFrom: nestedClassNode <ClassDeclarationAST | MixinApplicationClassAST> = (
  
@@ -2450,6 +2616,36 @@ This accessor will lazily generate the nested class when its enclosing instance 
 
 	imethod:: processMethod: ast inScope: scope in: '<bogus>'.
 	^imethod
+)
+createSetterMethodTreeForTransientSlot: tree = (
+	|   cacheSlotName selector assignToSlot newValueParameter parameterName parameter  | 
+
+	selector:: tree name asSymbol.
+	cacheSlotName:: IntermediateTransientSlot slotNameForTransientSlotNamed: selector.
+	parameterName:: #p1.
+
+	parameter:: UnresolvedSendAST new
+		to: hereNode
+		send: parameterName
+		with: {}.
+	
+	assignToSlot:: UnresolvedSendAST new
+		to: selfNode
+		send: (cacheSlotName, ':') asSymbol
+		with: {parameter}.
+
+	newValueParameter:: VarDeclAST name: parameterName type: nil.
+
+	^MethodAST new
+		pattern: (MessagePatternAST new
+			accessModifier: tree accessModifier;
+			selector: (selector, ':') asSymbol
+			parameters: { newValueParameter} asMutableArrayList);
+		body: (CodeBodyAST new
+		 	parameters: {newValueParameter} asMutableArrayList
+			temporaries: {}
+			statements: { assignToSlot } asMutableArrayList);
+		start: 1; end: 1	
 )
 currentScope ^ <Scope> = (
 	^scopeStack last
@@ -2769,6 +2965,8 @@ private processInstanceSideOf: aNode <ClassAST> ofMixin: mixinIR <IntermediateMi
 	processInitializerFor: aNode in: mixinIR.
 	side:: aNode instanceSide.
 	processSide: side ofMixin: mixinIR. (* compile instance methods *)
+	side transientSlots do: 
+		[ :each |  mixinIR transientSlots add: ( compileTransientSlotAST: each into: mixinIR declaration)  ].   (* compile transient slots *)  
 	(compileNestedClassesOf: side within: mixinIR) do: 
 		[:nestedClassIR | mixinIR nestedClasses add: nestedClassIR].
 )

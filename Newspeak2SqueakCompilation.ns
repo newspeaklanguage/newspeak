@@ -108,7 +108,8 @@ specialSelectors =
 	nil. (* #class. *)
 	#blockCopy:. #value. #value:. #do:. #new. #new:. #x. #y}.
 |) (
-class AST2ByteCodeCompiler = ASTTool ((* The compiler is a visitor on an AST that has been processed by the rewriter.
+class AST2ByteCodeCompiler = ASTTool (
+(* The compiler is a visitor on an AST that has been processed by the rewriter.
 It is a subtype of  ASTTool[Self] - that is, its methods do not return individual results, but instead
 side effect state within the compiler.
 
@@ -120,25 +121,6 @@ what the actual instruction codes are, what the actual offsets for branches are 
 so the compiler can abstract from these details. One can almost think of this as producing
 assembly.
 
-The trickiest part of the byte code compiler is deciding when to pop the result of an expression. Subexpressions leave their result on the operand stack, but top level expressions need not, since the result is not used. Furthermore, the VM does not clean up the operand stack upon return from a method, it seeems, so we are obligated to leave an empty operand stack on method exit.
-
-There would appear to be a space-time tradeoff - we can spend cycles popping results, or we can allocate a larger operand stack. But since we always need to clean it up, the time is always lost so we should optimize for space.
-
-In straight line code, the situation is simple: keep track of the depth of the stack, and pop it to zero at the end of a statement. However, once we have conditional branches, we need to ensure that the last statement in a branch leaves its result, because it is in fact a subexpression.
-
-However, this is not true in case of loops!
-
-We do not need to retain the result of the last statement of a non-inlined closure. This is its value, but the rewriter  already takes care of this by inserting a local return.
-
-The compiler tracks whether we are at the start of a statement or not using the boolean slot statementStarting. When traversing nodes that may have subexpressions, the current value of statementStarting is always saved before traversing subexpressions, and restored afterwards. The convention is to store the current value of statementStarting into a local named shouldPop (since we should pop the operand stack if we are at the start of a statement, i.e., the expression is a top level one and its value will not be used).
-
-The value of shouldPop is used when there is a choice between generating a popping or non-popping version of a bytecode. It is not, however, used to pop the results of individual subexpressions. Rather than clutter the logic with tests of shouldPop (or statementStarting) everywhere, we ensure that the method statementEnd is called at the end of each statement. It pops the stack as needed. Since only top level expressions will be popped, this does not change the maximal operand stack size; it only centralizes the handling.
-
-The statementEnd method is called by CodeBodyAST, which traverses the statement lists. Also, when traversing a CodeBodyAST, statementStarting is set to true before each statement is handled - except for the last statment, whose result we may need as noted above.
-
-statmentEnd needs to know how many pops to perform. Whenever we start a new CodeBodyAST, we must remember the depth of the operand stack at that time (stored in statementBaselineStackDepth). At the end of each statement, we want to pop the stack down to that depth. This complication could be avoided if we chose to have every expression consider whether it was top level or not.
-
-Keeping track of operand stack depth is not as simple as it seems.
 Closure code appears inline (regardless of whether execution is inlined!). Code in a non-inlined closure starts executing with an empty operand stack, but the depth of the method must be sufficient for the block.
 
 To complicate matters further, the actual size of the activation is simply the sum of the number of parameters, number of locals and maximal operand stack size.
@@ -159,17 +141,18 @@ Then, the actual operand stack size we specify for the method is
 
 context size - #method formals - #method locals
 
-We don't do this yet.  What we do instead is often suboptimal, but sometimes insufficient. We compute the cumulative maximum operand stack size for all code in the method, including closures. The idea was that this would be conservative and simple, but in fact it may fail if a closure has a large number of arguments and copy-downs, and the actual operand stack usage is small. *)| 
-  cgen <CodeGenerator>
-  debugInfo <DebugInfo>
+We don't do this yet.  What we do instead is often suboptimal, but sometimes insufficient. We compute the cumulative maximum operand stack size for all code in the method, including closures. The idea was that this would be conservative and simple, but in fact it may fail if a closure has a large number of arguments and copy-downs, and the actual operand stack usage is small. *)
+| 
+	cgen <CodeGenerator>
+	debugInfo <DebugInfo>
 
-  shouldPop <Boolean>
-  scopeStack <List[Scope]>
+	valueExpected <Boolean>
+	scopeStack <List[Scope]>
 
-  (* Possibly these three should be unified as a ContextTracker or something.*)
-  maxClosureContextSize <Integer>
-  offsetStack <List[Integer]> (* see codeBodyNode:  rename localOffsetAllocator? *)
-  contextDepth <Integer> (* The number of outerContexts that need to be traversed to reach the method context.  E.g., 0=method, 1=closure, 2=closure in closure, and so on. Used for debug info. *)
+	(* Possibly these three should be unified as a ContextTracker or something.*)
+	maxClosureContextSize <Integer>
+	offsetStack <List[Integer]> (* see codeBodyNode:  rename localOffsetAllocator? *)
+	contextDepth <Integer> (* The number of outerContexts that need to be traversed to reach the method context.  E.g., 0=method, 1=closure, 2=closure in closure, and so on. Used for debug info. *)
 |) (
 class CodeGenerator = (|
 public code = IntermediateMethod new.
@@ -889,36 +872,44 @@ addLocalVar: var <VarDeclAST> = (
 	
 	^localVariableDebugInfo
 )
-applyShouldNotPopTo: node = (
-	| original result |
-	original:: shouldPop.
-	shouldPop:: false.
+applyForEffectTo: node <Node> = (
+	| original startDepth result |
+	original:: valueExpected.
+	startDepth:: cgen currentStackDepth.
+	valueExpected:: false.
 	result:: node apply: self.
-	shouldPop:: original.
+	valueExpected:: original.
+	cgen currentStackDepth = startDepth ifFalse: [unbalancedStack].
 	^result
 )
-applyShouldPopTo: node = (
-	| original result |
-	original:: shouldPop.
-	shouldPop:: true.
+applyForValueTo: node <Node> = (
+	| original startDepth result |
+	original:: valueExpected.
+	startDepth:: cgen currentStackDepth.
+	valueExpected:: true.
 	result:: node apply: self.
-	shouldPop:: original.
+	valueExpected:: original.
+	cgen currentStackDepth = (startDepth + 1) ifFalse: [unbalancedStack].
 	^result
 )
 public arrayNode: node <ArrayAST> = (
-	node elements isNil
+	nil = node elements
 		ifTrue: 
 			[cgen createEmptyArray: node size]
 		ifFalse:
-			[node elements do: [:ea | self applyShouldNotPopTo: ea].
+			[node elements do: [:ea | self applyForValueTo: ea].
 			cgen createFullArray: node size].
+		
+	valueExpected ifFalse: [^cgen pop].
 )
 public blockLocalReturnNode: node <BlockLocalReturnAST> = (
-	self applyShouldNotPopTo: node expression.
+	valueExpected ifTrue: [returnUsedForValue].
+	self applyForValueTo: node expression.
 	addDebugInfo: (node start to: node end).
 	cgen returnFromBlock.
 )
 public boolNode: node <BoolAST> = (
+	valueExpected ifFalse: [^self].
 	addDebugInfo: (node start to: node end).
 	cgen pushLiteral: node value
 )
@@ -926,10 +917,10 @@ cascadeNormal: node <SendAST> = (
 
 	node isCascadedSendNode
 		ifTrue: [cascadeNormal: node previousSend]
-		ifFalse: [self applyShouldNotPopTo: node receiver].
+		ifFalse: [self applyForValueTo: node receiver].
 	
 	cgen dup.
-	self applyShouldNotPopTo: node message.
+	node message arguments do: [:argument | self applyForValueTo: argument].
 	addDebugInfo: (node message start to: node message end).
 	cgen normalSend: node message selector numArgs: node message arguments size.
 	cgen pop.
@@ -955,11 +946,13 @@ public cascadedSendNode: node <CascadedSendAST> = (
 		message: 'Unknown type of cascade'.
 	
 	cascadeNormal: node previousSend.
-	self applyShouldNotPopTo: node message.
+	node message arguments do: [:argument | self applyForValueTo: argument].
 	addDebugInfo: (node message start to: node message end).
 	cgen normalSend: node message selector numArgs: node message arguments size.
+	valueExpected ifFalse: [cgen pop].
 )
 public characterNode: node <CharacterAST> = (
+	valueExpected ifFalse: [^self].
 	addDebugInfo: (node start to: node end).
 	cgen pushLiteral: node value
 )
@@ -968,7 +961,7 @@ cleanup = (
   	debugInfo: nil.
 	contextDepth: nil.
 	
-	shouldPop: nil.
+	valueExpected: nil.
 	maxClosureContextSize: nil.
 	scopeStack: nil.
 
@@ -976,26 +969,27 @@ cleanup = (
 )
 public closureNode: node <ClosureAST> = (
 	| blockPos <Integer> savedStackDepth <Integer> savedStackMax <Integer> |
-
-	node copiedValues do: [:each | self applyShouldNotPopTo: each].
 	
-	(* do this after pushing copied values! *)
-	pushScope: (scopeMap at: node).  pushOffsetCounter. contextDepth: contextDepth + 1.
+	valueExpected ifFalse: [^self].
+
+	node copiedValues do: [:each | self applyForValueTo: each].
 
 	cgen
 		createClosureOfArity: node parameters size
 		copying: node copiedValues size
 		length: 0 (* needs patching *).
 
+	(* do this after pushing copied values! *)
+	pushScope: (scopeMap at: node).  pushOffsetCounter. contextDepth: contextDepth + 1.
+
 	blockPos: cgen bci.
 	savedStackDepth:: cgen currentStackDepth.	
 	savedStackMax:: cgen maxStackDepth.
 	cgen maxStackDepth: 0.
-	 
 
 	(node pushNilCount) timesRepeat: [cgen pushNil]. 
 	(* These nils establish the temp frame for temps other than params and copied values. They contribute to the operand stack size, obviating the need to directly include the number of local variables in the context size *)
-	node body apply: self.
+	self applyForEffectTo: node body.
 	
 	maxClosureContextSize:: 
 		maxClosureContextSize max: (node parameters size + node copiedValues size + cgen maxStackDepth).
@@ -1009,10 +1003,7 @@ public closureNode: node <ClosureAST> = (
 )
 public codeBodyNode: node <CodeBodyAST> = (
 	|
-	stmtCount <Integer>
-	stmtSize <Integer> 
-
-	baselineStackDepth <Integer>
+	statements
 	localVariableDebugInfos
 	startBCI
 	validBCIRange
@@ -1027,7 +1018,6 @@ public codeBodyNode: node <CodeBodyAST> = (
 		(node parameters collect: [:param | addLocalVar: param]).
 		
 	(* Copied values are included at the beginning of temporaries thanks to the Rewriter. *)
-		
 	node temporaries do: 
 		[:temp | | varInfo <SemanticVarDecl> remoteVarInfo <SemanticVarDecl> |
 		varInfo:: currentScope at: temp name.
@@ -1038,87 +1028,65 @@ public codeBodyNode: node <CodeBodyAST> = (
 				localVariableDebugInfos add:
 					(debugInfo addInfoForRemote: varInfo in: remoteVarInfo)]].
 
-	stmtCount:: 1.
-	stmtSize:: node statements size.
-	baselineStackDepth:: cgen currentStackDepth.
-	node statements do: [:statement | 
-		stmtCount < stmtSize 
-			ifTrue: 
-				[(* Pop intermediate results. *)
-				self applyShouldPopTo: statement.
-				cgen ensureStackDepth: baselineStackDepth]
-			ifFalse:
-				[(* Pop or retain last result based on context. *)
-				statement apply: self.
-				shouldPop 
-					ifTrue: [cgen ensureStackDepth: baselineStackDepth]
-					ifFalse: [assert: [cgen currentStackDepth >= baselineStackDepth]]].
-		
-		stmtCount:: stmtCount + 1.
-	].
+	statements:: node statements.
+	1 to: statements size do: 
+		[:index | | statement = node statements at: index. |
+		index = statements size 
+			ifTrue: [statement apply: self]
+			ifFalse: [self applyForEffectTo: statement]].
 	
 	validBCIRange:: startBCI to: cgen bci - 1.
 	localVariableDebugInfos do: [:each | each validBCIRange: validBCIRange].
 	^localVariableDebugInfos
 )
 public conditionalNode: node <IfAST> = (
-	| ifPos <Integer> endThen <Integer> depth <Integer> thenDepth <Integer> |
+	| ifPos <Integer> endThen <Integer> depth <Integer> |
 
 	(* cond. branch(L1). then. jump(L2). L1: else. L2: *)
 	(* cond. branch(L1). then. L1: *)
 	
-	(* issues: utilizing short jumps; nested blocks and popping *)
-	
-	self applyShouldNotPopTo: node condition.
+	self applyForValueTo: node condition.
 	cgen jumpIf: node ifTrue not by: 0. (* jump to else (but needs patching) *)
-
 	ifPos: cgen bci. (* remember patch address *)
+
 	depth: cgen currentStackDepth.
 
-	assert: [node then isCodeBodyNode and: [node then parameters isEmpty]]
-		message: 'Nullary block expected for then clause'.
 	pushScope:: scopeMap at: node then.
 	node then apply: self.
-	thenDepth: cgen currentStackDepth.
 	popScope.
 	
-	node else isNil
-		ifTrue: [endThen: cgen bci.]
+	nil = node else
+		ifTrue: 
+			[valueExpected ifTrue: [cgen pushNil].
+			 endThen: cgen bci]
 		ifFalse:
-			[assert:[node else isCodeBodyNode and:[node else parameters isEmpty]]
-				message: 'Nullary block expected for else clause'.
-			cgen currentStackDepth: depth.
-			cgen jumpBy: 0.
-			(* need jump over else segment (but needs patching) *)
-			endThen:: cgen bci.
-			pushScope:: scopeMap at: node else.
-			node else apply: self.
-			popScope.
-			cgen patchJumpAt: endThen with: cgen bci - endThen.
-			(* patch jump over else *)].
+			[cgen currentStackDepth: depth.
+			 cgen jumpBy: 0. (* jump to end (but needs patching) *)
+			 endThen:: cgen bci. (* remember patch address *)
+			 pushScope:: scopeMap at: node else.
+			 node else apply: self.
+			 popScope.
+			 cgen patchJumpAt: endThen with: cgen bci - endThen].
 		
 	cgen patchJumpIfAt: ifPos with: endThen - ifPos.
-	(* patch the jump after the test so it comes to end of the then block *)
-	cgen currentStackDepth: (thenDepth max: cgen currentStackDepth).
-	(* if one of the branches did a non-local return, the operand stack depth will differ between them. The smaller is the NLR, which doesn't matter, as control will leave the method, so we keep the larger one. *)
-	shouldPop ifFalse:
-		[cgen currentStackDepth: (cgen currentStackDepth max: depth+1)].
-	(* If shouldPop is false we  want to assume the if left a result on the stack, even if it did not because both branches ended in an NLR *)
 )
 currentScope ^ <Scope> = (
 	^scopeStack last
 )
 public enclosingObjectNode: node <EnclosingObjectAST> = (
+	valueExpected ifFalse: [^self].
 	addDebugInfo: (node start to: node end).
 	cgen pushEnclosingObject: node depth.
 )
 public globalNode: node <GlobalAST>  = (
+	valueExpected ifFalse: [^self].
 	cgen pushLiteralVariable: node association.
 )
 public implicitReceiverSendNode: node <ImplicitReceiverSendAST> = (
-	self applyShouldNotPopTo: node message.
+	node message arguments do: [:argument | self applyForValueTo: argument].
 	addDebugInfo: (node message start to: node message end).
-	cgen implicitReceiverSend: node message selector numArgs: node message arguments size
+	cgen implicitReceiverSend: node message selector numArgs: node message arguments size.
+	valueExpected ifFalse: [cgen pop].
 )
 indexOfVar: v <VarDeclAST> ^ <Integer> = (
 	^(currentScope at: v name asSymbol) offset
@@ -1134,6 +1102,7 @@ literalArray ^<Array[Character | Number | String | Symbol]> = (
 )
 public localReadNode: node <LocalReadAST> = (
 	| var <LocalEntry> = node variable. |
+	valueExpected ifFalse: [^self].
 	addDebugInfo: (node start to: node end).	
 	(isRemote: var) 
 		ifFalse: [cgen pushTemporary: (indexOfVar: var)]
@@ -1143,11 +1112,11 @@ public localReadNode: node <LocalReadAST> = (
 				inVector: (indexOfVar: (vectorOf: var))].
 )
 public localWriteNode: node <LocalWriteAST> = (
-	self applyShouldNotPopTo: node value.
+	self applyForValueTo: node value.
 	addDebugInfo: (node start to: node end).
-	shouldPop
-		ifTrue: [popAndStoreInto: node variable]
-		ifFalse: [storeInto: node variable] .
+	valueExpected
+		ifTrue: [storeInto: node variable]
+		ifFalse: [popAndStoreInto: node variable].
 )
 public loopNode: node <LoopAST> = (
 
@@ -1156,52 +1125,38 @@ public loopNode: node <LoopAST> = (
 	|
 	topOfLoop <Integer>
 	whilePos <Integer>
-	baselineStackDepth <Integer>
-	skope <Scope>
+	conditionScope <Scope>
 	localVariableDebugInfos = List new.
 	|
 
 	nil = node body ifFalse:
 		[pushScope:: scopeMap at: node body].
 
-	baselineStackDepth:: cgen currentStackDepth.
 	nil = node prologue ifFalse: 
-		[localVariableDebugInfos addAll: (self applyShouldPopTo: node prologue)].
-	cgen ensureStackDepth: baselineStackDepth.
-	(* Ensure prologue maintains stack depth to prevent overflowing it during say nested loops. *)
+		[localVariableDebugInfos addAll: (self applyForEffectTo: node prologue)].
 	
 	topOfLoop:: cgen bci.
 	
-	skope:: scopeMap at: node condition ifAbsent: [nil].
-	nil = skope ifFalse: [pushScope: skope].
-	localVariableDebugInfos addAll: (self applyShouldNotPopTo: node condition). 
-	nil = skope ifFalse: [popScope].
+	conditionScope:: scopeMap at: node condition ifAbsent: [nil].
+	nil = conditionScope ifFalse: [pushScope: conditionScope].
+	localVariableDebugInfos addAll: (self applyForValueTo: node condition). 
+	nil = conditionScope ifFalse: [popScope].
 	
 	cgen jumpIf: node isWhileTrue not by: 0. 
 	whilePos:: cgen bci. (* remember patch address *)
 
 	nil = node body ifFalse:
-		[self applyShouldPopTo: node body.
-		cgen ensureStackDepth: baselineStackDepth.
- 		(* Ensure loop body maintains stack depth to prevent overflowing it during loop execution. *)
-		popScope].
+		[self applyForEffectTo: node body.
+		 popScope].
 	
 	cgen jumpBy: topOfLoop - cgen bci - (cgen sizeOfBackJump). (* jump to top of loop *)
 	
 	cgen patchJumpIfAt: whilePos with: cgen bci - whilePos.
  	(* patch the jump after the test so it comes to end of the then block *)
 	
-	shouldPop ifFalse: [cgen pushNil]. (* Result of loop message. Technically wrong, but Squeak makes the same mistake, and loops are almost never evaluated for value. *)
+	valueExpected ifTrue: [cgen pushNil]. (* Result of loop message. Technically wrong, but Squeak makes the same mistake, and loops are almost never evaluated for value. *)
 	
 	localVariableDebugInfos do: [:each | each validBCIRange: (each validBCIRange first to: cgen bci - 1)].
-)
-public messageNode: message <MessageAST> = (
-	shouldPop ifTrue: [halt].
-	message arguments do: [:arg <ExpressionAST> | arg apply: self].
-)
-public messagePatternNode: node <MessagePatternAST> = (
-	halt.
-	node parameters do: [:p | addLocalVar: p]
 )
 public methodLocalReturnNode: node <MethodLocalReturnAST> = (
 	^self returnStatNode: node
@@ -1220,7 +1175,7 @@ public methodNode: node <MethodAST> = (
 		argCount: node pattern parameters size;
 		literals: literalArray.
 	
-	node body apply: self.
+	self applyForEffectTo: node body.
 	cgen code debugInfo: debugInfo. (* set debug info *)
 	processLiteralMessagesOf: node.
 	(* currentMethod frameSize: cgen maxLocals. *)
@@ -1232,6 +1187,7 @@ public methodNode: node <MethodAST> = (
 	^result
 )
 public mixinClassNode: node  = (
+	valueExpected ifFalse: [^self].
 	cgen pushMixinClass.
 )
 nextOffset = (
@@ -1241,6 +1197,7 @@ nextOffset = (
 	^next
 )
 public nilNode: node = (
+	valueExpected ifFalse: [^self].
 	addDebugInfo: (node start to: node end).
 	cgen pushNil.
 )
@@ -1248,19 +1205,22 @@ public nonLocalReturnNode: node <NonlocalReturnAST> = (
 	^self returnStatNode: node
 )
 public numberNode: node <NumberAST>  = (
+	valueExpected ifFalse: [^self].
 	addDebugInfo: (node start to: node end).
 	cgen pushLiteral: node value.
 )
 public ordinarySendNode: node <NormalSendAST> = (
-	self applyShouldNotPopTo: node receiver.
-	self applyShouldNotPopTo: node message.
+	self applyForValueTo: node receiver.
+	node message arguments do: [:argument | self applyForValueTo: argument].
 	addDebugInfo: (node message start to: node message end).
 	cgen normalSend: node message selector numArgs: node message arguments size.
+	valueExpected ifFalse: [cgen pop].
 )
 public outerSendNode: node <OuterSendAST> = (
-	self applyShouldNotPopTo: node message.
+	node message arguments do: [:argument | self applyForValueTo: argument].
 	addDebugInfo: (node message start to: node message end).
-	cgen outerSend: node message selector numArgs: node message arguments size depth: node depth
+	cgen outerSend: node message selector numArgs: node message arguments size depth: node depth.
+	valueExpected ifFalse: [cgen pop].
 )
 public parameterNode: node <ParameterAST> = (
 	cgen pushTemporary: (indexOfVar: node).
@@ -1302,11 +1262,11 @@ pushScope: s <Scope> = (
 	scopeStack addLast: s
 )
 public receiverNode: node = (
+	valueExpected ifFalse: [^self].
 	addDebugInfo: (node start to: node end).
 	cgen pushSelf.
 )
 public returnStatNode: node <MethodLocalReturnAST | NonLocalReturnAST> = (
-
 	(* if expr is self, true, false or nil do something special *)
 	(node expression isReceiverNode) ifTrue:
 		[(* implicit return selfs at end of method have no source range *)
@@ -1314,21 +1274,25 @@ public returnStatNode: node <MethodLocalReturnAST | NonLocalReturnAST> = (
 			[addDebugInfo: (node start to: node end)].
 		^cgen returnSelfFromMethod].
 
-	self applyShouldNotPopTo: node expression.
+	self applyForValueTo: node expression.
 	addDebugInfo: (node start to: node end).
 	cgen returnFromMethod.
+	
+	(* Simplify depth tracking for branches like x:: y ifTrue: [z] ifFalse: [^w] *)
+	valueExpected ifTrue: [cgen incrementStackDepthBy: 1].
 )
 public selfSendNode: node <SendAST> = (
-	self applyShouldNotPopTo: node message.
+	node message arguments do: [:argument | self applyForValueTo: argument].
 	addDebugInfo: (node message start to: node message end).
-	cgen selfSend: node message selector numArgs: node message arguments size
+	cgen selfSend: node message selector numArgs: node message arguments size.
+	valueExpected ifFalse: [cgen pop].
 )
 setup = (
 	cgen:: CodeGeneratorV4 new.
   	debugInfo: DebugInfo new.
 	contextDepth: 0.
 	
-	shouldPop: true.
+	valueExpected: nil.
 	maxClosureContextSize: 0.
 	scopeStack: List new.
 
@@ -1347,25 +1311,20 @@ storeInto: var <LocalEntry> = (
 				inVector: (indexOfVar: (vectorOf: var))]
 )
 public stringNode: node <StringAST>  = (
+	valueExpected ifFalse: [^self].
 	addDebugInfo: (node start to: node end).
 	cgen pushLiteral: node value.
 )
 public superSendNode: node <SuperSendNode> = (
-	self applyShouldNotPopTo: node message.
+	node message arguments do: [:argument | self applyForValueTo: argument].
 	addDebugInfo: (node message start to: node message end).
 	cgen superSend: node message selector numArgs: node message arguments size.
+	valueExpected ifFalse: [cgen pop].
 )
 public symbolNode: node <SymbolAST>  = (
+	valueExpected ifFalse: [^self].
 	addDebugInfo: (node start to: node end).
 	cgen pushLiteral: node value.
-)
-public temporaryNode: node <TemporaryVariableAST> = (
-	(isRemote: node) 
-		ifFalse: [cgen pushTemporary: (indexOfVar: node)]
-		ifTrue:
-			[cgen
-				pushRemoteTemporary: (indexOfVar: node)
-				inVector: (indexOfVar: (vectorOf: node))].
 )
 vectorOf: v <VarDeclAST> ^<VarDelcAST> = (
 	^(currentScope at: v name asSymbol) remoteVector

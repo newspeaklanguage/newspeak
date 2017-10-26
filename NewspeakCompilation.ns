@@ -159,18 +159,17 @@ public do: n <Integer> timesRepeat: b <BlockAST> = (
 	skope <Scope>
 	loopVarName <Symbol>
 	var <ParameterAST>
+	varEntry <LocalEntry>
 	|
 	skope:: scopeMap at: b.
 
 	(* introduce counter variable *)
 	loopVarName:: '.i' asSymbol.
-	var:: (ParameterAST name: loopVarName type: nil)
-		start: b start; end: b end.	
-	skope
-		at: loopVarName
-		put: (LocalEntry forDeclaration: var atDepth: 0).
+	var:: (ParameterAST name: loopVarName type: nil) copyPositionFrom: b.
+	varEntry:: LocalEntry forDeclaration: var atDepth: nil.
+	skope at: loopVarName put: varEntry.
 	assert: [b parameters isEmpty].
-	b parameters add: var.
+	b parameters add: varEntry.
 
 	(* translate n timesRepeat: [blockBody]
 	into 1 to: n do: [ :.i | blockBody] *)
@@ -192,6 +191,7 @@ public from: first <AST> to: last <AST> by: step <AST> do: block <BlockAST> = (
 	condExpr		<ExpressionAST>
 	condBody		<CodeBodyAST>
 	condStats		<MutableList[StatementAST]>
+	rewrittenBlock
 	incArg			<MutableList[ExpressionAST]>
 	incExpr			<ExpressionAST>
 	incStat			<StatementAST>
@@ -205,6 +205,7 @@ public from: first <AST> to: last <AST> by: step <AST> do: block <BlockAST> = (
 	counterVar:: TemporaryAST name: block parameters removeFirst name type: nil.
 	counterEntry:: LocalEntry forDeclaration: counterVar atDepth: nil.
 	counter:: (LocalReadAST of: counterEntry) start: block start; end: block end.
+	blockScope at: counterEntry name put: counterEntry.
 	
 	(* introduce counter limit variable if needed *)
 	prologue:: emptyBody.
@@ -217,9 +218,18 @@ public from: first <AST> to: last <AST> by: step <AST> do: block <BlockAST> = (
 			 limitVar:: TemporaryAST name: limitName type: nil.
 			 limitVar start: block start; end: block end.
 			 limitEntry:: LocalEntry forDeclaration: limitVar atDepth: nil.
-			 prologue temporaries add: limitVar.
+			 prologue temporaries add: limitEntry.
 			 blockScope at: limitName put: limitEntry.
 			 limit:: (LocalReadAST of: limitEntry) start: block start; end: block end].
+		
+	(* setup prologue *)
+	prologue temporaries add: counterEntry.
+	prologue statements add: (LocalWriteAST to: counterEntry assign: first).
+	(* counter := first *)
+	limitNeeded ifTrue: [
+		(* initialize limit variable - note that this must be done *after* setting up the counter because of possible side effects *)
+		prologue statements add: (LocalWriteAST to: limitEntry assign: last). (* .limit := last *)
+	].
 	
 	(* setup loop condition => introduce condition block for whileTrue: loop *)
 	condSel:: step value < 0 ifTrue: [ #<= ] ifFalse: [ #>= ].
@@ -235,6 +245,11 @@ public from: first <AST> to: last <AST> by: step <AST> do: block <BlockAST> = (
 			start: block start; end: block end.
 	scopeMap at: condBody put: nil.
 
+	(* inlined closure body *)
+	pushScope: blockScope.
+	rewrittenBlock:: rewriteInlinedBlockNode: block forValue: false.
+	popScope.
+
 	(* add counter increment to loop body *)
 	incArg:: List new add: counter ; yourself.
 	incExpr:: OrdinarySendAST to: step send: (MessageAST new send: #+ with: incArg).
@@ -243,21 +258,12 @@ public from: first <AST> to: last <AST> by: step <AST> do: block <BlockAST> = (
 	incStat:: LocalWriteAST to: counterEntry assign: incExpr. 
 	incStat start: block start; end: block end.
 	(* counter := step + counter *)
-	block body statements add: incStat.
-
-	(* setup prologue *)
-	prologue temporaries add: counterVar.
-	prologue statements add: (LocalWriteAST to: counterEntry assign: first).
-	(* counter := first *)
-	limitNeeded ifTrue: [
-		(* initialize limit variable - note that this must be done *after* setting up the counter because of possible side effects *)
-		prologue statements add: (LocalWriteAST to: limitEntry assign: last). (* .limit := last *)
-	].
+	rewrittenBlock body statements add: incStat.	
 	
 	(* initialize loop instance variables *)
 	condition:: condBody.
 	isWhileTrue:: true.
-	body:: block body
+	body:: rewrittenBlock body
 )
 public from: first <AST> to: last <AST> do: block <BlockAST> = (
 	from: first to: last by: (NumberAST new value: 1) do: block
@@ -435,21 +441,24 @@ public characterNode: node <CharacterAST> = (
 public codeBodyNode: node <CodeBodyAST> = (
 	(* Move slot initializers to statements. Simultaneous slots. *)
 	
-	| bodyScope temporaries setterEntry statements result |
+	| bodyScope parameters temporaries setterEntry statements result |
 	bodyScope:: pushScopeForNode: node.
+	
+	parameters:: node parameters collect:
+		[:varDecl <VarDeclAST> | 
+		 checkForReservedWord: varDecl name. 
+		 currentScope at: varDecl name].
 	
 	temporaries:: List new.
 	node temporaries do: 
 		[:varDecl <VarDeclAST> | | t |
-		checkForReservedWord: varDecl name.
-		t:: TemporaryAST name: varDecl name type: varDecl type.
-		t copyPositionFrom: varDecl.
-		temporaries add: t].
+		 checkForReservedWord: varDecl name.
+		 temporaries add: (currentScope at: varDecl name)].
 
 	setterEntry:: LocalEntry forDeclaration: (TemporaryAST name: namer setterTemp type: nil) atDepth: nil.
 	bodyScope at: namer setterTemp put: setterEntry.
 	bodyScope at: (namer setterTemp, ':') asSymbol put: setterEntry.
-	temporaries add: setterEntry ast.
+	temporaries add: setterEntry.
 	
 	statements:: List new.
 	node temporaries do: 
@@ -473,12 +482,12 @@ public codeBodyNode: node <CodeBodyAST> = (
 	
 	setterEntry used ifFalse: 
 		[bodyScope at: namer setterTemp put: nil.
-		bodyScope at: (namer setterTemp, ':') asSymbol put: nil.
-		temporaries remove: setterEntry ast].
+		 bodyScope at: (namer setterTemp, ':') asSymbol put: nil.
+		 temporaries remove: setterEntry].
 
 	popScope.
 	result:: CodeBodyAST new
-		parameters: node parameters
+		parameters: parameters
 		temporaries: temporaries
 		statements: statements.
 	result literalMessages: node literalMessages.
@@ -603,17 +612,17 @@ public messagePatternNode: node <MessagePatternAST> ^<MessagePatternAST> = (
 )
 public methodNode: node <MethodAST> = (
 	(* Need setter temp? Implicit ^self? *)
-	| pattern body accessModifier result |
+	| body accessModifier result |
 	closureDepth:: 0.
-	pattern:: node pattern apply: self.
+	checkForReservedWord: node selector.
+	node body parameters: node pattern parameters. (* Should the parser do this? *)
 	(* We add the implicit ^self before rewritting the body to ensure the last non-return statment is rewritten for effect. *)
 	(node body statements isEmpty or: [node body statements last isReturnStatNode not])
 		ifTrue: [node body statements add:
 					(ReturnStatAST new expression: (VariableAST new name: #self))].
 	body:: self applyForEffectTo: node body.
-	body parameters: pattern parameters.
 	result:: MethodAST new
-		pattern: pattern
+		pattern: node pattern
 		body: body
 		accessModifier: node accessModifier.
 	scopeMap at: result put: (scopeMap at: node).
@@ -735,18 +744,18 @@ processInlineableLoop: node <NormalSendAST> ^<LoopAST> = (
 	
 	sel = #timesRepeat: ifTrue: [^LoopAST new
 		do: (rcvr apply: self)
-		timesRepeat: (rewriteInlinedBlockNode: arg1 forValue: false)].
+		timesRepeat: arg1].
 	
 	sel = #to:do: ifTrue: [^LoopAST new
 		from: (rcvr apply: self)
 		to: (arg1 apply: self)
-		do: (rewriteInlinedBlockNode: arg2 forValue: false)].
+		do: arg2].
 	
 	sel = #to:by:do: ifTrue: [^LoopAST new
 		from: (rcvr apply: self)
 		to: (arg1 apply: self)
 		by: (arg2 apply: self)
-		do: (rewriteInlinedBlockNode: arg3 forValue: false)].
+		do: arg3].
 	
 	assert: [false] message: 'Unknown loop selector'
 )
@@ -870,10 +879,12 @@ rewriteBlockNode: node <BlockAST> forValue: forValue <Boolean> ^ <BlockAST> = (
 	node body start isNumber
 		ifFalse: [node body start: node start. node body end: node end].
 	
+	pushScopeForNode: node.
 	params:: node parameters collect:
 		[:p <VarDeclAST> |
 		checkForReservedWord: p name.
-		p].
+		currentScope at: p name].
+	popScope.
 	rewrittenNode:: BlockAST new body: 
 		(forValue ifTrue: [applyForValueTo: node body] ifFalse: [applyForEffectTo: node body]).
 	rewrittenNode start: node start; end: node end.
@@ -1226,6 +1237,9 @@ public isLocalBinding ^<Boolean> = (
 )
 public name = (
 	^ast name
+)
+public printOn: stream = (
+	stream nextPutAll: 'LocalEntry('; nextPutAll: name; nextPutAll: ')'.
 )
 ) : (
 )

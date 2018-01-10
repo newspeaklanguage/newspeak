@@ -93,7 +93,6 @@ input <ReadStream>
 scopeStack <List[Scope]> = List new.
 literalTable <IdentityMap[Symbol, Integer]>
 rewriter = Rewriter new.
-squeakRewriter = SqueakRewriter new.
 methodCompiler = AST2ByteCodeCompiler new.
 currentDepth <Integer> (* The lexical nesting level of the current class; 
 							top level classes are at level 0 *)
@@ -146,12 +145,8 @@ We don't do this yet.  What we do instead is often suboptimal, but sometimes ins
 	debugInfo <DebugInfo>
 
 	valueExpected <Boolean>
-	scopeStack <List[Scope]>
 
-	(* Possibly these three should be unified as a ContextTracker or something.*)
 	maxClosureContextSize <Integer>
-	offsetStack <List[Integer]> (* see codeBodyNode:  rename localOffsetAllocator? *)
-	contextDepth <Integer> (* The number of outerContexts that need to be traversed to reach the method context.  E.g., 0=method, 1=closure, 2=closure in closure, and so on. Used for debug info. *)
 |) (
 class CodeGenerator = (|
 public code = IntermediateMethod new.
@@ -640,24 +635,22 @@ class DebugInfo = ((* Debugger information. *)|
 	public bciSourceMapping <MutableMap[Integer, Interval]> = Map new.
 	public localVariables <MutableList[LocalVariableDebugInfo]> = List new.
 |) (
-public addInfoForLocal: varInfo <SemanticVarDecl> = (
-
+public addInfoForLocal: var <AllocatedLocal> = (
 	| info |
 	info: LocalVariableDebugInfo new.
-	info name: varInfo name.
-	info zeroOriginOffset: varInfo offset.
-	info	remoteVector: nil.
-	info contextDepth: contextDepth.
+	info name: var original name.
+	info zeroOriginOffset: var offset.
+	info remoteVector: nil.
+	info contextDepth: var closureDepth.
 	^localVariables addLast: info.
 )
-public addInfoForRemote: varInfo <SemanticVarDecl> in: remoteVarInfo <SemanticVarDecl> = (
-
+public addInfoForRemote: varInfo <AllocatedLocal> in: remoteVarInfo <SemanticVarDecl> = (
 	| info |
 	info: LocalVariableDebugInfo new.
-	info name: varInfo name.
-	info zeroOriginOffset: varInfo offset.
-	info	remoteVector: remoteVarInfo name.
-	info contextDepth: contextDepth.
+	info name: varInfo original name.
+	info zeroOriginOffset: varInfo original remoteOffset.
+	info remoteVector: remoteVarInfo original name.
+	info contextDepth: varInfo closureDepth.
 	^localVariables addLast: info.
 )
 public mapBCI: bci <Integer> to: src <interval> = (
@@ -840,25 +833,11 @@ addDebugInfo: node <AST> = (
 	Can't send after generating the bytecode because there may be multiple bytes and mapping the last byte is wrong. *)
 	debugInfo mapBCI: cgen bci to: (node start to: node end).
 )
-addLocalVar: var <VarDeclAST> = (
-	| offset <Integer> localVariableDebugInfo |
+addLocalVar: var <AllocatedLocal> = (
+	var remote ifFalse: 
+		[cgen maxLocals: (cgen maxLocals max: var offset + 1)].
 
-	var isLocalBinding ifFalse: [stop].
-	
-	(indexOfVar: var) isNil ifFalse: [^self]. 
-	(* The setterTemp is declared in each expansion of a setter send, but we only need one. *)
-
-	offset:: nextOffset.
-	
-	(* ('Assigned ', offset printString, ' to ', var name) out. *)
-	(currentScope at: var name) offset: offset.
-	
-	localVariableDebugInfo:: debugInfo addInfoForLocal: (currentScope at: var name).
-
-	#BOGUS. (* Should not include parameters here. *)
-	cgen maxLocals: (cgen maxLocals max: offset+1).
-	
-	^localVariableDebugInfo
+	^debugInfo addInfoForLocal: var
 )
 applyForEffectTo: node <Node> = (
 	| original startDepth result |
@@ -947,59 +926,50 @@ public characterNode: node <CharacterAST> = (
 cleanup = (
 	cgen: nil.
   	debugInfo: nil.
-	contextDepth: nil.
 	
 	valueExpected: nil.
 	maxClosureContextSize: nil.
-	scopeStack: nil.
-
-	offsetStack: nil.
 )
 public closureNode: node <ClosureAST> = (
 	| blockPos <Integer> savedStackDepth <Integer> savedStackMax <Integer> |
 	
 	valueExpected ifFalse: [^self].
 
-	node copiedValues do: [:each | self applyForValueTo: each].
+	node copiedOuter size = node copiedInner size ifFalse: [error].
+	node copiedOuter do:
+		[:each | cgen pushTemporary: each offset].
 
 	cgen
 		createClosureOfArity: node parameters size
-		copying: node copiedValues size
+		copying: node copiedOuter size
 		length: 0 (* needs patching *).
-
-	(* do this after pushing copied values! *)
-	pushOffsetCounter. contextDepth: contextDepth + 1.
 
 	blockPos: cgen bci.
 	savedStackDepth:: cgen currentStackDepth.	
 	savedStackMax:: cgen maxStackDepth.
 	cgen maxStackDepth: 0.
 
+	(* node copiedInner do: [:var | addLocalVar: var]. --- todo for debugger *)
 	(node pushNilCount) timesRepeat: [cgen pushNil]. 
 	(* These nils establish the temp frame for temps other than params and copied values. They contribute to the operand stack size, obviating the need to directly include the number of local variables in the context size *)
 	self applyForEffectTo: node body.
 	
 	maxClosureContextSize:: 
-		maxClosureContextSize max: (node parameters size + node copiedValues size + cgen maxStackDepth).
+		maxClosureContextSize max: (node parameters size + node copiedOuter size + cgen maxStackDepth).
 	cgen currentStackDepth: savedStackDepth.
 	cgen maxStackDepth: savedStackMax.
 	
 	cgen patchClosureJumpAt: blockPos with: cgen bci - blockPos. (* patch jump over block body *)
-
-	popOffsetCounter. contextDepth: contextDepth - 1.
 )
 public codeBodyNode: node <CodeBodyAST> = (
 	(* This could be a method body, a closure body, part of an inlined block, or a setter send.  Each method body and closure body needs to have separate indexing for temps because their activations will be separate MethodContexts.  Inlined blocks and setter sends should continue to use the same indexing as their enclosing method or closure.  To accomplish this, we use a stack of counters. *)
 
 	|
-	scope = scopeMap at: node ifAbsent: [nil].
 	statements
 	localVariableDebugInfos
 	startBCI
 	validBCIRange
 	|
-
-	nil = scope ifFalse: [pushScope: scope].
 	
 	localVariableDebugInfos:: List new.
 	startBCI:: cgen bci.
@@ -1009,14 +979,12 @@ public codeBodyNode: node <CodeBodyAST> = (
 		
 	(* Copied values are included at the beginning of temporaries thanks to the Rewriter. *)
 	node temporaries do: 
-		[:temp | | varInfo <SemanticVarDecl> remoteVarInfo <SemanticVarDecl> |
-		varInfo:: currentScope at: temp name.
-		varInfo remote 
+		[:temp |
+		temp remote 
 			ifFalse: [localVariableDebugInfos add: (addLocalVar: temp)]
 			ifTrue:
-				[remoteVarInfo:: currentScope at: varInfo remoteVector name.
-				localVariableDebugInfos add:
-					(debugInfo addInfoForRemote: varInfo in: remoteVarInfo)]].
+				[localVariableDebugInfos add:
+					(debugInfo addInfoForRemote: temp in: temp remoteVector)]].
 
 	statements:: node statements.
 	1 to: statements size do: 
@@ -1027,8 +995,7 @@ public codeBodyNode: node <CodeBodyAST> = (
 	
 	validBCIRange:: startBCI to: cgen bci - 1.
 	localVariableDebugInfos do: [:each | each validBCIRange: validBCIRange].
-	
-	nil = scope ifFalse: [popScope].
+
 	^localVariableDebugInfos
 )
 public conditionalNode: node <IfAST> = (
@@ -1057,9 +1024,6 @@ public conditionalNode: node <IfAST> = (
 		
 	cgen patchJumpIfAt: ifPos with: endThen - ifPos.
 )
-currentScope ^ <Scope> = (
-	^scopeStack last
-)
 public enclosingObjectNode: node <EnclosingObjectAST> = (
 	valueExpected ifFalse: [^self].
 	addDebugInfo: node.
@@ -1075,12 +1039,6 @@ public implicitReceiverSendNode: node <ImplicitReceiverSendAST> = (
 	cgen implicitReceiverSend: node message selector numArgs: node message arguments size.
 	valueExpected ifFalse: [cgen pop].
 )
-indexOfVar: v <VarDeclAST> ^ <Integer> = (
-	^(currentScope at: v name asSymbol) offset
-)
-isRemote: node ^ <Boolean> = (
-	^(currentScope at: node name asSymbol) remote
-)
 literalArray ^<Array[Character | Number | String | Symbol]> = (
 	| literals <Array[Character | Number | String | Symbol]> |
 	literals:: Array new: literalTable size.
@@ -1088,15 +1046,15 @@ literalArray ^<Array[Character | Number | String | Symbol]> = (
 	^literals
 )
 public localReadNode: node <LocalReadAST> = (
-	| var <LocalEntry> = node variable. |
+	| var <AllocatedLocal> = node variable. |
 	valueExpected ifFalse: [^self].
 	addDebugInfo: node.
-	(isRemote: var) 
-		ifFalse: [cgen pushTemporary: (indexOfVar: var)]
+	var remote
+		ifFalse: [cgen pushTemporary: var offset]
 		ifTrue:
 			[cgen
-				pushRemoteTemporary: (indexOfVar: var)
-				inVector: (indexOfVar: (vectorOf: var))].
+				pushRemoteTemporary: var original remoteOffset
+				inVector: var remoteVector offset].
 )
 public localWriteNode: node <LocalWriteAST> = (
 	self applyForValueTo: node value.
@@ -1112,12 +1070,8 @@ public loopNode: node <LoopAST> = (
 	|
 	topOfLoop <Integer>
 	whilePos <Integer>
-	conditionScope <Scope>
 	localVariableDebugInfos = List new.
 	|
-
-	nil = node body ifFalse:
-		[pushScope:: scopeMap at: node body].
 
 	nil = node prologue ifFalse: 
 		[localVariableDebugInfos addAll: (self applyForEffectTo: node prologue)].
@@ -1130,8 +1084,7 @@ public loopNode: node <LoopAST> = (
 	whilePos:: cgen bci. (* remember patch address *)
 
 	nil = node body ifFalse:
-		[self applyForEffectTo: node body.
-		 popScope].
+		[self applyForEffectTo: node body].
 	
 	cgen jumpBy: topOfLoop - cgen bci - (cgen sizeOfBackJump). (* jump to top of loop *)
 	
@@ -1149,7 +1102,6 @@ public methodNode: node <MethodAST> = (
 	(* Create a compiled method, whose body is the result of compiling the node's body. *)
 	| result <IntermediateMethod> |
 	setup.
-	pushOffsetCounter.
 	
 	cgen
 		maxLocals: 0;
@@ -1162,7 +1114,6 @@ public methodNode: node <MethodAST> = (
 	cgen code debugInfo: debugInfo. (* set debug info *)
 	processLiteralMessagesOf: node.
 	
-	popOffsetCounter.
 	result:: cgen close.
 	cleanup.
 	^result
@@ -1170,12 +1121,6 @@ public methodNode: node <MethodAST> = (
 public mixinClassNode: node  = (
 	valueExpected ifFalse: [^self].
 	cgen pushMixinClass.
-)
-nextOffset = (
-	|  next |
-	next:: offsetStack removeLast.
-	offsetStack addLast: next + 1.
-	^next
 )
 public nilNode: node = (
 	valueExpected ifFalse: [^self].
@@ -1203,19 +1148,13 @@ public outerSendNode: node <OuterSendAST> = (
 	cgen outerSend: node message selector numArgs: node message arguments size depth: node depth.
 	valueExpected ifFalse: [cgen pop].
 )
-popAndStoreInto: var <LocalEntry> = (
-	(isRemote: var)
-		ifFalse: [cgen popIntoTemporary: (indexOfVar: var)]
+popAndStoreInto: var <AllocatedLocal> = (
+	var remote
+		ifFalse: [cgen popIntoTemporary: var offset]
 		ifTrue:
 			[cgen
-				popIntoRemoteTemporary: (indexOfVar: var)
-				inVector: (indexOfVar: (vectorOf: var))]
-)
-popOffsetCounter = (
-	offsetStack removeLast.
-)
-popScope ^ <Scope> = (
-  ^scopeStack removeLast
+				popIntoRemoteTemporary: var original remoteOffset
+				inVector: var remoteVector offset]
 )
 processLiteralMessagesOf: node <MethodAST> = (
 
@@ -1232,12 +1171,6 @@ processLiteralMessagesOf: node <MethodAST> = (
 					arguments: (messageAST arguments collect: [:symbolAST | symbolAST value]) asArray)]]].
 
 	cgen code pragmas: pragmas.
-)
-pushOffsetCounter = (
-	offsetStack addLast: 0.
-)
-pushScope: s <Scope> = (
-	scopeStack addLast: s
 )
 public receiverNode: node = (
 	valueExpected ifFalse: [^self].
@@ -1268,22 +1201,17 @@ public selfSendNode: node <SendAST> = (
 setup = (
 	cgen:: CodeGeneratorV4 new.
   	debugInfo: DebugInfo new.
-	contextDepth: 0.
 	
 	valueExpected: nil.
 	maxClosureContextSize: 0.
-	scopeStack: List new.
-
-	offsetStack: List new.
-	contextDepth: 0.
 )
-storeInto: var <LocalEntry> = (
-	(isRemote: var)
-		ifFalse: [cgen storeIntoTemporary: (indexOfVar: var)]
+storeInto: var <AllocatedLocal> = (
+	var remote
+		ifFalse: [cgen storeIntoTemporary: var offset]
 		ifTrue:
 			[cgen
-				storeIntoRemoteTemporary: (indexOfVar: var)
-				inVector: (indexOfVar: (vectorOf: var))]
+				storeIntoRemoteTemporary: var original remoteOffset
+				inVector: var remoteVector offset]
 )
 public stringNode: node <StringAST>  = (
 	valueExpected ifFalse: [^self].
@@ -1300,9 +1228,6 @@ public symbolNode: node <SymbolAST>  = (
 	valueExpected ifFalse: [^self].
 	addDebugInfo: node.
 	cgen pushLiteral: node value.
-)
-vectorOf: v <VarDeclAST> ^<VarDelcAST> = (
-	^(currentScope at: v name asSymbol) remoteVector
 )
 ) : (
 )
@@ -1400,8 +1325,19 @@ public symbolNode: node <SymbolAST> = (
 	(* Leaf *)
 )
 public tupleNode: node <TupleAST> = (
-	node elements do: [:each | each apply: self]
+	node elements do: [:element | element apply: self]
 )
+) : (
+)
+class AllocatedLocal = (
+|
+	public remote <Boolean>
+	public offset <Integer>
+	public remoteVector <AllocatedLocal>
+	public closureDepth <Integer>
+	public original <LocalEntry>
+|
+) (
 ) : (
 )
 class ArrayAST = AST ((* To use pushFullArray/pushEmptyArray *)|
@@ -1413,8 +1349,412 @@ public apply: tool <ASTTool[T]> ^<T> = (
 )
 ) : (
 )
+class ClosureRewriter1 = ASTTraverser (
+(* Phase 1 of closure rewrite.
+
+Determines which local variables need to be made indirect/remote:
+ - a variable written by a closure nested in its defining scope, OR
+ - a variable written in its defining scope after being read in a nested closure
+(- and is not an inlined induction variable; must behave as if each iteration has its own copy)
+
+Determines which local variables are copied into each closure:
+ - non-indirect free variables
+ - the indirection vector of indirect free variables
+
+Adds literals and selectors to the literal table.
+Adds indirection vectors to code bodies. *)
+|
+	closureDepth
+	captured ::= List new.
+	
+	capturedMap = Map new.
+|
+) (
+addLiteral: value <Character | Number | String | Symbol> = (
+	literalTable at: value ifAbsentPut: [literalTable size].
+)
+addRemoteVectorForCodeBodyNode: node <CodeBodyAST> = (
+	|
+	indirectionCount
+	indirectionVectorAST
+	indirectionVectorEntry
+	rewrittenParameters
+	rewrittenTemporaries
+	rewrittenStatements
+	remoteOffset
+	|
+	
+	indirectionCount:: 0.
+	node parameters do: 
+		[:parameter | parameter remote ifTrue: [error]].
+	node temporaries do: 
+		[:temporary | temporary remote ifTrue: [indirectionCount:: indirectionCount + 1]].
+	
+	0 = indirectionCount ifFalse: 
+		[indirectionVectorAST:: rewriter TemporaryAST
+			name: #'@indirectionVector'
+			type: nil.
+		 indirectionVectorEntry:: LocalEntry
+			forDeclaration: indirectionVectorAST
+			atDepth: nil.
+		 indirectionVectorEntry closureDepth: closureDepth.
+		 indirectionVectorEntry remote: false.
+		 node temporaries addFirst: indirectionVectorEntry.
+		 node statements addFirst: (rewriter LocalWriteAST
+			to: indirectionVectorEntry
+			assign: (ArrayAST new size: indirectionCount))].
+		
+	remoteOffset:: 0.
+	node temporaries do: 
+		[:temporary | 
+		 temporary remote ifTrue: 
+			[temporary remoteVector2: indirectionVectorEntry.
+			 temporary remoteOffset: remoteOffset.
+			 remoteOffset:: remoteOffset + 1]].
+)
+public blockNode: node <BlockAST> = (
+	| parentCaptured |
+	closureDepth:: closureDepth + 1.
+	parentCaptured:: captured.
+	captured:: List new.
+	
+	node body apply: self.
+	capturedMap at: node put: captured.
+	
+	closureDepth:: closureDepth - 1.
+	captured do: [:each | each closureDepth < closureDepth ifTrue: [parentCaptured add: each]].
+	captured:: parentCaptured.	
+)
+public cascadedSendNode: node <CascadedSendAST> = (
+	| selector = node message selector. |
+	(specialSelectors includes: selector)
+		ifFalse: [addLiteral: selector].
+	^super cascadedSendNode: node
+)
+public characterNode: node <CharacterAST> = (
+	addLiteral: node value.
+	^node
+)
+public codeBodyNode: node <CodeBodyAST> = (	
+	node parameters do:
+		[:parameter | 
+		 parameter closureDepth: closureDepth.
+		 parameter remote: false].
+	node temporaries do:
+		[:temporary | 
+		 temporary closureDepth: closureDepth.
+		 temporary remote: false].
+		
+	node statements do: [:statement | statement apply: self].
+	
+	addRemoteVectorForCodeBodyNode: node.
+)
+public globalNode: node <GlobalAST> = (
+	addLiteral: node association.
+	^node
+)
+public implicitReceiverSendNode: node <ImplicitReceiverSendAST> = (
+	addLiteral: node message selector.
+	^super implicitReceiverSendNode: node
+)
+public localReadNode: node <LocalReadAST> = (
+	| var = node variable. |
+	closureDepth > var closureDepth ifTrue: 
+		[var captured: true.
+		 captured add: var].
+)
+public localWriteNode: node <WriteReadAST> = (
+	| var = node variable. |
+	node value apply: self.
+
+	(* Nested write or write after nested read *)
+	closureDepth > var closureDepth
+		ifTrue: 
+			[var captured: true; remote: true.
+			 var induction ifTrue: [error].
+			 captured add: var]
+		ifFalse:
+			[var captured ifTrue: [var induction ifFalse: [var remote: true]]].
+)
+public loopNode: node <LoopAST> = (
+	super loopNode: node.
+
+	(* Work around bad scoping of induction variables. *)
+	nil = node prologue ifFalse:
+		[addRemoteVectorForCodeBodyNode: node prologue].
+)
+public methodNode: node <MethodAST> = (
+	| pattern body result |
+	literalTable:: Map new.
+	closureDepth:: 0.
+	
+	node body apply: self.
+	
+	^capturedMap
+)
+public numberNode: node <NumberAST> = (
+	| value = node value. |
+	(value isInteger and: [value between: -32768 and: 32767]) 
+		ifFalse: [addLiteral: node value].
+	^node
+)
+public ordinarySendNode: node <OrdinarySendAST> = (
+	| selector = node message selector. |
+	(specialSelectors includes: selector)
+		ifFalse: [addLiteral: selector].
+	^super ordinarySendNode: node
+)
+public outerSendNode: node <OuterSendAST> = (
+	addLiteral: node message selector.
+	^super outerSendNode: node
+)
+public selfSendNode: node <SelfSendAST> = (
+	addLiteral: node message selector.
+	^super selfSendNode: node.
+)
+public stringNode: node <StringAST> = (
+	(* Note we treat it as a symbol. *)
+	addLiteral: node value asSymbol.
+	^node
+)
+public superSendNode: node <SuperSendAST> = (
+	addLiteral: node message selector.
+	^super superSendNode: node
+)
+public symbolNode: node <SymbolAST> = (
+	addLiteral: node value.
+	^node
+)
+) : (
+)
+class ClosureRewriter2 with: cm = (
+(* Phase 2 of closure rewrite. 
+
+Adds copied versions of captured variables.
+Assigns locals to context/activation slots. *)
+|
+	capturedSets <Map[BlockAST, List[LocalEntry]]> = cm.
+
+	closureDepth ::= 0.
+	remapping ::= Map new.
+	
+	nextOffset ::= 0.
+|
+) (
+allocateLocal: var <LocalEntry> = (
+	(*var name = 'failureBlock' ifTrue: [closureDepth > 1 ifTrue: [stop]].*)
+	^remapping at: var ifAbsentPut: 
+		[ | allocated = AllocatedLocal new. |
+		 allocated closureDepth: closureDepth.
+		 allocated remote: var remote.
+		 var remote
+			ifTrue:
+				[allocated remoteVector: (remapping at: var remoteVector2)]
+			ifFalse: 
+				[allocated offset: nextOffset.
+				 nextOffset: nextOffset + 1].
+		 allocated original: var.
+		 allocated].
+)
+public arrayNode: node <ArrayAST> = (
+	(* Only remote vector initialization (empty array) should appear here. *)
+	node elements = nil ifFalse: [error].
+
+	^ArrayAST new 
+		size: node size 
+)
+public blockLocalReturnNode: node <BlockLocalReturnAST> = (
+	^(rewriter BlockLocalReturnAST expression: (node expression apply: self))
+		copyPositionFrom: node
+)
+public blockNode: node <BlockAST> = (
+	|
+	copied = List new.
+	copiedOuter = List new.
+	copiedInner = List new.
+	parentRemapping
+	parentNextOffset
+	lastImplicitOffset
+	rewrittenBody
+	result
+	|
+	closureDepth:: closureDepth + 1.
+	parentNextOffset:: nextOffset.
+	nextOffset:: 0.
+	parentRemapping:: remapping.
+	remapping:: Map new.
+	
+	(* 1. Parameters *)
+	node parameters do: [:parameter | allocateLocal: parameter].
+	
+	(* 2. Copy downs *)
+	(capturedSets at: node) do: 
+		[:captured | 
+		 captured remote 
+			ifTrue: [copied include: captured remoteVector2]
+			ifFalse: [copied include: captured]].
+	copied do: 
+		[:copiedVar |
+		 copiedOuter add: (parentRemapping at: copiedVar).
+		 copiedInner add: (allocateLocal: copiedVar)].
+	
+	lastImplicitOffset:: nextOffset.
+	
+	(* 3. Indirected *)
+	(capturedSets at: node) do: 
+		[:captured | captured remote ifTrue: [allocateLocal: captured]].
+	
+	rewrittenBody:: node body apply: self.
+	
+	result:: CogClosureAST new
+		body: rewrittenBody;
+		copiedOuter: copiedOuter;
+		copiedInner: copiedInner;
+		pushNilCount: nextOffset - lastImplicitOffset;
+		copyPositionFrom: node.
+		
+	remapping:: parentRemapping.
+	nextOffset:: parentNextOffset.
+	closureDepth:: closureDepth - 1.
+	
+	^result
+)
+public boolNode: node <BooleanAST> = (
+	^node
+)
+public cascadedSendNode: node <CascadedSendAST> = (
+	^(CascadedSendAST new
+		to: (node previousSend apply: self)
+		cascade: (node message apply: self))
+		copyPositionFrom: node
+)
+public characterNode: node <CharacterAST> = (
+	^node
+)
+public codeBodyNode: node <CodeBodyAST> = (	
+	^CodeBodyAST new
+            parameters: (node parameters collect:  [:parameter | allocateLocal: parameter])
+            temporaries: (node temporaries collect: [:temporary | allocateLocal: temporary])
+            statements: (node statements collect: [:statement | statement apply: self]);
+		literalMessages: node literalMessages;
+            copyPositionFrom: node
+)
+public conditionalNode: node <ConditionalAST> = (
+	^(rewriter ConditionalAST
+		if: (node condition apply: self)
+		is: node ifTrue
+		then: (nullableCodeBodyNode: node then)
+		else: (nullableCodeBodyNode: node else))
+		copyPositionFrom: node
+)
+public enclosingObjectNode: node <EnclosingObjectAST> = (
+	^node
+)
+public globalNode: node <GlobalAST> = (
+	^node
+)
+public implicitReceiverSendNode: node <ImplicitReceiverSendAST> = (
+	^(rewriter ImplicitReceiverSendAST new
+		message: (node message apply: self);
+		depth: node depth)
+		copyPositionFrom: node
+)
+public localReadNode: node <LocalReadAST> = (
+	^(rewriter LocalReadAST
+		of: (remapping at: node variable))
+		copyPositionFrom: node
+)
+public localWriteNode: node <LocalWriteAST> = (
+	^(rewriter LocalWriteAST
+		to: (remapping at: node variable)
+		assign: (node value apply: self))
+		copyPositionFrom: node
+)
+public loopNode: node <LoopAST> = (
+	^rewriter LoopAST new
+		prologue: (nullableCodeBodyNode: node prologue);
+		condition: (nullableCodeBodyNode: node condition);
+		isWhileTrue: node isWhileTrue;
+		body: (nullableCodeBodyNode: node body)
+)
+public messageNode: node <MessageAST> = (
+	^(MessageAST new
+		send: node selector
+		with: (node arguments collect: [:argument | argument apply: self]))
+		copyPositionFrom: node
+)
+public methodLocalReturnNode: node <MethodLocalReturnAST> = (
+	^(rewriter MethodLocalReturnAST expression: (node expression apply: self))
+		copyPositionFrom: node
+)
+public methodNode: node <MethodAST> = (
+	| body result |
+	
+	body:: node body apply: self.
+	^(MethodAST new 
+		pattern: node pattern
+		body: body
+		accessModifier: node accessModifier)
+		copyPositionFrom: node
+)
+public mixinClassNode: node <MixinClassNode> = (
+	^node
+)
+public nilNode: node <NilAST> = (
+	^node
+)
+public nonLocalReturnNode: node <NonlocalReturnAST> = (
+	^(rewriter NonlocalReturnAST expression: (node expression apply: self))
+		copyPositionFrom: node
+)
+nullableCodeBodyNode: node = (
+	nil = node ifTrue: [^nil].
+	^codeBodyNode: node
+)
+public numberNode: node <NumberAST> = (
+	^node
+)
+public ordinarySendNode: node <OrdinarySendAST> = (
+	^(rewriter OrdinarySendAST
+		to: (node receiver apply: self)
+		send: (node message apply: self))
+		copyPositionFrom: node
+)
+public outerSendNode: node <OuterSendAST> = (
+	^(rewriter OuterSendAST new
+		message: (node message apply: self);
+		depth: node depth)
+		copyPositionFrom: node
+)
+public receiverNode: node <ReceiverAST> = (
+	^node
+)
+public selfSendNode: node <SelfSendAST> = (
+	^(rewriter SelfSendAST new
+		message: (node message apply: self))
+		copyPositionFrom: node
+)
+public stringNode: node <StringAST> = (
+	^node
+)
+public superSendNode: node <SuperSendAST> = (
+	^(rewriter SuperSendAST new
+		message: (node message apply: self))
+		copyPositionFrom: node
+)
+public symbolNode: node <SymbolAST> = (
+	^node
+)
+public tupleNode: node <TupleAST> = (
+	^ArrayAST new 
+		elements: (node elements collect: [:element | element apply: self]);
+		size: node elements size 
+)
+) : (
+)
 class CogClosureAST = BlockAST (|
-	public copiedValues <{AST}>
+	public copiedInner <List[LocalEntry]>
+	public copiedOuter <List[LocalEntry]>
 	public pushNilCount <Integer>
 |) (
 public apply: tool <ASTTool[T]> ^<T> = (
@@ -1525,395 +1865,6 @@ public tupleNode: node <TupleAST> = (
 	(* We can only use pushConsArray for tuples small enough to fit all elements on the operand stack. The optimial limit is the large frame size minus the current stack depth. We don't track the current depth here, so an arbitrary conservative limit is used. *) 
 	node elements size > 7 ifTrue: [^self largeTupleNode: node].
 	^super tupleNode: node
-)
-) : (
-)
-class SqueakRewriter = ((* Closure indirection, literal tables, ?long tuples. *)|
-	scopeStack = List new.
-|) (
-class CopyDownAnalyzer for: node <CodeBodyAST> = ASTTraverser ((* A closure needs to copy variables that are read but defined in the outer scope.  At the point of this anaylsis, indirection has already been added so there should be no reads to an order context and (if this block is nested) outer closures have already copied what they need, so outer reads should only be one level out. *)|
-	depth ::= 0.
-	shadowing = Map new.
-	public needsToCopy = Set new.
-	public pushNilCount ::= 0.
-	|node apply: self) (
-public blockNode: node <BlockAST> = (
-	depth:: depth + 1.
-	super blockNode: node.
-	depth:: depth - 1.
-)
-public codeBodyNode: node <CodeBodyNode> = (
-	node parameters do: [:each | self shadow: each name].
-	node temporaries do: [:each | self shadow: each name].
-	
-	depth = 0 ifTrue: [pushNilCount: pushNilCount + node temporaries size].
-
-	node statements
-		do: [:each | each apply: self].
-)
-isShadowed: var <Symbol> ^<Boolean> = (
-	^(shadowing at: var ifAbsent: [^false]) <= depth
-)
-public localReadNode: node <LocalReadAST> = (
-	variableRead: node variable
-)
-public localWriteNode: node <LocalWriteAST> = (
-	node value apply: self. (* This happens first! *)
-	variableWrite: node variable
-)
-shadow: var <Symbol> = (
-	(* ('shadowing ' , var , ' at ', depth printString) out. *)
-	shadowing at: var put: depth.
-)
-variableRead: var <SlotEntry> = (
-	(isShadowed: var name) ifTrue: [^self].
-	var remote ifTrue: [^variableRead: var remoteVector].
-	(* ('need to copy ', var name, ' for read at ', depth printString) out. *)
-	needsToCopy add: var name.
-)
-variableWrite: var = (
-	(isShadowed: var name) ifTrue: [^self].
-	var remote ifTrue: [^variableRead: var remoteVector].
-	assert: [false] message: var name, ' should have been made indirect'.
-	needsToCopy add: var name.
-)
-) : (
-)
-class IndirectionAnalyzer for: node <CodeBodyAST> = ASTTraverser (|
-	depth ::= 0.	
-	candidates = Set new.
-	public needsIndirection = Set new.
-	hasNestedRead = Set new.
-
-	|node apply: self) (
-public blockNode: node <BlockAST> = (
-	depth:: depth + 1.
-	super blockNode: node.
-	depth:: depth - 1.
-)
-public codeBodyNode: node <CodeBodyNode> = (	
-	depth = 0 ifTrue:
-		[ | scope = scopeMap at: node. |
-		scope isNil ifFalse: [
-		(* Parameters are immutable, so they never need indirection. *)
-		node temporaries do: [:temp | candidates add: (scope at: temp name)]]].
-	
-	node statements
-		do: [:each | each apply: self].
-)
-public localReadNode: node <LocalReadAST> = (
-	self variableRead: node variable
-)
-public localWriteNode: node <LocalWriteAST> = (
-	node value apply: self. (* This happens first! *)
-	self variableWrite: node variable
-)
-variableRead: var <SlotEntry> = (
-	(candidates includes: var) ifFalse: [^self].
-	
-	depth > 0 ifTrue: [hasNestedRead add: var].
-)
-variableWrite: var <SlotEntry> = (
-	(candidates includes: var) ifFalse: [^self].
-	
-	(* Depth 0 being the code body that declaring the variables we're considering. *)
-	depth > 0 ifTrue: [ 
-		(* this is a nested write, must indirect *)
-		needsIndirection add: var.
-		(* ('nested write of ', var) out. *)
-	] ifFalse: [
-		(hasNestedRead includes: var) ifTrue: [ 
-			(* write after nested read, must indirect *)
-			(* ('read after write of ', var) out. *)
-			needsIndirection add: var.
-		].
-	].
-)
-) : (
-)
-addLiteral: value <Character | Number | String | Symbol> = (
-	literalTable at: value ifAbsentPut: [literalTable size].
-)
-public blockLocalReturnNode: node <BlockLocalReturnAST> = (
-	^(rewriter BlockLocalReturnAST expression: (node expression apply: self))
-		copyPositionFrom: node
-)
-public blockNode: node <BlockAST> ^ <ClosureAST> = (
-(* This method should only be called on a block that is not going to be inlined.
-
-There are two things that require rewriting in blocks.
-
-1. a.  Non-empty blocks must have their body rewritten recursively
-    b. Empty blocks need a nil expression in them.
-    c. All blocks must have their parameters rewritten from generic VarDecls to ParameterASTs. 
-2. If the last statement in a block is not a return, the block returns
-the expression to its caller. So the last expression needs to be replaced by a 'local return'.
-
-We accomplish (1) by calling rewriteInlinedBlockNode:, and then do  (2) explicitly.
-
-The reason for this separation is that step (1) is always needed; step (2) is only needed if the block is not inlined.
-*)
-	|
-	result <CogClosureAST>
-	needsCopy <NeedsCopyFinder>
-	copiedVarNames <List[Symbol]>
-	copiedValues <List[TemporaryVariableAST]>
-	setterTempNeeded <Boolean>
-	|
-	copiedVarNames: List new.
-	needsCopy:: (CopyDownAnalyzer for: node body).
-	needsCopy needsToCopy do: [:var <Symbol> |
-			| varEntry |
-			(* (var , ' will be copied') out. *)
-			copiedVarNames addFirst: var.
-			varEntry:: LocalEntry
-				forDeclaration: (rewriter TemporaryAST name: var type: nil)
-				atDepth: nil.
-			node body temporaries addFirst: varEntry.
-			(scopeMap at: node) at: var put: varEntry].
-		
-	copiedValues:: copiedVarNames collect: [:var <Symbol> |
-		rewriter LocalReadAST of: (currentScope at: var)].
-	
-	pushScopeForNode: node.
-	result:: CogClosureAST new
-		body: (node body apply: self).
-	result body parameters: (List withAll: node parameters).
-	result copiedValues: copiedValues.
-	result pushNilCount: needsCopy pushNilCount.
-	popScope.
-	scopeMap at: result put: (scopeMap at: node).
-	^result copyPositionFrom: node
-)
-public boolNode: node <BooleanAST> = (
-	(* No need to add literal: true and false are quick literals in both bytecode sets. *)
-	^node
-)
-public cascadedSendNode: node <CascadedSendAST> = (
-	| selector = node message selector. |
-	(specialSelectors includes: selector)
-		ifFalse: [addLiteral: selector].
-	^(CascadedSendAST new
-		to: (node previousSend apply: self)
-		cascade: (node message apply: self))
-		copyPositionFrom: node
-)
-public characterNode: node <CharacterAST> = (
-	addLiteral: node value.
-	^node
-)
-public codeBodyNode: node <CodeBodyAST> ^ <CodeBodyAST> = (
-	| 
-	bodyScope <Scope>
-	statements <List[StatementAST]>
-	temps <List[TemporaryAST]> 
-	result <CodeBodyAST>
-	itv <TemporaryAST>
-	itvEntry <SlotEntry>
-	i <Integer>
-	finder <NeedsIndirectionFinder>
-	|
-	pushScopeForNode: node. 
-	bodyScope:: scopeMap at: node.
-	
-	temps:: List withAll: node temporaries.
-
-	statements:: List new.
- 	finder:: IndirectionAnalyzer for: node.
-	finder needsIndirection isEmpty ifFalse: [
-		(* introduce an indirect temp vector aka remote vector *)
-		itv:: rewriter TemporaryAST
-			name: ('@indirectionVector',scopeStack size printString) asSymbol
-			type: nil.
-		itvEntry:: LocalEntry forDeclaration: itv atDepth: currentDepth.
-		bodyScope
-			at: itv name put: itvEntry; (* getter *)
-			at: (itv name,':') asSymbol put: itvEntry. (* setter *)
-		temps addLast: itvEntry. (* N.B. addLAST, copied values must be at beginning *)
-		
-		(* initialize itv in the very first statement *)
-		statements add: (rewriter LocalWriteAST
-			to: itvEntry
-			assign: (ArrayAST new size: finder needsIndirection size)).
-	].
-
-	i:: 0.
-	finder needsIndirection do: [:tempEntry <SlotEntry> |
-		assert: [tempEntry remote not].
-		tempEntry
-			remote: true;
-			remoteVector: itvEntry;
-			offset: i.
-		i:: i+1.
-	].
-
-	(* add actual statements in code body *)
-	node statements
-		do: [:stat | statements add: (stat apply: self)].
-
-	result:: CodeBodyAST new
-            parameters: node parameters
-            temporaries: temps
-            statements: statements;
-		literalMessages: node literalMessages;
-            start: node start; end: node end.
-	popScope.
-	scopeMap at: result put: bodyScope.
-	^result copyPositionFrom: node
-)
-public conditionalNode: node <ConditionalAST> = (
-	^(rewriter ConditionalAST
-		if: (node condition apply: self)
-		is: node ifTrue
-		then: (inlinedCodeBodyNode: node then)
-		else: (inlinedCodeBodyNode: node else))
-		copyPositionFrom: node
-)
-currentScope ^ <Scope> = (
-	^scopeStack last
-)
-public enclosingObjectNode: node <EnclosingObjectAST> = (
-	^node
-)
-public globalNode: node <GlobalAST> = (
-	addLiteral: node association.
-	^node
-)
-public implicitReceiverSendNode: node <ImplicitReceiverSendAST> = (
-	addLiteral: node message selector.
-	^(rewriter ImplicitReceiverSendAST new
-		message: (node message apply: self);
-		depth: node depth)
-		copyPositionFrom: node
-)
-public inlinedCodeBodyNode: node <CodeBodyAST> ^ <CodeBodyAST> = (
-	| 
-	bodyScope <Scope>
-	result <CodeBodyAST>
-	|
-	nil = node ifTrue: [^nil].
-
-	pushScopeForNode: node. 
-	bodyScope:: scopeMap at: node.
-	
-	result:: CodeBodyAST new
-            parameters: node parameters
-            temporaries: node temporaries
-            statements: (node statements collect: [:stat | stat apply: self]);
-		literalMessages: node literalMessages;
-            start: node start; end: node end.
-	popScope.
-	scopeMap at: result put: bodyScope.
-	^result copyPositionFrom: node
-)
-public localReadNode: node <LocalReadAST> = (
-	^node
-)
-public localWriteNode: node <LocalWriteAST> = (
-	^(rewriter LocalWriteAST
-		to: node variable
-		assign: (node value apply: self))
-		copyPositionFrom: node
-)
-public loopNode: node <LoopAST> = (
-	^rewriter LoopAST new
-		prologue: (inlinedCodeBodyNode: node prologue);
-		condition: (inlinedCodeBodyNode: node condition);
-		isWhileTrue: node isWhileTrue;
-		body: (inlinedCodeBodyNode: node body)
-)
-public messageNode: node <MessageAST> = (
-	^(MessageAST new
-		send: node selector
-		with: (node arguments collect: [:ea | ea apply: self]))
-		copyPositionFrom: node
-)
-public methodLocalReturnNode: node <MethodLocalReturnAST> = (
-	^(rewriter MethodLocalReturnAST expression: (node expression apply: self))
-		copyPositionFrom: node
-)
-public methodNode: node <MethodAST> = (
-	| pattern body result |
-	literalTable:: Map new.
-	
-	body:: node body apply: self.
-	result:: MethodAST new 
-		pattern: node pattern
-		body: body
-		accessModifier: node accessModifier.
-	scopeMap at: result put: (scopeMap at: node).
-	^result
-)
-public mixinClassNode: node <MixinClassNode> = (
-	^node
-)
-public nilNode: node <NilAST> = (
-	(* No need to add literal: nil is a quick literal in both bytecode sets. *)
-	^node
-)
-public nonLocalReturnNode: node <NonlocalReturnAST> = (
-	^(rewriter NonlocalReturnAST expression: (node expression apply: self))
-		copyPositionFrom: node
-)
-public numberNode: node <NumberAST> = (
-	| value = node value. |
-	(value isInteger and: [value between: -32768 and: 32767]) 
-		ifFalse: [addLiteral: node value].
-	^node
-)
-public ordinarySendNode: node <OrdinarySendAST> = (
-	| selector = node message selector. |
-	(specialSelectors includes: selector)
-		ifFalse: [addLiteral: selector].
-	^(rewriter OrdinarySendAST
-		to: (node receiver apply: self)
-		send: (node message apply: self))
-		copyPositionFrom: node
-)
-public outerSendNode: node <OuterSendAST> = (
-	addLiteral: node message selector.
-	^(rewriter OuterSendAST new
-		message: (node message apply: self);
-		depth: node depth)
-		copyPositionFrom: node
-)
-popScope ^<Scope> = (
-	^scopeStack removeLast
-)
-pushScope: s <Scope> = (
-	^scopeStack addLast: s
-)
-pushScopeForNode: node <AST> = (
-	^scopeStack addLast: (scopeMap at: node)
-)
-public receiverNode: node <ReceiverAST> = (
-	^node
-)
-public selfSendNode: node <SelfSendAST> = (
-	addLiteral: node message selector.
-	^(rewriter SelfSendAST new
-		message: (node message apply: self))
-		copyPositionFrom: node
-)
-public stringNode: node <StringAST> = (
-	(* Note we treat it as a symbol. *)
-	addLiteral: node value asSymbol.
-	^node
-)
-public superSendNode: node <SuperSendAST> = (
-	addLiteral: node message selector.
-	^(rewriter SuperSendAST new
-		message: (node message apply: self))
-		copyPositionFrom: node
-)
-public symbolNode: node <SymbolAST> = (
-	addLiteral: node value.
-	^node
-)
-public tupleNode: node <TupleAST> = (
-	^ArrayAST new 
-		elements: (node elements collect: [:ea | ea apply: self]);
-		size: node elements size 
 )
 ) : (
 )
@@ -2250,7 +2201,9 @@ public compileExpressionSource: src <String> debugMapper: debugMapper <MethodCon
 				ifFalse: [MessagePatternAST new selector: #DoItIn: parameters: 
 					{VarDeclAST name: doitContextArgumentName type: nil}]]);
 		body: body;
-		accessModifier: #public.
+		accessModifier: #public;
+		start: 1;
+		end: src size.
 	
 	(* Build scope *)
 	setScopeFor: method in: enclosing.
@@ -2263,8 +2216,7 @@ public compileExpressionSource: src <String> debugMapper: debugMapper <MethodCon
 				(DebugMappedLocalEntry name: name mapper: debugMapper)]].
 	
 	(* Rewrite and compile *)
-	result:: ((method apply: rewriter) apply: squeakRewriter) apply: methodCompiler.
-	result source: src.
+	result:: methodNode: method.
 	scopeMap:: Map new.
 
 	^result
@@ -2507,8 +2459,11 @@ makePrimaryFactoryFor: hdr <ClassHeaderAST> ^<MethodAST> = (
 		start: start; end: end.
 )
 methodNode: node <MethodAST> ^<IntermediateMethod> = (
-	| result <IntermediateMethod> |
-	result:: ((node apply: rewriter) apply: squeakRewriter) apply: methodCompiler.
+	| result capturedMap |
+	result:: node apply: rewriter.
+	capturedMap:: result apply: ClosureRewriter1 new.
+	result:: result apply: (ClosureRewriter2 with: capturedMap).
+	result:: result apply: methodCompiler.
 	result source: (sourceForNode: node).
 	^result
 )

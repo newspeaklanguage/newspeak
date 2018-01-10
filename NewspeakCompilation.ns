@@ -36,9 +36,6 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 class ClassEntry forDeclaration: cd atDepth: d = SymbolTableEntry forAST: cd atDepth: d (|
 public enclosingClass <ClassEntry>
 |) (
-public isClassBinding ^<Boolean> = (
-	^true
-)
 public name = (
 	^ast selector
 )
@@ -178,7 +175,6 @@ public do: n <Integer> timesRepeat: b <BlockAST> = (
 public from: first <AST> to: last <AST> by: step <AST> do: block <BlockAST> = (
 	|
 	blockScope		<Scope>	
-	counterVar		<TemporaryAST>
 	counterEntry	
 	counter		<TemporaryVariableAST>
 	limitNeeded		<Boolean>
@@ -202,10 +198,9 @@ public from: first <AST> to: last <AST> by: step <AST> do: block <BlockAST> = (
 	blockScope:: scopeMap at: block body.
 
 	(* loop counter (= block parameter) *)
-	counterVar:: TemporaryAST name: block parameters removeFirst name type: nil.
-	counterEntry:: LocalEntry forDeclaration: counterVar atDepth: nil.
+	counterEntry:: blockScope at: block parameters removeFirst name.
+	counterEntry induction: true.
 	counter:: (LocalReadAST of: counterEntry) start: block start; end: block end.
-	blockScope at: counterEntry name put: counterEntry.
 	
 	(* introduce counter limit variable if needed *)
 	prologue:: emptyBody.
@@ -246,9 +241,7 @@ public from: first <AST> to: last <AST> by: step <AST> do: block <BlockAST> = (
 	scopeMap at: condBody put: nil.
 
 	(* inlined closure body *)
-	pushScope: blockScope.
 	rewrittenBlock:: rewriteInlinedBlockNode: block forValue: false.
-	popScope.
 
 	(* add counter increment to loop body *)
 	incArg:: List new add: counter ; yourself.
@@ -445,15 +438,17 @@ public codeBodyNode: node <CodeBodyAST> = (
 	bodyScope:: pushScopeForNode: node.
 	
 	parameters:: node parameters collect:
-		[:varDecl <VarDeclAST> | 
-		 checkForReservedWord: varDecl name. 
-		 currentScope at: varDecl name].
+		[:varDecl <VarDeclAST> | | p |
+		 p:: currentScope at: varDecl name.
+		 p closureDepth: closureDepth.
+		 p].
 	
 	temporaries:: List new.
 	node temporaries do: 
 		[:varDecl <VarDeclAST> | | t |
-		 checkForReservedWord: varDecl name.
-		 temporaries add: (currentScope at: varDecl name)].
+		 t:: currentScope at: varDecl name.
+		 t closureDepth: closureDepth.
+		 temporaries add: t].
 
 	setterEntry:: LocalEntry forDeclaration: (TemporaryAST name: namer setterTemp type: nil) atDepth: nil.
 	bodyScope at: namer setterTemp put: setterEntry.
@@ -598,18 +593,6 @@ public messageNode: node <MessageAST> ^<MessageAST> = (
 		start: node start;
 		end: node end
 )
-public messagePatternNode: node <MessagePatternAST> ^<MessagePatternAST> = (
-	| params <List[ParameterAST]> |
-	checkForReservedWord: node selector.
-	params:: node parameters collect:
-		[:p <VarDeclAST> | 
-		checkForReservedWord: p name. 
-		p].
-	^MessagePatternAST new
-		selector: node selector parameters: params;
-		start: node start;
-		end: node end.
-)
 public methodNode: node <MethodAST> = (
 	(* Need setter temp? Implicit ^self? *)
 	| body accessModifier result |
@@ -625,7 +608,7 @@ public methodNode: node <MethodAST> = (
 		pattern: node pattern
 		body: body
 		accessModifier: node accessModifier.
-	scopeMap at: result put: (scopeMap at: node).
+	scopeMap at: result put: (scopeMap at: body).
 	^result
 )
 public numberNode: node <NumberAST> = (
@@ -872,23 +855,15 @@ rewriteBlockNode: node <BlockAST> forValue: forValue <Boolean> ^ <BlockAST> = (
 (* An empty block evaluates to nil when called. This method performs the necessary transformation if the block is empty; otherwise it recursively rewrites the block body. This rewrite is done on all blocks, regardless of whether they are inlined. *)
 	| 
 	rewrittenNode <BlockAST> 
-      params <Collection[ParameterAST]>  
 	| 
 	(* this shouldn't be handled here, but I'm not sure where the block / codebody 
 	comes from. *)
 	node body start isNumber
 		ifFalse: [node body start: node start. node body end: node end].
 	
-	pushScopeForNode: node.
-	params:: node parameters collect:
-		[:p <VarDeclAST> |
-		checkForReservedWord: p name.
-		currentScope at: p name].
-	popScope.
 	rewrittenNode:: BlockAST new body: 
 		(forValue ifTrue: [applyForValueTo: node body] ifFalse: [applyForEffectTo: node body]).
 	rewrittenNode start: node start; end: node end.
-	rewrittenNode body parameters: params.
 	node body statements isEmpty ifTrue:
 		[rewrittenNode body statements add: (NilAST new start: node body start; end: node body end)].
 	scopeMap at: rewrittenNode put: (scopeMap at: node).
@@ -973,24 +948,9 @@ currentScope ::= initialScope.
 currentDepth <Integer> ::= initialDepth. (* The lexical nesting level of the class declaration currently being visited; top-level classes are level 0. *)
 |
 ) (
-public blockNode: aNode <BlockAST> = (
-	| parameterScope <Scope> |
-	parameterScope:: Scope parent: currentScope.
-	(* establish parameter scope *)
-	aNode parameters do:
-		[:parameter <VarDeclAST> | 
-		 parameterScope
-			at: parameter name
-			put: (LocalEntry
-				forDeclaration: parameter
-				atDepth: currentDepth)].
-	pushScope: parameterScope.
-	
+public blockNode: node <BlockAST> = (	
 	(* visit body *)
-	aNode body apply: self.
-	scopeMap at: aNode put: (scopeMap at: aNode body).
-	
-	popScope (* pop the parameter scope, ps *)
+	scopeMap at: node put: (node body apply: self).
 )
 public buildScopeFor: mm <MixinMirror> ^<Scope> = (
 	assert: [mm isKindOfMixinMirror] message: ''.
@@ -1038,23 +998,38 @@ public classNode: aNode <ClassDeclarationAST> = (
 
 	currentDepth:: currentDepth - 1.
 )
-public codeBodyNode: aNode <CodeBodyAST> = (
+public codeBodyNode: node <CodeBodyAST> = (
 	| bodyScope <Scope> |
 
 	bodyScope:: Scope parent: currentScope.
-	aNode temporaries do: 
-		[:t <SlotDefAST> | | local |
-		 local:: LocalEntry forDeclaration: t slotDecl atDepth: currentDepth.
-		 bodyScope at: t name put: local. (* getter *)
-		 bodyScope at: (namer initializerSelectorForSlot: t) put: local. (* setter *)
-		 t isMutable ifTrue: [bodyScope at: (setterSelectorFor: t) put: local. (* setter *)]].
+	node parameters do:
+		[:parameter <VarDeclAST> | 
+		 checkForReservedWord: parameter name.
+		 (bodyScope includesKeyLocal: parameter name) ifTrue: 
+			[Error signal: 'Conflicting slots named ', parameter name].
+		 bodyScope
+			at: parameter name
+			put: (LocalEntry
+				forDeclaration: parameter
+				atDepth: currentDepth)].
+	node temporaries do: 
+		[:temporary <SlotDefAST> | | local |
+		 checkForReservedWord: temporary name.
+		 (bodyScope includesKeyLocal: temporary name) ifTrue: 
+			[Error signal: 'Conflicting slots named ', temporary name].
+		 local:: LocalEntry forDeclaration: temporary slotDecl atDepth: currentDepth.
+		 bodyScope at: temporary name put: local. (* getter *)
+		 bodyScope at: (namer initializerSelectorForSlot: temporary) put: local. (* setter *)
+		 temporary isMutable ifTrue: 
+			[bodyScope at: (setterSelectorFor: temporary) put: local. (* setter *)]].
 
 	pushScope: bodyScope.
-	scopeMap at: aNode put: bodyScope.
+	scopeMap at: node put: bodyScope.
 	(* visit statements *)
-	aNode temporaries do: [:t | t initializer isNil ifFalse: [t initializer apply: self]].
-	aNode statements do: [:statement | statement apply: self].
+	node temporaries do: [:temporary | nil = temporary initializer ifFalse: [temporary initializer apply: self]].
+	node statements do: [:statement | statement apply: self].
 	popScope.
+	^bodyScope
 )
 incrementalScopeFor: mm <MixinMirror> ^<Scope> = (
 	|
@@ -1099,39 +1074,16 @@ incrementalScopeFor: mm <MixinMirror> ^<Scope> = (
 public messageNode: node <MessageAST> = (
 	node arguments do: [:argument | argument apply: self]
 )
-public messagePatternNode: aNode <MessagePatternAST> = (
-
-	| parameterScope <Scope> |
-	parameterScope:: Scope parent: currentScope.
-	(* establish parameter scope *)
-	aNode parameters do:
-		[:parameter <VarDeclAST> | 
-		parameterScope
-		at: parameter name
-		put: (LocalEntry
-			forDeclaration: parameter
-			atDepth: currentDepth)].
-	
-	pushScope: parameterScope.
-	scopeMap at: aNode put: parameterScope.
-	(* the pattern scope, ps, must be popped by the caller *)
-	(* establish type parameter scope - skip for now *)
-)
 public methodNode: node <MethodAST> = (
 
 	(* register method in current scope *)
+	checkForReservedWord: node selector.
 	currentScope
 		at: node selector
 		put: (MethodEntry forDeclaration: node atDepth: currentDepth).
 
-	(* visit pattern *)
-	node pattern apply: self.
-	
-	(* visit body *)
-	node body apply: self.
-	scopeMap at: node put: (scopeMap at: node body).
-
-	popScope (* Pop pattern scope *)
+	node body parameters: node pattern parameters. (* Should the parser do this? *)
+	scopeMap at: node put: (node body apply: self).
 )
 public mixinApplication: node <MixinApplicationAST> = (
 	node mixinExpr apply: self.
@@ -1226,11 +1178,17 @@ setterSelectorFor: slot <SlotDefAST | InstanceVariableMirror> ^<Symbol> = (
 ) : (
 )
 class LocalEntry forDeclaration: decl <VarDeclAST> atDepth: d <Integer> = SymbolTableEntry forAST: decl atDepth: d ((* Semantic info for a parameter or temporary. *)|
-public offset <Integer>
+(* public offset <Integer>
 public remote <Boolean> ::= false.
-public remoteVector <LocalEntry>
+public remoteVector <LocalEntry> *)
 
+public closureDepth
 public used ::= false.
+public induction ::= false.
+public captured ::= false.
+public remote
+public remoteVector2
+public remoteOffset
 |) (
 public isLocalBinding ^<Boolean> = (
 	^true
@@ -1239,7 +1197,7 @@ public name = (
 	^ast name
 )
 public printOn: stream = (
-	stream nextPutAll: 'LocalEntry('; nextPutAll: name; nextPutAll: ')'.
+	stream nextPutAll: 'LocalEntry('; nextPutAll: name; nextPutAll: '#'; print: hash; nextPutAll: ')'.
 )
 ) : (
 )
@@ -1329,6 +1287,9 @@ public depth ^<Integer> = (
 	parent isNil ifTrue: [^0].
 	^parent depth + 1.
 )
+public includesKeyLocal: key = (
+	^bindings includesKey: key
+)
 public printOn: stm = (
 	stm nextPutAll: 'Scope('.
 	bindings keys
@@ -1343,9 +1304,6 @@ public new = (
 )
 )
 class SlotEntry forDeclaration: decl <VarDeclAST> atDepth: d <Integer> = SymbolTableEntry forAST: decl atDepth: d () (
-public isSlotBinding ^<Boolean> = (
-	^true
-)
 public name = (
 	^ast name
 )
@@ -1355,9 +1313,6 @@ class SymbolTableEntry forAST: tree atDepth: d = ((* An entry in a scope. *)|
 public ast <AST> = tree.
 public depth <Integer> = d.
 |) (
-public isClassBinding ^<Boolean> = (
-	^false
-)
 public isDebugMappedLocalEntry = (
 	^false
 )
@@ -1365,9 +1320,6 @@ public isLocalBinding ^<Boolean> = (
 	^false
 )
 public isMethodBinding ^<Boolean> = (
-	^false
-)
-public isSlotBinding ^<Boolean> = (
 	^false
 )
 ) : (

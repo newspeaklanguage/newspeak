@@ -591,13 +591,13 @@ colorizeMethodSource: sourceText = (
 	#BOGUS. (* We should have decided not to colorize earlier when the method gave us nil source. *)
 	activationMirror sourceAvailable ifFalse: [^sourceText].
 
-	methodMirror reflectee methodClass language isNewspeakLanguage3 
+	methodMirror definingClass language isNewspeakLanguage3 
 		ifFalse:[^super colorizeMethodSource: sourceText].
 
 	^ide newspeakColorization NS3BrowserColorizer new 
 		parseText: sourceText asString
 		fromClass: methodMirror definingMixin reflectee definingClass
-		usingSelector: (methodMirror isExpression ifTrue: [#doItExpression] ifFalse: [#methodDecl])
+		usingSelector: (methodMirror isExpression ifTrue: [#doItExpression] ifFalse: [model selectorForParsing])
 )
 public colorizeMethodSource: sourceText in: editor = (
 	| range |
@@ -605,7 +605,7 @@ public colorizeMethodSource: sourceText in: editor = (
 	#BOGUS. (* We should have decided not to colorize earlier when the method gave us nil source. *)
 	activationMirror sourceAvailable ifFalse: [^sourceText].
 
-	range:: activationMirror sourceRangeIn: thread.
+	range:: activationMirror sourceRange.
 	sourceText asString = source asString ifTrue:
 		[^highlight: (colorizeMethodSource: sourceText) range: range].
 	^colorizeMethodSource: sourceText
@@ -928,13 +928,25 @@ public valueStringLimitedTo: numberOfCharacters <Integer> = (
 )
 ) : (
 )
-class ThreadPresenter onSubject: subj <ThreadSubject> = ProgrammingPresenter onSubject: subj (|
+class ThreadPresenter onSubject: subj <ThreadSubject> = ProgrammingPresenter onSubject: subj (
+(*
+This class will be instantiated inside a Debugger object, which provides access to the current thread (the thread I am  presenting and the top activation mirror) . On every step, the activation slot will be updated to hold the 'new' top activation. This situation is not ideal since it would be more reasonable to access the current activation and thread Mirrors  through ThreadSubject. #refreshActivations is being called from the ActivatiolnPresenters I'm containing, on every step.  See #refreshActivations methods to understand how Activation Presenters are updated on every step 
+*)
+
+|
 	protected activations <PresenterList>
 	protected definitionHolder <HolderFragment>
 	protected moreLinkHolder <HolderFragment>
 |) (
 chunkSize = (	(* Show at most this many activations at first. If there are more activations, show a 'more' link. *)	^100)
 public compileMethod: newSource <String>inPresenter: p <ActivationPresenter>ifCompiledAsSame: onCompiledAsSame <[]>ifCompiledAsNew: onCompiledAsNew <[]>ifFailed: onFail <[:String]> = (	| edited <ActivationMirror> home <ActivationMirror> |	edited:: p subject activationMirror.	home:: edited homeInThread.	home ifNil: [^onFail value: 'Block''s method not on stack.'].	(edited = home or: [p okToRestartBlock]) ifFalse:		[p okToRestartBlock: true.		^onFail value: 'Need to revert to block''s method. Click Save again to revert.'].	p subject		compileNewSource: newSource		ifSuccess:			[refreshActivations.			onCompiledAsSame value.]		ifNewMethod: onCompiledAsNew		ifFailure:			[:message |			refreshActivations.			onFail valueWithPossibleArgument: message].)
+createPresenterForActivation: anActivation  = (
+	^(createSubjectForActivation: anActivation) 
+		presenter showMethodHeader: subject isExemplar not.
+)
+createSubjectForActivation: anActivation  = (
+	^ActivationSubject onModel: anActivation .
+)
 definition = (
 	isAlive ifFalse: [^nothing].
 	
@@ -1024,6 +1036,12 @@ expandTopActivation = (
 			expand;
 			refreshPcRangeIndication]
 )
+private indexOfAnyOf: aCollection from: anotherCollection   = (
+	1 to: anotherCollection size do:
+		[:index |
+		(aCollection includes: (anotherCollection at: index)) ifTrue: [^ index]].
+	^0.
+)
 public navigateTo: destinationSubject = (
 	enterSubject::
 		(isWindowOwnedByDebugger and: [shell shiftWasPressed not])
@@ -1040,79 +1058,32 @@ public noticeRemoval = (
 	thread ifNotNil: [releaseThread terminate]
 )
 public refreshActivations = (
-	(* Refresh the activation list, often after an incremental state change such as a step. Try to recognize small updates and avoid rebuilding too much. Also be smart about keeping interesting activation presenters expanded. Normally sent by a contained activation presenter via the sendUp mechanism. *)
-	| oldTop oldSender i <Integer> maybeHome expandFirstIfIntoBlock |
-	oldTop:: activations presenters first subject activationMirror.
-	expandFirstIfIntoBlock:: activations presenters first isExpanded.
-	oldSender:: activations presenters size >= 2 ifTrue:
-					[(activations presenters at: 2) subject activationMirror].
-	maybeHome:: oldTop context_slot closure ifNotNil: [oldTop context_slot home].
+	(* Refresh the ActivationPresenter 's  list after every step. Presenters which are no longer in the chain are removed. New ones are added. Modified Activations are updated with a new ActivationSubject. It's important not to recreate all Presenters so UI state of activations that are still alive can be preserved (e.g.the presenter is the only one knowing that weather it is expanded or not). *)
 
-	(* Same activation *)
-	oldTop == activation ifTrue:
-		[refreshExistingActivationPresenters.
-		refreshPcRangeIndication.
-		expandTopActivation.
-		^self].
+	| activationsInPresenters remainingPresenters indexOfTopOldActivation allActivations 
+	topOldActivation newActivations newPresenters |
+	
+	allActivations::	subject allActivations.
+	activationsInPresenters:: activations presenters collect: [:each | each subject activationMirror].
+	indexOfTopOldActivation:: indexOfAnyOf: allActivations from:  activationsInPresenters.
 
-	(* Returned to sender *)
-	oldSender == activation ifTrue:
-		[activations removeAt: 1.
-		refreshExistingActivationPresenters.
-		expandTopActivation.
-		^self].
+	topOldActivation:: activationsInPresenters at: indexOfTopOldActivation.
+	remainingPresenters:: activations presenters copyFrom:  indexOfTopOldActivation to: activations presenters size.
 
-	(* Called other method *)
-	(oldTop isSenderOf: activation) ifTrue:
-		[activations addFirst: (ActivationSubject onModel: activation) presenter.
-		refreshExistingActivationPresenters.
-		expandTopActivation.
-		^self].
+	(* update subject of all remainingPresenters and refresh *)
+	remainingPresenters do: [ :each |
+		| newActivation|
+		newActivation:: allActivations at:  (allActivations indexOf: each subject activationMirror).
+		each subject: (createSubjectForActivation: newActivation).
+		each refresh. 
+	].
 
-	(* More than one new activation on stack *)
-	(activation hasActivation: oldTop) ifTrue:
-		[ | newPresenters |
-		newPresenters:: (activation activationsUpTo: oldTop) collect:
-			[:act| (ActivationSubject onModel: act) presenter].
-		activations presenters: newPresenters, activations presenters.
-		refreshExistingActivationPresenters.
-		expandTopActivation.
-		^self].
+	newActivations::  allActivations copyUpTo: topOldActivation. (*not including parameter *) 
+	newPresenters:: newActivations collect: [:each | createPresenterForActivation: each].
+	
+	activations presenters: (newPresenters,  remainingPresenters).
+	expandTopActivation.
 
-      i:: 0.
-	(* See if activation was further up on the stack *)
-	activations presenters do:
-		[:each  |
-		i:: i + 1.
-		each subject activationMirror == activation ifTrue:
-			[activations presenters: (activations presenters copyFrom: i to: activations presenters size).
-			expandTopActivation.
-			refreshExistingActivationPresenters.
-			^self]].
-
-	(* Now check for a new block activation for stepIntoBlock: *)
-	(activation context_slot closure notNil
-	 and: [activation context_slot home == maybeHome
-	 and: [(i:: activations findFirst: [:p| p subject activationMirror context_slot == maybeHome]) ~= 0]]) ifTrue:
-		[ | newPresenters |
-		 newPresenters:: ((activation activationsUpTo: oldTop home) collect:
-									[:act| (ActivationSubject onModel: act) presenter]) allButLast.
-		activations presenters:
-			newPresenters,
-			(activations presenters copyFrom: i to: activations presenters size).
-		expandFirstIfIntoBlock ifTrue:
-			[expandTopActivation].
-		refreshExistingActivationPresenters.
-		^self].
-
-	(* Used to think that normally, this should not happen.  But looks like stepIntoBlock makes it happen. *)
-	activation context_slot home == maybeHome ifTrue:
-		[repopulateActivations.
-		expandFirstIfIntoBlock ifTrue: [expandTopActivation].
-		^self].
-
-	reportNoActivationsFrom: thisContext.
-	repopulateActivations
 )
 refreshExistingActivationPresenters = (
 	activations presenters do: [:each | each refreshActivationState]
@@ -1122,18 +1093,6 @@ refreshPcRangeIndication = (
 		[activations presenters first refreshPcRangeIndication]
 )
 releaseUi: body = (	majorUpdate:		[activations setPresenters: {}.		definitionHolder content: body].)
-repopulateActivations = (
-	(* Fill the activations list with newly built activation presenters for the top chunk of the stack and update the contents of the moreLinkHolder. *)
-	withTopChunkOfActivationsAndMoreLinkDo:
-		[:presenters :moreLinkOrNothing |
-		activations presenters: presenters.
-		moreLinkHolder content: moreLinkOrNothing]
-)
-reportNoActivationsFrom: aContext = (
-	(* Report that e.g. refreshActivatioons found no activafions to refresh.
-	 In the normal debugger this is an error but in subclasses it may be OK. *)
-	(aContext printString, ' : should not happen') out
-)
 respondToCollapseAll = (
 	majorUpdate:
 		[activations presenters do: [:each | each collapse]]
@@ -1183,32 +1142,25 @@ public title = (
 	^'Stack Trace: ', subject title
 )
 withNextChunkOfActivationsAndMoreLinkDo: binaryBlock = (
-	| toSkip index presenters |
-	toSkip:: activations presenters size.
+	^withNextChunkOfActivationsAndMoreLinkDo: binaryBlock skipping: activations presenters size.  
+)
+withNextChunkOfActivationsAndMoreLinkDo: binaryBlock skipping: numberOfActivationsToSkip  = (
+	|  index presenters |
 	index:: 1.
 	presenters:: List new.
 	subject activationsDo:
 		[:each |
-		index > toSkip ifTrue:
+		index > numberOfActivationsToSkip ifTrue:
 			[presenters size < chunkSize ifFalse:
 				[^binaryBlock
 					value: presenters
 					value: (link: 'show more...' action: [showNextChunkOfActivations]) smallFont].
-			presenters add: ((ActivationSubject onModel: each) presenter showMethodHeader: subject isExemplar not)].
+			presenters add: (createPresenterForActivation: each)].
 		index:: index + 1].
 	^binaryBlock value: presenters value: nothing
 )
 withTopChunkOfActivationsAndMoreLinkDo: binaryBlock = (
-	| presenters |
-	presenters:: List new.
-	subject activationsDo:
-		[:each |
-		presenters size < chunkSize ifFalse:
-			[^binaryBlock
-				value: presenters
-				value: (link: 'show more...' action: [showNextChunkOfActivations]) smallFont].
-		presenters add: ((ActivationSubject onModel: each) presenter showMethodHeader: subject isExemplar not)].
-	^binaryBlock value: presenters value: nothing
+	^withNextChunkOfActivationsAndMoreLinkDo: binaryBlock skipping: 0. 
 )
 ) : (
 )
@@ -1223,6 +1175,9 @@ activationSubjectOnModel: m = (
 public activationsDo: action = (
 	(* The debugger does quite a bit of forking UI activity. From time to time (with debugger tests), activation is nil. So, the folliwing check was added. *)
 	activation ifNotNil: [:it | it activationsDo: action]
+)
+public allActivations = (
+	^activation withAllActivations.
 )
 public createPresenter = (
 	^ThreadPresenter onSubject: self

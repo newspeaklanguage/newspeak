@@ -2127,9 +2127,6 @@ classNode: node <ClassDeclarationAST> ^<IntermediateClassDeclaration> = (
 
 	^classDecl
 )
-public compileAllowingBacktickMethodSource: src <String> within: enclosing <MixinMirror> ^<IntermediateMethod> = (
-	^compileMethodSource: src within: enclosing parsingWith: [:x | parser parseMethodDeclarationAllowBacktick: x].
-)
 compileBodylessInitializerSource: src <String> within: enclosing <MixinMirror> ^<LowLevelMethodMirror> = (
 	|
 	nc <MixinApplicationClassAST> = parser nestedClassDecl parseString: src.
@@ -2160,7 +2157,7 @@ public compileClassSource: src <String> within: enclosingIR <IntermediateMixin> 
 	scopeMap:: Map new.
 	^intermediate
 )
-public compileExpressionSource: src <String> debugMapper: debugMapper <MethodContext> inMixin: enclosing <MixinMirror> allowBlackMarket: allowBlackMarket <Boolean> ^<IntermediateMethod>
+public compileExpressionSource: src <String> debugMapper: debugMapper <MethodContext> withScope: withScope <Map> inMixin: enclosing <MixinMirror> ^<IntermediateMethod>
 = (
 	(* Compile a DoIt method.  If aContext is not nil, compile a DoItIn:ctxt method where accesses to names in scope of the context are rewritten to access through the context.  Cog closures complicate this rewriting compared to BlockContexts, as access might be rather indirect.  Also, in cases where a temp is only a copied value and not in a remote indirection vector, it would be impractical to handle writes such that they actually track down all places where the temp lives and update them.  In these cases, we should merely find the most local copy, which I believe is what closure compiled Squeak does. *)
 	|
@@ -2170,9 +2167,7 @@ public compileExpressionSource: src <String> debugMapper: debugMapper <MethodCon
 	|
 
 	(* Parse as a code body *)
-	body:: allowBlackMarket
-		ifTrue: [parser parseExpressionAllowBacktick: src]
-		ifFalse: [parser parseExpression: src].
+	body:: parser parseExpression: src.
 	input: src.
 
 	(* Ensure last statement is a return statement *)
@@ -2185,17 +2180,11 @@ public compileExpressionSource: src <String> debugMapper: debugMapper <MethodCon
 
 	(* Put into a method *)
 	method:: MethodAST new
-		pattern: (nil = debugMapper
-			ifTrue: [allowBlackMarket
-				ifTrue: [MessagePatternAST new selector: #DoItWith: parameters:
-					{VarDeclAST name: doitBlackMarketArgumentName type: nil}]
-				ifFalse: [MessagePatternAST new selector: #DoIt parameters: {}]]
-			ifFalse: [allowBlackMarket
-				ifTrue: [MessagePatternAST new selector: #DoItIn:With: parameters:
-					{VarDeclAST name: doitContextArgumentName type: nil.
-					VarDeclAST name: doitBlackMarketArgumentName type: nil}]
-				ifFalse: [MessagePatternAST new selector: #DoItIn: parameters:
-					{VarDeclAST name: doitContextArgumentName type: nil}]]);
+		pattern: (MessagePatternAST new
+			selector: #DoItIn:With:
+			parameters:
+				{VarDeclAST name: doitContextArgumentName type: nil.
+				 VarDeclAST name: '@with' type: nil});
 		body: body;
 		accessModifier: #public;
 		start: 1;
@@ -2206,10 +2195,15 @@ public compileExpressionSource: src <String> debugMapper: debugMapper <MethodCon
 	nil = debugMapper ifFalse:
 		[debugMapper localNames do:
 			[:name <Symbol> |
-			 currentScope at: name put:
-				(DebugMappedLocalEntry name: name mapper: debugMapper).
-			 currentScope at: (name,':') asSymbol put:
-				(DebugMappedLocalEntry name: name mapper: debugMapper)]].
+			 | entry = ContextMappedEntry name: name mapper: debugMapper. |
+			 currentScope at: name put: entry.
+			 currentScope at: (name,':') asSymbol put: entry]].
+	nil = withScope ifFalse:
+		[withScope keysAndValuesDo:
+			[:key <Symbol> :value |
+			 | entry = WithMappedEntry name: key asSymbol. |
+			 currentScope at: key asSymbol put: entry.
+			 currentScope at: (key,':') asSymbol put: entry]].
 
 	(* Rewrite and compile *)
 	result:: methodNode: method.
@@ -2218,11 +2212,8 @@ public compileExpressionSource: src <String> debugMapper: debugMapper <MethodCon
 	^result
 )
 public compileMethodSource: src <String> within: enclosing <MixinMirror> ^<IntermediateMethod> = (
-	^compileMethodSource: src within: enclosing parsingWith: [:x | parser parseMethodDeclaration: x].
-)
-public compileMethodSource: src <String> within: enclosing <MixinMirror> parsingWith: parserBlock ^<IntermediateMethod> = (
 	| tree <AST> result <LowLevelMethodMirror> |
-	tree:: parserBlock value: src.
+	tree:: parser parseMethodDeclaration: src.
 	saveInput: src.
 	setScopeFor: tree in: enclosing.
 	result:: methodNode: tree.
@@ -2905,18 +2896,47 @@ superMixinInitializerSelectorFor: selector <Symbol> number: i <Integer> ^<Symbol
 )
 ) : (
 )
-class DebugMappedLocalEntry name: nom mapper: mapper = SymbolTableEntry forAST: nil atDepth: nil (|
+class ContextMappedEntry name: nom mapper: mapper = SymbolTableEntry forAST: nil atDepth: nil (|
 	public name = nom.
 	debugMapper = mapper.
 |) (
 public getterAst = (
 	^debugMapper getterAstFor: name.
 )
-public isDebugMappedLocalEntry = (
+public isMappedBinding = (
 	^true
 )
 public setterAst: newVal = (
 	^debugMapper setterAstFor: name putting: newVal.
+)
+) : (
+)
+class WithMappedEntry name: nom = SymbolTableEntry forAST: nil atDepth: nil (|
+	public name = nom.
+|) (
+public getterAst = (
+	^UnresolvedSendAST new
+		receiver: mapAst;
+		message: (MessageAST new
+			selector: #at:;
+			arguments: {SymbolAST new value: name})
+)
+public isMappedBinding = (
+	^true
+)
+private mapAst = (
+	^UnresolvedSendAST new
+		receiver: (VariableAST new name: #'@here');
+		message: (MessageAST new
+			selector: #'@with';
+			arguments: {}).
+)
+public setterAst: newVal = (
+	^UnresolvedSendAST new
+		receiver: mapAst;
+		message: (MessageAST new
+			selector: #at:put:;
+			arguments: {SymbolAST new value: name. newVal})
 )
 ) : (
 )

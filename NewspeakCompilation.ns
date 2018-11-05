@@ -59,9 +59,9 @@ class Rewriter = ASTTool (
 The common rewriter should be sufficient for Dart and JavaScript. Squeak will require a second rewrite phase for closure analysis, which should be simpler than the current implementation because determining which locals need to be indirected or copied down will be easier when the tree already has distinguished sends that are reads/writes to locals.
 *)
 |
-	currentScope <Scope> ::= nil.
-	valueExpected <Boolean> ::= true.
-	closureDepth <Integer> ::= 0.
+	currentScope <Scope>
+	valueExpected <Boolean>
+	closureDepth <Integer>
 |) (
 public class BlockLocalReturnAST expression: e = ReturnAST expression: e () (
 public apply: tool <ASTTool[T]> ^<T> = (
@@ -160,111 +160,89 @@ public apply: tool <ASTTool[T]> ^<T> = (
 	^tool loopNode: self
 )
 public do: n <Integer> timesRepeat: b <BlockAST> = (
-	|
-	skope <Scope>
-	loopVarName <Symbol>
-	var <ParameterAST>
-	varEntry <LocalEntry>
-	|
-	skope:: scopeMap at: b.
+	| var <ParameterAST> |
 
 	(* introduce counter variable *)
-	loopVarName:: '.i' asSymbol.
-	var:: (ParameterAST name: loopVarName type: nil) copyPositionFrom: b.
-	varEntry:: LocalEntry forDeclaration: var atDepth: nil.
-	skope at: loopVarName put: varEntry.
+	var:: (ParameterAST name: #'.i' type: nil) copyPositionFrom: b.
 	assert: [b parameters isEmpty].
-	b parameters add: varEntry.
+	b parameters add: var. (* BOGUS: Should not mutate AST *)
 
-	(* translate n timesRepeat: [blockBody]
-	into 1 to: n do: [:.i | blockBody] *)
-	from: (NumberAST new value: 1; start: b start; end: b end) to: n do: b
+	(* translate n timesRepeat: [blockBody] into 1 to: n do: [:.i | blockBody] *)
+	from: (NumberAST new value: 1; copyPositionFrom: b) to: n do: b
 )
 public from: first <AST> to: last <AST> by: step <AST> do: block <BlockAST> = (
 	|
-	blockScope		<Scope>
+	loopScope		<Scope>
+	counterDecl	<VarDecl>
 	counterEntry
 	counter		<TemporaryVariableAST>
-	limitNeeded		<Boolean>
 	limitName		<Symbol>
-	limitVar		<TemporaryAST>
+	limitDecl		<TemporaryAST>
 	limitEntry
 	limit			<LiteralAST | VariableAST>
 	condSel			<Symbol>
-	condArg		<MutableList[ExpressionAST]>
 	condExpr		<ExpressionAST>
-	condBody		<CodeBodyAST>
-	condStats		<MutableList[StatementAST]>
-	rewrittenBlock
-	incArg			<MutableList[ExpressionAST]>
 	incExpr			<ExpressionAST>
 	incStat			<StatementAST>
 	|
-	(* preliminaries *)
+
 	assert: [ step isNumberNode and: [step value isKindOfInteger] ] message: 'Loop with non-integer step'.
 	assert: [ block isBlockNode ] message: 'Loop with block that is not a BlockAST'.
-	blockScope:: scopeMap at: block body.
 
-	(* loop counter (= block parameter) *)
-	counterEntry:: blockScope at: block parameters removeFirst name.
-	counterEntry induction: true.
-	counter:: (LocalReadAST of: counterEntry) start: block start; end: block end.
-
-	(* introduce counter limit variable if needed *)
+	isWhileTrue:: true.
 	prologue:: emptyBody.
-	(limitNeeded:: last isLiteralNode not)
-		ifFalse:
-			[(* no limit variable needed - use last directly since there's no computation involved *)
-			limit:: last]
-		ifTrue:
-			[limitName:: '.limit' asSymbol.
-			 limitVar:: TemporaryAST name: limitName type: nil.
-			 limitVar start: block start; end: block end.
-			 limitEntry:: LocalEntry forDeclaration: limitVar atDepth: nil.
-			 prologue temporaries add: limitEntry.
-			 blockScope at: limitName put: limitEntry.
-			 limit:: (LocalReadAST of: limitEntry) start: block start; end: block end].
 
-	(* setup prologue *)
+	loopScope:: Scope parent: currentScope.
+	pushScope: loopScope.
+
+	(* Create counter variable from block's parameter. *)
+	counterDecl:: block parameters removeLast. (* BOGUS: Should not mutate AST *)
+	counterEntry:: LocalEntry forDeclaration: counterDecl atDepth: nil.
+	counterEntry induction: true.
+	loopScope at: counterDecl name put: counterEntry.
 	prologue temporaries add: counterEntry.
 	prologue statements add: (LocalWriteAST to: counterEntry assign: first).
-	(* counter := first *)
-	limitNeeded ifTrue: [
-		(* initialize limit variable - note that this must be done *after* setting up the counter because of possible side effects *)
-		prologue statements add: (LocalWriteAST to: limitEntry assign: last). (* .limit := last *)
-	].
+	counter:: (LocalReadAST of: counterEntry) copyPositionFrom: block.
+
+	(* Introduce counter limit variable if needed. *)
+	last isLiteralNode
+		ifTrue:
+			[(* no limit variable needed - use last directly since there's no side-effect *)
+			limit:: last]
+		ifFalse:
+			[limitName:: #'.limit'.
+			 limitDecl:: TemporaryAST name: limitName type: nil.
+			 limitDecl copyPositionFrom: block.
+			 limitEntry:: LocalEntry forDeclaration: limitDecl atDepth: nil.
+			 loopScope at: limitName put: limitEntry.
+			 prologue temporaries add: limitEntry.
+			 (* initialize limit variable - note that this must be done *after* setting up the counter because of possible side effects *)
+			 prologue statements add: (LocalWriteAST to: limitEntry assign: last). (* .limit := last *)
+			 limit:: (LocalReadAST of: limitEntry) copyPositionFrom: block].
 
 	(* setup loop condition => introduce condition block for whileTrue: loop *)
 	condSel:: step value < 0 ifTrue: [ #<= ] ifFalse: [ #>= ].
-	condArg:: List new add: counter; yourself.
-	condExpr:: OrdinarySendAST to: limit send: (MessageAST new send: condSel with: condArg).
+	condExpr:: OrdinarySendAST to: limit send: (MessageAST new send: condSel with: {counter}).
 	(* limit <= counter OR limit >= counter *)
-	condStats:: List new add: condExpr; yourself.
-	condBody::
-		CodeBodyAST new
-			parameters: List new;
-			temporaries: List new;
-			statements: condStats;
-			start: block start; end: block end.
-	scopeMap at: condBody put: nil.
+	condition:: CodeBodyAST new
+		parameters: {};
+		temporaries: {};
+		statements: {condExpr};
+		copyPositionFrom: block.
 
 	(* inlined closure body *)
-	rewrittenBlock:: rewriteInlinedBlockNode: block forValue: false.
+	body:: (rewriteInlinedBlockNode: block forValue: false) body.
 
 	(* add counter increment to loop body *)
-	incArg:: List new add: counter; yourself.
-	incExpr:: OrdinarySendAST to: step send: (MessageAST new send: #+ with: incArg).
-	incExpr start: block start; end: block end.
+	incExpr:: OrdinarySendAST to: step send: (MessageAST new send: #+ with: {counter}).
+	incExpr copyPositionFrom: block.
 	(* step + counter *)
 	incStat:: LocalWriteAST to: counterEntry assign: incExpr.
-	incStat start: block start; end: block end.
+	incStat copyPositionFrom: block.
 	(* counter := step + counter *)
-	rewrittenBlock body statements add: incStat.
+	body statements add: incStat.
 
-	(* initialize loop instance variables *)
-	condition:: condBody.
-	isWhileTrue:: true.
-	body:: rewrittenBlock body
+	popScope.
 )
 public from: first <AST> to: last <AST> do: block <BlockAST> = (
 	from: first to: last by: (NumberAST new value: 1) do: block
@@ -443,7 +421,28 @@ public codeBodyNode: node <CodeBodyAST> = (
 	(* Move slot initializers to statements. Simultaneous slots. *)
 
 	| bodyScope parameters temporaries setterEntry statements result |
-	bodyScope:: pushScopeForNode: node.
+	bodyScope:: Scope parent: currentScope.
+	node parameters do:
+		[:parameter <VarDeclAST> |
+		 checkForReservedWord: parameter name.
+		 (bodyScope includesKeyLocal: parameter name) ifTrue:
+			[Error signal: 'Conflicting slots named ', parameter name].
+		 bodyScope
+			at: parameter name
+			put: (LocalEntry
+				forDeclaration: parameter
+				atDepth: nil)].
+	node temporaries do:
+		[:temporary <SlotDefAST> | | local |
+		 checkForReservedWord: temporary name.
+		 (bodyScope includesKeyLocal: temporary name) ifTrue:
+			[Error signal: 'Conflicting slots named ', temporary name].
+		 local:: LocalEntry forDeclaration: temporary slotDecl atDepth: nil.
+		 bodyScope at: temporary name put: local. (* getter *)
+		 bodyScope at: (namer initializerSelectorForSlot: temporary) put: local. (* setter *)
+		 temporary isMutable ifTrue:
+			[bodyScope at: (setterSelectorFor: temporary) put: local. (* setter *)]].
+	pushScope: bodyScope.
 
 	parameters:: node parameters collect:
 		[:varDecl <VarDeclAST> | | p |
@@ -494,7 +493,6 @@ public codeBodyNode: node <CodeBodyAST> = (
 		temporaries: temporaries
 		statements: statements.
 	result literalMessages: node literalMessages.
-	scopeMap at: result put: bodyScope.
 	^result
 )
 depthOfEnclosingClass: name <Symbol> ^<Integer> = (
@@ -513,34 +511,20 @@ emptyBody = (
 		parameters: List new;
 		temporaries: List new;
 		statements: (List new add: NilAST new; yourself).
-	scopeMap at: body put: nil.
 	^body
 )
 futureFor: expression <ExpressionAST> ^<ExpressionAST> = (
 	(* @here Future computing: [expression] *)
-	|
-	scope <Scope>
-	block <BlockAST>
-	codebody <CodeBodyAST>
-	futureExp <ExpressionAST>
-	|
-
-	scope:: Scope parent: currentScope.
-
-	futureExp:: UnresolvedSendAST new
+	^UnresolvedSendAST new
 		receiver: (UnresolvedSendAST new
 			receiver: implicitReceiverNode;
 			message: (MessageAST new selector: #Future; arguments: {}));
 		message: (MessageAST new selector: #computing:; arguments: {
-			block:: BlockAST new body: (
-				 codebody:: CodeBodyAST new
+			BlockAST new body: (
+				 CodeBodyAST new
 					parameters: List new;
 					temporaries: List new;
-					statements: {expression})}).
-
-	scopeMap at: codebody put: scope.
-	scopeMap at: block put: scope.
-	^futureExp
+					statements: {expression})})
 )
 implicitReceiverNode ^<VariableAST> = (
 	^VariableAST new name: #'@here'
@@ -604,8 +588,9 @@ public messageNode: node <MessageAST> ^<MessageAST> = (
 public methodNode: node <MethodAST> = (
 	(* Need setter temp? Implicit ^self? *)
 	| body accessModifier result |
-	closureDepth:: 0.
 	checkForReservedWord: node selector.
+	closureDepth:: 0.
+	currentScope:: scopeMap at: node.
 	node body parameters: node pattern parameters. (* Should the parser do this? *)
 	(* We add the implicit ^self before rewritting the body to ensure the last non-return statment is rewritten for effect. *)
 	(node body statements isEmpty or: [node body statements last isReturnStatNode not])
@@ -616,7 +601,7 @@ public methodNode: node <MethodAST> = (
 		pattern: node pattern
 		body: body
 		accessModifier: node accessModifier.
-	scopeMap at: result put: (scopeMap at: body).
+	currentScope:: nil.
 	^result
 )
 public numberNode: node <NumberAST> = (
@@ -640,7 +625,7 @@ offsetOfImplicitReceiverTarget: binding <SymbolTableEntry> ^<Integer> = (
 	assert: [depth >= 0] message: 'Invalid enclosing object index'.
 	^depth
 )
-public popScope ^<Scope> = (
+popScope = (
 	currentScope:: currentScope parent.
 )
 processEventualSend: node <NormalSendAST> = (
@@ -768,7 +753,7 @@ processLocalWrite: message <MessageAST> to: declaration <LocalEntry> = (
 		to: declaration assign: (applyForValueTo: message arguments first))
 		copyPositionFrom: message
 )
-public processOrdinarySend: node <UnresolvedSendAST> ^<AST> = (
+processOrdinarySend: node <UnresolvedSendAST> ^<AST> = (
 	(isInlineableConditional: node)
 		ifTrue: [^processInlineableConditional: node].
 	(isInlineableLoop: node)
@@ -840,7 +825,6 @@ processSetterSend: node <SetterSendAST> binding: binding ^<AST> = (
 		parameters: List new;
 		temporaries: {};
 		statements: {setterTempWrite. send. setterTempRead}.
-	scopeMap at: body put: currentScope.
 	^body
 )
 processSuperSend: node <UnresolvedSendAST> = (
@@ -848,11 +832,8 @@ processSuperSend: node <UnresolvedSendAST> = (
 		message: (node message apply: self);
 		copyPositionFrom: node
 )
-public pushScope: scope <Scope> = (
-	^currentScope:: scope
-)
-pushScopeForNode: node <AST> = (
-	^pushScope: (scopeMap at: node)
+pushScope: scope <Scope> = (
+	currentScope:: scope
 )
 public returnStatNode: node <ReturnStatAST> = (
 	^((closureDepth > 0 ifTrue: [NonlocalReturnAST] ifFalse: [MethodLocalReturnAST])
@@ -874,7 +855,6 @@ rewriteBlockNode: node <BlockAST> forValue: forValue <Boolean> ^ <BlockAST> = (
 	rewrittenNode start: node start; end: node end.
 	node body statements isEmpty ifTrue:
 		[rewrittenNode body statements add: (NilAST new start: node body start; end: node body end)].
-	scopeMap at: rewrittenNode put: (scopeMap at: node).
 	^rewrittenNode
 )
 rewriteInlinedBlockNode: node <BlockAST> forValue: forValue <Boolean> ^ <CodeBodyAST> = (
@@ -958,25 +938,9 @@ currentScope ::= initialScope.
 currentDepth <Integer> ::= initialDepth. (* The lexical nesting level of the class declaration currently being visited; top-level classes are level 0. *)
 |
 ) (
-public blockNode: node <BlockAST> = (
-	(* visit body *)
-	scopeMap at: node put: (node body apply: self).
-)
 public buildScopeFor: mm <MixinMirror> ^<Scope> = (
 	assert: [mm isKindOfMixinMirror] message: ''.
 	^incrementalScopeFor: mm.
-)
-public cascadedSendNode: node <CascadedSendAST> = (
-	node previousSend apply: self.
-	node message apply: self.
-)
-public characterNode: aNode <CharacterAST> = (
-	(* leaf, do nothing *)
-)
-public classHeaderNode: aNode = (
-	aNode constructor apply: self.
-	aNode slots do: [:s | s initializer ifNotNil: [:i | i apply: self]].
-	aNode initExprs do: [:e | e apply: self].
 )
 public classNode: aNode <ClassDeclarationAST> = (
 	| thisClass <ClassEntry> instanceSideScope <Scope> classSideScope <Scope> |
@@ -1006,39 +970,6 @@ public classNode: aNode <ClassDeclarationAST> = (
 	popScope.
 
 	currentDepth:: currentDepth - 1.
-)
-public codeBodyNode: node <CodeBodyAST> = (
-	| bodyScope <Scope> |
-
-	bodyScope:: Scope parent: currentScope.
-	node parameters do:
-		[:parameter <VarDeclAST> |
-		 checkForReservedWord: parameter name.
-		 (bodyScope includesKeyLocal: parameter name) ifTrue:
-			[Error signal: 'Conflicting slots named ', parameter name].
-		 bodyScope
-			at: parameter name
-			put: (LocalEntry
-				forDeclaration: parameter
-				atDepth: currentDepth)].
-	node temporaries do:
-		[:temporary <SlotDefAST> | | local |
-		 checkForReservedWord: temporary name.
-		 (bodyScope includesKeyLocal: temporary name) ifTrue:
-			[Error signal: 'Conflicting slots named ', temporary name].
-		 local:: LocalEntry forDeclaration: temporary slotDecl atDepth: currentDepth.
-		 bodyScope at: temporary name put: local. (* getter *)
-		 bodyScope at: (namer initializerSelectorForSlot: temporary) put: local. (* setter *)
-		 temporary isMutable ifTrue:
-			[bodyScope at: (setterSelectorFor: temporary) put: local. (* setter *)]].
-
-	pushScope: bodyScope.
-	scopeMap at: node put: bodyScope.
-	(* visit statements *)
-	node temporaries do: [:temporary | nil = temporary initializer ifFalse: [temporary initializer apply: self]].
-	node statements do: [:statement | statement apply: self].
-	popScope.
-	^bodyScope
 )
 incrementalScopeFor: mm <MixinMirror> ^<Scope> = (
 	|
@@ -1080,9 +1011,6 @@ incrementalScopeFor: mm <MixinMirror> ^<Scope> = (
 		scope at: c name put: ce].
 	^scope
 )
-public messageNode: node <MessageAST> = (
-	node arguments do: [:argument | argument apply: self]
-)
 public methodNode: node <MethodAST> = (
 	(* register method in current scope *)
 	checkForReservedWord: node selector.
@@ -1091,7 +1019,8 @@ public methodNode: node <MethodAST> = (
 		put: (MethodEntry forDeclaration: node atDepth: currentDepth).
 
 	node body parameters: node pattern parameters. (* Should the parser do this? *)
-	scopeMap at: node put: (node body apply: self).
+
+	scopeMap at: node put: currentScope. (* BOGUS: Rewriter should start with the right currentScope. *)
 )
 public mixinApplication: node <MixinApplicationAST> = (
 	node mixinExpr apply: self.
@@ -1109,52 +1038,16 @@ public mixinApplicationClass: node <MixinApplicationClassAST> = (
 public mixinClassNode: aNode = (
 	(* leaf, do nothing *)
 )
-public numberNode: aNode <NumberAST> = (
-	(* leaf, do nothing *)
-)
-popScope ^<Scope> = (
-	^currentScope:: currentScope parent
+popScope = (
+	currentScope:: currentScope parent
 )
 pushScope: scope <Scope> = (
-	^currentScope:: scope
+	currentScope:: scope
 )
-public returnStatNode: node <ReturnStatAST> = (
-	node expression apply: self
-)
-public setterSendNode: node <SetterSendAST> = (
-	node receiver apply: self.
-	node message apply: self.
-)
-public sideNode: aNode <SideAST> = (
-	scopeMap at: aNode put: currentScope.
-
-	(* visit methods *)
-	aNode methods do:
-		[:m <MethodAST> | m apply: self].
-
-	(* visit nested classes *)
-	aNode nestedClasses do:
-		[:nc <ClassDeclarationAST> | nc apply: self].
-)
-public slotDefNode: aNode <SlotDefAST> = (
-)
-public stringNode: aNode <StringAST> = (
-	(* leaf, do nothing *)
-)
-public symbolNode: aNode <SymbolAST> = (
-	(* leaf, do nothing *)
-)
-public tupleNode: node <TupleAST> = (
-	node elements do: [:element | element apply: self]
-)
-public unresolvedSendNode: node <UnresolvedSendAST> = (
-	node receiver apply: self.
-	node message apply: self.
-)
-public varDeclNode: aNode <VarDeclAST> = (
-	(* Do nothing. It could arguably add aNode's data to current scope - but in practice, the context knows better how to do this. *)
-)
-public variableNode: aNode <VariableAST> = (
+public sideNode: node <SideAST> = (
+	scopeMap at: node put: currentScope.
+	node methods do: [:method <MethodAST> | method apply: self].
+	node nestedClasses do: [:nestedClass <ClassDeclarationAST> | nestedClass apply: self].
 )
 ) : (
 public new ^<Instance> = (

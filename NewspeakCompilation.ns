@@ -42,22 +42,17 @@ public name = (
 )
 ) : (
 )
-class Compiler = (| protected scopeMap <Map[AST, Scope]> ::= Map new. |) (
+class Compiler = () (
 class Rewriter = ASTTool (
-(* This class is intended to become a common rewriter for the Squeak, Dart and JavaScript compilers. It should handle
+(* A common rewriter for the Newspeak compilers targeting Squeak and JavaScript.
 
-*self/super/outer/implicitReceiver/ordinary send or local read/write.
-*local/non-local return.
-*implicit return self
-*[] is [nil]
-*slot initializers
-*simultaneous slots
-*setter temp
-*inlined messages
-*large tuples?
-
-The common rewriter should be sufficient for Dart and JavaScript. Squeak will require a second rewrite phase for closure analysis, which should be simpler than the current implementation because determining which locals need to be indirected or copied down will be easier when the tree already has distinguished sends that are reads/writes to locals.
-*)
+ - Resolves sends to self, super, outer, implicit receiver and ordinary sends, as well as local variable reads and writes.
+ - Resolves returns to local and non-local returns.
+ - Adds the implicit return self to method bodies without a return statement.
+ - Adds the implicit return nil to empty closure bodies.
+ - Adds local slot initializers to statement lists.
+ - Adds temporaries to turn setter sends into regular implicit receiver sends.
+ - Rewrites well-known control messages with closure literal arguments to branches and loops. *)
 |
 	currentScope <Scope>
 	valueExpected <Boolean>
@@ -438,10 +433,10 @@ public codeBodyNode: node <CodeBodyAST> = (
 		 (bodyScope includesKeyLocal: temporary name) ifTrue:
 			[Error signal: 'Conflicting slots named ', temporary name].
 		 local:: LocalEntry forDeclaration: temporary slotDecl atDepth: nil.
-		 bodyScope at: temporary name put: local. (* getter *)
-		 bodyScope at: (namer initializerSelectorForSlot: temporary) put: local. (* setter *)
+		 bodyScope at: (namer selectorForSlotInitializer: temporary) put: local.
+		 bodyScope at: (namer selectorForSlotGetter: temporary) put: local.
 		 temporary isMutable ifTrue:
-			[bodyScope at: (setterSelectorFor: temporary) put: local. (* setter *)]].
+			[bodyScope at: (namer selectorForSlotSetter: temporary) put: local]].
 	pushScope: bodyScope.
 
 	parameters:: node parameters collect:
@@ -585,12 +580,12 @@ public messageNode: node <MessageAST> ^<MessageAST> = (
 		start: node start;
 		end: node end
 )
-public methodNode: node <MethodAST> = (
+public methodNode: node <MethodAST> inScope: scope = (
 	(* Need setter temp? Implicit ^self? *)
 	| body accessModifier result |
 	checkForReservedWord: node selector.
 	closureDepth:: 0.
-	currentScope:: scopeMap at: node.
+	currentScope:: scope.
 	node body parameters: node pattern parameters. (* Should the parser do this? *)
 	(* We add the implicit ^self before rewritting the body to ensure the last non-return statment is rewritten for effect. *)
 	(node body statements isEmpty or: [node body statements last isReturnStatNode not])
@@ -922,138 +917,6 @@ public variableNode: node <VariableAST> = (
 )
 ) : (
 )
-class ScopeBuilder nestedIn: initialScope <Scope> atLevel: initialDepth <Integer> = ASTTool (
-(* The scope builder is a visitor on the AST. It computes a tree of scopes that shadows the AST itself. More precisely, it computes a mapping from ASTs to their scopes. This allows us to get to the appropriate scope for an abstract syntax node without polluting the AST with extraneous data like scopes.
-
-We could associate each node in the AST with the scope in which it is found, but this would be overkill. Instead, only nodes that actually introduce new scopes (such as class sides, message patterns, code bodies and blocks) actually get mapped in this manner. The intent is that later phases of compilation will visit the tree and look up the scopes at the points where they are introduced.
-
-The builder starts at a given node, in the context of some mixin, described by a mirror. This is because, in an incremental environment, we may not have the complete AST for a module, but instead be asked to process a part of that module, such as a nested class, slot definition or method. The surrounding scope can be computed from the mirror representing the immediately enclosing mixin.
-
-Then we traverse the tree, creating and populating new scopes as needed. We maintain a stack of scopes (scopeStack) that initially contains only the surrounding scope. Scopes get pushed on to the stack when we encounter a node that introduces a scope, and popped when we finish with that node. The scopes are chained to their super scopes (the scope below them on the stack).
-
-A possible optimization is to avoid a traversal of an entire side of a class.
-One can process only a side without its subtrees (i.e., methods and nested classes). These can be visited later, as long as we ensure that the processing of the subtree begins with a proper super scope on top of the scope stack. *)
-|
-currentScope ::= initialScope.
-currentDepth <Integer> ::= initialDepth. (* The lexical nesting level of the class declaration currently being visited; top-level classes are level 0. *)
-|
-) (
-public buildScopeFor: mm <MixinMirror> ^<Scope> = (
-	assert: [mm isKindOfMixinMirror] message: ''.
-	^incrementalScopeFor: mm.
-)
-public classNode: aNode <ClassDeclarationAST> = (
-	| thisClass <ClassEntry> instanceSideScope <Scope> classSideScope <Scope> |
-
-	thisClass:: ClassEntry forDeclaration: aNode atDepth: currentDepth.
-	thisClass enclosingClass: (currentScope at: #'@currentClass' ifAbsent: [nil]).
-
-	currentScope at: aNode name put: thisClass.
-
-	currentDepth:: currentDepth + 1.
-
-	instanceSideScope:: Scope parent: currentScope. (* establish instance side scope *)
-	pushScope: instanceSideScope.
-	aNode header slots do: [:v <SlotDeclAST> |
-		| se = SlotEntry forDeclaration: v atDepth: currentDepth. |
-		instanceSideScope at: v name put: se. (* getter *)
-		instanceSideScope at: (namer initializerSelectorForSlot: v) put: se.
-		v isMutable ifTrue: [instanceSideScope at: (namer setterSelectorFor: v) put: se]. (* setter *)].
-	instanceSideScope at: #'@currentClass' put: thisClass.
-	aNode instanceSide apply: self.
-	popScope.
-
-	classSideScope:: (Scope parent: currentScope). (* establish class side scope *)
-	pushScope: classSideScope.
-	classSideScope at: #'@currentClass' put: thisClass.
-	aNode classSide apply: self.
-	popScope.
-
-	currentDepth:: currentDepth - 1.
-)
-incrementalScopeFor: mm <MixinMirror> ^<Scope> = (
-	|
-	enclosingMixin
-	enclosingScope <Scope>
-	scope <Scope>
-	currentClass <ClassEntry>
-	depth
-	|
-	enclosingMixin:: mm declaration enclosingClass.
-	nil = enclosingMixin
-		ifTrue: [enclosingScope:: Scope new]
-		ifFalse: [enclosingScope:: incrementalScopeFor: enclosingMixin instanceSide].
-	scope:: Scope parent: enclosingScope.
-	depth:: scope depth.
-	currentClass:: ClassEntry
-		forDeclaration: (MessagePatternAST new selector: mm declaration name)
-		atDepth: depth.
-	currentClass enclosingClass: (scope at: #'@currentClass' ifAbsent: [nil]).
-	scope at: #'@currentClass' put: currentClass.
-	depth:: depth + 1.
-	mm slots do: [:s <SlotMirror> |
-		| se = SlotEntry
-			forDeclaration: (MessagePatternAST new selector: s name; accessModifier: s accessModifier)
-			atDepth: depth. |
-		scope at: s name put: se. (* getter *)
-		scope at: (namer initializerSelectorForSlot: s) put: se.
-		s isMutable ifTrue: [scope at: (namer setterSelectorFor: s) put: se. (* setter *)]].
-	mm methods do: [:m <MethodMirror> |
-		| me = MethodEntry
-			forDeclaration: (MessagePatternAST new selector: m name; accessModifier: m accessModifier)
-			atDepth: depth. |
-		scope at: m name put: me].
-	mm nestedClasses do: [:c <ClassDeclarationMirror> |
-		| ce = ClassEntry
-			forDeclaration: (MessagePatternAST new selector: c name; accessModifier: c accessModifier)
-			atDepth: depth. |
-		ce enclosingClass: currentClass.
-		scope at: c name put: ce].
-	^scope
-)
-public methodNode: node <MethodAST> = (
-	(* register method in current scope *)
-	checkForReservedWord: node selector.
-	currentScope
-		at: node selector
-		put: (MethodEntry forDeclaration: node atDepth: currentDepth).
-
-	node body parameters: node pattern parameters. (* Should the parser do this? *)
-
-	scopeMap at: node put: currentScope. (* BOGUS: Rewriter should start with the right currentScope. *)
-)
-public mixinApplication: node <MixinApplicationAST> = (
-	node mixinExpr apply: self.
-	node superclassExpr apply: self
-)
-public mixinApplicationClass: node <MixinApplicationClassAST> = (
-	| thisClass <ClassEntry> |
-	#BOGUS yourself. (* WIP *)
-	thisClass:: ClassEntry forDeclaration: node atDepth: node.
-	thisClass enclosingClass: (currentScope at: #'@currentClass' ifAbsent: [nil]).
-
-	currentScope at: node name put: thisClass.
-	scopeMap at: node put: currentScope.
-)
-public mixinClassNode: aNode = (
-	(* leaf, do nothing *)
-)
-popScope = (
-	currentScope:: currentScope parent
-)
-pushScope: scope <Scope> = (
-	currentScope:: scope
-)
-public sideNode: node <SideAST> = (
-	scopeMap at: node put: currentScope.
-	node methods do: [:method <MethodAST> | method apply: self].
-	node nestedClasses do: [:nestedClass <ClassDeclarationAST> | nestedClass apply: self].
-)
-) : (
-public new ^<Instance> = (
-	^self nestedIn: Scope new atLevel: 0
-)
-)
 public Scope = (
 	^outer NewspeakCompilation Scope
 )
@@ -1061,20 +924,19 @@ checkForReservedWord: selector = (
 	(namer isReservedWord: selector) ifTrue:
 		[Error signal: '"', selector, '" is a reserved word'].
 )
-public compileClassHeader: source <String>
- within: enclosingDeclIR <IntermediateClassDeclaration> = (
+public compileClassHeader: source <String> within: enclosingIR <IntermediateMixin> = (
 	subclassResponsibility
 )
-public compileClassSource: source <ReadStream> within: enclosing <MixinMirror> ^<IntermediateClassDeclaration> = (
+public compileClassSource: src <String> within: enclosingIR <IntermediateMixin> ^<IntermediateClassDeclaration> = (
 	subclassResponsibility
 )
-public compileExpressionSource: source <ReadStream> inContext: aContext <MethodContext> inMixin: enclosing <MixinMirror> allowBlackMarket: allowBlackMarket <Boolean> ^<IntermediateMethod> = (
+public compileExpressionSource: src <String> debugMapper: debugMapper <MethodContext> withScope: withScope <Map> inMixin: enclosing <MixinMirror> ^<IntermediateMethod> = (
 	subclassResponsibility
 )
-public compileMethodSource: source <String> within: enclosing <MixinMirror> ^<IntermediateMethod> = (
+public compileMethodSource: source <String> within: enclosing <IntermediateMixin> ^<IntermediateMethod> = (
 	subclassResponsibility
 )
-setterSelectorFor: slot <SlotDefAST | InstanceVariableMirror> ^<Symbol> = (
+public compileTransientSlotSource: src <String> within: enclosingIR <IntermediateMixin> ^<IntermediateTransientSlot> = (
 	subclassResponsibility
 )
 ) : (
@@ -1113,47 +975,30 @@ public isMethodBinding ^<Boolean> = (
 ) : (
 )
 class Namer = () (
-public fullyQualifiedNameToSimple: name = (
-	| index = name lastIndexOf: "`". |
-	index = 0 ifTrue: [^name].
-	^(name copyFrom: 1 + index to: name size) asSymbol
-)
-public fullyQualifySimpleName: sn with: fqp = (
-	^(fqp, syntheticNameSeparator, sn) asSymbol
-)
-public initializerSelectorForSlot: slot <SlotDefAST | InstanceVariableMirror> ^<Symbol> = (
-	^('init`', slot name, ':') asSymbol
+public doitContextArgumentName = (
+	^#'@context'
 )
 public isReservedWord: selector = (
 	^{#self. #super. #outer. #true. #false. #nil} includes: selector
 )
-public mixinNameOfClassNamed: className = (
-	(* |
-	simpleNames
-	rawNames
-	result
-	|
-	rawNames:: className subStrings: syntheticNameSeparator.
-	rawNames size =1 ifTrue: [^className].
-	simpleNames:: rawNames select: [:n | n initialIntegerOrNil isNil].
-	assert: [simpleNames size >= 2] message: ''.
-	^(simpleNames fold: [:sn1 :sn2 | sn1, syntheticNameSeparator, sn2]) asSymbol. *)
-	^className
-)
 public mixinSlotNameFor: nestedName = (
-	| mixinName |
-	mixinName:: self mixinNameOfClassNamed: nestedName.
-	^(mixinName, syntheticNameSeparator, 'slot') asSymbol
+	^(nestedName, '`slot') asSymbol
 )
-public setterSelectorFor: slot <SlotDefAST | InstanceVariableMirror> ^<Symbol> = (
-	slot isMutable ifFalse: [self warnObsolete].
-	^((slot isMutable ifTrue: [ '' ] ifFalse: [ 'setOnce`' ]), slot name, ':') asSymbol.
+public scopeArgumentName = (
+	^#'@with'
+)
+public selectorForSlotGetter: slot <SlotDefAST | InstanceVariableMirror> ^<Symbol> = (
+	^slot name
+)
+public selectorForSlotInitializer: slot <SlotDefAST | InstanceVariableMirror> ^<Symbol> = (
+	^('init`', slot name, ':') asSymbol
+)
+public selectorForSlotSetter: slot <SlotDefAST | InstanceVariableMirror> ^<Symbol> = (
+	slot isMutable ifFalse: [Error signal: 'Slot is not mutable'].
+	^(slot name, ':') asSymbol
 )
 public setterTemp = (
 	^#'@setterTemp'
-)
-public syntheticNameSeparator = (
-	^'`'
 )
 ) : (
 )

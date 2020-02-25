@@ -33,6 +33,8 @@ private Map = platform collections Map.
 private List = platform collections List.
 private IdentitySet = platform squeak IdentitySet.
 private IdentityMap = platform squeak IdentityDictionary.
+private UnhandledError = platform squeak UnhandledError.
+private Semaphore = platform squeak Semaphore.
 
 private Duct = platform ducts Duct.
 private WeakStorage = platform ducts WeakStorage.
@@ -81,8 +83,7 @@ Builders are connected up and down.  If you get a builder on a declaration, if y
 	public header <ClassHeaderBuilder> = ClassHeaderBuilder forIntermediate: ir.
 |prvtIntermediate existingMixin: mixin) (
 public accessModifier = (
-	(*TODO: we might want to change an access modifier. Currently this is only a getter reading from the old existing mixin. *)
-	^prvtExistingMixin accessModifier
+	^prvtIntermediate accessModifier
 )
 checkForHeaderConflicts: newIntermediate <IntermediateClassDeclaration> = (
 	newIntermediate instanceSide slots do:
@@ -438,6 +439,9 @@ public initializer = (
 	halt.
 )
 public isClassHeaderMirror ^<Boolean> = (
+	^true
+)
+public isKindOfClassHeaderMirror ^<Boolean> = (
 	^true
 )
 public name ^ <Symbol> = (
@@ -1160,7 +1164,7 @@ public addFromSource: s <String> ifFail: onFail = (
 		on: Error
 		do: onFail.
 )
-public addMirror: m <TransientSlotBuilder>= (
+public addMirror: m <TransientSlotBuilder> = (
 
 	(* intermediate checkNameConflictsForMethod: m name. *)
 	super addMirror: m.
@@ -1214,21 +1218,9 @@ public = other <Object> ^<Boolean> = (
 	^other isKindOfObjectMirror
 		and: [vmmirror is: reflectee identicalTo: other reflectee]
 )
-public evaluate: expression <String>
-ifCompilerError: compilationErrorHandler <[:Error]>
-ifError: evalErrorHandler <[:Error]> ^<ObjectMirror> = (
-	^self evaluate: expression with: Map new ifCompilerError: compilationErrorHandler ifError: evalErrorHandler
-)
-public evaluate: expression <String>
-with: scope <Map[Symbol, ObjectMirror]>
-ifCompilerError: compilationErrorHandler <[:Error]>
-ifError: evalErrorHandler <[:Error]> ^<ObjectMirror> = (
-	(* Evaluate [expression] with the reflectee as the receiver. If [expression] cannot be compiled, activate [compilationErrorHandler] with the exception. If the evaluation of [expression] raises an error, activate [evalErrorHandler] with the error. Otherwise return an ObjectMirror on the result of [expression]. *)
-	| rawScope cls mxn mtdMirror result |
-	rawScope:: Map new.
-	scope keysAndValuesDo: [:key :value | rawScope at: key put: value reflectee].
-
-	[cls:: vmmirror classOf: reflectee.
+private compileExpression: expression with: rawScope = (
+	| cls mxn mtdMirror state result |
+	cls:: vmmirror classOf: reflectee.
 	mxn:: MixinMirror reflecting: cls mixin.
 	mtdMirror:: compiler
 		compileExpressionSource: expression asString
@@ -1241,19 +1233,53 @@ ifError: evalErrorHandler <[:Error]> ^<ObjectMirror> = (
 	mtdMirror methodMixin: cls mixin definingClass.
 	mtdMirror compiledMethod properties
 		at: #source put: expression;
-		at: #debugInfo put: mtdMirror debugInfo]
-			on: Error
-			do: [:e | ^compilationErrorHandler cull: e ].
+		at: #debugInfo put: mtdMirror debugInfo.
 
-	[result:: vmmirror
-		object: reflectee
-		executeMethod: mtdMirror compiledMethod
-		with: {nil. rawScope}
-		ifFail: [ ^compilationErrorHandler cull: (Error description: 'primitiveExecuteMethod failed') ]]
-			on: Error
-			do: [:e | ^evalErrorHandler cull: e].
+	^mtdMirror compiledMethod
+)
+public evaluate: expression <String> ^<ThreadMirror> = (
+	^self evaluate: expression with: Map new
+)
+public evaluate: expression <String> with: scope <Map[Symbol, ObjectMirror]> ^<ThreadMirror> = (
+	| rawScope expressionMethod state result latch process |
+	rawScope:: Map new.
+	scope keysAndValuesDo: [:key :value | rawScope at: key put: value reflectee].
+	expressionMethod:: compileExpression: expression with: scope.
 
-	^ObjectMirror reflecting: result
+	state:: #running.
+	latch:: Semaphore new.
+	process::
+		[[result:: vmmirror
+			object: reflectee
+			executeMethod: expressionMethod
+			with: {nil. rawScope}
+			ifFail: [^Error signal: 'primitiveExecuteMethod failed'].
+		  state:: #fulfilled.
+		  latch signal] 
+			on: UnhandledError
+			do:
+				[:ex | 
+				result:: ex exception.
+				state:: #broken.
+				latch signal.
+				process suspend]. 
+		] newProcess.
+
+	process
+		name: 'Evaluating ', expression asString;
+		resume.
+	latch wait.
+
+	state = #broken ifTrue:
+		[(* position the process to continue in the signalerContext *)
+		process suspendedContext unwindTo: result signalerContext.
+		result signalerContext push: result.
+		process suspendedContext: result signalerContext].
+
+	^ThreadMirror
+		state: state
+		result: (ObjectMirror reflecting: result)
+		process: process
 )
 public getClass ^<ClassMirror> = (
 	^ClassMirror reflecting: (vmmirror classOf: reflectee)
@@ -1361,6 +1387,24 @@ public source = (
 	ast:: parser classHeader parseString: mixin cachedHeaderSource.
 	myTree:: (ast slots select: [:t | t name = name]) first.
 	^mixin cachedHeaderSource copyFrom: myTree start to: myTree end
+)
+) : (
+)
+class ThreadMirror state: s result: r process: p = (
+	|
+	protected state = s.
+	public result = r.
+	public process = p.
+	|
+) (
+public isBroken ^<Boolean> = (
+	^state = #broken
+)
+public isFulfilled ^<Boolean> = (
+	^state = #fulfilled
+)
+public isSuspended ^<Boolean> = (
+	^state = #suspended
 )
 ) : (
 )

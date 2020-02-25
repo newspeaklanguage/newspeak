@@ -3,21 +3,21 @@ Newspeak3
 class NewspeakTypechecker usingPlatform: p ide: ide ast: astModule namespace: ns = (
 (* A visitor that computes the type of a Newspeak program.
 
-Newspeak has no global namespace, but a nominal typechecker needs one. The typechecker takes a namespace as a parameter to its factory.  All types are identified by a fully qualified name that is rooted in a top level class that is stored in this namespace. Well, almost.  If a class named C uses a type that conflicts with the top level namespace, then a special conflict namespace #'C conflicts' is added to the top level and is consulted before looking up things at the top level. The typechecker does not look into other nested namespaces.
+Newspeak has no global namespace, but a nominal typechecker needs one. The typechecker takes a namespace as a parameter to its factory.  All types are identified by a fully qualified name that is rooted in a top level class that is stored in this namespace. Well, almost.  Details below.
 
 Fully qualified names are used to define object types (see below). The checker has utilities to convert between classes and object types.
 
 Types are represented via a class hierarchy that consists of:
 
 a. Type, the abstract class at the top of the hierarchy.
-b. ObjectType, which is defined by an immutable list of symbols that defines a class as a path of class names starting from a top level class (a fully qualified name).
+b. ObjectType, which is defined by an underlying mixin.
 c. FunctionType, which is defined by a pair of a list of argument types and a return type.
 d. ErrorType, the magical type that is a subtype and supertype of everything and supports all methods. There is a special subclass
 	of ErrorType, AccessErrorType, for errors involving accessibility violations. We cache singleton instances for both.
 e. UnionType, defined by a list of types that are acceptable at a given point.
-f. GenericType, defined by an object type representing the generic, and a list of type arguments. For the time being, we largely ignore generics.
-g. TypeVariable, defined by a path that starts with its name, and a bound, which is a type.
-h. Pseudo types (subclasses of PseudoType) used to represent the receiver types of self, super, here and outer sends (respectively SelfType, SuperType, HereType, OuterType).  Each such type captures the special lookup rules of the corresponding send, especially wrt access control. This ensures that for each kind of send, the type exposes  methods that are valid.
+f. TypeVariable, defined by its name, and a bound, which is a type.
+g. Pseudo types (subclasses of PseudoType) used to represent the receiver types of self, super, here and outer sends (respectively SelfType, SuperType, HereType, OuterType).  Each such type captures the special lookup rules of the corresponding send, especially wrt access control. This ensures that for each kind of send, the type exposes methods that are valid.
+h. GenericType, defined by an object type representing the generic, and a list of type arguments. For the time being, we largely ignore generics.
 
 The typechecker is designed to be incremental. The basic ideas go back as far as the Cecil typechecker, but are properly explained in the context of Scala optimization in the OOPSLA 2016 paper: Parallel Incremental Whole-Program Optimizations for Scala.js.
 
@@ -60,6 +60,33 @@ All this is encapsulated in this module, which eventually needs to be fed into t
 
 Errors are reported by calling the error:at: method, which produces a TypeError object and adds it to a set that is returned by the typecheck. If the set is empty, typechecking succeeded. The client can then determine how to report the errors, which carry a message and source location information.
 
+More on namespacing:
+
+While modules in Newspeak are completely self contained (modulo inheritance from Object) types inherently cross module boundaries, as they describe inter-module communication.  A module typically traffics in some datatypes that it does not define. The obvious example
+is the types of the parameters to the factory method, which must originate elsewhere, unless they are all instances of the basic classes inherited from Object and their allied types. However, such types can also originate as inputs to arbitrary methods.
+
+It follows that these types cannot be found by Newspeak's dynamic lookup rules, which are restricted to the module and its superclass
+chain. The need for an external namespace stems from the above considerations.
+
+The scoping rules for types largely follow the Newspeak lookup rules, but they deviate for the following reasons:
+
+a. The need to lookup in the external namespace as noted above. We use a global, top level namespace that is consulted after conventional lookup has failed. In addition, the concept of conflict namespaces is used. See below.
+
+b. The namespace of types includes type variables that have no runtime presence. These include the special type Self and any
+type parameters (though these we may forego).
+
+c.  We cannot follow the dynamic lookup rules precisely, because the typechecker is doing a static lookup. In particular, it does not have  access to actual classes and their associated class hierarchy. Instead, it must work based on class declarations. These specify superclasses via expressions in their superclass clauses. These expressions cannot be evaluated by the typechecker, as it is intended to typecheck declarations in isolation with no access to a module's actual factory parameters.  Instead, these superclass expressions must typechecked, and a superclass type inferred in the process.  Care must be taken to avoid infinite regress in this situation.  First, we must detect circular references among superclass clauses. These are neither impossible nor illegal in Newspeak. Consider
+
+class Inane () (
+  class X = Y ()()
+  class Y = X()()
+)
+
+This is perfectly valid, and nothing bad will happen until one of the classes Inane>>X or Inane>>Y, or a subclass thereof, is instantiated, at which point we have an infinite loop. The typechecker however, should not loop in such situations.  Furthermore, we need to be able to detect the class Object at the end of the superclass chain without provoking such a cycle. This also requires care.
+
+
+ If a class named C uses a type that conflicts with the top level namespace, then a special conflict namespace #'C conflicts' is added to the top level and is consulted before looking up things at the top level. The typechecker does not look into other nested namespaces.
+
 
  (c) 1995-1997 Sun Microsystems, Inc. ALL RIGHTS RESERVED.
  (c) Google Inc. 2016 - 2017.
@@ -80,6 +107,8 @@ private ParameterizedTypeAST = astModule ParameterizedTypeAST.
 private UnaryTypeOpAST = astModule UnaryTypeOpAST.
 private BinaryTypeOpAST = astModule BinaryTypeOpAST.
 private MessagePatternAST = astModule MessagePatternAST.
+private SlotDefAST = astModule SlotDefAST.
+private ImmutableSlotDefAST = astModule ImmutableSlotDefAST.
 private VarDeclAST = astModule VarDeclAST.
 
 private ClassDeclarationMirror = p mirrors ClassDeclarationMirror.
@@ -94,12 +123,16 @@ namespace <Map[Symbol, Object]> = ns.
 trail <Map[SubtypeQuery, Boolean]> = Map new.
 scopeStack <List[Scope]> = List new.
 typeBuilder <TypeBuilder>
-currentClass <ClassDeclarationMirror>
+currentClass <MixinMirror>
 currentTopLevelClass <ClassDeclarationMirror>
 currentDeclaration <Symbol>
 currentReturnType <ObjectType>
 errorSet <Set>
 
+objectMixin <MixinMirror> = (localMember: #Object in:  (MixinMirror reflecting: (namespace at: #Kernel) mixin)) instanceSide.
+klassMixin <MixinMirror> = (localMember: #Class in:  (MixinMirror reflecting: (namespace at: #Kernel) mixin)) instanceSide.
+nilMixin <MixinMirror> = (localMember: #UndefinedObject in:  (MixinMirror reflecting: (namespace at: #Kernel) mixin)) instanceSide.
+boolMixin <MixinMirror> = (localMember: #Boolean in:  (MixinMirror reflecting: (namespace at: #Kernel) mixin)) instanceSide.
 errorType <ErrorType> = ErrorType new.
 accessErrorType <AccessErrorType> = AccessErrorType new.
 bottom <BottomType> = BottomType new.
@@ -107,13 +140,17 @@ dependentDeclarations <Map[Query, Set[Declaration]]> = Map new.
 queriesOfDeclaration <Map[Declaration, Set[Query]]> = Map new.
 dependentQueries <Map[Declaration, Set[Query]]> = Map new.
 cachedTypes <Map[Query, Type]> = Map new.
-|) (
+superclassTable <Map[Mixin, Mixin]> = Map new.
+cycle = Object new.
+|
+superclassTable at: klassMixin put: objectMixin.
+) (
 class AccessErrorType = ErrorType (
 (* A special type for access errors. These need to be reported whenever they come up, so they need to be preserved in caches.
    This, they are distinct from normal type errors.
 *)
 ) (
-isKindOfAccessErrorType ^ <Boolean> = (
+public isKindOfAccessErrorType ^ <Boolean> = (
 	^true
 )
 ) : (
@@ -121,14 +158,33 @@ isKindOfAccessErrorType ^ <Boolean> = (
 class BottomType = Type (
 (* The bottom of the type lattice. *)
 ) (
+public apply: v  = (
+  ^v bottomType: self
+)
+public asFunctionType ^ <FunctionType> = (
+  ^FunctionType domain: List new range: self
+)
 public subtypeOf: t <Type> ^ <Boolean> = (
 	^true
 )
 ) : (
 )
+class ErrorDummy = (
+(*
+The purpose of this class is to provide a dummy mixin that we can associate with the error type.
+*)
+) (
+) : (
+)
 class ErrorType = Type (
 (* The error type. *)
 ) (
+public apply: v  = (
+  ^v errorType: self
+)
+public asFunctionType  = (
+  ^self
+)
 public at: o = (
 (* One can ask an error type for the type of any selector, or for the type of the nth argument for any n *)
 	^self
@@ -138,6 +194,12 @@ public domain = (
 )
 public isKindOfErrorType ^ <Boolean> = (
 	^true
+)
+public mixin = (
+  ^(ClassDeclarationMirror reflecting: ErrorDummy mixin) instanceSide
+)
+public name ^ <String> = (
+  ^'Unspecified type'
 )
 public range = (
 	^self
@@ -156,6 +218,12 @@ class FunctionType domain: d <List[Type]> range: r <Type> = Type (
 public = o = (
 	o isKindOfFunctionType ifFalse: [^false].
 	^domain = o domain and: [range = o range]
+)
+public apply: v  = (
+  ^v functionType: self
+)
+public asFunctionType  = (
+  ^self
 )
 public hash ^ <Integer> = (
 	^(domain hash xor: range hash) bitXor: class hash
@@ -178,21 +246,24 @@ public subtypeOf: t <Type> ^ <Boolean> = (
 )
 ) : (
 )
-class GenericType generic: g <ObjectType> typeArguments: tas <List[ObjectType]> = ObjectType forPath: g path (
+class GenericType generic: g <ObjectType> typeArguments: tas <List[ObjectType]> = ObjectType forMixin: g mixin (
 (* A generic (aka parameterized) type such as List[String]. *)
 |
-	generic <ObjectType> = g.
-	typeArguments <List[ObjectType]> = tas.
+	public generic <ObjectType> = g.
+	public typeArguments <List[ObjectType]> = tas.
 |) (
 public = o = (
 	o isKindOfGenericType ifFalse: [^false].
-	^path = o path and: [typeArguments = o typeArguments]
+	^mixin = o mixin and: [typeArguments = o typeArguments]
+)
+public apply: v = (
+  ^v genericType: self
 )
 public at: selector <Symbol> ^ <FunctionType> = (
 	halt.
 )
 public hash ^ <Integer> = (
-	^(path hash bitXor: class hash) bitXor: typeArguments hash
+	^(mixin hash bitXor: class hash) bitXor: typeArguments hash
 )
 public isKindOfGenericType ^ <Boolean> = (
 	^true
@@ -203,7 +274,7 @@ public isKindOfObjectType ^ <Boolean> = (
 public printOn: s = (
 	s nextPutAll: class name.
 	s nextPutAll: ' generic: '.
-	s nextPutAll: path printString.
+	s nextPutAll: mixin printString.
 	s nextPutAll: ' typeArguments: ['.
 	typeArguments do: [:ta <ObjectType> |
 		s nextPutAll: ta printString.
@@ -216,55 +287,25 @@ public subtypeOf: t <Type> ^ <Boolean> = (
 )
 ) : (
 )
-class HereType for: c <ClassDeclarationMirror> = PseudoType for: c path: (herePathFor: c instanceSide) (
+class HereType forMixin: m <MixinMirror> = PseudoType forMixin: m (
 (* The type of the lexical scope. *)
 ) (
 public = o = (
 	o isKindOfHereType ifFalse: [^false].
-	^classDeclaration = o classDeclaration
+	^mixin = o mixin
 )
 public at: selector <Symbol> ^ <FunctionType> = (
 (* Override so that we don't insist on public members only *)
- | m <Mirror> = findMember: selector. signature <MessagePatternAST> |
+ |
+m <Mirror> = hereMember: selector in: mixin.
+signature <MessagePatternAST | SlotDefAST | ClassHeaderAST | Nil>
+|
 
-  nil = m ifTrue: [^errorType].
-  signature:: signatureFor: m.
-	^(signature apply: selfSubstitution) apply: typeBuilder
-  (* deal with substitution of Self, Instance? and build a function type *)
-)
-findMember: selector <Symbol> ^ <Mirror> = (
-(* Return the mirror representing selector in
-this type's classDeclaration. Check if it is a
-reserved word, otherwise look for a method
-defined on classDeclaration*)
-	selector = #nil
-		ifTrue: [^mirrorForObjectType: (literal: #Nil)].
-	({#true. #false} includes: selector)
-		ifTrue: [^mirrorForObjectType: (literal: #Boolean)].
-	(* check reserved words *)
-	^findOwnMember: selector
-)
-findOwnMember: selector <Symbol> ^ <Mirror> = (
-(* Find the method named selector defined in this
-type's classDeclaration. First check for local slots
-or formal parameters in the current method/block
-scope, otherwise climb the enclosing class hierarchy
-(lexical scope) and finally try the type of the
-classDeclaration (i.e., "self" ). *)
-	| actualType <MixinMirror> m <MethodMirror> localType <ObjectType> |
-
-	localType:: typeOfLocal: selector.
-	nil ~= localType
-		ifTrue: [^mirrorForObjectType: localType]. (* formal or temp *)
-
-	actualType:: classDeclaration instanceSide.
-
-	 [nil ~= actualType] whileTrue: [
-		m:: memberOf: actualType selector: selector.
-		nil ~= m ifTrue: [^m].
-		actualType:: actualType enclosingMixin.
-		]. (* lexical scope *)
-	^(objectTypeFor: classDeclaration) at: selector. (* check self *)
+  nil = m ifTrue: [^errorTypeForSelector: selector].
+  signature:: signatureFor: m withSelector: selector.
+  nil = signature ifTrue: [^errorType].
+  ^((signature apply: selfSubstitution) apply: typeBuilder) asFunctionType
+  (* deal with substitution of Self and build a function type *)
 )
 public isKindOfHereType ^ <Boolean> = (
 	^true
@@ -278,7 +319,7 @@ selfIdAST ^ <AST> = (
 	(* should be a type variable; definitely not the here type *)
 )
 selfSubstitution ^ <Substitutor> = ( (* we should cache these *)
-	 ^Substitutor forSubstitution: (Map new at: #Self put: typeOfSelf)
+	 ^Substitutor forSubstitution: (Map new at: #Self put: typeOfSelf; yourself)
 )
 public subtypeOf: t <Type> ^ <Boolean> = (
 (* could use equality *)
@@ -289,54 +330,52 @@ supertype ^ <ObjectType> = ( (* Could return Object *)
 )
 ) : (
 )
-class ObjectType forPath: ts <List[Symbol]> = Type (
+class ObjectType forMixin: m <MixinMirror> = Type (
 (* The type of an Object. *)
 |
-	public path <List[Symbol]> = ts.
+	public mixin = m.
 |) (
 public = o ^ <Boolean> = (
 	o isKindOfObjectType ifFalse: [^false].
-	^path = o path
+	^mixin = o mixin
+)
+public apply: v  = (
+  ^v objectType: self
+)
+public asFunctionType ^ <FunctionType> = (
+  ^FunctionType domain: List new range: self
 )
 public at: selector <Symbol> ^ <FunctionType> = (
- | m <Mirror> = findMember: selector. signature <MessagePatternAST> |
+ | m <Mirror | Nil> = publicMember: selector at: mixin. signature <MessagePatternAST> |
 
-  nil = m ifTrue: [^errorType].
-  m accessModifier ~= #public ifTrue: [^accessErrorType].
+  nil = m ifTrue: [^errorTypeForSelector: selector].
   signature:: signatureFor: m withSelector: selector.
-	^(signature apply: selfSubstitution) apply: myTypeBuilder
-  (* deal with substitution of Self, Instance? and build a function type *)
+  ^((signature apply: selfSubstitution) apply: myTypeBuilder) asFunctionType
+  (* deal with substitution of Self and build a function type *)
 )
-findMember: selector <Symbol> ^ <Mirror> = (
-	|
-	actualType <ClassDeclarationMirror>
-	m <MethodMirror>
-	|
-	actualType:: mirrorForObjectType: self.
-	[actualType ~= nil] whileTrue: [
-		m:: nonPrivateMemberOf: actualType instanceSide selector: selector.
-		nil ~= m ifTrue: [^m].
-		actualType:: superclassOf: actualType.
-		].
-	^nil
+errorTypeForSelector: selector  = (
+   | result |
+   result::  anyMember: selector at: mixin.
+   result = nil ifTrue: [^errorType].
+   ^accessErrorType
 )
 public hash ^ <Integer> = (
-	^path hash bitXor: class hash
+	^mixin hash bitXor: class hash
 )
 public isKindOfObjectType ^ <Boolean> = (
 	^true
 )
 myTypeBuilder ^ <TypeBuilder> = (
 (* really need to cache this somewhere *)
-	^typeBuilderFor: (mirrorForObjectType: self)
+	^typeBuilderFor: mixin declaration
 )
 public name ^ <String> = (
-	^(path inject: '' into: [:s <String> :e <Symbol> | s, e, ' ']) allButLast.
+	^mixin name.
 )
 public printOn: s = (
 	s nextPutAll: class name.
-	s nextPutAll: ' forPath: '.
-	s nextPutAll: path printString
+	s nextPutAll: ' forMixin: '.
+	s nextPutAll: mixin name
 )
 selfIdAST ^ <AST> = (
 | tree <AST> |
@@ -351,11 +390,11 @@ selfIdAST ^ <AST> = (
 	^tree
 )
 selfSubstitution ^ <Substitutor> = ( (* we should cache these out the object type *)
-	 ^Substitutor forSubstitution: (Map new at: #Self put: selfIdAST)
+	 ^Substitutor forSubstitution: (Map new at: #Self put: selfIdAST; yourself)
 )
 signatureFor: m <Mirror> withSelector: selector <Symbol> ^ <MessagePatternAST> = (
 	^m isKindOfMethodMirror ifTrue: [
-		parser messagePattern parseString: m source. (* parse the message pattern *)
+		parser parseMessagePattern: m source. (* parse the message pattern *)
 		] ifFalse: [
 		m isKindOfSlotDeclarationMirror
 			ifTrue: [signatureForSlot: m withSelector: selector]
@@ -364,7 +403,7 @@ signatureFor: m <Mirror> withSelector: selector <Symbol> ^ <MessagePatternAST> =
 )
 signatureForNestedClass: m <ClassDeclarationMirror> ^ <MessagePatternAST> = (
 	| classType <UnaryTypeOpAST> |
-	classType = UnaryTypeOpAST new
+	classType:: UnaryTypeOpAST new
 		operand: (TypeIdAST new name: m name; yourself);
 		operator: #class;
 		yourself.
@@ -376,10 +415,10 @@ signatureForNestedClass: m <ClassDeclarationMirror> ^ <MessagePatternAST> = (
 		yourself
 )
 signatureForSlot: m <SlotDeclarationMirror> withSelector: selector <Symbol> ^ <MessagePatternAST> = (
-	| ast <SlotDefAST> = parser slotDeclaration parse: m source. slotType <AST> params |
+	| ast <SlotDefAST> = parser parseSlotDefinition: m source. slotType <AST> params |
 	slotType:: ast type.
 	nil = slotType ifTrue: [slotType:: errorType].
-	params = (selector last asSymbol = ':'
+	params:: (selector last asSymbol = ':'
 		ifTrue: [{VarDeclAST name: m name type: slotType}]
 		ifFalse: [{}]).
 	^MessagePatternAST new
@@ -394,48 +433,31 @@ public subtypeOf: t <Type> ^ <Boolean> = (
 	t = errorType ifTrue: [^true].
 	t isKindOfObjectType ifFalse: [^false] ifTrue: [ot:: t].
 
-	path = ot path ifTrue: [^true].
+	mixin = ot mixin ifTrue: [^true].
 	(supertype subtypeOf: t) ifTrue: [^true].
 	^false
 )
 supertype ^ <ObjectType> = (
- |
-  actualType <ClassDeclarationMirror>
-  superklass <ClassDeclarationMirror>
-  supertypePath <List[Symbol]> ::= {}.
- |
-
-  (* TODO: This could be a mixin application - but they have to be named *)
-  actualType:: mirrorForObjectType: self.
-  superklass:: actualType superclass.
-  supertypePath:: pathForMixin: superklass instanceSide.
-	^ObjectType forPath: supertypePath.
+  ^ObjectType forMixin: (superclassOf: mixin).
 )
 ) : (
 )
-class OuterType for: c <ClassDeclarationMirror> = PseudoType for: c path: {#@Outer} (
-(* The type of outer inside class declaration c. *)
+class OuterType forMixin: m <MixinMirror> = PseudoType forMixin: m (
+(* The type of outer inside mixin m. *)
 ) (
 public = o = (
 	o isKindOfOuterType ifFalse: [^false].
-	^classDeclaration = o classDeclaration
+	^mixin = o mixin
 )
-findMember: selector <Symbol> ^ <ClassDeclarationMirror> = (
-(* Return a mirror representing
-the outer class named selector in
-this type's classDeclaration *)
-| actualType <ClassDeclarationMirror> m <MethodMirror> |
-	actualType:: classDeclaration  enclosingClass.
+public at: selector <Symbol> ^ <FunctionType> = (
+(* override superclass to avoid access check. Maybe we just want to create an overridable access check to be called
+from ObjectType>>at: instead?  *)
+ | m <Mirror> = localMember: selector in: mixin. signature <MessagePatternAST> |
 
-	 [nil ~= actualType] whileTrue: [
-		m:: actualType instanceSide nestedClasses findMirrorNamed: selector.
-		nil ~= m ifTrue: [^m].
-		actualType simpleName = selector ifTrue: [^actualType].
-		(* usually, we'd find it at the next level, but for the top level
-		   we need to check here *)
-		actualType:: actualType enclosingClass.
-		]. (* lexical scope *)
-	^nil
+  nil = m ifTrue: [^errorType].
+  signature:: signatureFor: m withSelector: selector.
+  (* deal with substitution of Self *)
+  ^((signature apply: selfSubstitution) apply: myTypeBuilder) asFunctionType (* and build a function type *)
 )
 public isKindOfOuterType ^ <Boolean> = (
 	^true
@@ -457,33 +479,13 @@ public subtypeOf: t <Type> ^ <Boolean> = (
 )
 supertype ^ <ObjectType> = (
 (* No one should be asking an outer type for its supertype *)
-	^ObjectType forPath: {#Object}
+	^ObjectType forMixin: objectMixin
 )
 ) : (
 )
-class PathFinder forTypesIn: klass <ClassDeclarationMirror> = (
-(* A visitor on type expression ASTs that computes a path that defines the underlying ObjectType the type expression represents. *)
-| surroundingClass <ClassDeclarationMirror> = klass. |) (
-public binaryTypeOpNode: node <BinaryTypeOpAST> ^ <List[Symbol]> = (
-	^{} (* return the empty path, which should be interpreted by the caller as an error type*)
-)
-public typeIdNode: node <TypeIdAST> ^ <List[Symbol]> = (
-	^lookupPathForType: node name inClass: surroundingClass
-)
-public unaryTypeOpNode: node <UnaryTypeOpAST> ^ <List[Symbol]> = (
-	| operator <Symbol> |
-	operator:: node operator.
-	(operator = #class or: [operator = #instance or: [operator = #def and: [self target isTypeVar]]])
-		 ifFalse: [error: 'No unary type operator ', operator at: {node operand concreteEnd + 1. node concreteEnd}].
-	^(node operand apply: self), {node operator}
-)
-) : (
-)
-class PseudoType for: c <ClassDeclarationMirror> path: p <List[Symbol]> = ObjectType forPath: p (
+class PseudoType forMixin: m <MixinMirror> = ObjectType forMixin: m (
 (* An abstract type for pseudo variables like here and outer. *)
-|
-	public classDeclaration <ClassDeclarationMirror> = c.
-|) (
+) (
 public = o = (
 (* If we add any new subclass, must test for it here too
 so that we never answer true if one of these somehow
@@ -491,20 +493,7 @@ gets instantiated. *)
    o isKindOfPseudoType ifFalse: [^false].
    o isKindOfHereType ifTrue: [^false].
    o is isKindOfOuterType ifTrue: [^false].
-   classDeclaration = o classDeclaration
-)
-public at: selector <Symbol> ^ <FunctionType> = (
-(* override superclass to avoid access check. Maybe we just want to create an overridable access check to be called
-from ObjectType>>at: instead?  *)
- | m <Mirror> = findMember: selector. signature <MessagePatternAST> |
-
-  nil = m ifTrue: [^errorType].
-  signature:: signatureFor: m.
-  (* deal with substitution of Self, Instance? *)
-	^(signature apply: selfSubstitution) apply: myTypeBuilder (* and build a function type *)
-)
-public hash ^ <Integer> = (
-	^classDeclaration hash bitXor: class hash
+   mixin = o mixin
 )
 public isKindOfPseudoType ^ <Boolean> = (
 	^true
@@ -519,7 +508,7 @@ public invalidate = (
 )
 ) : (
 )
-class SelfType for: c <ClassDeclarationMirror> path: p <List[Symbol]> = PseudoType for: c path: p (
+class SelfType forMixin: m <MixinMirror> = PseudoType forMixin: m (
 (* The type of the pseudovariable 'self'. As usual, the motivation is access control.
 Because self sends behave differently wrt access control, type enforcement must be
 specialized as it is here.
@@ -527,41 +516,21 @@ specialized as it is here.
 ) (
 public = o ^ <Boolean> = (
 	o isKindOfSelfType ifFalse: [^false].
-	^classDeclaration = o classDeclaration
+	^mixin = o mixin
 )
 public at: selector <Symbol> ^ <FunctionType> = (
- | m <Mirror> = findLocalMember: selector. signature <MessagePatternAST> |
-
-	nil = m ifTrue: [
-		m:: findInheritedMember: selector.
-		nil = m ifTrue: [^errorType].
-		m accessModifier = #private ifTrue: [^accessErrorType].
-		].
-	signature:: signatureFor: m.
+ | result <Mirror> signature <MessagePatternAST> |
+      result:: selfMember: selector at: mixin.
+      result = nil ifTrue: [^errorTypeForSelector: selector].
+	signature:: signatureFor: m withSelector: selector.
 	 (* deal with substitution of Self, Instance? *)
-	^(signature apply: selfSubstitution) apply: myTypeBuilder (* and build a function type *)
-)
-findInheritedMember: selector <Symbol> ^ <Mirror> = (
-	|
-	actualType <ClassDeclarationMirror>
-	m <MethodMirror>
-	|
-	actualType:: classDeclaration superclass.
-
-	 [nil ~= actualType] whileTrue: [
-		m:: nonPrivateMemberOf: actualType instanceSide selector: selector.
-		nil ~= m ifTrue: [^m].
-		actualType:: superclassOf: actualType.
-		].
-	^memberOf: (superclassOf: classDeclaration) instanceSide selector: selector
-	(* If we didn't find any non-private member, look for for private ones so
-	  we can give a good error message *)
-)
-findLocalMember: selector <Symbol> ^ <Mirror> = (
-	^memberOf: (mirrorForObjectType: self) instanceSide selector: selector.
+	^((signature apply: selfSubstitution) apply: myTypeBuilder) asFunctionType (* and build a function type *)
 )
 public isKindOfSelfType ^ <Boolean> = (
 	^true
+)
+myTypeBuilder ^ <TypeBuilder> = (
+	^typeBuilderFor: mixin
 )
 ) : (
 )
@@ -612,19 +581,31 @@ public messagePatternNode: node <MessagePatternAST> = (
 		selector: node selector;
 		accessModifier: node accessModifier;
 		parameters: (node parameters collect: [:p <AST> | p apply: self]);
-		returnType: (node returnType apply: self);
-		concreteStart: node concreteStart;
-		concreteEnd: node concreteEnd;
+		returnType: ((returnTypeFor: node) apply: self);
 		yourself
 )
+public slotDefNode: node <SlotDefAST> = (
+  |
+  slotKlass = node isMutable ifTrue: [SlotDefAST] ifFalse: [ImmutableSlotDefAST].
+  result = slotKlass new.
+  |
+  result accessModifier: node accessModifier.
+  result isTransient: node isTransient.
+  result slotDecl: (node slotDecl apply: self).
+  result initializer: node initializer. (* BOGUS *)
+  ^result.
+)
 public typeIdNode: node <TypeIdAST> ^ <AST> = (
-	^substitution at: node name ifAbsent: [^node]
+	^(substitution at: node name ifAbsent: [^node]) apply: Type2AST new
 )
 public unaryTypeOpNode: node <UnaryTypeOpAST> ^ <UnaryTypeOpAST> = (
 	^UnaryTypeOpAST new
 		operator: node operator;
 		operand: (node operand apply: self);
 		yourself
+)
+public varDeclNode: node <VarDeclAST> = (
+  ^VarDeclAST name: node name type: (node type isNil ifTrue: [nil] ifFalse: [node type apply: self])
 )
 ) : (
 )
@@ -652,7 +633,7 @@ public isKindOfSubtypeQuery ^ <Boolean> = (
 )
 ) : (
 )
-class SuperType for: c <ClassDeclarationMirror> path: p <List[Symbol]> = PseudoType for: c path: p (
+class SuperType forMixin: m <MixinMirror>  = PseudoType forMixin: m (
 (* The type of the pseudovariable super. Here, c represents the mirror on the superclass
 of the class being typechecked.
 
@@ -662,19 +643,16 @@ since super sends behave differenty than either self sends or normal sends.
 ) (
 public = o = (
 	o isKindOfSuperType ifFalse: [^false].
-	^classDeclaration = o classDeclaration
+	^mixin = o mixin
 )
 public at: selector <Symbol> ^ <FunctionType> = (
- | m <Mirror> = findMember: selector. signature <MessagePatternAST> |
+ | m <Mirror> = superMember: selector at: mixin. signature <MessagePatternAST> |
 
-  nil = m ifTrue: [^errorType].
-  m accessModifier = #private ifTrue: [^accessErrorType].
-(* protected or public access is ok *)
-  signature:: signatureFor: m.
-  (* deal with substitution of Self, Instance?
-These must be substituted with the appropriate values
+  nil = m ifTrue: [^errorTypeForSelector: selector].
+  signature:: signatureFor: m withSelector: selector.
+  (* deal with substitution of Self. Self must be substituted with the appropriate values
 for the current class, not the the superclass *)
-	^(signature apply: selfSubstitution) apply: myTypeBuilder (* and build a function type *)
+	^((signature apply: selfSubstitution) apply: myTypeBuilder) asFunctionType (* and build a function type *)
 )
 public isKindOfSuperType ^ <Boolean> = (
 	^true
@@ -684,17 +662,57 @@ public isKindOfSuperType ^ <Boolean> = (
 class Type = (
 (* Abstract class, root of the type hierarchy. *)
 ) (
+public asFunctionType  = (
+  ^subclassResponsibility
+)
 public subtypeOf: t <Type> ^ <Boolean> = (
 	subclassResponsibility
 )
 ) : (
 )
-class TypeBuilder forTypesIn: klass <ClassDeclarationMirror> = (
+class Type2AST = (
+) (
+public bottomType: b <BottomType> = (
+  ^TypeIdAST new name: #'bottom``'; yourself
+)
+public errorType: e <ErrorType> = (
+  ^TypeIdAST new name: #'error``'; yourself
+)
+public functionType: f <FunctionType> ^ <MessagePatternAST> = (
+  | ps = f domain collect: [:t | t apply: self].  r = f range apply: self.|
+
+  ^MessagePatternAST selector: #'unknown`' parameters: ps  returnType: r
+)
+public genericType: g <GenericType> ^ <ParameterizedTypeAST> = (
+  ^ParameterizedTypeAST new
+      generic: (g generic apply: self);
+      arguments: (g typeArguments collect: [:ta <ObjectType> | ta apply: self]);
+      yourself
+)
+public objectType: ot <ObjectType> ^ <TypeIdAST> = (
+  ^TypeIdAST new name: ot name; yourself
+)
+public typeVariable: tv <TypeVariable> ^ <TypeIdAST> = (
+  ^TypeIdAST new name: tv name; yourself
+)
+public unionType: u <UnionType> ^ <BinaryTypeOpAST> = (
+  ^u elements fold: [:e <Type> :f <BinaryTypeOpAST> |
+	BinaryTypeOpAST new
+        leftOperand: (e apply: self);
+        rightOperand: f;
+        operator: #|;
+        yourself
+  ]
+)
+) : (
+)
+class TypeBuilder forTypesIn: klass <MixinMirror> = (
 (* A visitor that creates a Type from an AST representing a type. *)
 |
 surroundingClass <ClassDeclarationMirror> = klass.
-pathFinder <PathFinder> = PathFinder forTypesIn: surroundingClass.
-|assert: [klass isMirror] message: '') (
+|
+
+assert: [klass isKindOfMirror] message: '') (
 public binaryTypeOpNode: node <BinaryTypeOpAST> ^ <Type> = (
 	| l = node leftOperand apply: self. r = node rightOperand apply: self. |
 	node operator = '|' ifTrue: [^UnionType unifying: {l. r}].
@@ -712,11 +730,38 @@ public messagePatternNode: node <MessagePatternAST> ^ <FunctionType> = (
 		domain: (node parameters collect: [:p <VarDeclNode> | p type apply: self])
 		range: ((returnTypeFor: node) apply: self)
 )
-public typeIdNode: node <TypeIdAST> ^ <Type> = (
-	^ObjectType forPath: (lookupPathForType: node name inClass: surroundingClass)
+public typeIdNode: node <TypeIdAST> ^ <ObjectType> = (
+    |
+    m  <MixinMirror | MethodMirror | ClassDeclarationMirror | SlotDeclarationMirror | TypeVariable | Nil> =
+       type: node name at: surroundingClass.
+    s <MessagePatternAST | SlotDefAST | ClassHeaderAST | Nil>
+    |
+
+     m isKindOfTypeVariable ifTrue: [^m].
+     m isKindOfClassDeclarationMirror ifTrue: [
+       ^ObjectType forMixin: m instanceSide
+     ].
+     m isKindOfSlotDeclarationMirror ifTrue: [
+	   s:: signatureFor: m.
+	   ^s type apply: self
+	].
+      m isKindOfMethodMirror ifTrue: [
+	  s:: signatureFor: m.
+	halt.
+	  ^s returnType apply: self
+	].
 )
 public unaryTypeOpNode: node <UnaryTypeOpAST> ^ <ObjectType> = (
-	^ObjectType forPath: (node apply: pathFinder)
+      |
+      operand = node operand apply: self.
+      |
+      ('unary type op ', node operator) out.
+      operand out.
+      node operator = #class ifTrue: [
+	  ^ObjectType forMixin: operand mixin classMixin
+	].
+
+	^ObjectType forMixin: (type: node operator at: operand mixin) instanceSide
 )
 ) : (
 )
@@ -725,16 +770,24 @@ public message = s.
 public start = p1.
 public end = p2.
 |) (
+public printString ^ <String> = (
+  ^'Type error: ', message
+)
 ) : (
 )
-class TypeVariable named: n <Symbol> bound: b <ObjectType> forType: t <ObjectType> = ObjectType forPath: t path, {n} (
+class TypeVariable named: n <Symbol> bound: b <ObjectType> forType: t <ObjectType> = ObjectType forMixin: b mixin (
 (* Type variables, such as Self, Instance or generics. *)
 |
-	bound <ObjectType> = b.
+	public name = n.
+	public bound <ObjectType> = b.
+	owner <ObjectType>  = t.
 |) (
 public = o ^ <Boolean> = (
 	o isKindOfTypeVariable ifFalse: [^false].
-	^path = o path
+	^mixin = o mixin
+)
+public apply: v = (
+  ^v typeVariable: self
 )
 public at: selector <Symbol> ^ <FunctionType> = (
 	^bound at: selector
@@ -742,16 +795,13 @@ public at: selector <Symbol> ^ <FunctionType> = (
 public isKindOfTypeVariable ^ <Boolean> = (
 	^true
 )
-public name ^ <Symbol> = (
-	^path first
-)
 public subtypeOf: t <Type> ^ <Boolean> = (
 	^bound subtypeOf: t
 )
 ) : (
 )
 class UnionType unifying: ts <List[Type]> = Type (
-(* The union of th etypes in ts *)
+(* The union of the types in ts *)
 |
 	public elements <List[Type]> = ts.
 |) (
@@ -759,13 +809,32 @@ public = o = (
 	o isKindOfUnionType ifFalse: [^false].
 	^elements = o elements
 )
+public apply: v  = (
+  ^v unionType: self
+)
+public asFunctionType ^ <FunctionType> = (
+  ^FunctionType domain: List new range: self
+)
 public hash ^ <Integer> = (
 	^elements hash bitXor: class hash
 )
 public isKindOfUnionType ^ <Boolean> = (
 	^true
 )
+public subtypeOf: t <Type> ^ <Boolean> = (
+	elements inject: true into: [:b <Boolean> :e <Type>  | b and: [e subtypeOf: t]]
+)
 ) : (
+)
+anyMember: selector <Symbol> at: mixin <MixinMirror> ^ <MethodMirror | ClassDeclarationMirror | SlotDeclarationMirror | Nil> = (
+(* This routine is useful for delivering better errors. In cases where a member exists but is inaccessible, users may be confused
+    as to why no member was found. If we can't find a legal member, we can call this routine to find out if an inacessible meber
+    exists and give a more informative error message.
+*)
+  | result |
+  result:: localMember: selector in: mixin.
+  result ~= nil ifTrue: [^result].
+  ^inheritedInaccessibleMember: selector in: (superclassOf: mixin)
 )
 public blockNode: node ^ <ObjectType> = (
 | tas <VarOrdCltn[ObjectType]> = List(*[ObjectType]*)  new. |
@@ -773,7 +842,7 @@ public blockNode: node ^ <ObjectType> = (
   node parameters do: [:p <VarDecl> | tas add: (p apply: self)].
   tas addLast: (node body apply: self).
   popScope.
-	^BlockApplicationType new apply: (TypeIdAST new setId: #Fun) to: tas.
+	^GenericType new generic: (TypeIdAST new setId: #Fun) typeArguments: tas.
 )
 public cascadedSendNode: node ^ <ObjectType> = (
 	node previousSend apply: self.
@@ -786,7 +855,7 @@ public codeBodyNode: node ^ <ObjectType> = (
 	| lastStatementType <ObjectType> |
 
 	(* pushScope (if we have a map) or just nest a new one *)
-	nestScope: Scope new.
+	nestScope.
 	node temporaries do: [:t <VarDecl> | t apply: self].
 
 	(* Parameters are not typechecked here. For method bodies, the parameters are
@@ -799,6 +868,33 @@ public codeBodyNode: node ^ <ObjectType> = (
 	popScope.
 	^lastStatementType.
 )
+computeSuperclassOf: klass <MixinMirror> ^ <MixinMirror | Nil> = (
+	|
+	superclassClause <SendAST> = klass declaration header superclassClause.
+	superclassClauseType <ObjectType>
+	enclosing <MixinMirror | Nil> = klass enclosingMixin.
+	result
+	|
+	'computing superclass of : ' out.
+	klass out.
+	^enclosing isNil
+	   ifTrue: ['Found Object for top level class' out. objectMixin]
+         ifFalse: [
+	     superclassTable at: klass put: cycle.
+	     setClass: enclosing.
+	    (*must move one lexical level out before evaluating superclass clause *)
+	     superclassClauseType:: superclassClause apply: self.
+	     setClass: klass. (* reset lexical level *)
+	     superclassClauseType mixin isMeta ifFalse: [
+		  error: 'Class type expected' at: {superclassClause start. superclassClause end}.
+		  'Error, non meta, returning object mixin' out.
+		  ^objectMixin
+	      ].	(* the type should be of the form T class *)
+	      result:: superclassClauseType classMixin.
+	      'found: ' out. result out.
+	      superclassTable at: klass put: result
+	    ].
+)
 currentConflictNamespace = (
 	^namespace at: (currentTopLevelClass simpleName, ' conflicts') asSymbol ifAbsent: [Map new]
 )
@@ -809,12 +905,12 @@ currentConflictNamespaceHasEntryFor: typeName <Symbol> = (
 currentScope ^ <Scope> = (
 	^scopeStack last
 )
-declarationsForSignatureQuery: q <SignatureQuery> ^ <List[Declaration]> = (
+declarationsForSignatureQuery: q <SignatureQuery> ^ <List[Mirror]> = (
 | result <Mirror> truncated <Symbol> |
-	^{memberOf: (mirrorForObjectType: q type) instanceSide selector: q selector}
+	^{localMember: q selector in: (q type mixin)}
 )
-declarationsForSubtypeQuery: q <SubtypeQuery> ^ <List[Declaration]> = (
-	^{mirrorForObjectType: q subtype. mirrorForObjectType: q supertype}
+declarationsForSubtypeQuery: q <SubtypeQuery> ^ <List[MixinMirror]> = (
+	^{q subtype mixin. q supertype mixin}
 )
 error: msg <String> at: location <Pair[Integer]> = (
 	errorSet add: (TypeError message: msg start: location first end: location last).
@@ -824,16 +920,18 @@ functionTypeOf: node <SendASTNode> ^ <MsgSignature> = (
 	| query <Query> receiverType <ObjectType> cachedType <Type> selector <Symbol> |
 	selector:: node message selector.
 	receiverType:: node receiver apply: self.
-	query:: SignatureQuery type: receiverType selector: selector.
+	cachedType:: receiverType at: selector.
+	(* disable query system for initial testing *)
+(*	query:: SignatureQuery type: receiverType selector: selector.
 	registerDependenciesOfQuery: query.
 	cachedType:: cachedTypes at: query ifAbsent: [
 		cachedTypes at: query put: (receiverType at: selector).
-		].
+		].*)
 	cachedType isKindOfAccessErrorType ifTrue: [
 		error: selector, ' is defined, but is not accessible' at: {node concreteStart. node concreteEnd}
 		] ifFalse: [
 		cachedType isKindOfErrorType ifTrue: [
-			error: selector, ' is not defined on type ', receiverType name at: {node concreteStart. node concreteEnd}
+			error: selector, ' is not defined on type ', receiverType name at: {node start. node end}
 			].
 		].
 	^cachedType.
@@ -852,8 +950,63 @@ public guaranteedNode: node ^ <Type> = (
 (* not supported in the grammar or parser yet *)
 	^node expr type.
 )
-herePathFor: m <MixinMirror> ^ <List[Symbol]> = (
-	^(pathForMixin: m) asOrderedCollection addLast: #'@Here'; yourself
+hereMember: selector <Symbol> in: mixin <MixinMirror> ^ <MethodMirror | ClassDeclarationMirror | SlotDeclarationMirror | Nil> = (
+  | result |
+  ('searching for here member ', selector, ' in: ') out.
+  mixin out.
+  result:: lexicalMember: selector inScopeOf: mixin.
+  result ~= nil ifTrue: ['found: ' out. result out.^result].
+  selector = #nil ifTrue: ['returned nil ' out.^nilMixin].
+  ({#true. #false} includes: selector) ifTrue: ['returned bool ' out.^boolMixin].
+  ^inheritedMember: selector in: (superclassOf: mixin)
+)
+inheritedInaccessibleMember: selector <Symbol> in: mixin <MixinMirror> ^ <MethodMirror | ClassDeclarationMirror | SlotDeclarationMirror | Nil> = (
+(* used by #anyMember:at: *)
+	|
+	actualType <MixinMirror | Nil>
+	m <Mirror | Nil>
+	|
+	('searching for inherited inaccessible member ', selector, ' in: ') out.
+	mixin out.
+	actualType:: mixin.
+	[actualType ~= nil] whileTrue: [
+		m:: localMember: selector in: actualType.
+		nil ~= m ifTrue: ['found: ' out. m out.^m].
+		actualType:: superclassOf: actualType.
+		].
+	^nil
+)
+inheritedMember: selector <Symbol> in: mixin <MixinMirror> ^ <MethodMirror | ClassDeclarationMirror | SlotDeclarationMirror | Nil> = (
+(*
+Note that we cannot just do a full lookup and filter out private results; those are supposed to be completely invisible to the
+regular lookup, so that implementors can add or remove them at will. Hence, we must do the iteration up the class chain here,
+using #localNonPrivateMember:in: as the building block.
+*)
+	|
+	actualType <MixinMirror | Nil>
+	m <Mirror | Nil>
+	|
+	('searching for inherited member ', selector, ' in: ') out.
+	mixin out.
+	actualType:: mixin.
+	[actualType ~= nil] whileTrue: [
+		m:: localNonPrivateMember: selector in: actualType.
+		nil ~= m ifTrue: ['found: ' out. m out.^m].
+		actualType:: superclassOf: actualType.
+		].
+	^nil
+)
+inheritedPublicMember: selector <Symbol> in: mixin <MixinMirror> ^ <MethodMirror | ClassDeclarationMirror | SlotDeclarationMirror | Nil> = (
+(* This routine is more subtle than what might think. In particuar, it would not be correct to iterate up the superclass chain
+    Looking for public members. That woukd ignore any protected members along the path. But protected members can override
+    public ones and so we use #inheritedMember:in: to find what the inherited member would be, and then check if it is public.
+    We use #isPublic: to check this. It allows for the possibility that result is nil, and returns false in that case too.
+   If the result of #isPublic: is false, there is no public member, and we return nil.
+*)
+	| result <Mirror | Nil> |
+	result:: inheritedMember: selector in: mixin.
+	(isPublic: result) ifTrue: [^result].
+	^nil
 )
 public invalidateDeclaration: declaration <Declaration> ^ <Set[Declaration]> = (
 (* To be called when declaration has changed.
@@ -873,62 +1026,65 @@ invalidateDependenciesOn: declaration <Declaration> ^ <Set[Declaration]> = (
 		].
 	^invalidDeclarations
 )
+isPublic: m <Mirror> ^ <Boolean> = (
+	^m ~= nil and: [m accessModifier = #public]
+)
+lexicalMember: selector <Symbol> inScopeOf: mixin <MixinMirror> ^ <MethodMirror | ClassDeclarationMirror | SlotDeclarationMirror | Nil> = (
+(* Find the method named selector defined in this
+type's classDeclaration. First check scope of mixin , otherwise climb the enclosing class hierarchy
+(lexical scope)  *)
+	| actualType <MixinMirror> m <MethodMirror>  |
+	('searching for lexical member ', selector, ' in: ') out.
+	mixin out.
+	actualType:: mixin.
+
+	 [nil ~= actualType] whileTrue: [
+		m:: localMember: selector in: actualType.
+		nil ~= m ifTrue: ['found: ' out. m out.^m].
+		actualType:: actualType enclosingMixin.
+		]. (* lexical scope *)
+	^nil
+)
 literal: typeName <Symbol> ^ <ObjectType> = (
 	^(TypeIdAST new name: typeName) apply: typeBuilder
 	)
-lookupPathForType: typeName <Symbol> ^ <List[Symbol]> = (
-(* Compute path for a type name referenced in the class
-currently being typechecked. first lookup in lexical scope;
-if not found, check self; otherwise check surrounding
-namespace *)
-	| path <List[Symbol]> f <FunctionType> |
-
-	path:: pathFor: typeName inClass: currentClass.
-	^path isEmpty
-	    ifFalse: [path]
-	    ifTrue: [
-		f:: typeOfSelf at: typeName.
-		(* No lexical definition. Check self*)
-		f isKindOfErrorType ifTrue: [
-			namespace at: typeName ifAbsent: [^{}].
-			^{typeName}
-			] ifFalse: [^(objectTypeFor: currentClass) path, {typeName}].
-		(* maybe use typeOfSelf bound? *)
-	 ].
-)
-lookupPathForType: typeName <Symbol> inClass: klass <ClassDeclarationMirror> ^ <List[Symbol]> = (
-(* Compute path for a type name referenced in the class
-klass. First lookup in lexical scope of klass;
-if not found, check klass (including supertypes); otherwise
-check surrounding namespaces (conflict and regular)*)
-	| path <List[Symbol]> f <FunctionType> otype <ObjectType> |
-
-	path:: pathFor: typeName inClass: klass.
-	^path isEmpty
-	    ifFalse: [path]
-	    ifTrue: [
-		otype:: objectTypeFor: klass.
-		f:: otype at: typeName.
-		(*  No lexical definition. Check klass *)
-		^f isKindOfErrorType ifTrue: [
-			namespaceLookupPathForType: typeName ofType: (otype path first).
-			] ifFalse: [otype path, {typeName}] (*Er, this won't be canonical *)
-		]
-)
-memberOf: target <MixinMirror> selector: selector <Symbol> ^ <Mirror> = (
+localMember: selector <Symbol> in: mixin <MixinMirror> ^ <MethodMirror | ClassDeclarationMirror | SlotDeclarationMirror | Nil> = (
 | result <Mirror> |
-	result:: target methods findMirrorNamed: selector.
-	result ~= nil ifTrue: [^result].
+	('searching for local member ', selector, ' in: ') out.
+	mixin out.
+	result:: mixin methods findMirrorNamed: selector.
+	result ~= nil ifTrue: ['found: ' out. result out.^result].
+	mixin isMeta ifTrue: [
+		mixin declaration header primaryFactory simpleName = selector ifTrue: [
+			'found primary factory ', selector out.
+			^mixin declaration header primaryFactory].
+	].
 	selector last asSymbol = ':' ifTrue: [
-			result:: target slots findMirrorNamed: selector allButLast asSymbol.
+			result:: mixin slots findMirrorNamed: selector allButLast asSymbol.
 			(* assume it's a setter and look for its slot *)
-			(result ~= nil and: [result isMutable]) ifTrue: [^result]
+			(result ~= nil and: [result isMutable]) ifTrue: ['found: ' out. result out.^result]
 			] ifFalse: [
-				result:: target nestedClasses findMirrorNamed: selector.
-				result ~= nil ifTrue: [^result].
-				result:: target slots findMirrorNamed: selector.
-				result ~= nil ifTrue: [^result].
+				result:: mixin nestedClasses findMirrorNamed: selector.
+				result ~= nil ifTrue: ['found: ' out. result out.  ^result].
+				result:: mixin slots findMirrorNamed: selector.
+				^result.
 			].
+	^nil
+)
+localNonPrivateMember: selector <Symbol> in: mixin <MixinMirror> ^ <MethodMirror | ClassDeclarationMirror | SlotDeclarationMirror | Nil> = (
+| result <Mirror> |
+	('searching for local non-private member ', selector, ' in: ') out.
+	mixin out.
+	result:: localMember: selector in: mixin.
+	(nonPrivate: result) ifTrue: ['found: ' out. result out.^result].
+	^nil
+)
+localPublicMember: selector <Symbol> in: mixin <MixinMirror> ^ <MethodMirror | ClassDeclarationMirror | SlotDeclarationMirror | Nil> = (
+| result <Mirror> |
+	('searching for local public member ', selector, ' in: ') out.
+	mixin out.
+	result:: localMember: selector in: mixin.
+	(isPublic: result) ifTrue: ['found: ' out. result out.^result].
 	^nil
 )
 public messageNode: node <MessageAST> ^ <List[ObjectType]> = (
@@ -941,27 +1097,15 @@ public methodNode: node <MethodAST> ^ <MsgSignature> = (
 	| signature <FunctionType> |
 	pushScope: Scope new.
 	signature:: node pattern apply: self.
-halt.
 	currentReturnType:: signature range.
-halt.
 	node body apply: self.
 	popScope.
 	^currentReturnType
 	)
-mirrorForObjectType: o <ObjectType> ^ <ClassDeclarationMirror> = (
-	| topName <Symbol> = o path first. mirror <ClassDeclarationMirror> |
-	mirror:: ClassDeclarationMirror reflecting: (currentConflictNamespace at: topName ifAbsent: [namespace at: topName]) mixin.
-	2 to: o path size do: [:i <Integer> | | id <Symbol> = o  path at: i. |
-		id = #'@Here' ifTrue: [^mirror].
-		nil = mirror ifTrue: [^nil].
-		mirror:: mirror instanceSide nestedClasses findMirrorNamed: id.
-		].
-	^mirror
-)
 namespaceFor: typeName <Symbol> ^ <Map[Symbol, Object]> = (
 	^namespace at: (typeName, ' conflicts') asSymbol ifAbsent: [namespace]
 )
-namespaceLookupPathForType: typeName <Symbol> ofType: toplevelTypeName <Symbol> = (
+namespaceLookupPathForType: typeName <Symbol> ofType: toplevelTypeName <Symbol> ^ <List[Symbol]> = (
 (* Given typeName, a simple name of a top level type
 referenced by a top level class named toplevelTypeName,
 compute a path for it.  Check if the namespace we are
@@ -971,8 +1115,8 @@ Otherwise, check the main namespace.
 *)
 	|
 	conflictNamespaceName <Symbol> = (toplevelTypeName, ' conflicts') asSymbol.
-	conflictNamespace <Map[Symbol, Class]>
-	conflictClass <Class>
+	conflictNamespace <Map[Symbol, Class] | Nil>
+	conflictClass <Class | Nil>
 	|
 	conflictNamespace:: namespace at: conflictNamespaceName ifAbsent: [].
 	nil = conflictNamespace ifFalse: [
@@ -982,6 +1126,11 @@ Otherwise, check the main namespace.
 	namespace at: typeName ifAbsent: [^{}].
 	^{typeName}
 )
+nestScope ^ <Scope> = (
+	(* Hook up a new lexically nested scope, and push onto the scope stack *)
+	| s =  Scope parent:  currentScope. |
+	pushScope: s
+)
 nestScope: s <Scope> = (
 	(* Hook up a new lexically nested scope, and push onto the scope stack *)
 	s setSuperScope: currentScope.
@@ -990,53 +1139,17 @@ nestScope: s <Scope> = (
 nonPrivate: m <Mirror> ^ <Boolean> = (
 	^m ~= nil and: [m accessModifier ~= #private]
 )
-nonPrivateMemberOf: target <MixinMirror> selector: selector <Symbol> ^ <Mirror> = (
-| result <Mirror> |
-	result:: target methods findMirrorNamed: selector.
-	(nonPrivate: result) ifTrue: [^result].
-	selector last asSymbol = ':' ifTrue: [
-			result:: target slots findMirrorNamed: selector allButLast asSymbol.
-			(* assume it's a setter and look for its slot *)
-			((nonPrivate: result) and: [result isMutable]) ifTrue: [^result]
-			] ifFalse: [
-				result:: target nestedClasses findMirrorNamed: selector.
-				(nonPrivate: result) ifTrue: [^result].
-				result:: target slots findMirrorNamed: selector.
-				(nonPrivate: result) ifTrue: [^result].
-			].
-	^nil
-)
 public numberNode: node = (
 	^literal: #Number
 )
-objectTypeFor: c <ClassDeclarationMirror> ^ <ObjectType> = (
-	^ObjectType forPath: (pathForMixin: c instanceSide)
-)
-pathFor: typeName <Symbol> inClass: klass <ClassDeclarationMirror> ^ <List[Symbol]> = (
-(* Compute path for the name typeName referenced  in klass and
-defined in klasses'  lexical scope. Check klass, and if not found
-recurse up the enclosing class chain.
-*)
-	nil = klass ifTrue: [^{}]. (* got to the top level *)
-	(typeSelector: typeName declaredIn: klass) ifTrue: [
-		(* is this a selector of the class we are looking at *)
-		^(pathForMixin: klass mixin), {typeName}
-		(* if so , the path is the path for this class with the type name appended*)
-		].
-	^pathFor: typeName inClass: klass enclosingClass.
-	(* otherwise, recurse on the enclosing class *)
-)
-pathForMixin: mixin <MixinMirror> ^ <List[Symbol]> = (
-(* Compute the path for mixin *)
-	| enclosingMixin = mixin enclosingMixin. |
-	enclosingMixin = nil ifTrue: [^{mixin simpleName}].
-	(* A top level mixin's path includes only its simple name *)
-	^(pathForMixin: enclosingMixin), {mixin simpleName}
-	(* Otherwise, it is the path of its enclosing mixin with
-	its simple name appended *)
-)
 popScope ^ <Scope> = (
 	^scopeStack removeLast
+)
+publicMember: selector <Symbol> at: mixin <MixinMirror> ^ <MethodMirror | ClassDeclarationMirror | SlotDeclarationMirror | Nil> = (
+  | result |
+  result:: localPublicMember: selector in: mixin.
+  result ~= nil ifTrue: [^result].
+  ^inheritedPublicMember: selector in: (superclassOf: mixin)
 )
 pushScope: scope <Scope> = (
 	scopeStack addLast: scope
@@ -1061,13 +1174,19 @@ eType:: node expression apply: self.
 	ifTrue: [BottomType new]
 	ifFalse: [error: 'Type of returned expression is not a subtype of declared return type' at: {node concreteStart. node concreteEnd}]
 	)
-returnTypeFor: node <MessagePatternAST> ^ <AST> = (
-	| returnType <ObjectType> |
+returnTypeFor: node <MessagePatternAST> ^ <TypeAST> = (
+	| returnType <TypeAST | Nil> |
 	returnType:: node returnType.
 	returnType = nil ifTrue: [^ TypeIdAST new name: #Self].
 	^returnType
 )
-setClass: klass <ClassDeclarationMirror> = (
+selfMember: selector <Symbol> at: mixin <MixinMirror> ^ <MethodMirror | ClassDeclarationMirror | SlotDeclarationMirror | Nil> = (
+  | result |
+  result:: localMember: selector in: mixin.
+  result ~= nil ifTrue: [^result].
+  ^inheritedMember: selector in: (superclassOf: mixin)
+)
+setClass: klass <MixinMirror> = (
 	currentClass:: klass.
 	typeBuilder:: TypeBuilder forTypesIn: klass.
 )
@@ -1076,25 +1195,37 @@ public setterSendNode: node ^ <Type> = (
 
 	etype:: node expr apply: self.
 	(type: etype isSubtypeOf: (node var type apply: self))
-	ifFalse: [error: etype name, ' is not a subtype of ', node var type name at: {node concreteStart. node concreteEnd}].
+	ifFalse: [error: etype name, ' is not a subtype of ', node var type name at: {node start. node end}].
 	^etype
+)
+signatureFor: m <Mirror> ^ <MessagePatternAST | SlotDefAST | ClassHeaderAST | Nil> = (
+(* Ugly.  This a case where Felix's pattern matching work would be nice *)
+  m isKindOfMethodMirror ifTrue: [^parser parseMethodHeader: m source].
+  m isKindOfTransientSlotMirror ifTrue: [^(parser parseTransientSlotDeclaration: m source) slotDecl type].
+  m isKindOfSlotDeclarationMirror ifTrue: [^(parser parseSlotDefinition: m source) slotDecl type].
+  m isKindOfMixinMirror ifTrue: [^parser parseTypeId: m name].
+  m isKindOfClassDeclarationMirror ifTrue: [^parser parseTypeId: m name].
 )
 public stringNode: node = (
 	^literal: #String
 )
-public superclassOf: klass <ClassDeclarationMirror> ^ <ClassDeclarationMirror> = (
-	| superclassClause <SendAST> superclassClauseType <ObjectType> |
-	superclassClause:: klass header superclassClause.
-	setClass: klass enclosingClass.
-	(*must move one lexical level out before evaluating superclass clause *)
-	superclassClauseType:: superclassClause apply: self.
-	setClass: klass.
-	superclassClauseType path last = #class ifFalse: [
-		error: 'Class type expected' at: {superclassClause start. superclassClause end}.
-		^mirrorForObjectType: (ObjectType forPath: {#Object})
-		].
-	(* the type should be of the form T class *)
-	^mirrorForObjectType: (ObjectType forPath: superclassClauseType path allButLast)
+superMember: selector <Symbol> at: mixin <MixinMirror> ^ <MethodMirror | ClassDeclarationMirror | SlotDeclarationMirror | Nil> = (
+  ^inheritedMember: selector in: (superclassOf: mixin)
+)
+public superclassOf: klass <MixinMirror> ^ <MixinMirror | Nil> = (
+     | result <MixinMirror | Nil>  |
+      'looking for superclass of : ' out.
+      klass out.
+	klass isMeta ifTrue: ['found: ' out. klassMixin out.^klassMixin].
+	klass  = objectMixin ifTrue: ['found nil' out. ^nil].
+      result:: superclassTable at: klass ifAbsent: [computeSuperclassOf: klass].
+      result = cycle
+         ifTrue: [
+	      error: 'Error: cycle in superclass chain for class ', klass name  at: {6. klass name size + 6}.
+	      'Error, cycle : returning object mixin' out.
+	      ^objectMixin
+	   ]
+         ifFalse: ['found: ' out. result out.^result]
 )
 public symbolNode: node = (
 	^literal: #Symbol
@@ -1128,6 +1259,16 @@ tupleType:: TupleAST new apply: tupleTarget to: tupleActuals.
 
 ^ProtocolMerge new type1: sqType type2: tupleType.
 )
+type: selector <Symbol> at: mixin <MixinMirror>
+  ^ <MixinMirror | MethodMirror | ClassDeclarationMirror | SlotDeclarationMirror | TypeVariable | Nil> = (
+  | result  <MethodMirror | ClassDeclarationMirror | SlotDeclarationMirror | Nil> |
+
+  selector = #Self ifTrue: [^typeOfSelf].
+  selector = #Nil ifTrue: [^nilMixin].
+  result:: hereMember: selector in: mixin.
+  result ~= nil ifTrue: [^result].
+  ^ClassDeclarationMirror reflecting: (currentConflictNamespace at: selector ifAbsent: [namespace at: selector]) mixin
+)
 type: sub <Type> isSubtypeOf: sup <Type> ^ <Boolean> = (
 	| query |
 	query:: SubtypeQuery subtype: sub supertype: sup.
@@ -1141,39 +1282,27 @@ typeBuilderFor: klass <ClassDeclarationMirror> ^ <TypeBuilder> = (
 	^TypeBuilder forTypesIn: klass
 )
 typeOfHere ^ <ObjectType> = (
-	^HereType for: currentClass
+	^HereType forMixin: currentClass
 )
 typeOfLocal: varName <Symbol> ^ <ObjectType> = (
 	 ^currentScope at: varName ifAbsent: []
 )
 typeOfOuter ^ <ObjectType> = (
-	^OuterType for: currentClass mixin
+	^OuterType forMixin: currentClass
 )
 typeOfSelf ^ <ObjectType> = (
-	| currentType <ObjectType> = SelfType for: currentClass path: (pathForMixin: currentClass instanceSide), {#self} . |
+	| currentType <ObjectType> = SelfType forMixin: currentClass. |
 	^TypeVariable named: #Self bound: currentType forType: currentType.
 )
 typeOfSuper ^ <ObjectType> = (
-	^SuperType for: currentClass superclass path: (lookupPathForType: currentClass simpleName), {#super}
-)
-typeSelector: typeName <Symbol> declaredIn: klass <ClassDeclarationMirror> ^ <Boolean> = (
-	| mixin <MixinMirror> = klass instanceSide. candidate <Mirror> |
-
-	typeName = #Self ifTrue: [^true]. (* every klass has a self type *)
-	typeName = #Instance ifTrue: [^true]. (* and an Instance type (or only allow for metaclasses?) *)
-	candidate:: mixin nestedClasses findMirrorNamed: typeName.
-	nil ~= candidate ifTrue: [^true].
-	candidate:: mixin methods findMirrorNamed: typeName.
-	nil ~= candidate ifTrue: [^true].
-	candidate:: mixin slots findMirrorNamed: typeName.
-	^nil ~= candidate.
+	^SuperType forMixin: currentClass  superclass mixin: (superclassOf: currentClass)
 )
 public typecheckMethod: m <MethodAST> ofClass: c <Class> ^ <Set[TypeError]> = (
-	| toplevelCandidate <ClassDeclarationMirror> = ClassDeclarationMirror reflecting: c mixin. |
+	| toplevelCandidate <MixinMirror> ::= MixinMirror reflecting: c mixin. |
 	currentClass:: toplevelCandidate.
 	typeBuilder:: TypeBuilder forTypesIn: toplevelCandidate.
 	currentDeclaration:: m selector.
-	[nil ~= toplevelCandidate enclosingClass] whileTrue: [toplevelCandidate:: toplevelCandidate enclosingClass].
+	[nil ~= toplevelCandidate enclosingMixin] whileTrue: [toplevelCandidate:: toplevelCandidate enclosingMixin].
 	currentTopLevelClass:: toplevelCandidate.
 	errorSet:: Set new.
 	methodNode: m.
@@ -1181,7 +1310,7 @@ public typecheckMethod: m <MethodAST> ofClass: c <Class> ^ <Set[TypeError]> = (
 )
 public typecheckMethodSource: src <String> ofClass: c <Class> ^ <Set[TypeError]> = (
 	| m <MethodAST> |
-	m:: parser methodDecl parseString: src.
+	m:: parser parseMethodDeclaration: src.
 	^typecheckMethod: m ofClass: c.
 )
 public unresolvedSendNode: node <UnresolvedSendAST> ^ <ObjectType> = (

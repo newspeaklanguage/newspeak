@@ -5,24 +5,107 @@ private ClassDeclarationBuilder = p mirrors ClassDeclarationBuilder.
 private ObjectMirror = p mirrors ObjectMirror.
 private ActivationMirror = p mirrors ActivationMirror.
 private Message = p kernel Message.
+private StringBuilder = p kernel StringBuilder.
 private List = p collections List.
 private Map = p collections Map.
 private TestContext = m TestContext.
 |) (
 public class ActivationTests = TestBase () (
+activationRestartMethod: list = (
+	list add: 1984.
+	^10
+)
 add: x to: y = (
 	| z |
 	z:: x + y.
 	^z
 )
+assertOperandsOf: activation haveValues: values = (
+	assertList: (activation operands collect: [:ea | ea reflectee]) equals: values.
+)
+assertSlotsOf: activation haveNamesAndValues: pairs = (
+	| slots success |
+	slots:: activation slots.
+	success:: true.
+	1 to: pairs size / 2 do:
+		[:index | | name value |
+		name:: pairs at: index * 2 - 1.
+		value:: pairs at: index * 2.
+		assert: (slots at: index) name equals: name.
+		assert: (slots at: index) value reflectee equals: value].
+)
+assertThread: thread atMethod: expectedMethod snippet: expectedSnippet = (
+	| activation |
+	activation:: thread suspendedActivation.
+	assert: activation method name equals: expectedMethod.
+	assert: (currentSnippet: activation) equals: expectedSnippet.
+)
 compilationError = (
 	^Error
 )
 currentSnippet: activation = (
-	| source range |
-	source:: activation method source.
+	| range |
 	range:: activation sourceRange.
-	^source copyFrom: range start to: range stop.
+	nil = range ifTrue: [^nil].
+	^activation method source copyFrom: range start to: range stop
+)
+deadHomeWithLocals: a = (
+	| b c d |
+	b:: 2. (* Not copied *)
+	c:: 3. (* Copied *)
+	d:: 4. (* Indirect *)
+	^[d:: d + c]
+)
+describeActivation: activation = (
+	| sb = StringBuilder new. |
+	describeActivation: activation to: sb.
+	^sb asString
+)
+describeActivation: activation to: sb = (
+	| enclosing methodMixin receiverMixin source range |
+	enclosing:: activation enclosingActivation.
+	[nil = enclosing] whileFalse:
+		[sb add: '[] in '.
+		 enclosing:: enclosing enclosingActivation].
+	receiverMixin:: activation receiver getClass mixin.
+	sb add: receiverMixin name.
+	methodMixin:: activation method definingMixin.
+	methodMixin = receiverMixin ifFalse:
+		[sb add: '(', methodMixin name, ')'].
+	sb add: ' '.
+	sb add: activation method name.
+	sb add: ' '.
+
+	activation isUncontinuable ifTrue:
+		[sb add: '<uncontinuable>'. ^self].
+
+	source:: activation method source.
+	nil = source ifTrue:
+		[sb add: '<no source>'. ^self].
+	range:: activation sourceRange.
+	nil = range ifTrue:
+		[sb add: '<no source range for this bytecode>'. ^self].
+	sb add: '<'.
+	sb add: (source copyFrom: range start to: range stop).
+	sb add: '>'.
+)
+liveHomeWithLocals: a = (
+	| b c d |
+	b:: 2. (* Not copied *)
+	c:: 3. (* Copied *)
+	d:: 4. (* Indirect *)
+	^[d:: d + c] value
+)
+nlr1 = (
+	^nlr2
+)
+nlr2 = (
+	nlr3: [^2].
+	^20
+)
+nlr3: block = (
+	block value.
+	^3
 )
 quickResumeReturnAcrossBoundry = (
 	| closure thread activation |
@@ -36,14 +119,19 @@ quickResumeReturnAcrossBoundry = (
 	assert: activation sender equals: nil.
 
 	thread resume.
+
 	assert: thread isBroken.
-	assert: thread suspendedActivation equals: nil.
 	assert: (thread result reflectee printString startsWith: 'CannotReturn').
+	assert: thread suspendedActivation method name equals: #cannotReturn:.
+	assert: thread suspendedActivation sender equals: activation.
 
 	^'expected return'
 )
 seven = (
 	^[3 + 4]
+)
+seventySeven = (
+	^[(add: 3 to: 4) + (add: 30 to: 40)]
 )
 stackOf: thread = (
 	| names activation |
@@ -110,6 +198,26 @@ public testActivationEvaluate = (
 	assert: eval isBroken.
 	assert: eval result getClass mixin name equals: 'MessageNotUnderstood'.
 )
+public testActivationEvaluateEnclosingLocals = (
+	| x closure thread activation eval |
+	x:: 3. (* Not captured *)
+	closure:: [nil].
+	thread:: ActivationMirror invokeSuspended: closure.
+
+	activation:: thread suspendedActivation.
+	assert: activation receiver equals: (ObjectMirror reflecting: self).
+	assert: activation closure equals: (ObjectMirror reflecting: closure).
+	assert: activation method name equals: #testActivationEvaluateEnclosingLocals.
+
+	eval:: activation evaluate: 'x'.
+	assert: eval isFulfilled.
+	assert: eval result reflectee equals: 3.
+
+	eval:: activation evaluate: 'x: 4'.
+	assert: eval isFulfilled.
+	assert: eval result reflectee equals: 4.
+	assert: x equals: 4.
+)
 public testActivationEvaluateWithScope = (
 	| closure thread activation scope eval |
 	closure:: [add: 3 to: 4].
@@ -128,6 +236,26 @@ public testActivationEvaluateWithScope = (
 	assert: eval isFulfilled.
 	assert: eval result reflectee equals: 17.
 )
+public testActivationIsUncontinuable = (
+	| thread activation |
+	thread:: ActivationMirror invokeSuspended: [1984].
+	assertThread: thread atMethod: #testActivationIsUncontinuable snippet: '1984'. (* Push 1984 *)
+	assert: thread isSuspended.
+	activation:: thread suspendedActivation.
+	deny: activation isUncontinuable.
+
+	activation stepOver.
+
+	assertThread: thread atMethod: #testActivationIsUncontinuable snippet: '1984'. (* Return top *)
+	assert: thread isSuspended.
+	deny: activation isUncontinuable.
+
+	activation stepOver.
+
+	assert: thread isFulfilled.
+	assert: thread result equals: (ObjectMirror reflecting: 1984).
+	assert: activation isUncontinuable.
+)
 public testActivationLocals = (
 	| closure thread activation locals |
 	closure:: [add: 3 to: 4].
@@ -138,62 +266,338 @@ public testActivationLocals = (
 	thread stepInto. (* Push 4 *)
 	thread stepInto. (* Send add:to: *)
 
-	locals:: thread suspendedActivation locals.
-	assert: (locals at: 1) name equals: 'x'.
-	assert: (locals at: 1) value reflectee equals: 3.
-	assert: (locals at: 2) name equals: 'y'.
-	assert: (locals at: 2) value reflectee equals: 4.
-	assert: (locals at: 3) name equals: 'z'.
-	assert: (locals at: 3) value reflectee equals: nil.
+	assertSlotsOf: thread suspendedActivation
+		haveNamesAndValues: {#x. 3. #y. 4. #z. nil}.
+
 	thread stepInto. (* Send x *)
 
-	locals:: thread suspendedActivation locals.
-	assert: (locals at: 1) name equals: 'x'.
-	assert: (locals at: 1) value reflectee equals: 3.
-	assert: (locals at: 2) name equals: 'y'.
-	assert: (locals at: 2) value reflectee equals: 4.
-	assert: (locals at: 3) name equals: 'z'.
-	assert: (locals at: 3) value reflectee equals: nil.
+	assertSlotsOf: thread suspendedActivation
+		haveNamesAndValues: {#x. 3. #y. 4. #z. nil}.
+
 	thread stepInto. (* Send y *)
 
-	locals:: thread suspendedActivation locals.
-	assert: (locals at: 1) name equals: 'x'.
-	assert: (locals at: 1) value reflectee equals: 3.
-	assert: (locals at: 2) name equals: 'y'.
-	assert: (locals at: 2) value reflectee equals: 4.
-	assert: (locals at: 3) name equals: 'z'.
-	assert: (locals at: 3) value reflectee equals: nil.
+	assertSlotsOf: thread suspendedActivation
+		haveNamesAndValues: {#x. 3. #y. 4. #z. nil}.
+
 	thread stepInto. (* Send + y *)
 
-	locals:: thread suspendedActivation locals.
-	assert: (locals at: 1) name equals: 'x'.
-	assert: (locals at: 1) value reflectee equals: 3.
-	assert: (locals at: 2) name equals: 'y'.
-	assert: (locals at: 2) value reflectee equals: 4.
-	assert: (locals at: 3) name equals: 'z'.
-	assert: (locals at: 3) value reflectee equals: nil.
+	assertSlotsOf: thread suspendedActivation
+		haveNamesAndValues: {#x. 3. #y. 4. #z. nil}.
+
 	thread stepInto. (* Send z: *)
 
-	locals:: thread suspendedActivation locals.
-	assert: (locals at: 1) name equals: 'x'.
-	assert: (locals at: 1) value reflectee equals: 3.
-	assert: (locals at: 2) name equals: 'y'.
-	assert: (locals at: 2) value reflectee equals: 4.
-	assert: (locals at: 3) name equals: 'z'.
-	assert: (locals at: 3) value reflectee equals: 7.
+	assertSlotsOf: thread suspendedActivation
+		haveNamesAndValues: {#x. 3. #y. 4. #z. 7}.
+
 	thread stepInto. (* Send z *)
 
-	locals:: thread suspendedActivation locals.
-	assert: (locals at: 1) name equals: 'x'.
-	assert: (locals at: 1) value reflectee equals: 3.
-	assert: (locals at: 2) name equals: 'y'.
-	assert: (locals at: 2) value reflectee equals: 4.
-	assert: (locals at: 3) name equals: 'z'.
-	assert: (locals at: 3) value reflectee equals: 7.
+	assertSlotsOf: thread suspendedActivation
+		haveNamesAndValues: {#x. 3. #y. 4. #z. 7}.
+
 	thread stepInto. (* Return top *)
 	thread stepInto. (* Return top *)
 
 	assert: thread isFulfilled.
+)
+public testActivationLocalsDeadHome = (
+	| closure thread activation locals |
+	closure:: deadHomeWithLocals: 1.
+	thread:: ActivationMirror invokeSuspended: closure.
+	assert: thread isSuspended.
+
+	assertSlotsOf: thread suspendedActivation
+		haveNamesAndValues: {#a. nil. #b. nil. #c. nil. #d. nil}.
+
+	thread stepInto. (* Push d *)
+	thread stepInto. (* Push c *)
+	thread stepInto. (* Send + *)
+	thread stepInto. (* Store d *)
+
+	assertSlotsOf: thread suspendedActivation
+		haveNamesAndValues: {#a. nil. #b. nil. #c. nil. #d. nil}.
+
+	thread stepInto. (* Return top *)
+
+	assert: thread isFulfilled.
+)
+public testActivationLocalsLiveHome = (
+	| closure thread activation locals |
+	closure:: [liveHomeWithLocals: 1].
+	thread:: ActivationMirror invokeSuspended: closure.
+	assert: thread isSuspended.
+
+	thread stepInto. (* Push 1 *)
+	thread stepInto. (* Send liveHomeWithLocals: *)
+
+	assertSlotsOf: thread suspendedActivation
+		haveNamesAndValues: {#a. 1. #b. nil. #c. nil. #d. nil}.
+
+	thread stepInto. (* Push new array *)
+	thread stepInto. (* PopInto vector *)
+	thread stepInto. (* Push 2 *)
+	thread stepInto. (* PopInto b *)
+	thread stepInto. (* Push 3 *)
+	thread stepInto. (* PopInto c *)
+	thread stepInto. (* Push 4 *)
+	thread stepInto. (* PopIntoVector d *)
+
+	assertSlotsOf: thread suspendedActivation
+		haveNamesAndValues: {#a. 1. #b. 2. #c. 3. #d. 4}.
+
+	thread stepInto. (* Push vector (copied) *)
+	thread stepInto. (* Push c (copied) *)
+	thread stepInto. (* Push closure *)
+	thread stepInto. (* Send value *)
+
+	assertSlotsOf: thread suspendedActivation
+		haveNamesAndValues: {#a. 1. #b. 2. #c. 3. #d. 4}.
+
+	thread stepInto. (* Push d *)
+	thread stepInto. (* Push c *)
+	thread stepInto. (* Send + *)
+	thread stepInto. (* Store d *)
+
+	assertSlotsOf: thread suspendedActivation
+		haveNamesAndValues: {#a. 1. #b. 2. #c. 3. #d. 7}.
+
+	thread stepInto. (* Return top *)
+	thread stepInto. (* Return top *)
+	thread stepInto. (* Return top *)
+
+	assert: thread isFulfilled.
+)
+public testActivationOperandsClosure = (
+	| three four thread activation |
+	three:: 3.
+	four:: 4.
+	thread:: ActivationMirror invokeSuspended: [three + four].
+	assert: thread isSuspended.
+	activation:: thread suspendedActivation.
+	assertOperandsOf: activation haveValues: {}.
+
+	thread stepInto. (* Push three *)
+	assertOperandsOf: activation haveValues: {3}.
+
+	thread stepInto. (* Push four *)
+	assertOperandsOf: activation haveValues: {3. 4}.
+
+	thread stepInto. (* Send + *)
+	assertOperandsOf: activation haveValues: {7}.
+
+	thread stepInto. (* Return top *)
+	assertOperandsOf: activation haveValues: {}.
+	assert: thread isFulfilled.
+)
+public testActivationOperandsMethod = (
+	| thread activation |
+	thread:: ActivationMirror invokeSuspended: [add: 3 to: 4].
+	assert: thread isSuspended.
+
+	thread stepInto. (* Push 3 *)
+	thread stepInto. (* Push 4 *)
+	thread stepInto. (* Send add:to: *)
+	activation:: thread suspendedActivation.
+	assertOperandsOf: activation haveValues: {}.
+
+	thread stepInto. (* Send x *)
+	assertOperandsOf: activation haveValues: {3}.
+
+	thread stepInto. (* Send y *)
+	assertOperandsOf: activation haveValues: {3. 4}.
+
+	thread stepInto. (* Send + y *)
+	assertOperandsOf: activation haveValues: {7}.
+
+	thread stepInto. (* Send z: *)
+	assertOperandsOf: activation haveValues: {}.
+
+	thread stepInto. (* Send z *)
+	assertOperandsOf: activation haveValues: {7}.
+
+	thread stepInto. (* Return top *)
+	assertOperandsOf: activation haveValues: {}.
+
+	thread stepInto. (* Return top *)
+	assert: thread isFulfilled.
+)
+public testActivationRestartClosure = (
+	| list thread activation |
+	list:: List new.
+	thread:: ActivationMirror invokeSuspended: [list add: 1984. 10].
+
+	assertThread: thread atMethod: #testActivationRestartClosure snippet: 'list'.
+	thread suspendedActivation stepOver.
+	assertThread: thread atMethod: #testActivationRestartClosure snippet: '1984'.
+	thread suspendedActivation stepOver.
+	assertThread: thread atMethod: #testActivationRestartClosure snippet: 'add: 1984'.
+	assertList: list equals: {}.
+	thread suspendedActivation stepOver.
+	assertList: list equals: {1984}.
+
+	thread suspendedActivation restart.
+	assertThread: thread atMethod: #testActivationRestartClosure snippet: 'list'.
+
+	thread resume.
+	assert: thread isFulfilled.
+	assert: thread result equals: (ObjectMirror reflecting: 10).
+	assert: thread suspendedActivation equals: nil.
+	assertList: list equals: {1984. 1984}.
+)
+public testActivationRestartClosureWithLookup = (
+	| list thread activation |
+	list:: List new.
+	thread:: ActivationMirror invokeSuspended: [list add: 1984. 10].
+	assert: thread isSuspended.
+	assert: (describeActivation: thread suspendedActivation)
+	equals: '[] in ActivationTests testActivationRestartClosureWithLookup <list>'.
+
+	should: [activation restartWithLookup] signal: Error.
+	assert: thread isSuspended.
+	assert: (describeActivation: thread suspendedActivation)
+	equals: '[] in ActivationTests testActivationRestartClosureWithLookup <list>'.
+
+	thread resume.
+	assert: thread isFulfilled.
+	assert: thread result equals: (ObjectMirror reflecting: 10).
+	assert: thread suspendedActivation equals: nil.
+	assertList: list equals: {1984}.
+)
+public testActivationRestartMethod = (
+	| list thread activation |
+	list:: List new.
+	thread:: ActivationMirror invokeSuspended: [activationRestartMethod: list].
+
+	assertThread: thread atMethod: #testActivationRestartMethod snippet: 'list'.
+	thread suspendedActivation stepOver.
+	assertThread: thread atMethod: #testActivationRestartMethod snippet: 'activationRestartMethod: list'.
+	thread suspendedActivation stepInto.
+	assertThread: thread atMethod: #activationRestartMethod: snippet: 'list'.
+	thread suspendedActivation stepOver.
+	assertThread: thread atMethod: #activationRestartMethod: snippet: '1984'.
+	thread suspendedActivation stepOver.
+	assertThread: thread atMethod: #activationRestartMethod: snippet: 'add: 1984'.
+	assertList: list equals: {}.
+	thread suspendedActivation stepOver.
+	assertList: list equals: {1984}.
+
+	thread suspendedActivation restart.
+	assertThread: thread atMethod: #activationRestartMethod: snippet: 'list'.
+
+	thread resume.
+	assert: thread isFulfilled.
+	assert: thread result equals: (ObjectMirror reflecting: 10).
+	assert: thread suspendedActivation equals: nil.
+	assertList: list equals: {1984. 1984}.
+)
+public testActivationRestartMethodWithLookup = (
+	| builder klass instance list thread activation |
+	builder:: ClassDeclarationBuilder fromSource: 'class Foo = ()(
+		public foo: list = ( ^self bar )
+		public bar = ( ^Exception new signal )
+		public baz = ( ^Exception new signal )
+	)'.
+	klass:: builder install applyToObject reflectee.
+	instance:: klass new.
+
+	list:: List new.
+	thread:: (ActivationMirror invokeSuspended: [instance foo: list]) resume.
+	assert: thread isBroken.
+	activation:: thread suspendedActivation sender.
+	assert: (describeActivation: activation) equals: 'Foo foo: <bar>'.
+
+	(* Note the new method has a different number of temporaries than the old method. *)
+	builder instanceSide methods addFromSource:
+		'public foo: list = (
+			| temp1 temp2 |
+			temp1:: self baz.
+			temp2:: self baz.
+			list add: temp1.
+			list add: temp2.
+			^temp1 + temp2
+		)'.
+	builder install.
+	activation restartWithLookup.
+	assert: thread isSuspended.
+	activation:: thread suspendedActivation.
+	assert: (describeActivation: activation) equals: 'Foo foo: <baz>'.
+
+	thread resume.
+	assert: thread isBroken.
+	activation:: thread suspendedActivation.
+	assert: (describeActivation: activation) equals: 'Foo baz <^Exception new signal>'.
+
+	builder instanceSide methods addFromSource:
+		'public baz = ( ^1984 )'.
+	builder install.
+	activation restartWithLookup.
+	assert: thread isSuspended.
+	activation:: thread suspendedActivation.
+	assert: (describeActivation: activation) equals: 'Foo baz <1984>'.
+	assertList: list equals: {}.
+
+	thread resume.
+	assert: thread isFulfilled.
+	assert: thread result reflectee equals: 3968.
+	assertList: list equals: {1984. 1984}.
+)
+public testActivationRestartTerminated = (
+	| thread activation |
+	thread:: ActivationMirror invokeSuspended: [add: 3 to: 4].
+	assert: thread isSuspended.
+	activation:: thread suspendedActivation.
+
+	thread terminate.
+	assert: thread isTerminated.
+	assert: thread result equals: nil.
+	assert: thread suspendedActivation equals: nil.
+
+	should: [activation restart] signal: Exception.
+	assert: thread isTerminated.
+	assert: thread result equals: nil.
+	assert: thread suspendedActivation equals: nil.
+)
+public testActivationReturn = (
+	| list thread activation |
+	list:: List new.
+	thread:: ActivationMirror invokeSuspended: [list add: (add: 3 to: 4)].
+
+	assertThread: thread atMethod: #testActivationReturn snippet: 'list'.
+	thread suspendedActivation stepOver.
+	assertThread: thread atMethod: #testActivationReturn snippet: '3'.
+	thread suspendedActivation stepOver.
+	assertThread: thread atMethod: #testActivationReturn snippet: '4'.
+	thread suspendedActivation stepOver.
+	assertThread: thread atMethod: #testActivationReturn snippet: 'add: 3 to: 4'.
+	thread suspendedActivation stepInto.
+	assertThread: thread atMethod: #add:to: snippet: 'x'.
+	(* Return to another activation. *)
+	thread suspendedActivation return: (ObjectMirror reflecting: 1984).
+	assertThread: thread atMethod: #testActivationReturn snippet: 'add: (add: 3 to: 4)'.
+	thread suspendedActivation stepOver.
+	assertList: list equals: {1984}.
+	assertThread: thread atMethod: #testActivationReturn snippet: 'list add: (add: 3 to: 4)'.
+	(* Return to complete thread. *)
+	thread suspendedActivation return: (ObjectMirror reflecting: 42).
+
+	assert: thread isFulfilled.
+	assert: thread result equals: (ObjectMirror reflecting: 42).
+	assert: thread suspendedActivation equals: nil.
+)
+public testActivationReturnTerminated = (
+	| thread activation |
+	thread:: ActivationMirror invokeSuspended: [add: 3 to: 4].
+	assert: thread isSuspended.
+	activation:: thread suspendedActivation.
+
+	thread terminate.
+	assert: thread isTerminated.
+	assert: thread result equals: nil.
+	assert: thread suspendedActivation equals: nil.
+
+	should: [activation return: (ObjectMirror reflecting: 1984)] signal: Exception.
+	assert: thread isTerminated.
+	assert: thread result equals: nil.
+	assert: thread suspendedActivation equals: nil.
 )
 public testActivationSourceRange = (
 	| closure thread activation |
@@ -239,18 +643,7 @@ public testActivationSourceRange = (
 
 	assert: thread isFulfilled.
 )
-public testClosureActivation = (
-	| closure thread activation |
-	closure:: seven.
-	thread:: ActivationMirror invokeSuspended: closure.
-	assert: thread isSuspended.
-	activation:: thread suspendedActivation.
-	assert: activation closure equals: (ObjectMirror reflecting: closure).
-	assert: activation receiver equals: (ObjectMirror reflecting: self).
-	assert: activation method name equals: #seven.
-	assert: activation sender equals: nil.
-)
-public testClosureActivationStepInto = (
+public testActivationStepInto = (
 	| thread activation |
 	thread:: ActivationMirror invokeSuspended: seven.
 	assert: thread isSuspended.
@@ -268,6 +661,300 @@ public testClosureActivationStepInto = (
 	assert: thread result equals: (ObjectMirror reflecting: 7).
 	assertList: (stackOf: thread) equals: {}.
 )
+public testActivationStepIntoTerminated = (
+	| thread activation |
+	thread:: ActivationMirror invokeSuspended: [add: 3 to: 4].
+	assert: thread isSuspended.
+	activation:: thread suspendedActivation.
+
+	thread terminate.
+	assert: thread isTerminated.
+	assert: thread result equals: nil.
+	assert: thread suspendedActivation equals: nil.
+
+	should: [activation stepInto] signal: Exception.
+	assert: thread isTerminated.
+	assert: thread result equals: nil.
+	assert: thread suspendedActivation equals: nil.
+)
+public testActivationStepOut = (
+	| thread activation |
+	thread:: ActivationMirror invokeSuspended: seventySeven.
+
+	assertThread: thread atMethod: #seventySeven snippet: '3'.
+	thread suspendedActivation stepOver. (* Push 3 *)
+	assertThread: thread atMethod: #seventySeven snippet: '4'.
+	thread suspendedActivation stepOver. (* Push 4 *)
+	assertThread: thread atMethod: #seventySeven snippet:  'add: 3 to: 4'.
+	thread suspendedActivation stepInto. (* Send add:to: *)
+	assertThread: thread atMethod: #add:to: snippet:  'x'.
+	thread suspendedActivation stepOut.
+	assertThread: thread atMethod: #seventySeven snippet:  '30'.
+	thread suspendedActivation stepOver. (* Push 30 *)
+	assertThread: thread atMethod: #seventySeven snippet:  '40'.
+	thread suspendedActivation stepOver. (* Push 40 *)
+	assertThread: thread atMethod: #seventySeven snippet:  'add: 30 to: 40'.
+	thread suspendedActivation stepInto. (* Send add:to: *)
+	assertThread: thread atMethod: #add:to: snippet:  'x'.
+	thread suspendedActivation stepOut.
+	assertThread: thread atMethod: #seventySeven snippet:  '+ (add: 30 to: 40)'.
+	thread suspendedActivation stepOut.
+
+	assert: thread isFulfilled.
+	assert: thread result equals: (ObjectMirror reflecting: 77).
+	assert: thread suspendedActivation equals: nil.
+)
+public testActivationStepOutNLRSkipsGoal = (
+	| thread activation |
+	thread:: ActivationMirror invokeSuspended: [nlr1].
+
+	assertThread: thread atMethod: #testActivationStepOutNLRSkipsGoal snippet: 'nlr1'.
+	thread suspendedActivation stepInto.
+	assertThread: thread atMethod: #nlr1 snippet: 'nlr2'.
+	thread suspendedActivation stepInto.
+	assertThread: thread atMethod: #nlr2 snippet: '[^2]'.
+	thread suspendedActivation stepInto.
+	assertThread: thread atMethod: #nlr2 snippet: 'nlr3: [^2]'.
+	thread suspendedActivation stepInto.
+	assertThread: thread atMethod: #nlr3: snippet: 'block'.
+	thread suspendedActivation stepInto.
+	assertThread: thread atMethod: #nlr3: snippet: 'value'.
+	thread suspendedActivation stepInto.
+	assertThread: thread atMethod: #nlr2 snippet: '2'.
+	thread suspendedActivation stepInto.
+	assertThread: thread atMethod: #nlr2 snippet: '^2'.
+
+	thread suspendedActivation stepOut.
+	assertThread: thread atMethod: #nlr1 snippet: '^nlr2'.
+
+	thread resume.
+	assert: thread isFulfilled.
+	assert: thread result equals: (ObjectMirror reflecting: 2).
+	assert: thread suspendedActivation equals: nil.
+)
+public testActivationStepOutTerminated = (
+	| thread activation |
+	thread:: ActivationMirror invokeSuspended: [add: 3 to: 4].
+	assert: thread isSuspended.
+	activation:: thread suspendedActivation.
+
+	thread terminate.
+	assert: thread isTerminated.
+	assert: thread result equals: nil.
+	assert: thread suspendedActivation equals: nil.
+
+	should: [activation stepOut] signal: Exception.
+	assert: thread isTerminated.
+	assert: thread result equals: nil.
+	assert: thread suspendedActivation equals: nil.
+)
+public testActivationStepOver = (
+	| thread activation |
+	thread:: ActivationMirror invokeSuspended: seventySeven.
+
+	assertThread: thread atMethod: #seventySeven snippet: '3'.
+	thread suspendedActivation stepOver. (* Push 3 *)
+	assertThread: thread atMethod: #seventySeven snippet: '4'.
+	thread suspendedActivation stepOver. (* Push 4 *)
+	assertThread: thread atMethod: #seventySeven snippet: 'add: 3 to: 4'.
+	thread suspendedActivation stepOver. (* Send add:to: *)
+	assertThread: thread atMethod: #seventySeven snippet: '30'.
+	thread suspendedActivation stepOver. (* Push 30 *)
+	assertThread: thread atMethod: #seventySeven snippet: '40'.
+	thread suspendedActivation stepOver. (* Push 40 *)
+	assertThread: thread atMethod: #seventySeven snippet: 'add: 30 to: 40'.
+	thread suspendedActivation stepOver. (* Send add:to: *)
+	assertThread: thread atMethod: #seventySeven snippet: '+ (add: 30 to: 40)'.
+	thread suspendedActivation stepOver. (* Send + *)
+	assertThread: thread atMethod: #seventySeven snippet: '(add: 3 to: 4) + (add: 30 to: 40)'.
+	thread suspendedActivation stepOver. (* Return 77 *)
+
+	assert: thread isFulfilled.
+	assert: thread result equals: (ObjectMirror reflecting: 77).
+	assert: thread suspendedActivation equals: nil.
+)
+public testActivationStepOverNLRSkipsGoal = (
+	| thread activation |
+	thread:: ActivationMirror invokeSuspended: [nlr1].
+
+	assertThread: thread atMethod: #testActivationStepOverNLRSkipsGoal snippet: 'nlr1'.
+	thread suspendedActivation stepInto.
+	assertThread: thread atMethod: #nlr1 snippet: 'nlr2'.
+	thread suspendedActivation stepInto.
+	assertThread: thread atMethod: #nlr2 snippet: '[^2]'.
+	thread suspendedActivation stepInto.
+	assertThread: thread atMethod: #nlr2 snippet: 'nlr3: [^2]'.
+	thread suspendedActivation stepInto.
+	assertThread: thread atMethod: #nlr3: snippet: 'block'.
+	thread suspendedActivation stepInto.
+	assertThread: thread atMethod: #nlr3: snippet: 'value'.
+
+	thread suspendedActivation stepOver.
+	assertThread: thread atMethod: #nlr1 snippet: '^nlr2'.
+
+	thread resume.
+	assert: thread isFulfilled.
+	assert: thread result equals: (ObjectMirror reflecting: 2).
+	assert: thread suspendedActivation equals: nil.
+)
+public testActivationStepOverTerminated = (
+	| thread activation |
+	thread:: ActivationMirror invokeSuspended: [add: 3 to: 4].
+	assert: thread isSuspended.
+	activation:: thread suspendedActivation.
+
+	thread terminate.
+	assert: thread isTerminated.
+	assert: thread result equals: nil.
+	assert: thread suspendedActivation equals: nil.
+
+	should: [activation stepOver] signal: Exception.
+	assert: thread isTerminated.
+	assert: thread result equals: nil.
+	assert: thread suspendedActivation equals: nil.
+)
+public testActivationStepThrough = (
+	| thread activation |
+	thread:: ActivationMirror invokeSuspended: [nlr1].
+
+	assertThread: thread atMethod: #testActivationStepThrough snippet: 'nlr1'.
+	thread suspendedActivation stepInto.
+	assertThread: thread atMethod: #nlr1 snippet: 'nlr2'.
+	thread suspendedActivation stepInto.
+	assertThread: thread atMethod: #nlr2 snippet: '[^2]'.
+	thread suspendedActivation stepInto.
+	assertThread: thread atMethod: #nlr2 snippet: 'nlr3: [^2]'.
+
+	thread suspendedActivation stepThrough.
+	assertThread: thread atMethod: #nlr2 snippet: '2'.
+
+	thread resume.
+	assert: thread isFulfilled.
+	assert: thread result equals: (ObjectMirror reflecting: 2).
+	assert: thread suspendedActivation equals: nil.
+)
+public testActivationStepThroughNLRSkipsGoal = (
+	| thread activation |
+	thread:: ActivationMirror invokeSuspended: [nlr1].
+
+	assertThread: thread atMethod: #testActivationStepThroughNLRSkipsGoal snippet: 'nlr1'.
+	thread suspendedActivation stepInto.
+	assertThread: thread atMethod: #nlr1 snippet: 'nlr2'.
+	thread suspendedActivation stepInto.
+	assertThread: thread atMethod: #nlr2 snippet: '[^2]'.
+	thread suspendedActivation stepInto.
+	assertThread: thread atMethod: #nlr2 snippet: 'nlr3: [^2]'.
+	thread suspendedActivation stepThrough.
+	assertThread: thread atMethod: #nlr2 snippet: '2'.
+	thread suspendedActivation stepInto.
+	assertThread: thread atMethod: #nlr2 snippet: '^2'.
+
+	thread suspendedActivation stepThrough.
+	assertThread: thread atMethod: #nlr1 snippet: '^nlr2'.
+
+	thread resume.
+	assert: thread isFulfilled.
+	assert: thread result equals: (ObjectMirror reflecting: 2).
+	assert: thread suspendedActivation equals: nil.
+)
+public testActivationStepThroughTerminated = (
+	| thread activation |
+	thread:: ActivationMirror invokeSuspended: [add: 3 to: 4].
+	assert: thread isSuspended.
+	activation:: thread suspendedActivation.
+
+	thread terminate.
+	assert: thread isTerminated.
+	assert: thread result equals: nil.
+	assert: thread suspendedActivation equals: nil.
+
+	should: [activation stepThrough] signal: Exception.
+	assert: thread isTerminated.
+	assert: thread result equals: nil.
+	assert: thread suspendedActivation equals: nil.
+)
+public testActivationStepUncontinuable = (
+	| thread activation |
+	thread:: ActivationMirror invokeSuspended: [add: 3 to: 4].
+
+	assertThread: thread atMethod: #testActivationStepUncontinuable snippet: '3'.
+	thread suspendedActivation stepOver.
+	assertThread: thread atMethod: #testActivationStepUncontinuable snippet: '4'.
+	thread suspendedActivation stepOver.
+	assertThread: thread atMethod: #testActivationStepUncontinuable snippet: 'add: 3 to: 4'.
+	thread suspendedActivation stepInto.
+	assertThread: thread atMethod: #add:to: snippet: 'x'.
+
+	activation:: thread suspendedActivation.
+
+	thread suspendedActivation stepOut.
+	assertThread: thread atMethod: #testActivationStepUncontinuable snippet: 'add: 3 to: 4'.
+
+	assert: activation isUncontinuable.
+
+	should: [activation stepInto] signal: Error.
+	assertThread: thread atMethod: #testActivationStepUncontinuable snippet: 'add: 3 to: 4'.
+	assert: thread isSuspended.
+	should: [activation stepOver] signal: Error.
+	assertThread: thread atMethod: #testActivationStepUncontinuable snippet: 'add: 3 to: 4'.
+	assert: thread isSuspended.
+	should: [activation stepThrough] signal: Error.
+	assertThread: thread atMethod: #testActivationStepUncontinuable snippet: 'add: 3 to: 4'.
+	assert: thread isSuspended.
+	should: [activation stepOut] signal: Error.
+	assertThread: thread atMethod: #testActivationStepUncontinuable snippet: 'add: 3 to: 4'.
+	assert: thread isSuspended.
+	should: [activation restart] signal: Error.
+	assertThread: thread atMethod: #testActivationStepUncontinuable snippet: 'add: 3 to: 4'.
+	assert: thread isSuspended.
+	should: [activation return: (ObjectMirror reflecting: 1984)] signal: Error.
+	assertThread: thread atMethod: #testActivationStepUncontinuable snippet: 'add: 3 to: 4'.
+	assert: thread isSuspended.
+
+	thread resume.
+	assert: thread isFulfilled.
+	assert: thread result equals: (ObjectMirror reflecting: 7).
+	assert: thread suspendedActivation equals: nil.
+)
+public testBrokenThreadAtSenderOfSignal = (
+	| exception closure thread activation |
+	exception:: Exception new.
+	closure:: [exception signal].
+	thread:: (ActivationMirror invokeSuspended: closure) resume.
+
+	assert: thread isBroken.
+	assert: thread result reflectee equals: exception.
+	assertThread: thread atMethod: #testBrokenThreadAtSenderOfSignal snippet: 'exception signal'.
+)
+public testClosureActivation = (
+	| closure thread activation |
+	closure:: seven.
+	thread:: ActivationMirror invokeSuspended: closure.
+	assert: thread isSuspended.
+
+	activation:: thread suspendedActivation.
+	assert: activation closure equals: (ObjectMirror reflecting: closure).
+	assert: activation receiver equals: (ObjectMirror reflecting: self).
+	assert: activation method name equals: #seven.
+	assert: activation sender equals: nil.
+
+	activation:: activation enclosingActivation.
+	assert: activation closure equals: nil.
+	assert: activation receiver equals: (ObjectMirror reflecting: self).
+	assert: activation method name equals: #seven.
+	assert: activation sender equals: nil.
+)
+public testEnclosingActivationEquality = (
+	| closure thread activation |
+	thread:: (ObjectMirror reflecting: self) evaluateSuspended: '[1984] value'.
+	thread suspendedActivation stepInto. (* Push closure *)
+	thread suspendedActivation stepInto. (* Send value *)
+	assert: thread isSuspended.
+
+	activation:: thread suspendedActivation.
+	deny: activation closure equals: nil.
+	assert: activation sender equals: activation enclosingActivation.
+)
 public testEvaluateActivation = (
 	| closure thread activation |
 	thread:: (ObjectMirror reflecting: self) evaluateSuspended: '3 + 4'.
@@ -276,22 +963,69 @@ public testEvaluateActivation = (
 	assert: activation closure equals: nil.
 	assert: activation receiver equals: (ObjectMirror reflecting: self).
 	assert: activation method name equals: #DoItIn:With:.
+	assert: activation method source equals: '3 + 4'.
 	assert: activation sender equals: nil.
+	assert: activation enclosingActivation equals: nil.
 )
-public testEvaluateActivationStepInto = (
-	| thread activation |
-	thread:: (ObjectMirror reflecting: self) evaluateSuspended: '3 + 4'.
+public testEvaluateActivationLocals = (
+	| thread activation locals |
+	thread:: (ObjectMirror reflecting: self) evaluateSuspended: ' | seven | seven:: 3 + 4 '.
 	assert: thread isSuspended.
+
 	thread stepInto. (* Push 3 *)
-	assert: thread isSuspended.
 	thread stepInto. (* Push 4 *)
-	assert: thread isSuspended.
 	thread stepInto. (* Send + *)
+	thread stepInto. (* Send seven: *)
+
+	activation:: thread suspendedActivation.
+	assert: activation closure equals: nil.
+	assert: activation receiver equals: (ObjectMirror reflecting: self).
+	assert: activation method name equals: #DoItIn:With:.
+	assert: activation method source equals: ' | seven | seven:: 3 + 4 '.
+	assert: activation sender equals: nil.
+	locals:: activation slots.
+	assert: (locals at: 1) name equals: 'seven'.
+	assert: (locals at: 1) value reflectee equals: 7.
+)
+public testExceptionDuringResumeSlowly = (
+	| exception thread |
+	exception:: Exception new.
+	thread:: ActivationMirror invokeSuspended: [exception signal].
 	assert: thread isSuspended.
-	thread stepInto. (* Return 7 *)
-	assert: thread isFulfilled.
-	assert: thread result equals: (ObjectMirror reflecting: 7).
-	assert: thread suspendedActivation equals: nil.
+	assertThread: thread atMethod: #testExceptionDuringResumeSlowly snippet: 'exception'.
+
+	thread resumeSlowly.
+	assert: thread isBroken.
+	assert: thread result reflectee equals: exception.
+	assertThread: thread atMethod: #testExceptionDuringResumeSlowly snippet: 'exception signal'.
+)
+public testExceptionDuringStepOut = (
+	| exception thread |
+	exception:: Exception new.
+	thread:: ActivationMirror invokeSuspended: [exception signal].
+	assert: thread isSuspended.
+	assertThread: thread atMethod: #testExceptionDuringStepOut snippet: 'exception'.
+
+	thread suspendedActivation stepOut.
+	assert: thread isBroken.
+	assert: thread result reflectee equals: exception.
+	assertThread: thread atMethod: #testExceptionDuringStepOut snippet: 'exception signal'.
+)
+public testExceptionDuringStepOver = (
+	| exception thread |
+	exception:: Exception new.
+	thread:: ActivationMirror invokeSuspended: [exception signal].
+	assert: thread isSuspended.
+	assertThread: thread atMethod: #testExceptionDuringStepOver snippet: 'exception'.
+
+	thread suspendedActivation stepOver.
+	assert: thread isSuspended.
+	assertThread: thread atMethod: #testExceptionDuringStepOver snippet: 'signal'.
+
+	thread suspendedActivation stepOver.
+	assert: thread isBroken.
+	assert: thread result reflectee equals: exception.
+	assertThread: thread atMethod: #testExceptionDuringStepOver snippet: 'exception signal'.
 )
 public testQuickResumeReturnAcrossBoundry = (
 	assert: quickResumeReturnAcrossBoundry equals: 'expected return'
@@ -302,10 +1036,119 @@ public testQuickResumeUnhandledException = (
 
 	thread:: ActivationMirror invokeSuspended: closure.
 	assert: thread isSuspended.
+
 	thread resume.
+
 	assert: thread isBroken.
-	assert: thread suspendedActivation equals: nil.
 	assert: thread result reflectee equals: exception.
+	activation:: thread suspendedActivation.
+	assert: activation closure equals: (ObjectMirror reflecting: closure).
+	assert: activation receiver equals: (ObjectMirror reflecting: self).
+	assert: activation method name equals: #testQuickResumeUnhandledException.
+	assert: activation sender equals: nil.
+)
+public testThreadResumeBroken = (
+	| exception thread |
+	exception:: Exception new.
+	thread:: (ActivationMirror invokeSuspended: [exception signal]) resume.
+	assert: thread isBroken.
+	assertThread: thread atMethod: #testThreadResumeBroken snippet: 'exception signal'.
+
+	thread resume.
+	assert: thread isFulfilled.
+	assert: thread result reflectee equals: exception.
+	assert: thread suspendedActivation equals: nil.
+)
+public testThreadResumeFulfilled = (
+	| thread |
+	thread:: (ActivationMirror invokeSuspended: [add: 3 to: 4]) resume.
+	assert: thread isFulfilled.
+	assert: thread result reflectee equals: 7.
+	assert: thread suspendedActivation equals: nil.
+
+	should: [thread resume] signal: Exception.
+	assert: thread isFulfilled.
+	assert: thread result reflectee equals: 7.
+	assert: thread suspendedActivation equals: nil.
+)
+public testThreadResumeSuspended = (
+	| thread activation1 activation2 |
+	thread:: ActivationMirror invokeSuspended: [add: 3 to: 4].
+	assert: thread isSuspended.
+	assertThread: thread atMethod: #testThreadResumeSuspended snippet: '3'.
+	activation1:: thread suspendedActivation.
+
+	thread resume.
+	assert: thread isFulfilled.
+	assert: thread result reflectee equals: 7.
+	assert: thread suspendedActivation equals: nil.
+)
+public testThreadResumeTerminated = (
+	| thread |
+	thread:: (ActivationMirror invokeSuspended: [add: 3 to: 4]) terminate.
+	assert: thread isTerminated.
+	assert: thread result equals: nil.
+	assert: thread suspendedActivation equals: nil.
+
+	should: [thread resume] signal: Exception.
+	assert: thread isTerminated.
+	assert: thread result equals: nil.
+	assert: thread suspendedActivation equals: nil.
+)
+public testThreadTerminateBroken = (
+	| thread |
+	thread:: (ActivationMirror invokeSuspended: [Exception new signal]) resume.
+	assert: thread isBroken.
+	assertThread: thread atMethod: #testThreadTerminateBroken snippet: 'Exception new signal'.
+
+	thread terminate.
+	assert: thread isTerminated.
+	assert: thread result equals: nil.
+	assert: thread suspendedActivation equals: nil.
+)
+public testThreadTerminateFulfilled = (
+	| thread |
+	thread:: (ActivationMirror invokeSuspended: [add: 3 to: 4]) resume.
+	assert: thread isFulfilled.
+	assert: thread result reflectee equals: 7.
+	assert: thread suspendedActivation equals: nil.
+
+	should: [thread terminate] signal: Exception.
+	assert: thread isFulfilled.
+	assert: thread result reflectee equals: 7.
+	assert: thread suspendedActivation equals: nil.
+)
+public testThreadTerminateSuspended = (
+	| thread activation1 activation2 |
+	thread:: ActivationMirror invokeSuspended: [add: 3 to: 4].
+	assert: thread isSuspended.
+	assertThread: thread atMethod: #testThreadTerminateSuspended snippet: '3'.
+	activation1:: thread suspendedActivation.
+
+	thread stepInto. (* Push 3 *)
+	thread stepInto. (* Push 4 *)
+	thread stepInto. (* Send add:to: *)
+	assertThread: thread atMethod: #add:to: snippet: 'x'.
+	activation2:: thread suspendedActivation.
+
+	thread terminate.
+	assert: thread isTerminated.
+	assert: thread result equals: nil.
+	assert: thread suspendedActivation equals: nil.
+	assert: activation1 isUncontinuable.
+	assert: activation2 isUncontinuable.
+)
+public testThreadTerminateTerminated = (
+	| thread |
+	thread:: (ActivationMirror invokeSuspended: [add: 3 to: 4]) terminate.
+	assert: thread isTerminated.
+	assert: thread result equals: nil.
+	assert: thread suspendedActivation equals: nil.
+
+	should: [thread terminate] signal: Exception.
+	assert: thread isTerminated.
+	assert: thread result equals: nil.
+	assert: thread suspendedActivation equals: nil.
 )
 ) : (
 TEST_CONTEXT = ()
@@ -381,7 +1224,7 @@ public testSimulationImplicitReceiverSend = (
 public testSimulationJump = (
 	| mirror = ObjectMirror reflecting: self. |
 
-	"a" isString ifFalse: [^self]. (* This fails badly enough on Squeak to lock up the UI. *)
+	"a" isKindOfString ifFalse: [^self]. (* This fails badly enough on Squeak to lock up the UI. *)
 
 	assertSimulation: [(mirror evaluate: 'foo') result] answers: (mirror evaluate: 'foo') result.
 )

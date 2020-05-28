@@ -154,7 +154,8 @@ public class Compiler = super Compiler (
 
 	rewriter = Rewriter new.
 	translator = Translator new.
-	currentDepth
+	currentScope
+	currentDepth 
 	currentMixinUID
 	jsWriter = JavascriptWriter new.
 	public supportDoesNotUnderstand ::= true.
@@ -266,6 +267,12 @@ processEventualSend: node <NormalSendAST> = (
 				copyPositionFrom: node message))
 		copyPositionFrom: node
 )
+processMappedVariable: msg decl: binding = (
+	^((msg selector endsWith: ':')
+		ifTrue: [binding setterAst: msg arguments first]
+		ifFalse: [binding getterAst])
+			apply: self
+)
 public propertyCallNode: node <PropertyCallAST> ^ <PropertyCallAST> = (
 	| args |
 	assert: [node isKindOfMessageNode].
@@ -351,138 +358,6 @@ public unresolvedSendNode: node <UnresolvedSendAST> ^ <AST> = (
 	^super unresolvedSendNode: node
 )
 ) : (
-)
-class ScopeBuilder nestedIn: initialScope <Scope> atLevel: initialDepth <Integer> = ASTTool (
-(* The scope builder is a visitor on the AST. It computes a tree of scopes that shadows the AST itself. More precisely, it computes a mapping from ASTs to their scopes. This allows us to get to the appropriate scope for an abstract syntax node without polluting the AST with extraneous data like scopes.
-
-We could associate each node in the AST with the scope in which it is found, but this would be overkill. Instead, only nodes that actually introduce new scopes (such as class sides, message patterns, code bodies and blocks) actually get mapped in this manner. The intent is that later phases of compilation will visit the tree and look up the scopes at the points where they are introduced.
-
-The builder starts at a given node, in the context of some mixin, described by a mirror. This is because, in an incremental environment, we may not have the complete AST for a module, but instead be asked to process a part of that module, such as a nested class, slot definition or method. The surrounding scope can be computed from the mirror representing the immediately enclosing mixin.
-
-Then we traverse the tree, creating and populating new scopes as needed. We maintain a stack of scopes (scopeStack) that initially contains only the surrounding scope. Scopes get pushed on to the stack when we encounter a node that introduces a scope, and popped when we finish with that node. The scopes are chained to their super scopes (the scope below them on the stack).
-
-A possible optimization is to avoid a traversal of an entire side of a class.
-One can process only a side without its subtrees (i.e., methods and nested classes). These can be visited later, as long as we ensure that the processing of the subtree begins with a proper super scope on top of the scope stack. *)
-|
-currentScope ::= initialScope.
-currentDepth <Integer> ::= initialDepth. (* The lexical nesting level of the class declaration currently being visited; top-level classes are level 0. *)
-|
-) (
-public buildScopeFor: mm <MixinMirror> ^<Scope> = (
-	assert: [mm isKindOfMixinMirror] message: ''.
-	^incrementalScopeFor: mm.
-)
-public classNode: aNode <ClassDeclarationAST> = (
-	| thisClass <ClassEntry> instanceSideScope <Scope> classSideScope <Scope> |
-
-	thisClass:: ClassEntry forDeclaration: aNode atDepth: currentDepth.
-	thisClass enclosingClass: (currentScope at: #'@currentClass' ifAbsent: [nil]).
-
-	currentScope at: aNode name put: thisClass.
-
-	currentDepth:: currentDepth + 1.
-
-	instanceSideScope:: Scope parent: currentScope. (* establish instance side scope *)
-	pushScope: instanceSideScope.
-	aNode header slots do: [:v <SlotDeclAST> |
-		| se = SlotEntry forDeclaration: v atDepth: currentDepth. |
-		instanceSideScope at: v name put: se. (* getter *)
-		instanceSideScope at: (namer selectorForSlotInitializer: v) put: se.
-		v isMutable ifTrue: [instanceSideScope at: (namer selectorForSlotSetter: v) put: se]. (* setter *)].
-	instanceSideScope at: #'@currentClass' put: thisClass.
-	aNode instanceSide apply: self.
-	popScope.
-
-	classSideScope:: (Scope parent: currentScope). (* establish class side scope *)
-	pushScope: classSideScope.
-	classSideScope at: #'@currentClass' put: thisClass.
-	aNode classSide apply: self.
-	popScope.
-
-	currentDepth:: currentDepth - 1.
-)
-incrementalScopeFor: mm <MixinMirror> ^<Scope> = (
-	|
-	enclosingMixin
-	enclosingScope <Scope>
-	scope <Scope>
-	currentClass <ClassEntry>
-	depth
-	|
-	enclosingMixin:: mm declaration enclosingClass.
-	nil = enclosingMixin
-		ifTrue: [enclosingScope:: Scope new]
-		ifFalse: [enclosingScope:: incrementalScopeFor: enclosingMixin instanceSide].
-	scope:: Scope parent: enclosingScope.
-	depth:: scope depth.
-	currentClass:: ClassEntry
-		forDeclaration: (MessagePatternAST new selector: mm declaration name)
-		atDepth: depth.
-	currentClass enclosingClass: (scope at: #'@currentClass' ifAbsent: [nil]).
-	scope at: #'@currentClass' put: currentClass.
-	depth:: depth + 1.
-	mm slots do: [:s <SlotMirror> |
-		| se = SlotEntry
-			forDeclaration: (MessagePatternAST new selector: s name; accessModifier: s accessModifier)
-			atDepth: depth. |
-		scope at: s name put: se. (* getter *)
-		scope at: (namer selectorForSlotInitializer: s) put: se.
-		s isMutable ifTrue: [scope at: (namer selectorForSlotSetter: s) put: se. (* setter *)]].
-	mm methods do: [:m <MethodMirror> |
-		| me = MethodEntry
-			forDeclaration: (MessagePatternAST new selector: m name; accessModifier: m accessModifier)
-			atDepth: depth. |
-		scope at: m name put: me].
-	mm nestedClasses do: [:c <ClassDeclarationMirror> |
-		| ce = ClassEntry
-			forDeclaration: (MessagePatternAST new selector: c name; accessModifier: c accessModifier)
-			atDepth: depth. |
-		ce enclosingClass: currentClass.
-		scope at: c name put: ce].
-	^scope
-)
-public methodNode: node <MethodAST> = (
-	(* register method in current scope *)
-	checkForReservedWord: node selector.
-	currentScope
-		at: node selector
-		put: (MethodEntry forDeclaration: node atDepth: currentDepth).
-
-	node body parameters: node pattern parameters. (* Should the parser do this? *)
-
-	scopeMap at: node put: currentScope. (* BOGUS: Rewriter should start with the right currentScope. *)
-)
-public mixinApplication: node <MixinApplicationAST> = (
-	node mixinExpr apply: self.
-	node superclassExpr apply: self
-)
-public mixinApplicationClass: node <MixinApplicationClassAST> = (
-	| thisClass <ClassEntry> |
-	#BOGUS yourself. (* WIP *)
-	thisClass:: ClassEntry forDeclaration: node atDepth: node.
-	thisClass enclosingClass: (currentScope at: #'@currentClass' ifAbsent: [nil]).
-
-	currentScope at: node name put: thisClass.
-	scopeMap at: node put: currentScope.
-)
-popScope = (
-	currentScope:: currentScope parent
-)
-public propertyCallNode: aNode <PropertyCallAST> = (
-	self messageNode: aNode
-)
-pushScope: scope <Scope> = (
-	currentScope:: scope
-)
-public sideNode: node <SideAST> = (
-	scopeMap at: node put: currentScope.
-	node methods do: [:method <MethodAST> | method apply: self].
-	node nestedClasses do: [:nestedClass <ClassDeclarationAST> | nestedClass apply: self].
-)
-) : (
-public new ^<Instance> = (
-	^self nestedIn: Scope new atLevel: 0
-)
 )
 class Translator = ASTTool (
 (* Visits nodes of an NS AST to produce a Javascript AST. The usual translation unit is a method. Translation is initiated by sending the translateMethodNode: message. The argument is the method to translate, the returned value is the translation. *)
@@ -826,6 +701,46 @@ accessorForSuperclass: superclassCall <AST> inScope: s <Scope> ^<Node> = (
 	translator beginNewTranslationCycle.
 	^send apply: translator
 )
+buildIncrementalScopeFor: mm <MixinMirror> = (
+	| enclosingClass thisClass |
+	enclosingClass:: mm declaration enclosingClass.
+	nil = enclosingClass ifFalse: [buildIncrementalScopeFor: enclosingClass instanceSide].
+
+	thisClass:: ClassEntry
+		forDeclaration: (MessagePatternAST new selector: mm declaration name)
+		atDepth: currentDepth.
+	thisClass enclosingClass: (currentScope at: #'@currentClass' ifAbsent: [nil]).
+
+	pushScope:: Scope parent: currentScope.
+	currentDepth:: currentDepth + 1.
+
+	currentScope at: #'@currentClass' put: thisClass.
+
+	mm slots do:
+		[:s <SlotMirror> |
+		| se = SlotEntry
+			forDeclaration: (MessagePatternAST new selector: s name; accessModifier: s accessModifier)
+			atDepth: currentDepth. |
+		currentScope at: (namer selectorForSlotInitializer: s) put: se.
+		currentScope at: (namer selectorForSlotGetter: s) put: se.
+		s isMutable ifTrue:
+			[currentScope at: (namer selectorForSlotSetter: s) put: se]].
+
+	mm methods do:
+		[:m <MethodMirror> |
+		| me = MethodEntry
+			forDeclaration: (MessagePatternAST new selector: m name; accessModifier: m accessModifier)
+			atDepth: currentDepth. |
+		currentScope at: m name put: me].
+
+	mm nestedClasses do:
+		[:c <ClassDeclarationMirror> |
+		| ce = ClassEntry
+			forDeclaration: (MessagePatternAST new selector: c name; accessModifier: c accessModifier)
+			atDepth: currentDepth. |
+		ce enclosingClass: thisClass.
+		currentScope at: c name put: ce].
+)
 checkForDuplicateNames: aNode = (
 	| namesWithDuplicates names duplicateNames |
 
@@ -881,34 +796,43 @@ classNode: aNode <ClassDeclarationAST> within: mixinIR ^ <IntermediateClassDecla
 	^ir
 )
 public compileClassSource: source <String> within: enclosingIR <IntermediateMixin> ^<IntermediateClassDeclaration> = (
-	| tree <AST> intermediate <IntermediateClassDeclaration> enclosingBuilder |
-	tree:: nil = enclosingIR
-		ifTrue: [parser compilationUnit parseString: source ]
-		ifFalse: [
-			enclosingBuilder:: enclosingIR builder.
-			parser classDecl parseString: source.
-			].
-
+	| tree <AST> intermediate <IntermediateClassDeclaration> |
+	
 	setInput: source.
-	setScopeFor: tree in: enclosingBuilder.
+	currentScope:: Scope new.
+	currentDepth:: 0.
+	
+	tree:: nil = enclosingIR
+		ifTrue:
+			[parser compilationUnit parseString: source]
+		ifFalse:
+			[buildIncrementalScopeFor: enclosingIR builder.
+			 parser classDecl parseString: source].
+
+	toScope: currentScope addClass: tree.
+
 	(*sentSelectors:: Set new.*)
 	intermediate:: nil = enclosingIR
 		ifTrue: [classNode: tree within: nil]
 		ifFalse: [compileNestedClassAST: tree into: enclosingIR].
 
-	scopeMap:: Map new.
 	^intermediate
 )
-public compileExpressionSource: expression <String> inMixin: enclosing <MixinMirror> ^<MethodIR> = (
+public compileExpressionSource: expression <String> inMixin: enclosing <MixinMirror> withScope: withScope <Map> ^<MethodIR> = (
 	|
 	body <CodeBodyAST>
 	method <MethodAST>
 	result <LowLevelMethodMirror>
 	|
 
+	input:: expression.
+	currentScope:: Scope new.
+	currentDepth:: 0.
+
+	buildIncrementalScopeFor: enclosing.
+		
 	(* Parse as a code body *)
 	body:: parser doItExpression parseString: expression.
-	input:: expression.
 
 	(* Ensure last statement is a return statement *)
 	body statements isEmpty ifFalse:
@@ -920,28 +844,40 @@ public compileExpressionSource: expression <String> inMixin: enclosing <MixinMir
 
 	(* Put into a method *)
 	method:: MethodAST new
-		pattern: (MessagePatternAST new selector: #DoIt parameters: {});
+		pattern: (MessagePatternAST new
+			selector: #DoItWith:
+			parameters: {VarDeclAST name: namer scopeArgumentName type: nil});
 		body: body;
-		accessModifier: #public.
+		accessModifier: #public;
+		start: 1;
+		end: expression size.
 
 	(* Build scope *)
-	setScopeFor: method in: enclosing.
+	pushScope:: Scope parent: currentScope.
 	currentMixinUID: enclosing declaration qualifiedName.
+	nil = withScope ifFalse:
+		[withScope keysAndValuesDo:
+			[:key <Symbol> :value |
+			 | entry = WithMappedEntry name: key asSymbol. |
+			 currentScope at: key asSymbol put: entry.
+			 currentScope at: (key,':') asSymbol put: entry]].
 
 	(* Rewrite and compile *)
- 	result:: methodNode: method.
-	scopeMap:: Map new.
-	^result
+ 	^methodNode: method
 )
 public compileMethodSource: source <String> within: enclosing <MixinMirror> ^<IntermediateMethod> = (
 	| tree <AST> jsTree <IntermediateMethod> |
-	tree:: parser methodDecl parseString: source.
+
 	setInput: source.
-	setScopeFor: tree in: enclosing.
+	currentScope:: Scope new.
+	currentDepth:: 0.
+	
+	buildIncrementalScopeFor: enclosing.
+	
+	tree:: parser methodDecl parseString: source.
+
 	currentMixinUID: enclosing declaration qualifiedName.
-	jsTree:: methodNode: tree.
-	scopeMap:: Map new.
-	^jsTree
+	^methodNode: tree
 )
 compileNestedClassAST: tree <ClassDeclarationAST | MixinApplicationClassAST>
  into: enclosingIR <IntermediateMixin> ^<IntermediateClassDeclaration> = (
@@ -963,9 +899,9 @@ compileNestedClassesOf: aNode <SideAST> within: mixinMirror <LowLevelMixinMirror
 	^compileNestedClasses: aNode nestedClasses within: mixinMirror
 )
 computeMethod: aNode <MethodAST> inScope: s <Scope> = (
-	| scopeBuilder <ScopeBuilder> |
+	(* | scopeBuilder <ScopeBuilder> |
 	scopeBuilder:: ScopeBuilder nestedIn: s atLevel: currentDepth.
-	aNode apply: scopeBuilder.
+	aNode apply: scopeBuilder. *)
 	(* need to build scope for method before visiting it *)
 	^methodNode: aNode.
 )
@@ -997,7 +933,7 @@ This accessor will lazily generate the nested class when its enclosing instance 
 	methodAST::
 		accessorForNestedClassNamed: n
 		in: mixinMirror qualifiedName
-		superCall: (accessorForSuperclass: hdr superclassCall inScope: (scopeMap at: classDecl instanceSide)).
+		superCall: (accessorForSuperclass: hdr superclassCall inScope: currentScope).
 	accessor:: IntermediateMethod
 		named: classDecl name
 		accessModifier: classDecl accessModifier
@@ -1005,9 +941,6 @@ This accessor will lazily generate the nested class when its enclosing instance 
 		source: nil.
 	accessor isSynthetic: true.
 	mixinMirror methods add: accessor.
-)
-currentScope ^<Scope> = (
-	^scopeStack last
 )
 public dnuHandlers = (
 	(* We used to generate a separate function for each selector. Now we are recycling the same code for each selector and using the JS magic 'arguments' to handle the variable number of arguments in an attempt to reduce the amount of code the must be compiled at start-up (recall DNU handlers must be installed up front). *)
@@ -1184,7 +1117,7 @@ params <List[VarDeclAST]>
 )
 methodNode: aNode <MethodAST> ^ <IntermediateMethod> = (
 	| tree <AST> jsTree |
-	tree:: rewriter methodNode: aNode inScope: (scopeMap at: aNode). (* rewrite ast *)
+	tree:: rewriter methodNode: aNode inScope: currentScope. (* rewrite ast *)
 	translator beginNewTranslationCycle.
 	jsTree:: tree apply: translator. (* final pass: visit rewritten ast *)
 	(* pop scope? *)
@@ -1194,13 +1127,21 @@ methodNode: aNode <MethodAST> ^ <IntermediateMethod> = (
 		function: jsTree
 		source: ([sourceForNode: aNode] on: Error do: [nil])
 )
-popScope ^<Scope> = (
-	^scopeStack removeLast
+popScope = (
+	currentScope:: currentScope parent.
 )
-processClassSideOf: aNode <ClassAST> ofMixin: mixinMirror <LowLevelMixinMirror> = (
-	(* | primaryFactory <MethodMirror> factoryAST <MethodAST> | *)
-	processFactoryFor: aNode in: mixinMirror.
-	processSide: aNode classSide ofMixin: mixinMirror. (* compile class methods *)
+processClassSideOf: classNode <ClassDeclarationAST> ofMixin: mixinMirror <LowLevelMixinMirror> = (
+	| thisClass <ClassEntry> |
+	thisClass:: currentScope at: classNode name.
+	pushScope:: Scope parent: currentScope.
+	currentScope at: #'@currentClass' put: thisClass.
+	classNode instanceSide methods do:
+		[:methodNode <MethodAST> | toScope: currentScope addMethod: methodNode].
+
+	processFactoryFor: classNode in: mixinMirror.
+	processSide: classNode classSide ofMixin: mixinMirror. (* compile class methods *)
+	
+	popScope.
 )
 processFactoryFor: aNode <ClassAST> in: mixinIR <MixinIR> = (
 	| accessor <MethdMirror> argNames ast |
@@ -1222,14 +1163,27 @@ processFactoryFor: aNode <ClassAST> in: mixinIR <MixinIR> = (
 	mixinIR methods add: accessor.
 )
 processInitializerFor: aNode <ClassAST> in: mixinIR <MixinIR> = (
-	processMethod: (superConstructorMethodFor: aNode header) inScope: (scopeMap at: aNode instanceSide) in: mixinIR.
+	processMethod: (superConstructorMethodFor: aNode header) inScope: currentScope in: mixinIR.
 	(*makeCreateSlotsFor: aNode hdr within: mixinIR.*)
-	processMethod: (initializerFor: aNode header) inScope: (scopeMap at: aNode instanceSide) in: mixinIR.
+	processMethod: (initializerFor: aNode header) inScope: currentScope in: mixinIR.
 )
-processInstanceSideOf: aNode <ClassAST> ofMixin: mixinIR <MixinIR> ^ <Collection[MixinRep]> = (
-	processInitializerFor: aNode in: mixinIR.
-	processSide: aNode instanceSide ofMixin: mixinIR. (* compile instance methods *)
-	compileNestedClassesOf: aNode instanceSide within: mixinIR. (* gather nested classes *)
+processInstanceSideOf: classNode <ClassDeclarationAST> ofMixin: mixinIR <MixinIR> ^ <Collection[MixinRep]> = (
+	| thisClass <ClassEntry> |
+	thisClass:: currentScope at: classNode name.
+	pushScope:: Scope parent: currentScope.
+	currentScope at: #'@currentClass' put: thisClass.
+	classNode header slots do:
+		[:slotNode <SlotDefAST> | toScope: currentScope addSlot: slotNode].
+	classNode instanceSide methods do:
+		[:methodNode <MethodAST> | toScope: currentScope addMethod: methodNode].
+	classNode instanceSide nestedClasses do:
+		[:nestedClassNode <ClassDeclarationAST> | toScope: currentScope addClass: nestedClassNode].
+
+	processInitializerFor: classNode in: mixinIR.
+	processSide: classNode instanceSide ofMixin: mixinIR. (* compile instance methods *)
+	compileNestedClassesOf: classNode instanceSide within: mixinIR. (* gather nested classes *)
+	
+	popScope.
 )
 processMethod: aNode <MethodAST> inScope: s <Scope> in: mixinIR <MixinIR> = (
 	| method <MethodMirror> |
@@ -1242,7 +1196,7 @@ processSide: side <SideAST> ofMixin: mixinIR <MixinIR> = (
 		[:methodNode | mixinIR methods add: (methodNode: methodNode)].
 )
 pushScope: scope <Scope> = (
-	scopeStack addLast: scope
+	currentScope:: scope
 )
 selectorForSlotInitializer: slot <SlotDefAST | InstanceVariableMirror> ^<Symbol> = (
 	^('init`', slot name, ':') asSymbol
@@ -1257,15 +1211,6 @@ selfNode ^ <VariableAST> = (
 )
 setInput: source <ReadStream> = (
 	input: source. (* save the input *)
-)
-setScopeFor: node <AST> in: enclosing <MixinMirror | nil> = (
-	| scopeBuilder |
-	nil = enclosing
-		ifTrue: [pushScope:: Scope new]
-		ifFalse: [pushScope:: ScopeBuilder new buildScopeFor: enclosing].
-	currentDepth:: currentScope depth + 1.
-	scopeBuilder:: ScopeBuilder nestedIn: currentScope atLevel: currentDepth.
-	node apply: scopeBuilder
 )
 sourceForNode: node <AST> ^ <String> = (
 	| savedPos <Integer> pos <Integer> len <Integer> s <String> |
@@ -1343,6 +1288,28 @@ superConstructorNameFor: aNode <ClassHeaderAST> ^ <Symbol> = (
 	#BOGUS. (* Should not rely on this running after currentMixinUID is set. *)
 	^'superInit`', currentMixinUID
 )
+toScope: scope <Scope> addClass: nestedClassNode <ClassDeclarationAST> = (
+	| entry = ClassEntry forDeclaration: nestedClassNode atDepth: currentDepth. |
+	checkForReservedWord: nestedClassNode selector.
+	entry enclosingClass: (currentScope at: #'@currentClass' ifAbsent: [nil]).
+	scope
+		at: nestedClassNode selector
+		put: entry
+)
+toScope: scope <Scope> addMethod: methodNode <MethodAST> = (
+	checkForReservedWord: methodNode selector.
+	currentScope
+		at: methodNode selector
+		put: (MethodEntry forDeclaration: methodNode atDepth: currentDepth).
+)
+toScope: scope <Scope> addSlot: slotNode <SlotDeclAST> = (
+	| entry = SlotEntry forDeclaration: slotNode atDepth: currentDepth. |
+	checkForReservedWord: slotNode name.
+	scope at: (namer selectorForSlotInitializer: slotNode) put: entry.
+	scope at: (namer selectorForSlotGetter: slotNode) put: entry.
+	slotNode isMutable ifTrue:
+		[scope at: (namer selectorForSlotSetter: slotNode) put: entry].
+)
 ) : (
 )
 public class IntermediateClassDeclaration = (|
@@ -1374,6 +1341,7 @@ classMethodsMetadata = (
 	^js array: (classSide methods collect:
 		[:method | js new: (js ident: 'MM') with: {
 			js literal: method name.
+			js literal: method accessModifier.
 			js literal: method isSynthetic.
 			encodeSource: method source.
 		}])
@@ -1447,7 +1415,7 @@ invokeMeta = (
 			{
 			js assign: (js propertyOf: (js ident: 'this') at: (js literal: (names manglePublic: 'enclosingObjects`',qualifiedName)))
 				toBe: (js ident: 'enclosingObjects').
-			js assign: (js propertyOf: (js ident: 'this') at: (js literal: (names manglePublic: 'super`',qualifiedName)))
+			js assign: (js propertyOf: (js ident: 'this') at: (js literal: (names mangleSlot: 'super`',qualifiedName)))
 				toBe: (js ident: 'runtimeSuperclass').
 			js assign: (js propertyOf: (js ident: 'this') at: (js literal: 'basicNew')) toBe: basicNewMeta.
 			js verbatim: 'this.basicNew.prototype = this'.
@@ -1466,6 +1434,7 @@ methodsMetadata = (
 	^js array: (instanceSide methods collect:
 		[:method | js new: (js ident: 'MM') with: {
 			js literal: method name.
+			js literal: method accessModifier.
 			js literal: method isSynthetic.
 			encodeSource: method source.
 		}])
@@ -1524,6 +1493,7 @@ slotsMetadata = (
 	^js array: (instanceSide slots collect:
 		[:slot | js new: (js ident: 'SM') with: {
 			js literal: slot name.
+			js literal: slot accessModifier.
 			js literal: slot isMutable.
 			js literal: slot isSynthetic
 	}]).
@@ -1600,15 +1570,16 @@ protected _mangleSelector: selector <String> ^ <String> = (
 	(* Convert a Newspeak selector into a JS identifer. *)
 
 	(* Binary *)
-	('+-*/\<>~=@%|&?!,' includes: selector first) ifTrue:
+	('+-*/\<>~=@%|&?!,' includes: selector last) ifTrue:
 		[ | sb = StringBuilder new. |
 		sb add: '$'.
 		selector do: [:specialCharacter | sb add: (specialCharacterManglings at: specialCharacter)].
 		^sb asString asSymbol].
 
-	^((('$', selector)
+	^(((('$', selector)
 		replaceAll: ":" with: "$") (* Keyword *)
 		replaceAll: "`" with: "$") (* Qualified *)
+		replaceAll: "@" with: "$") (* synthetic temp *)
 		replaceAll: "." with: "$" (* limit temp *)
 )
 public fullyQualifiedNameToSimple: fullName <String> = (
@@ -1734,8 +1705,8 @@ private script = (
 		js var: 'nil' value: (js literal: 'patch me with nil').
 		js var: 'currentActor'.
 		js var: 'theGlobalObject' value: (js ident: 'this').
-		js verbatim: 'function SM(n,m,s){this.name=n; this.isMutable=m; this.isSynthetic=s; }'.
-		js verbatim: 'function MM(n,sy,src){this.name=n; this.isSynthetic=sy; this.source=src; }'.
+		js verbatim: 'function SM(n,am,m,s){this.name=n; this.accessModifier = am; this.isMutable=m; this.isSynthetic=s; }'.
+		js verbatim: 'function MM(n,am,sy,src){this.name=n; this.accessModifier = am; this.isSynthetic=sy; this.source=src; }'.
 		js verbatim: 'function dnuCatcher(s){ return function() {
 return this.dnu(vmmirror.kernel.$Message().$mangledSelector$arguments$(s, Array.prototype.slice.call(arguments)));
 } }'.
@@ -1890,12 +1861,14 @@ var vmmirror = new function(){
 		Class.$name$slot = "Class";
 		Metaclass.$name$slot = "Metaclass";
 		Mixin.$name$slot = "Mixin";
+		UndefinedObject.$name$slot = "UndefinedObject";
 		Kernel.$name$slot = "Kernel";
 
 		Object$class.$name$slot = "Object class";
 		Class$class.$name$slot = "Class class";
 		Metaclass$class.$name$slot = "Metaclass class";
 		Mixin$class.$name$slot = "Mixin class";
+		UndefinedObject$class.$name$slot = "UndefinedObject class";
 		Kernel$class.$name$slot = "Kernel class";
 
 		//runtimeClass
@@ -1903,12 +1876,14 @@ var vmmirror = new function(){
 		Class.runtimeClass = Class$runtimeClass;
 		Metaclass.runtimeClass = Metaclass$runtimeClass;
 		Mixin.runtimeClass = Mixin$runtimeClass;
+		UndefinedObject.runtimeClass = UndefinedObject$runtimeClass;
 		Kernel.runtimeClass = Kernel$runtimeClass;
 
 		Object$class.runtimeClass = Metaclass$runtimeClass;
 		Class$class.runtimeClass = Metaclass$runtimeClass;
 		Metaclass$class.runtimeClass = Metaclass$runtimeClass;
 		Mixin$class.runtimeClass = Metaclass$runtimeClass;
+		UndefinedObject$class.runtimeClass = Metaclass$runtimeClass;
 		Kernel$class.runtimeClass = Metaclass$runtimeClass;
 
 		//thisClass$slot
@@ -1916,12 +1891,14 @@ var vmmirror = new function(){
 		Class$class.$thisClass$slot = Class;
 		Metaclass$class.$thisClass$slot = Metaclass;
 		Mixin$class.$thisClass$slot = Mixin;
+		UndefinedObject$class.$thisClass$slot = UndefinedObject;
 		Kernel$class.$thisClass$slot = Kernel;
 
 		kernel.$KernelForV8$Object$slot = Object;
 		kernel.$KernelForV8$Class$slot = Class;
 		kernel.$KernelForV8$Metaclass$slot = Metaclass;
 		kernel.$KernelForV8$Mixin$slot = Mixin;
+		kernel.$KernelForV8$UndefinedObject$slot = UndefinedObject;
 
 		return kernel;
 	};
@@ -1932,10 +1909,14 @@ var vmmirror = new function(){
 	};
 
 	this.$applyMixin$toSuperclass$withEnclosingObjects$ = function(runtimeMixin, newspeakSuperclass, enclosingObjects){
-
 		var Class = this.kernel.$Class();
 		var Metaclass = this.kernel.$Metaclass();
 		var Mixin = this.kernel.$Mixin();
+		
+		if (newspeakSuperclass.newspeakClass === Metaclass)
+			this.kernel.$Error().$signal("Invalid superclass");  // [newspeakClass] is a Metaclass
+		if (newspeakSuperclass.newspeakClass.newspeakClass !== Metaclass)
+			this.kernel.$Error().$signal("Invalid superclass");  // [newspeakClass] is an instance
 
 		var runtimeSuperclass = newspeakSuperclass.runtimeClass;
 		var runtimeClass = runtimeMixin.invoke(runtimeSuperclass, enclosingObjects);
@@ -2003,6 +1984,35 @@ var vmmirror = new function(){
 	};
 };
 '
+)
+) : (
+)
+class WithMappedEntry name: nom = SymbolTableEntry forAST: nil atDepth: nil (|
+	public name = nom.
+|) (
+public getterAst = (
+	^UnresolvedSendAST new
+		receiver: mapAst;
+		message: (MessageAST new
+			selector: #at:;
+			arguments: {SymbolAST new value: name})
+)
+public isMappedBinding = (
+	^true
+)
+private mapAst = (
+	^UnresolvedSendAST new
+		receiver: (VariableAST new name: #'@here');
+		message: (MessageAST new
+			selector: namer scopeArgumentName;
+			arguments: {})
+)
+public setterAst: newVal = (
+	^UnresolvedSendAST new
+		receiver: mapAst;
+		message: (MessageAST new
+			selector: #at:put:;
+			arguments: {SymbolAST new value: name. newVal})
 )
 ) : (
 )

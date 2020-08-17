@@ -1,5 +1,5 @@
 Newspeak3
-'Root'
+'HopscotchIDE'
 class SimpleBrowsing usingPlatform: p ide: webIde = (
 (* An IDE for Newspeak on the web.
     Copyright 2016-2017 Google Inc.
@@ -7,9 +7,10 @@ class SimpleBrowsing usingPlatform: p ide: webIde = (
 *)
 |	(* imports *)
 	StringBuilder = p kernel StringBuilder.
-	Subject = p hopscotch core Subject.
-	Presenter = p hopscotch core Presenter.	
+	Subject = p hopscotch Subject.
+	Presenter = p hopscotch Presenter.	
 	TextEditorFragment = p hopscotch fragments TextEditorFragment.
+    Window = p hopscotch Window.
 	Color = p graphics Color.
 	Gradient = p hopscotch Gradient.
 	List = p collections List.
@@ -2435,6 +2436,19 @@ smallBlank = (
 tertiaryTextColor = (
 	^Color gray: 0.8
 )
+linkToBrowseSelector: selector = (
+	^link: selector action: [browseSelector: selector]
+)
+linkToBrowseNamespace: ns key: key = (
+	^row: {
+		image: images classPresenterImage.
+		smallBlank.
+		link: key
+		action: [enterSubject:: NamespaceSubject onModel: ns key: key]}.
+)
+linkToBrowseClass: aClass = (
+	^link: aClass name action: [browseClass: aClass]
+)
 ) : (
 )
 class RegisterDebugger onSubject: s = Subject onModel: nil (
@@ -2722,21 +2736,35 @@ editorDefinition ^ <CodeMirrorFragment> = (
 )
 public class SearchResultsSubject onModel: searchTerm <String> = Subject onModel: searchTerm (|
 includeSynthetics <Boolean> ::= searchTerm includes: "`".
-public classesMatches <List[Class | Mixin]>
-public selectorsMatches <List[Symbol]>
-public packageMatches <List[PackageInfo]>
-public namespaceMatches <List[Symbol,Namespace]>
+public classMatches <Array[ClassDeclarationMirror]>
+public selectorMatches <Array[Symbol]>
+public namespaceMatches <Array[{String. Namespace}]>
 public searchSuggestions <List[Symbol]>
 |
 
 findClassMatches.
 findSelectorMatches.
-findPackageMatches.
 findNamespaceMatches.
-createSuggestions
+(*createSuggestions*)
 ) (
 public createPresenter = (
 	^SearchResultsPresenter onSubject: self
+)
+public title = (
+	^'Search for "', model, '"'
+)
+properlySorted: selectors <Collection[String]> = (
+	| lower <List[String]>  upper <List[String]> |
+	lower:: List new: selectors size.
+	upper:: List new: selectors size // 2.
+	selectors do:
+		[:each <String> |
+		each first isUppercase
+			ifTrue: [upper add: each ]
+			ifFalse: [lower add: each]].
+      lower sort:  [:a :b | a key < b key].
+      upper sort:  [:a :b | a key < b key].
+	^lower asArray, upper 
 )
 createSuggestions = (
 	| foundNoResults <Boolean> names <Set[String]> |
@@ -2744,138 +2772,120 @@ createSuggestions = (
 	foundNoResults:: true.
 	classesMatches isEmpty ifFalse: [foundNoResults:: false].
 	selectorsMatches isEmpty ifFalse: [foundNoResults:: false].
-	packageMatches isEmpty ifFalse: [foundNoResults:: false].
 	namespaceMatches isEmpty ifFalse: [foundNoResults:: false].
 	foundNoResults ifFalse: [searchSuggestions:: Set new. ^self].
 
-	names:: SqueakSet new: 200.
-	systemScope allClassesDo: [:each | names add: (each simpleName)].
-	PackageOrganizer default packages do: [:each | names add: (each packageName)].
-	Symbol allSymbols do: [:each | names add: each].
-
+	names:: Set new: 200.
+	systemScope allClassesDo: [:each <ClassDeclarationMirror> | 
+      names add: (each simpleName)
+      ].
 	searchSuggestions:: (model correctAgainst: names).
 )
-findClassMatches = (
-	| collected patterns |
-	collected:: Set new: 20.
-	patterns:: searchPatterns. (* compute once *)
-	systemScope allClassesDo:
-		[:cls |
-		patterns do:
-			[:pattern | (pattern match: cls simpleName) ifTrue: [ collected add: cls ]]].
-	classesMatches:: (collected asSortedList:
-		[:a :b | a simpleName < b simpleName]) asArray
-)
 findNamespaceMatches = (
-	| collected packages |
+	| collected <Set[Association[String, Namespace]]> |
 	collected:: Set new: 20.
 	ide namespacing Categories keysAndValuesDo:
 		[:k :v |
 		searchPatterns do:
-			[:pattern | (pattern match: k) ifTrue:
-				[collected add: (k -> v)]]].
-	namespaceMatches:: collected asSortedList: [:a :b | a key < b key].
+			[:pattern <String> | (pattern: pattern match: k) ifTrue:
+				[collected add: {k. v}]]].
+	namespaceMatches:: collected (*sort: [:a :b | a first < b first]*) asArray.
 )
-findPackageMatches = (
-	| collected packages |
-	collected:: Set new: 20.
-	packages:: PackageOrganizer default packages.
-	searchPatterns do:
-		[:pattern |
-		collected addAll: (packages select:
-			[:packageInfo | pattern match: packageInfo packageName])].
-	packageMatches:: collected asSortedList: [:a :b | a packageName < b packageName].
+findWildcardsIn: p <String> ^ <List[Integer]> = (
+(* Return an ordered list of indices in p where the wildcard indicator, *, appears.
+     We always consider the list to have a wildcard just before the pattern starts and
+     just after it ends. This makes for more uniform processing later.
+*)
+  | index <Integer> ::= 1. wildcardIndices = List withAll: {0}. nextIndex |
+  [index <= p size] whileTrue: [
+     nextIndex:: p indexOf: '*' startingAt: index.
+     wildcardIndices add: nextIndex.
+     index:: nextIndex + 1.
+  ].
+  wildcardIndices add: p size + 1.
+  ^wildcardIndices.
 )
-findSelectorMatches = (
-	| collected |
-	collected:: Set new: 20.
-	searchPatterns do:
-		[:each |
-		collected addAll: (Symbol selectorsMatching: each)].
-	includeSynthetics ifFalse:
-		[collected removeAllSuchThat: [:each | each includes: "`"].
-		collected removeAllSuchThat: [:each | each includes: " "]].
-	selectorsMatches:: properlySorted: collected.
+pattern: p <String> match: s <String>  ^ <Boolean> = (
+  | 
+  index <Integer> ::= 1.
+  nextIndex 
+  wildcardIndices = findWildcardsIn: p. 
+  segments <List[String]> = List new.
+  isFirst <Boolean> ::= true.
+  |
+  wildcardIndices reduce: [:i <Integer> :j <Integer> |
+     segments add: (p copyStringFrom: i + 1 to: j - 1).
+     j
+  ].
+  segments:: segments select: [:seg | seg isEmpty not]. (* eliminate effects of adjacent wildcards *)
+  segments do: [:seg |
+    nextIndex:: s indexOf: seg startingAt: index.
+    nextIndex = 0 ifTrue: [^false].
+    isFirst ifTrue: [
+      isFirst:: false.
+      wildcardIndices removeFirst. (* get rid of initial dummy *)
+      (nextIndex = 1 or: [wildcardIndices first = 1]) ifFalse: [^false] 
+      (*unless there's a wildcard at the start of the pattern, 
+      the first segment needs to sart at the beginning of s *)
+      ].
+    index:: nextIndex + seg size.
+  ].
+  ^index = p size or: [wildcardIndices removeLast last = p size]
+  (* If the last segement doesn't extend to the end of s, the pattern must end with a wildcard *)
 )
-properlySorted: selectors = (
-	| lower upper |
-	lower:: List new: selectors size.
-	upper:: List new: selectors size // 2.
-	selectors do:
-		[:each |
-		each first isUppercase
-			ifTrue: [upper add: each ]
-			ifFalse: [lower add: each]].
-	^lower asSortedList asArray, upper asSortedList
-)
-searchPatterns ^<Array[String]> = (
+searchPatterns ^ <Array[String]> = (
 (* Produce a collection of the specific search pattern to use. The model is the raw input provided by the user and may include multiple patterns. *)
-| parts |
-parts:: model findTokens: ';'.
-parts:: parts collect: [:each | each withBlanksTrimmed].
-parts:: parts select: [:each | each notEmpty].
-parts:: parts collect:
-	[:each |
-	(each includesAnyOf: '*#')
+| parts <Array[String]> |
+parts:: model (*findTokens: ';' - forget about multiple patterns for now*).
+parts:: parts collect: [:each <String> | each withBlanksTrimmed].
+parts:: parts select: [:each <String> | each isEmpty not].
+(*parts:: parts collect:
+	[:each <String> |
+	((each indexOf: "*") ~= 0 or: [(each indexOf: "#") ~= 0])
 		ifTrue: [each]
-		ifFalse: [('"*"' match: each)
+		ifFalse: [(pattern: '"*"' match: each)
 				ifTrue: [each copyFrom: 2 to: each size - 1]
-				ifFalse: ['*', each, '*']]].
+				ifFalse: ['*', each, '*']]].*)
 ^parts
 )
-public title = (
-	^'Search for "', model, '"'
+findSelectorMatches = (
+	| collected <Set[String]>  |
+	collected:: Set new: 20.
+    systemScope allSelectorsDo: [:sel <String> |
+	  searchPatterns do:
+	    [:each <String> |
+		  (pattern: each match: sel) ifTrue: [collected add: sel ].
+        ].
+    ]
+	includeSynthetics ifFalse:
+		[collected removeAllSuchThat: [:each | (each indexOf: "`") ~= 0].
+		collected removeAllSuchThat: [:each | (each indexOf: " ") ~= 0]].
+	selectorMatches:: (*properlySorted:*) collected asArray.
+)
+findClassMatches = (
+	| collected <Set[ClassDeclarationMirror]> patterns <Array[String]> |
+	collected:: Set new: 20.
+	patterns:: searchPatterns. (* compute once *)
+	systemScope allClassesDo:
+		[:cls <ClassDeclarationMirror> |
+		patterns do:
+			[:pattern | (pattern: pattern match: cls simpleName) ifTrue: [ collected add: cls ]]].
+	classMatches:: (collected (*sort:
+		[:a :b | a simpleName < b simpleName]*)) asArray
 )
 ) : (
 )
 class SearchResultsPresenter onSubject:s = ProgrammingPresenter onSubject:s (
 ) (
-classSearchResults = (
-^
-	incrementalList:
-		[:s |
-		subject classesMatches do:
-			[:each | | classSubject |
-			classSubject:: subjectForClass: each.
-			s nextPut:
-				(collapsed: (ClassNamePresenter onSubject: classSubject)
-					expanded: [classSubject presenter])]]
-)
 classesSection = (
 	^subject classesMatches isEmpty
 		ifTrue: [nothing]
 		ifFalse: [sectionWithHeader: 'Classes' andContents: classSearchResults]
 )
-definition = (
-	^column: {
-		( deferred: [searchFeedback]).
-		( initially: (label: 'Searching namespaces') deferred: [namespacesSection] ).
-		( initially: (label: 'Searching packages') deferred: [packagesSection] ).
-		( initially: (label: 'Searching classes') deferred: [classesSection] ).
-		( initially: (label: 'Searching selectors') deferred: [selectorsSection] ).
-		}
-)
-namespaceSearchResults = (
-	^incrementalList: [:s |
-		subject namespaceMatches do: [:assoc |
-			s nextPut: (linkToBrowseNamespace: assoc value key: assoc key)]]
-)
 namespacesSection = (
 	^subject namespaceMatches isEmpty
 		ifTrue: [nothing]
 		ifFalse: [sectionWithHeader: 'Namespaces' andContents: namespaceSearchResults].
-)
-packageSearchResults = (
-	^incrementalList: [:s |
-		subject packageMatches do: [:packageInfo |
-			s nextPut:
-				(link: packageInfo packageName
-				action: [browsePackage: packageInfo packageName])]]
-)
-packagesSection = (
-	^subject packageMatches isEmpty
-		ifTrue: [nothing]
-		ifFalse: [sectionWithHeader: 'Packages' andContents: packageSearchResults]
 )
 searchFeedback = (
  subject searchSuggestions isEmpty
@@ -2894,17 +2904,36 @@ searchSuggestions = (
 sectionWithHeader: theHeader andContents: theContents = (
 ^ column: {minorHeadingBlock: (label: (theHeader asText allBold)). indentedBlock: theContents. }
 )
-selectorSearchResults = (
-	^incrementalList: [:s |
-		subject selectorsMatches do: [:each |
-			s nextPut:
-				(collapsed: (linkToBrowseSelector: each)
-				expanded: [SelectorPresenter onSubject: (SelectorSubject onModel: each)])]]
-)
 selectorsSection = (
 	^subject selectorsMatches isEmpty
 		ifTrue: [nothing]
 		ifFalse: [sectionWithHeader: 'Selectors' andContents: selectorSearchResults]
+)
+definition = (
+	^column: {
+		( deferred: [searchFeedback]).
+		( initially: (label: 'Searching namespaces') deferred: [namespacesSection] ).
+        ( initially: (label: 'Searching classes') deferred: [classesSection] ).
+		( initially: (label: 'Searching selectors') deferred: [selectorsSection] ).
+		}
+)
+namespaceSearchResults  ^ <Array[Fragment]> = (
+	^subject namespaceMatches collect: [:assoc <{String. Namespace}> |
+			  linkToBrowseNamespace: assoc first key: assoc last
+            ]
+)
+selectorSearchResults  ^ <Array[Fragment]> = (
+	^subject selectorMatches collect: [:each <Symbol> |
+				  collapsed: (linkToBrowseSelector: each)
+				  expanded: [SelectorPresenter onSubject: (SelectorSubject onModel: each)]
+                ]
+)
+classSearchResults ^ <Array[Fragment]> = (
+^subject classMatches collect:
+			[:each <ClassDeclarationMirror> | 
+				collapsed: (linkToBrowseClass: each reflectee)
+				expanded: [(ClassSubject onModel: each) presenter]
+            ]
 )
 ) : (
 )
@@ -2944,6 +2973,38 @@ public initialSource ^ <String> = (
 )
 public initialSource: s  <String> = (
   initialSource_slot:: s
+)
+) : (
+)
+public class IDEWindow openSubject: s <Subject> = Window openSubject: s (
+) (
+class ToolbarPresenter = super ToolbarPresenter (
+  | textView <CodeMirrorFragment> |
+) (
+toolbarItems ^ <Array[Fragment]>  = (
+ ^super toolbarItems, {searchField. searchButton}
+)
+searchField ^ <Fragment> = (
+  textView:: codeMirror: ''. 
+  textView setSize: 200 height: 20.
+  textView acceptResponse: [:editor | find: editor textBeingAccepted].
+  ^textView
+)
+find = (
+  find: textView textBeingAccepted
+)
+find: s <String> = (
+  enterSubject: (SearchResultsSubject onModel: s)
+)
+searchButton ^ <ButtonFragment> = (
+	^imageButton: {
+         images findSquareLeftImage.
+		 images findSquareLeftOverImage.
+	     images findSquareLeftDownImage
+         }
+	  action: [find].
+)
+) : (
 )
 ) : (
 )

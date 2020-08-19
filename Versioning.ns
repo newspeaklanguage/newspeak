@@ -232,18 +232,12 @@ public withAllAncestors = (
 )
 ) : (
 )
-public class LowerCommonAncestorsFinder for: aVersion and: anotherVersion = (
+public class LeastCommonAncestorsFinder for: aVersion and: anotherVersion = (
 |
 	v1 = aVersion. 
 	v2=  anotherVersion.
 |
 ) (
-commonAncestorsFor: elements = (
-	^ intersectionOfSets: ( elements collect: [ :x  |  x withAllAncestors ]).
-)
-intersectionOfSets: aCollectionOfSets = (
-	^ aCollectionOfSets inject:  aCollectionOfSets anyOne into: [ :int :each | int intersection: each ].
-)
 nonCommonAncestorsFor: elements withCommonAncestors: commonAncestors = (
 	| nonCommonAncestors |
 	nonCommonAncestors::  Set new .
@@ -265,7 +259,7 @@ valueForNodes:  elements = (
 	
 	(sameElementsIn: elements) ifTrue: [ ^ elements anyOne] .
 	
-	commonAncestors:: commonAncestorsFor: elements.
+	commonAncestors:: class commonAncestorsFor: elements.
 	nonCommonAncestors:: nonCommonAncestorsFor: elements withCommonAncestors: commonAncestors.
 
 	(* frontierCommonAncestors are common ancestors who leak into the nonCommonAncestors group *)
@@ -287,6 +281,12 @@ valueForNodes:  elements = (
 
 )
 ) : (
+public commonAncestorsFor: elements = (
+	^ intersectionOfSets: ( elements collect: [ :x  |  x withAllAncestors ]).
+)
+public intersectionOfSets: aCollectionOfSets = (
+	^ aCollectionOfSets inject:  aCollectionOfSets anyOne into: [ :int :each | int intersection: each ].
+)
 )
 class ObjectVersion withParents: parentsCollection versionedData: dataToVersion  = Version withParents: parentsCollection (
 |
@@ -308,9 +308,41 @@ class ObjectVersionHistory from: aStart upTo: nodes  = (
 |
 	start ::=  aStart.
 	upToNodes = nodes.
+	lcas
 |
 	initializeStart. 
 ) (
+calculateChangesWhenIntersection = (
+	| slcas completeParent1Changes changesParent2 changesBeyondSLCAS combined |
+	slcas:: (SingleLeastCommonAncestorFinder for:  start parent1 and: start parent2) value.
+	completeParent1Changes:: (ObjectVersionHistory from: start parent1 upTo: { slcas} ) resumedChangeRecord. (*  just pick 1 side *)
+	changesParent2:: (ObjectVersionHistory from: start parent2 upTo: lcas ) resumedChangeRecord.
+	
+	changesBeyondSLCAS:: (ObjectVersionHistory from: slcas parent2 upTo: upToNodes) resumedChangeRecord.
+	combined:: combine: completeParent1Changes and: changesParent2 mergeData: start versionedData. 
+	^ compactRecords: { changesBeyondSLCAS . combined }
+
+)
+calculateChangesWhenNoIntersection = (
+	| slcas completeParent1Changes changesParent2  combined |
+	
+	completeParent1Changes:: (ObjectVersionHistory from: start parent1 upTo: upToNodes ) resumedChangeRecord. (*  just pick 1 side *)
+	changesParent2:: (ObjectVersionHistory from: start parent2 upTo: lcas ) resumedChangeRecord.
+	^ combine: completeParent1Changes and: changesParent2 mergeData: start versionedData. 
+
+)
+combine: a and: b mergeData: m = (
+	| changesDictionary  |
+
+	changesDictionary:: Map new.
+	
+	a changes keysAndValuesDo: [ :k :v | changesDictionary at: k put: v   ].
+	b changes keysAndValuesDo: [ :k :v | changesDictionary at: k put: v   ].
+	m changes keysAndValuesDo: [ :k :v | changesDictionary at: k put: v   ].
+	
+	^ RegularObjectChange withChanges: changesDictionary.
+
+)
 compactRecords: recordsList  = (
 	| result |
 
@@ -351,36 +383,42 @@ involvedNodes = (
 
 )
 public resumedChangeRecord = (
-	| records  commonAncestor parents partialRecord newStart | 
+	| records  commonAncestor parents partialRecord  | 
 
 	(upToNodes includes:  start) 
 		ifTrue: [ ^ nil].
 	
 	records:: List new.
-	newStart:: start.
-
-	parents:: parentsToConsiderFor: end.
-	(parents size = 2) ifTrue: [
-		commonAncestor::  (CommonAncestorFinder 
-								for: (parents at: 1) 
-								and: (parents at: 2)) value.
-		(* should  check if reached end before *) 						
-		partialRecord:: (historyFrom: start to: commonAncestor) resumedChangeRecord. 		
-		partialRecord ifNotNil: [  records add: partialRecord. ].	
-		newStart:: commonAncestor.
-	].	
+	
+	parents:: start parents .
 	
 	(parents size = 0) ifTrue: [
 		error.			  
 	].
-
-	parents do: [ :each |
-		partialRecord:: (historyFrom: newStart to:  each) resumedChangeRecord. 			
-		partialRecord ifNotNil: [  records add: partialRecord. ].		
-	].
 	
-	records add: end versionedData.
-	^ compactRecords: records. 
+	(parents size = 1) ifTrue: [
+		| parentRecords |
+		parentRecords:: (ObjectVersionHistory from: parents first upTo: upToNodes) resumedChangeRecord. 
+		^compactRecords: { parentRecords . start versionedData }.
+	].
+
+	
+	(parents size = 2) ifTrue: [
+		| parent1 parent2  intersection|
+		parent1:: parents at: 1.
+		parent2:: parents at: 2.
+		
+		lcas::  (LeastCommonAncestorsFinder 
+								for: parent1 
+								and: parent2) value.
+								
+		intersection:: LeastCommonAncestorsFinder intersectionOfSets: { lcas . upToNodes }.
+		^ intersection isEmpty 
+						ifTrue: [ calculateChangesWhenIntersection ]
+						ifFalse: [ calculateChangesWhenNoIntersection ].		 				
+
+	].	
+	
 )
 ) : (
 public completeFor: aVersion = (
@@ -405,22 +443,44 @@ mergeRecordsBetween: aChangeRecord and: anotherChangeRecord = (
 		value1:: aChangeRecord changes at: key.
 		value2:: anotherChangeRecord changes at: key.
 
-	 	true (*  (value1 ~= value2) *) 	
+	 	 (value1 ~= value2) 
 				ifTrue:  [  changesDictionary at: key put:  (UnidentifiableObject for:  'UNRESOLVED MERGE CONFLICT') . (* error.  *)].
 		].
 	
 	^ RegularObjectChange withChanges: changesDictionary.
 )
 public value = (
-	| commonAncestor changeRecords1 changeRecords2 mergedData |
-	commonAncestor:: (CommonAncestorFinder for: version1 and: version2) value.
+	| lcas changeRecords1 changeRecords2 mergedData |
+	lcas:: (LeastCommonAncestorsFinder for: version1 and: version2) value.
 	
-	changeRecords1:: (ObjectVersionHistory from: commonAncestor to:  version1) resumedChangeRecord .	
-	changeRecords2:: (ObjectVersionHistory from: commonAncestor to:  version2) resumedChangeRecord.
+	changeRecords1:: (ObjectVersionHistory from: version1 upTo:  lcas) resumedChangeRecord .	
+	changeRecords2:: (ObjectVersionHistory from: version2 upTo:  lcas) resumedChangeRecord.
 
 	mergedData:: mergeRecordsBetween: changeRecords1 and: changeRecords2. 
 	^ ObjectVersion withParents: { version1 . version2 } versionedData: mergedData.
 
+)
+) : (
+)
+public class SingleLeastCommonAncestorFinder for: aVersion and: anotherVersion = (
+|
+	v1 = aVersion. 
+	v2=  anotherVersion.
+|
+) (
+public value = (
+	| lcas res  |
+	
+	lcas:: (LeastCommonAncestorsFinder for: v1 and: v2) value.
+	
+	(lcas size = 1) 
+		ifTrue: [ ^ lcas first].	
+
+	(* more than 1 parent *)
+	res:: ((LeastCommonAncestorsFinder commonAncestorsFor: lcas)  asSortedList: [:x1 :x2 | x1 distanceToRoot >=  x2 distanceToRoot   ]) first .
+
+	^ res 
+	
 )
 ) : (
 )

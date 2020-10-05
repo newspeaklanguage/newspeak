@@ -15,6 +15,7 @@ class SimpleBrowsing usingPlatform: p ide: webIde = (
 	Gradient = p hopscotch Gradient.
 	List = p collections List.
 	Map = p collections Map.
+    Set = p collections Set.
     OrderedMap = [p collections OrderedMap] on: Error do: [:e | Map].
     Exception = p kernel Exception.
 	ClassMirror = p mirrors ClassMirror.
@@ -26,6 +27,7 @@ class SimpleBrowsing usingPlatform: p ide: webIde = (
 	JSMath = p js global at: 'Math'.
 	JSPromise = p js global at: 'Promise'.
 		(* module variables *)
+      body = (p js global at: 'document') at: 'body'.
       atomicInstaller = p mirrors installer.
       compiler = p mirrors compiler.
 	cachedPlatform = p.
@@ -1496,6 +1498,21 @@ changeResponse ^ <[:CodeMirrorFragment :Event]> = (
 		ed enterEditState.
 	 ]
 )
+cancelResponse ^ <[:CodeMirrorFragment]> = (
+	^[:ed <CodeMirrorFragment> |
+        ed text: subject source.
+		colorizeMethodSource: (crToLf: subject source) withEditor: ed.
+		ed leaveEditState.
+	 ]
+)
+errorDisplay: msg <String> ^ <Fragment> = (
+  ^row: {label: msg. button: 'Clear' action: [subject errorMessages remove: msg] }
+)
+errorMessages ^ <Array[Fragment]> = (
+  ^(subject errorMessages collect: [:msg <String> |
+       errorDisplay: msg
+    ]) asArray.
+)
 public definition ^ <Fragment> = (
 	| toggle |
 	toggle::
@@ -1526,21 +1543,16 @@ public definition ^ <Fragment> = (
      	              smallBlank.
 	              dropDownMenu: [methodMenuFor: subject name]
 			}.
-			cm
+			cm.
+            column: errorMessages.
 		}].
 	^toggle
-)
-cancelResponse ^ <[:CodeMirrorFragment]> = (
-	^[:ed <CodeMirrorFragment> |
-        ed text: subject source.
-		colorizeMethodSource: (crToLf: subject source) withEditor: ed.
-		ed leaveEditState.
-	 ]
 )
 ) : (
 )
 public class MethodSubject onModel: mm <MethodMirror> = Subject onModel: mm (
 (* Manages the UI for a method. *)
+| public errorMessages <Set[String]> = Set new. |
 ) (
 public accessModifier ^ <Symbol> = (
 	^methodMirror accessModifier
@@ -1590,6 +1602,9 @@ public compileSource: src <String> ifSuccess: successBlock <[:MethodMirror]> ifF
 	successBlock value: newMirror]
 		on: Error
 		do: [:ex <Exception> | failureBlock value: ex printString].
+)
+public clearErrors = (
+  errorMessages removeAll: errorMessages
 )
 ) : (
 )
@@ -2740,7 +2755,7 @@ editorDefinition ^ <CodeMirrorFragment> = (
 ) : (
 )
 public class SearchResultsSubject onModel: searchTerm <String> = Subject onModel: searchTerm (|
-includeSynthetics <Boolean> ::= searchTerm includes: "`".
+includeSynthetics <Boolean> ::= (searchTerm indexOf: "`") isNil not.
 public classMatches <Array[ClassDeclarationMirror]>
 public selectorMatches <Array[Symbol]>
 public namespaceMatches <Array[{String. Namespace}]>
@@ -2786,9 +2801,39 @@ createSuggestions = (
       ].
 	searchSuggestions:: (model correctAgainst: names).
 )
+findSelectorMatches = (
+	| collected <Set[String]>  |
+	collected:: Set new: 20.
+    systemScope allSelectorsDo: [:sel <String> |
+	  searchPatterns do:
+	    [:each <String> |
+		  (pattern: each match: sel) ifTrue: [collected add: sel ].
+        ].
+    ]
+	includeSynthetics ifFalse:
+		[collected removeAllSuchThat: [:each | (each indexOf: "`") ~= 0].
+		collected removeAllSuchThat: [:each | (each indexOf: " ") ~= 0]].
+	selectorMatches:: (*properlySorted:*) collected asArray.
+)
+searchPatterns ^ <Array[String]> = (
+(* Produce a collection of the specific search pattern to use. The model is the raw input provided by the user and may include multiple patterns. *)
+| parts <Array[String]> |
+parts:: {model} (*findTokens: ';' - forget about multiple patterns for now*).
+parts:: parts collect: [:each <String> | each withBlanksTrimmed].
+parts:: parts select: [:each <String> | each isEmpty not].
+(*parts:: parts collect:
+	[:each <String> |
+	((each indexOf: "*") ~= 0 or: [(each indexOf: "#") ~= 0])
+		ifTrue: [each]
+		ifFalse: [(pattern: '"*"' match: each)
+				ifTrue: [each copyFrom: 2 to: each size - 1]
+				ifFalse: ['*', each, '*']]].*)
+^parts
+)
 findNamespaceMatches = (
 	| collected <Set[Association[String, Namespace]]> |
 	collected:: Set new: 20.
+    'computing namesapces' out.
 	ide namespacing Categories keysAndValuesDo:
 		[:k :v |
 		searchPatterns do:
@@ -2796,19 +2841,17 @@ findNamespaceMatches = (
 				[collected add: {k. v}]]].
 	namespaceMatches:: collected (*sort: [:a :b | a first < b first]*) asArray.
 )
-findWildcardsIn: p <String> ^ <List[Integer]> = (
-(* Return an ordered list of indices in p where the wildcard indicator, *, appears.
-     We always consider the list to have a wildcard just before the pattern starts and
-     just after it ends. This makes for more uniform processing later.
-*)
-  | index <Integer> ::= 1. wildcardIndices = List withAll: {0}. nextIndex |
-  [index <= p size] whileTrue: [
-     nextIndex:: p indexOf: '*' startingAt: index.
-     wildcardIndices add: nextIndex.
-     index:: nextIndex + 1.
-  ].
-  wildcardIndices add: p size + 1.
-  ^wildcardIndices.
+findClassMatches = (
+	| collected <Set[ClassDeclarationMirror]> patterns <Array[String]> |
+	collected:: Set new: 20.
+	patterns:: searchPatterns. (* compute once *)
+	systemScope allClassesDo:
+		[:cls <ClassDeclarationMirror> |
+		patterns do:
+			[:pattern | (pattern: pattern match: cls simpleName) ifTrue: [ collected add: cls ]]].
+            'found matching classes ' out.
+	classMatches:: (collected (*sort:
+		[:a :b | a simpleName < b simpleName]*)) asArray
 )
 pattern: p <String> match: s <String>  ^ <Boolean> = (
   | 
@@ -2831,56 +2874,29 @@ pattern: p <String> match: s <String>  ^ <Boolean> = (
       wildcardIndices removeFirst. (* get rid of initial dummy *)
       (nextIndex = 1 or: [wildcardIndices first = 1]) ifFalse: [^false] 
       (*unless there's a wildcard at the start of the pattern, 
-      the first segment needs to sart at the beginning of s *)
+      the first segment needs to start at the beginning of s *)
       ].
     index:: nextIndex + seg size.
   ].
   ^index = p size or: [wildcardIndices removeLast last = p size]
-  (* If the last segement doesn't extend to the end of s, the pattern must end with a wildcard *)
+  (* If the last segment doesn't extend to the end of s, the pattern must end with a wildcard *)
 )
-searchPatterns ^ <Array[String]> = (
-(* Produce a collection of the specific search pattern to use. The model is the raw input provided by the user and may include multiple patterns. *)
-| parts <Array[String]> |
-parts:: model (*findTokens: ';' - forget about multiple patterns for now*).
-parts:: parts collect: [:each <String> | each withBlanksTrimmed].
-parts:: parts select: [:each <String> | each isEmpty not].
-(*parts:: parts collect:
-	[:each <String> |
-	((each indexOf: "*") ~= 0 or: [(each indexOf: "#") ~= 0])
-		ifTrue: [each]
-		ifFalse: [(pattern: '"*"' match: each)
-				ifTrue: [each copyFrom: 2 to: each size - 1]
-				ifFalse: ['*', each, '*']]].*)
-^parts
-)
-findSelectorMatches = (
-	| collected <Set[String]>  |
-	collected:: Set new: 20.
-    systemScope allSelectorsDo: [:sel <String> |
-	  searchPatterns do:
-	    [:each <String> |
-		  (pattern: each match: sel) ifTrue: [collected add: sel ].
-        ].
-    ]
-	includeSynthetics ifFalse:
-		[collected removeAllSuchThat: [:each | (each indexOf: "`") ~= 0].
-		collected removeAllSuchThat: [:each | (each indexOf: " ") ~= 0]].
-	selectorMatches:: (*properlySorted:*) collected asArray.
-)
-findClassMatches = (
-	| collected <Set[ClassDeclarationMirror]> patterns <Array[String]> |
-	collected:: Set new: 20.
-	patterns:: searchPatterns. (* compute once *)
-	systemScope allClassesDo:
-		[:cls <ClassDeclarationMirror> |
-		patterns do:
-			[:pattern | (pattern: pattern match: cls simpleName) ifTrue: [ collected add: cls ]]].
-	classMatches:: (collected (*sort:
-		[:a :b | a simpleName < b simpleName]*)) asArray
+findWildcardsIn: p <String> ^ <List[Integer]> = (
+(* Return an ordered list of indices in p where the wildcard indicator, *, appears.
+     We always consider the list to have a wildcard just before the pattern starts and
+     just after it ends. This makes for more uniform processing later.
+*)
+  | index <Integer> ::= 1. wildcardIndices = List withAll: {0}. nextIndex |
+  [index <= p size] whileTrue: [
+     nextIndex:: p indexOf: '*' startingAt: index. (* if not found, we get 0 *)
+     index:: nextIndex = 0 ifFalse: [nextIndex + 1] ifTrue:  [p size  + 1].
+     wildcardIndices add: nextIndex.
+  ].
+  ^wildcardIndices.
 )
 ) : (
 )
-class SearchResultsPresenter onSubject:s = ProgrammingPresenter onSubject:s (
+class SearchResultsPresenter onSubject:s = ProgrammingPresenter onSubject: s (
 ) (
 classesSection = (
 	^subject classesMatches isEmpty
@@ -2981,19 +2997,13 @@ public initialSource: s  <String> = (
 )
 ) : (
 )
-public class IDEWindow openSubject: s <Subject> = Window openSubject: s (
+public class IDEWindow into: b openSubject: s <Subject> = Window into: b openSubject: s (
 ) (
 class ToolbarPresenter = super ToolbarPresenter (
   | textView <CodeMirrorFragment> |
 ) (
 toolbarItems ^ <Array[Fragment]>  = (
  ^super toolbarItems, {searchField. searchButton}
-)
-searchField ^ <Fragment> = (
-  textView:: codeMirror: ''. 
-  textView setSize: 200 height: 20.
-  textView acceptResponse: [:editor | find: editor textBeingAccepted].
-  ^textView
 )
 find = (
   find: textView textBeingAccepted
@@ -3003,15 +3013,24 @@ find: s <String> = (
 )
 searchButton ^ <ButtonFragment> = (
 	^imageButton: {
-         images findSquareLeftImage.
-		 images findSquareLeftOverImage.
-	     images findSquareLeftDownImage
+         ide images findSquareLeftImage.
+	 ide images findSquareLeftOverImage.
+	 ide images findSquareLeftDownImage
          }
 	  action: [find].
 )
+searchField ^ <Fragment> = (
+  textView:: codeMirror: ''. 
+  (*textView editor setSize: 200 height: 20.*)
+  textView acceptResponse: [:editor | find: editor textBeingAccepted].
+  ^textView
+)
 ) : (
 )
 ) : (
+public openSubject: s = (
+	^into: body openSubject: s
+)
 )
 colorizingBlockFor: cm <CodeMirrorFragment> = (
       cm resetStyles.

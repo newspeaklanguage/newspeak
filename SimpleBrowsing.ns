@@ -2358,9 +2358,6 @@ addButtonWithMenu: menu = (
 		   ide images addOutImage
 		}
 )
-browseClass: klass <Behavior> = (
-	enterSubject:: ClassSubject onModel: (ClassMirror reflecting: klass) mixin declaration.
-)
 browseMixinMirror: mixin <MixinMirror> = (
 	enterSubject:: ClassSubject onModel: mixin declaration.
 )
@@ -2461,13 +2458,17 @@ linkToBrowseSelector: selector = (
 )
 linkToBrowseNamespace: ns key: key = (
 	^row: {
-		image: images classPresenterImage.
+		image: ide images classPresenterIcon.
 		smallBlank.
 		link: key
 		action: [enterSubject:: NamespaceSubject onModel: ns key: key]}.
 )
 linkToBrowseClass: aClass = (
 	^link: aClass name action: [browseClass: aClass]
+)
+browseClass: klass <Behavior | ClassDeclarationMirror> = (
+  | decl <ClassDeclarationMirror> = klass isKindOfClassDeclarationMirror ifTrue: [klass] ifFalse: [(ClassMirror reflecting: klass) mixin declaration]. |
+	enterSubject:: ClassSubject onModel: decl.
 )
 ) : (
 )
@@ -2765,7 +2766,7 @@ public searchSuggestions <List[Symbol]>
 findClassMatches.
 findSelectorMatches.
 findNamespaceMatches.
-(*createSuggestions*)
+createSuggestions.
 ) (
 public createPresenter = (
 	^SearchResultsPresenter onSubject: self
@@ -2786,34 +2787,121 @@ properlySorted: selectors <Collection[String]> = (
       upper sort:  [:a :b | a key < b key].
 	^lower asArray, upper 
 )
+prepareSegments: p <String> ^ <List[Integer]> = (
+(* Return a list of segment markers in p, i.e., indices that immediately precede or follow
+    the substrings between wildcard characters in p.
+*)
+| wildcardIndices <List[Integer]> = findWildcardsIn: p. |
+  wildcardIndices isEmpty ifTrue: [^List withAll: {0.  p size + 1}]. (* no wildcards found *)
+  wildcardIndices first = 1 ifFalse: [wildcardIndices addFirst: 0].
+  wildcardIndices last = p size ifFalse: [wildcardIndices add: p size  + 1].
+  ^wildcardIndices
+)
+public isKindOfSearchResultsSubject ^ <Boolean> = (
+  ^true
+)
+isMyKind:  s <Subject> ^ <Boolean> = (
+  ^s isKindOfSearchResultsSubjecr
+)
 createSuggestions = (
 	| foundNoResults <Boolean> names <Set[String]> |
 
 	foundNoResults:: true.
-	classesMatches isEmpty ifFalse: [foundNoResults:: false].
-	selectorsMatches isEmpty ifFalse: [foundNoResults:: false].
+	classMatches isEmpty ifFalse: [foundNoResults:: false].
+	selectorMatches isEmpty ifFalse: [foundNoResults:: false].
 	namespaceMatches isEmpty ifFalse: [foundNoResults:: false].
 	foundNoResults ifFalse: [searchSuggestions:: Set new. ^self].
-
-	names:: Set new: 200.
+    searchSuggestions:: Set new. ^self (* hack *)
+	(*names:: Set new: 200.
 	systemScope allClassesDo: [:each <ClassDeclarationMirror> | 
       names add: (each simpleName)
       ].
-	searchSuggestions:: (model correctAgainst: names).
+	searchSuggestions:: (model correctAgainst: names).*)
+)
+pattern: p <String> match: s <String>  ^ <Boolean> = (
+  | 
+  index <Integer> ::= 1.
+  nextIndex 
+  segmentMarkers = prepareSegments: p. 
+  segments <List[String]> ::= List new.
+  isFirst <Boolean> ::= true.
+  |
+  segmentMarkers reduce: [:i <Integer> :j <Integer> |
+     segments add: (p copyStringFrom: i + 1 to: j - 1).
+     j
+  ].
+  segments:: segments select: [:seg | seg isEmpty not]. (* eliminate effects of adjacent wildcards *)
+  segments do: [:seg |
+    nextIndex:: s indexOf: seg startingAt: index.
+    nextIndex = 0 ifTrue: [^false].
+    isFirst ifTrue: [
+      isFirst:: false.
+      segmentMarkers removeFirst. (* get rid of initial dummy *)
+      (nextIndex = 1 or: [segmentMarkers first = 1]) ifFalse: [^false] 
+      (*unless there's a wildcard at the start of the pattern, 
+      the first segment needs to start at the beginning of s *)
+      ].
+    index:: nextIndex + seg size.
+  ].
+  ^index > p size or: [segmentMarkers last = p size].
+  (* If the last segment doesn't extend to the end of s, the pattern must end with a wildcard *)
+)
+findClassMatches = (
+	| collected <Set[ClassDeclarationMirror]> patterns <Array[String]> |
+	collected:: Set new: 20.
+	patterns:: searchPatterns. (* compute once *)
+	systemScope allClassesDo:
+		[:cls <ClassDeclarationMirror> |
+		patterns do:
+			[:pattern | (pattern: pattern match: cls simpleName) ifTrue: [ collected add: cls]]].
+	classMatches:: (collected (*sort:
+		[:a :b | a simpleName < b simpleName]*)) asArray
 )
 findSelectorMatches = (
-	| collected <Set[String]>  |
+	| collected <Set[String]> patterns <Array[String]> |
 	collected:: Set new: 20.
+    patterns:: searchPatterns. (* compute once *)
     systemScope allSelectorsDo: [:sel <String> |
-	  searchPatterns do:
+	  patterns do:
 	    [:each <String> |
-		  (pattern: each match: sel) ifTrue: [collected add: sel ].
+		  (pattern: each match: sel) ifTrue: [collected add: sel].
         ].
-    ]
+    ].
 	includeSynthetics ifFalse:
 		[collected removeAllSuchThat: [:each | (each indexOf: "`") ~= 0].
 		collected removeAllSuchThat: [:each | (each indexOf: " ") ~= 0]].
 	selectorMatches:: (*properlySorted:*) collected asArray.
+)
+findNamespaceMatches = (
+	| 
+    collected <Set[Association[String, Namespace]]> = Set new: 20.
+    patterns <Array[String]> = searchPatterns.
+    root = ide namespacing Root. 
+    |
+    addMatchesOfPatterns: patterns inNamespace: root to: collected.
+	namespaceMatches:: collected (*sort: [:a :b | a first < b first]*) asArray.
+)
+addMatchesOfPatterns: ps <Array[String]> inNamespace: ns <Namespace> to: collected <Set[Association[String, Namespace]]> = (
+	ns keysAndValuesDo:
+		[:k :v |
+        v isKindOfNamespace ifTrue: [
+          addMatchesOfPatterns: ps inNamespace: v to: collected.
+		  ps do:
+			[:pattern <String> | 
+              (pattern: pattern match: k) ifTrue:
+				[collected add: {k. v}]]]].
+)
+findWildcardsIn: p <String> ^ <List[Integer]> = (
+(* Return an ordered list of indices in p where the wildcard indicator, *, appears.*)
+  | index <Integer> ::= 1. wildcardIndices = List new. nextIndex |
+  p isEmpty ifTrue: [^List new].
+  [index <= p size] whileTrue: [
+     nextIndex:: p indexOf: '*' startingAt: index. (* if not found, we get 0 *)
+     index:: nextIndex = 0 ifFalse: [nextIndex + 1] ifTrue:  [p size  + 1].
+     wildcardIndices add: nextIndex.
+  ].
+  wildcardIndices last = 0 ifTrue: [wildcardIndices removeLast]. (* no wildcards found *)
+  ^wildcardIndices.
 )
 searchPatterns ^ <Array[String]> = (
 (* Produce a collection of the specific search pattern to use. The model is the raw input provided by the user and may include multiple patterns. *)
@@ -2830,90 +2918,14 @@ parts:: parts select: [:each <String> | each isEmpty not].
 				ifFalse: ['*', each, '*']]].*)
 ^parts
 )
-findNamespaceMatches = (
-	| collected <Set[Association[String, Namespace]]> |
-	collected:: Set new: 20.
-    'computing namesapces' out.
-	ide namespacing Categories keysAndValuesDo:
-		[:k :v |
-		searchPatterns do:
-			[:pattern <String> | (pattern: pattern match: k) ifTrue:
-				[collected add: {k. v}]]].
-	namespaceMatches:: collected (*sort: [:a :b | a first < b first]*) asArray.
-)
-findClassMatches = (
-	| collected <Set[ClassDeclarationMirror]> patterns <Array[String]> |
-	collected:: Set new: 20.
-	patterns:: searchPatterns. (* compute once *)
-	systemScope allClassesDo:
-		[:cls <ClassDeclarationMirror> |
-		patterns do:
-			[:pattern | (pattern: pattern match: cls simpleName) ifTrue: [ collected add: cls ]]].
-            'found matching classes ' out.
-	classMatches:: (collected (*sort:
-		[:a :b | a simpleName < b simpleName]*)) asArray
-)
-pattern: p <String> match: s <String>  ^ <Boolean> = (
-  | 
-  index <Integer> ::= 1.
-  nextIndex 
-  wildcardIndices = findWildcardsIn: p. 
-  segments <List[String]> = List new.
-  isFirst <Boolean> ::= true.
-  |
-  wildcardIndices reduce: [:i <Integer> :j <Integer> |
-     segments add: (p copyStringFrom: i + 1 to: j - 1).
-     j
-  ].
-  segments:: segments select: [:seg | seg isEmpty not]. (* eliminate effects of adjacent wildcards *)
-  segments do: [:seg |
-    nextIndex:: s indexOf: seg startingAt: index.
-    nextIndex = 0 ifTrue: [^false].
-    isFirst ifTrue: [
-      isFirst:: false.
-      wildcardIndices removeFirst. (* get rid of initial dummy *)
-      (nextIndex = 1 or: [wildcardIndices first = 1]) ifFalse: [^false] 
-      (*unless there's a wildcard at the start of the pattern, 
-      the first segment needs to start at the beginning of s *)
-      ].
-    index:: nextIndex + seg size.
-  ].
-  ^index = p size or: [wildcardIndices removeLast last = p size]
-  (* If the last segment doesn't extend to the end of s, the pattern must end with a wildcard *)
-)
-findWildcardsIn: p <String> ^ <List[Integer]> = (
-(* Return an ordered list of indices in p where the wildcard indicator, *, appears.
-     We always consider the list to have a wildcard just before the pattern starts and
-     just after it ends. This makes for more uniform processing later.
-*)
-  | index <Integer> ::= 1. wildcardIndices = List withAll: {0}. nextIndex |
-  [index <= p size] whileTrue: [
-     nextIndex:: p indexOf: '*' startingAt: index. (* if not found, we get 0 *)
-     index:: nextIndex = 0 ifFalse: [nextIndex + 1] ifTrue:  [p size  + 1].
-     wildcardIndices add: nextIndex.
-  ].
-  ^wildcardIndices.
-)
 ) : (
 )
 class SearchResultsPresenter onSubject:s = ProgrammingPresenter onSubject: s (
 ) (
-classesSection = (
-	^subject classesMatches isEmpty
-		ifTrue: [nothing]
-		ifFalse: [sectionWithHeader: 'Classes' andContents: classSearchResults]
-)
 namespacesSection = (
 	^subject namespaceMatches isEmpty
 		ifTrue: [nothing]
 		ifFalse: [sectionWithHeader: 'Namespaces' andContents: namespaceSearchResults].
-)
-searchFeedback = (
- subject searchSuggestions isEmpty
-	ifTrue: [^ nothing]
-	ifFalse: [
-		^sectionWithHeader: 'Did you mean?' andContents: searchSuggestions.
-	].
 )
 searchSuggestions = (
 	^incrementalList: [:s |
@@ -2922,39 +2934,63 @@ searchSuggestions = (
 				(link: suggestion
 				action: [ enterSubject: (SearchResultsSubject onModel: suggestion)])]].
 )
-sectionWithHeader: theHeader andContents: theContents = (
-^ column: {minorHeadingBlock: (label: (theHeader asText allBold)). indentedBlock: theContents. }
-)
-selectorsSection = (
-	^subject selectorsMatches isEmpty
-		ifTrue: [nothing]
-		ifFalse: [sectionWithHeader: 'Selectors' andContents: selectorSearchResults]
-)
-definition = (
-	^column: {
-		( deferred: [searchFeedback]).
-		( initially: (label: 'Searching namespaces') deferred: [namespacesSection] ).
-        ( initially: (label: 'Searching classes') deferred: [classesSection] ).
-		( initially: (label: 'Searching selectors') deferred: [selectorsSection] ).
-		}
-)
-namespaceSearchResults  ^ <Array[Fragment]> = (
-	^subject namespaceMatches collect: [:assoc <{String. Namespace}> |
-			  linkToBrowseNamespace: assoc first key: assoc last
-            ]
-)
 selectorSearchResults  ^ <Array[Fragment]> = (
 	^subject selectorMatches collect: [:each <Symbol> |
 				  collapsed: (linkToBrowseSelector: each)
 				  expanded: [SelectorPresenter onSubject: (SelectorSubject onModel: each)]
                 ]
 )
+isMyKind:  f <Fragment> ^ <Boolean> = (
+  ^f isKindOfSearchResultsPresenter
+)
+public isKindOfSearchResultsPresenter ^ <Boolean> = (
+  ^true
+)
+classesSection = (
+	^subject classMatches isEmpty
+		ifTrue: [nothing]
+		ifFalse: [sectionWithHeader: 'Classes' andContents: classSearchResults]
+)
+selectorsSection = (
+	^subject selectorMatches isEmpty
+		ifTrue: [nothing]
+		ifFalse: [sectionWithHeader: 'Selectors' andContents: selectorSearchResults]
+)
+searchResultsMenu = (
+	^menuWithLabelsAndActions: {
+		{'Inspect Presenter'. [respondToInspectPresenter]}
+	}
+)
+sectionWithHeader: theHeader andContents: theContents = (
+^ column: {minorHeadingBlock: (label: theHeader). indentedBlock: (column: theContents). }
+)
 classSearchResults ^ <Array[Fragment]> = (
 ^subject classMatches collect:
 			[:each <ClassDeclarationMirror> | 
-				collapsed: (linkToBrowseClass: each reflectee)
+				collapsed: (linkToBrowseClass: each)
 				expanded: [(ClassSubject onModel: each) presenter]
             ]
+)
+namespaceSearchResults  ^ <Array[Fragment]> = (
+	^subject namespaceMatches collect: [:assoc <{String. Namespace}> |
+			  linkToBrowseNamespace: assoc last key: assoc first
+            ]
+)
+definition = (
+	^column: {
+        row: {filler. dropDownMenu: [searchResultsMenu]}.
+		( deferred: [searchFeedback]).
+		( initially: (label: 'Searching namespaces') deferred: [namespacesSection] ).
+        ( initially: (label: 'Searching classes') deferred: [classesSection] ).
+		( initially: (label: 'Searching selectors') deferred: [selectorsSection] ).
+		}
+)
+searchFeedback = (
+ subject searchSuggestions isEmpty
+	ifTrue: [^ nothing]
+	ifFalse: [
+		^sectionWithHeader: 'Did you mean?' andContents: searchSuggestions.
+	].
 )
 ) : (
 )

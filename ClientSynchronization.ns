@@ -157,7 +157,7 @@ createObjectDefinitionForClass: anObject   = (
 	mixin:: (mirror getSlot: #mixinSlot) reflectee.
 
 	^ ClassDefinition  
-		mixin: (toObjectReference: enclosingObject)
+		mixin: (toObjectReference: mixin)
 		superclass: (toObjectReference: superclass) 
 		enclosingObjectReference: (toObjectReference: enclosingObject)
 	
@@ -352,11 +352,19 @@ isNew: anObject = (
 		anObject isBlock ifTrue: [ error].
 	
 
-	^ (isIdentifiable: anObject) and:
-		[ (guidByObject includesKey: anObject) not ].
+	^ ((isIdentifiable: anObject) and:
+		[ (isTracked: anObject) not ]) and: [ (isNotSynchronizable: anObject) not]
 )
 isNotSynchronizable: anObject =   (
-	^ (guidByObject includesKey: anObject) and: [ (stateByObject includesKey: anObject) not ]
+	((guidByObject includesKey: anObject) and: [ (stateByObject includesKey: anObject) not ]) 
+		ifTrue: [^true].
+	
+	((anObject isBehavior) and: [ isNotSynchronizable: (clientServerSync enclosingObjectFor: anObject)  ]) ifTrue: [
+		^ true
+	].
+
+	^false
+
 )
 public isTracked: anObject = (
 	^ guidByObject includesKey: anObject.
@@ -434,12 +442,14 @@ toNewObjectReferenceIdentifiedWith: id  = (
 	^  NewObjectReference toObjectIdentifiedWith: id.
 )
 toObjectReference: anObject newObjectFrom: newObjectBlock = (
-	((anObject == Object) or: [ anObject == Array]) ifTrue: [ error].
+	((anObject == Object) or: [ anObject == Array]) ifTrue: [ 
+		^toObjectReferenceForReserved: anObject	
+	].
 
-	(anObject isMixin) ifTrue: [ halt ].
+(*	(anObject isKindOfMixin) ifTrue: [ halt ]. *)
 
 	
-	(anObject isBehavior) and: [ isNotSynchronizable: (clientServerSync enclosingObjectFor: anObject)  ] ifTrue: [
+	((anObject isBehavior) and: [ isNotSynchronizable: (clientServerSync enclosingObjectFor: anObject)  ]) ifTrue: [
 		^toObjectReferenceByMessageSendForClass: anObject newObjectFrom: newObjectBlock
 	].
 
@@ -457,6 +467,13 @@ toObjectReferenceByMessageSendForClass: aClass newObjectFrom: newObjectBlock = (
 	^ ObjectReferenceByMessageSend 
 		receiverReference: (toObjectReference: enclosingObject newObjectFrom: newObjectBlock) 
 		selector: (clientServerSync mixinNameForClass:  aClass).
+	
+)
+toObjectReferenceForReserved: aClass = (
+	
+	^ ObjectReferenceByMessageSend 
+		receiverReference: (UnidentifiableObject for: nil) 
+		selector: aClass printString.
 	
 )
 public updateStateForObjectsWithId: ids =  (
@@ -618,6 +635,10 @@ public newObjectWithId: anId  = (
 	^  newObjectsByGuid at: anId.
 
 )
+public newObjects  = (
+	^  newObjectsByGuid values
+
+)
 public objectWithGuid: anIdentifier = (
 	^ changeTrackingContext objectById: anIdentifier ifNotFound: [
 		newObjectsByGuid at: anIdentifier.
@@ -669,6 +690,10 @@ public newObjectWithId: anId  = (
 	^  newObjectsByLocal at: anId.
 
 )
+public newObjects  = (
+	^  newObjectsByLocal values
+
+)
 public objectWithGuid: anIdentifier = (
 	^ storeVersion versionById: anIdentifier .
 )
@@ -693,22 +718,34 @@ createInstanceFrom:   definitionWithId = (
 
 )
 ensureMaterialized: ids usingDefinitions: definitionsWithId = (
-	|  newInstances definitionsToIniitialize |
+	|   definitionsToIniitialize |
 
 	(* ensure every new object  gets instantiated (empty) but with an id *)
 	ids do: [:each | registerIfNeededObjectWithId:  each usingDefinitions: definitionsWithId ].
 	
-	definitionsToIniitialize:: (definitionsWithId filter: [ :each |  ids includes: each id  ]) 
+	definitionsToIniitialize:: (definitionsWithId select: [ :each |  ids includes: each id  ]) 
 							reject: [ :each | initializedIds includes: each id ].
-	
-	newInstances::	definitionsToIniitialize collect: [:each | 
+
+	definitionsToIniitialize collect: [:eachDef | 
 			| newInstance  |
-			newInstance:: objectStore newObjectWithId: each id .  
-			fillNewInstance: newInstance fromDefinition: each definition.
-			initializedIds add: each id.
+			
+			
+			eachDef definition withDependentObjectReferencesByIdDo: [ :eachRef :eachId |
+				(eachRef existsReferencedObjectIn: objectStore) ifFalse: [
+					(eachId >= 0) ifTrue: [ (* PATCH: negative ids are for 'well know objects' that should not be synchronized  *)
+						ensureMaterialized: {eachId } usingDefinitions: definitionsWithId.				
+					].
+				].
+				
+			]. 
+			
+		
+			newInstance:: objectStore newObjectWithId: eachDef id .  
+			fillNewInstance: newInstance fromDefinition: eachDef definition.
+			initializedIds add: eachDef id.
 	].
 
-	^ newInstances.	
+	
 )
 fillNewInstance: anInstance fromDefinition: aDefinition = (
 	subclassResponsibility.
@@ -716,11 +753,13 @@ fillNewInstance: anInstance fromDefinition: aDefinition = (
 public materializeObjectsFrom: definitionsWithId = (
 
 	ensureMaterialized: (definitionsWithId collect: [:each | each id ])  usingDefinitions: definitionsWithId.
+	(self class printString includesSubstring: 'Version') ifTrue: [objectStore newObjects do: [ :x  | x versionedData ifNil: [halt]]].
 	^objectStore newObjects.
 
 )
 registerIfNeededObjectWithId: anId usingDefinitions: definitions = (
 
+	
 	(objectStore containsNewObjectWithId: anId) ifFalse: [
 		| definitionWithId definition newInstance newDependingIds  |
 		definitionWithId:: definitions detect: [:each | each id = anId  ].
@@ -739,8 +778,9 @@ registerIfNeededObjectWithId: anId usingDefinitions: definitions = (
 		]. 
 		
 		definition needsDependeciesInitialized ifTrue: [
+	
 			ensureMaterialized: newDependingIds usingDefinitions: definitions.
-			initializedIds add: anId.
+			(* initializedIds add: anId. *)
 		].
 		
 		newInstance:: createInstanceFrom: definitionWithId. 

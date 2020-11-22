@@ -32,7 +32,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         server = GCDWebServer()
         server.addGETHandler(forBasePath: "/",
                                 directoryPath: Bundle.main.resourcePath!,
-                                indexFilename: "primordialsoup.html",
+                                indexFilename: "",
                                 cacheAge: 3600,
                                 allowRangeRequests: true)
                 

@@ -1,0 +1,1098 @@
+Newspeak3
+'Newspeak'
+class NewspeakCompilation usingPlatform: p asts: asts = (
+(* Facilities common to each of the Newspeak compilers, such as scopes and the scope builder. A common Rewriter should eventually be located here as well.
+
+It is intended that module definitions for each compilation target will be mixed-in to this module definition, and so inherit the facilities provided here. Until general mixin application is supported, the target-specific modules must use the same cheat used by BlocklessCombinatorialParsing of declaring a superclass clause matching the factory of the class it will be later mixed-in to.
+
+
+This module is derived from Newspeak2SqueakCompilation, which is why the pre-2013 copyrights apply.
+
+Copyright 2008 Cadence Design Systems, Inc.
+Copyright 2010 Gilad Bracha, Felix Geller and Ryan Macnak
+Copyright 2011 Matthias Kleine, Ryan Macnak and Cadence Design Systems
+Copyright 2013 Ryan Macnak
+
+Licensed under the Apache License, Version 2.0 (the ''License''); you may not use this file except in compliance with the License. You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0 *)
+|
+	private Map = p collections Map.
+	private List = p collections List.
+
+	private AST = asts AST.
+	private ASTTool = asts ASTTool.
+	private BlockAST = asts BlockAST.
+	private CascadedSendAST = asts CascadedSendAST.
+	private CodeBodyAST = asts CodeBodyAST.
+	private MessageAST = asts MessageAST.
+	private MessagePatternAST = asts MessagePatternAST.
+	private MethodAST = asts MethodAST.
+	private UnresolvedSendAST = asts UnresolvedSendAST.
+	private NumberAST = asts NumberAST.
+	private ReturnStatAST = asts ReturnStatAST.
+	private TupleAST = asts TupleAST.
+	private VariableAST = asts VariableAST.
+
+	public namer = Namer new.
+|) (
+class ClassEntry forDeclaration: cd atDepth: d = SymbolTableEntry forAST: cd atDepth: d (|
+public enclosingClass <ClassEntry>
+|) (
+public name = (
+	^ast selector
+)
+) : (
+)
+class Compiler = () (
+class Rewriter = ASTTool (
+(* A common rewriter for the Newspeak compilers targeting Squeak and JavaScript.
+
+ - Resolves sends to self, super, outer, implicit receiver and ordinary sends, as well as local variable reads and writes.
+ - Resolves returns to local and non-local returns.
+ - Adds the implicit return self to method bodies without a return statement.
+ - Adds the implicit return nil to empty closure bodies.
+ - Adds local slot initializers to statement lists.
+ - Adds temporaries to turn setter sends into regular implicit receiver sends.
+ - Rewrites well-known control messages with closure literal arguments to branches and loops. *)
+|
+	currentScope <Scope>
+	valueExpected <Boolean>
+	closureDepth <Integer>
+|) (
+public class BlockLocalReturnAST expression: e = ReturnAST expression: e () (
+public apply: tool <ASTTool[T]> ^<T> = (
+	^tool blockLocalReturnNode: self
+)
+public isKindOfBlockLocalReturnAST ^<Boolean> = (
+	^true
+)
+) : (
+)
+public class BooleanAST withValue: b = AST (|
+	public value = b.
+|) (
+public apply: tool <ASTTool[T]> ^<T> = (
+	^tool boolNode: self
+)
+public isKindOfLiteralNode ^<Boolean> = (^true)
+public printOn: stream = (
+	stream nextPutAll: 'BooleanAST: '.
+	value printOn: stream.
+)
+) : (
+)
+public class ConditionalAST if: cond is: ifTrue_ then: t else: e = AST (|
+	public condition <ExpressionAST> = cond.
+	public ifTrue = ifTrue_.
+	public then <CodeBodyAST> = t.
+	public else <CodeBodyAST | nil> = e.
+|) (
+public apply: tool <ASTTool[T]> ^<T> = (
+	^tool conditionalNode: self
+)
+) : (
+public if: cond <ExpressionAST> is: val <Boolean> then: t <BlockAST> forValue: forValue ^<Instance> = (
+	^self if: cond is: val then: t else: (forValue ifTrue: [emptyBody])
+)
+)
+class EnclosingObjectAST = AST (
+(* See mailing list for debate over 'outer Foo' as an expression. *)
+|
+	public depth <Integer>
+|) (
+public apply: tool <ASTTool[T]> ^<T> = (
+	^tool enclosingObjectNode: self
+)
+public isKindOfExplicitRcvrNode ^<Boolean> = (
+	^true
+)
+) : (
+)
+public class ImplicitReceiverSendAST = SendAST (|
+public depth <Integer> (* Used on targets that don't have implicit receiver lookup at runtime. *)
+public binding <ClassEntry | SlotEntry | MethodEntry>
+|) (
+public apply: tool <ASTTool[T]> ^<T> = (
+	^tool implicitReceiverSendNode: self
+)
+public isKindOfImplicitReceiverSendNode ^<Boolean> = (
+	^true
+)
+) : (
+)
+public class LocalReadAST of: var = AST (|
+	public variable = var.
+|) (
+public apply: tool <ASTTool[T]> ^<T> = (
+	^tool localReadNode: self
+)
+public name = (
+	^variable ast name
+)
+) : (
+)
+public class LocalWriteAST to: var assign: val = AST (|
+	public variable = var.
+	public value = val.
+|) (
+public apply: tool <ASTTool[T]> ^<T> = (
+	^tool localWriteNode: self
+)
+public name = (
+	^variable ast name
+)
+) : (
+)
+public class LoopAST = AST (
+(* This node represents a while loop. The general form of the loop is:
+prologue; while (cond = whileTrue) { body}
+*)
+|
+	public prologue <CodeBodyAST>
+	public condition <CodeBodyAST>
+	public isWhileTrue <Boolean>
+	public body <CodeBodyAST>
+|) (
+public apply: tool <ASTTool[T]> ^<T> = (
+	^tool loopNode: self
+)
+public do: n <Integer> timesRepeat: b <BlockAST> = (
+	| var <ParameterAST> |
+	(* introduce counter variable *)
+	var:: (ParameterAST name: #'.i' type: nil) copyPositionFrom: b.
+	assert: [b parameters isEmpty].
+	b parameters add: var. (* BOGUS: Should not mutate AST *)
+	(* translate n timesRepeat: [blockBody] into 1 to: n do: [:.i | blockBody] *)
+	from: (NumberAST new value: 1; copyPositionFrom: b) to: n do: b
+)
+public from: first <AST> to: last <AST> by: step <AST> do: block <BlockAST> = (
+	|
+	loopScope		<Scope>
+	counterDecl	<VarDecl>
+	counterEntry
+	counter		<TemporaryVariableAST>
+	limitName		<Symbol>
+	limitDecl		<TemporaryAST>
+	limitEntry
+	limit			<LiteralAST | VariableAST>
+	condSel			<Symbol>
+	condExpr		<ExpressionAST>
+	incExpr			<ExpressionAST>
+	incStat			<StatementAST>
+	|
+	assert: [step isKindOfNumberNode] message: 'Loop with non-number step'.
+	assert: [block isKindOfBlockNode] message: 'Loop with block that is not a BlockAST'.
+	isWhileTrue:: true.
+	prologue:: emptyBody.
+	loopScope:: Scope parent: currentScope.
+	pushScope: loopScope.
+	(* Create counter variable from block's parameter. *)
+	counterDecl:: block parameters removeLast. (* BOGUS: Should not mutate AST *)
+	counterEntry:: LocalEntry forDeclaration: counterDecl atDepth: nil.
+	counterEntry induction: true.
+	loopScope at: counterDecl name put: counterEntry.
+	prologue temporaries add: counterEntry.
+	prologue statements add: (LocalWriteAST to: counterEntry assign: first).
+	counter:: (LocalReadAST of: counterEntry) copyPositionFrom: block.
+
+	(* Introduce counter limit variable if needed. *)
+	last isKindOfLiteralNode
+		ifTrue:
+			[(* no limit variable needed - use last directly since there's no side-effect *)
+			limit:: last]
+		ifFalse:
+			[limitName:: #'.limit'.
+			 limitDecl:: TemporaryAST name: limitName type: nil.
+			 limitDecl copyPositionFrom: block.
+			 limitEntry:: LocalEntry forDeclaration: limitDecl atDepth: nil.
+			 loopScope at: limitName put: limitEntry.
+			 prologue temporaries add: limitEntry.
+			 (* initialize limit variable - note that this must be done *after* setting up the counter because of possible side effects *)
+			 prologue statements add: (LocalWriteAST to: limitEntry assign: last). (* .limit := last *)
+			 limit:: (LocalReadAST of: limitEntry) copyPositionFrom: block].
+	(* setup loop condition => introduce condition block for whileTrue: loop *)
+	condSel:: step value < 0 ifTrue: [ #<= ] ifFalse: [ #>= ].
+	condExpr:: OrdinarySendAST to: limit send: (MessageAST new send: condSel with: {counter}).
+	(* limit <= counter OR limit >= counter *)
+	condition:: CodeBodyAST new
+		parameters: {};
+		temporaries: {};
+		statements: {condExpr};
+		copyPositionFrom: block.
+	(* inlined closure body *)
+	body:: (rewriteInlinedBlockNode: block forValue: false) body.
+	(* add counter increment to loop body *)
+	incExpr:: OrdinarySendAST to: step send: (MessageAST new send: #+ with: {counter}).
+	incExpr copyPositionFrom: block.
+	(* step + counter *)
+	incStat:: LocalWriteAST to: counterEntry assign: incExpr.
+	incStat copyPositionFrom: block.
+	(* counter := step + counter *)
+	body statements add: incStat.
+	popScope.
+)
+public from: first <AST> to: last <AST> do: block <BlockAST> = (
+	from: first to: last by: (NumberAST new value: 1) do: block
+)
+public repeat: b <CodyBodyAST> = (
+	condition:: b.
+	condition statements add: ((BooleanAST withValue: true) start: condition end; end: condition end).
+	isWhileTrue:: true.
+)
+public while: v <Boolean> do: b <CodeBodyAST> = (
+	condition:: b.
+	isWhileTrue:: v.
+)
+public while: b1 <CodyBodyAST> is: v <Boolean> do: b2 <CodyBodyAST> = (
+	condition:: b1.
+	isWhileTrue:: v.
+	body:: b2.
+)
+) : (
+)
+public class MethodLocalReturnAST expression: e = ReturnAST expression: e () (
+public apply: tool <ASTTool[T]> ^<T> = (
+	^tool methodLocalReturnNode: self
+)
+) : (
+)
+public class NilAST = AST () (
+public apply: tool <ASTTool[T]> ^<T> = (
+	^tool nilNode: self
+)
+) : (
+)
+public class NonlocalReturnAST expression: e = ReturnAST expression: e () (
+public apply: tool <ASTTool[T]> ^<T> = (
+	^tool nonLocalReturnNode: self
+)
+) : (
+)
+public class OrdinarySendAST to: rcvr send: msg = SendAST (|
+	public receiver = rcvr.
+	public message = msg.
+|) (
+public apply: tool <ASTTool[T]> ^<T> = (
+	^tool ordinarySendNode: self
+)
+public isKindOfOrdinarySendNode ^<Boolean> = (
+	^true
+)
+) : (
+)
+public class OuterSendAST = SendAST (|
+public depth <Integer>
+public binding <ClassEntry | SlotEntry | MethodEntry>
+|) (
+public apply: tool <ASTTool[T]> ^<T> = (
+	^tool outerSendNode: self
+)
+) : (
+)
+public class ParameterAST name: n type: t = AST (|
+	public name = n.
+	public type = t.
+|) (
+public apply: tool <ASTTool[T]> ^<T> = (
+	^tool parameterDeclNode: self
+)
+public printOn: stream = (
+	stream nextPutAll: 'ParameterAST('; nextPutAll: name; nextPutAll: ')'.
+)
+) : (
+)
+class ReceiverAST = AST () (
+public apply: tool <ASTTool[T]> ^<T> = (
+	^tool receiverNode: self
+)
+public isKindOfReceiverNode ^<Boolean> = (
+	^true
+)
+) : (
+)
+class ReturnAST expression: e = AST (|
+	public expression <AST> = e.
+|) (
+public isKindOfReturnStatNode ^<Boolean> = (
+	^true
+)
+) : (
+)
+public class SelfSendAST = SendAST (|
+public binding <ClassEntry | SlotEntry | MethodEntry>
+|) (
+public apply: tool <ASTTool[T]> ^<T> = (
+	^tool selfSendNode: self
+)
+public isKindOfSelfSendNode ^<Boolean> = (
+	^true
+)
+public receiver = (
+	^ReceiverAST new
+)
+) : (
+)
+class SendAST = AST (|
+	public message <MessageAST>
+|) (
+public isKindOfSendNode ^<Boolean> = ( ^true )
+) : (
+)
+public class SuperSendAST = SendAST () (
+public apply: tool <ASTTool[T]> ^<T> = (
+	^tool superSendNode: self
+)
+public isKindOfSuperSendNode ^<Boolean> = (
+	^true
+)
+) : (
+)
+public class TemporaryAST name: n type: t = AST (|
+	public name = n.
+	public type = t.
+|) (
+public apply: tool <ASTTool[T]> ^<T> = (
+	^tool temporaryDeclNode: self
+)
+public printOn: stream = (
+	stream nextPutAll: 'TemporaryAST('; nextPutAll: name; nextPutAll: ')'.
+)
+) : (
+)
+applyForEffectTo: node <Node> = (
+	| original result |
+	original:: valueExpected.
+	valueExpected:: false.
+	result:: node apply: self.
+	valueExpected:: original.
+	^result
+)
+applyForValueTo: node <Node> = (
+	| original result |
+	original:: valueExpected.
+	valueExpected:: true.
+	result:: node apply: self.
+	valueExpected:: original.
+	^result
+)
+public blockNode: node <BlockAST> = (
+	| rewrittenBlock <BlockAST> last <AST> |
+	closureDepth:: closureDepth + 1.
+	rewrittenBlock:: rewriteBlockNode: node forValue: true.
+	last:: rewrittenBlock body statements last.
+	(last isKindOfReturnStatNode or: [last isKindOfBlockLocalReturnAST]) ifFalse:
+		[(* The last expression in a block is returned by it. *)
+		rewrittenBlock body statements removeLast.
+		rewrittenBlock body statements add:
+			((BlockLocalReturnAST expression: last) copyPositionFrom: last)].
+	closureDepth:: closureDepth - 1.
+	^rewrittenBlock
+)
+canInlineSeqexps ^<Boolean> = (
+	^true (* No on JS and Dart *)
+)
+public cascadedSendNode: node <CascadedSendAST> = (
+	| prevSend msg |
+	prevSend:: node previousSend apply: self.
+	msg:: node message apply: self.
+	^CascadedSendAST new to: prevSend cascade: msg
+)
+public characterNode: node <CharacterAST> = (
+	^node
+)
+public codeBodyNode: node <CodeBodyAST> = (
+	(* Move slot initializers to statements. Simultaneous slots. *)
+	| bodyScope parameters temporaries setterEntry statements result |
+	bodyScope:: Scope parent: currentScope.
+	node parameters do:
+		[:parameter <VarDeclAST> |
+		 checkForReservedWord: parameter name.
+		 (bodyScope includesKeyLocal: parameter name) ifTrue:
+			[Error signal: 'Conflicting slots named ', parameter name].
+		 bodyScope
+			at: parameter name
+			put: (LocalEntry
+				forDeclaration: parameter
+				atDepth: nil)].
+	node temporaries do:
+		[:temporary <SlotDefAST> | | local |
+		 checkForReservedWord: temporary name.
+		 (bodyScope includesKeyLocal: temporary name) ifTrue:
+			[Error signal: 'Conflicting slots named ', temporary name].
+		 local:: LocalEntry forDeclaration: temporary slotDecl atDepth: nil.
+		 bodyScope at: (namer selectorForSlotInitializer: temporary) put: local.
+		 bodyScope at: (namer selectorForSlotGetter: temporary) put: local.
+		 temporary isMutable ifTrue:
+			[bodyScope at: (namer selectorForSlotSetter: temporary) put: local]].
+	pushScope: bodyScope.
+	parameters:: node parameters collect:
+		[:varDecl <VarDeclAST> | | p |
+		 p:: currentScope at: varDecl name.
+		 p closureDepth: closureDepth.
+		 p].
+	temporaries:: List new.
+	node temporaries do:
+		[:varDecl <VarDeclAST> | | t |
+		 t:: currentScope at: varDecl name.
+		 t closureDepth: closureDepth.
+		 temporaries add: t].
+	setterEntry:: LocalEntry forDeclaration: (TemporaryAST name: namer setterTemp type: nil) atDepth: nil.
+	bodyScope at: namer setterTemp put: setterEntry.
+	bodyScope at: (namer setterTemp, ':') asSymbol put: setterEntry.
+	temporaries add: setterEntry.
+	statements:: List new.
+	node temporaries do:
+		[:varDecl <VarDeclAST> |
+		| initializer |
+		initializer:: varDecl initializer.
+		nil = initializer ifFalse:
+			[node isSeq ifFalse:
+				[initializer:: futureFor: initializer].
+			statements add: (LocalWriteAST
+				to: (bodyScope at: varDecl name)
+				assign: (self applyForValueTo: initializer))]].
+	node statements keysAndValuesDo:
+		[:index :statement |
+		| rewritten |
+		rewritten:: (index = node statements size and: [valueExpected])
+			ifTrue: [applyForValueTo: statement]
+			ifFalse: [applyForEffectTo: statement].
+		statements add: rewritten].
+	setterEntry used ifFalse:
+		[bodyScope at: namer setterTemp put: nil.
+		 bodyScope at: (namer setterTemp, ':') asSymbol put: nil.
+		 temporaries remove: setterEntry].
+	popScope.
+	result:: CodeBodyAST new
+		parameters: parameters
+		temporaries: temporaries
+		statements: statements.
+	result literalMessages: node literalMessages.
+	^result
+)
+depthOfEnclosingClass: name <Symbol> ^<Integer> = (
+	| entry <ClassEntry> |
+	entry:: currentScope at: #'@currentClass'.
+	[entry isNil] whileFalse:
+		[entry name = name ifTrue: [
+			^entry depth].
+		entry:: entry enclosingClass].
+	Error signal: 'No enclosing class named "', name, '"'
+)
+emptyBody = (
+	| body |
+	#BOGUS. (* Should be able to use immutable collections. *)
+	body:: CodeBodyAST new
+		parameters: List new;
+		temporaries: List new;
+		statements: (List new add: NilAST new; yourself).
+	^body
+)
+futureFor: expression <ExpressionAST> ^<ExpressionAST> = (
+	(* @here Future computing: [expression] *)
+	^UnresolvedSendAST new
+		receiver: (UnresolvedSendAST new
+			receiver: implicitReceiverNode;
+			message: (MessageAST new selector: #Future; arguments: {}));
+		message: (MessageAST new selector: #computing:; arguments: {
+			BlockAST new body: (
+				 CodeBodyAST new
+					parameters: List new;
+					temporaries: List new;
+					statements: {expression})})
+)
+implicitReceiverNode ^<VariableAST> = (
+	^VariableAST new name: #'@here'
+)
+isImplicitReceiverNode: node <AST> ^<Boolean> = (
+	node isKindOfVariableNode ifFalse: [^false].
+	^node name = #'@here'
+)
+isOuterNode: node <AST> ^<Boolean> = (
+	node isKindOfVariableNode ifFalse: [^false].
+	^node name = #outer
+)
+isRemovableBlock: block <BlockAST> withArgs: numArgs <Integer> ^<Boolean> = (
+	(* Answers true if block can be removed (inlined) within another block. *)
+	block isKindOfBlockNode ifFalse: [^false].
+	block parameters size = numArgs ifFalse: [^false].
+	^true
+)
+isSelfNode: node <AST> ^<Boolean> = (
+	node isKindOfVariableNode ifFalse: [^false].
+	^node name = #self
+)
+isSuperNode: node <AST> ^<Boolean> = (
+	node isKindOfVariableNode ifFalse: [^false].
+	^node name = #super
+)
+public messageNode: node <MessageAST> ^<MessageAST> = (
+	^MessageAST new
+		send: node selector
+		with: (node arguments collect: [:arg | applyForValueTo: arg]);
+		isEventual: node isEventual;
+		start: node start;
+		end: node end
+)
+public methodNode: node <MethodAST> inScope: scope = (
+	(* Need setter temp? Implicit ^self? *)
+	| body accessModifier result |
+	checkForReservedWord: node selector.
+	closureDepth:: 0.
+	currentScope:: scope.
+	node body parameters: node pattern parameters. (* Should the parser do this? *)
+	(* We add the implicit ^self before rewritting the body to ensure the last non-return statment is rewritten for effect. *)
+	(node body statements isEmpty or: [node body statements last isKindOfReturnStatNode not])
+		ifTrue: [node body statements add:
+					(ReturnStatAST new expression: (VariableAST new name: #self))].
+	body:: self applyForEffectTo: node body.
+	result:: MethodAST new
+		pattern: node pattern
+		body: body
+		accessModifier: node accessModifier.
+	currentScope:: nil.
+	^result
+)
+public numberNode: node <NumberAST> = (
+	^node
+)
+offsetOfEnclosingObjectForClass: name <Symbol> ^<Integer> = (
+	| entry <ClassEntry> |
+	entry:: currentScope at: #'@currentClass'.
+	[entry isNil] whileFalse:
+		[entry name = name ifTrue: [
+			| offset = outer Compiler currentDepth - entry depth - 1. |
+			assert: [offset >= 0] message: 'Invalid enclosing object index'.
+			^offset].
+		entry:: entry enclosingClass].
+	Error signal: 'No enclosing class named "', name, '"'
+)
+offsetOfImplicitReceiverTarget: binding <SymbolTableEntry> ^<Integer> = (
+	(* Note this calculation differs from the one used by explicit outer sends by a factor of one. This is because an explicit outer send needs the depth of the enclosing object with for a class whose name is a given selector, whereas an implicit receiver send needs the depth of the enclosing object for the class that defined a given selector. *)
+	| depth |
+	depth:: outer Compiler currentDepth - binding depth.
+	assert: [depth >= 0] message: 'Invalid enclosing object index'.
+	^depth
+)
+popScope = (
+	currentScope:: currentScope parent.
+)
+processEventualSend: node <NormalSendAST> = (
+	subclassResponsibility
+)
+processImplicitReceiverSend: node <UnresolvedSendAST> = (
+	|
+	message = node message.
+	selector = message selector.
+	binding <SymbolTableEntry>
+	|
+	selector = #self ifTrue:
+		[^ReceiverAST new copyPositionFrom: message].
+	selector = #nil ifTrue:
+		[^NilAST new copyPositionFrom: message].
+	selector = #false ifTrue:
+		[^(BooleanAST withValue: false) copyPositionFrom: message].
+	selector = #true ifTrue:
+		[^(BooleanAST withValue: true) copyPositionFrom: message].
+	binding:: currentScope at: selector ifAbsent: [nil].
+	(* Nothing is lexically visible. *)
+	binding isNil ifTrue:
+		[^processImplicitReceiverSend: message binding: nil].
+	binding isKindOfLocalBinding ifTrue:
+		[^processLocalAccess: message of: binding].
+	binding isKindOfMappedBinding ifTrue:
+		[^processMappedVariable: message decl: binding].
+	^processImplicitReceiverSend: message binding: binding
+)
+processImplicitReceiverSend: msg <MessageAST> binding: binding <ClassEntry | SlotEntry | MethodEntry> = (
+	| depth = binding isNil ifTrue: [0] ifFalse: [offsetOfImplicitReceiverTarget: binding]. |
+	^(ImplicitReceiverSendAST new
+		depth: depth;
+		binding: binding;
+		message: (msg apply: self))
+		copyPositionFrom: msg
+)
+processLocalAccess: msg <MessageAST> of: decl <SlotEntry> = (
+	^(msg selector endsWith: ':')
+		ifTrue: [processLocalWrite: msg to: decl]
+		ifFalse: [processLocalRead: msg from: decl]
+)
+processLocalRead: message <MessageAST> from: declaration <LocalEntry> = (
+	assert: [message arguments isEmpty] message: ''.
+	assert: [declaration isNil not] message: ''.
+	^(LocalReadAST of: declaration)
+		start: message start;
+		end: message end
+)
+processLocalWrite: message <MessageAST> to: declaration <LocalEntry> = (
+	assert: [message arguments size = 1] message: ''.
+	^(LocalWriteAST
+		to: declaration assign: (applyForValueTo: message arguments first))
+		copyPositionFrom: message
+)
+processOrdinarySend: node <UnresolvedSendAST> ^<AST> = (
+	| inlined |
+	inlined:: tryInlineSend: node.
+	nil = inlined ifFalse: [^inlined].
+	(* And lo, we really have a normal send. *)
+	^(OrdinarySendAST
+		to: (node receiver apply: self) send: (node message apply: self))
+		copyPositionFrom: node
+)
+processOuterExpression: node <UnresolvedSendAST> = (
+	^EnclosingObjectAST new
+		depth: (offsetOfEnclosingObjectForClass: node message selector);
+		start: node receiver start;
+		end: node message end
+)
+processOuterSend: node <UnresolvedSendAST> = (
+	(* +1 because we're looking for members of the enclosing class, not the siblings of the enclosing class. *)
+	| binding = currentScope
+		at: node message selector
+		depth: (depthOfEnclosingClass: node receiver message selector) + 1. |
+	^OuterSendAST new
+		depth: (offsetOfEnclosingObjectForClass: node receiver message selector);
+		binding: binding;
+		message: (node message apply: self);
+		start: node receiver receiver start;
+		end: node message end
+)
+processSelfSend: node <UnresolvedSendAST> = (
+	| binding = currentScope at: node message selector depth: outer Compiler currentDepth. |
+	^SelfSendAST new
+		message: (node message apply: self);
+		binding: binding;
+		copyPositionFrom: node
+)
+processSetterSend: node <SetterSendAST> binding: binding ^<AST> = (
+	|
+	setterTempBinding <LocalEntry>
+	setterTempRead
+	setterTempWrite
+	message <MessageAST>
+	send <NormalSendAST>
+	depth
+	body <CodeBodyAST>
+	|
+	valueExpected
+		ifFalse: [^processImplicitReceiverSend: node message binding: binding].
+
+	setterTempBinding:: currentScope at: namer setterTemp.
+	setterTempBinding used: true.
+
+	(* t := exp *)
+	setterTempWrite:: LocalWriteAST
+		to: setterTempBinding
+		assign: (node message arguments first apply: self).
+
+	(* setter: t *)
+	setterTempRead:: LocalReadAST of: setterTempBinding.
+	message:: MessageAST new selector: node message selector; arguments: {setterTempRead}.
+	assert: [isImplicitReceiverNode: node receiver] message: 'Setter send receiver should be implicit'.
+	depth:: binding isNil ifTrue: [0] ifFalse: [offsetOfImplicitReceiverTarget: binding].
+	send:: ImplicitReceiverSendAST new
+		depth: depth;
+		binding: binding;
+		message: message. (* Do not rewrite message twice *)
+
+	(* t:=exp. setter: t. t *)
+	body:: CodeBodyAST new
+		parameters: List new;
+		temporaries: {};
+		statements: {setterTempWrite. send. setterTempRead}.
+	^body
+)
+processSuperSend: node <UnresolvedSendAST> = (
+	^SuperSendAST new
+		message: (node message apply: self);
+		copyPositionFrom: node
+)
+pushScope: scope <Scope> = (
+	currentScope:: scope
+)
+public returnStatNode: node <ReturnStatAST> = (
+	^((closureDepth > 0 ifTrue: [NonlocalReturnAST] ifFalse: [MethodLocalReturnAST])
+		expression: (applyForValueTo: node expression))
+		copyPositionFrom: node
+)
+rewriteBlockNode: node <BlockAST> forValue: forValue <Boolean> ^ <BlockAST> = (
+(* An empty block evaluates to nil when called. This method performs the necessary transformation if the block is empty; otherwise it recursively rewrites the block body. This rewrite is done on all blocks, regardless of whether they are inlined. *)
+	|
+	rewrittenNode <BlockAST>
+	|
+	(* this shouldn't be handled here, but I'm not sure where the block / codebody
+	comes from. *)
+	node body start isKindOfNumber
+		ifFalse: [node body start: node start. node body end: node end].
+
+	rewrittenNode:: BlockAST new body:
+		(forValue ifTrue: [applyForValueTo: node body] ifFalse: [applyForEffectTo: node body]).
+	rewrittenNode start: node start; end: node end.
+	node body statements isEmpty ifTrue:
+		[rewrittenNode body statements add: (NilAST new start: node body start; end: node body end)].
+	^rewrittenNode
+)
+rewriteInlinedBlockNode: node <BlockAST> forValue: forValue <Boolean> ^ <CodeBodyAST> = (
+(* An empty block evaluates to nil when called. This method performs the necessary transformation if the block is empty; otherwise it recursively rewrites the block body. This rewrite is done on all blocks, regardless of whether they are inlined. *)
+	^rewriteBlockNode: node forValue: forValue
+)
+public setterSendNode: node <SetterSendAST> ^<AST> = (
+	|
+	message = node message.
+	selector = message selector.
+	binding <SymbolTableEntry>
+	|
+
+	binding:: currentScope at: selector ifAbsent: [nil].
+
+	(* Nothing is lexically visible. *)
+	binding isNil ifTrue:
+		[^processSetterSend: node binding: nil].
+
+	binding isKindOfLocalBinding ifTrue:
+		[^processLocalAccess: message of: binding].
+
+	binding isKindOfMappedBinding ifTrue:
+		[^processMappedVariable: message decl: binding].
+
+	^processSetterSend: node binding: binding
+)
+public stringNode: node <StringAST> = (
+	^node
+)
+public symbolNode: node <SymbolAST> = (
+	^node
+)
+tryInlineIfFalse: node <UnresolvedSendAST> = (
+	| then = node message arguments at: 1. |
+	(isRemovableBlock: then withArgs: 0) ifFalse: [^nil].
+	^ConditionalAST
+		if: (node receiver apply: self)
+		is: false
+		then: (rewriteInlinedBlockNode: then forValue: valueExpected) body
+		forValue: valueExpected
+)
+tryInlineIfFalseIfTrue: node <UnresolvedSendAST> = (
+	|
+	then = node message arguments at: 1.
+	else = node message arguments at: 2.
+	|
+	(isRemovableBlock: then withArgs: 0) ifFalse: [^nil].
+	(isRemovableBlock: else withArgs: 0) ifFalse: [^nil].
+	^ConditionalAST
+		if: (node receiver apply: self)
+		is: false
+		then: (rewriteInlinedBlockNode: then forValue: valueExpected) body
+		else: (rewriteInlinedBlockNode: else forValue: valueExpected) body
+)
+tryInlineIfTrue: node <UnresolvedSendAST> = (
+	| then = node message arguments at: 1. |
+	(isRemovableBlock: then withArgs: 0) ifFalse: [^nil].
+	^ConditionalAST
+		if: (node receiver apply: self)
+		is: true
+		then: (rewriteInlinedBlockNode: then forValue: valueExpected) body
+		forValue: valueExpected
+)
+tryInlineIfTrueIfFalse: node <UnresolvedSendAST> = (
+	|
+	then = node message arguments at: 1.
+	else = node message arguments at: 2.
+	|
+	(isRemovableBlock: then withArgs: 0) ifFalse: [^nil].
+	(isRemovableBlock: else withArgs: 0) ifFalse: [^nil].
+	^ConditionalAST
+		if: (node receiver apply: self)
+		is: true
+		then: (rewriteInlinedBlockNode: then forValue: valueExpected) body
+		else: (rewriteInlinedBlockNode: else forValue: valueExpected) body
+)
+tryInlineRepeat: node <UnresolvedSendAST> = (
+	| body = node receiver. |
+	(isRemovableBlock: body withArgs: 0) ifFalse: [^nil].
+	^LoopAST new
+		repeat: (rewriteInlinedBlockNode: body forValue: false) body
+)
+tryInlineSend: node <UnresolvedSendAST> = (
+	| selector = node message selector. |
+	canInlineSeqexps ifFalse: [valueExpected ifTrue: [^false]].
+
+	#ifTrue: = selector ifTrue: [^tryInlineIfTrue: node].
+	#ifFalse: = selector ifTrue: [^tryInlineIfFalse: node].
+	#ifTrue:ifFalse: = selector ifTrue: [^tryInlineIfTrueIfFalse: node].
+	#ifFalse:ifTrue: = selector ifTrue: [^tryInlineIfFalseIfTrue: node].
+
+	#whileTrue = selector ifTrue: [^tryInlineWhileTrue: node].
+	#whileFalse = selector ifTrue: [^tryInlineWhileFalse: node].
+	#whileTrue: = selector ifTrue: [^tryInlineWhileTrueColon: node].
+	#whileFalse: = selector ifTrue: [^tryInlineWhileFalseColon: node].
+	#repeat = selector ifTrue: [^tryInlineRepeat: node].
+	#timesRepeat: = selector ifTrue: [^tryInlineTimesRepeat: node].
+	#to:do: = selector ifTrue: [^tryInlineToDo: node].
+	#to:by:do: = selector ifTrue: [^tryInlineToByDo: node].
+
+	^nil
+)
+tryInlineTimesRepeat: node <UnresolvedSendAST> = (
+	|
+	count = node receiver.
+	body = node message arguments at: 1.
+	|
+	(isRemovableBlock: body withArgs: 0) ifFalse: [^nil].
+	^LoopAST new
+		do: (count apply: self)
+		timesRepeat: body
+)
+tryInlineToByDo: node <UnresolvedSendAST> = (
+	|
+	start = node receiver.
+	stop = node message arguments at: 1.
+	step = node message arguments at: 2.
+	body = node message arguments at: 3.
+	|
+	step isKindOfNumberNode ifFalse: [^nil].
+	(isRemovableBlock: body withArgs: 1) ifFalse: [^nil].
+	^LoopAST new
+		from: (start apply: self)
+		to: (stop apply: self)
+		by: (step apply: self)
+		do: body
+)
+tryInlineToDo: node <UnresolvedSendAST> = (
+	|
+	start = node receiver.
+	stop = node message arguments at: 1.
+	body = node message arguments at: 2.
+	|
+	(isRemovableBlock: body withArgs: 1) ifFalse: [^nil].
+	^LoopAST new
+		from: (start apply: self)
+		to: (stop apply: self)
+		do: body
+)
+tryInlineWhileFalse: node <UnresolvedSendAST> = (
+	| cond = node receiver. |
+	(isRemovableBlock: cond withArgs: 0) ifFalse: [^nil].
+	^LoopAST new
+		while: false
+		do: (rewriteInlinedBlockNode: cond forValue: true) body
+)
+tryInlineWhileFalseColon: node <UnresolvedSendAST> = (
+	|
+	cond = node receiver.
+	body = node message arguments at: 1.
+	|
+	(isRemovableBlock: cond withArgs: 0) ifFalse: [^nil].
+	(isRemovableBlock: body withArgs: 0) ifFalse: [^nil].
+	^LoopAST new
+		while: (rewriteInlinedBlockNode: cond forValue: true) body
+		is: false
+		do: (rewriteInlinedBlockNode: body forValue: false) body
+)
+tryInlineWhileTrue: node <UnresolvedSendAST> = (
+	| cond = node receiver. |
+	(isRemovableBlock: cond withArgs: 0) ifFalse: [^nil].
+	^LoopAST new
+		while: true
+		do: (rewriteInlinedBlockNode: cond forValue: true) body
+)
+tryInlineWhileTrueColon: node <UnresolvedSendAST> = (
+	|
+	cond = node receiver.
+	body = node message arguments at: 1.
+	|
+	(isRemovableBlock: cond withArgs: 0) ifFalse: [^nil].
+	(isRemovableBlock: body withArgs: 0) ifFalse: [^nil].
+	^LoopAST new
+		while: (rewriteInlinedBlockNode: cond forValue: true) body
+		is: true
+		do: (rewriteInlinedBlockNode: body forValue: false) body
+)
+public tupleNode: node <TupleAST> = (
+	^TupleAST new
+		elements: (node elements collect: [:element | applyForValueTo: element]);
+		copyPositionFrom: node
+)
+public unresolvedSendNode: node <UnresolvedSendAST> ^<AST> = (
+	(node message isEventual) ifTrue:
+		[^processEventualSend: node].
+	(isImplicitReceiverNode: node receiver) ifTrue:
+		[^processImplicitReceiverSend: node].
+	(isSelfNode: node receiver) ifTrue:
+		[^processSelfSend: node].
+	(isSuperNode: node receiver) ifTrue:
+		[^processSuperSend: node].
+	(isOuterNode: node receiver) ifTrue:
+		[^processOuterExpression: node].
+	(node receiver isKindOfSendNode and: [isOuterNode: node receiver receiver]) ifTrue:
+		[^processOuterSend: node].
+	^processOrdinarySend: node
+)
+public variableNode: node <VariableAST> = (
+	node name = #self ifTrue:
+		[^ReceiverAST new copyPositionFrom: node].
+	node name = #nil ifTrue:
+		[^NilAST new copyPositionFrom: node].
+	node name = #true ifTrue:
+		[^(BooleanAST withValue: true) copyPositionFrom: node].
+	node name = #false ifTrue:
+		[^(BooleanAST withValue: false) copyPositionFrom: node].
+	assert: [(node name = #super) not] message: '"super" is not a valid expression'.
+	assert: [(node name = #outer) not] message: '"outer" is not a valid expression'.
+	halt.
+	^node
+)
+) : (
+)
+public Scope = (
+	^outer NewspeakCompilation Scope
+)
+checkForReservedWord: selector = (
+	(namer isReservedWord: selector) ifTrue:
+		[Error signal: '"', selector, '" is a reserved word'].
+)
+public compileClassHeader: source <String> within: enclosingIR <IntermediateMixin> = (
+	subclassResponsibility
+)
+public compileClassSource: src <String> within: enclosingIR <IntermediateMixin> ^<IntermediateClassDeclaration> = (
+	subclassResponsibility
+)
+public compileExpressionSource: src <String> debugMapper: debugMapper <MethodContext> withScope: withScope <Map> inMixin: enclosing <MixinMirror> ^<IntermediateMethod> = (
+	subclassResponsibility
+)
+public compileMethodSource: source <String> within: enclosing <IntermediateMixin> ^<IntermediateMethod> = (
+	subclassResponsibility
+)
+public compileTransientSlotSource: src <String> within: enclosingIR <IntermediateMixin> ^<IntermediateTransientSlot> = (
+	subclassResponsibility
+)
+) : (
+)
+class LocalEntry forDeclaration: decl <VarDeclAST> atDepth: d <Integer> = SymbolTableEntry forAST: decl atDepth: d (
+(* Semantic info for a parameter or temporary. *)
+|
+(* public offset <Integer>
+public remote <Boolean> ::= false.
+public remoteVector <LocalEntry> *)
+
+public closureDepth
+public used ::= false.
+public induction ::= false.
+public captured ::= false.
+public remote
+public remoteVector2
+public remoteOffset
+|) (
+public isKindOfLocalBinding ^<Boolean> = (
+	^true
+)
+public name = (
+	^ast name
+)
+public printOn: stream = (
+	stream nextPutAll: 'LocalEntry('; nextPutAll: name; nextPutAll: '#'; print: hash; nextPutAll: ')'.
+)
+) : (
+)
+class MethodEntry forDeclaration: decl atDepth: d = SymbolTableEntry forAST: decl atDepth: d () (
+) : (
+)
+class Namer = () (
+public doitContextArgumentName = (
+	^#'@context'
+)
+public isReservedWord: selector = (
+	^{#self. #super. #outer. #true. #false. #nil} includes: selector
+)
+public mixinSlotNameFor: nestedName = (
+	^(nestedName, '`slot') asSymbol
+)
+public scopeArgumentName = (
+	^#'@with'
+)
+public selectorForSlotGetter: slot <SlotDefAST | InstanceVariableMirror> ^<Symbol> = (
+	^slot name
+)
+public selectorForSlotInitializer: slot <SlotDefAST | InstanceVariableMirror> ^<Symbol> = (
+	^('init`', slot name, ':') asSymbol
+)
+public selectorForSlotSetter: slot <SlotDefAST | InstanceVariableMirror> ^<Symbol> = (
+	slot isMutable ifFalse: [Error signal: 'Slot is not mutable'].
+	^(slot name, ':') asSymbol
+)
+public setterTemp = (
+	^#'@setterTemp'
+)
+) : (
+)
+public class Scope parent: p = (|
+	public parent <Scope> = p.
+	protected bindings <Map[Symbol, SymbolTableEntry]> = Map new.
+|) (
+public at: key <Symbol> ^<SymbolTableEntry> = (
+	(* Answers the value associated with aKey in this or one the super scopes or fails if aKey is absent. *)
+	^self at: key ifAbsent: [Error signal: 'Key ', key, ' not found!']
+)
+public at: key depth: d = (
+	depth = d ifFalse: [
+		nil = parent
+			ifTrue: [^nil]
+			ifFalse: [^parent at: key depth: d]].
+	^bindings at: key ifAbsent: [nil]
+)
+public at: key <Symbol> ifAbsent: blk <[X def]> ^<SymbolTableEntry | X> = (
+	(* Answers the value associated with aKey in this or one of the superScopes or the value of aBlock if aKey is absent. *)
+	(* Optimization note: This is written using [nil] blocks to avoid passing non-clean blocks dynamically down the scope structure. *)
+
+	| val <T> |
+	val:: self bindings at: key ifAbsent: [nil].
+	nil = val ifFalse: [^val].
+	nil = self parent ifTrue: [^blk value].
+	val:: self parent at: key ifAbsent: [nil].
+	nil = val ifFalse: [^val].
+	^blk value
+)
+public at: key <Symbol> put: value <SymbolTableEntry> = (
+	^self bindings at: key put: value
+)
+public depth ^<Integer> = (
+	parent isNil ifTrue: [^0].
+	^parent depth + 1.
+)
+public includesKeyLocal: key = (
+	^bindings includesKey: key
+)
+public printOn: stm = (
+	stm nextPutAll: 'Scope('.
+	bindings keys
+		do: [:key | stm nextPutAll: key]
+		separatedBy: [ stm nextPutAll: ', '].
+	stm nextPutAll: ') in '.
+	parent printOn: stm.
+)
+) : (
+public new = (
+	^self parent: nil
+)
+)
+class SlotEntry forDeclaration: decl <VarDeclAST> atDepth: d <Integer> = SymbolTableEntry forAST: decl atDepth: d () (
+public name = (
+	^ast name
+)
+) : (
+)
+class SymbolTableEntry forAST: tree atDepth: d = (
+(* An entry in a scope. *)
+|
+public ast <AST> = tree.
+public depth <Integer> = d.
+|) (
+public isKindOfLocalBinding ^<Boolean> = (
+	^false
+)
+public isKindOfMappedBinding = (
+	^false
+)
+) : (
+)
+) : (
+)

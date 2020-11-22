@@ -1,0 +1,767 @@
+Newspeak3
+'MemoryHole'
+class VCSMercurialBackendProvider usingPlatform: platform vcs: vcs = (
+(* Back-end for accessing mercurial repositories
+
+Copyright (c) 2010-2011 Matthias Kleine
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the ''Software''), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED ''AS IS'', WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. *)
+|
+	private AbstractBackend = vcs core AbstractBackend.
+
+	private diffing = vcs diffing.
+	private logger = vcs core logger.
+
+	private Differencer = diffing Differencer.
+
+	(* Collections *)
+	private Set = platform squeak Set.
+	private Map = platform squeak Dictionary.
+
+	private CrLfFileStream = platform squeak CrLfFileStream.
+
+	private INIFile = platform squeak INIFile.
+	private Semaphore = platform squeak Semaphore.
+|) (
+public class Backend = AbstractBackend (|
+(* A public flag to toggle a memory hole from being managing what it considers to be resource files (currently .png and .txt).  This is set in the hgrc file for the repository under the newspeak section wtih the track_resources key.  For example:
+	[newspeak]
+	track_resources = true
+
+If the key is not in the newspeak section, the default value is true.  This field is set by #currentHistorianNameIfNone: method when it reads the historian out of the hgrc file.
+ *)
+	public useMirrorsForResources ::= true.
+|) (
+public class LocalRepository onRepositoryId: repositoryId = AbstractLocalRepository onRepositoryId: repositoryId (
+(* Implements historians using mercurial's bookmarks
+
+Mercurial's bookmarks behave different than historians in several ways.
+
+Although not the default, mercurial can be configured to store the 'current bookmark'. But even if it is configured to do so, the current bookmark is reset when existing bookmarks are set to point to other versions. We can fix this for local repositories by restoring the current bookmark after certain operations, but we cannot fix this for remote operations. If remote repositories are also to be used as local repositories and this becomes too much of a nuisance, we must store the current historian differently.
+
+If new versions are added to a repository, mercurial moves all bookmarks that point to an ancestor version to the new version. This is not what we want. Therefore we have to ensure bookmarks are restored after push and pull operations.
+
+Mercurial's 'bookmarks' command works only on local repositories. We use the 'debugpushkey' command instead. This allows using one implementation to access local and remote bookmarks. *)
+|
+
+public Command = Commands new Command.
+protected cachedRemoteRepositories
+
+private configFileMutex = Semaphore forMutualExclusion.
+|) (
+class Commands = () (
+public class Command = NonCachingCommand (|
+	cachedBookmarks ::= nil.
+	cachedHistorianName ::= nil.
+	cachedCommonAncestors ::= Map new.
+
+	cachedPaths ::= Map new.
+	cachedFileAtRevision ::= Map new.
+|) (
+public cat: filename atInternalId: internalId = (
+	| result |
+	result:: cachedFileAtRevision
+		at: {filename. internalId asString}
+		ifAbsentPut: [ | stream |
+			stream:: super cat: filename atInternalId: internalId.
+			[stream contents] ifError: [stream collection]].
+	^result readStream
+)
+public commit: message = (
+	super commit: message.
+	resetCaches
+)
+public commonAncestorOf: revA and: revB = (
+	^cachedCommonAncestors
+		at: (Set withAll: {revA. revB})
+		ifAbsentPut: [
+			super commonAncestorOf: revA and: revB]
+)
+public currentHistorianNameIfNone: block = (
+	nil = cachedHistorianName ifTrue: [
+		cachedHistorianName:: super currentHistorianNameIfNone: block.].
+	^cachedHistorianName
+)
+public makeHistorianCurrent: id = (
+	super makeHistorianCurrent: id.
+	resetCaches.
+)
+public merge: internalId = (
+	super merge: internalId.
+	resetCaches
+)
+notRestoringBookmarksPull: revision from: remoteSource = (
+	super notRestoringBookmarksPull: revision from: remoteSource.
+	resetCaches
+)
+public pathOf: source = (
+	^cachedPaths
+		at: source
+		ifAbsentPut: [super pathOf: source]
+)
+public remoteBookmarksFrom: source ifFail: failBlock = (
+	(* ^source = repositoryId
+		ifTrue: [
+			nil = cachedBookmarks ifTrue: [
+				cachedBookmarks:: super remoteBookmarksFrom: source ifFail: failBlock].
+			cachedBookmarks]
+		ifFalse: [super remoteBookmarksFrom: source ifFail: failBlock] *)
+	^super remoteBookmarksFrom: source ifFail: failBlock
+)
+renameBookmark: oldName to: newName = (
+	super renameBookmark: oldName to: newName.
+	resetCaches
+)
+public resetCaches = (
+	(* Clearing all caches every time something might have changed in the repository is less than optimal, e.g. when we change a bookmark's version we don't have to throw away the complete bookmark version cache. *)
+	cachedBookmarks:: nil.
+	cachedCommonAncestors:: Map new.
+	cachedHistorianName:: nil
+)
+public setRemoteBookmark: bookmarkName
+from: originalId
+to: newId
+on: otherRepositoryId
+ifFail: failBlock = (
+	repositoryId = otherRepositoryId ifTrue: [resetCaches].
+	super
+		setRemoteBookmark: bookmarkName
+		from: originalId
+		to: newId
+		on: otherRepositoryId
+		ifFail: failBlock
+)
+public stayOnCurrentHistorianNameDo: aBlock = (
+	| result oldHistorianName |
+	oldHistorianName:: currentHistorianNameIfNone: [
+		^aBlock value].
+	result:: aBlock value.
+	(currentHistorianNameIfNone: [nil]) = oldHistorianName ifFalse: [
+		makeHistorianCurrent: oldHistorianName].
+	^result
+)
+) : (
+)
+class NonCachingCommand = MercurialCommand (
+(* Mercurial commands specific to a local repository *)
+) (
+public addStream: stream asFileNamed: filename = (
+	writeStream: stream toFileNamed: filename.
+	launcher run: {'add'. filename}
+)
+public cat: filename atInternalId: internalId = (
+	^launcher runBinaryStream: {'cat'. filename. '--rev'. internalId asString}
+)
+clone: repositoryLocation = (
+	^launcher noDefaultArgumentsRun: {'clone'. repositoryLocation. repositoryDirectory pathName}
+)
+public commit: message = (
+	launcher run: {'add'. '-X'. '.*'}.
+	launcher run: {'commit'. '-m'. message}.
+)
+public commonAncestorOf: revA and: revB = (
+	| line |
+	line:: launcher run: {'debugancestor'. revA asString. revB asString}.
+	^(line subStrings: ':') second withBlanksTrimmed
+)
+public configFileDo: block = (
+configFileMutex critical: [
+	| configFile fileStream result filename |
+
+	filename:: (repositoryDirectory / '.hg' / 'hgrc') fullName.
+	fileStream:: CrLfFileStream fileNamed: filename.
+	nil = fileStream ifTrue: [logger error: 'Could not open ', filename].
+	configFile:: INIFile readFrom: fileStream.
+	result:: block value: configFile.
+	fileStream truncate. (* In case our new file is shorter. *)
+	configFile writeOn: fileStream.
+	fileStream flush close.
+	^result
+]
+)
+configKeyHistorian = (
+	^'current_historian'
+)
+configLinesStartingWith: prefix = (
+	| lines |
+	lines:: launcher runLines: {'showconfig'}.
+	^lines select: [:each | each startsWith: prefix]
+)
+configSectionNewspeak = (
+	^'newspeak'
+)
+public createEmptyRepository = (
+	launcher noDefaultArgumentsRun: {'init'. repository repositoryDirectory pathName}.
+	launcher run: {'bookmark'. 'master'}.
+	addStream: '' readStream asFileNamed: ignoredFilename.
+	launcher run: {'commit'.  '-m'. 'Initial Commit'}.
+)
+public currentHistorianNameIfNone: block = (
+	^configFileDo: [:configFile | |section|
+		section:: configFile section: configSectionNewspeak.
+		useMirrorsForResources:: (section at: 'track_resources' ifAbsent: ['true']) = 'true'.
+		section
+			at: configKeyHistorian
+			ifAbsent: block]
+)
+defaultArguments = (
+	^super defaultArguments, {'--cwd'. repositoryDirectory fullName}
+)
+public makeHistorianCurrent: id = (
+	launcher run: {'update'. '-C'. id asString}.
+	configFileDo: [:configFile |
+		(configFile section: configSectionNewspeak)
+			at: configKeyHistorian
+			put: id]
+)
+public pathOf: source = (
+	| lines |
+	lines:: launcher runLines: {'paths'}.
+	lines do: [:each | | subStrings |
+		subStrings:: each subStrings: ' ='.
+		subStrings first = source ifTrue: [
+			^subStrings second]].
+	(* Assume source is already a path *)
+	^source
+)
+public removeAll: filenames = (
+	filenames isEmpty ifFalse: [
+		launcher run: {'rm' .'-f'}, filenames]
+)
+public sourceIds = (
+	^(configLinesStartingWith: 'paths') collect: [:each |
+		(each subStrings: '.=') second]
+)
+tipStream = (
+	^launcher runStream: {'tip'}, logTemplate
+)
+) : (
+)
+MercurialCommand = (
+	^outer LocalRepository MercurialCommand
+)
+repositoryId = (
+	^outer LocalRepository repositoryId
+)
+) : (
+)
+class Historian named: historianName version: v = AbstractLocalHistorian named: historianName version: v (
+(* Specialization for local historians
+
+Mercurial does not support bookmark tracking. Tracking information is therefore stored in the mercurial conifig file. This works only for local historians, though. *)
+|
+	protected cachedTrackedHistorian
+|) (
+configSectionNewspeakTrackingHistorian = (
+	^'newspeak_tracking_historian'
+)
+configSectionNewspeakTrackingRepository = (
+	^'newspeak_tracking_repository'
+)
+public trackedHistorian: otherHistorian = (
+	command configFileDo: [:configFile |
+		configFile section: configSectionNewspeakTrackingRepository at: name put: otherHistorian repository repositoryId.
+		configFile section: configSectionNewspeakTrackingHistorian at: name put: otherHistorian name]
+)
+public trackedHistorianifPresent: presentBlock ifAbsent: absentBlock ifError: errorBlock = (
+	(* Returns nil if not existing *)
+	| remoteRepositoryId remoteHistorianName |
+	nil = cachedTrackedHistorian ifTrue: [
+		cachedTrackedHistorian:: command configFileDo: [:configFile | | remoteRepositoryPath |
+			remoteHistorianName:: (configFile section: configSectionNewspeakTrackingHistorian) at: name ifAbsent: [
+				^absentBlock value].
+			remoteRepositoryId:: (configFile section: configSectionNewspeakTrackingRepository) at: name ifAbsent: [
+				^absentBlock value].
+			remoteRepositoryPath:: command pathOf: remoteRepositoryId.
+			(repository remoteRepositoryAt: remoteRepositoryPath)
+				historianNamed: remoteHistorianName
+				ifFail: [
+					logger warn: 'Failed to load remote historian ', remoteHistorianName.
+					^errorBlock value]]].
+	^presentBlock value: cachedTrackedHistorian
+)
+) : (
+)
+class RepositoryVersionAccessing = AbstractRepositoryVersionAccessing (|
+	private mirrorAccessor ::= MirrorAccessor new.
+	private cachedVersionAtInternalId ::= Map new.
+|) (
+class MirrorAccessor = (
+(* Reading all mirrors of a version from the back end can be slow. Versions that are closely related often are identical in most mirrors. Mercurial can efficiently determine which files changed across revisions. Using this knowledge we can reuse mirrors of previously loaded versions. Thus, loading mirrors becomes more efficient.
+The same applies for writing mirrors; only mirrors that changed are written to the back end *)
+|
+	(* For the moment we store the mirrors of the version that was fetched most recently. We could also store mirrors of multiple versions and try to find a version close to the one to be loaded. *)
+	private lastLoadedRevision ::= 'null'.
+	public lastLoadedMirrors ::= Map new.
+|) (
+class VersionLoader onVersion: v = (|
+	version = v.
+|) (
+applyFileChange: change toMirrors: result = (
+	| filename changeCode |
+	changeCode:: change first.
+	filename:: change second.
+	"R" = changeCode ifTrue: [
+		result removeKey: filename ifAbsent: []].
+	('MA' includes: changeCode) ifTrue: [ | mirror |
+			mirror:: createMirrorForFilenamed: filename.
+			mirror isNil ifFalse: [result at: filename put: mirror]]
+)
+createMirrorForFilenamed: filename = (
+	| stream result |
+	((filename endsWith: '.png') or: [filename endsWith: '.txt']) ifTrue:
+		[useMirrorsForResources ifFalse: [^nil]].
+	logger log: 'Loading mirror for ', filename.
+	stream:: command cat: filename atInternalId: version internalId.
+	result:: sourceMirrors mirrorForStream: stream name: filename.
+	logger log: 'Finished loading mirror for ', filename.
+	^result
+)
+public loadMirrors = (
+	(* This isn't thread safe. Access to last loaded revision/mirrors isn't synchronized *)
+	| changes |
+	changes:: command statusFrom: lastLoadedRevision to: version internalId.
+	lastLoadedRevision:: version internalId.
+	lastLoadedMirrors:: lastLoadedMirrors value copy.
+	changes do: [:each |
+		applyFileChange: each toMirrors: lastLoadedMirrors].
+	^lastLoadedMirrors
+)
+) : (
+)
+public loadMirrorsFor: version = (
+	^(VersionLoader onVersion: version) loadMirrors
+)
+) : (
+)
+class RepositoryVersion = AbstractRepositoryVersion (|
+public parentInternalIds
+public branchName
+cachedMirrors
+cachedParents
+|) (
+closestAncestorsWithInternalIdOf: otherVersion = (
+	^otherVersion isRepositoryVersion
+		ifTrue: [{otherVersion}]
+		ifFalse: [otherVersion parents collect: [:each |
+					closestAncestorsWithInternalIdOf: each]]
+)
+public commonAncestorWith: otherVersion = (
+	^(closestAncestorsWithInternalIdOf: otherVersion) inject: self into: [:acc :each |
+		commonAncestorWithRepositoryVersion: each].
+)
+commonAncestorWithRepositoryVersion: otherVersion = (
+	| commonInternalId |
+	commonInternalId:: command commonAncestorOf: internalId and: otherVersion internalId.
+	^versionAtInternalId: commonInternalId
+)
+public mirrors ^<Map[String, SourceMirror]> = (
+	nil = cachedMirrors ifTrue: [
+		cachedMirrors:: mirrorAccessor loadMirrorsFor: self].
+	^cachedMirrors
+)
+public parents = (
+	nil = cachedParents ifTrue: [
+		cachedParents:: super parents].
+	^cachedParents
+)
+streamVersionsTo: otherVersion = (
+	^RepositoryVersionStream onStream:
+		(command streamLogFrom: internalId to: otherVersion internalId)
+)
+) : (
+)
+class RepositoryVersionStream onStream: stream = AbstractRepositoryVersionStream onStream: stream (
+) (
+extractParents: line = (
+	(* Format is rev:node rev:node, e.g.
+	1:533ba6a30a2a8d4ba869ee3d2cc5e90e08bfd2ac -1:0000000000000000000000000000000000000000 *)
+	| substrings |
+	substrings:: line subStrings: ': '.
+	^(substrings at: 3) = '-1' (* No parent / null revision *)
+		ifTrue: [
+			(substrings at: 1) = '-1'
+				ifTrue: [{}]
+				ifFalse: [{substrings at: 2}]]
+		ifFalse: [{substrings at: 2. substrings at: 4}]
+)
+public next = (
+	| internalId parentInternalIds message author version branch |
+	internalId:: nextLine.
+	parentInternalIds:: extractParents: nextLine.
+	author:: nextLine.
+	branch:: nextLine.
+	branch = '' ifTrue: [
+		branch:: 'default'].
+	message:: nextLine.
+	version:: RepositoryVersion new
+		internalId: internalId;
+		parentInternalIds: parentInternalIds;
+		author: author;
+		branchName: branch;
+		message: message;
+		yourself.
+	cachedVersionAtInternalId
+		at: internalId
+		put: version.
+	^version
+)
+) : (
+)
+cacheAllVersionsFrom: internalId = (
+	| stream |
+	stream:: RepositoryVersionStream onStream:
+		(command streamFromInternalId: internalId).
+	[stream atEnd] whileFalse: [ | version |
+		version:: stream next.
+		cachedVersionAtInternalId
+			at: version internalId
+			put: version]
+)
+public clearCache = (
+	mirrorAccessor:: MirrorAccessor new.
+	cachedVersionAtInternalId:: Map new.
+)
+public exportVersionId: internalId to: remoteRepository = (
+	command disabledBookmarksPush: internalId to: remoteRepository repositoryId.
+)
+immutableVersionAt: internalId = (
+	^cachedVersionAtInternalId
+		at: internalId
+		ifAbsent: [
+			cacheAllVersionsFrom: internalId.
+			cachedVersionAtInternalId at: internalId]
+)
+public importVersionId: internalId from: remoteRepository = (
+	cachedVersionAtInternalId
+		at: internalId
+		ifAbsent: [
+			command disabledBookmarksPull: internalId from: remoteRepository repositoryId].
+)
+public logStream = (
+	^RepositoryVersionStream onStream: command logStream
+)
+public versionAtInternalId: internalId = (
+	^(command isImmutableId: internalId)
+		ifTrue: [ | stream |
+			immutableVersionAt: internalId]
+		ifFalse: [(RepositoryVersionStream onStream: (command streamAtInternalId: internalId)) next]
+)
+) : (
+)
+public clearCaches = (
+	cachedCommand: nil.
+	repositoryVersionAccessing clearCache.
+)
+clone: repositoryLocation = (
+	| remoteHistorian |
+	command clone: repositoryLocation.
+	remoteHistorian:: remoteRepositories anyOne historians anyOne.
+	remoteHistorian trackAs: remoteHistorian name.
+	historians anyOne loadIntoImage
+)
+command = (
+	^super command
+)
+create = (
+	command createEmptyRepository
+)
+public imageHistorian = (
+	(* TODO: Consider introducing an unnamed historian *)
+	^(command currentHistorianNameIfNone: [nil])
+		ifNil: [trackMain]
+		ifNotNil: [:it | historianNamed: it ifFail: [logger halt: 'Could not load', it]]
+)
+public refresh = (
+	command resetCaches.
+	cachedRemoteRepositories:: nil
+)
+public remoteRepositories = (
+	nil = cachedRemoteRepositories ifTrue: [
+		cachedRemoteRepositories:: command sourceIds collect: [:each | RemoteRepository onLocalRepository: self onRepositoryId: (command pathOf: each) onName: each]].
+	^cachedRemoteRepositories
+)
+repository = (
+	^self
+)
+public repositoryDirectory = (
+	^super repositoryDirectory
+)
+trackMain = (
+	| remoteHistorian newHistorian |
+	historians isEmpty ifFalse: [
+		'No current historian is set, even though the repository already contains historians. Using a random one.' out.
+		^historians first makeCurrentHistorian; yourself
+		].
+
+	'The repository does not have any historians.' out.
+	command createRemoteBookmark: 'main' to: 'tip' on: repositoryId ifFail: [halt].
+	^(historianNamed: 'main' ifFail: [halt]) makeCurrentHistorian; yourself
+
+	(* logger info: 'The repository does not have any historians. We''ll try to import ''main'' from a random remote repository'.
+	remoteHistorian:: remoteRepositories anyOne historianNamed: 'main' ifFail: [
+		logger halt: 'Failed to load main historian'].
+	newHistorian:: remoteHistorian trackAs: remoteHistorian name.
+	^newHistorian
+		makeCurrentHistorian;
+		yourself *)
+)
+) : (
+)
+class RemoteRepository onLocalRepository: lr onRepositoryId: repositoryId  onName: n = AbstractRemoteRepository onLocalRepository: lr onRepositoryId: repositoryId onName: n (
+(* A remote mercurial repository
+
+Mercurial offers only a limited way to interact with remote repositories. E.g., in order to access a file at a revision that is stored in a remote repository, this revision first has to be pulled into a local repository. Thus, a remote repository always needs a local repository in order to be functional.
+
+Yet, the class RemoteRepository is *not* nested within LocalRepository. By not making it a nested class, all access to its local repository has to be funelled through the slot localRepository. As both, Local- and RemoteRepository have similar interfaces, having to make access to the local repository explicit is a good thing, as it prevents accidentially accessing the local repository using implicit outer sends. *)
+) (
+class Historian named: historianName versionId: vId = AbstractRemoteHistorian named: historianName versionId: vId (|
+	private cachedVersion
+|) (
+public setTo: newVersion ifFail: failBlock = (
+	(* import the version *before* setting the version *)
+	repository importVersionId: newVersion internalId.
+	super setTo: newVersion ifFail: failBlock.
+	versionId:: newVersion internalId
+)
+public version = (
+	nil = cachedVersion ifTrue: [
+		cachedVersion:: super version].
+	^cachedVersion
+)
+) : (
+public named: historianName version: version = (
+	^self named: historianName versionId: version internalId
+)
+)
+Command = (
+	^MercurialCommand
+)
+localRepository = (
+	^super localRepository
+)
+) : (
+)
+class Repository onRepositoryId: id = AbstractRepository onRepositoryId: id (|
+public repositoryType = 'hg'.
+|) (
+class MercurialCommand = AbstractCommand (
+(* We're using mercurial's bookmarks to implement historians. Unfortunately,
+bookmarks have some undesirable properties that we must try to compensate for.
+
+Mercurial does not by default have a notion of a current bookmark. It does
+provide an option to track the current bookmark, but that doesn't always work.
+So we track the current historian ourselves in .hg/hgrc.
+
+Mercurial's bookmarks do not support tracking/upstream relations to be defined.
+We store them ourselves in .hg/hgrc.
+
+A historian is always owned by a single repository. Historian 'master' on repo1
+is different from historian 'master' on repo2. This is not the case with
+bookmarks. Bookmarks share a single global namespace. If a repository pushes
+revisions to another repository, it automatically updates all bookmarks on that
+destination repository. In order to transfer versions between repositories
+without changing historians we must reset historians to the state that we found
+them at before. The current code that does this has not yet been checked for
+problems that might occur in case of concurrent access to repositories. *)
+|
+
+	commandLine = 'hg'.
+|) (
+bookmarksDisabledRun: commands = (
+	launcher run: {'--config'. 'extensions.hgext.bookmarks=!'}, commands
+)
+public createRemoteBookmark: bookmarkName
+to: newId
+on: repositoryId
+ifFail: failBlock = (
+	setRemoteBookmark: bookmarkName
+	from: unexistingVersionId
+	to: newId
+	on: repositoryId
+	ifFail: failBlock
+)
+defaultArguments = (
+	^{}
+)
+public deleteRemoteBookmark: bookmarkName withId: originalId on: repositoryId ifFail: failBlock = (
+	^self
+		setRemoteBookmark: bookmarkName
+		from: originalId
+		to: ''
+		on: repositoryId
+		ifFail: failBlock
+)
+public disabledBookmarksPull: revision from: remoteSource = (
+	bookmarksDisabledRun: {'pull'. remoteSource. '--rev'. revision}
+)
+public disabledBookmarksPush: internalId to: destination = (
+	(* We must use '-f' as we might create a new head, if the current historian is not a head *)
+	bookmarksDisabledRun: {'push'. destination. '-f'. '--rev'. internalId}
+)
+public isImmutableId: internalId = (
+	| isNode trimmedId |
+	trimmedId:: internalId withBlanksTrimmed.
+	^trimmedId size = 40 and: [
+		trimmedId allSatisfy: [:each | each isDigit or: [each >= "a" and: [each <= "f"]]]]
+)
+public logStream = (
+	^launcher runStream: {'log'}, logTemplate
+)
+logTemplate = (
+	^{'--debug'. '--template'. '{node}\n{parents}\n{author|person}\n{branches}\n{desc|firstline}\n'}
+)
+public merge: internalId = (
+	launcher run: {'--config'. 'ui.merge=internal:local'. 'merge'. internalId asString}.
+)
+parentStream = (
+	^launcher runStream: {'parents'}, logTemplate
+)
+public remoteBookmarksFrom: source ifFail: failBlock = (
+	(* Currently returns {} on failure. This is less than ideal, as it does not expose the problem. *)
+	| lines |
+(*	logger log: 'Getting remote bookmarks from ', source. *)
+	lines:: launcher runLines: {'debugpushkey'. source. 'bookmarks'} ifFail: [^ failBlock value].
+(*	logger log: 'Finished remote bookmarks from ', source. *)
+	^lines collect: [:each | each subStrings: '	']
+)
+renameBookmark: oldName to: newName = (
+	launcher runLines: {'bookmarks'. '--config'. 'bookmarks.track.current=True'. '--rename'. oldName. newName}.
+)
+public setRemoteBookmark: bookmarkName
+from: originalId
+to: newId
+on: repositoryId
+ifFail: failBlock = (
+	(* restoringBookmarksPush: newId to: repositoryId. *)
+	launcher run: {'debugpushkey'. repositoryId. 'bookmarks'. bookmarkName. originalId. newId} ifFail: failBlock
+)
+public statusFrom: revA to: revB = (
+	| lines statusAndFilenames |
+	lines:: launcher runLines: {'status'. '--rev'. revA asString, ':', revB asString}.
+	statusAndFilenames:: lines collect: [:each | {each first. each allButFirst: 2}].
+	^statusAndFilenames reject: [:each | isFilenameIgnored: each second]
+)
+public streamAtInternalId: internalId = (
+	^launcher runStream: {'log'. '-r'.  internalId asString, ':',  internalId asString}, logTemplate
+)
+public streamFromInternalId: internalId = (
+	^launcher runStream: {'log'. '-r'.  internalId asString, ':0'}, logTemplate
+)
+public streamLogFrom: fromId to: toId = (
+	^launcher runStream: {'log' .'--rev'. fromId asString, '::', toId asString}, logTemplate
+)
+unexistingVersionId = (
+	^''
+)
+) : (
+)
+class MercurialHistorian named: historianName = AbstractHistorian named: historianName (
+(* Implements historians using mercurial's bookmarks
+
+Mercurial's bookmarks behave different than historians in several ways.
+
+Although not the default, mercurial can be configured to store the 'current bookmark'. But even if it is configured to do so, the current bookmark is reset when existing bookmarks are set to point to other versions. We can fix this for local repositories by restoring the current bookmark after certain operations, but we cannot fix this for remote operations. If remote repositories are also to be used as local repositories and this becomes too much of a nuisance, we must store the current historian differently.
+
+If new versions are added to a repository, mercurial moves all bookmarks that point to an ancestor version to the new version. This is not what we want. Therefore we have to ensure bookmarks are restored after push and pull operations.
+
+Mercurial's 'bookmarks' command works only on local repositories. We use the 'debugpushkey' command instead. This allows using one implementation to access local and remote bookmarks. *)
+) (
+class HistorianChange onVersion: v = AbstractHistorianChange onVersion: v (
+) (
+public commit = (
+	activatedDo: [
+		withoutActivationCommit]
+)
+mergeIfNeeded = (
+	1 = newVersion parents size ifFalse: [ | mergeSource |
+		mergeSource:: newVersion parents detect: [:each | (each = historian version) not].
+		command merge: mergeSource internalId].
+)
+withoutActivationCommit = (
+	mergeIfNeeded.
+	changedMirrors do: [:each |
+		command addStream: each source readStream asFileNamed: each filename].
+	command removeAll: (
+		deletedOriginalMirrors collect: [:each | each filename]).
+	command commit: newVersion message
+)
+) : (
+)
+activatedDo: block = (
+	(* Doesn't check for nested calls. Could be added if required more than once *)
+	^command stayOnCurrentHistorianNameDo: [
+		makeCurrentHistorian.
+		block value]
+)
+public createIfFail: failBlock = (
+	command
+		createRemoteBookmark: name
+		to: version internalId
+		on: repositoryId
+		ifFail: failBlock.
+)
+deleteIfFail: failBlock = (
+	command
+		deleteRemoteBookmark: name
+		withId: version internalId
+		on: repositoryId
+		ifFail: failBlock
+)
+public makeCurrentHistorian = (
+	command makeHistorianCurrent: name.
+)
+public repository = (
+	^outer Repository repository
+)
+public setTo: newVersion ifFail: failBlock = (
+	(* Subclasses must ensure that newVersion is available in the owning repository *)
+	command
+		setRemoteBookmark: name
+		from: version internalId
+		to: newVersion internalId
+		on: repositoryId
+		ifFail: failBlock
+)
+public version = (
+	subclassResponsibility
+)
+) : (
+)
+Command = (
+	^subclassResponsibility
+)
+Historian = (
+	^MercurialHistorian
+)
+command = (
+	^super command
+)
+public historians = (
+	^(command
+		remoteBookmarksFrom: repositoryId
+		ifFail: [logger error: 'Could not access remote repository']) collect: [:each |
+			historianNamed: each first versionId: each second]
+)
+repository = (
+	^self
+)
+public repositoryId = (
+	^super repositoryId
+)
+) : (
+)
+Version = (
+	^super Version
+)
+sourceMirrors = (
+	^super sourceMirrors
+)
+) : (
+)
+) : (
+)

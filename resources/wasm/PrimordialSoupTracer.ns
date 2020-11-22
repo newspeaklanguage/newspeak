@@ -1,0 +1,909 @@
+Newspeak3
+'NS2PrimordialSoup'
+class PrimordialSoupTracer packageUsing: manifest = (
+(* Bootstraps Primordial Soup snapshots from Squeak. *)
+|
+runtime = manifest RuntimeForPrimordialSoup packageRuntimeUsing: manifest.
+runtimeWithMirrors = manifest RuntimeWithMirrorsForPrimordialSoup packageRuntimeUsing: manifest.
+helloApp = manifest HelloApp packageUsing: manifest.
+testApp = manifest TestRunner packageUsing: manifest.
+benchmarkApp = manifest BenchmarkRunner packageUsing: manifest.
+compilerApp = manifest CompilerApp packageUsing: manifest.
+|) (
+class Tracer usingPlatform: p with: runtime source: ks = (|
+List = p collections List.
+IdentityMap = p squeak IdentityDictionary.
+SmallInteger = p squeak SmallInteger.
+LargePositiveInteger = p squeak LargePositiveInteger.
+LargeNegativeInteger = p squeak LargeNegativeInteger.
+String = p squeak String.
+ByteString = p squeak ByteString.
+ByteSymbol = p squeak ByteSymbol.
+WideString = p squeak WideString.
+WideSymbol = p squeak WideSymbol.
+Class = p kernel Class.
+BlockClosure = p squeak BlockClosure.
+False = p squeak False.
+ImplementationBase = p squeak ImplementationBase.
+Message = p squeak Message.
+Metaclass = p kernel Metaclass.
+True = p squeak True.
+UndefinedObject = p squeak UndefinedObject.
+WeakArray = p squeak WeakArray.
+WeakSet = p squeak WeakSet.
+MethodContext = p squeak MethodContext.
+CompiledMethod = p squeak CompiledMethod.
+InstanceMixin = p kernel InstanceMixin.
+ClassMixin = p kernel ClassMixin.
+MethodDictionary = p squeak MethodDictionary.
+Dictionary = p squeak Dictionary.
+Fraction = p squeak Fraction.
+FileStream = p squeak FileStream.
+processorAssociation = p squeak Smalltalk associationAt: #Processor.
+vmmirror = p squeak VMMirror new.
+keepSource = ks.
+
+private kSmiCid = 3.
+private kMintCid = 4.
+private kBigintCid = 5.
+private kFloat64Cid = 6.
+private kByteArrayCid = 7.
+private kStringCid = 8.
+private kArrayCid = 9.
+private kWeakArrayCid = 10.
+private kEphemeronCid = 11.
+private kActivationCid = 12.
+private kClosureCid = 13.
+private kFirstPlainObjectCid = 14.
+
+psoup = runtime InternalKernel new.
+platform = runtime Platform internalKernel: psoup.
+
+replacements = IdentityMap new.
+symbolsPlaceholder = Array new.
+empty = Array new.
+
+public stream = ByteArray new writeStream.
+clusters = IdentityMap new.
+orderedClusters = List new.
+stack = List new: 32.
+backRefs = IdentityMap new: 4096.
+nextBackRef
+|) (
+class ActivationCluster for: cls = Cluster (|
+klass = cls.
+objects = List new.
+|) (
+public analyze: object = (
+	objects add: object.
+
+	enqueue: object sender.
+	enqueue: (newBCI: object).
+	enqueue: object method.
+	enqueue: object closure.
+	enqueue: object receiver.
+	enqueue: object stackPtr.
+	1 to: object stackPtr do: [:i | enqueue: (object tempAt: i)].
+)
+public name = (
+	^'Activation'
+)
+newBCI: ctxt = (
+	ctxt pc isNil ifTrue: [^nil].
+	^ctxt pc - ctxt method initialPC + 1.
+)
+public writeEdges = (
+	objects do: [:object |
+		writeBackRef: object sender.
+		writeBackRef: (newBCI: object).
+		writeBackRef: object method.
+		writeBackRef: object closure.
+		writeBackRef: object receiver.
+		stream uint16: object stackPtr. (* can't write smi because smi cluster maybe later*)
+		1 to: object stackPtr do: [:i | writeBackRef: (object tempAt: i)]]
+)
+public writeNodes = (
+	| prim = vmmirror. |
+	writeFormat: kActivationCid negated.
+	putUnsigned: objects size.
+	objects do: [:object | registerBackRef: object].
+)
+) : (
+)
+class ArrayCluster for: cls = Cluster (|
+klass = cls.
+objects = List new.
+|) (
+public analyze: object = (
+	objects add: object.
+	1 to: object size do: [:i | enqueue: (object at: i)].
+)
+public name = (
+	^'Array'
+)
+public replace: a with: b = (
+	1 to: objects size do: [:index |
+		a == (objects at: index) ifTrue: [objects at: index put: b. ^self]].
+	halt.
+)
+public writeEdges = (
+	objects do: [:object |
+		(backRefs at: object) == 0 ifTrue: [halt].
+		object do: [:each | writeBackRef: each]].
+)
+public writeNodes = (
+	| prim = vmmirror. |
+	writeFormat: kArrayCid negated.
+	putUnsigned: objects size.
+	objects do: [:object |
+		registerBackRef: object.
+		putUnsigned: (prim indexedSlotsOf: object)].
+)
+) : (
+)
+class ByteArrayCluster for: cls = Cluster (|
+	klass = cls.
+	objects = List new.
+|) (
+public analyze: object = (
+	objects add: object.
+)
+public name = (
+	^'ByteArray'
+)
+public writeEdges = (
+)
+public writeNodes = (
+	|
+	prim = vmmirror.
+	stop = [halt].
+	|
+	writeFormat: kByteArrayCid negated.
+	putUnsigned: objects size.
+	objects do: [:object |
+		registerBackRef: object.
+		putUnsigned: object size.
+		1 to: object size do: [:i | stream nextPut: (prim ifFail: stop indexedSlotOf: object at: i)]].
+)
+) : (
+)
+class ByteSymbolCluster for: cls = Cluster (|
+	klass = cls.
+	public symbols = List new.
+	strings = List new.
+|) (
+public analyze: object = (
+	object isSymbol
+		ifTrue: [symbols add: object]
+		ifFalse: [strings add: object].
+)
+public name = (
+	^'ByteSymbol'
+)
+public writeEdges = (
+)
+public writeNodes = (
+	|
+	prim = vmmirror.
+	stop = [halt].
+	|
+	writeFormat: kStringCid negated.
+	putUnsigned: strings size. (* non-canonical *)
+	strings do: [:object |
+		registerBackRef: object.
+		putUnsigned: object size.
+		1 to: object size do: [:i | stream nextPut: (prim ifFail: stop indexedSlotOf: object at: i)]].
+
+	putUnsigned: symbols size. (* canonical *)
+	symbols do: [:object |
+		registerBackRef: object.
+		putUnsigned: object size.
+		1 to: object size do: [:i | stream nextPut: (prim ifFail: stop indexedSlotOf: object at: i)]].
+)
+) : (
+)
+class ClassCluster for: cls = Cluster (|
+klass = cls.
+objects = List new.
+rewrites = List new.
+|) (
+public analyze: object = (
+	| rewrite |
+	objects add: object.
+	rewrite:: {
+		object superclass.
+		object methodDictionary.
+		object enclosingObjectSlot.
+		object mixinSlot.
+		nil. (* class id slot *)
+		newFormatFor: object.
+		object mixinSlot name.
+		object subclasses isEmpty ifTrue: [nil] ifFalse: [object subclasses].
+	}.
+	rewrites add: rewrite.
+	rewrite do: [:each | enqueue: each].
+)
+public name = (
+	^'Class'
+)
+newFormatFor: cls = (
+	(* special objects in psoup *)
+	psoup SmallInteger == cls ifTrue: [^nil].
+	psoup Activation == cls ifTrue: [^nil].
+	psoup WeakArray == cls ifTrue: [^nil].
+	psoup _Array == cls ifTrue: [^nil].
+	psoup ByteArray == cls ifTrue: [^nil].
+	psoup String == cls ifTrue: [^nil].
+	psoup MediumInteger == cls ifTrue: [^nil].
+	psoup Ephemeron == cls ifTrue: [^3].
+	psoup Closure == cls ifTrue: [^nil].
+
+	psoup Method == cls ifTrue: [^cls instSize]. (* A regular object is psoup *)
+
+	psoup Metaclass == cls ifTrue: [^7].
+	psoup UndefinedObject == cls ifTrue: [^cls instSize].
+	psoup True == cls ifTrue: [^cls instSize].
+	psoup False == cls ifTrue: [^cls instSize].
+	psoup InstanceMixin == cls ifTrue: [^cls instSize].
+	psoup ClassMixin == cls ifTrue: [^cls instSize].
+	psoup Class == cls ifTrue: [^cls instSize].
+	psoup Boolean == cls ifTrue: [^cls instSize].
+	psoup Behavior == cls ifTrue: [^cls instSize].
+	(classOf: psoup) == cls ifTrue: [^cls instSize].
+	psoup _Object == cls ifTrue: [^cls instSize].
+	psoup Message == cls ifTrue: [^cls instSize].
+	^cls instSize
+)
+public writeEdges = (
+	rewrites size = objects size ifFalse: [halt].
+	writeBackRef: klass.
+	rewrites do: [:rewrite |
+		rewrite do: [:ref | writeBackRef: ref]].
+)
+public writeNodes = (
+	writeFormat: 8.
+	putUnsigned: objects size.
+	objects do: [:object | registerBackRef: object].
+)
+) : (
+)
+class ClassMixinCluster for: cls = Cluster (|
+klass = cls.
+objects = List new.
+|) (
+public analyze: object = (
+	objects add: object.
+
+	enqueue: object instanceMixin.
+	enqueue: object methodDictionary.
+	enqueue: object enclosingMixin.
+	(* dropping organization, binding *)
+)
+public name = (
+	^'ClassMixin'
+)
+public writeEdges = (
+	writeBackRef: klass.
+	objects do: [:object |
+		writeBackRef: object instanceMixin.
+		writeBackRef: object methodDictionary.
+		writeBackRef: object enclosingMixin].
+)
+public writeNodes = (
+	assert: [klass instSize = 3] message: ''.
+
+	writeFormat: klass instSize.
+	putUnsigned: objects size.
+	objects do: [:object | registerBackRef: object].
+)
+) : (
+)
+class ClosureCluster for: cls = Cluster (|
+klass = cls.
+objects = List new.
+|) (
+public analyze: object = (
+	objects add: object.
+
+	(* enqueue: object numCopiedValues. *)(* not written as ref *)
+	enqueue: object outerContext.
+	enqueue: (newInitialBCI: object).
+	enqueue: object numArgs.
+	1 to: object numCopiedValues do: [:i | enqueue: (object at: i)].
+)
+public name = (
+	^'Closure'
+)
+newInitialBCI: block = (
+	^block startpc - block method initialPC + 1.
+)
+public writeEdges = (
+	objects do: [:object |
+		writeBackRef: object outerContext.
+		writeBackRef: (newInitialBCI: object).
+		writeBackRef: object numArgs.
+		1 to: object numCopiedValues do: [:i | writeBackRef: (object at: i)]].
+)
+public writeNodes = (
+	| prim = vmmirror. |
+	writeFormat: kClosureCid negated.
+	stream putUnsigned: objects size.
+	objects do: [:object |
+		registerBackRef: object.
+		stream uint16: object numCopiedValues].
+)
+) : (
+)
+class Cluster = (
+|
+	public nodesSize
+	public edgesSize
+|
+) (
+public recordWriteEdges = (
+	| start |
+	start: stream position.
+	writeEdges.
+	edgesSize:: stream position - start.
+)
+public recordWriteNodes = (
+	| start |
+	start: stream position.
+	writeNodes.
+	nodesSize:: stream position - start.
+)
+public size = (
+	^nodesSize + edgesSize
+)
+) : (
+)
+class InstanceMixinCluster for: cls = Cluster (|
+klass = cls.
+objects = List new.
+|) (
+public analyze: object = (
+	objects add: object.
+
+	enqueue: object name.
+	enqueue: object methodDictionary.
+	enqueue: object enclosingMixin.
+	enqueue: (canonicalizeEmpty: object slots).
+	enqueue: (canonicalizeEmpty: object nestedMixins).
+	enqueue: (object applications size = 0 ifFalse: [object applications]).
+	enqueue: object classMixin.
+	enqueue: object accessModifier.
+	enqueue: object cachedConstructorName.
+	keepSource ifTrue: [enqueue: object cachedHeaderSource].
+	(* dropping category, organization, binding *)
+)
+public name = (
+	^'InstanceMixin'
+)
+public writeEdges = (
+	writeBackRef: klass.
+	objects do: [:object |
+		writeBackRef: object simpleName.
+		writeBackRef: object methodDictionary.
+		writeBackRef: object enclosingMixin.
+		writeBackRef: (canonicalizeEmpty: object slots).
+		writeBackRef: (canonicalizeEmpty: object nestedMixins).
+		writeBackRef: (object applications size = 0 ifFalse: [object applications]).
+		writeBackRef: object classMixin.
+		writeBackRef: object accessModifier.
+		writeBackRef: object cachedConstructorName.
+		writeBackRef: (keepSource ifTrue: [object cachedHeaderSource]).].
+)
+public writeNodes = (
+	assert: [klass instSize = 10] message: ''.
+
+	writeFormat: klass instSize.
+	putUnsigned: objects size.
+	objects do: [:object | registerBackRef: object].
+)
+) : (
+)
+class MetaclassCluster for: cls = Cluster (|
+klass = cls.
+objects = List new.
+rewrites = List new.
+|) (
+public analyze: object = (
+	| rewrite |
+	objects add: object.
+	rewrite:: {
+		object superclass.
+		object methodDictionary.
+		object enclosingObjectSlot.
+		object mixinSlot.
+		nil. (* class id slot *)
+		newFormatFor: object.
+		object theNonMetaClass
+	}.
+	rewrites add: rewrite.
+	rewrite do: [:each | enqueue: each].
+)
+public name = (
+	^'Metaclass'
+)
+newFormatFor: cls = (
+	assert: [cls instSize = 7 (* size in squeak *)] message: ''.
+	^7 + 1 (* Adding the class id slot *)
+)
+public writeEdges = (
+	rewrites size = objects size ifFalse: [halt].
+
+	writeBackRef: klass.
+	rewrites do: [:rewrite |
+		rewrite do: [:ref | writeBackRef: ref]].
+)
+public writeNodes = (
+	assert: [klass instSize = 7] message: ''.
+
+	writeFormat: klass instSize.
+	putUnsigned: objects size.
+	objects do: [:object | registerBackRef: object].
+)
+) : (
+)
+class MethodCluster for: cls = Cluster (|
+klass = cls.
+objects = List new.
+rewrites = List new.
+canons = List new.
+dups = List new.
+|) (
+public analyze: object = (
+	| rewrite |
+	objects add: object.
+	rewrite:: {
+		newHeaderFor: object.
+		newLiteralsFor: object.
+		newBytecodeFor: object.
+		object methodClass. (*mixin*)
+		object selector.
+		object isSynthetic ifTrue: [nil] ifFalse: [keepSource ifTrue: [object getSource asString] ifFalse: [0]].
+	}.
+	rewrites add: rewrite.
+	rewrite do: [:each | enqueue: each].
+)
+list: a equals: b = (
+	a size = b size ifFalse: [^false].
+	1 to: a size do: [:index | (a at: index) = (b at: index) ifFalse: [^false]].
+	^true
+)
+public name = (
+	^'Method'
+)
+newBytecodeFor: cm = (
+	| a = cm initialPC. b = cm endPC. bytes |
+
+	(cm at: a) = 226 ifTrue: [^nil].
+	cm endPC > (cm initialPC) ifTrue: [
+		((cm at: a + 1) between: 176 and: 183) ifTrue: [^nil].
+		(cm at: a + 1) = 235 ifTrue: [^nil]].
+
+	bytes:: ByteArray new: b - a + 1.
+	1 to: bytes size do: [:i | bytes at: i put: (cm at: a + i - 1)].
+
+	canons do: [:canon | (list: canon equals: bytes) ifTrue: [dups add: bytes. ^canon]].
+	canons add: bytes.
+
+	^bytes
+)
+newHeaderFor: cm = (
+	| accessModifier numArgs numTemps primitive start |
+	accessModifier:: cm accessModifier.
+	accessModifier == #public ifTrue: [accessModifier:: 0].
+	accessModifier == #protected ifTrue: [accessModifier:: 1].
+	accessModifier == #private ifTrue: [accessModifier:: 2].
+	assert: [accessModifier between: 0 and: 3] message: ''.
+
+	numArgs:: cm numArgs.
+	assert: [numArgs between: 0 and: 255] message: ''.
+
+	numTemps:: cm numTemps.
+	assert: [numTemps between: 0 and: 255] message: ''.
+
+	primitive:: cm pragmaAt: #primitive:.
+	primitive == nil
+		ifTrue: [primitive:: cm primitive]
+		ifFalse: [primitive:: primitive arguments first].
+
+	(* quick return self *)
+	primitive = 256 ifTrue: [primitive:: 200].
+	assert: [primitive < 256] message: ''.
+
+	start:: cm initialPC.
+	(cm at: start) = 226
+		ifTrue: [
+			| slot = cm at: start + 1. |
+			assert: [slot between: 0 and: 255] message: ''.
+			assert: [cm readsField: slot + 1] message: ''.
+			assert: [cm initialPC + 2 = cm endPC] message: ''.
+			primitive:: 256 + slot.
+			assert: [numArgs = 0] message: ''].
+	cm endPC > cm initialPC ifTrue: [
+		((cm at: start + 1) between: 176 and: 183) ifTrue: [
+			| slot = (cm at: start + 1) bitAnd: 7. |
+			assert: [slot between: 0 and: 255] message: ''.
+			primitive:: 512 + slot].
+		(cm at: start + 1) = 235 ifTrue: [
+			| slot = cm at: start + 2. |
+			assert: [slot between: 0 and: 255] message: ''.
+			primitive:: 512 + slot]].
+
+	assert: [primitive between: 0 and: 1024] message: ''.
+
+	(* 0:7 numArgs
+		8:15 numTemps
+		16:27 prim
+		28:29 access *)
+	^(accessModifier << 28) | (primitive << 16) | (numTemps << 8) | (numArgs << 0)
+)
+newLiteralsFor: cm = (
+	| lits = cm literals allButLast: 2. |
+	canons do: [:canon | (list: canon equals: lits) ifTrue: [dups add: lits. ^canon]].
+	canons add: lits.
+	^lits
+)
+public writeEdges = (
+	rewrites size = objects size ifFalse: [halt].
+
+	{'method'. canons size. dups size} out.
+	writeBackRef: klass.
+	rewrites do: [:rewrite |
+		rewrite do: [:ref | writeBackRef: ref]].
+)
+public writeNodes = (
+	assert: [klass instSize = 6] message: ''.
+
+	writeFormat: klass instSize.
+	putUnsigned: objects size.
+	objects do: [:object | registerBackRef: object].
+)
+) : (
+)
+class PlainCluster for: cls = Cluster (|
+klass = cls.
+namedSlots = cls format bitAnd: 16rFFFF.
+objects = List new.
+|) (
+public analyze: object = (
+	|
+	prim = vmmirror.
+	stop = [halt].
+	|
+	objects add: object.
+	1 to: namedSlots do: [:i | enqueue: (prim ifFail: stop namedSlotOf: object at: i)].
+)
+public name = (
+	^klass name
+)
+public writeEdges = (
+	|
+	prim = vmmirror.
+	stop = [halt].
+	n = namedSlots.
+	|
+	writeBackRef: klass.
+	objects do: [:object |
+		1 to: n do: [:i | writeBackRef: (prim ifFail: stop namedSlotOf: object at: i)]].
+)
+public writeNodes = (
+	writeFormat: klass instSize.
+	putUnsigned: objects size.
+	objects do: [:object | registerBackRef: object].
+)
+) : (
+)
+class SmallIntegerCluster for: cls = Cluster (|
+	klass = cls.
+	small = List new.
+	large = List new.
+|) (
+public analyze: object = (
+	(object between: -9223372036854775808 and: 9223372036854775807)
+		ifTrue: [small add: object]
+		ifFalse: [large add: object].
+)
+public name = (
+	^'Integer'
+)
+public writeEdges = (
+)
+public writeNodes = (
+	writeFormat: kSmiCid negated.
+	putUnsigned: small size.
+	small do: [:object |
+		registerBackRef: object.
+		on: stream int64: object].
+
+	putUnsigned: large size.
+	large do: [:object |
+		registerBackRef: object.
+		stream nextPut: ((object < 0) ifTrue: [1] ifFalse: [0]).
+		stream uint16: object digitLength.
+		1 to: object digitLength do: [:i | stream nextPut: (object digitAt: i)]].
+)
+) : (
+)
+class StringCluster for: cls = Cluster (|
+	klass = cls.
+	objects = List new.
+|halt) (
+public analyze: object = (
+	objects add: object.
+)
+public name = (
+	^'String'
+)
+public writeEdges = (
+)
+public writeNodes = (
+	|
+	prim = vmmirror.
+	stop = [halt].
+	|
+	writeFormat: kStringCid negated.
+	putUnsigned: objects size. (* non-canonical *)
+	objects do: [:object |
+		registerBackRef: object.
+		putUnsigned: object size.
+		1 to: object size do: [:i | stream nextPut: (prim ifFail: stop indexedSlotOf: object at: i)]].
+	putUnsigned: 0. (* canonical *)
+)
+) : (
+)
+class WeakArrayCluster for: cls = Cluster (|
+klass = cls.
+objects = List new.
+|) (
+public analyze: object = (
+	objects add: object.
+	(* 1 to: object size do: [:i | enqueue: (object at: i)]. *)
+)
+public name = (
+	^'WeakArray'
+)
+public writeEdges = (
+	objects do: [:object |
+		object do: [:each | writeWeakBackRef: each]].
+)
+public writeNodes = (
+	| prim = vmmirror. |
+	writeFormat: kWeakArrayCid negated.
+	putUnsigned: objects size.
+	objects do: [:object |
+		registerBackRef: object.
+		putUnsigned: (prim indexedSlotsOf: object)].
+)
+) : (
+)
+analyze: object = (
+	(clusterFor: object) analyze: object.
+)
+buildReplacements = (
+	replaceClass: Array with: psoup _Array.
+	replaceClass: ByteArray with: psoup ByteArray.
+	replaceClass: String with: psoup String.
+	replaceClass: ByteString with: psoup String.
+	replaceClass: ByteSymbol with: psoup String.
+	replaceClass: WideString with: psoup String.
+	replaceClass: WideSymbol with: psoup String.
+	replaceClass: Class with: psoup Class.
+	replaceClass: BlockClosure with: psoup Closure.
+	replaceClass: False with: psoup False.
+	replaceClass: Message with: psoup Message.
+	replaceClass: Metaclass with: psoup Metaclass.
+	replaceClass: SmallInteger with: psoup SmallInteger.
+	replaceClass: True with: psoup True.
+	replaceClass: UndefinedObject with: psoup UndefinedObject.
+	replaceClass: WeakArray with: psoup WeakArray.
+	replaceClass: MethodContext with: psoup Activation.
+	replaceClass: CompiledMethod with: psoup Method.
+	replaceClass: InstanceMixin with: psoup InstanceMixin.
+	replaceClass: ClassMixin with: psoup ClassMixin.
+	replaceClass: Object with: psoup _Object.
+	replaceClass: Fraction with: psoup Fraction.
+
+	replacements at: processorAssociation put: nil.
+)
+canonicalizeEmpty: array = (
+	0 = array size ifTrue: [^empty].
+	^array
+)
+classOf: object = (
+	^vmmirror classOf: object
+)
+clusterFor: object = (
+	^clusterForClass: (replace: (vmmirror classOf: object)).
+)
+clusterForClass: klass = (
+	^clusters at: klass ifAbsentPut: [orderedClusters add: (newClusterForClass: klass)].
+)
+enqueue: preobject = (
+	| object |
+	object:: replace: preobject.
+	backRefs at: object ifAbsentPut: [stack add: object. 0].
+)
+newClusterForClass: klass = (
+	LargePositiveInteger == klass ifTrue: [^SmallIntegerCluster for: klass].
+	LargeNegativeInteger == klass ifTrue: [^SmallIntegerCluster for: klass].
+
+	enqueue: klass.
+
+	(* Schema change in psoup *)
+	klass isMeta ifTrue: [^ClassCluster for: klass].
+	psoup Metaclass == klass ifTrue: [^MetaclassCluster for: klass].
+	psoup InstanceMixin == klass ifTrue: [^InstanceMixinCluster for: klass].
+	psoup ClassMixin == klass ifTrue: [^ClassMixinCluster for: klass].
+	psoup Method == klass ifTrue: [^MethodCluster for: klass].
+
+	(* special objects in psoup *)
+	psoup _Array == klass ifTrue: [^ArrayCluster for: klass].
+	psoup ByteArray == klass ifTrue: [^ByteArrayCluster for: klass].
+	psoup String == klass ifTrue: [^ByteSymbolCluster for: klass].
+	psoup SmallInteger == klass ifTrue: [^SmallIntegerCluster for: klass].
+	psoup WeakArray == klass ifTrue: [^WeakArrayCluster for: klass].
+	psoup Activation == klass ifTrue: [^ActivationCluster for: klass].
+	psoup Closure == klass ifTrue: [^ClosureCluster for: klass].
+
+	(* regular objects in psoup *)
+	psoup UndefinedObject == klass ifTrue: [^PlainCluster for: klass].
+	psoup True == klass ifTrue: [^PlainCluster for: klass].
+	psoup False == klass ifTrue: [^PlainCluster for: klass].
+	(vmmirror classOf: psoup) = klass ifTrue: [^PlainCluster for: klass].
+	^PlainCluster for: klass
+)
+newReplace: preobject = (
+	| preclass = vmmirror classOf: preobject. |
+
+	(* MethodDictionary -> Array *)
+	MethodDictionary == preclass ifTrue: [^preobject values].
+
+	(* WeakSet (Class>>subclasses and InstanceMixin>>applications) -> WeakArray *)
+	WeakSet == preclass ifTrue: [^WeakArray withAll: (preobject asArray reject: [:e | e isNil]) ].
+
+	(* Dictionary (InstanceMixin>>nestedMixins -> Array *)
+	Dictionary == preclass ifTrue: [^newReplaceDictionary: preobject].
+
+	(* Character -> String *)
+	Character == preclass ifTrue: [^preobject asString asSymbol].
+	
+	WideString == preclass ifTrue: [^preobject squeakToUtf8].
+	WideSymbol == preclass ifTrue: [^preobject squeakToUtf8 asSymbol].
+
+	^preobject
+)
+newReplaceDictionary: preobject = (
+	(* Must be the nested mixins map *)
+	| x = preobject values. |
+	x do: [:ea | assert: [ea isMixin] message: ''].
+	^Array withAll: x
+)
+on: stm int64: anInteger = (
+	| n |
+	(anInteger < 16r8000000000000000 negated) | (anInteger >= 16r8000000000000000)
+		ifTrue: [self error: 'outside 32-bit integer range'].
+
+	anInteger < 0
+		ifTrue: [n:: 16r10000000000000000 + anInteger]
+		ifFalse: [n:: anInteger].
+	stm nextPut: (n digitAt: 8).
+	stm nextPut: (n digitAt: 7).
+	stm nextPut: (n digitAt: 6).
+	stm nextPut: (n digitAt: 5).
+	stm nextPut: (n digitAt: 4).
+	stm nextPut: (n digitAt: 3).
+	stm nextPut: (n digitAt: 2).
+	stm nextPut: (n digitAt: 1).
+)
+patchImplementationBase = (
+	psoup _Object superclass: nil.
+	psoup _Object methodDictionary at: #'initializer`new' put:
+		(CompiledMethod toReturnSelf selector: #'initializer`new'; yourself).
+)
+putUnsigned: value = (
+	| v ::= value. |
+	[v > 127] whileTrue:
+		[stream nextPut: (v bitAnd: 127).
+		 v:: v >> 7].
+	stream nextPut: v + 128.
+)
+registerBackRef: object = (
+	| r = replace: object. |
+	r == object ifFalse: [halt].
+	backRefs at: object put: nextBackRef.
+	nextBackRef:: nextBackRef + 1.
+)
+replace: preobject = (
+	^replacements at: preobject ifAbsentPut: [newReplace: preobject]
+)
+replaceClass: oldClass with: newClass = (
+	replacements at: oldClass put: newClass.
+	replacements at: (vmmirror classOf: oldClass) put: (vmmirror classOf: newClass).
+)
+serialize: root = (
+	| interpreter rewind fastforward finalSymbols |
+	nextBackRef:: 1.
+
+	backRefs at: nil put: 0.
+	analyze: nil.
+	backRefs at: false put: 0.
+	analyze: false.
+	backRefs at: true put: 0.
+	analyze: true.
+
+	(* Side-effect these clusters first. *)
+	clusterFor: SmallInteger.
+	clusterFor: String.
+
+	enqueue: root.
+	[stack isEmpty] whileFalse: [analyze: stack removeLast].
+
+	(* Now that we're done tracing, we know what symbols are included and 'become' the placeholder array we initialized the kernel with. *)
+	finalSymbols:: (clusters at: psoup String) symbols asArray.
+	(clusters at: psoup _Array) replace: symbolsPlaceholder with: finalSymbols. (* swap node *)
+	replacements at: symbolsPlaceholder put: finalSymbols. (* swap incoming edges *)
+
+	interpreter:: '#!fuchsia primordialsoup'.
+	1 to: interpreter size do: [:index | stream nextPut: (interpreter at: index)].
+	stream nextPut: 10. (* \n *)
+	stream uint16: 16r1984.
+	stream uint16: 0.
+	stream uint16: orderedClusters size.
+	rewind:: stream position.
+	stream uint32: 0.
+	orderedClusters do: [:c | c recordWriteNodes].
+	orderedClusters do: [:c | c recordWriteEdges].
+	writeBackRef: root.
+
+	fastforward:: stream position.
+	stream position: rewind.
+	stream uint32: nextBackRef - 1.
+	stream position: fastforward.
+
+	orderedClusters sort: [:a :b | a size > b size].
+	orderedClusters do: [:c | (c name, ' ', c size printString) out].
+)
+public serialize: app to: filename = (
+	| root |
+	patchImplementationBase.
+	buildReplacements.
+	root:: psoup buildObjectStoreWithApplication: app platform: platform symbols: symbolsPlaceholder.
+	serialize: root.
+
+	FileStream forceNewFileNamed: filename do: [:stm |
+		stm binary.
+		stm nextPutAll: stream contents.
+		stm close].
+)
+writeBackRef: object = (
+	| r = backRefs at: (replacements at: object). |
+	r == 0 ifTrue: [halt].
+	putUnsigned: r.
+)
+writeFormat: format = (
+	stream int32: format.
+)
+writeWeakBackRef: object = (
+	| ref = backRefs at: (replace: object) ifAbsent: [backRefs at: nil]. |
+	putUnsigned: ref.
+)
+) : (
+)
+public main: p args: a = (
+	(Tracer usingPlatform: p with: runtime source: false)
+		serialize: helloApp to: 'primordialsoup/snapshots/hello.vfuel'.
+
+	(Tracer usingPlatform: p with: runtimeWithMirrors source: true)
+		serialize: testApp to: 'primordialsoup/snapshots/tests.vfuel'.
+
+	(Tracer usingPlatform: p with: runtime source: false)
+		serialize: benchmarkApp to: 'primordialsoup/snapshots/benchmarks.vfuel'.
+
+	(Tracer usingPlatform: p with: runtimeWithMirrors source: false)
+		serialize: compilerApp to: 'primordialsoup/snapshots/compiler.vfuel'.
+)
+) : (
+)

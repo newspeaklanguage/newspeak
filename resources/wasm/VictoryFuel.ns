@@ -1,0 +1,986 @@
+Newspeak3
+'VictoryFuel'
+class VictoryFuel usingPlatform: p vm: vm = (
+(* Clustered serialization inspired by Fuel and Parcels.
+
+A traditional serialization scheme recursively visits the references of a object, and writes back references for objects already encountered or starts writing a new object body. Clustered serialization visits all the references and assigns the objects to clusters (e.g., based on class), then writes all the object bodies (byte data, nodes), then writes all the object references (pointer data, edges). Clustering allows writing and reading the type information once per cluster instead of once per object, and for allocating objects in tight loops. Placing all nodes before all edges allows for filling objects in tight loops.
+
+Serialization:
+- Push the root object onto a work stack.
+- While the work stack is not empty, pop an object. Record that we have seen this object. Assign it to a cluster, either based on its class or whether it is a 'global' that will pre-exist for the deserializer. Visit its references, and push any we haven't seen onto the stack. (Use of an explicit stack avoids deep recursion and context-stack mapping busy work.)
+- For each cluster, write the bodies (byte data, nodes) of each object and assign each object a back ref.
+- For each cluster, write the references (pointer data, edges) of each object using back ref.
+- Write the root's back ref.
+
+Deserialization:
+- For each cluster, allocate each object and fill its byte data.
+- For each cluster, fill the pointer data of each object.
+- For each cluster, set the class of each object. (We must do this after all edges have been read to be sure the class's format field is valid and the object will not be truncated or have bytes interpreted as pointers or vis versa.)
+- For each cluster, send #rehash to each object. (Identity hashes are not preserved across serialization.)
+
+Perfomance compared to NewspeakObjectFormat:
+	BootstrapRuntimeForSqueak  RuntimeForSqueak  HopscotchIDEApp
+VF Ser       154.6ms +- 0.54%      419.5ms +- 2.27%     401.9ms +- 2.8%
+NOF Ser     367.6ms +- 2.12%    1017.2ms +- 0.48%   1019.8ms +- 1.78%
+NOF/VF                2.37                        2.42                         2.537
+VF Des         45.4ms +- 2.24%      108.7ms +- 0.82%    108.7ms +- 0.54%
+NOF Des     279.4ms +- 4.95%      900.3ms +- 0.90%     882.2ms +- 0.88%
+NOF/VF                6.15                        8.28                          8.11
+
+TODO:
+- Use mirror primitives to allocate/trace/fill compiled methods.
+- Write an identity map in Newspeak that uses mirror primitives for == and identityHash.
+- What if finalization mutates our subgraph between analysis and writing edges?
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License. You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License. *)
+|
+	private List = p squeak OrderedCollection.
+	private IdentityMap = p squeak IdentityDictionary.
+	private CompiledMethod = p squeak CompiledMethod. (* Replace with mirror primitive for allocation. *)
+
+	(* Classes which require special handling because they have immediate instances, may switch representation between 32- and 64-bit images, or must be canonicalized. *)
+	private SmallInteger = p squeak SmallInteger.
+	private LargePositiveInteger = p squeak LargePositiveInteger.
+	private LargeNegativeInteger = p squeak LargeNegativeInteger.
+	private Character = p squeak Character.
+	private ImmediateFloat = p squeak Smalltalk at: #SmallFloat64 ifAbsent: [nil].
+	private BoxedFloat = p squeak Smalltalk at: #BoxedFloat64 ifAbsent: [p squeak Float].
+	private ByteSymbol = p squeak ByteSymbol.
+	private WideSymbol = p squeak WideSymbol.
+
+	private WideString = p squeak WideString. (* To deserialize WideSymbols. *)
+	private MethodDictionary = p squeak MethodDictionary. (* Ordering requirement. *)
+
+	private processorAssociation = p squeak Smalltalk associationAt: #Processor.
+	private vmmirror = vm.
+
+	private IntegerPsuedoFormat = -1.
+	private FloatPsuedoFormat = -2.
+	private CharPsuedoFormat = -3.
+	private SymbolPsuedoFormat = -4.
+	private WideSymbolPsuedoFormat = -5.
+	private GlobalsPsuedoFormat = -6.
+	private Version = 3.
+|) (
+public class Deserializer over: stream_ <ReadStream> withGlobals: globals_ <Map[Symbol, Object]> = (|
+stream <ReadStream> = stream_.
+globals <Map[Symbol, Object]> = globals_.
+clusters <Array>
+backRefs <Array>
+nextBackRef <Integer>
+|) (
+class CharacterCluster = () (
+public adoptInstances = (
+)
+public doRehash = (
+)
+public readEdges = (
+)
+public readNodes = (
+	| numInstances |
+	numInstances:: stream uint16.
+	numInstances timesRepeat:
+		[registerBackRef: (Character codePoint: stream int32)].
+)
+) : (
+)
+class CompiledMethodCluster for: fmt = (|
+	format = fmt.
+	klass
+	backRefStart <Integer>
+	backRefStop <Integer>
+|) (
+public adoptInstances = (
+	|
+	prim = vmmirror.
+	stop = [halt].
+	localClass = klass.
+	|
+	backRefStart to: backRefStop do: [:i |
+		prim ifFail: stop haveClass: localClass adoptInstance: (backRefs at: i)].
+)
+public doRehash = (
+)
+public readEdges = (
+	|
+	prim = vmmirror.
+	stop = [stop].
+	namedSlots = format bitAnd: 16rFFFF.
+	|
+	klass:: readBackRef.
+	backRefStart to: backRefStop do: [:i |
+		| object = backRefs at: i. |
+		1 to: object numLiterals + 1 do: [:j |
+			#BOGUS. (* Use a mirror primitive *)
+			object objectAt: j put: readBackRef]].
+)
+public readNodes = (
+	| prim stop allocClass numInstances |
+	prim:: vmmirror.
+	stop:: [halt].
+	(* allocClass:: TemporaryClass withFormat: format. *)
+	backRefStart:: nextBackRef.
+	numInstances:: stream uint16.
+	numInstances timesRepeat:
+		[| numLiterals byteSize object |
+		numLiterals:: stream uint16.
+		byteSize:: stream uint16.
+		#BOGUS. (* Should use mirror primitives. *)
+		object:: CompiledMethod newMethod: byteSize header: numLiterals.
+		object initialPC to: object basicSize do: [:i | prim ifFail: stop indexedSlotOf: object at: i put: stream next].
+		registerBackRef: object].
+	backRefStop:: nextBackRef - 1.
+)
+) : (
+)
+class FixedPointersCluster for: fmt = (|
+	format = fmt.
+	klass
+	backRefStart <Integer>
+	backRefStop <Integer>
+	allocClass
+|) (
+public adoptInstances = (
+	|
+	prim = vmmirror.
+	stop = [halt].
+	localClass = klass.
+	|
+	backRefStart to: backRefStop do: [:i |
+		prim ifFail: stop haveClass: localClass adoptInstance: (backRefs at: i)].
+)
+public doRehash = (
+	backRefStart to: backRefStop do: [:i | (backRefs at: i) rehash].
+)
+public readEdges = (
+	|
+	prim = vmmirror.
+	stop = [halt].
+	namedSlots = format bitAnd: 16rFFFF.
+	|
+	klass:: readBackRef.
+	backRefStart to: backRefStop do: [:i |
+		| object = backRefs at: i. |
+		1 to: namedSlots do: [:jj | prim ifFail: stop namedSlotOf: object at: jj put: readBackRef]].
+)
+public readNodes = (
+	|
+	prim = vmmirror.
+	stop = [halt].
+	numInstances
+	namedSlots = format bitAnd: 16rFFFF.
+	|
+	allocClass:: TemporaryClass withFormat: format.
+	backRefStart:: nextBackRef.
+	numInstances:: stream uint16.
+	numInstances timesRepeat:
+		[| object |
+		object:: prim ifFail: stop instantiateFixedClass: allocClass.
+		registerBackRef: object].
+	backRefStop:: nextBackRef - 1.
+)
+) : (
+)
+class FloatCluster = () (
+public adoptInstances = (
+)
+public doRehash = (
+)
+public readEdges = (
+)
+public readNodes = (
+	| numInstances |
+	numInstances:: stream uint16.
+	numInstances timesRepeat:
+		[ | object = BoxedFloat new. |
+		(* Big-endian. Sub-optimial, but we don't currently have the right primitives to use little-endian encoding. *)
+		object basicAt: 1 put: stream uint32.
+		object basicAt: 2 put: stream uint32.
+		registerBackRef: object (* normalize *)].
+)
+) : (
+)
+class GlobalsCluster = () (
+public adoptInstances = (
+)
+public doRehash = (
+)
+public readEdges = (
+)
+public readNodes = (
+	| numInstances |
+	numInstances:: stream uint16.
+	numInstances timesRepeat: [
+		|
+		keySize = stream uint16.
+		key = String new: keySize.
+		|
+		1 to: keySize do: [:i | key basicAt: i put: stream next].
+		registerBackRef: (globals at: key asSymbol)].
+)
+) : (
+)
+class IntegerCluster = () (
+public adoptInstances = (
+)
+public doRehash = (
+)
+public readEdges = (
+)
+public readNodes = (
+	| numSmall numLargePositive numLargeNegative |
+	numSmall:: stream uint16.
+	numLargePositive:: stream uint16.
+	numLargeNegative:: stream uint16.
+	numSmall timesRepeat:
+		[registerBackRef: stream int32].
+	numLargePositive timesRepeat:
+		[ | digits = stream uint16. object = LargePositiveInteger new: digits. |
+		1 to: digits do: [:index | object digitAt: index put: stream next].
+		registerBackRef: object normalize].
+	numLargeNegative timesRepeat:
+		[ | digits = stream uint16. object = LargeNegativeInteger new: digits. |
+		1 to: digits do: [:index | object digitAt: index put: stream next].
+		registerBackRef: object normalize].
+)
+) : (
+)
+class SymbolCluster = () (
+public adoptInstances = (
+)
+public doRehash = (
+)
+public readEdges = (
+)
+public readNodes = (
+	| localStream = stream. numInstances |
+	numInstances:: localStream uint16.
+	numInstances timesRepeat:
+		[ | size object |
+		size:: localStream uint16.
+		object:: String new: size.
+		1 to: size do: [:i | object basicAt: i put: localStream next].
+		registerBackRef: object asSymbol].
+)
+) : (
+)
+class Uint32Cluster for: fmt = (|
+	format = fmt.
+	klass
+	backRefStart <Integer>
+	backRefStop <Integer>
+|) (
+public adoptInstances = (
+	|
+	prim = vmmirror.
+	stop = [halt].
+	localClass = klass.
+	|
+	backRefStart to: backRefStop do: [:i |
+		prim ifFail: stop haveClass: localClass adoptInstance: (backRefs at: i)].
+)
+public doRehash = (
+)
+public readEdges = (
+	klass:: readBackRef.
+)
+public readNodes = (
+	| prim allocClass numInstances |
+	prim:: vmmirror.
+	allocClass:: TemporaryClass withFormat: format.
+	backRefStart:: nextBackRef.
+	numInstances:: stream uint16.
+	numInstances timesRepeat:
+		[ | size object |
+		size:: stream uint32.
+		object:: prim ifFail: [halt] instantiateVariableClass: allocClass withSize: size.
+		1 to: size do: [:i | prim ifFail: [halt] indexedSlotOf: object at: i put: stream uint32].
+		registerBackRef: object].
+	backRefStop:: nextBackRef - 1.
+)
+) : (
+)
+class Uint8Cluster for: fmt = (|
+	format = fmt.
+	klass
+	backRefStart <Integer>
+	backRefStop <Integer>
+|) (
+public adoptInstances = (
+	|
+	prim = vmmirror.
+	stop = [halt].
+	localClass = klass.
+	|
+	backRefStart to: backRefStop do: [:i |
+		prim ifFail: stop haveClass: localClass adoptInstance: (backRefs at: i)].
+)
+public doRehash = (
+)
+public readEdges = (
+	klass:: readBackRef.
+)
+public readNodes = (
+	| prim allocClass numInstances localStream = stream. |
+	prim:: vmmirror.
+	allocClass:: TemporaryClass withFormat: format.
+	backRefStart:: nextBackRef.
+	numInstances:: localStream uint16.
+	numInstances timesRepeat:
+		[ | size object |
+		size:: localStream uint32.
+		object:: prim ifFail: [halt] instantiateVariableClass: allocClass withSize: size.
+		1 to: size do: [:i | prim ifFail: [halt] indexedSlotOf: object at: i put: localStream next].
+		registerBackRef: object].
+	backRefStop:: nextBackRef - 1.
+)
+) : (
+)
+class VariablePointersCluster for: fmt = (|
+	format = fmt.
+	klass
+	backRefStart <Integer>
+	backRefStop <Integer>
+|) (
+public adoptInstances = (
+	|
+	prim = vmmirror.
+	stop = [halt].
+	localClass = klass.
+	|
+	backRefStart to: backRefStop do: [:i |
+		prim ifFail: stop haveClass: localClass adoptInstance: (backRefs at: i)].
+)
+public doRehash = (
+	backRefStart to: backRefStop do: [:i | (backRefs at: i) rehash].
+)
+public readEdges = (
+	|
+	prim = vmmirror.
+	stop = [halt].
+	namedSlots = format bitAnd: 16rFFFF.
+	|
+	klass:: readBackRef.
+	backRefStart to: backRefStop do: [:i |
+		| object = backRefs at: i. |
+		1 to: namedSlots do:
+			[:j | prim ifFail: stop namedSlotOf: object at: j put: readBackRef].
+		1 to: (prim indexedSlotsOf: object) do:
+			[:j | prim ifFail: stop indexedSlotOf: object at: j put: readBackRef]].
+)
+public readNodes = (
+	| prim allocClass numInstances |
+	prim:: vmmirror.
+	allocClass:: TemporaryClass withFormat: format.
+	backRefStart:: nextBackRef.
+	numInstances:: stream uint16.
+	numInstances timesRepeat:
+		[| size object |
+		size:: stream uint16.
+		object:: prim ifFail: [halt] instantiateVariableClass: allocClass withSize: size.
+		registerBackRef: object].
+	backRefStop:: nextBackRef - 1.
+)
+) : (
+)
+class WideSymbolCluster = () (
+public adoptInstances = (
+)
+public doRehash = (
+)
+public readEdges = (
+)
+public readNodes = (
+	| localStream = stream. numInstances |
+	numInstances:: localStream uint16.
+	numInstances timesRepeat:
+		[ | size object |
+		size:: localStream uint16.
+		object:: WideString new: size.
+		1 to: size do: [:i | object basicAt: i put: localStream uint32].
+		registerBackRef: object asSymbol].
+)
+) : (
+)
+WeakPointerCluster = (
+	(* Same behavior during deserialization. *)
+	^VariablePointersCluster
+)
+public deserialize = (
+	| numClusters |
+	assert: [stream uint16 = 16r1984] message: 'Not VictoryFuel'.
+	assert: [stream uint16 = Version] message: 'Version mismatch'.
+	numClusters:: stream uint16.
+	clusters:: Array new: numClusters.
+	backRefs:: Array new: stream uint32.
+	nextBackRef:: 1.
+	registerBackRef: nil.
+	registerBackRef: false.
+	registerBackRef: true.
+	registerBackRef: processorAssociation.
+
+	1 to: numClusters do: [:i | clusters at: i put: readCluster readNodes].
+	1 to: numClusters do: [:i | (clusters at: i) readEdges].
+	1 to: numClusters do: [:i | (clusters at: i) adoptInstances].
+	1 to: numClusters do: [:i | (clusters at: i) doRehash].
+	^readBackRef
+)
+readBackRef = (
+	^backRefs at: stream uint32
+)
+readCluster = (
+	| format = readFormat. instSpec |
+
+	format == IntegerPsuedoFormat ifTrue: [^IntegerCluster new].
+	format == FloatPsuedoFormat ifTrue: [^FloatCluster new].
+	format == CharPsuedoFormat ifTrue: [^CharacterCluster new].
+	format == SymbolPsuedoFormat ifTrue: [^SymbolCluster new].
+	format == WideSymbolPsuedoFormat ifTrue: [^WideSymbolCluster new].
+	format == GlobalsPsuedoFormat ifTrue: [^GlobalsCluster new].
+
+	instSpec:: (format bitShift: -16) bitAnd: 16r1F.
+	instSpec <= 1 ifTrue: [^FixedPointersCluster for: format].
+	instSpec <= 3 ifTrue: [^VariablePointersCluster for: format].
+	instSpec <= 4 ifTrue: [^WeakPointerCluster for: format].
+	instSpec <= 5 ifTrue: [^EphemeronCluster for: format].
+	instSpec <= 9 ifTrue: [halt].
+	instSpec <= 11 ifTrue: [^Uint32Cluster for: format].
+	instSpec <= 15 ifTrue: [^Uint16Cluster for: format].
+	instSpec <= 23 ifTrue: [^Uint8Cluster for: format].
+	instSpec <= 31 ifTrue: [^CompiledMethodCluster for: format].
+
+	Error signal: 'Unknown format'.
+)
+readFormat = (
+	^stream int32
+)
+registerBackRef: object = (
+	backRefs at: nextBackRef put: object.
+	nextBackRef:: nextBackRef + 1.
+)
+) : (
+)
+public class Serializer over: stream_ <ReadStream> withGlobals: globals_ <Map[Symbol, Object]> = (|
+stream = stream_.
+clusters = IdentityMap new.
+stack = List new: 32.
+backRefs = IdentityMap new: 4096.
+nextBackRef
+reverseGlobals = IdentityMap new.
+|createPsuedoClassClusters.
+	globals_ keysAndValuesDo: [:k :v | reverseGlobals at: v put: k]) (
+class CharacterCluster = (|
+objects = List new.
+|) (
+public analyze: object <Character> = (
+	objects add: object.
+)
+public printOn: stm = (
+	objects size printOn: stm.
+	stm space; nextPutAll: 'Character'.
+)
+public writeEdges = (
+)
+public writeNodes = (
+	writeFormat: CharPsuedoFormat.
+	stream uint16: objects size.
+	objects do: [:object |
+		registerBackRef: object.
+		stream uint32: object codePoint].
+)
+) : (
+)
+class CompiledMethodCluster for: cls = (|
+klass = cls.
+namedSlots = cls instSize.
+objects = List new.
+|) (
+public analyze: object = (
+	objects add: object.
+	pointersOf: object do: [:each | enqueue: each].
+)
+pointersOf: object do: action = (
+	#BOGUS. (* Should use mirror primitives. *)
+	1 to: object numLiterals + 1 do: [:i | action value: (object objectAt: i)].
+)
+public printOn: stm = (
+	objects size printOn: stm.
+	stm space; nextPutAll: 'CompiledMethod'.
+)
+public writeEdges = (
+	writeBackRef: klass.
+	objects do: [:object |
+		pointersOf: object do: [:each | writeBackRef: each]].
+)
+public writeNodes = (
+	| prim = vmmirror. |
+	writeFormat: klass format.
+	stream uint16: objects size.
+	objects do: [:object |
+		registerBackRef: object.
+		#BOGUS. (* Should use mirror primitives. *)
+		stream uint16: object numLiterals.
+		stream uint16: object basicSize - object initialPC + 1.
+		object initialPC to: object basicSize do: [:i | stream nextPut: (object basicAt: i)]].
+)
+) : (
+)
+class FixedPointersCluster for: cls = (|
+klass = cls.
+namedSlots = cls format bitAnd: 16rFFFF.
+objects = List new.
+|) (
+public analyze: object = (
+	|
+	prim = vmmirror.
+	stop = [halt].
+	|
+	objects add: object.
+	1 to: namedSlots do: [:i | enqueue: (prim ifFail: stop namedSlotOf: object at: i)].
+)
+public printOn: stm = (
+	objects size printOn: stm.
+	stm space; nextPutAll: klass name.
+)
+public writeEdges = (
+	|
+	prim = vmmirror.
+	stop = [halt].
+	n = namedSlots.
+	|
+	writeBackRef: klass.
+	objects do: [:object |
+		1 to: n do: [:i | writeBackRef: (prim ifFail: stop namedSlotOf: object at: i)]].
+)
+public writeNodes = (
+	writeFormat: klass format.
+	stream uint16: objects size.
+	objects do: [:object | registerBackRef: object].
+)
+) : (
+)
+class FloatCluster = (|
+objects = List new.
+|) (
+public analyze: object <Integer> = (
+	objects add: object.
+)
+public printOn: stm = (
+	objects size printOn: stm.
+	stm space; nextPutAll: 'Float'.
+)
+public writeEdges = (
+)
+public writeNodes = (
+	writeFormat: FloatPsuedoFormat.
+	stream uint16: objects size.
+	objects do: [:object |
+		registerBackRef: object.
+		(* Big-endian. Sub-optimial, but we don't currently have the right primitives to use little-endian encoding. *)
+		stream uint32: (object basicAt: 1).
+		stream uint32: (object basicAt: 2)].
+)
+) : (
+)
+class GlobalsCluster new = (|
+	klass
+	objects = List new.
+|) (
+public analyze: object = (
+	objects add: object.
+)
+public printOn: stm = (
+	objects size printOn: stm.
+	stm space; nextPutAll: 'globals'.
+)
+public writeEdges = (
+)
+public writeNodes = (
+	writeFormat: GlobalsPsuedoFormat.
+	stream uint16: objects size.
+	objects do: [:object |
+		|
+		key = reverseGlobals at: object.
+		keySize = key size.
+		|
+		registerBackRef: object.
+		stream uint16: keySize.
+		1 to: keySize do: [:i | stream nextPut: (key basicAt: i)]].
+)
+) : (
+)
+class IntegerCluster = (|
+small = List new.
+largePositive = List new.
+largeNegative = List new.
+|) (
+public analyze: object <SmallInteger | LargePositiveInteger | LargeNegativeInteger> = (
+	(* Bucket into signed 31-bit, larger positive and larger negative integers. *)
+	object <= 1073741823 (* 1 << 30 - 1*)
+		ifTrue:
+			[object >= -1073741824 (* -1 << 30 *)
+				ifTrue: [small add: object]
+				ifFalse: [largeNegative add: object]]
+		ifFalse:
+			[largePositive add: object].
+)
+public printOn: stm = (
+	small size + largePositive size + largeNegative size printOn: stm.
+	stm space; nextPutAll: 'Integer'.
+)
+public writeEdges = (
+)
+public writeNodes = (
+	writeFormat: IntegerPsuedoFormat.
+	stream uint16: small size.
+	stream uint16: largePositive size.
+	stream uint16: largeNegative size.
+
+	small do: [:object |
+		registerBackRef: object.
+		stream int32: object].
+	largePositive do: [:object |
+		registerBackRef: object.
+		stream uint16: object digitLength.
+		1 to: object digitLength do: [:index | stream nextPut: (object digitAt: index)]].
+	largeNegative do: [:object |
+		registerBackRef: object.
+		stream uint16: object digitLength.
+		1 to: object digitLength do: [:index | stream nextPut: (object digitAt: index)]].
+)
+) : (
+)
+class SymbolCluster = (|
+objects = List new.
+|) (
+public analyze: object <ByteSymbol> = (
+	objects add: object.
+)
+public printOn: stm = (
+	objects size printOn: stm.
+	stm space; nextPutAll: 'ByteSymbol'.
+)
+public writeEdges = (
+)
+public writeNodes = (
+	writeFormat: SymbolPsuedoFormat.
+	stream uint16: objects size.
+	objects do: [:object |
+		registerBackRef: object.
+		stream uint16: object size.
+		1 to: object size do: [:i | stream nextPut: (object basicAt: i)]].
+)
+) : (
+)
+class Uint32Cluster for: cls = (|
+klass = cls.
+objects = List new.
+|) (
+public analyze: object = (
+	objects add: object.
+)
+public printOn: stm = (
+	objects size printOn: stm.
+	stm space; nextPutAll: klass name.
+)
+public writeEdges = (
+	writeBackRef: klass.
+)
+public writeNodes = (
+	|
+	prim = vmmirror.
+	stop = [halt].
+	|
+	writeFormat: klass format.
+	stream uint16: objects size.
+	objects do: [:object |
+		registerBackRef: object.
+		stream uint32: object size.
+		1 to: object size do: [:i | stream uint32: (prim ifFail: stop indexedSlotOf: object at: i)]].
+)
+) : (
+)
+class Uint8Cluster for: cls = (|
+klass = cls.
+objects = List new.
+|) (
+public analyze: object = (
+	objects add: object.
+)
+public printOn: stm = (
+	objects size printOn: stm.
+	stm space; nextPutAll: klass name.
+)
+public writeEdges = (
+	writeBackRef: klass.
+)
+public writeNodes = (
+	|
+	prim = vmmirror.
+	stop = [halt].
+	|
+	writeFormat: klass format.
+	stream uint16: objects size.
+	objects do: [:object |
+		registerBackRef: object.
+		stream uint32: object size.
+		1 to: object size do: [:i | stream nextPut: (prim ifFail: stop indexedSlotOf: object at: i)]].
+)
+) : (
+)
+class VariablePointersCluster for: cls = (|
+klass = cls.
+namedSlots = cls instSize.
+objects = List new.
+|) (
+public analyze: object = (
+	objects add: object.
+	pointersOf: object do: [:each | enqueue: each].
+)
+pointersOf: object do: action = (
+	| prim = vmmirror. |
+	1 to: namedSlots do:
+		[:i | action value: (prim ifFail: [halt] namedSlotOf: object at: i )].
+	1 to: (prim indexedSlotsOf: object) do:
+		[:i | action value: (prim ifFail: [halt] indexedSlotOf: object at: i)].
+)
+public printOn: stm = (
+	objects size printOn: stm.
+	stm space; nextPutAll: klass name.
+)
+public writeEdges = (
+	writeBackRef: klass.
+	objects do: [:object |
+		pointersOf: object do: [:each | writeBackRef: each]].
+)
+public writeNodes = (
+	| prim = vmmirror. |
+	writeFormat: klass format.
+	stream uint16: objects size.
+	objects do: [:object |
+		registerBackRef: object.
+		stream uint16: (prim indexedSlotsOf: object)].
+)
+) : (
+)
+class WeakPointersCluster for: cls = (|
+klass = cls.
+namedSlots = cls instSize.
+objects = List new.
+|) (
+public analyze: object = (
+	objects add: object.
+	strongPointersOf: object do: [:each | enqueue: each].
+)
+public printOn: stm = (
+	objects size printOn: stm.
+	stm space; nextPutAll: klass name.
+)
+strongPointersOf: object do: action = (
+	(* The fixed pointers of format 4 objects are strong, and the indexed pointers are weak. *)
+	| prim = vmmirror. |
+	1 to: namedSlots do:
+		[:i | action value: (prim namedSlotOf: object at: i ifFail: [halt])].
+)
+weakPointersOf: object do: action = (
+	(* The fixed pointers of format 4 objects are strong, and the indexed pointers are weak. *)
+	| prim = vmmirror. |
+	1 to: (prim indexedSlotsOf: object) do:
+		[:i | action value: (prim ifFail: [halt] indexedSlotOf: object at: i)].
+)
+public writeEdges = (
+	|
+	prim = vmmirror.
+	stop = [halt].
+	n = namedSlots.
+	|
+	writeBackRef: klass.
+	objects do: [:object |
+		1 to: n do:
+			[:i | writeBackRef: (prim ifFail: stop namedSlotOf: object at: i)].
+		1 to: (prim indexedSlotsOf: object) do:
+			[:i | writeWeakBackRef: (prim ifFail: stop indexedSlotOf: object at: i)]].
+)
+public writeNodes = (
+	| prim = vmmirror. |
+	writeFormat: klass format.
+	stream uint16: objects size.
+	objects do: [:object |
+		registerBackRef: object.
+		stream uint16: (prim indexedSlotsOf: object)].
+)
+) : (
+)
+class WideSymbolCluster = (|
+objects = List new.
+|) (
+public analyze: object <WideSymbol> = (
+	objects add: object.
+)
+public printOn: stm = (
+	objects size printOn: stm.
+	stm space; nextPutAll: 'WideSymbol'.
+)
+public writeEdges = (
+)
+public writeNodes = (
+	writeFormat: WideSymbolPsuedoFormat.
+	stream uint16: objects size.
+	objects do: [:object |
+		registerBackRef: object.
+		stream uint16: object size.
+		1 to: object size do: [:i | stream uint32: (object basicAt: i)]].
+)
+) : (
+)
+analyze: object = (
+	(clusterFor: object) analyze: object
+)
+clusterFor: object = (
+	(reverseGlobals includesKey: object) ifTrue: [^clusterForClass: nil].
+	^clusterForClass: (vmmirror classOf: object).
+)
+clusterForClass: klass = (
+	^clusters at: klass ifAbsentPut: [newClusterForClass: klass].
+)
+createPsuedoClassClusters = (
+	| intCluster floatCluster |
+
+	intCluster:: IntegerCluster new.
+	clusters at: SmallInteger put: intCluster.
+	clusters at: LargePositiveInteger put: intCluster.
+	clusters at: LargeNegativeInteger put: intCluster.
+
+	floatCluster:: FloatCluster new.
+	clusters at: BoxedFloat put: floatCluster.
+	clusters at: ImmediateFloat put: floatCluster.
+
+	clusters at: Character put: CharacterCluster new.
+
+	clusters at: ByteSymbol put: SymbolCluster new.
+	clusters at: WideSymbol put: WideSymbolCluster new.
+
+	clusters at: nil put: GlobalsCluster new. (* Add this last to override any nil entry from, e.g. missing ImmediateFloat. *)
+
+
+	(* Eagerly create the other cluster classes so we don't mutate Object's subclasses set in the middle of analysis. *)
+	self FixedPointersCluster.
+	self VariablePointersCluster.
+	self WeakPointersCluster.
+	self Uint32Cluster.
+	self Uint8Cluster.
+	self CompiledMethodCluster.
+)
+enqueue: object = (
+	backRefs at: object ifAbsentPut: [stack add: object. 0].
+)
+newClusterForClass: klass = (
+	| instSpec |
+	enqueue: klass.
+
+	instSpec:: klass instSpec.
+	instSpec <= 1 ifTrue: [^FixedPointersCluster for: klass].
+	instSpec <= 3 ifTrue: [^VariablePointersCluster for: klass].
+	instSpec <= 4 ifTrue: [^WeakPointersCluster for: klass].
+	instSpec <= 5 ifTrue: [^EphemeronCluster for: klass].
+	instSpec <= 9 ifTrue: [halt].
+	instSpec <= 11 ifTrue: [^Uint32Cluster for: klass].
+	instSpec <= 15 ifTrue: [^Uint16Cluster for: klass].
+	instSpec <= 23 ifTrue: [^Uint8Cluster for: klass].
+	instSpec <= 31 ifTrue: [^CompiledMethodCluster for: klass].
+	halt.
+)
+registerBackRef: object = (
+	backRefs at: object put: nextBackRef.
+	nextBackRef:: nextBackRef + 1.
+)
+public serialize: root = (
+	| orderedClusters rewind fastforward |
+	nextBackRef:: 1.
+	registerBackRef: nil.
+	registerBackRef: false.
+	registerBackRef: true.
+	registerBackRef: processorAssociation.
+
+	enqueue: root.
+	[stack isEmpty] whileFalse: [analyze: stack removeLast].
+
+	orderedClusters:: sortClusters.
+
+	stream uint16: 16r1984.
+	stream uint16: Version.
+	stream uint16: orderedClusters size.
+	rewind:: stream position.
+	stream uint32: 0.
+	orderedClusters do: [:c | c writeNodes].
+	orderedClusters do: [:c | c writeEdges].
+	writeBackRef: root.
+
+	fastforward:: stream position.
+	stream position: rewind.
+	stream uint32: nextBackRef.
+	stream position: fastforward.
+)
+sortClusters = (
+	(* Method dictionaries must be rehashed first, otherwise other rehashing may involve sending message to objects whose classes have broken method dictionaries. *)
+	| sorted = List new: clusters size. |
+	(clusters includesKey: MethodDictionary) ifTrue:
+		[sorted add: (clusters removeKey: MethodDictionary)].
+	clusters do: [:c | sorted add: c].
+	^sorted
+)
+writeBackRef: object = (
+	stream uint32: (backRefs at: object).
+)
+writeFormat: format = (
+	stream int32: format.
+)
+writeWeakBackRef: object = (
+	| ref = backRefs at: object ifAbsent: [backRefs at: nil]. |
+	stream uint32: ref.
+)
+) : (
+)
+class TemporaryClass withFormat: fmt = (
+(* A fake class used for allocation. If deserialization is successful, no message should be sent to any object before the graph is fully deserialized, and the VM will only interpret the format field of this object. If things go wrong, the other fields should make messages to incomplete objects result in MessageNotUnderstood: PartiallyDeserializedObject>>message instead of a crash. *)
+|
+	superclassX = Object.
+	methodDictionaryX = Object methodDictionary.
+	formatX = fmt.
+	mixinX
+	enclosingObjectX
+	subclassesX
+	public name = 'PartiallyDeserializedObject'.
+|) (
+) : (
+)
+) : (
+FORMAT = (
+(*
+
+== Header ==
+16: magic number
+16: num clusters
+16: num back refs
+
+== Nodes ==
+	== Cluster ==
+	32: psuedo format or class format
+	16: num instances
+		== Object ==
+		[16: size if variable]
+		[n: data, if bits]
+
+== Edges ==
+	== Cluster ==
+	{16: class backref}
+		== Object ==
+		{16: backrefs}
+
+== Footer ==
+16: root backref
+
+*))
+)

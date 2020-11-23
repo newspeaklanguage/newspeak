@@ -4,7 +4,6 @@ import Combine
 public class WebViewStore: ObservableObject {
     
     private var observers = Set<NSKeyValueObservation>()
-    //private var schemeHandler: SchemeHandler!
     
     @Published public var webView: WKWebView {
         didSet {
@@ -14,14 +13,13 @@ public class WebViewStore: ObservableObject {
 
     public init() {
         
-        let config = WKWebViewConfiguration()
-        //self.schemeHandler = SchemeHandler(config)
-        self.webView = WKWebView(frame: .zero, configuration: config)
+        self.webView = WKWebView(frame: .zero)
                 
         self.webView
           .configuration
           .preferences
-          .setValue(true, forKey: "allowFileAccessFromFileURLs")
+          .setValue(true,
+                    forKey: "allowFileAccessFromFileURLs")
         
         self.webView
             .configuration
@@ -32,7 +30,8 @@ public class WebViewStore: ObservableObject {
         self.webView
           .configuration
           .preferences
-          .setValue(true, forKey: "developerExtrasEnabled")
+          .setValue(true,
+                    forKey: "developerExtrasEnabled")
         #endif
                         
         setupObservers()
@@ -84,43 +83,9 @@ extension WebViewStore {
 
     private func scrollTo(_ YOffset: Int) {
         let script = "window.scrollTo(0, \(YOffset));"
-        let scrollScript = WKUserScript(source: script, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
+        let scrollScript = WKUserScript(source: script,
+                                        injectionTime: .atDocumentEnd,
+                                        forMainFrameOnly: true)
         self.webView.configuration.userContentController.addUserScript(scrollScript)
     }
-}
-
-// MARK: - WKURLSchemeHandler
-
-class SchemeHandler: NSObject, WKURLSchemeHandler {
-
-    init(_ config: WKWebViewConfiguration) {
-        super.init()
-
-        config.setURLSchemeHandler(self, forURLScheme: "blob")
-    }
-
-    func webView(_ webView: WKWebView, start urlSchemeTask: WKURLSchemeTask) {
-        print("Processing request for URL: \(urlSchemeTask.request.url?.absoluteString ?? "")")
-//        guard let urlString = urlSchemeTask.request.url?.absoluteString else {
-//            return
-//        }
-//
-//        if urlString == Constant.articleURLString, let data = Constant.articleHTML.data(using: .utf8) {
-//            let response = URLResponse(url: URL(string: "some")!, mimeType: "text/html", expectedContentLength: data.count, textEncodingName: "utf-8")
-//            urlSchemeTask.didReceive(response)
-//            urlSchemeTask.didReceive(data)
-//            urlSchemeTask.didFinish()
-//        } else if urlString == Constant.scriptURLString, let data = Constant.script.data(using: .utf8) {
-//            let response = URLResponse(url: URL(string: "some")!, mimeType: "application/javascript", expectedContentLength: data.count, textEncodingName: "utf-8")
-//            urlSchemeTask.didReceive(response)
-//            urlSchemeTask.didReceive(data)
-//            urlSchemeTask.didFinish()
-//        }
-
-    }
-
-    func webView(_ webView: WKWebView, stop urlSchemeTask: WKURLSchemeTask) {
-        print("Stopping request for URL: \(urlSchemeTask.request.url?.absoluteString ?? ""))")
-    }
-
 }

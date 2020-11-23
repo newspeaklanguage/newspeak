@@ -54,7 +54,16 @@ public struct WebView: View {
         }
         
         public func userContentController(_ userContentController: WKUserContentController,
-                                          didReceive message: WKScriptMessage) {            
+                                          didReceive message: WKScriptMessage) {
+            if message.name == "logHandler" {
+                print("LOG: \(message.body)")
+                return
+            }
+
+            if message.name == "readBlob" {
+                print("LOG: \(message.body)")
+                return
+            }
         }
         
         public func fileDownloadedAtURL(url: URL) {
@@ -139,7 +148,29 @@ extension WebView: NSViewRepresentable {
                 self.webView
                     .configuration
                     .userContentController
-                    .add(context.coordinator, name: "readBlob")
+                    .add(context.coordinator,
+                         name: "readBlob")
+                                
+                let logHandler = """
+                    function captureLog(msg) {
+                        window.webkit.messageHandlers.logHandler.postMessage(msg);
+                    }
+                    window.console.log = captureLog;
+                """
+                let logHandlerScript = WKUserScript(source: logHandler,
+                                          injectionTime: .atDocumentEnd,
+                                          forMainFrameOnly: false)
+                self.webView
+                    .configuration
+                    .userContentController
+                    .addUserScript(logHandlerScript)
+                
+                // register the bridge script that listens for the output
+                self.webView
+                    .configuration
+                    .userContentController
+                    .add(context.coordinator,
+                         name: "logHandler")
             }
         }
     }

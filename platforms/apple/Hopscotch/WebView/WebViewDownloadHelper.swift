@@ -13,9 +13,9 @@ protocol WKWebViewDownloadHelperDelegate {
 
 class WKWebviewDownloadHelper : NSObject {
     
-    var webView:WKWebView
-    var mimeTypes:[MimeType]
-    var delegate:WKWebViewDownloadHelperDelegate
+    var webView : WKWebView
+    var mimeTypes : [MimeType]
+    var delegate :WKWebViewDownloadHelperDelegate
     
     init(webView:WKWebView, mimeTypes:[MimeType], delegate:WKWebViewDownloadHelperDelegate) {
         self.webView = webView
@@ -100,47 +100,55 @@ extension WKWebviewDownloadHelper: WKNavigationDelegate {
     func webView(_ webView: WKWebView,
                  decidePolicyFor navigationAction: WKNavigationAction,
                  decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
-        if let url = navigationAction.request.url {
-            if (url.absoluteString.contains("blob")) {
-                //                    var fileName = getDefaultFileName(forMimeType: mimeType)
-                //                    if let name = getFileNameFromResponse(navigationResponse.response) {
-                //                        fileName = name
-                //                    }
-                downloadData(fromURL: url, fileName: "test") { success, destinationURL in
-                    if success, let destinationURL = destinationURL {
-                        self.delegate.fileDownloadedAtURL(url: destinationURL)
-                    }
-                    decisionHandler(.cancel)
-                    return
-                }
-            } else {
-                decisionHandler(.allow)
-            }
-        } else {
-            decisionHandler(.allow)
-        }
-    }
-    
-    func webView(_ webView: WKWebView,
-                 decidePolicyFor navigationResponse: WKNavigationResponse,
-                 decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
-        if let mimeType = navigationResponse.response.mimeType {
-            if isMimeTypeConfigured(mimeType) {
-                if let url = navigationResponse.response.url {
-                    var fileName = getDefaultFileName(forMimeType: mimeType)
-                    if let name = getFileNameFromResponse(navigationResponse.response) {
-                        fileName = name
-                    }
-                    downloadData(fromURL: url, fileName: fileName) { success, destinationURL in
-                        if success, let destinationURL = destinationURL {
-                            self.delegate.fileDownloadedAtURL(url: destinationURL)
-                        }
-                    }
-                    decisionHandler(.cancel)
-                    return
-                }
+        if let navigationURL = navigationAction.request.url {
+            if (navigationURL.absoluteString.contains("blob")) {
+                downloadBlob(navigationURL: navigationURL)
             }
         }
         decisionHandler(.allow)
+    }
+    
+    func downloadBlob(navigationURL: URL) {
+        
+        let script = """
+            var xhr = new XMLHttpRequest();
+            xhr.open('GET', '\(navigationURL.absoluteString)', true);
+            xhr.responseType = 'blob';
+
+            xhr.onload = function() {
+                console.log('LOAD')
+                if (this.status == 200) {
+                    var blob = this.response;
+                    window.webkit.messageHandlers.readBlob.postMessage(blob);
+                    //var reader = new FileReader();
+                    //reader.readAsBinaryString(blob);
+                    //reader.onloadend = function() {
+                    //    window.webkit.messageHandlers.readBlob.postMessage(reader.result);
+                    //}
+                }
+            };
+
+            xhr.ontimeout = () => {
+                console.log('Timeout');
+            };
+
+            xhr.onerror = function(e) {
+                console.log(e);
+            };
+
+            console.log('SEND')
+            xhr.send();
+        """
+        
+        self.webView.evaluateJavaScript(script) { (results, error) in
+            
+            if let results = results {
+                print(results)
+            }
+
+            if let error = error {
+                print(error)
+            }
+        }
     }
 }

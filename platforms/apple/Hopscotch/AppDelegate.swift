@@ -2,8 +2,6 @@
 import Cocoa
 import SwiftUI
 
-import GCDWebServer
-
 protocol feedBack {
     func output()
 }

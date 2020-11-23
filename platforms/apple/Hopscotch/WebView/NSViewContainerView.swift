@@ -1,9 +1,3 @@
-//
-//  NSViewContainerView.swift
-//  WebView
-//
-//  Created by Ben Chatelain on 5/5/20.
-//
 
 #if os(macOS)
 import AppKit

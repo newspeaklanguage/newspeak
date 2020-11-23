@@ -18,6 +18,11 @@ public class WebViewStore: ObservableObject {
           .preferences
           .setValue(true, forKey: "allowFileAccessFromFileURLs")
         
+        self.webView
+            .configuration
+            .preferences
+            .javaScriptEnabled = true
+
         #if DEBUG
         self.webView
           .configuration

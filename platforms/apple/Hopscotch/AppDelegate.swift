@@ -57,8 +57,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
     
     private func hasUserRuntimePath() -> Bool {
-        if let path = UserDefaults.standard.string(forKey: self.runtimeKey) {
-            return !path.isEmpty
+        let defaults = UserDefaults.standard
+        if let path = defaults.string(forKey: self.runtimeKey) {
+            if !path.isEmpty {
+                if (FileManager.default.fileExists(atPath: path)) {
+                    return true
+                } else {
+                    defaults.removeObject(forKey: self.runtimeKey)
+                }
+            }
         }
         return false
     }

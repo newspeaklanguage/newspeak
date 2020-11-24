@@ -8,12 +8,9 @@ struct ContentView: View {
     var body: some View {        
         WebView(webView: store.webView).onAppear {
         }
-        .onAppear() {            
-            self.load()
-        }
     }
     
-    private func load() {
+    func load() {
         let appDelegate = NSApplication.shared.delegate as! AppDelegate
         if var url = appDelegate.server.serverURL {
             url.appendPathComponent("primordialsoup.html")

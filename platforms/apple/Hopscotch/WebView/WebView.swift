@@ -9,10 +9,10 @@ public struct WebView: View {
     public class Coordinator: NSObject,
                               WKScriptMessageHandler,
                               WKUIDelegate,
-                              WKWebViewDownloadHelperDelegate {
+                              WebViewNavigationHelperDelegate {
         
         private var parent: WebView
-        private var helper : WKWebviewDownloadHelper!
+        private var helper : WebViewNavigationHelper!
         
         init(_ parent: WebView) {
             self.parent = parent
@@ -36,15 +36,17 @@ public struct WebView: View {
                             completionHandler: @escaping ([URL]?) -> Void) {
             let openPanel = NSOpenPanel()
             openPanel.canChooseFiles = true
-            openPanel.begin { (result) in
-                if result == NSApplication.ModalResponse.OK {
+            openPanel.beginSheetModal(for: self.parent.webView.window!, completionHandler: {
+                result in if result == .OK {
                     if let url = openPanel.url {
                         completionHandler([url])
+                    } else {
+                        completionHandler(nil)
                     }
-                } else if result == NSApplication.ModalResponse.cancel {
+                } else {
                     completionHandler(nil)
                 }
-            }
+            })
         }
         
         public func webView(_ webView: WKWebView,
@@ -62,14 +64,10 @@ public struct WebView: View {
 
             if message.name == "readBlob" {
                 if let text = message.body as? String {
-                    print("readBlob: \(message.body)")
-                
-                    // Save blob as file
+
                     let dialog = NSSavePanel()
                     dialog.title = "Save"
                     dialog.showsResizeIndicator = true
-                    //dialog.showsHiddenFiles = false
-
                     dialog.beginSheetModal(for: self.parent.webView.window!, completionHandler: {
                         result in if result == .OK {
                             do {
@@ -90,11 +88,10 @@ public struct WebView: View {
         }
         
         public func registerDownloadHelper() {
-//            let mimeTypes = [MimeType(type: "ms-excel", fileExtension: "xls"),
-//                             MimeType(type: "pdf", fileExtension: "pdf")]
-//            helper = WKWebviewDownloadHelper(webView: parent.webView,
-//                                             mimeTypes:mimeTypes,
-//                                             delegate: self)
+            let mimeTypes = [MimeType(type: "pdf", fileExtension: "pdf")]
+            self.helper = WebViewNavigationHelper(webView: parent.webView,
+                                                  mimeTypes:mimeTypes,
+                                                  delegate: self)
         }
         
         #endif

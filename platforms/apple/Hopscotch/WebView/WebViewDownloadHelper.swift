@@ -7,17 +7,17 @@ struct MimeType {
     var fileExtension:String
 }
 
-protocol WKWebViewDownloadHelperDelegate {
+protocol WebViewNavigationHelperDelegate {
     func fileDownloadedAtURL(url:URL)
 }
 
-class WKWebviewDownloadHelper : NSObject {
+class WebViewNavigationHelper : NSObject {
     
     var webView : WKWebView
     var mimeTypes : [MimeType]
-    var delegate :WKWebViewDownloadHelperDelegate
+    var delegate :WebViewNavigationHelperDelegate
     
-    init(webView:WKWebView, mimeTypes:[MimeType], delegate:WKWebViewDownloadHelperDelegate) {
+    init(webView:WKWebView, mimeTypes:[MimeType], delegate:WebViewNavigationHelperDelegate) {
         self.webView = webView
         self.mimeTypes = mimeTypes
         self.delegate = delegate
@@ -95,7 +95,7 @@ class WKWebviewDownloadHelper : NSObject {
     }
 }
 
-extension WKWebviewDownloadHelper: WKNavigationDelegate {
+extension WebViewNavigationHelper: WKNavigationDelegate {
     
     func webView(_ webView: WKWebView,
                  decidePolicyFor navigationAction: WKNavigationAction,
@@ -109,7 +109,7 @@ extension WKWebviewDownloadHelper: WKNavigationDelegate {
         }
         decisionHandler(.allow)
     }
-    
+        
     func downloadBlob(navigationURL: URL) {
         
         let script = """

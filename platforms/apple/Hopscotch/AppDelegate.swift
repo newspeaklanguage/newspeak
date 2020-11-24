@@ -27,7 +27,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         window.contentView = NSHostingView(rootView: contentView)
         window.makeKeyAndOrderFront(nil)
         
-        //GCDWebServer.setLogLevel(0)
+        GCDWebServer.setLogLevel(3)
         server = GCDWebServer()
         server.addGETHandler(forBasePath: "/",
                              directoryPath: Bundle.main.resourcePath!,

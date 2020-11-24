@@ -8,10 +8,12 @@ protocol feedBack {
 
 @NSApplicationMain
 class AppDelegate: NSObject, NSApplicationDelegate {
-    
+        
     var window: NSWindow!
     var server: GCDWebServer!
-        
+    
+    private let vmLocation = "/vm"
+    
     func applicationDidFinishLaunching(_ aNotification: Notification) {
         // Create the SwiftUI view that provides the window contents.
         let contentView = ContentView()
@@ -27,15 +29,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         window.contentView = NSHostingView(rootView: contentView)
         window.makeKeyAndOrderFront(nil)
         
-        GCDWebServer.setLogLevel(3)
-        server = GCDWebServer()
-        server.addGETHandler(forBasePath: "/",
-                             directoryPath: Bundle.main.resourcePath!,
-                             indexFilename: "",
-                             cacheAge: 0,
-                             allowRangeRequests: true)
-                
-        server.start(withPort: 1234, bonjourName: "Hopscotch")
+        if let path = Bundle.main.resourcePath {
+            GCDWebServer.setLogLevel(3)
+            server = GCDWebServer()
+            server.addGETHandler(forBasePath: "/",
+                                 directoryPath: path + self.vmLocation,
+                                 indexFilename: "",
+                                 cacheAge: 0,
+                                 allowRangeRequests: true)
+                    
+            server.start(withPort: 1234, bonjourName: "Hopscotch")
+        } else {
+            let alert: NSAlert = NSAlert()
+            alert.messageText = "Unable to create Newspeak environment "
+            alert.beginSheetModal(for: self.window) { _ in
+            }
+        }
     }
     
     func applicationWillTerminate(_ aNotification: Notification) {

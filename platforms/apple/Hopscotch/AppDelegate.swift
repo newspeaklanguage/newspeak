@@ -11,7 +11,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     
     var window: NSWindow!
     var server: GCDWebServer!
-    
+        
     func applicationDidFinishLaunching(_ aNotification: Notification) {
         // Create the SwiftUI view that provides the window contents.
         let contentView = ContentView()
@@ -27,12 +27,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         window.contentView = NSHostingView(rootView: contentView)
         window.makeKeyAndOrderFront(nil)
         
+        //GCDWebServer.setLogLevel(0)
         server = GCDWebServer()
         server.addGETHandler(forBasePath: "/",
-                                directoryPath: Bundle.main.resourcePath!,
-                                indexFilename: "",
-                                cacheAge: 3600,
-                                allowRangeRequests: true)
+                             directoryPath: Bundle.main.resourcePath!,
+                             indexFilename: "",
+                             cacheAge: 0,
+                             allowRangeRequests: true)
                 
         server.start(withPort: 1234, bonjourName: "Hopscotch")
     }
@@ -41,7 +42,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
     
 }
-
 
 struct AppDelegate_Previews: PreviewProvider {
     static var previews: some View {

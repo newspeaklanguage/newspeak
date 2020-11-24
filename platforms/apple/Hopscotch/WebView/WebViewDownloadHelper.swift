@@ -103,6 +103,8 @@ extension WKWebviewDownloadHelper: WKNavigationDelegate {
         if let navigationURL = navigationAction.request.url {
             if (navigationURL.absoluteString.contains("blob")) {
                 downloadBlob(navigationURL: navigationURL)
+                decisionHandler(.cancel)
+                return
             }
         }
         decisionHandler(.allow)
@@ -111,32 +113,21 @@ extension WKWebviewDownloadHelper: WKNavigationDelegate {
     func downloadBlob(navigationURL: URL) {
         
         let script = """
+
             var xhr = new XMLHttpRequest();
             xhr.open('GET', '\(navigationURL.absoluteString)', true);
-            xhr.responseType = 'blob';
 
             xhr.onload = function() {
-                console.log('LOAD')
                 if (this.status == 200) {
                     var blob = this.response;
                     window.webkit.messageHandlers.readBlob.postMessage(blob);
-                    //var reader = new FileReader();
-                    //reader.readAsBinaryString(blob);
-                    //reader.onloadend = function() {
-                    //    window.webkit.messageHandlers.readBlob.postMessage(reader.result);
-                    //}
+                    var reader = new FileReader();
+                    reader.readAsBinaryString(blob);
+                    reader.onloadend = function() {
+                        window.webkit.messageHandlers.readBlob.postMessage(reader.result);
+                    }
                 }
             };
-
-            xhr.ontimeout = () => {
-                console.log('Timeout');
-            };
-
-            xhr.onerror = function(e) {
-                console.log(e);
-            };
-
-            console.log('SEND')
             xhr.send();
         """
         

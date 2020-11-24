@@ -470,9 +470,13 @@ static inline NSString* _EncodeBase64(NSString* string) {
   return -1;
 }
 
-- (dispatch_source_t)_createDispatchSourceWithListeningSocket:(int)listeningSocket isIPv6:(BOOL)isIPv6 {
+- (dispatch_source_t)
+_createDispatchSourceWithListeningSocket:(int)listeningSocket isIPv6:(BOOL)isIPv6 {
   dispatch_group_enter(_sourceGroup);
-  dispatch_source_t source = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, listeningSocket, 0, dispatch_get_global_queue(_dispatchQueuePriority, 0));
+  dispatch_source_t source = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ,
+                                                    listeningSocket,
+                                                    0,
+                                                    dispatch_get_global_queue(_dispatchQueuePriority, 0));
   dispatch_source_set_cancel_handler(source, ^{
     @autoreleasepool {
       int result = close(listeningSocket);
@@ -505,7 +509,9 @@ static inline NSString* _EncodeBase64(NSString* string) {
         int noSigPipe = 1;
         setsockopt(socket, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, sizeof(noSigPipe));  // Make sure this socket cannot generate SIG_PIPE
 
-        GCDWebServerConnection* connection = [(GCDWebServerConnection*)[self->_connectionClass alloc] initWithServer:self localAddress:localAddress remoteAddress:remoteAddress socket:socket];  // Connection will automatically retain itself while opened
+        GCDWebServerConnection* connection = [(GCDWebServerConnection*)[self->_connectionClass alloc]
+                                              initWithServer:self localAddress:localAddress
+                                              remoteAddress:remoteAddress socket:socket];  // Connection will automatically retain itself while opened
         [connection self];  // Prevent compiler from complaining about unused variable / useless statement
       } else {
         GWS_LOG_ERROR(@"Failed accepting %s socket: %s (%i)", isIPv6 ? "IPv6" : "IPv4", strerror(errno), errno);
@@ -584,7 +590,10 @@ static inline NSString* _EncodeBase64(NSString* string) {
   NSString* bonjourName = _GetOption(_options, GCDWebServerOption_BonjourName, nil);
   NSString* bonjourType = _GetOption(_options, GCDWebServerOption_BonjourType, @"_http._tcp");
   if (bonjourName) {
-    _registrationService = CFNetServiceCreate(kCFAllocatorDefault, CFSTR("local."), (__bridge CFStringRef)bonjourType, (__bridge CFStringRef)(bonjourName.length ? bonjourName : _serverName), (SInt32)_port);
+    _registrationService = CFNetServiceCreate(kCFAllocatorDefault, CFSTR("local."),
+                                              (__bridge CFStringRef)bonjourType,
+                                              (__bridge CFStringRef)(bonjourName.length ? bonjourName : _serverName),
+                                              (SInt32)_port);
     if (_registrationService) {
       CFNetServiceClientContext context = {0, (__bridge void*)self, NULL, NULL, NULL};
 
@@ -604,7 +613,12 @@ static inline NSString* _EncodeBase64(NSString* string) {
           values[index] = (__bridge CFStringRef)(value);
           index ++;
         }
-        CFDictionaryRef txtDictionary = CFDictionaryCreate(CFAllocatorGetDefault(), (void *)keys, (void *)values, count, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+        CFDictionaryRef txtDictionary = CFDictionaryCreate(CFAllocatorGetDefault(),
+                                                           (void *)keys,
+                                                           (void *)values,
+                                                           count,
+                                                           &kCFTypeDictionaryKeyCallBacks,
+                                                           &kCFTypeDictionaryValueCallBacks);
         if (txtDictionary != NULL) {
           CFDataRef txtData = CFNetServiceCreateTXTDataWithDictionary(nil, txtDictionary);
           Boolean setTXTDataResult = CFNetServiceSetTXTData(_registrationService, txtData);
@@ -1086,6 +1100,7 @@ static inline NSString* _EncodeBase64(NSString* string) {
           } else {
             response = [GCDWebServerResponse responseWithStatusCode:kGCDWebServerHTTPStatusCode_NotFound];
           }
+            
           return response;
         }];
   } else {

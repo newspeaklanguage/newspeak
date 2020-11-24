@@ -177,4 +177,3 @@ extension WebView: NSViewRepresentable {
 }
 
 #endif
-

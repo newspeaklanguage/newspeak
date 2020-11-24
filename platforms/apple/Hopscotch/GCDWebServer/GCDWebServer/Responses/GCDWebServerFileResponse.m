@@ -76,6 +76,14 @@ static inline NSDate* _NSDateFromTimeSpec(const struct timespec* t) {
   return [NSDate dateWithTimeIntervalSince1970:((NSTimeInterval)t->tv_sec + (NSTimeInterval)t->tv_nsec / 1000000000.0)];
 }
 
+//static void
+//setHeaders(GCDWebServerResponse* response) {
+//  [response setValue:@"*" forAdditionalHeader:@"Access-Control-Allow-Origin"];
+//  [response setValue:@"GET, POST, PUT, HEAD, OPTIONS" forAdditionalHeader:@"Access-Control-Allow-Methods"];
+//  [response setValue:@"Content-Type" forAdditionalHeader:@"Access-Control-Allow-Headers"];
+//  [response setValue:@"true" forAdditionalHeader:@"Access-Control-Allow-Credentials"];
+//}
+
 - (instancetype)initWithFile:(NSString*)path byteRange:(NSRange)range isAttachment:(BOOL)attachment mimeTypeOverrides:(NSDictionary<NSString*, NSString*>*)overrides {
   struct stat info;
   if (lstat([path fileSystemRepresentation], &info) || !(info.st_mode & S_IFREG)) {
@@ -133,6 +141,8 @@ static inline NSDate* _NSDateFromTimeSpec(const struct timespec* t) {
     self.contentLength = _size;
     self.lastModifiedDate = _NSDateFromTimeSpec(&info.st_mtimespec);
     self.eTag = [NSString stringWithFormat:@"%llu/%li/%li", info.st_ino, info.st_mtimespec.tv_sec, info.st_mtimespec.tv_nsec];
+    
+    //setHeaders(self);
   }
   return self;
 }

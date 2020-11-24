@@ -266,17 +266,31 @@
   return [(GCDWebServerResponse*)[self alloc] initWithRedirect:location permanent:permanent];
 }
 
-- (instancetype)initWithStatusCode:(NSInteger)statusCode {
+//static void
+//setHeaders(GCDWebServerResponse* response) {
+//  [response setValue:@"*" forAdditionalHeader:@"Access-Control-Allow-Origin"];
+//  [response setValue:@"GET, POST, PUT, HEAD, OPTIONS" forAdditionalHeader:@"Access-Control-Allow-Methods"];
+//  [response setValue:@"Content-Type" forAdditionalHeader:@"Access-Control-Allow-Headers"];
+//  [response setValue:@"true" forAdditionalHeader:@"Access-Control-Allow-Credentials"];
+//}
+
+- (instancetype)
+initWithStatusCode:(NSInteger)statusCode {
+  
   if ((self = [self init])) {
     self.statusCode = statusCode;
+    //setHeaders(self);
   }
   return self;
 }
 
-- (instancetype)initWithRedirect:(NSURL*)location permanent:(BOOL)permanent {
+- (instancetype)
+initWithRedirect:(NSURL*)location permanent:(BOOL)permanent {
+  
   if ((self = [self init])) {
     self.statusCode = permanent ? kGCDWebServerHTTPStatusCode_MovedPermanently : kGCDWebServerHTTPStatusCode_TemporaryRedirect;
     [self setValue:[location absoluteString] forAdditionalHeader:@"Location"];
+    //setHeaders(self);
   }
   return self;
 }

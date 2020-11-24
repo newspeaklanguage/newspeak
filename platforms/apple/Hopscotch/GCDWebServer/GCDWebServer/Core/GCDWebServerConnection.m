@@ -149,6 +149,7 @@ NS_ASSUME_NONNULL_END
 
 // http://www.w3.org/Protocols/rfc2616/rfc2616-sec10.html
 - (void)_finishProcessingRequest:(GCDWebServerResponse*)response {
+  
   GWS_DCHECK(_responseMessage == NULL);
   BOOL hasBody = NO;
 
@@ -356,7 +357,10 @@ NS_ASSUME_NONNULL_END
       }];
 }
 
-- (instancetype)initWithServer:(GCDWebServer*)server localAddress:(NSData*)localAddress remoteAddress:(NSData*)remoteAddress socket:(CFSocketNativeHandle)socket {
+- (instancetype)initWithServer:(GCDWebServer*)server
+                  localAddress:(NSData*)localAddress
+                 remoteAddress:(NSData*)remoteAddress
+                        socket:(CFSocketNativeHandle)socket {
   if ((self = [super init])) {
     _server = server;
     _localAddressData = localAddress;

@@ -61,27 +61,40 @@ public struct WebView: View {
             }
 
             if message.name == "readBlob" {
-                print("LOG: \(message.body)")
+                if let text = message.body as? String {
+                    print("readBlob: \(message.body)")
+                
+                    // Save blob as file
+                    let dialog = NSSavePanel()
+                    dialog.title = "Save"
+                    dialog.showsResizeIndicator = true
+                    //dialog.showsHiddenFiles = false
+
+                    dialog.beginSheetModal(for: self.parent.webView.window!, completionHandler: {
+                        result in if result == .OK {
+                            do {
+                                try text.write(to: dialog.url!,
+                                               atomically: true,
+                                               encoding: String.Encoding.utf8)
+                            } catch {
+                                print("Unable to save file")
+                            }
+                        }
+                    })
+                }
                 return
             }
         }
         
         public func fileDownloadedAtURL(url: URL) {
-            //            DispatchQueue.main.async {
-            //                let activityVC = UIActivityViewController(activityItems: [url], applicationActivities: nil)
-            //                activityVC.popoverPresentationController?.sourceView = self.view
-            //                activityVC.popoverPresentationController?.sourceRect = self.view.frame
-            //                activityVC.popoverPresentationController?.barButtonItem = self.navigationItem.rightBarButtonItem
-            //                self.present(activityVC, animated: true, completion: nil)
-            //            }
         }
         
         public func registerDownloadHelper() {
-            let mimeTypes = [MimeType(type: "ms-excel", fileExtension: "xls"),
-                             MimeType(type: "pdf", fileExtension: "pdf")]
-            helper = WKWebviewDownloadHelper(webView: parent.webView,
-                                             mimeTypes:mimeTypes,
-                                             delegate: self)            
+//            let mimeTypes = [MimeType(type: "ms-excel", fileExtension: "xls"),
+//                             MimeType(type: "pdf", fileExtension: "pdf")]
+//            helper = WKWebviewDownloadHelper(webView: parent.webView,
+//                                             mimeTypes:mimeTypes,
+//                                             delegate: self)
         }
         
         #endif

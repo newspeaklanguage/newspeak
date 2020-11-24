@@ -113,7 +113,6 @@ extension WKWebviewDownloadHelper: WKNavigationDelegate {
     func downloadBlob(navigationURL: URL) {
         
         let script = """
-
             var xhr = new XMLHttpRequest();
             xhr.open('GET', '\(navigationURL.absoluteString)', true);
 

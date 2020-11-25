@@ -14,11 +14,15 @@ public class WebViewStore: ObservableObject {
     public init() {
         
         let config = WKWebViewConfiguration()
-        config.userContentController = WKUserContentController()
-        config.preferences.setValue(true, forKey: "allowFileAccessFromFileURLs")
-        config.preferences.setValue(true, forKey: "javaScriptEnabled")
-        config.preferences.setValue(true, forKey: "javaScriptCanOpenWindowsAutomatically")
+        config.setValue(true, forKey: "_allowUniversalAccessFromFileURLs")
+        config.setValue(true, forKey: "allowUniversalAccessFromFileURLs")
+        
         self.webView = WKWebView(frame: .zero, configuration: config)
+        webView
+            .configuration
+            .preferences
+            .setValue(true,
+                      forKey: "allowFileAccessFromFileURLs")
         
         #if DEBUG
         self.webView

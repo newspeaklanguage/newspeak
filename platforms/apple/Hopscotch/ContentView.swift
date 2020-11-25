@@ -10,14 +10,12 @@ struct ContentView: View {
         }
     }
     
-    func load() {
-        let appDelegate = NSApplication.shared.delegate as! AppDelegate
-        if var url = appDelegate.server.serverURL {
-            url.appendPathComponent("primordialsoup.html")
-            url.appendQueryItem(name: "snapshot", value: "HopscotchWebIDE.vfuel")
-            let request = URLRequest(url: url)
-            self.store.webView.load(request)
-        }
+    func load(_ url: URL) {
+        var url = url
+        url.appendPathComponent("primordialsoup.html")
+        url.appendQueryItem(name: "snapshot", value: "HopscotchWebIDE.vfuel")
+        let request = URLRequest(url: url)
+        self.store.webView.load(request)
     }
 }
 

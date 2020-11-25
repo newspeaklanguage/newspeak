@@ -41,6 +41,10 @@ public struct WebView: View {
             openPanel.beginSheetModal(for: self.parent.webView.window!,
                                       completionHandler: {
                 result in if result == .OK {
+//                    var files = [URL]()
+//                    for url in openPanel.urls {
+//                        files.append(URL(string: url.path)!)
+//                    }
                     completionHandler(openPanel.urls)
                 } else {
                     completionHandler(nil)

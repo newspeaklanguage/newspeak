@@ -58,12 +58,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     
     private func runtimePath() -> String {
         
-        let defaults = UserDefaults.standard
-        if let path = defaults.string(forKey: self.runtimeKey) {
-            if !path.isEmpty {
-                return path
-            }
-        }
+//        let defaults = UserDefaults.standard
+//        if let path = defaults.string(forKey: self.runtimeKey) {
+//            if !path.isEmpty {
+//                return path
+//            }
+//        }
         return self.runtimeBundlePath()
     }
     
@@ -142,7 +142,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             server.start(withPort: 1234, bonjourName: "Hopscotch")
             
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: {
-                self.contentView.load()
+                self.contentView.load(self.server.serverURL!)
                 print("Loaded runtime: \(path)")
             })
             

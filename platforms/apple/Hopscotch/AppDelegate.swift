@@ -56,6 +56,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return ""
     }
     
+    private func runtimePath() -> String {
+        
+        let defaults = UserDefaults.standard
+        if let path = defaults.string(forKey: self.runtimeKey) {
+            if !path.isEmpty {
+                return path
+            }
+        }
+        return self.runtimeBundlePath()
+    }
+    
     private func hasUserRuntimePath() -> Bool {
         let defaults = UserDefaults.standard
         if let path = defaults.string(forKey: self.runtimeKey) {
@@ -70,17 +81,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return false
     }
 
-    private func runtimePath() -> String {
-        
-        let defaults = UserDefaults.standard
-        if let path = defaults.string(forKey: self.runtimeKey) {
-            if !path.isEmpty {
-                return path
-            }
-        }
-        return self.runtimeBundlePath()
-    }
-    
     private func selectRuntimeDestination() {
         
         let openPanel = NSOpenPanel()

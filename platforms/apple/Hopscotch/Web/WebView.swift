@@ -36,7 +36,8 @@ public struct WebView: View {
                             completionHandler: @escaping ([URL]?) -> Void) {
             let openPanel = NSOpenPanel()
             openPanel.canChooseFiles = true
-            openPanel.beginSheetModal(for: self.parent.webView.window!, completionHandler: {
+            openPanel.beginSheetModal(for: self.parent.webView.window!,
+                                      completionHandler: {
                 result in if result == .OK {
                     if let url = openPanel.url {
                         completionHandler([url])

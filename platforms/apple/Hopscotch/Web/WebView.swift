@@ -36,14 +36,12 @@ public struct WebView: View {
                             completionHandler: @escaping ([URL]?) -> Void) {
             let openPanel = NSOpenPanel()
             openPanel.canChooseFiles = true
+            openPanel.allowsMultipleSelection = parameters.allowsMultipleSelection
+            openPanel.canChooseDirectories = parameters.allowsDirectories
             openPanel.beginSheetModal(for: self.parent.webView.window!,
                                       completionHandler: {
                 result in if result == .OK {
-                    if let url = openPanel.url {
-                        completionHandler([url])
-                    } else {
-                        completionHandler(nil)
-                    }
+                    completionHandler(openPanel.urls)
                 } else {
                     completionHandler(nil)
                 }
@@ -88,13 +86,12 @@ public struct WebView: View {
         public func fileDownloadedAtURL(url: URL) {
         }
         
-        public func registerDownloadHelper() {
+        public func registerNavigationHelper() {
             let mimeTypes = [MimeType(type: "pdf", fileExtension: "pdf")]
             self.helper = WebViewNavigationHelper(webView: parent.webView,
                                                   mimeTypes:mimeTypes,
                                                   delegate: self)
         }
-        
         #endif
     }
     
@@ -154,7 +151,7 @@ extension WebView: NSViewRepresentable {
             view.contentView = webView
             if let webview = view.contentView {
                 webview.uiDelegate = context.coordinator
-                context.coordinator.registerDownloadHelper()
+                context.coordinator.registerNavigationHelper()
                 
                 self.webView
                     .configuration

@@ -32,16 +32,12 @@ https://github.com/newspeaklanguage/primordialsoup.
 
 Thus, your directory structure looks like:
 
-nswasm
+```
+                nswasm
 
-|
-
----------> newspeak
-
-|
-
- ---------> primordialsoup
-
+                |         |
+     newspeak    primordialsoup
+```
 
 
 Follow the instructions at

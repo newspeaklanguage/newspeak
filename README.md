@@ -56,9 +56,9 @@ git checkout extraRevs
 
 You'll also want to download CodeMirror from https://codemirror.net/.
 
-Place it in the top level of the primordialsoup repo.
+Place it in the top level of the newspeak repo.
 
-In the top level of thenewspeak repository, you should find the script
+In the top level of the newspeak repository, you should find the script
 build.sh. It assumes Emscripten is in ~/software/emsdk/; you will
 want to adjust that to reflect where you have installed emscripten.
 

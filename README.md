@@ -35,7 +35,7 @@ Thus, your directory structure looks like:
 ```
                nswasm
                
-                 |        |
+              |            |
       newspeak    primordialsoup
 ```
 

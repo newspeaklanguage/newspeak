@@ -9,10 +9,15 @@ If you intend to develop with the new Web IDE, read on:
 
 * The Web IDE is still experimental. Caveat Emptor.
 
-First, download the electron app frm 
+First, download the electron app from
+
+https://newspeaklanguage.org/NewspeakIDE.app.zip (for Intel macs)
+https://newspeaklanguage.org/newspeakIDE.zip (for Windows)
+
 
 At the moment, we recommend the following setup (this will
-definitely change).
+definitely change - such complexity is not the way we intend to do things at the
+Ministry of Truth).
 
 Set up a directory for your work, say, nswasm
 
@@ -61,7 +66,7 @@ source build.sh
 HopscotchWebIDE.vfuel should now exist in the ./out subdirectory of the
 newspeak repository.
 
-The serve script will  run a python web server and tell you where you
+The serve.sh script will run a python web server and tell you where you
 can access the IDE. You should be able to
 access the file from a web browser by visiting
 

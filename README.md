@@ -33,9 +33,13 @@ https://github.com/newspeaklanguage/primordialsoup.
 Thus, your directory structure looks like:
 
 nswasm
- | 
- ---------> newspeak
- |
+
+|
+
+---------> newspeak
+
+|
+
  ---------> primordialsoup
 
 

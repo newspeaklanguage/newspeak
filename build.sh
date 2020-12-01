@@ -5,8 +5,8 @@ EMSDK=~/software/emsdk
 
 source $EMSDK/emsdk_env.sh
 
-# We assume we cloned psoup into the newspeak directory;
-# change this if you're psoup repo is elsewhere
+# We assume we cloned psoup into the directory above newspeak;
+# change this if your psoup repo is elsewhere
 pushd ../primordialsoup
 ./build os=emscripten arch=wasm
 popd

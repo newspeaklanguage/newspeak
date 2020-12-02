@@ -11,7 +11,7 @@ async function createWindow () {
   })
 
   // and load the index.html of the app.
-    await mainWindow.loadURL(`file:///${__dirname}/primordialsoup/out/web/primordialsoup.html?snapshot=HopscotchWebIDE.vfuel`);
+    await mainWindow.loadURL(`file:///${__dirname}/out/primordialsoup.html?snapshot=HopscotchWebIDE.vfuel`);
 
   // Open the DevTools.
   // mainWindow.webContents.openDevTools()

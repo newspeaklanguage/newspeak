@@ -30,14 +30,9 @@ and then clone this repo under it.
 In the same directory, clone
 https://github.com/newspeaklanguage/primordialsoup.
 
-Thus, your directory structure looks like:
-
-```
-               nswasm
-               
-              |            |
-      newspeak    primordialsoup
-```
+To be clear: you should now have a directory named nswasm, with two
+subdirectories; newspeak, containing this repository, and
+primordialsoup, containing https://github.com/newspeaklanguage/primordialsoup.
 
 
 Follow the instructions at

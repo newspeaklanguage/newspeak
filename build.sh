@@ -28,7 +28,8 @@ pushd out
     *.png \
     CodeMirror/lib/codemirror.js \
     CodeMirror/addon/display/autorefresh.js \
-    RuntimeForElectron HopscotchWebIDE HopscotchWebIDE.vfuel \
+    RuntimeWithMirrorsForPrimordialSoup HopscotchWebIDE HopscotchWebIDE.vfuel \
+    RuntimeForElectron HopscotchWebIDE HopscotchElectronIDE.vfuel \    
     RuntimeForElectron Ampleforth Ampleforth.vfuel  
     
 popd

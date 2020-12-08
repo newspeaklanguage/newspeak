@@ -13,11 +13,7 @@ public class WebViewStore: ObservableObject {
 
     public init() {
         
-        let config = WKWebViewConfiguration()
-        config.setValue(true, forKey: "_allowUniversalAccessFromFileURLs")
-        config.setValue(true, forKey: "allowUniversalAccessFromFileURLs")
-        
-        self.webView = WKWebView(frame: .zero, configuration: config)
+        self.webView = WKWebView(frame: .zero)
         webView
             .configuration
             .preferences

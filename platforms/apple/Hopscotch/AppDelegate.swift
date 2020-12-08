@@ -36,11 +36,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         window.contentView = NSHostingView(rootView: contentView)
         window.makeKeyAndOrderFront(nil)
         
-        if self.hasUserRuntimePath() {
-            self.loadRuntime()
-        } else {
-            self.selectRuntimeDestination()
-        }
+        self.loadRuntime()
     }
     
     private func runtimeBundlePath() -> String {
@@ -56,75 +52,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
     
     private func runtimePath() -> String {
-        
-        let defaults = UserDefaults.standard
-        if let path = defaults.string(forKey: self.runtimeKey) {
-            if !path.isEmpty {
-                return path
-            }
-        }
         return self.runtimeBundlePath()
-    }
-    
-    private func hasUserRuntimePath() -> Bool {
-        let defaults = UserDefaults.standard
-        if let path = defaults.string(forKey: self.runtimeKey) {
-            if !path.isEmpty {
-                if (FileManager.default.fileExists(atPath: path)) {
-                    return true
-                } else {
-                    defaults.removeObject(forKey: self.runtimeKey)
-                }
-            }
-        }
-        return false
-    }
-    
-    private func selectRuntimeDestination() {
-        
-        let openPanel = NSOpenPanel()
-        openPanel.canChooseFiles = false
-        openPanel.canChooseDirectories = true
-        openPanel.beginSheetModal(for: self.window, completionHandler: {
-            result in if result == .OK {
-                if let url = openPanel.url {
-                    self.copyRuntime(url)
-                }
-            }
-            self.loadRuntime()
-        })
-    }
-    
-    private func copyRuntime(_ url : URL) {
-        
-        let fileManager = FileManager.default
-        let destination = url.path + "/" + self.runtimeName
-        if (fileManager.fileExists(atPath: destination)) {
-            let alert: NSAlert = NSAlert()
-            alert.messageText = "Runtime already exists at location."
-            alert.beginSheetModal(for: self.window) { _ in
-            }
-            return
-        }
-
-        let runtimePath = self.runtimeBundlePath()
-        if runtimePath.isEmpty{
-            self.alertRuntimeNotFound()
-        } else {
-            do {
-                let source = URL(fileURLWithPath: runtimePath)
-                let dest = URL(fileURLWithPath: destination)
-                try fileManager.copyItem(at: source, to: dest)
-                
-                let defaults = UserDefaults.standard
-                defaults.set(destination, forKey: self.runtimeKey)
-            }
-            catch let error as NSError {
-                print("\(error)")
-                self.alertRuntimeNotCreated()
-                return
-            }
-        }
     }
     
     private func loadRuntime() {

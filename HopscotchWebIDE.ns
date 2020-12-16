@@ -49,7 +49,8 @@ class  HopscotchWebIDE packageUsing: manifest = (
 		manifest MirrorTesting.
 		manifest MirrorTestingConfiguration.
 		manifest MirrorTestingModel.
-		manifest MirrorBuilderTesting.
+
+manifest MirrorBuilderTesting.
 		manifest MirrorBuilderTestingConfiguration.
 		manifest ActivationMirrorTesting.
 		manifest ActivationMirrorTestingConfiguration.
@@ -90,8 +91,50 @@ class HopscotchImages packageUsing: manifest = (
 |) (
 ) : (
 )
+class RestoreDialog usingPlatform: p = (
+  |
+  private Presenter = p hopscotch Presenter.
+  private Subject = p hopscotch Subject.
+  window = p hopscotch HopscotchWindow openSubject: (RestoreDialogSubject onModel: p).
+  |
+) (
+public class RestoreDialogSubject onModel: p = Subject onModel: p () (
+public isKindOfRestoreDialogSubject ^ <Boolean> = (^true)
+isMyKind: other <Subject> ^ <Boolean> = (
+  ^other isKindOfRestoreDialogSubject
+)
+public createPresenter = (^RestoreDialogPresenter onSubject: self)
+public loadSaved = (
+  window exit.
+  setupIDEWith: (loadFrom: #lastSaved usingPlatform: model) using: model
+)
+public restoreBackup = (
+  window exit.
+  setupIDEWith: (loadFrom: #backup usingPlatform: model) using: model
+)
+) : (
+)
+class RestoreDialogPresenter onSubject: s = Presenter onSubject: s () (
+public isKindOfRestoreDialogPresenter ^ <Boolean> = (^true)
+isMyKind: other <Fragment> ^ <Boolean> = (
+  ^other isKindOfRestoreDialogPresenter
+)
+definition = (
+     ^column: {
+      label: 'You have backup changes that are newer than your last save. Do you want to restore these changes, or load from the last save?'.
+      row: {
+        button: 'Restore from backup' action: [subject restoreBackup].
+        button: 'Load older saved version' action: [subject loadSaved].	
+      }
+    }
+  )
+) : (
+)
+) : (
+)
 class HopscotchWebIDE usingPlatform: p = (
 	|
+	public Map = p collections Map.
 	public images = imagesOuter.
 	public browsing = Browsing usingPlatform: p ide: self.
 	public debugging = Debugging usingPlatform: p ide: self.
@@ -107,7 +150,10 @@ class HopscotchWebIDE usingPlatform: p = (
 	public deployment
 	public psoupDeploymentRuntime = RuntimeForPrimordialSoup.
 	public psoupWithMirrorsDeploymentRuntime = RuntimeWithMirrorsForPrimordialSoup.
-	|
+        public localStorage = (p js global at: 'window') at: 'localStorage'.
+	public atomicInstaller = p mirrors installer.
+	Date = p js global at: 'Date'.
+        |
 	populateNamespaceUsingPlatform: p.
 	deployment:: DeploymentManager usingPlatform: p ide: self.
 ) (
@@ -145,11 +191,42 @@ public launch: s <Subject> inWindow: w <HopscotchShell class> = (
 public launch: s <Subject> = (
   browsing launch: s inWindow: browsing IDEWindow
 )
+backup ^ <Map[Symbol, String]> = (
+  ^[json decode: (localStorage getItem: #backup)] on: Error do: [:e | Map new].
+)
+topMostBuilderOf: b <ClassDeclarationBuilder> ^ <ClassDeclarationBuilder> = (
+  | outermost <ClassDeclarationBuilder> ::= b. |
+  [nil = outermost enclosingClass] whileFalse:
+    [outermost:: outermost enclosingClass].
+  ^outermost
+)
+public installFromBuilders: bs <Array[ClassDeclarationBuilder]> into: namespace <Map[Symbol, Object]> ^ <List[MixinMirror]> = (
+(* A centralized method for installing new code from the IDE *)
+  |
+  lastBackup <Map[Symbol, String]> = backup.
+  (* Make sure all builders are top level *)
+  builders <Array[ClassDeclarationBuilder]> = bs collect: [:b <ClassDeclartionBuilder> | topMostBuilderOf: b].
+  (* Install the code *)
+  mixins = atomicInstaller install: builders into: namespace.
+  |
+  (* Backup the changes *)
+  builders do: [:b <ClassDeclarationBuilder> | 
+    (* Add each changed module to the backup *)
+    lastBackup at: b name put: (browsing compilationUnitFromSource: b source)
+  ].
+  (* Save new backup in local storage *)
+  localStorage setItem: #backup to: (json encode: lastBackup).
+  (* Timestamp latest backup *)
+  localStorage setItem: #lastBackupTime to: Date new getTime.
+  ^mixins
+)
+public installFromBuilders: bs <Array[ClassDeclarationBuilder]> ^ <List[MixinMirror]> = (
+(* A centralized method for installing new code from the IDE *)
+  ^installFromBuilders: bs into: namespacing Root.
+)
 populateNamespaceUsingPlatform: p <Platform> ^ <Namespace> = (
 	|
 	platformMirror <ObjectMirror> = p mirrors ObjectMirror reflecting: p.
-	platformClass <ClassMirror> = platformMirror getClass.
-	runtimeMirror<ObjectMirror> = platformClass enclosingObject.
 	runtimeClass <ClassMirror> = topLevelClassOf: platformMirror.
 	namespace <Namespace> = namespacing Root.
 	|
@@ -217,13 +294,113 @@ topLevelClassOf: om <ObjectMirror> ^ <ClassMirror> = (
 	[klass enclosingObject reflectee isNil] whileFalse: [klass:: klass enclosingObject getClass].
 	^klass
 )
+setupIDEWith: mixins using: platform = (
+    | ide =  ideUsingPlatform: platform. |
+    augmentIDE: ide withPlatform: platform local.
+    mixins do: [:m <MixinMirror> | ide namespacing Root at: m name put: m declaration applyToObject reflectee].
+    ide launch: (ide browsing HomeSubject new)
+)
+loadOrRestoreUsingPlatform: p  = (
+  |
+  localStorage<Alien[LocalStorage]> = (p js global at: 'window') at: 'localStorage'.
+  lastBackupTime = Integer parse: ([localStorage getItem:  #lastBackupTime] on: Error do: [:e | 0]) radix: 10.
+  lastSavedTime = Integer parse: ([localStorage getItem:  #lastSavedTime] on: Error do: [:e | 0]) radix: 10.
+  |
+  lastBackupTime > lastSavedTime
+    ifTrue: [RestoreDialog usingPlatform: p]
+    ifFalse: [setupIDEWith: (loadFrom: #lastSaved usingPlatform: p) using: p] 
+)
+public augmentNamespace: namespace withPlatform: p = (
+	|
+	platformMirror <ObjectMirror> = p mirrors ObjectMirror reflecting: p.
+	platformClass <ClassMirror> = platformMirror getClass.
+	runtimeMirror<ObjectMirror> = platformClass enclosingObject.
+	runtimeClass <ClassMirror> = topLevelClassOf: platformMirror.
+	|
+
+	runtimeClass slots do:
+		[:s <SlotMirror> | | klass <ClassMIrror> o <Object> |
+		o:: (runtimeMirror getSlot: s name) reflectee.
+		o isKindOfBehavior ifTrue:
+			[namespace at: o name put: o]].
+)
+namespaceGivenPlatform: p ^ <Map[Symbol, Object]> = (
+  |
+  platformMirror <ObjectMirror> = p mirrors ObjectMirror reflecting: p.
+  runtimeClass <ClassMirror> = topLevelClassOf: platformMirror.
+  ns = p collections Map new. 
+  |
+  ns   at: runtimeClass mixin name put: runtimeClass reflectee;
+		at: 'Browsing' put: Browsing;
+		at: 'Minitest' put: Minitest;
+		at: 'MinitestUI' put: MinitestUI;
+		at: 'Namespacing' put: Namespacing;
+		at: 'NewspeakColorization' put: NewspeakColorization;
+		at: 'CombinatorialParsing' put: CombinatorialParsing;
+		at: 'NewspeakGrammar' put: NewspeakGrammar;
+		at: 'NewspeakASTs' put: NewspeakASTs;
+		at: 'NewspeakParsing' put: NewspeakParsing;
+		at: 'Debugging' put: Debugging;
+		at: 'WorkspaceManager' put: WorkspaceManager;
+		at: 'DeploymentManager' put: DeploymentManager;		
+		at: 'RuntimeForPrimordialSoup' put: RuntimeForPrimordialSoup;
+		at: 'RuntimeWithMirrorsForPrimordialSoup' put: RuntimeWithMirrorsForPrimordialSoup;
+		at: 'RuntimeForElectron' put: RuntimeForElectron;		
+		at: 'RuntimeForV8' put: RuntimeForV8;
+		at: 'RuntimeForV8WithMirrorBuilders' put: RuntimeForV8WithMirrorBuilders;
+		at: 'NewspeakCompilation' put: NewspeakCompilation;
+        at: 'JavascriptGeneration' put: JavascriptGeneration;
+        at: 'Newspeak2V8Compilation' put: Newspeak2V8Compilation;
+        at: 'KernelForV8' put: KernelForV8;
+        at: 'ActorsForV8' put: ActorsForV8;	
+        at: 'AliensForV8' put: AliensForV8;
+        at: 'MirrorsForV8' put: MirrorsForV8;
+        at: 'MirrorGroups' put: MirrorGroups;	
+        at: 'Collections' put: Collections;
+        at: 'Streams' put: Streams;
+	    at: 'WebFiles' put: WebFiles.
+  testModules do: [:testModule | ns at: testModule name put: testModule].
+  augmentNamespace: ns withPlatform: p.
+  ^ns
+)
+loadFrom: lsKey <Symbol> usingPlatform: p ^ <List[MixinMirror]> = (
+   [ | 
+     json = JSON usingPlatform: p.
+     localStorage = (p js global at: 'window') at: 'localStorage'.
+     compiler = p mirrors compiler.
+     recoveredMap <Map[String]| Nil> =  json decode: ([localStorage getItem:  lsKey] on: Error do: [:e | nil]). 
+     recoveredCode = recoveredMap isNil ifFalse: [recoveredMap values] ifTrue: [p collections List new].
+     bs <List[ClassDeclarationBuilder]> = recoveredCode collect: [:s <String> |
+       p mirrors ClassDeclarationBuilder fromUnitSource: s
+    ].
+    forbidden <Set[Symbol]> = p collections Set withAll: {#HopscotchWebIDE. #KernelForPrimordialSoup}.    
+    filtered = bs reject: [:b | forbidden includes:  b name].
+    mixins <List[MixinMirror]> = p mirrors installer install: filtered into: (namespaceGivenPlatform: p).
+    |
+    ^mixins
+  ] on: Error do: [:msg | msg out. nil].
+  ^p collections List new
+)
+ensureLocalStorage: localStorage = (
+   (localStorage getItem:  #lastBackupTime) isNil ifTrue: [
+       localStorage setItem:  #lastBackupTime to: 0.   
+   ].
+   (localStorage getItem:  #backup) isNil ifTrue: [
+       localStorage setItem:  #backup to: '{}'.
+       ].       
+   (localStorage getItem:  #lastSavedTime) isNil ifTrue: [ 
+       localStorage setItem:  #lastSavedTime to: 0.
+       ].       
+   (localStorage getItem:  #lastSaved) isNil ifTrue: [ 
+       localStorage setItem:  #lastSaved to: '{}'.
+       ].
+)
 public main: platform <Platform> args: args <Tuple[String]> = (
 	| hopscotchPlatform ide |
+    ensureLocalStorage:: (platform js global at: 'window') at: 'localStorage'.
     (platform js global at: 'document') at: 'title' put: 'Newspeak IDE'.
     hopscotchPlatform:: hopscotchRuntime using: platform.
-    ide:: ideUsingPlatform: hopscotchPlatform.
-    augmentIDE: ide withPlatform: platform.
-    ide launch: (ide browsing HomeSubject new)
+    loadOrRestoreUsingPlatform: hopscotchPlatform 
 )
 ) : (
 )

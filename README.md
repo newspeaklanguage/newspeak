@@ -13,10 +13,10 @@ First, download the electron app:
 * [For Mac (Intel)](https://newspeaklanguage.org/NewspeakIDE.app.zip)
 * [For Windows](https://newspeaklanguage.org/newspeakIDE.zip)
 
+# Just in Case
 
-At the moment, we recommend the following setup (this will
-definitely change - such complexity is not the way we intend to do things at the
-Ministry of Truth).
+
+If you feel you must rebuild the system from scratch, here's how:
 
 Set up a directory for your work, say, nswasm
 

@@ -1,0 +1,953 @@
+Newspeak3
+'Mirrors'
+class MirrorsForV8 usingPlatform: p runtime: r vmMirror: vmm = (
+(* The reflection library for the Javascript-based implementation of Newspeak.
+
+Copyright Google Inc. 2014 - 2017
+*)
+|
+private List = p collections List.
+private Map = p collections Map.
+private Mixin = p kernel Mixin.
+private StringBuilder = p kernel StringBuilder.
+private ImmutableMirrorGroup = (r MirrorGroups usingLib: p) ImmutableMirrorGroup.
+private vmmirror = vmm.
+
+private parserLib = Future computing: [r CombinatorialParsing usingPlatform: p].
+private grammar = Future computing: [r NewspeakGrammar usingPlatform: p parsers: parserLib].
+private asts = Future computing: [r NewspeakASTs usingLib: p].
+private parsing = Future computing: [r NewspeakParsing usingPlatform: p grammar: grammar asts: asts].
+private generation = Future computing: [r JavascriptGeneration usingPlatform: p].
+private compilation = Future computing: [r Compilation usingPlatform: p asts: asts parsing: parsing generation: generation].
+public compiler = Future computing: [compilation Compiler new].
+|) (
+class AbstractClassHeaderMirror = (
+) (
+public accessModifier = (
+(* Ths won't work for slots. So should we set this up explicitly and store the access? If we had the mangled name we could use that to decided; might be easier to keep mangled name and unmangle it on demand *)
+	(source startsWith: 'public ') ifTrue: [^#public].
+	(source startsWith: 'private ') ifTrue: [^#private].
+	^#protected
+)
+public classComment ^ <String> = (
+	^(compilation parser classHeader parseString: source) classComment
+)
+public source ^ <String> = (
+	subclassResponsibility
+)
+) : (
+)
+public class ClassDeclarationBuilder forExistingMixin: m <Mixin> within: enclosing <ClassDeclarationBuilder> = (
+(*
+A mutable description of a class, ready for installation. This class is the abstract superclass of two alternate
+implementations: IRBasedClassDeclarationBuilder and MixinBasedClassDeclarationBuilder.
+
+The former is created based upon the compiler's intermediate representation, and is useful when producing a
+complete class from source code.  The latter is created based upon an existing class declaration, specifically
+its mixin. This is much faster, as it does not require compilation to produce the builder. This is important
+since some IDE presenters work off a builder, and requiring a complete compile may introduce a noticeable
+delay (at least until the compiler gets a lot faster).
+
+Subclasses must implement a number of methods: computeInstanceSide, computeClassSide, name and declarationData.
+The first two specify how the MixinBuilders that represent the two sides of the class are computed. The name
+computation also depends on the underlying structure.
+
+The last subclass responsibility method, declarationData,
+specifies how to compute other data representing the class under construction. These will differ depending
+on whether the initial input for the new class is an IR (obtained by compiling source code) or a mixin (obtained
+from an existing class in the runtime). The builders for the sides are stored in the instanceSide and classSide slots.
+
+In all cases, the builder retains a copy of the existing mixin, if it exists. This the first formal parameter, m,
+which is saved in the slot prvtExistingMixin.
+If the class is new, m is nil.
+In addition, the builder expect another builder representing the enclosing class declaration. For top level classes
+this is nil.
+
+The remaining slots are reserved for future use to support deletion of members.
+
+Installation is always based on recompiling the current (likely modified) version of the class from source.
+This is because the compiled representation statically resolves the lexical level of a here send, and adding
+or removing members may impact that resolution within the class (including its nested classes).
+
+The recompiled IR is installed, either by updating the existing mixin in the runtime, or by creating a new one,
+which is stored in prvtExistingMixin so that it becomes the "existing mixin " from that point on.
+
+Still lacking are facilities for correctly adding slots (and hence nested classes) and for delteions.
+*)
+|
+prvtExistingMixin <Mixin> ::= m.
+public enclosingClass <ClassDeclarationBuilder> = enclosing.
+private instanceSideSlot <MixinBuilder>
+private classSideSlot <MixinBuilder>
+deletedInstanceMethods <List[Symbol]>
+deletedClassMethods <List[Symbol]>
+|) (
+public accessModifier = (
+	^declarationData accessModifier
+)
+public classSide ^ <MixinBuilder> = (
+	nil = classSideSlot ifTrue: [classSideSlot:: computeClassSide].
+	^classSideSlot
+)
+public computeClassDeclIR ^ <IntermediateClassDeclaration> = (
+(*  Compile latest source into an IR.  But this won't work for nested classes
+	| src = 'Newspeak3 ''Uncategorized'' ',  source. |
+	('compiling class:', src) out.*)
+
+	^nil = enclosingClass
+	  ifTrue: [
+		compiler compileClassSource: 'Newspeak3 ''Uncategorized'' ', source within: nil.
+		]
+	  ifFalse: [(* compiler compileClassSource: source within: enclosingClass.
+		Is enclosingClass the right kind of argument?
+		Can we make the compiler API more uniform so we can always just make this call?
+		This assumes we can dispense with compiling the entire module.
+		 *)
+		enclosingClass computeClassDeclIR instanceSide nestedClasses detect:
+		 [:ncd <IntermediateClassDeclaration> | ncd qualifiedName = qualifiedName]
+		]
+)
+computeClassSide ^ <MixinBuilder> = (
+	subclassResponsibility
+)
+computeInstanceSide ^ <MixinBuilder> = (
+	subclassResponsibility
+)
+declarationData = (
+	subclassResponsibility
+)
+public install ^<ClassDeclarationMirror> = (
+	| writer sb <StringBuilder> src <String> runtimeMixin <JRM> cdir <IntermediateClassDeclaration> |
+
+	writer:: generation Writer new.
+	sb:: StringBuilder new.
+	cdir:: computeClassDeclIR.
+	writer generateSourceFor: cdir runtimeMixin on: sb. (* compute up to date JS translation *)
+	src:: sb asString.
+	src out.
+	runtimeMixin:: js call: (js ident: 'eval') with: {src}. (* compute up to date runtime mixin *)
+	prvtExistingMixin isNil (* Update based on latest mixin *)
+		ifTrue: [
+			prvtExistingMixin:: Mixin fromRuntimeMixin: runtimeMixin.
+			updateSourceIndicesOfNewRuntimeMixin: runtimeMixin from: cdir.
+			(* this is where we should recompile the enclosing class*)
+			]
+		ifFalse: [updateMixinFrom: runtimeMixin with: cdir].
+	^ClassDeclarationMirror reflecting: prvtExistingMixin.
+)
+public instanceSide ^ <MixinBuilder> = (
+	nil = instanceSideSlot ifTrue: [instanceSideSlot:: computeInstanceSide].
+	^instanceSideSlot
+)
+public name ^<Symbol> = (
+	^subclassResponsibility
+)
+public qualifiedName = (
+	^declarationData qualifiedName
+)
+public simpleName ^<Symbol> = (
+	^name
+)
+public source ^<String> = (
+	| sb = StringBuilder new. |
+	sb add: header source.
+	sb writeln: ' ( '.
+	instanceSide nestedClasses do: [:ea <ClassDeclarationMirror | ClassDeclarationBuilder> | sb writeln: ea source].
+	instanceSide methods do: [:ea <MethodMirror | MethodBuilder> | sb writeln: ea source].
+	sb writeln: ' ) : ( '.
+	classSide methods do: [:ea <MethodMirror | MethodBuilder> | sb writeln: ea source].
+	sb writeln: ' )'.
+	^sb asString
+)
+updateApplicationsOf: oldRuntimeMixin <JRM> from: newRuntimeMixin <JRM> by: classDeclIR <IntermediateClassDeclaration> = (
+	|
+	newRuntimeMetamixin <MJRM> = js propertyOf: newRuntimeMixin at: (js literal: 'meta').
+	applications <Array[JRC]> = js propertyOf: oldRuntimeMixin at: (js literal: 'applications').
+	|
+	(* TODO: handle deletes *)
+	(* TODO: copy nested classes also? *)
+	(* TODO: copy new metadata *)
+	applications do: [:runtimeClass <JRC> |
+		|
+		runtimeMetaclass <MJRC> = js propertyOf: runtimeClass at: (js literal: 'meta').
+		|
+		(*runtimeClass out.*)
+		(* Cf. IntermediateClassDeclaration copyMethods: *)
+		classDeclIR instanceSide methods do: [:ea <IntermediateMethod> |
+			| jsProName <String> jsPubName <String> |
+			jsPubName:: compilation names manglePublic: ea name.
+			jsProName:: compilation names mangleProtected: ea name.
+			ea isProtected ifTrue: [
+				js assign: (js propertyOf: runtimeClass at: jsProName) toBe: (js propertyOf: newRuntimeMixin at: jsPubName).
+				js assign: (js propertyOf: runtimeClass at: jsPubName) toBe: (js call: (js ident: 'dnuCatcher') with: {jsPubName}).
+			].
+			ea isPublic ifTrue: [
+				js assign: (js propertyOf: runtimeClass at: jsProName) toBe: (js propertyOf: newRuntimeMixin at: jsPubName).
+				js assign: (js propertyOf: runtimeClass at: jsPubName) toBe: (js propertyOf: newRuntimeMixin at: jsPubName).
+			].
+		].
+		classDeclIR classSide methods do: [:ea <IntermediateMethod> |
+			| jsProName <String> jsPubName <String> |
+			jsPubName:: compilation names manglePublic: ea name.
+			jsProName:: compilation names mangleProtected: ea name.
+			ea isProtected ifTrue: [
+				js assign: (js propertyOf: runtimeMetaclass at: jsProName) toBe: (js propertyOf: newRuntimeMetamixin at: jsPubName).
+				js assign: (js propertyOf: runtimeMetaclass at: jsPubName) toBe: (js call: (js ident: 'dnuCatcher') with: {jsPubName}).
+			].
+			ea isPublic ifTrue: [
+				js assign: (js propertyOf: runtimeMetaclass at: jsProName) toBe: (js propertyOf: newRuntimeMetamixin at: jsPubName).
+				js assign: (js propertyOf: runtimeMetaclass at: jsPubName) toBe: (js propertyOf: newRuntimeMetamixin at: jsPubName).
+			].
+		].
+	].
+)
+updateHeaderSourceForNewRuntimeMixin: runtimeMixin <JRM> from: cdir <IntermediateClassDeclaration> = (
+ |
+  headerSourceIndex <Integer> ::= js propertyOf: (js ident: 'sources') at: (js literal: 'length').
+  headerSource = cdir headerSource.
+ |
+
+  js assign: (js propertyOf: runtimeMixin at: (js literal: 'header')) toBe: headerSourceIndex.
+  js assign: (js propertyOf: (js ident: 'sources') at: headerSourceIndex) toBe: headerSource.
+)
+updateInstanceMixin: oldRuntimeMixin <JRM> from: newRuntimeMixin <JRM> by: classDeclIR <IntermediateClassDeclaration> ^ <List[Symbol]> = (
+	(* TODO: handle deletes
+	go thru old methods and see if they exist in new methods, if not add them to deleted list? and remove from old.
+	*)
+	| newMethods <List[IntermediateMethod]> = classDeclIR instanceSide methods. |
+
+	deletedInstanceMethods:: List new.
+
+	(* (js propertyOf: oldRuntimeMixin at: #methods) forEach: [:m <MM> |
+		(newMethods anySatisfy: [:im <IntermediateMethod> |
+			im name = (compilation names manglePublic: (js propertyOf: m at: #name))
+			])
+		   ifFalse: [
+			deletedInstanceMethods add: im name.
+			(* remove from old; need to add delete support to JavascriptGeneration; not critical *)
+			].
+		].*)
+	(* TODO: copy nested classes also? *)
+	(* TODO: copy new metadata *)
+	newMethods do: [:ea <IntermediateMethod> | (* insert modified or new instance methods into mixin *)
+		| jsName <String> |
+		jsName:: compilation names manglePublic: ea name.
+		js assign: (js propertyOf: oldRuntimeMixin at: jsName) toBe: (js propertyOf: newRuntimeMixin at: jsName).
+	].
+	{#name. #header. #slots. #methods. #nestedClasses} do: [:jsName |
+		js assign: (js propertyOf: oldRuntimeMixin at: jsName) toBe: (js propertyOf: newRuntimeMixin at: jsName).
+	].
+)
+updateMetaMixin: oldRuntimeMetamixin <MJRM> from: newRuntimeMetamixin <MJRM> by: classDeclIR <IntermediateClassDeclaration> ^ <List[Symbol]> = (
+	| newMethods <List[IntermediateMethod]> = classDeclIR classSide methods. |
+
+	(* TODO: handle deletes *)
+	deletedClassMethods:: List new.
+	(* TODO: copy nested classes also? *)
+	(* TODO: copy new metadata *)
+	newMethods do: [:ea <IntermediateMethod> | (* insert modified or new class methods into mixin *)
+		| jsName <String> |
+		jsName:: compilation names manglePublic: ea name.
+		js assign: (js propertyOf: oldRuntimeMetamixin at: jsName) toBe: (js propertyOf: newRuntimeMetamixin at: jsName).
+	].
+	{#slots. #methods. #nestedClasses} do: [:jsName <Symbol> |
+		js assign: (js propertyOf: oldRuntimeMetamixin at: jsName) toBe: (js propertyOf: newRuntimeMetamixin at: jsName).
+	].
+)
+updateMixin: oldMixin <Mixin> from: newRuntimeMixin <JRM> by: classDeclIR <IntermediateClassDeclaration> = (
+	|
+	deletedInstanceMethods <List[Symbol]>
+	deletedClassMethods <List[Symbol]>
+	oldRuntimeMixin <JRM> = js propertyOf: oldMixin at: (js literal: 'runtimeMixin').
+	oldRuntimeMetamixin <MJRM> = js propertyOf: oldRuntimeMixin at: (js literal: 'meta').
+	newRuntimeMetamixin <MJRM> = js propertyOf: newRuntimeMixin at: (js literal: 'meta').
+	|
+	(* TODO: handle deletes *)
+	(* TODO: copy nested classes also? *)
+	(* TODO: copy new metadata *)
+	deletedInstanceMethods:: updateInstanceMixin: oldRuntimeMixin from: newRuntimeMixin  by: classDeclIR.
+	deletedClassMethods:: updateMetaMixin: oldRuntimeMetamixin from: newRuntimeMetamixin by: classDeclIR.
+	updateApplicationsOf: oldRuntimeMixin from: newRuntimeMixin by: classDeclIR.
+)
+updateMixinFrom: runtimeMixin <JRM> with: cdir <IntermediateClassDeclaration> = (
+ |
+  instanceMethodSourceIndices <Map[String, Integer]> = Map new.
+  classMethodSourceIndices <Map[String, Integer]> = Map new.
+  runtimeMetamixin <MJRM> = js propertyOf: runtimeMixin at: (js literal: 'meta').
+  existingMixin <JRM> = js propertyOf: prvtExistingMixin at: (js literal: 'runtimeMixin').
+  existingMetamixin <MJRM> = js propertyOf: existingMixin at: (js literal: 'meta').
+  newSourceIndex <Integer> ::= js propertyOf: (js ident: 'sources') at: (js literal: 'length').
+ |
+(* TODO: Also update source indices for header. *)
+(* TODO: update access modifiers if they have changed? *)
+	(* collect existing mixin's source indices into a map keyed by name *)
+	(js propertyOf: existingMixin at: (js literal: 'methods'))  do: [:ea <MM> |
+	   instanceMethodSourceIndices at: (js propertyOf: ea at: (js literal: 'name')) put: (js propertyOf: ea at: (js literal: 'source'))
+	].
+	(js propertyOf: existingMetamixin at: (js literal: 'methods')) do: [:ea <MM> |
+	  classMethodSourceIndices at: (js propertyOf: ea at: (js literal: 'name')) put: (js propertyOf: ea at: (js literal: 'source'))
+	].
+	(* Augment maps of source indices with entries for any new methods *)
+	(js propertyOf: runtimeMixin at: (js literal: 'methods')) do:
+		[:e <MM> | | selector |
+		   selector:: (js propertyOf: e at: (js literal: 'name')).
+		   instanceMethodSourceIndices at: selector ifAbsent: [instanceMethodSourceIndices at: selector put: newSourceIndex].
+		   newSourceIndex:: newSourceIndex + 1.
+		 ].
+	(js propertyOf: runtimeMetamixin at: (js literal: 'methods')) do:
+		[:e <MM> | | selector |
+		   selector:: (js propertyOf: e at: (js literal: 'name')).
+		   classMethodSourceIndices at: selector ifAbsent: [classMethodSourceIndices at: selector put: newSourceIndex].
+	         newSourceIndex:: newSourceIndex + 1.
+		 ].
+
+	  (* Update global sources array with any changed or new source code *)
+	instanceSide methods do: [:m <MethodBuilder> | | sourceIndex <Integer> |
+		  sourceIndex:: instanceMethodSourceIndices at: m name.
+		  m source ~= nil ifTrue: [js assign: (js propertyOf: (js ident: 'sources') at: sourceIndex) toBe: m source].
+		].
+	classSide methods do: [:m <MethodBuilder> | | sourceIndex <Integer> |
+		  sourceIndex:: classMethodSourceIndices at: m name.
+		  m source ~= nil ifTrue: [js assign: (js propertyOf: (js ident: 'sources') at: sourceIndex) toBe: m source].
+		].
+	  (* Ensure new runtime structure has correct source indices in its metadata*)
+	  (* what about the name itself? And the access modifier *)
+	(js propertyOf: runtimeMixin at: (js literal: 'methods')) do: [:mm <MM> |
+			js assign: (js propertyOf: mm at: (js literal: 'source'))
+			    toBe: (instanceMethodSourceIndices at: (js propertyOf: mm at: (js literal: 'name'))).
+	].
+	(js propertyOf: runtimeMetamixin at: (js literal: 'methods')) do: [:mm <MM> |
+		    js assign: (js propertyOf: mm at: (js literal: 'source'))
+		       toBe: (classMethodSourceIndices at: (js propertyOf: mm at: (js literal: 'name'))).
+		].
+		  (* Update class header source index *)
+	js assign: (js propertyOf: runtimeMixin at: (js literal: 'header')) toBe: (js propertyOf: existingMixin at: (js literal: 'header')).
+
+	(* Update the  existing runtime based on the new one *)
+	updateMixin: prvtExistingMixin from: runtimeMixin by: cdir
+)
+updateSourceIndicesOfNewRuntimeMixin: runtimeMixin <JRM> from: cdir <IntermediateClassDeclaration> = (
+ |
+  instanceMethodSourceIndices <Map[String, Integer]> = Map new.
+  classMethodSourceIndices <Map[String, Integer]> = Map new.
+  runtimeMetamixin <MJRM> = js propertyOf: runtimeMixin at: (js literal: 'meta').
+  newSourceIndex <Integer> ::= js propertyOf: (js ident: 'sources') at: (js literal: 'length').
+ |
+(* TODO: update access modifiers if they have changed? *)
+	(* Augment maps of source indices with entries for any new methods *)
+	(js propertyOf: runtimeMixin at: (js literal: 'methods')) do:
+		[:e <MM> | | selector |
+		   selector:: (js propertyOf: e at: (js literal: 'name')).
+		   instanceMethodSourceIndices at: selector ifAbsent: [instanceMethodSourceIndices at: selector put: newSourceIndex].
+		   newSourceIndex:: newSourceIndex + 1.
+		 ].
+	(js propertyOf: runtimeMetamixin at: (js literal: 'methods')) do:
+		[:e <MM> | | selector |
+		   selector:: (js propertyOf: e at: (js literal: 'name')).
+		   classMethodSourceIndices at: selector ifAbsent: [classMethodSourceIndices at: selector put: newSourceIndex].
+	         newSourceIndex:: newSourceIndex + 1.
+		 ].
+
+	  (* Update global sources array with any changed or new source code *)
+	instanceSide methods do: [:m <MethodBuilder> | | sourceIndex <Integer> |
+		  sourceIndex:: instanceMethodSourceIndices at: m name.
+		  m source ~= nil ifTrue: [js assign: (js propertyOf: (js ident: 'sources') at: sourceIndex) toBe: m source].
+		].
+	classSide methods do: [:m <MethodBuilder> | | sourceIndex <Integer> |
+		  sourceIndex:: classMethodSourceIndices at: m name.
+		  m source ~= nil ifTrue: [js assign: (js propertyOf: (js ident: 'sources') at: sourceIndex) toBe: m source].
+		].
+	  (* Ensure new runtime structure has correct source indices in its metadata*)
+	  (* what about the name itself? And the access modifier *)
+	(js propertyOf: runtimeMixin at: (js literal: 'methods')) do: [:mm <MM> |
+			js assign: (js propertyOf: mm at: (js literal: 'source'))
+			    toBe: (instanceMethodSourceIndices at: (js propertyOf: mm at: (js literal: 'name'))).
+	].
+	(js propertyOf: runtimeMetamixin at: (js literal: 'methods')) do: [:mm <MM> |
+		    js assign: (js propertyOf: mm at: (js literal: 'source'))
+		       toBe: (classMethodSourceIndices at: (js propertyOf: mm at: (js literal: 'name'))).
+		].
+		  (* Update class header source index *)
+	updateHeaderSourceForNewRuntimeMixin: runtimeMixin from: cdir.
+)
+) : (
+public fromSource: src <String> ^<ClassDeclarationBuilder> = (
+	^self fromUnitSource: 'Newspeak3 ''Uncategorized'' ', src
+)
+public fromUnitSource: src <String> ^<ClassDeclarationBuilder> = (
+	| ir <IntermediateMixin> = (compiler compileClassSource: src within: nil). |
+(* source indices will be BOGUS here *)
+	^IRBasedClassDeclarationBuilder fromIR: ir existingMixin: nil within: nil
+)
+public reflecting: mixin <InstanceMixin> ^<ClassDeclarationBuilder> = (
+	| m = ClassDeclarationMirror reflecting: mixin. |
+	nil = m enclosingClass ifFalse:
+		[^m enclosingClass asBuilder instanceSide nestedClasses findMirrorNamed: m simpleName].
+
+	^MixinBasedClassDeclarationBuilder
+		forExistingMixin: mixin
+		within: nil
+)
+)
+class ClassDeclarationMirror reflecting: mixin = (|
+	private reflectee = mixin.
+	public instanceSide <MixinMirror> = MixinMirror reflecting: mixin.
+	public classSide <MixinMirror> = MixinMirror reflecting: (classMixinOf: mixin).
+|) (
+public accessModifier ^ <Symbol> = (
+	^header accessModifier
+)
+public applyToObject ^<ClassMirror> = (
+	nil = enclosingClass ifFalse: [^notTopLevel].
+	^ClassMirror reflecting: (reflectee applyTo: Object withName: simpleName)
+)
+public asBuilder ^<ClassDeclarationBuilder> = (
+	^ClassDeclarationBuilder reflecting: reflectee
+)
+public definingMixin ^<MixinMirror> = (
+	| ec = enclosingClass. |
+	nil = ec ifTrue: [^nil].
+	^ec instanceSide
+)
+public enclosingClass ^ <ClassDeclarationMirror> = (
+	| enclosing <Class> |
+	enclosing:: (js propertyOf: (js propertyOf: reflectee at: (js literal: 'runtimeMixin')) at: (js literal: 'enclosingMixin')).
+	(js operator: '===' with: enclosing and: (js ident: 'undefined')) ifTrue: [^nil].
+	^ClassDeclarationMirror reflecting: (Mixin fromRuntimeMixin: enclosing)
+)
+public header ^<ClassHeaderMirror> = (
+	^ClassHeaderMirror reflecting: reflectee
+)
+public isKindOfClassDeclarationMirror ^<Boolean> = (
+	^true
+)
+public name = (
+	^(reflectee name splitBy: '`') last
+)
+public primaryFactorySelector ^ <Symbol> = (
+  ^header primaryFactorySelector
+)
+public qualifiedName = (
+	#BOGUS. (* Remove when currentMixinUID uses a proper token. *)
+	^reflectee name
+)
+public simpleName = (
+	^name
+)
+public source ^<String> = (
+	| sb = StringBuilder new. |
+	sb add: header source.
+	sb writeln: ' ( '.
+	instanceSide nestedClasses do: [:ea | sb writeln: ea source].
+	instanceSide methods do: [:ea | sb writeln: ea source].
+	sb writeln: ' ) : ( '.
+	classSide methods do: [:ea | sb writeln: ea source].
+	sb writeln: ' )'.
+	^sb asString
+)
+) : (
+)
+class ClassHeaderMirror reflecting: mixin = AbstractClassHeaderMirror (|
+	private reflectee <Mixin> = mixin.
+|) (
+public isKindOfClassHeaderMirror ^<Boolean> = (
+	^true
+)
+public name = (
+	^(reflectee name splitBy: '`') last
+)
+public preamble ^ <String> = (
+	(* Foo factory = SuperFoo superFactory *)
+	| headerAst |
+	headerAst:: compilation parser classHeader parseString: source.
+	^source copyFrom: headerAst start to: headerAst superConstructorCall end
+)
+public primaryFactorySelector ^ <Symbol> = (
+	| headerAst |
+	headerAst:: compilation parser classHeader parseString: source.
+	^headerAst constructor selector
+)
+public selectors ^ <List[Symbol]> = (
+  #BIOGUS yourself. (* need to construct an index when parsing *)
+  ^List new
+)
+public source ^<String> = (
+	| sourceIndex = js propertyOf: (js propertyOf: reflectee at: (js literal: 'runtimeMixin')) at: (js literal: 'header'). |
+	^js propertyOf: (js ident: 'sources') at: sourceIndex.
+)
+) : (
+)
+public class ClassMirror reflecting: r <Class> = (|
+public reflectee <Class> = r.
+|) (
+public = other <Object> ^<Boolean> = (
+	other isKindOfClassMirror ifFalse: [^false].
+	^js operator: '===' with: reflectee and: other reflectee
+)
+public allSuperclasses ^ <List[ClassMirror]> = (
+	| klass <Class> superclasses <List[Class]> |
+	superclasses:: List new.
+	klass:: superclass.
+	[klass isNil] whileFalse: [
+		superclasses add: klass.
+		klass:: klass superclass.
+	].
+	^superclasses
+)
+private computeMirrorGroup: mgAccessor <[:MixinMirror | MirrorGroup]> ^ <List[Mirror]> = (
+(* Return a mirror group based on the mixins group and those of all superclasses. The argument mgAccessor extracts a mirror group from any mirror provided to it. *)
+	| mg <MirrorGroup> |
+	mg:: List new.
+	(allSuperclasses reverse add: self; yourself)
+		do: [:klass <ClassMirror> | mg addAll: (mgAccessor value: klass mixin)].
+	^mg
+)
+public declaration ^ <ClassDeclarationMirror> = (
+(* Convenience method to make the API more usable *)
+	^mixin declaration
+)
+public enclosingObject ^<ObjectMirror> = (
+	^ObjectMirror reflecting: reflectee enclosingObject
+)
+public hash ^<Integer> = (
+	^(identityHashOf: reflectee) bitXor: class hash
+)
+public isKindOfClassMirror ^<Boolean> = (
+	^true
+)
+public isMeta ^<Boolean> = (
+	^reflectee isMeta
+)
+public methods ^ <MirrorGroup[MethodMirror]> = (
+	^computeMirrorGroup: [:r | r methods]
+)
+public mixin ^ <MixinMirror> = (
+	^MixinMirror reflecting: reflectee mixin
+)
+public name = (
+	^reflectee name
+)
+public nestedClasses ^ <MirrorGroup[ClassDeclarationMirror]> = (
+	^computeMirrorGroup: [:r | r nestedClasses]
+)
+public simpleName = (
+	^(reflectee name splitBy: '`') last
+)
+public slots ^ <MirrorGroup[SlotMirror]> = (
+	^computeMirrorGroup: [:r | r slots].
+)
+public superclass ^ <ClassMirror> = (
+	reflectee superclass isNil ifTrue: [^nil].
+	^ClassMirror reflecting: reflectee superclass
+)
+) : (
+)
+class IRBasedClassDeclarationBuilder fromIR: ir <IntermediateClassDeclaration> existingMixin: m <Mixin> within: enclosing <ClassDeclarationBuilder> = ClassDeclarationBuilder forExistingMixin: m  within: enclosing (
+|
+prvtIR <IntermediateClassDeclaration> = ir.
+|) (
+computeClassSide ^ <MixinBuilder> = (
+	| existingClassMixin = nil = prvtExistingMixin ifFalse: [classMixinOf: prvtExistingMixin]. |
+	^MixinBuilder for: prvtIR classSide classDeclaration: self existingMixin: existingClassMixin.
+)
+computeInstanceSide ^ <MixinBuilder> = (
+	^MixinBuilder for: prvtIR instanceSide classDeclaration: self existingMixin: prvtIR instanceSide.
+)
+declarationData = (
+	^prvtIR
+)
+public header ^ <ClassHeaderMirror> = (
+	^SourceBasedClassHeaderMirror from: prvtIR headerSource
+)
+public name ^<Symbol> = (
+	^compilation names fullyQualifiedNameToSimple: qualifiedName
+)
+) : (
+)
+class MethodBuilder reflecting: mir in: mb source: s = (|
+reflecteeX <IntermediateMethod> = mir.
+definingMixinX <MixinBuilder> = mb.
+public source <String> = s.
+|) (
+public accessModifier = (
+	^reflecteeX accessModifier
+)
+public definingMixin ^ <MixinBuilder> = (
+	^definingMixinX
+)
+public name ^<Symbol> = (
+	^reflecteeX name
+)
+public simpleName ^<Symbol> = (
+	^reflecteeX name
+)
+) : (
+)
+class MethodMirror name: n accessModifier: a mixin: m source: s = (|
+	public name <Symbol> = n.
+	public accessModifier <Symbol> = a.
+	public definingMixin <MixinMirror> = m.
+	private sourceIndex <Integer> = s.
+|) (
+public isKindOfMethodMirror ^<Boolean> = (
+	^true
+)
+public selectors ^ <List[Symbol]> = (
+  #BIOGUS yourself. (* need to construct an index when parsing *)
+  ^List new
+)
+public simpleName ^<Symbol> = (
+	^name
+)
+public source ^<String> = (
+	^js propertyOf: (js ident: 'sources') at: sourceIndex.
+)
+) : (
+)
+public class MixinBasedClassDeclarationBuilder forExistingMixin: m <InstanceMixin> within: enclosing <ClassDeclarationBuilder> =
+ClassDeclarationBuilder forExistingMixin: m  within: enclosing (
+| mixinMirror = MixinMirror reflecting: m. |
+) (
+computeClassSide ^ <MixinBuilder> = (
+	| existingClassMixin = classMixinOf: prvtExistingMixin. |
+	^MixinBuilder for: mixinMirror declaration classSide classDeclaration: self existingMixin: existingClassMixin.
+)
+computeInstanceSide ^ <MixinBuilder> = (
+	^MixinBuilder for: mixinMirror classDeclaration: self existingMixin: prvtExistingMixin.
+)
+declarationData ^ <ClassDeclarationMirror> = (
+	^mixinMirror declaration
+)
+public header ^ <ClassHeaderMirror> = (
+	^declarationData header
+)
+public name ^<Symbol> = (
+	^declarationData name
+)
+) : (
+)
+class MixinBuilder for: dataSource <IntermediateMixin | MixinMirror> classDeclaration: cdb <ClassDeclarationBuilder> existingMixin: em <Mixin> = (
+(*
+A mutable description of a mixin. Used by ClassDeclarationBuilder, which is the actual unit of installation.
+Instances of this class are created from dataSource, which  may be either the compiler's intermediate representation for mixins,
+or a mixin mirror. In all cases, a builder, cdb,  for the entire class must be supplied as a reference to the overall
+declaration. If the mixin, em, that is being described already exists, it too is required - otherwise em should be nil.
+
+The working representation for the builder consists of slots representing the methods, nested classes and slots of the mixin.
+These are computed upon instantiation. Changing the mixin elsewhere will have no effect on this builder once it has
+been instantiated!
+
+Arguably, it might be cleaner to separate out MixinBuilders into different implementations just like ClassDeclarationBuilders.
+In practice, the only point where a difference arises is in computing nestedClasses, the set of nested class builders.
+Thus, it seems simpler to factor out that decision to the method #nestedClassBuildrFor:within:, which does a test
+on the data to decide what action to take.
+*)
+|
+data <IntermediateMixin | MixinMirror> = dataSource.
+public declaration <ClassDeclarationBuilder> = cdb.
+public slots <MutableMirrorGroup> = MutableMirrorGroup group: ((dataSource slots reject: [:ea | ea isSynthetic])) within: self.
+public methods <MutableMethodGroup> = MutableMethodGroup group: ((dataSource methods reject: [:ea | ea isSynthetic]) collect: [:ea | MethodBuilder reflecting: ea in: self source: ea source]) within: self.
+public nestedClasses <MutableNestedClassGroup> =
+   MutableNestedClassGroup group: (dataSource nestedClasses collect: [:ea <IntermediateClassDeclaration | ClassDeclarationMirror> |
+	nestedClassBuilderFor: ea within: em]) within: self.
+|) (
+public canUnderstand: selector <Symbol> ^ <Boolean> = (
+	^methods includesMirrorNamed: selector
+)
+find: name <String> in: aMixin <Mixin>^ <Mixin> = (
+	^Mixin fromRuntimeMixin:
+		(js propertyOf:
+			(js propertyOf: aMixin at: (js literal: 'runtimeMixin')) at: (compilation names manglePublic: name)).
+)
+public isKindOfMixinMirror ^<Boolean> = (
+	^true
+)
+public isMeta ^ <Boolean> = (
+	^data isMeta
+)
+nestedClassBuilderFor: nc <IntermediateClassDeclaration | ClassDeclarationMirror> within: em <Mixin> ^ <ClassDeclartionBuilder> = (
+	data isKindOfIntermediateMixin ifTrue: [
+		^IRBasedClassDeclarationBuilder fromIR: nc existingMixin: (find: nc qualifiedName in: em) within: declaration
+		].
+	^MixinBasedClassDeclarationBuilder forExistingMixin: (find: nc qualifiedName in: em) within: declaration
+)
+) : (
+public reflecting: mxn <Mixin | ClassMixin> ^<MixinBuilder> = (
+	^mxn isMeta
+		ifTrue: [(ClassDeclarationBuilder reflecting: (MixinMirror reflecting: mxn) declaration instanceSide reflectee) classSide]
+		ifFalse: [(ClassDeclarationBuilder reflecting: mxn) instanceSide]
+)
+)
+class MixinMirror reflecting: mixin <Mixin> = (|
+	private reflectee <Mixin> = mixin.
+|) (
+public apply: newSuperclass <Class> withName: n <Symbol> ^ <ClassMirror> = (
+	^ClassMirror reflecting: (reflectee applyTo: newSuperclass withName: n)
+)
+public asBuilder ^<MixinBuilder> = (
+	^isMeta
+		ifTrue: [declaration asBuilder classSide]
+		ifFalse: [declaration asBuilder instanceSide]
+)
+public canUnderstand: selector <Symbol> ^ <Boolean> = (
+	^methods includesMirrorNamed: selector
+)
+public declaration ^<ClassDeclarationMirror> = (
+	^ClassDeclarationMirror
+		reflecting: (isMeta
+			ifFalse: [reflectee]
+			ifTrue: [(Mixin fromRuntimeMixin: (js propertyOf: (js propertyOf: reflectee at: (js literal: 'runtimeMixin')) at: (js literal: 'nonMeta')))])
+)
+public isKindOfMixinMirror ^<Boolean> = (
+	^true
+)
+public isMeta ^<Boolean> = (
+	^reflectee isMeta
+)
+public methods ^<MirrorGroup[MethodMirror]> = (
+	| raw <Array[MethodMirror]> |
+	raw:: ((js propertyOf: (js propertyOf: reflectee at: (js literal: 'runtimeMixin')) at: (js literal: 'methods'))
+		select: [:each | (js propertyOf: each at: (js literal: 'isSynthetic')) not])
+		collect: [:each | MethodMirror
+			name: (js propertyOf: each at: (js literal: 'name'))
+			accessModifier: (js propertyOf: each at: (js literal: 'accessModifier'))
+			mixin: self
+			source: (js propertyOf: each at: (js literal: 'source'))].
+	^ImmutableMirrorGroup group: raw
+)
+public name = (
+	^(reflectee name splitBy: '`') last
+)
+public nestedClasses ^<MirrorGroup[ClassDeclarationMirror]> = (
+	| raw <Array[ClassDeclarationMirror]> |
+	raw:: (js propertyOf: (js propertyOf: reflectee at: (js literal: 'runtimeMixin')) at: (js literal: 'nestedClasses'))
+		collect: [:each | ClassDeclarationMirror reflecting:
+			(Mixin fromRuntimeMixin:
+				(js propertyOf: (js propertyOf: reflectee at: (js literal: 'runtimeMixin')) at: (vmmirror mangleSelector: each)))].
+	^ImmutableMirrorGroup group: raw
+)
+public primaryFactorySelector ^ <Symbol> = (
+  ^declaration primaryFactorySelector
+)
+public slots ^<MirrorGroup[SlotDeclarationMirror]> = (
+	| raw <Array[SlotDeclarationMirror]> |
+	isMeta ifTrue: [^ImmutableMirrorGroup group: {}].
+	raw:: ((js propertyOf: (js propertyOf: reflectee at: (js literal: 'runtimeMixin')) at: (js literal: 'slots'))
+		select: [:each | (js propertyOf: each at: (js literal: 'isSynthetic')) not])
+		collect: [:each | SlotDeclarationMirror
+			name: (js propertyOf: each at: (js literal: 'name'))
+			accessModifier: (js propertyOf: each at: (js literal: 'accessModifier'))
+			isMutable: (js propertyOf: each at: (js literal: 'isMutable'))
+			mixin: self].
+	^ImmutableMirrorGroup group: raw
+)
+) : (
+)
+class MutableMethodGroup group: ms <List[Mirror]>
+  within: mb <MixinBuilder>
+ = MutableMirrorGroup group: ms within: mb  () (
+public addFromSource: s <String> ^ <MethodBuilder> = (
+	|
+	result <IntermediateMethod>
+	newM <MethodBuilder>
+	sourceIndex <Integer>
+	|
+	result:: compiler
+		compileMethodSource: s
+		within: definingMixin.
+
+	(* TODO: check for name conflicts *)
+
+	newM:: MethodBuilder reflecting: result in: definingMixin source: s.
+	removeMirrorNamed: result name.
+	(*mixinIR methods add: result.*)
+	addMirror: newM.
+	^newM
+)
+public removeMirrorNamed: m <Symbol | String>^ <Mirror> = (
+	| 	oldMirror <MethodMirror> |
+	oldMirror:: super removeMirrorNamed: m.
+	oldMirror isNil
+	  ifFalse: [ (* we are removing an existing method *)
+		(*mixinIR methods removeAllSuchThat: [:ea <IntermediateMethod> | ea name = m].*)
+	 ].
+	^oldMirror
+)
+) : (
+)
+class MutableMirrorGroup group: mirrors <List[Mirror]> within: mb <MixinBuilder> = ImmutableMirrorGroup group: mirrors (
+	|
+	protected definingMixin <MixinBuilder> = mb.
+	|
+) (
+addMirror: m <Mirror> ^ <Mirror> = (
+	mirrors keysAndValuesDo: [:index <Integer> :mirror <Mirror> |
+		mirror simpleName = m simpleName ifTrue: [^mirrors at: index put: m]].
+	^mirrors addLast: m
+)
+public removeMirrorNamed: m <Symbol | String>^ <Mirror> = (
+	mirrors keysAndValuesDo: [:index :mirror |
+		mirror simpleName = m  ifTrue: [^mirrors remove: mirror]].
+	^nil
+)
+) : (
+)
+class MutableNestedClassGroup group: ms within: mb = MutableMirrorGroup group: ms within: mb  (
+) (
+) : (
+)
+public class ObjectMirror reflecting: r = (|
+	public reflectee = r.
+|) (
+public = other <Object> ^<Boolean> = (
+	other isKindOfObjectMirror ifFalse: [^false].
+	^js operator: '===' with: reflectee and: other reflectee
+)
+private compileExpression: expression <String> with: rawScope <Map[Symbol, Object]> ^<JS[Function]> = (
+	|
+	compiler
+	ir
+	dnuHandlers
+	writer
+	sb
+	src
+	func
+	|
+
+	compiler:: compilation Compiler new.
+	ir:: compiler
+			compileExpressionSource: expression
+			inMixin: getClass mixin
+			withScope: rawScope.
+	dnuHandlers:: compiler dnuHandlers.
+
+	writer:: generation Writer new.
+	sb:: StringBuilder new.
+	writer generateSourceFor: dnuHandlers on: sb.
+	src:: sb asString.
+	func:: js call: (js ident: 'eval') with: {'(',src, ')'}.
+	js call: func with: {js verbatim: 'Object.prototype'}.
+
+	writer:: generation Writer new.
+	sb:: StringBuilder new.
+	writer generateSourceFor: ir function on: sb.
+	src:: sb asString.
+	src out.
+	^js call: (js ident: 'eval') with: {'(',src, ')'}
+)
+public evaluate: expression <String> ^<ThreadMirror> = (
+	^self evaluate: expression with: Map new
+)
+public evaluate: expression <String> with: scope <Map[Symbol, ObjectMirror]> ^<ThreadMirror> = (
+	| rawScope func state result |
+	rawScope:: Map new.
+	scope keysAndValuesDo: [:key :value | rawScope at: key put: value reflectee].
+
+	func:: compileExpression: expression with: scope.
+	
+	[result:: js call: (js propertyOf: func at: (js literal: 'call')) with: {reflectee. rawScope}.
+	 state:: #fulfilled]
+		on: Error do: [:e | result:: e. state:: #broken].
+
+	^ThreadMirror
+		state: state
+		result: (ObjectMirror reflecting: result)
+)
+public getClass = (
+	#BOGUS. (* Wrong for bilingual objects. *)
+	^ClassMirror reflecting:
+		(js propertyOf: reflectee at: (js literal: 'newspeakClass')).
+)
+public getSlot: selector = (
+	|
+	mangledName = vmmirror mangleSelector: selector, '`slot'.
+	raw = js propertyOf: reflectee at: mangledName.
+	|
+	(js operator: '===' with: (js ident: 'undefined') and: raw) ifTrue: [halt].
+	^ObjectMirror reflecting: raw
+)
+public hash ^<Integer> = (
+	^(identityHashOf: reflectee) bitXor: class hash
+)
+public isKindOfObjectMirror ^<Boolean> = (
+	^true
+)
+public setSlot: selector to: value = (
+	|
+	mangledName = vmmirror mangleSelector: selector, '`slot'.
+	raw = js propertyOf: reflectee at: mangledName.
+	|
+	(js operator: '===' with: (js ident: 'undefined') and: raw) ifTrue: [^halt].
+	js assign: (js propertyOf: reflectee at: mangledName) toBe: value.
+)
+) : (
+)
+class SlotDeclarationMirror name: n accessModifier: a isMutable: m mixin: mxn = (|
+	public name <Symbol> = n.
+	public accessModifier <Symbol> = a.
+	public isMutable <Boolean> = m.
+	public definingMixin <MixinMirror> = mxn.
+|) (
+public isKindOfSlotDeclarationMirror ^<Boolean> = (
+	^true
+)
+) : (
+)
+class SourceBasedClassHeaderMirror from: src <String> = AbstractClassHeaderMirror (
+|
+	public source = src.
+|
+) (
+) : (
+)
+class ThreadMirror state: s result: r = (
+	|
+	protected state = s.
+	public result <ObjectMirror | nil> = r.
+	|
+) (
+public isBroken ^<Boolean> = (
+	^state = #broken
+)
+public isFulfilled ^<Boolean> = (
+	^state = #fulfilled
+)
+public isKindOfThreadMirror ^ <Boolean> = (
+	^true
+)
+public isSuspended ^<Boolean> = (
+	^state = #suspended
+)
+) : (
+)
+classDeclIRFor: mixin within: enclosing = (
+	| source = 'Newspeak3 ''Uncategorized'' ', (ClassDeclarationMirror reflecting: mixin) source. |
+	(*('compiling class:', source) out.*)
+	^compiler compileClassSource: source within: enclosing
+)
+classMixinOf: m <InstanceMixin> ^ <ClassMixin> = (
+ (* Sometimes we need to get the class side of a mixin. Since reflectee is not exposed by MixinMirror, we must rely
+	on knowledge of the runtime structure.
+ *)
+	^Mixin fromRuntimeMixin: (js propertyOf: (js propertyOf: m at: (js literal: 'runtimeMixin')) at: (js literal: 'meta'))
+)
+private identityHashOf: object ^<Integer> = (
+	[(js propertyOf: object at: (js literal: 'hashCode')) = 0] whileTrue:
+		[js assign: (js propertyOf: object at: (js literal: 'hashCode')) toBe: (js verbatim: 'Math.random() * 0x3FFFFFF | 0')].
+	^(js propertyOf: object at: (js literal: 'hashCode'))
+)
+public installer = (
+  #BOGUS yourself.
+)
+sourceForMethod: methodName <String> ofMixin: m <Mixin> ^ <String> = (
+	| js = generation factory. sourceIndex <Integer> |
+	sourceIndex:: sourceIndexForMethod: methodName ofMixin: m.
+	^js propertyOf: (js ident: 'sources') at: sourceIndex.
+)
+sourceIndexForMethod: methodName <String> ofMixin: m <Mixin> ^ <Integer> = (
+	| js = generation factory. methodMetadata |
+	methodMetadata:: (js propertyOf: m at: (js literal: 'methods')) select: [:e | (js propertyOf: e at: 'name') = methodName].
+	^js propertyOf: methodMetadata at: 'source'. (* compute the source index from the metadata *)
+)
+) : (
+)

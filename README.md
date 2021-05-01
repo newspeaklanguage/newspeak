@@ -9,9 +9,14 @@ If you intend to develop with the new Web IDE, read on:
 
 * The Web IDE is still experimental. Caveat Emptor.
 
-First, download the electron app:
+First, download the app. For MacOS and Linux, you can use the Electron app
 * [For Mac (Intel)](https://newspeaklanguage.org/NewspeakIDE.app.zip)
 * [For Windows](https://newspeaklanguage.org/newspeakIDE.zip)
+
+You can also download a directory from which the app can be served locally to any web browser. [For all platforms](https://github.com/newspeaklanguagenewspeaklanguage.github.io/raw/master/servable.zip) 
+
+Unzip the download. The directory contains a script, serve.sh, that will try and serve using python web server.
+You may prefer this option if you're on Linux, or want a (much) smaller download. 
 
 # Just in Case
 

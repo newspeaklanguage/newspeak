@@ -1520,11 +1520,6 @@ along with an implementation of isKindOfX:  public isKindOfX ^ <Boolean> = (true
 *)
   subclassResponsibility
 )
-public noticeExposure = (
-	(* Propagated down the fragment hierarchy just after the hierarchy has been made visible. A fragment may receive this message multiple times over its life. Used by certain leaf fragments,such as CodeMirrorFragment, who may need to explicitly refresh themselves upon exposure as they have no direct connection to changed subjects. *)
-
-	childrenDo: [:each | each noticeExposure]
-)
 public refresh = (
 	(* Fragments that dynamically retrieve their information should reimplement this to update their visuals accordingly. *)
 
@@ -1589,6 +1584,11 @@ public sendDown ^ <DownwardRequestDispatcher> = (
 public receiveRequestFrom: dispatcher <RequestDispatcher> ^<Boolean> = (
 	(* Process the request to execute a 'vertical' message carrried by the dispatcher and answer true, or answer false if the request is not recognized. *)
 	^false
+)
+public noticeExposure = (
+	(* Propagated down the fragment hierarchy just after the hierarchy has been made visible. A fragment may receive this message multiple times over its life. Used by certain leaf fragments, such as CodeMirrorFragment, who may need to explicitly refresh themselves upon exposure as they have no direct connection to changed subjects. *)
+
+	childrenDo: [:each | each noticeExposure]
 )
 ) : (
 )
@@ -1799,18 +1799,6 @@ public childrenDo: aBlock = (
 public currentPresenter = (
 	^currentPresenterX
 )
-public enterPresenter: presenter = (
-  | oldPresenter newPresenter presenterToDisplay |  	
-	currentHopscotchWindow:: self.
-	newPresenter:: presenter refreshmentPresenter.
-    presenterToDisplay:: navigator equalVisitOr: newPresenter.
-    navigator visit: presenterToDisplay.
-	displayPresenter: presenterToDisplay.
-)
-public enterSubject: s <Subject> = (
-	currentHopscotchWindow:: self.
-	self enterPresenter: s presenter
-)
 public eraseHistory = (
 	(* Forget all visits in the history and show the home page. *)
 	navigator erase.
@@ -1908,6 +1896,32 @@ public closeActiveMenu = (
         	[activeMenuParent removeChild: activeMenu] on: Error do: [:e |  ].
         	activeMenu: nil.
 			activeMenuParent: nil.]
+)
+public enterSubject: s <Subject> = (
+   (* Must set the current window before subject computes its presenter *)
+	currentHopscotchWindow:: self.
+	self enterPresenter: s presenter
+)
+public enterPresenter: presenter = (
+  | oldPresenter newPresenter presenterToDisplay |
+    (* Must set current window, in case we were called directly and not via enterSubject: *)
+	currentHopscotchWindow:: self.
+    (*If we came from enterSubject:, we always have a semantically correct presenter as a parameter (either the subject was new or old. If new, it computed a fresh presenter from the latest data. If  old, either an update happened since it was last asked for its presenter or not. If no update happened, its presenter is up to date. If an update has happened, the logic recomputes a fresh presenter. 
+
+If we came from enterPresenter:, either we were passed a new presenter, which is accurate, or an old one (say, some cached presenter which may be obsolete at this point). 
+
+In either case, the presenter may not be suitable for display at top level. It might be nested in another presenter, or it might be used at top level, but in another window (the problem being that such a presenter must not be reused, because we must maintain a tree of presenters).
+
+We guard against all of the above problems by obtaining the refreshmentPresenter.
+*)
+	newPresenter:: presenter refreshmentPresenter.
+    (* An equivalent presenter may or may not have been displayed at the top level before. We check that by searching the history. *)
+    
+    presenterToDisplay:: navigator equalVisitOr: newPresenter.
+    
+    (* We are good to display presenterToDisplay. Add it to the history and display it *)
+    navigator visit: presenterToDisplay.
+	displayPresenter: presenterToDisplay.
 )
 ) : (
 )
@@ -2916,25 +2930,6 @@ openMenuWithLabelsAndActions: labelsAndActions = (
 padded: def with: offsets = (
 	^PaddedFrameComposer content: def offsets: offsets
 )
-public refreshmentPresenter ^ <Self> = (
-  | newPresenter <Presenter> = subject presenter. |
-  (newPresenter parent isNil not and: [creatingWindow ~= newPresenter shell]) ifTrue: [
-	^refreshmentPresenterOfMyClass
-	].
-(* I am not a top level presenter; I must not be displayed independently; return a clone *)
-  isNested ifTrue: [
-	| p = subject refreshmentSubject presenter. |
-	registerNewPresenter:  p.
-	^p
-	].
-  (isMyKind: newPresenter) ifTrue: [
-	(* UI was updated, and newPresenter is the correct replacement *)
-	registerNewPresenter: newPresenter. (* register and return *)
-	^newPresenter
-	].
- (* I am not the subject's standard kind of presenter *)
-  ^refreshmentPresenterOfMyClass
-)
 refreshmentPresenterOfMyClass ^ <Self> = (
  | newPresenter = class onSubject: subject. | (* create a new instance of my class *)
   registerNewPresenter: newPresenter. (* register and return *)
@@ -3031,6 +3026,36 @@ openMenu: aMenu <Menu> = (
 )
 ampleforth: h <String> mapping: m <Map[String, Fragment]> = (
   ^AmpleforthFragment html: h mapping: m
+)
+public refreshmentPresenter ^ <Self> = (
+(* Produce an equivalent, up to date (i.e., semantically valid) presenter that is suitable for display at the top level of a window.
+ It also registers the presenter with the navigator, so we track it as being presented at top level etc. It would be cleaner to restructure per this documentation.
+*)
+  | 
+  (* Get a semantically valid presenter, in case the receiver is obsolete. The result, newPresenter, may be an existing presenter or a newly computed one (depending on whether the subject already had an up to date presenter). It may be identical to the receiver (if the receiver is up to date and computed by the subject), or it may be a different instance of the same class (if it is out of date, or if it was not computed by the subject), or it may be of a different class entirely (if the receiver is not of the default presenter class of the subject).
+  
+  In the latter case, it is not equivalent to the receiver and cannot be returned. In any case, it might not be suitable for top level display because it is nested or part of a window other than the current one. Since the display hierarchy must form a tree, such a presenter is not a valid result for this method. The rest of this method deals with all these scenarios.
+  *)
+  newPresenter <Presenter> = subject presenter. 
+  |
+  (* It may be that newPresenter belongs to another window, and cannot be displayed at top level elsewhere.  Therefore, return a new presenter.
+  *)
+  (newPresenter parent isNil not and: [creatingWindow ~= newPresenter shell]) ifTrue: [
+	^refreshmentPresenterOfMyClass
+	].
+(* newPresenter is nested in another presenter.   Again, in that case, newPresenter cannot be displayed at top level elsewhere.  Therefore, return a new presenter. *)
+  isNested ifTrue: [
+	| p = subject refreshmentSubject presenter. | (* er, this may be wrong. What if it's of a different kind?  *)
+	registerNewPresenter:  p.
+	^p
+	].
+  (* newPresenter is of the same kind as the receiver.  It is not nested, nor is it from another window. It can be displayed at top level*)  
+  (isMyKind: newPresenter) ifTrue: [
+	registerNewPresenter: newPresenter. (* register and return. Registering compares to old presenter as needed? *)
+	^newPresenter
+	].
+ (* I am not the subject's standard kind of presenter, so newPresenter is of a different kind.  We  need to compute a new presenter of the same class as the receiver.*)
+  ^refreshmentPresenterOfMyClass
 )
 ) : (
 )

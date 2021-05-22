@@ -8,7 +8,7 @@ The output is not V8-specific and should run in any Javascript implementation th
 
 The current compilation scheme does not address async sends or reified activation records. It provides only limited support for refection. Also,  it does not provide generalized mixin application.
 
-At runtime, a Newspeak object O is represented as a Javascript object J with properties that correspond directly to the Newspeak slots. The prototype of J is a runtime-class JRC, whose properties correspond to the instance methods of O's class, including any necessary synthetic methods. The prototype of JRC is another runtime class object corresponding to the superclass of O's class, and so on up to Object. The prototype of the runtime class of Object is ImplementationBase, which is hand-written and contains stub implementations to end the upward recursion in basicNew and the instance initializers. JRC includes synthetic slots that refer to its runtime mixin, its enclosing object chain, and its metaclass or non-metaclass counterpart.
+At runtime, a Newspeak object O is represented as a Javascript object J with properties that correspond directly to the Newspeak slots. The prototype of J is a runtime-class JRC, whose properties correspond to the instance methods of O's class, including any necessary synthetic methods. The prototype of JRC is another runtime class object corresponding to the superclass of O's class, and so on up to Object. The prototype of the runtime class of Object is ImplementationBase, which is hand-written and contains stub implementations to end the upward recursion in basicNew and the instance initializers.JRC includes synthetic slots that refer to its runtime mixin, its enclosing object chain, and its metaclass or non-metaclass counterpart.
 
 The main output of the compiler is an object containing all of the runtime mixins corresponding to the top-level class declarations. A runtime mixin has properties containing the definitions of its Newspeak and synthetic methods and its nested mixins. It also has a function that takes a runtime superclass and produces a runtime class that represents the application of the mixin. This function produces either a runtime class or a runtime metaclass, not the pair.
 
@@ -20,7 +20,7 @@ All mixin applications share the same Newspeak and synthetic functions, except b
 
 [PERFORMANCE NOTE] It is important that an object's methods are defined in a prototype, rather than in the constructor call. If they were defined in the constructor, they would be different objects with different contexts.
 
-[PERFORMANCE NOTE] The current structure where the functions for methods are defined in other deeply nested functions may produce functions that perform slower than if they had been defined at the top level. This is because of a need to give them contexts, even if they never access their free variables. This used to be an issue in V8, but it was fixed under pressure from dart2js (who wanted to nest all of their code at least one level to avoid polluting the global scope). It may still be the case in other Javascript engines. Object creation follows the same pattern as the Squeak and Dart implementations: basicNew is followed by running a synthetic instance initializer.
+[PERFORMANCE NOTE] The current structure where the functions for methods are defined in other deeply nested functions may produce functions that perform slower than if they had been defined at the top level. This is because of a need to give them contexts, even if they never access their free variables. This used to be an issue in V8, but it was fixed under pressure from dart2js (who wanted to nest all of their code at least one level to avoid polluting the global scope). It may still be the case in other Javascript engines.Object creation follows the same pattern as the Squeak and Dart implementations: basicNew is followed by running a synthetic instance initializer.
 
 Mixin application is implemented by a hand-written method on VMMirror. First a pair of runtime class and runtime metaclass are produced by applying the runtime mixin and runtime metamixin to the runtime class of the superclass and the runtime class of Class, respectively. Then an instance of Metaclass is created to represent the Newspeak metaclass, and an instance of the metaclass is created to represent the Newspeak class. Newspeak objects never directly interact with runtime classes or runtime mixins; the objects answered by #class are the Newspeak class or metaclass.
 
@@ -290,7 +290,7 @@ public setterSendNode: node <SetterSendAST> ^ <AST> = (
 (* Rewrite a double-colon setter send. The value of the entire expression should be the value of the argument of the send, NOT the value returned by the setter method. This general case is somewhat inefficient, but in most cases the value of the expression is ignored by the parent so we can use a cheaper regular message send. *)
 	| binding block blockArg blockParam blockScope send rewrittenSetterSend |
 	binding:: currentScope at: node message selector ifAbsent: [MessageAST new].
-	binding isLocalBinding ifTrue:
+	binding isKindOfLocalBinding ifTrue:
 		(* This is an assignment to a temporary; no special handling is needed
 		as the value of the expression is the value being assigned. *)
 		[^processLocalAccess: node message of: binding].
@@ -562,6 +562,22 @@ processIntrinsicArg: arg <AST> = (
 	arg isKindOfLiteralNode ifTrue: [^arg value].
 	^arg apply: self
 )
+processLexicalSend: message to: jsReceiver binding: binding = (
+	(binding isNil not and: [binding ast accessModifier = #private]) ifTrue: [
+		(* Do early binding. *)
+		|
+		definingMixinDepth = binding depth - 1.
+		definingMixin = js ident: '$', definingMixinDepth printString.
+		targetMethod = js propertyOf: definingMixin at: (publicMessage: message).
+		|
+		^js call: targetMethod (*(js propertyOf: targetMethod at: (js literal: 'call'))*)
+			with: {jsReceiver}, (message arguments collect: [:each | each apply: self]) asArray
+	].
+
+	^js
+		call: (js propertyOf: jsReceiver at: (protectedMessage: message))
+		with: (message arguments collect: [:each | each apply: self]) asArray
+)
 processOuterReceiverAtDepth: depth <Integer> = (
 	| slotName |
 	depth = 0 ifTrue: [^js ident: 'self'].
@@ -651,22 +667,6 @@ wrapBodyForNlrHandling: body <Block> = (
 )
 wrapBodyNoNlrHandling: body <Block> = (
 	^js block: maybeCaptureReceiver, body statements
-)
-processLexicalSend: message to: jsReceiver binding: binding = (
-	(binding isNil not and: [binding ast accessModifier = #private]) ifTrue: [
-		(* Do early binding. *)
-		|
-		definingMixinDepth = binding depth - 1.
-		definingMixin = js ident: '$', definingMixinDepth printString.
-		targetMethod = js propertyOf: definingMixin at: (publicMessage: message).
-		|
-		^js call: targetMethod (*(js propertyOf: targetMethod at: (js literal: 'call'))*)
-			with: {jsReceiver}, (message arguments collect: [:each | each apply: self]) asArray
-	].
-
-	^js
-		call: (js propertyOf: jsReceiver at: (protectedMessage: message))
-		with: (message arguments collect: [:each | each apply: self]) asArray
 )
 ) : (
 )
@@ -1566,6 +1566,22 @@ class NameMangler = (|
 		at: "?" put: '$question';
 		at: "!" put: '$bang';
 		at: "," put: '$comma') (
+protected _mangleSelector: selector <String> ^ <String> = (
+	(* Convert a Newspeak selector into a JS identifer. *)
+
+	(* Binary *)
+	('+-*/\<>~=@%|&?!,' includes: selector last) ifTrue:
+		[ | sb = StringBuilder new. |
+		sb add: '$'.
+		selector do: [:specialCharacter | sb add: (specialCharacterManglings at: specialCharacter)].
+		^sb asString asSymbol].
+
+	^(((('$', selector)
+		replaceAll: ":" with: "$") (* Keyword *)
+		replaceAll: "`" with: "$") (* Qualified *)
+		replaceAll: "@" with: "$") (* synthetic temp *)		
+		replaceAll: "." with: "$" (* limit temp *)
+)
 public fullyQualifiedNameToSimple: fullName <String> = (
 	| parts |
 
@@ -1592,21 +1608,6 @@ public privateCannotReturn = (
 )
 public privateDnu = (
 	^'dnu'
-)
-protected _mangleSelector: selector <String> ^ <String> = (
-	(* Convert a Newspeak selector into a JS identifer. *)
-		 | sb = StringBuilder new. |
-	(* Binary *)
-	('+-*/\<>~=@%|&?!,' indexOf: (String with: selector last)) ~= 0 ifTrue:
-		[
-		sb add: '$'.
-		selector do: [:specialCharacter | sb add: (specialCharacterManglings at: specialCharacter)].
-		^sb asString asSymbol].
-
-
-		sb add: '$'.
-		selector do: [:e | ( '.:`@' indexOf: (String with: e)) ~= 0 ifTrue: [sb add: '$'] ifFalse: [sb addByte: e]].
-		^sb asString asSymbol.
 )
 ) : (
 )
@@ -1640,6 +1641,32 @@ public applicationSources: sources <List[String]> = (
 	results:: sources collect: [:source | compileSource: source enableIntrinsics: false].
 	applicationConfiguration: results first.
 )
+compileSource: source <String> enableIntrinsics: flag <Boolean> ^<ClassDeclarationIR> = (
+	| compilation |
+	compilation:: cachedCompilations
+		at: {source}
+		ifAbsentPut:
+			[ | newCompilation = CachedCompilation new. |
+			newCompilation source: source.
+			newCompilation enableIntrinsics: flag.
+			compiler enableIntrinsics: flag.
+			compiler sentSelectors: Set new.
+			newCompilation ir: (compiler compileClassSource: source within: nil).
+			newCompilation sentSelectors: compiler sentSelectors].
+	mixins add: compilation ir.
+	sentSelectors addAll: compilation sentSelectors.
+	^compilation ir
+)
+dedupllicateMixins = (
+  | mixinMap = Map new. |
+   mixinsDeduplicated ifFalse: [
+	mixins do: [:m <ClassDeclarationIR> |
+		mixinMap at: m qualifiedName put: m.
+		].
+      mixins:: mixinMap values.
+      mixinsDeduplicated:: true.
+	]
+)
 private main = (
 	^js verbatim:
 'var runtime = ns.$',runtimeConfiguration qualifiedName,'().$packageUsing$(ns);
@@ -1659,6 +1686,18 @@ private namespace = (
 					(js propertyOf: (js ident: 'this') at: (js literal: (names mangleSlot: cd qualifiedName)))}))]),
 		resources asArray
 	))) with: {})
+)
+public outputProgram ^<String> = (
+	| sb = StringBuilder new. |
+	dedupllicateMixins.
+	JavascriptWriter new generateSourceFor: script on: sb.
+	^sb asString
+)
+public outputSources ^<String> = (
+	| sb = StringBuilder new. |
+	dedupllicateMixins.
+	JavascriptWriter new generateSourceFor: sourcesScript on: sb.
+	^sb asString
 )
 private runtimeMixinNamespace = (
 	^js new: (js functionOf: {} body: (js block: (
@@ -1959,44 +1998,6 @@ var vmmirror = new function(){
 };
 '
 )
-compileSource: source <String> enableIntrinsics: flag <Boolean> ^<ClassDeclarationIR> = (
-	| compilation |
-	compilation:: cachedCompilations
-		at: {source}
-		ifAbsentPut:
-			[ | newCompilation = CachedCompilation new. |
-			newCompilation source: source.
-			newCompilation enableIntrinsics: flag.
-			compiler enableIntrinsics: flag.
-			compiler sentSelectors: Set new.
-			newCompilation ir: (compiler compileClassSource: source within: nil).
-			newCompilation sentSelectors: compiler sentSelectors].
-	mixins add: compilation ir.
-	sentSelectors addAll: compilation sentSelectors.
-	^compilation ir
-)
-dedupllicateMixins = (
-  | mixinMap = Map new. |
-   mixinsDeduplicated ifFalse: [
-	mixins do: [:m <ClassDeclarationIR> |
-		mixinMap at: m qualifiedName put: m.
-		].
-      mixins:: mixinMap values.
-      mixinsDeduplicated:: true.
-	]
-)
-public outputProgram ^<String> = (
-	| sb = StringBuilder new. |
-    dedupllicateMixins.
-	JavascriptWriter new generateSourceFor: script on: sb.
-	^sb asString
-)
-public outputSources ^<String> = (
-	| sb = StringBuilder new. |
-    dedupllicateMixins.
-	JavascriptWriter new generateSourceFor: sourcesScript on: sb.
-	^sb asString
-)
 ) : (
 )
 class WithMappedEntry name: nom = SymbolTableEntry forAST: nil atDepth: nil (|
@@ -2009,7 +2010,7 @@ public getterAst = (
 			selector: #at:;
 			arguments: {SymbolAST new value: name})
 )
-public isMappedBinding = (
+public isKindOfMappedBinding = (
 	^true
 )
 private mapAst = (

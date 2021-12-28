@@ -28,9 +28,20 @@ pushd out
     *.png \
     CodeMirror/lib/codemirror.js \
     CodeMirror/addon/display/autorefresh.js \
-    RuntimeWithMirrorsForPrimordialSoup HopscotchWebIDE HopscotchWebIDE.vfuel \
+    RuntimeForHopscotchForHTML HopscotchWebIDE HopscotchWebIDE.vfuel \
     RuntimeForElectron HopscotchWebIDE HopscotchElectronIDE.vfuel \
-    RuntimeForElectron Ampleforth Ampleforth.vfuel  
+    RuntimeForHopscotchForHTML Ampleforth Ampleforth.vfuel  \
+    RuntimeForCroquet CounterApp CroquetCounterApp.vfuel \
+    RuntimeForHopscotchForHTML CounterApp CounterApp.vfuel \
+    RuntimeForHopscotchForHTML TodoMVCApp TodoMVCApp.vfuel \
+    RuntimeForHopscotchForHTML TwoViewEditorApp TwoViewEditorApp.vfuel \
+    RuntimeForHopscotchForHTML ObjectPresenterDemo ObjectPresenterDemo.vfuel \
+    RuntimeForHopscotchForHTML BankAccountExemplarDemo BankAccountExemplarDemo.vfuel \
+    RuntimeForHopscotchForHTML HopscotchFontDemo HopscotchFontDemo.vfuel \
+    RuntimeForHopscotchForHTML HopscotchGestureDemo HopscotchGestureDemo.vfuel \
+    RuntimeForHopscotchForHTML HopscotchDemo HopscotchDemo.vfuel \
+    RuntimeForHopscotchForHTML Particles Particles.vfuel   
+    
     
 popd
 

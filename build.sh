@@ -31,6 +31,7 @@ pushd out
     RuntimeForHopscotchForHTML HopscotchWebIDE HopscotchWebIDE.vfuel \
     RuntimeForElectron HopscotchWebIDE HopscotchElectronIDE.vfuel \
     RuntimeForHopscotchForHTML Ampleforth Ampleforth.vfuel  \
+    RuntimeForHopscotchForHTML AmpleforthEditorApp AmpleforthEditor.vfuel  \    
     RuntimeForCroquet CounterApp CroquetCounterApp.vfuel \
     RuntimeForHopscotchForHTML CounterApp CounterApp.vfuel \
     RuntimeForHopscotchForHTML TodoMVCApp TodoMVCApp.vfuel \

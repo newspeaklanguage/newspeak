@@ -15,7 +15,7 @@ then
        *'Python 1'*)
          echo "Cannot serve Newspeak from localhost. Python 2 or 3 is needed to run the web server, but you have Python 1. Upgrade to Python 2 or 3.";;
        *)
-    echo "Cannot serve Newspeak from localhost. Python is needed to run the web server, but Python version not recognized";;
+    echo "Cannot serve Newspeak from localhost. Python 2 or 3 is needed to run the web server, but Python version not recognized";;
     esac
 else
     echo "Cannot serve Newspeak from localhost. Python is needed to run the web server, but Python could not be found on this system"

@@ -3390,7 +3390,7 @@ var NSCroquetImageButtonView;
 var NSCroquetRadioButtonView;
 var NSCroquetCheckboxView;
 var NSCroquetHyperlinkView;
-var NSCroquetImageHyperlinkView;
+var NSCroquetHyperlinkImageView;
 var NSCroquetCodeMirrorView;
 
 function storeModelAndView(m, v) {
@@ -3399,9 +3399,10 @@ function storeModelAndView(m, v) {
     NSCroquetButtonView = NewspeakCroquetButtonView;
     NSCroquetImageButtonView = NewspeakCroquetImageButtonView;
     NSCroquetRadioButtonView = NewspeakCroquetRadioButtonView;
-    NSCroquetImageCheckboxView = NewspeakCroquetCheckboxView;
+    NSCroquetCheckboxView = NewspeakCroquetCheckboxView;
     NSCroquetHyperlinkView = NewspeakCroquetHyperlinkView;
-    NSCroquetImageHyperlinkView = NewspeakCroquetImageHyperlinkView;
+    NSCroquetHyperlinkImageView = NewspeakCroquetHyperlinkImageView;
+    NSCroquetToggleComposerView = NewspeakCroquetToggleComposerView;                  
     NSCroquetCodeMirrorView = NewspeakCroquetCodeMirrorView;        
 }
 
@@ -3518,17 +3519,17 @@ class NewspeakCroquetHyperlinkView extends Croquet.View {
 
 NewspeakCroquetHyperlinkModel.register("NewspeakCroqueteHyperlinkModel");
 
-class NewspeakCroquetImageHyperlinkModel extends Croquet.Model {
+class NewspeakCroquetHyperlinkImageModel extends Croquet.Model {
     init(options) {
-	this.nsImageHyperlinkId = options.nsImageHyperlinkId;
-	this.subscribe(this.nsImageHyperlinkId, 'click', this.click);
+	this.nsHyperlinkImageId = options.nsHyperlinkImageId;
+	this.subscribe(this.nsHyperlinkImageId, 'click', this.click);
     }
     click(){
-	this.publish(this.nsImageHyperlinkId, 'model_click');
+	this.publish(this.nsHyperlinkImageId, 'model_click');
     }
 }
 
-class NewspeakCroquetImageHyperlinkView extends Croquet.View {
+class NewspeakCroquetHyperlinkImageView extends Croquet.View {
     constructor(model, presenter) {
 	super(model);
     }
@@ -3537,15 +3538,36 @@ class NewspeakCroquetImageHyperlinkView extends Croquet.View {
     }
 }
 
-NewspeakCroquetImageHyperlinkModel.register("NewspeakCroquetImageHyperlinkModel");
+NewspeakCroquetHyperlinkImageModel.register("NewspeakCroquetHyperlinkImageModel");
+
+class NewspeakCroquetToggleComposerModel extends Croquet.Model {
+    init(options) {
+	this.nsToggleComposerId = options.nsToggleComposerId;
+	this.subscribe(this.nsToggleComposerId, 'toggle', this.toggle);
+    }
+    toggle(){
+	this.publish(this.nsToggleComposerId, 'model_toggle');
+    }
+}
+
+class NewspeakCroquetToggleComposerView extends Croquet.View {
+    constructor(model, presenter) {
+	super(model);
+    }
+    modelID() {
+	return model.id
+    }
+}
+
+NewspeakCroquetToggleComposerModel.register("NewspeakCroquetToggleComposerModel");
 
 class NewspeakCroquetCodeMirrorModel extends Croquet.Model {
     init(options) {
 	this.nsCodeMirrorId = options.nsCodeMirrorId;
-	this.subscribe(this.nsCodeMirrorId, 'click', this.click);
+	this.subscribe(this.nsCodeMirrorId, 'keydown', this.keydown);
     }
-    click(){
-	this.publish(this.nsCodeMirrorId, 'model_click');
+    keydown(key){
+	this.publish(this.nsCodeMirrorId, 'model_keydown', key);
     }
 }
 
@@ -3568,8 +3590,10 @@ class NewspeakCroquetModel extends Croquet.Model {
 	this.subscribe('newspeak_croquet_image_button', 'createImageButton', this.createImageButton);
 	this.subscribe('newspeak_croquet_radio_button', 'createRadioButton', this.createRadioButton);
 	this.subscribe('newspeak_croquet_checkbox', 'createCheckbox', this.createCheckbox);		
-	this.subscribe('newspeak_croquet_hyperlink_', 'createHyperlink', this.createHyperlink);		
-	this.subscribe('newspeak_croquet_image_hyperlink', 'createImageHyperlink', this.createImageHyperlink);			
+	this.subscribe('newspeak_croquet_hyperlink', 'createHyperlink', this.createHyperlink);		
+	this.subscribe('newspeak_croquet_hyperlink_image', 'createHyperlinkImage', this.createHyperlinkImage);
+	this.subscribe('newspeak_croquet_toggle_composer', 'createToggleComposer', this.createToggleComposer);	
+	this.subscribe('newspeak_croquet_code_mirror', 'createCodeMirror', this.createCodeMirror);
     }
     createButton(bid) {
 	var m;
@@ -3621,17 +3645,36 @@ class NewspeakCroquetModel extends Croquet.Model {
 	}
 	this.publish(bid , 'model_createHyperlink', m);
     }     
-    createImageHyperlink(bid) {
+    createHyperlinkImage(bid) {
 	var m;
 	if (this.fragments.has(bid)) {
 	    m = this.fragments.get(bid)
 	} else {
-	    m = NewspeakCroquetImageHyperlinkModel.create({nsImageHyperlinkId: bid});
+	    m = NewspeakCroquetHyperlinkImageModel.create({nsHyperlinkImageId: bid});
 	    this.fragments.set(bid, m);
 	}
-	this.publish(bid , 'model_createImageHyperlink', m);
+	this.publish(bid , 'model_createHyperlinkImage', m);
     }
-    
+    createToggleComposer(bid) {
+	var m;
+	if (this.fragments.has(bid)) {
+	    m = this.fragments.get(bid)
+	} else {
+	    m = NewspeakCroquetToggleComposereModel.create({nsToggleComposerId: bid});
+	    this.fragments.set(bid, m);
+	}
+	this.publish(bid , 'model_createToggleComposer', m);
+    }    
+    createCodeMirror(bid) {
+	var m;
+	if (this.fragments.has(bid)) {
+	    m = this.fragments.get(bid)
+	} else {
+	    m = NewspeakCroquetCodeMirrorModel.create({nsCodeMirrorId: bid});
+	    this.fragments.set(bid, m);
+	}
+	this.publish(bid , 'model_createCodeMirror', m);
+    }    
 }
 
 NewspeakCroquetModel.register("NewspeakCroquetModel");

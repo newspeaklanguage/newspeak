@@ -6,4 +6,8 @@ source build.sh
 # APPVFUELPATH=x/resources/app/out/
 APPVFUELPATH=/Applications/NewspeakIDE.app/Contents/Resources/app/out/
 cp out/HopscotchElectronIDE.vfuel $APPVFUELPATH
+cp out/primordialsoup.wasm $APPVFUELPATH
+cp out/primordialsoup.js $APPVFUELPATH
+cp out/primordialsoup.html $APPVFUELPATH
+
 

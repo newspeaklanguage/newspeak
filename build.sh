@@ -26,22 +26,28 @@ pushd out
     ../../primordialsoup/out/snapshots/WebCompiler.vfuel \
     *.ns \
     *.png \
+    *.txt \
     CodeMirror/lib/codemirror.js \
     CodeMirror/addon/display/autorefresh.js \
     RuntimeForHopscotchForHTML HopscotchWebIDE HopscotchWebIDE.vfuel \
     RuntimeForElectron HopscotchWebIDE HopscotchElectronIDE.vfuel \
     RuntimeForHopscotchForHTML Ampleforth Ampleforth.vfuel  \
-    RuntimeForHopscotchForHTML AmpleforthEditorApp AmpleforthEditor.vfuel  \    
+    RuntimeForHopscotchForHTML AmpleforthViewer AmpleforthViewer.vfuel  \
+    RuntimeForHopscotchForHTML Live22Submission Live22Submission.vfuel  \
+    RuntimeForHopscotchForHTML Smalltalks22Tutorial Smalltalks22.vfuel  \
+    RuntimeForHopscotchForHTML Live22Presentation Live22Presentation.vfuel  \
     RuntimeForCroquet CounterApp CroquetCounterApp.vfuel \
     RuntimeForHopscotchForHTML CounterApp CounterApp.vfuel \
     RuntimeForHopscotchForHTML TodoMVCApp TodoMVCApp.vfuel \
+    RuntimeForCroquet TodoMVCApp CroquetTodoMVCApp.vfuel \
     RuntimeForHopscotchForHTML TwoViewEditorApp TwoViewEditorApp.vfuel \
+    RuntimeForHopscotchForHTML TelescreenApp Telescreen.vfuel \
     RuntimeForHopscotchForHTML ObjectPresenterDemo ObjectPresenterDemo.vfuel \
     RuntimeForHopscotchForHTML BankAccountExemplarDemo BankAccountExemplarDemo.vfuel \
     RuntimeForHopscotchForHTML HopscotchFontDemo HopscotchFontDemo.vfuel \
     RuntimeForHopscotchForHTML HopscotchGestureDemo HopscotchGestureDemo.vfuel \
     RuntimeForHopscotchForHTML HopscotchDemo HopscotchDemo.vfuel \
-    RuntimeForHopscotchForHTML Particles Particles.vfuel   
+    RuntimeForHopscotchForHTML Particles Particles.vfuel
     
     
 popd

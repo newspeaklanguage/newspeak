@@ -1,4 +1,4 @@
-const vfuelFile = '/assets/lib/HopscotchWebIDE.vfuel';
+const vfuelFile = '/pwa/public/assets/lib/HopscotchWebIDE.vfuel';
 
 function scheduleTurn(timeout) {
     if (timeout >= 0) {

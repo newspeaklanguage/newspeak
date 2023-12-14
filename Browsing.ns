@@ -35,7 +35,7 @@ class Browsing usingPlatform: p ide: webIde
     private JSPromise = p js global at: 'Promise'.
     private Date = p js global at: 'Date'.
     private URL = p js global at: 'URL'.
-    private Documents = webIde documents.
+
     
     (* module variables *)
     body = (p js global at: 'document') at: 'body'.
@@ -2947,15 +2947,6 @@ presenterForEntryAt: key <Symbol> ^ <EntryPresenter> = (
 
 	^(ValueEntryPresenter onSubject: s) key: key
 )
-respondToLoadDocuments = (
-   multipleFileChooser chooseFileList: [:fl | 
-	    subject loadDocuments:  fl
-		ifSuccess:
-			[updateGUI: []]
-		ifFailure:
-			[:msg | alert: msg. nil]
-	]
-)
 elementDescription ^ <String> = (
   ^'names at either the IDE top level (Root) namespace or of an enclosed namespace'
 )
@@ -2997,7 +2988,16 @@ respondToLoadDocumentFromZip = (
 		ifSuccess:
 			[updateGUI: []]
 		ifFailure:
-			[:msg | alert: msg. nil]
+			[:msg | alert: msg]
+	]
+)
+respondToLoadDocuments = (
+   multipleFileChooser chooseFileList: [:fl | 
+	    subject loadDocuments:  fl
+		ifSuccess:
+			[updateGUI: []]
+		ifFailure:
+			[:msg | alert: msg]
 	]
 )
 ) : (
@@ -3114,23 +3114,6 @@ updateNamespace = (
       ].
   ].
 )
-public loadDocuments: fs <List[Alien[File]]> ifSuccess: successBlock <[]> ifFailure: failureBlock <[:List[String]]> = (
-  | ps <List[Alien[Promise[[String]]]]>  = JSArray new: fs size. fns <Array[String]> = Array new: fs size.  |
-1 to: fs size do: [:i <Integer> |
-  | file <Alien[File]> = fs at: i. |
-  ps at: i - 1 put: file text.
-  fns at: i put: (file at: #name)
-  ].
-  (JSPromise all: ps) then: [:sources <JSArray[String]> |
-	  [| bs <List[Document]> = List new: fs size. |
-	  0 to: fs size - 1 do: [:i <Integer> |
-         | fn = (fns at: i+1).  dn = fn copyFrom: 1 to: (fn indexOf: '.') - 1. |
-          bs add: (ide documents freshDocumentWithContents: (sources at: i))
-		  ].
-        bs do: [:b <Document> | namespace at: b name put: b].
-        successBlock value.] on: Error do:  [:ex | failureBlock value: 'Failure: ', ex printString]
-	] onError: [:ex | failureBlock value: 'Error: ', ex printString].
-)
 public addNamespaceFromDefinition: definition <String> ifSuccess: successBlock <[]> ifFailure: failureBlock <[:String]> = (
 	| selector <Symbol> = definition asSymbol. |
 	(*model = ide namespacing Categories ifFalse: (* ? *)
@@ -3148,42 +3131,90 @@ public addDocumentNamed: n <String> ifSuccess: successBlock <[]> ifFailure: fail
 	[namespace at: docName put: (ide documents freshDocumentNamed: docName)] on: Error do: [:e |  ^failureBlock value: 'Document name must be a valid Newspeak identifier'].
 	successBlock value
 )
-public loadDocument: f <Alien[File]> ifSuccess: successBlock <[]> ifFailure: failureBlock <[:List[String]]>= (
+computeImageSourceFor: imgNode <Alien[Node]> from: imageMap <Map[String, Alien[Promise[Alien[Blob]]]]> = (
+(* Because internal URLs are invalidated after each session, we need to create new ones for the images, and update the DOM accordingly. 
+This method does this for a single node, imgNode,  based on imageMap,  mapping from names to images.*)
+(* Look up the image based in the img node's name, create an object URL for it and update the img node with the new URL *)
+   (imageMap at: (imgNode at: #name)) then: [:b <Alien[Blob]> |
+     imgNode at: #src put: (URL createObjectURL: b).
+     ]
+)
+public loadDocument: f <Alien[File]> ifSuccess: successBlock <[]> ifFailure: failureBlock <[:List[String]]> = (
   | 
   options <Alien> = JSObject new.
   folder = ide webFiles Folder named: (f at: #name).
   p <Alien[Promise[JSZip]]> = folder loadAsync: f options: options. 
+  fname = f at: #name.
   |
-  p then: [:jsz <Alien[JSZip]> | loadDocument: jsz named: (f at: #name). successBlock value. nil ]
-     onError: [:ex | failureBlock value: ex printString. nil].
+  p then: [:jsz <Alien[JSZip]> | 
+              [loadDocument: jsz named: (fname copyFrom: 1 to: (fname indexOf: '.') -1) ifSuccess: successBlock ifFailure: failureBlock. nil] 
+                on: Error do: [:ex | failureBlock value:  'Failure: ', ex printString]. 
+              ]
+     onError: [:ex | failureBlock value:  'Error: ', ex printString].
 )
-public loadDocument: jsz <Alien[JSZip]> named: n <String> = (
+public loadDocument: jsz <Alien[JSZip]> named: n <String> ifSuccess: successBlock <[]> ifFailure: failureBlock <[:List[String]]> = (
 (* Takes a zipfile representing a Document and converts it into a live Document. *)
 (* TODO:  extend to handle docs with transclusions and other resources . *)
   |
-  ps <List[Alien[Promise[[String]]]]>  = List new.  
-  a <Alien[JSArray[Promise[String]]]>
-  images <Alien[JSZip]>= jsz folder: #images.
-  contents <Alien[JSZip]> = jsz folder: #contents.
-  imageMap <Map[String, Alien[Blob]]>= Map new.
+  images <Alien[JSZip]> = jsz folder: n, '/images'.
+  imageMap <Map[String, Alien[Promise[Alien[Blob]]]]> = Map new.
+  contents <Alien[JSZip]> = jsz folder: n,  '/contents'.
   (* get main document *)
-  main <Alien[ZipObject]> = jsz file: (n copyFrom: 1 to: (n indexOf: '.')), 'html'.
-  (* parse main document *)
-  dom <Alien[Node]> = main then: [:f  <String> | DOMParser new parseFromString: f mimeType: 'text/html']. 
-  (*find all image nodes *)
-  imageNodes <Alien[JSArray[Node]]> = dom getElementsByTag: #img.
+  main <Alien[ZipObject]> = jsz file: n, '/', n, '.html'.
   |
-  
   images forEach: [:path <String> :zo <Alien[ZipObject]> |  
-  (* Create blob from image and store in a map keyed by image name *)
-    imageMap at: path put: (zo async: #blob)
-    ].
-  
-  0 to: (dom at: #length) do: [:i <Integer> | | imgNode <Alien[Node]> = dom at: i.  | 
-    imgNode at: #src put: (imageMap at: (URL createObjectURL: (imgNode at: #name))).
+       | 
+       (* The path argument is not working as specified, so we rely on an undocumented feature - the #unsafeOriginalName field.
+       This is obviously undesirable, but so far we don't have a better solution.
+       *)
+       imageName <String> = (path at: #unsafeOriginalName) copyFrom: n size + 9 to: (path at: #unsafeOriginalName) size.
+       |
+       (* Create blob from image and store in a map keyed by image name *)       
+       imageMap at: imageName put: (zo async: #blob)
+       ].
+  (* Extract main document contents *)     
+  (main async: #string) then: [:f  <String> | 
+     |
+     (* parse main document *)
+     dom <Alien[HTMLDocument]>  = DOMParser new parseFromString: f mimeType: 'text/html'.
+     (*find all image nodes *)
+     imageNodes <Alien[HTMLCollection[Node]]> = dom getElementsByTagName: #img.  
+     imgPromises <JSArray[Promise[Alien[Blob]]]> = JSArray new: (imageNodes at: #length).
+     |
+     (* Collect images in an array, in 1:1 correspondence with img nodes *)
+     0 to: (imageNodes at: #length) - 1 do: [:i <Integer> |  
+         imgPromises at: i put: (imageMap at: ((imageNodes at: i) at: #name)).
+         ].
+     (* Resolve image promises and process them *)
+    (JSPromise all: imgPromises) then: [:imgs <JSArray[Alien[Blob]]> |  
+         (* Create internal URIs for images and update img nodes accordingly *)
+         0 to: (imgs at: #length) - 1 do: [:i <Integer> |    
+           (imageNodes at: i) at: #src put: (URL createObjectURL: (imgs at: i)).
+           ].
+         (* Create a regular doc from the revised DOM *)
+         namespace at: n put: (ide documents freshDocumentFromDOM: dom). 
+         successBlock value.
+         nil.
+         ] onError: [:ex | failureBlock value:  'Error: ', ex printString. nil].
+     ].
+)
+public loadDocuments: fs <List[Alien[File]]> ifSuccess: successBlock <[]> ifFailure: failureBlock <[:List[String]]> = (
+  | ps <List[Alien[Promise[[String]]]]>  = JSArray new: fs size. fns <Array[String]> = Array new: fs size.  |
+1 to: fs size do: [:i <Integer> |
+  | file <Alien[File]> = fs at: i. |
+  ps at: i - 1 put: file text.
+  fns at: i put: (file at: #name)
   ].
- (* create a regular doc from the revised DOM *)
- namespace at: name put: (Documents freshDocumentFromDom: dom).
+  (JSPromise all: ps) then: [:sources <JSArray[String]> |
+	  [| bs <List[Document]> = List new: fs size. |
+	  0 to: fs size - 1 do: [:i <Integer> |
+         | fn = (fns at: i+1).  dn = fn copyFrom: 1 to: (fn indexOf: '.') - 1. |
+          bs add: (ide documents freshDocumentWithContents: (sources at: i))
+		  ].
+        bs do: [:b <Document> | namespace at: b name put: b].
+        successBlock value.] on: Error do:  [:ex | failureBlock value: 'Failure: ', ex printString].
+        nil.
+	] onError: [:ex | failureBlock value: 'Error: ', ex printString. nil].
 )
 ) : (
 public new = (

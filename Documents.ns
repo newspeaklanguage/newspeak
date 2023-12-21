@@ -16,6 +16,7 @@ The above leads to the view that  this tool is an extension of the IDE (or even,
 *)
     |	
     private Map = p collections Map.
+    private List = p collections List.
     private Set = p collections Set.
     private Subject = p hopscotch Subject.
     private Presenter = p hopscotch Presenter.
@@ -32,6 +33,12 @@ The above leads to the view that  this tool is an extension of the IDE (or even,
     private MethodSubject = webIDE browsing MethodSubject.
     private ThreadSubject = webIDE debugging ThreadSubject.    
     private Root = webIDE namespacing Root.
+    private JSObject = p js global at: 'Object'.
+    private JSArray = p js global at: 'Array'.
+    private JSPromise = p js global at: 'Promise'.
+    private JSZip = p js global at: 'JSZip'.
+    private URL = p js global at: 'URL'.
+
     private ide = webIDE.
     private retainedPlatform = p.
     parser = retainedPlatform mirrors compiler parser.
@@ -1121,6 +1128,108 @@ defaultAmpleforthDocumentBodyInnerHTML ^ <String> = (
 public freshDocumentNamed: n <Symbol> ^ <Document> = (
   ^freshDocumentWithContents: '<div class = "ampleforthDocumentClass" name = "', n, '" classBody = "
 ()()"></div><div class = "ampleforthDocumentBody" edition="2">', defaultAmpleforthDocumentBodyInnerHTML, '</div>'
+)
+loadTranscluded: documentFolder <Alien[JSZip]> into: namespace <NamespaceSubject> ifSuccess: successBlock <[]> ifFailure: failureBlock <[:List[String]]>= (
+  |
+  documentPromises <List[JSPromise[Blob]]> = List new.
+  documentNames = List new.
+  blobArray <JSArray[JSPromise[Blob]]>
+  documentArray <JSArray[JSPromise[JSZip]]>
+  |
+  documentFolder forEach: [:path <String> :zo <ZipObject> |
+    (* Again we rely on an undocumented feature - the #unsafeOriginalName field. See comments in #loadDocument:named:ifSuccess:ifFailure: *)
+    ((path at: #unsafeOriginalName) endsWith: '.DS_Store') ifFalse: [
+      documentNames add:  (path at: #unsafeOriginalName).
+      documentPromises add: (zo async: #blob). 
+      nil
+    ]
+    ].
+  blobArray::  JSArray new: documentPromises size.
+  documentArray::  JSArray new: documentPromises size.
+  0 to: documentPromises size -1 do: [:i <Integer> | blobArray at: i put: (documentPromises at: i+1)].
+  (JSPromise all: blobArray) then: [:blobs <JSArray[Blob]> |
+     0 to: (blobs at: #length) -1 do: [:i <Integer> | 
+       documentArray at: i put: (JSZip loadAsync: (blobs at: i)) 
+     ].
+     (JSPromise all: documentArray) then: [:docs <JSArray[JSZip]> | 
+       0 to: (docs at: #length) -1 do: [:i <Integer> | 
+         | 
+         doc <JSZip> = docs at: i.  
+         fn <String> = documentNames at: i+1.
+         dn <String> = fn copyFrom: (fn lastIndexOf: '/') + 1 to: fn size - 4. 
+         |
+         loadDocument: doc named: dn into: namespace ifSuccess: [('loaded transcluded document  ', dn) out. nil] ifFailure: [failureBlock].
+       ].
+       successBlock value.
+       nil
+     ] onError: [:ex | failureBlock value:  'Error loading transcluded document: ', ex printString. nil].
+     nil
+  ] onError: [:ex | failureBlock value:  'Error loading transcluded documents: ', ex printString. nil].
+)
+public loadDocument: jsz <Alien[JSZip]> named: n <String> into: namespace <NamespaceSubject> ifSuccess: successBlock <[]> ifFailure: failureBlock <[:List[String]]> = (
+(* Takes a zipfile representing a Document and converts it into a live Document. *)
+(* TODO: move this to Documents, so the IDE is not dependent on details of Document representation *)
+  |
+  images <Alien[JSZip]> = jsz folder: n, '/images'.
+  classFolder <Alien[JSZip]> = jsz folder: n, '/classes'.
+  documentFolder <Alien[JSZip]> = jsz folder: n, '/documents'.
+  imageMap <Map[String, Alien[Promise[Alien[Blob]]]]> = Map new.
+  contents <Alien[JSZip]> = jsz folder: n,  '/contents'.
+  (* get main document *)
+  main <Alien[ZipObject]> = jsz file: n, '/', n, '.html'.
+  |
+  loadClasses: classFolder into: namespace ifSuccess: [ 
+    loadTranscluded: documentFolder into: namespace ifSuccess: [
+       images forEach: [:path <String> :zo <Alien[ZipObject]> |  
+         | 
+         (* The path argument is not working as specified, so we rely on an undocumented feature - the #unsafeOriginalName field.
+         This is obviously undesirable, but so far we don't have a better solution.
+         *)
+         imageName <String> = (path at: #unsafeOriginalName) copyFrom: n size + 9 to: (path at: #unsafeOriginalName) size.
+         |
+         (* Create blob from image and store in a map keyed by image name *)       
+         imageMap at: imageName put: (zo async: #blob)
+         ].
+       (* Extract main document contents *)     
+      (main async: #string) then: [:f  <String> | 
+         |
+         (* parse main document *)
+         dom <Alien[HTMLDocument]>  = DOMParser new parseFromString: f mimeType: 'text/html'.
+         (*find all image nodes *)
+         imageNodes <Alien[HTMLCollection[Node]]> = dom getElementsByTagName: #img.  
+         imgPromises <JSArray[Promise[Alien[Blob]]]> = JSArray new: (imageNodes at: #length).
+         |
+         (* Collect images in an array, in 1:1 correspondence with img nodes *)
+         0 to: (imageNodes at: #length) - 1 do: [:i <Integer> |  
+             imgPromises at: i put: (imageMap at: ((imageNodes at: i) at: #name)).
+             ].
+         (* Resolve image promises and process them *)
+        (JSPromise all: imgPromises) then: [:imgs <JSArray[Alien[Blob]]> |  
+             (* Create internal URIs for images and update img nodes accordingly *)
+             0 to: (imgs at: #length) - 1 do: [:i <Integer> |    
+               (imageNodes at: i) at: #src put: (URL createObjectURL: (imgs at: i)).
+               ].
+             (* Create a regular doc from the revised DOM *)
+             namespace model at: n put: (ide documents freshDocumentFromDOM: dom). 
+             successBlock value.
+             nil.
+             ] onError: [:ex | failureBlock value:  'Error loading document: ', ex printString. nil].
+             nil
+         ] onError: [:ex | failureBlock value:  'Error loading document: ', ex printString. nil].
+         nil
+       ] ifFailure: [:ex | failureBlock value:  'Failure loading transcluded documents: ', ex printString. nil].
+       nil.
+     ] ifFailure: [:ex | failureBlock value:  'Failure loading document: ', ex printString. nil].
+)
+loadClasses: classFolder <Alien[JSZip]>  into: namespace <NamespaceSubject> ifSuccess: successBlock <[]> ifFailure: failureBlock <[:List[String]]>= (
+  |
+  classPromises <List[JSPromise[String]]> = List new.
+  promiseArray <JSArray[JSPromise[String]]>
+  |
+  classFolder forEach: [:path <String> :zo <ZipObject> | classPromises add: (zo async: #string). nil].
+  promiseArray::  JSArray new: classPromises size.
+  0 to: classPromises size -1 do: [:i <Integer> | promiseArray at: i put: (classPromises at: i+1)].
+  namespace compilePromises: promiseArray ifSuccess: successBlock ifFailure: failureBlock.
 )
 ) : (
 )

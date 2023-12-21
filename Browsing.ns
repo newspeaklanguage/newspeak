@@ -33,6 +33,7 @@ class Browsing usingPlatform: p ide: webIde
     private JSArray = p js global at: 'Array'.
     private JSMath = p js global at: 'Math'.
     private JSPromise = p js global at: 'Promise'.
+    private JSZip = p js global at: 'JSZip'.
     private Date = p js global at: 'Date'.
     private URL = p js global at: 'URL'.
 
@@ -3046,19 +3047,6 @@ public summaryText = (
 public title ^<String> = (
 	^key
 )
-public compileFiles: fs <List[Alien[File]]> ifSuccess: successBlock <[]> ifFailure: failureBlock <[:List[String]]> = (
-  | ps <List[Alien[Promise[[String]]]]>  = JSArray new: fs size. |
-  1 to: fs size do: [:i <Integer> | ps at: i - 1 put: (fs at: i) text].
-  (JSPromise all: ps) then: [:sources <JSArray[String]> |
-	  [|  mixins <List[MixinMirror]> bs <List[ClassDeclarationBuilder]> = List new: fs size. |
-	  0 to: fs size - 1 do: [:i <Integer> |
-          bs add: (ClassDeclarationBuilder fromUnitSource: (sources at: i))
-		  ].
-        mixins:: ide installFromBuilders: bs into: namespace.
-        mixins do: [:m <MixinMirror> | namespace at: m name ifAbsent: [namespace at: m name put: m declaration applyToObject reflectee]].
-        successBlock value.] on: Error do:  [:ex | failureBlock value: ex printString]
-	] onError: [:ex | failureBlock value: ex printString].
-)
 public addClassFromDefinition: definition <String> ifSuccess: successBlock <[]> ifFailure: failureBlock <[:String]> = (
 	| builder <ClassDeclarationBuilder> klass |
 	[builder:: ClassDeclarationBuilder fromSource: definition]
@@ -3133,52 +3121,6 @@ public loadDocument: f <Alien[File]> ifSuccess: successBlock <[]> ifFailure: fai
               ]
      onError: [:ex | failureBlock value:  'Error: ', ex printString].
 )
-public loadDocument: jsz <Alien[JSZip]> named: n <String> ifSuccess: successBlock <[]> ifFailure: failureBlock <[:List[String]]> = (
-(* Takes a zipfile representing a Document and converts it into a live Document. *)
-(* TODO:  extend to handle docs with transclusions and other resources . *)
-  |
-  images <Alien[JSZip]> = jsz folder: n, '/images'.
-  imageMap <Map[String, Alien[Promise[Alien[Blob]]]]> = Map new.
-  contents <Alien[JSZip]> = jsz folder: n,  '/contents'.
-  (* get main document *)
-  main <Alien[ZipObject]> = jsz file: n, '/', n, '.html'.
-  |
-  images forEach: [:path <String> :zo <Alien[ZipObject]> |  
-       | 
-       (* The path argument is not working as specified, so we rely on an undocumented feature - the #unsafeOriginalName field.
-       This is obviously undesirable, but so far we don't have a better solution.
-       *)
-       imageName <String> = (path at: #unsafeOriginalName) copyFrom: n size + 9 to: (path at: #unsafeOriginalName) size.
-       |
-       (* Create blob from image and store in a map keyed by image name *)       
-       imageMap at: imageName put: (zo async: #blob)
-       ].
-  (* Extract main document contents *)     
-  (main async: #string) then: [:f  <String> | 
-     |
-     (* parse main document *)
-     dom <Alien[HTMLDocument]>  = DOMParser new parseFromString: f mimeType: 'text/html'.
-     (*find all image nodes *)
-     imageNodes <Alien[HTMLCollection[Node]]> = dom getElementsByTagName: #img.  
-     imgPromises <JSArray[Promise[Alien[Blob]]]> = JSArray new: (imageNodes at: #length).
-     |
-     (* Collect images in an array, in 1:1 correspondence with img nodes *)
-     0 to: (imageNodes at: #length) - 1 do: [:i <Integer> |  
-         imgPromises at: i put: (imageMap at: ((imageNodes at: i) at: #name)).
-         ].
-     (* Resolve image promises and process them *)
-    (JSPromise all: imgPromises) then: [:imgs <JSArray[Alien[Blob]]> |  
-         (* Create internal URIs for images and update img nodes accordingly *)
-         0 to: (imgs at: #length) - 1 do: [:i <Integer> |    
-           (imageNodes at: i) at: #src put: (URL createObjectURL: (imgs at: i)).
-           ].
-         (* Create a regular doc from the revised DOM *)
-         namespace at: n put: (ide documents freshDocumentFromDOM: dom). 
-         successBlock value.
-         nil.
-         ] onError: [:ex | failureBlock value:  'Error: ', ex printString. nil].
-     ].
-)
 public oldloadDocuments: fs <List[Alien[File]]> ifSuccess: successBlock <[]> ifFailure: failureBlock <[:List[String]]> = (
   | ps <List[Alien[Promise[[String]]]]>  = JSArray new: fs size. fns <Array[String]> = Array new: fs size.  |
 1 to: fs size do: [:i <Integer> |
@@ -3196,6 +3138,17 @@ public oldloadDocuments: fs <List[Alien[File]]> ifSuccess: successBlock <[]> ifF
         successBlock value.] on: Error do:  [:ex | failureBlock value: 'Failure: ', ex printString].
         nil.
 	] onError: [:ex | failureBlock value: 'Error: ', ex printString. nil].
+)
+compilePromises: ps <JSArray[JSPromise[String]]> ifSuccess: successBlock <[]> ifFailure: failureBlock <[:List[String]]> = (
+  (JSPromise all: ps) then: [:sources <JSArray[String]> |
+	  [|  mixins <List[MixinMirror]> bs <List[ClassDeclarationBuilder]> = List new: (sources at: #length). |
+	  0 to: (sources at: #length) - 1 do: [:i <Integer> |
+          bs add: (ClassDeclarationBuilder fromUnitSource: (sources at: i)).
+		  ].
+        mixins:: ide installFromBuilders: bs into: namespace.
+        mixins do: [:m <MixinMirror> | namespace at: m name ifAbsent: [namespace at: m name put: m declaration applyToObject reflectee]].
+        successBlock value.] on: Error do:  [:ex | failureBlock value: ex printString]
+	] onError: [:ex | failureBlock value: ex printString].
 )
 public loadDocuments: fs <List[Alien[File]]> ifSuccess: successBlock <[]> ifFailure: failureBlock <[:List[String]]> = (
   | 
@@ -3218,12 +3171,119 @@ public loadDocuments: fs <List[Alien[File]]> ifSuccess: successBlock <[]> ifFail
          | fn = (fns at: i+1).  |
          loadDocument: (zips at: i) named: (fn copyFrom: 1 to: (fn indexOf: '.') -1) 
          ifSuccess: [updateCount:: updateCount - 1. updateCount = 0 ifTrue: [successBlock value]] 
-         ifFailure: [updateCount:: updateCount - 1. failureBlock]. 
+         ifFailure: [:ex | updateCount:: updateCount - 1. failureBlock value: ex]. 
          nil
          ].
         ] on: Error do:  [:ex | failureBlock value: 'Failure: ', ex printString].
         nil.
 	] onError: [:ex | failureBlock value: 'Error: ', ex printString. nil].
+)
+loadClasses: classFolder <Alien[JSZip]> ifSuccess: successBlock <[]> ifFailure: failureBlock <[:List[String]]>= (
+  |
+  classPromises <List[JSPromise[String]]> = List new.
+  promiseArray <JSArray[JSPromise[String]]>
+  |
+  classFolder forEach: [:path <String> :zo <ZipObject> | classPromises add: (zo async: #string). nil].
+  promiseArray::  JSArray new: classPromises size.
+  0 to: classPromises size -1 do: [:i <Integer> | promiseArray at: i put: (classPromises at: i+1)].
+  compilePromises: promiseArray ifSuccess: successBlock ifFailure: failureBlock
+)
+public compileFiles: fs <List[Alien[File]]> ifSuccess: successBlock <[]> ifFailure: failureBlock <[:List[String]]> = (
+  | ps <List[Alien[Promise[[String]]]]>  = JSArray new: fs size. |
+  1 to: fs size do: [:i <Integer> | ps at: i - 1 put: (fs at: i) text].
+  compilePromises: ps ifSuccess: successBlock ifFailure: failureBlock
+)
+public loadDocument: jsz <Alien[JSZip]> named: n <String> ifSuccess: successBlock <[]> ifFailure: failureBlock <[:List[String]]> = (
+(* Takes a zipfile representing a Document and converts it into a live Document. *)
+(* TODO: move this to Documents, so the IDE is not dependent on details of Document representation *)
+  |
+  images <Alien[JSZip]> = jsz folder: n, '/images'.
+  classFolder <Alien[JSZip]> = jsz folder: n, '/classes'.
+  documentFolder <Alien[JSZip]> = jsz folder: n, '/documents'.
+  imageMap <Map[String, Alien[Promise[Alien[Blob]]]]> = Map new.
+  contents <Alien[JSZip]> = jsz folder: n,  '/contents'.
+  (* get main document *)
+  main <Alien[ZipObject]> = jsz file: n, '/', n, '.html'.
+  |
+  loadClasses: classFolder ifSuccess: [ 
+    loadTranscluded: documentFolder ifSuccess: [
+       images forEach: [:path <String> :zo <Alien[ZipObject]> |  
+         | 
+         (* The path argument is not working as specified, so we rely on an undocumented feature - the #unsafeOriginalName field.
+         This is obviously undesirable, but so far we don't have a better solution.
+         *)
+         imageName <String> = (path at: #unsafeOriginalName) copyFrom: n size + 9 to: (path at: #unsafeOriginalName) size.
+         |
+         (* Create blob from image and store in a map keyed by image name *)       
+         imageMap at: imageName put: (zo async: #blob)
+         ].
+       (* Extract main document contents *)     
+      (main async: #string) then: [:f  <String> | 
+         |
+         (* parse main document *)
+         dom <Alien[HTMLDocument]>  = DOMParser new parseFromString: f mimeType: 'text/html'.
+         (*find all image nodes *)
+         imageNodes <Alien[HTMLCollection[Node]]> = dom getElementsByTagName: #img.  
+         imgPromises <JSArray[Promise[Alien[Blob]]]> = JSArray new: (imageNodes at: #length).
+         |
+         (* Collect images in an array, in 1:1 correspondence with img nodes *)
+         0 to: (imageNodes at: #length) - 1 do: [:i <Integer> |  
+             imgPromises at: i put: (imageMap at: ((imageNodes at: i) at: #name)).
+             ].
+         (* Resolve image promises and process them *)
+        (JSPromise all: imgPromises) then: [:imgs <JSArray[Alien[Blob]]> |  
+             (* Create internal URIs for images and update img nodes accordingly *)
+             0 to: (imgs at: #length) - 1 do: [:i <Integer> |    
+               (imageNodes at: i) at: #src put: (URL createObjectURL: (imgs at: i)).
+               ].
+             (* Create a regular doc from the revised DOM *)
+             namespace at: n put: (ide documents freshDocumentFromDOM: dom). 
+             successBlock value.
+             nil.
+             ] onError: [:ex | failureBlock value:  'Error loading document: ', ex printString. nil].
+             nil
+         ] onError: [:ex | failureBlock value:  'Error loading document: ', ex printString. nil].
+         nil
+       ] ifFailure: [:ex | failureBlock value:  'Failure loading transcluded documents: ', ex printString. nil].
+       nil.
+     ] ifFailure: [:ex | failureBlock value:  'Failure loading document: ', ex printString. nil].
+)
+loadTranscluded: documentFolder <Alien[JSZip]> ifSuccess: successBlock <[]> ifFailure: failureBlock <[:List[String]]>= (
+  |
+  documentPromises <List[JSPromise[Blob]]> = List new.
+  documentNames = List new.
+  blobArray <JSArray[JSPromise[Blob]]>
+  documentArray <JSArray[JSPromise[JSZip]]>
+  |
+  documentFolder forEach: [:path <String> :zo <ZipObject> |
+    (* Again we rely on an undocumented feature - the #unsafeOriginalName field. See comments in #loadDocument:named:ifSuccess:ifFailure: *)
+    ((path at: #unsafeOriginalName) endsWith: '.DS_Store') ifFalse: [
+      documentNames add:  (path at: #unsafeOriginalName).
+      documentPromises add: (zo async: #blob). 
+      nil
+    ]
+    ].
+  blobArray::  JSArray new: documentPromises size.
+  documentArray::  JSArray new: documentPromises size.
+  0 to: documentPromises size -1 do: [:i <Integer> | blobArray at: i put: (documentPromises at: i+1)].
+  (JSPromise all: blobArray) then: [:blobs <JSArray[Blob]> |
+     0 to: (blobs at: #length) -1 do: [:i <Integer> | 
+       documentArray at: i put: (JSZip loadAsync: (blobs at: i)) 
+     ].
+     (JSPromise all: documentArray) then: [:docs <JSArray[JSZip]> | 
+       0 to: (docs at: #length) -1 do: [:i <Integer> | 
+         | 
+         doc <JSZip> = docs at: i.  
+         fn <String> = documentNames at: i+1.
+         dn <String> = fn copyFrom: (fn lastIndexOf: '/') + 1 to: fn size - 4. 
+         |
+         loadDocument: doc named: dn ifSuccess: [('loaded transcluded document  ', dn) out. nil] ifFailure: [failureBlock].
+       ].
+       successBlock value.
+       nil
+     ] onError: [:ex | failureBlock value:  'Error loading transcluded document: ', ex printString. nil].
+     nil
+  ] onError: [:ex | failureBlock value:  'Error loading transcluded documents: ', ex printString. nil].
 )
 ) : (
 public new = (

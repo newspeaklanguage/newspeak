@@ -898,18 +898,6 @@ public cloneNamed: n <String>  (* :exemplar: cloneNamed: #Dummy *)= (
    (* instantiate cloned class, and use it as model for an instance of my class, which we return *)
    ^class onModel: ((((ObjectMirror reflecting: ide documentHolder) evaluate: n) result reflectee) contents: document contents)
 )
-processImagesUsingFolder: folder = (
-  | 
-  dom = DOMParser new parseFromString: document contents mimeType: 'text/html'.
-  images = dom getElementsByTagName: #img.
-  imageFolder = folder getFolder: 'images'.
-  |
-  (* for each image in the main document, save contents to file in zip folder 'images' *)
-  (0 to: (images at: #length) -1) do: [:i <Integer> | 
-  | img <Alien[Node]> = images at: i.  fn <String> = img at: #name. |
-    imageFolder file: fn contents: ((retainedPlatform js global fetch: (img at: #src)) then: [:r | r blob]). 
-  ].
-)
 processImagesFromDom: dom usingFolder: folder = (
   | 
   images = dom getElementsByTagName: #img.
@@ -936,15 +924,18 @@ public savedHTMLFor: dom <Alien[Node]> ^ <String>  = (
 public save = (
   createFolder save.
 )
-processIcons: iconNamespace usingFolder: folder = (
+ampletExpressionsIn: dom  ^ <List[String]> = (
   | 
-  nonstandardIcons <List[Icon]>= iconNamespace keys select: [:k <String> | (ide standardPreludeIconNames includes: k) not].
-  importedIcons <List[String]> = nonstandardIcons select: [:k <String> | potentialImports includes: k].
+  amplets = dom getElementsByClassName:  'ampleforth'. 
+  ampletExpressions = List new.
   |
-  (* for each non-standard icon in the main document, save contents to file in zip folder 'icons'. W need to get the image data and write it out, but that may be impossible *)
-  importedIcons do: [:iconName <String> | 
-  folder addFile: iconName, '.png' contents: ((iconNamespace at: iconName) decode)
-  ].
+  0 to: (amplets at: 'length') - 1 do: [:i | ampletExpressions add: ((amplets at: i) getAttribute: 'name'). nil].
+  ^ampletExpressions
+)
+potentialImportsUsing: dom ^ <Set[String]> = (
+  | importCandidates <Set[String]> = Set new. |
+ gatherMessagesOf: document mirror getClass mixin declaration into: importCandidates using: dom.
+ ^importCandidates
 )
 public createFolder ^ <Folder> = (
 (*
@@ -991,41 +982,43 @@ Content could of course include multiple units (say, a list of presentations). E
   processImagesFromDom: dom usingFolder: folder.
   (* processMediaUsingFolder: folder  - or are video and audio separate?*)
   (* process transcluded documents *)
-  processObjectsUsingFolder: folder.
+  processObjectsFromDom: dom usingFolder: folder.
   (* add contents if any *)
   model addContentsUsingFolder: innerFolder.
   (* add main document to folder; we do this last, so service methods can update the copied dom first *)
   folder addTextFile: name, '.html' contents: (savedHTMLFor: dom).  
   ^folder
 )
-gatherMessagesOf: c <ClassDeclarationMirror> into: importCandidates <Set[String]> = (
+gatherMessagesOf: c <ClassDeclarationMirror> into: importCandidates <Set[String]> using: dom = (
+   | relevantAmplets = (ampletExpressionsIn: dom) select: [:e <String> | (e indexOf: ':') ~= 0]. |
    importCandidates addAll: c header selectors.
-   importCandidates remove: c name.
+
   c instanceSide methods do: [:mm <MethodMirror>  | importCandidates addAll: mm selectors].
   c classSide methods do: [:mm <MethodMirror> | importCandidates addAll: mm selectors].
   c instanceSide lazySlots do: [:ls <LazySlotMirror> | importCandidates addAll: ls selectors].    
-  c instanceSide nestedClasses do: [:nc <ClassDeclarationMirror> | gatherMessagesOf: nc into: importCandidates].  
+  c instanceSide nestedClasses do: [:nc <ClassDeclarationMirror> | gatherMessagesOf: nc into: importCandidates using: dom].  
+  relevantAmplets do: [:e <String> | 
+    | m <MethodMirror> = document mirror compileExpression: e scope: Map new. |
+    importCandidates addAll: m selectors
+    ].
+  importCandidates remove: c name.
 )
-dependencies  ^ <List> = (
+processIcons: iconNamespace fromDom: dom usingFolder: folder = (
   | 
-  nonstandardNames <List> = ide namespacing Root keys select: [:k <String> | (ide standardPreludeMessages includes: k) not].
-  importedNames <List[String]> = nonstandardNames select: [:k <String> | potentialImports includes: k].
+  nonstandardIcons <List[Icon]>= iconNamespace keys select: [:k <String> | (ide standardPreludeIconNames includes: k) not].
+  importedIcons <List[String]> = nonstandardIcons select: [:k <String> | (potentialImportsUsing: dom)  includes: k].
   |
-  
-  ^importedNames collect: [:k <String> | ide namespacing Root at: k] 
+  (* for each non-standard icon in the main document, save contents to file in zip folder 'icons'. W need to get the image data and write it out, but that may be impossible *)
+  importedIcons do: [:iconName <String> | 
+  folder addFile: iconName, '.png' contents: ((iconNamespace at: iconName) decode)
+  ].
 )
-potentialImports ^ <Set[String]> = (
-  | importCandidates <Set[String]> = Set new. |
- gatherMessagesOf: document mirror getClass mixin declaration into: importCandidates.
- (* Must add selectors used in code within amplets themselves (i.e., literally inside the HTML)  *)
- ^importCandidates
-)
-processObjectsUsingFolder: folder = (
+processObjectsFromDom: dom usingFolder: folder = (
   | 
   docs <JSZip> = folder addFolder: 'documents'. 
   classes <JSZip> = folder addFolder: 'classes'.
   icons <JSZip> = folder addFolder: 'icons'.
-  imported <List> = dependencies. 
+  imported <List> = dependenciesUsing: dom. 
   importedClasses <List[Class]> = imported select: [:o | o isKindOfClass].
   importedDocuments <List[Document]> = imported select: [:o | o isKindOfDocument].
   importedNamespaces <List[Namespace]>= imported select: [:o | o isKindOfNamespace].
@@ -1036,7 +1029,17 @@ processObjectsUsingFolder: folder = (
    ].
    (* for each transcluded document in the main document, save it in zip folder 'documents'.' *)
    importedDocuments do: [:d <Document> | docs file: d name, '.zip'  contents: (DocumentSubject onModel: d) createFolder asBlob].
-   (* processIcons: (importedNamespaces at: #Icons) usingFolder: icons. *)
+   (* processIcons: (importedNamespaces at: #Icons) fromDom: dom usingFolder: icons. *)
+)
+dependenciesUsing: dom ^ <List> = (
+  | 
+  (* Obtain all non-standard entries in the root namespace.*)
+  nonstandardNames <List> = ide namespacing Root keys select: [:k <String> | (ide standardPreludeMessages includes: k) not].
+  (* Intersect with any potential imports, yielding a conservative list of the names of the document's non-standard dependencies *)
+  importedNames <List[String]> = nonstandardNames select: [:k <String> |(potentialImportsUsing: dom) includes: k].
+  |
+  (* Lookup the values of the dependencies and return them *)
+  ^importedNames collect: [:k <String> | ide namespacing Root at: k] 
 )
 ) : (
 )

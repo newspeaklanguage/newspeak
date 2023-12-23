@@ -11,6 +11,20 @@ pushd ../primordialsoup
 ./build os=emscripten arch=wasm
 popd
 
+# Back in 'newspeak'.
+# Increase the pwaVersion in the PWA service worker, the newspeak/platforms/webIDE/sw.js
+# This is required on every Newspeak build (strictly speaking,
+#   only on every Newspeak deployment to HTTP server), for the PWA clients
+#   to refresh all caches.
+# Without the pwaVersion increase, PWA clients would not replace
+#   the cached HopscotchWebIDE.vfuel with the new version,
+#   unless forced by manual cache clean or similar
+
+. ./increase-pwa-version.sh
+
+# Ensure the newspeak/out directory exists, and copy into it:
+#   - The primordialsoup built primordialsoup.html, primordialsoup.js, primordialsoup.wasm
+#   - All primordialsoup built snapshots of vfuel files such as WebCompiler.vfuel
 mkdir -p out
 cp ../primordialsoup/out/ReleaseEmscriptenWASM/primordialsoup.* out
 cp ../primordialsoup/out/snapshots/*.vfuel out

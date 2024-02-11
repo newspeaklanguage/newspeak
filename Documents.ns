@@ -1195,28 +1195,6 @@ dependenciesUsing: dom ^ <List> = (
   (* Lookup the values of the dependencies and return them *)
   ^importedNames collect: [:k <String> | ide namespacing Root at: k] 
 )
-public createFolder ^ <Folder> = (
-(*
-This method creates an in-memory zip folder representing the current document. See the class comment for details of the persistent representation
-*)
-  | 
-  folder <Folder> = (* Create a zip folder *) ide webFiles Folder named: name. 
-    (* add contents subfolder *)
-  innerFolder = folder addFolder: 'contents'.
-  (* Copy the DOM so we can modify it before saving *)
-  dom = DOMParser new parseFromString: document contents mimeType: 'text/html'.
-  |
-  (* add images to folder *)
-  processImagesFromDom: dom usingFolder: folder.
-  (* processMediaUsingFolder: folder  - or are video and audio separate?*)
-  (* process obejcts accessed from the IDE root namespace, such as classes and transcluded documents *)
-  processObjectsFromDom: dom usingFolder: folder.
-  (* add contents if any *)
-  model addContentsUsingFolder: innerFolder.
-  (* add main document to folder; we do this last, so service methods can update the copied dom first *)
-  folder addTextFile: name, '.html' contents: (savedHTMLFor: dom).  
-  ^folder
-)
 gatherMessagesOf: c <ClassDeclarationMirror> into: importCandidates <Set[String]> using: dom = (
    | 
    relevantAmplets = (ampletExpressionsIn: dom) select: [:e <String> | 
@@ -1242,6 +1220,47 @@ gatherMessagesOf: c <ClassDeclarationMirror> into: importCandidates <Set[String]
     ].
   (* Remove c's name, if it shows up,  to prevent infinite regress *)
   importCandidates remove: c name ifAbsent: []. 
+)
+public createFolder ^ <Folder> = (
+(*
+This method creates an in-memory zip folder representing the current document. See the class comment for details of the persistent representation
+*)
+  | 
+  folder <Folder> = (* Create a zip folder *) ide webFiles Folder named: name. 
+    (* add contents subfolder *)
+  innerFolder = folder addFolder: 'contents'.
+  (* Copy the DOM so we can modify it before saving *)
+  dom = DOMParser new parseFromString: document contents mimeType: 'text/html'.
+  |
+  (* add images to folder *)
+  processMediaFromDom: dom usingFolder: folder.
+  (* process objects accessed from the IDE root namespace, such as classes and transcluded documents *)
+  processObjectsFromDom: dom usingFolder: folder.
+  (* add contents if any *)
+  model addContentsUsingFolder: innerFolder.
+  (* add main document to folder; we do this last, so service methods can update the copied dom first *)
+  folder addTextFile: name, '.html' contents: (savedHTMLFor: dom).  
+  ^folder
+)
+processMediaFromDom: dom usingFolder: folder = (
+ (* for now, use old way to deal with images for compatibility *)
+  processImagesFromDom: dom usingFolder: folder.
+  processMediaOfType: #video fromDom: dom usingFolder: folder.
+  processMediaOfType: #audio fromDom: dom usingFolder: folder
+)
+processMediaOfType: type fromDom: dom usingFolder: folder = (
+  | 
+  media = dom getElementsByTagName: type.
+  folderName = type (*= #img ifTrue: [#images] ifFalse: [type]*).
+  mediaFolder = folder getFolder: folderName.
+  |
+  (* for each media resource in the main document, save contents to per media type folder *)
+  (0 to: (media at: #length) -1) do: [:i <Integer> | 
+  | resource <Alien[Node]> = media at: i.  fn <String> = resource at: 'title'. |
+    mediaFolder file: fn contents: ((retainedPlatform js global fetch: (resource at: #src)) then: [:r | r blob]). 
+    (* revise src attribute to an externally valid URI *)
+    resource at: #src put: './', folderName, '/', fn.
+  ].
 )
 ) : (
 )
@@ -1299,6 +1318,20 @@ public textOfHTMLDocument: dom  <Alien[Node]>  ^ <String> = (
 public documentHolderMixinBuilder ^ <MixinBuilder> = (
   ^(ObjectMirror reflecting: ide documentHolder) getClass mixin asBuilder
 )
+public freshDocumentNamed: n <Symbol> ^ <Document> = (
+  ^freshDocumentWithContents: '<div class = "ampleforthDocumentClass" name = "', n, '" classBody = "
+()()"></div><div class = "ampleforthDocumentBody" edition="2">', defaultAmpleforthDocumentBodyInnerHTML, '</div>'
+)
+loadClasses: classFolder <Alien[JSZip]>  into: namespace <NamespaceSubject> ifSuccess: successBlock <[]> ifFailure: failureBlock <[:List[String]]>= (
+  |
+  classPromises <List[JSPromise[String]]> = List new.
+  promiseArray <JSArray[JSPromise[String]]>
+  |
+  classFolder forEach: [:path <String> :zo <ZipObject> | classPromises add: (zo async: #string). nil].
+  promiseArray::  JSArray new: classPromises size.
+  0 to: classPromises size -1 do: [:i <Integer> | promiseArray at: i put: (classPromises at: i+1)].
+  namespace compilePromises: promiseArray ifSuccess: successBlock ifFailure: failureBlock.
+)
 defaultAmpleforthDocumentBodyInnerHTML ^ <String> = (
   ^'<div class="self_ampleforth" contenteditable="true" style="border: 2px solid blue; resize: horizontal; overflow: auto; overflow-wrap: break-word; width: 40em;" onkeyup="updateRawHTML()" ondragover="((e) => {e.preventDefault();})(event)" ondrop="((e) => {
               e.preventDefault();
@@ -1311,7 +1344,6 @@ defaultAmpleforthDocumentBodyInnerHTML ^ <String> = (
             // Loop through dropped files
             for (const file of e.dataTransfer.files) {
                 if (file.type.startsWith(''image/'')) {
-                              console.log(file.size);
                               const imageElement = document.createElement(''img'');
                               // Set the image element src field to a blob URL we create
                               imageElement.src = window.URL.createObjectURL(file);
@@ -1319,7 +1351,29 @@ defaultAmpleforthDocumentBodyInnerHTML ^ <String> = (
                               imageElement.name = file.name;
                               // Insert the image after the text node
                               textNode.after(imageElement);               
-               } // if (file.type.startsWith(...)
+               } // images
+               if (file.type.startsWith(''video/'')) {
+                              const videoElement = document.createElement(''video'');
+                              // Set the image element src field to a blob URL we create
+                              videoElement.src = window.URL.createObjectURL(file);
+                              videoElement.style.maxWidth = ''300px'';
+                              videoElement.controls = true;
+                              videoElement.title = file.name;
+                              console.log(file.name);
+                              console.log(videoElement.title);
+                              // Insert the video after the text node
+                              textNode.after(videoElement);    
+               } // video
+               if (file.type.startsWith(''audio/'')) {
+                              const audioElement = document.createElement(''audio'');
+                              // Set the image element src field to a blob URL we create
+                              audioElement.src = window.URL.createObjectURL(file);
+                              audioElement.style.maxWidth = ''300px'';
+                              audioElement.controls = true;
+                              audioElement.title = file.name;
+                              // Insert the audio after the text node
+                              textNode.after(audioElement);    
+               } // audio
             }//for (const file of e.dataTransfer.files
             updateRawHTML();
   }// ondrop body
@@ -1330,9 +1384,110 @@ defaultAmpleforthDocumentBodyInnerHTML ^ <String> = (
         const textContainer = document.querySelector(''p'');
 </div>'
 )
-public freshDocumentNamed: n <Symbol> ^ <Document> = (
-  ^freshDocumentWithContents: '<div class = "ampleforthDocumentClass" name = "', n, '" classBody = "
-()()"></div><div class = "ampleforthDocumentBody" edition="2">', defaultAmpleforthDocumentBodyInnerHTML, '</div>'
+parseMain: f <String> withZipfile: jsz <Alien[JSZip]> = (
+   | 
+   (* parse main document *)
+   dom <Alien[HTMLDocument]>  = DOMParser new parseFromString: f mimeType: 'text/html'.
+   images <Alien[JSZip]> = jsz folder: n, '/images'.
+   videoFolder <Alien[JSZip]> = jsz folder: n, '/video'.
+   audioFolder <Alien[JSZip]> = jsz folder: n, '/audio'.
+   imageMap <Map[String, Alien[Promise[Alien[Blob]]]]> = Map new.
+   contents <Alien[JSZip]> = jsz folder: n,  '/contents'.
+   (* find all image nodes *)
+   imageNodes <Alien[HTMLCollection[Node]]> = dom getElementsByTagName: #img.  
+   imgPromises <JSArray[Promise[Alien[Blob]]]> = JSArray new: (imageNodes at: #length).
+   (* find all video nodes *)
+   videoNodes <Alien[HTMLCollection[HTMLVideoElement]]> = dom getElementsByTagName: #video.  
+   videoPromises <JSArray[Promise[Alien[Blob]]]> = JSArray new: (imageNodes at: #length).
+   (* find all audio nodes *)
+   audioNodes <Alien[HTMLCollection[HTMLAudioElement]]> = dom getElementsByTagName: #audio.  
+   audioPromises <JSArray[Promise[Alien[Blob]]]> = JSArray new: (imageNodes at: #length).
+   |
+   images forEach: [:path <String> :zo <Alien[ZipObject]> |  
+         | 
+         (* The path argument is not working as specified, so we rely on an undocumented feature - the #unsafeOriginalName field.
+         This is obviously undesirable, but so far we don't have a better solution.
+         *)
+         imageName <String> = (path at: #unsafeOriginalName) copyFrom: n size + 9 to: (path at: #unsafeOriginalName) size.
+         |
+         (* Create blob from image and store in a map keyed by image name *)       
+         imageMap at: imageName put: (zo async: #blob)
+         ].
+         (* Collect images in an array, in 1:1 correspondence with img nodes *)
+         collect: imageNodes into: imgPromises using: imageMap.
+         (* Resolve image promises and process them *)
+        (JSPromise all: imgPromises) then: [:imgs <JSArray[Alien[Blob]]> |  
+             (* Create internal URIs for images and update img nodes accordingly *)
+             0 to: (imgs at: #length) - 1 do: [:i <Integer> |    
+               (imageNodes at: i) at: #src put: (URL createObjectURL: (imgs at: i)).
+               ].
+             (* Create a regular doc from the revised DOM *)
+             namespace model at: n put: (ide documents freshDocumentFromDOM: dom). 
+             successBlock value.
+             nil.
+             ] onError: [:ex | failureBlock value:  'Error loading document: ', ex printString. nil].
+)
+loadImages: images <Alien[JSZip]> ofDocumentNamed: n <String>  into: namespace <NamespaceSubject> dom: dom  ifSuccess: successBlock <[]> ifFailure: failureBlock <[:List[String]]>= (
+  |
+  imageMap <Map[String, Alien[Promise[Alien[Blob]]]]> = Map new.
+  (*find all image nodes *)
+  imageNodes <Alien[HTMLCollection[Node]]> = dom getElementsByTagName: #img. 
+  imgPromises <JSArray[Promise[Alien[Blob]]]> = JSArray new: (imageNodes at: #length).
+  |
+
+  images forEach: [:path <String> :zo <Alien[ZipObject]> |  
+         | 
+         (* The path argument is not working as specified, so we rely on an undocumented feature - the #unsafeOriginalName field.
+         This is obviously undesirable, but so far we don't have a better solution.
+         *)
+         imageName <String> = (path at: #unsafeOriginalName) copyFrom: n size + 9 to: (path at: #unsafeOriginalName) size.
+         |
+         (* Create blob from image and store in a map keyed by image name *)       
+         imageMap at: imageName put: (zo async: #blob)
+         ].
+         (* Collect images in an array, in 1:1 correspondence with img nodes *)
+         collect: imageNodes into: imgPromises using: imageMap.
+
+         (* Resolve image promises and process them *)
+        (JSPromise all: imgPromises) then: [:imgs <JSArray[Alien[Blob]]> |  
+             (* Create internal URIs for images and update img nodes accordingly *)
+             0 to: (imgs at: #length) - 1 do: [:i <Integer> |    
+               (imageNodes at: i) at: #src put: (URL createObjectURL: (imgs at: i)).
+               ].
+             successBlock value.
+             nil.
+             ] onError: [:ex | failureBlock value:  'Error loading document: ', ex printString. nil].
+)
+public loadDocument2: jsz <Alien[JSZip]> named: n <String> into: namespace <NamespaceSubject> ifSuccess: successBlock <[]> ifFailure: failureBlock <[:List[String]]> = (
+(* Takes a zipfile representing a Document and converts it into a live Document. *)
+  |
+  images <Alien[JSZip]> = jsz folder: n, '/images'.
+  videoFolder <Alien[JSZip]> = jsz folder: n, '/video'.
+  audioFolder <Alien[JSZip]> = jsz folder: n, '/audio'.
+  classFolder <Alien[JSZip]> = jsz folder: n, '/classes'.
+  documentFolder <Alien[JSZip]> = jsz folder: n, '/documents'.
+  contents <Alien[JSZip]> = jsz folder: n,  '/contents'.
+  (* get main document *)
+  main <Alien[ZipObject]> = jsz file: n, '/', n, '.html'.
+  |
+  loadClasses: classFolder into: namespace ifSuccess: [ 
+    loadTranscluded: documentFolder into: namespace ifSuccess: [
+       (* Extract main document contents *)     
+       (main async: #string) then: [:f  <String> |
+          |
+          (* parse main document *)
+          dom <Alien[HTMLDocument]>  = DOMParser new parseFromString: f mimeType: 'text/html'.
+          |
+          loadImages: images ofDocumentNamed: n into: namespace dom: dom ifSuccess: [
+             (* Create a regular doc from the revised DOM *)
+             namespace model at: n put: (ide documents freshDocumentFromDOM: dom). 
+             successBlock value.
+             nil.
+          ]  ifFailure: [:ex | failureBlock value:  'Failure loading document: ', ex printString. nil].
+       ] onError: [:ex | failureBlock value:  'Error loading document: ', ex printString. nil].
+    ] ifFailure: [:ex | failureBlock value:  'Failure loading transcluded documents: ', ex printString. nil].
+    nil.
+  ] ifFailure: [:ex | failureBlock value:  'Failure loading document: ', ex printString. nil].
 )
 loadTranscluded: documentFolder <Alien[JSZip]> into: namespace <NamespaceSubject> ifSuccess: successBlock <[]> ifFailure: failureBlock <[:List[String]]>= (
   |
@@ -1371,14 +1526,35 @@ loadTranscluded: documentFolder <Alien[JSZip]> into: namespace <NamespaceSubject
      nil
   ] onError: [:ex | failureBlock value:  'Error loading transcluded documents: ', ex printString. nil].
 )
+collect: nodes <HTMLCollection> into: promises <JSArray[Promise[Alien[Blob]]]> using: map <Map[String, Alien[Promise[Alien[Blob]]]]> = (
+   (* Collect media in an array, in 1:1 correspondence with media nodes *)
+   0 to: (nodes at: #length) - 1 do: [:i <Integer> |  
+      promises at: i put: (map at: ((nodes at: i) at: #title)).
+      ].
+)
+buildMap: map <Map[String, Alien[Promise[Alien[Blob]]]]> for: folder <Alien[JSZip]> withinDocumentNamed: n <String> = (
+       folder forEach: [:path <String> :zo <Alien[ZipObject]> |  
+         | 
+         (* The path argument is not working as specified, so we rely on an undocumented feature - the #unsafeOriginalName field.
+         This is obviously undesirable, but so far we don't have a better solution.
+         *)
+         resourceName <String> = (path at: #unsafeOriginalName) copyFrom: n size + 8 to: (path at: #unsafeOriginalName) size.
+         |
+         (* Create blob from resource and store in a map keyed by resource name *)       
+         map at: resourceName put: (zo async: #blob)
+         ].
+)
 public loadDocument: jsz <Alien[JSZip]> named: n <String> into: namespace <NamespaceSubject> ifSuccess: successBlock <[]> ifFailure: failureBlock <[:List[String]]> = (
 (* Takes a zipfile representing a Document and converts it into a live Document. *)
-(* TODO: move this to Documents, so the IDE is not dependent on details of Document representation *)
   |
   images <Alien[JSZip]> = jsz folder: n, '/images'.
+  videoFolder <Alien[JSZip]> = jsz folder: n, '/video'.
+  audioFolder <Alien[JSZip]> = jsz folder: n, '/audio'.
   classFolder <Alien[JSZip]> = jsz folder: n, '/classes'.
   documentFolder <Alien[JSZip]> = jsz folder: n, '/documents'.
   imageMap <Map[String, Alien[Promise[Alien[Blob]]]]> = Map new.
+  videoMap <Map[String, Alien[Promise[Alien[Blob]]]]> = Map new.
+  audioMap <Map[String, Alien[Promise[Alien[Blob]]]]> = Map new.  
   contents <Alien[JSZip]> = jsz folder: n,  '/contents'.
   (* get main document *)
   main <Alien[ZipObject]> = jsz file: n, '/', n, '.html'.
@@ -1403,21 +1579,47 @@ public loadDocument: jsz <Alien[JSZip]> named: n <String> into: namespace <Names
          (*find all image nodes *)
          imageNodes <Alien[HTMLCollection[Node]]> = dom getElementsByTagName: #img.  
          imgPromises <JSArray[Promise[Alien[Blob]]]> = JSArray new: (imageNodes at: #length).
+         (*find all video nodes *)
+         videoNodes <Alien[HTMLCollection[HTMLVideoElement]]> = dom getElementsByTagName: #video.  
+         videoPromises <JSArray[Promise[Alien[Blob]]]> = JSArray new: (videoNodes at: #length).
+         (*find all audio nodes *)
+         audioNodes <Alien[HTMLCollection[HTMLAudioElement]]> = dom getElementsByTagName: #audio.  
+         audioPromises <JSArray[Promise[Alien[Blob]]]> = JSArray new: (audioNodes at: #length).
          |
          (* Collect images in an array, in 1:1 correspondence with img nodes *)
          0 to: (imageNodes at: #length) - 1 do: [:i <Integer> |  
              imgPromises at: i put: (imageMap at: ((imageNodes at: i) at: #name)).
              ].
+         (* Collect videos in an array, in 1:1 correspondence with video nodes *)
+         buildMap: videoMap for: videoFolder withinDocumentNamed: n.
+         collect: videoNodes into: videoPromises using: videoMap.
+         (* Collect audios in an array, in 1:1 correspondence with audio nodes *)
+         buildMap: audioMap for: audioFolder withinDocumentNamed: n.
+         collect: audioNodes into: audioPromises using: audioMap.
          (* Resolve image promises and process them *)
         (JSPromise all: imgPromises) then: [:imgs <JSArray[Alien[Blob]]> |  
              (* Create internal URIs for images and update img nodes accordingly *)
              0 to: (imgs at: #length) - 1 do: [:i <Integer> |    
                (imageNodes at: i) at: #src put: (URL createObjectURL: (imgs at: i)).
-               ].
-             (* Create a regular doc from the revised DOM *)
-             namespace model at: n put: (ide documents freshDocumentFromDOM: dom). 
-             successBlock value.
-             nil.
+               ]. 
+             (* Resolve video promises and process them *)
+             (JSPromise all: videoPromises) then: [:videos <JSArray[Alien[Blob]]> |  
+               (* Create internal URIs for videos and update video nodes accordingly *)
+               0 to: (videos at: #length) - 1 do: [:j <Integer> |   
+                 (videoNodes at: j) at: #src put: (URL createObjectURL: (videos at: j)).
+                 ].  
+                 (* Resolve audio promises and process them *)
+                 (JSPromise all: audioPromises) then: [:audios <JSArray[Alien[Blob]]> |  
+                 (* Create internal URIs for audios and update audio nodes accordingly *)
+                 0 to: (audios at: #length) - 1 do: [:k <Integer> |    
+                   (audioNodes at: k) at: #src put: (URL createObjectURL: (audios at: k)).
+                   ].              
+                  (* Create a regular doc from the revised DOM *)
+                  namespace model at: n put: (ide documents freshDocumentFromDOM: dom). 
+                  successBlock value.
+                  nil.
+                  ] onError: [:ex | failureBlock value:  'Error loading document: ', ex printString. nil].
+               ] onError: [:ex | failureBlock value:  'Error loading document: ', ex printString. nil].
              ] onError: [:ex | failureBlock value:  'Error loading document: ', ex printString. nil].
              nil
          ] onError: [:ex | failureBlock value:  'Error loading document: ', ex printString. nil].
@@ -1425,16 +1627,6 @@ public loadDocument: jsz <Alien[JSZip]> named: n <String> into: namespace <Names
        ] ifFailure: [:ex | failureBlock value:  'Failure loading transcluded documents: ', ex printString. nil].
        nil.
      ] ifFailure: [:ex | failureBlock value:  'Failure loading document: ', ex printString. nil].
-)
-loadClasses: classFolder <Alien[JSZip]>  into: namespace <NamespaceSubject> ifSuccess: successBlock <[]> ifFailure: failureBlock <[:List[String]]>= (
-  |
-  classPromises <List[JSPromise[String]]> = List new.
-  promiseArray <JSArray[JSPromise[String]]>
-  |
-  classFolder forEach: [:path <String> :zo <ZipObject> | classPromises add: (zo async: #string). nil].
-  promiseArray::  JSArray new: classPromises size.
-  0 to: classPromises size -1 do: [:i <Integer> | promiseArray at: i put: (classPromises at: i+1)].
-  namespace compilePromises: promiseArray ifSuccess: successBlock ifFailure: failureBlock.
 )
 ) : (
 )

@@ -29,7 +29,7 @@
 #   Copies all built files to the Newspeak HTTPs server directory
 #   specified in the first argument, and updates the PWA Service Worker version file
 #   specified in the second argument. The updated version is used as the PWA cache version.
-#   By 'All built files' we mean the 'HopscotchWebIDE.vfuel' and miscelaneous js and html files
+#   By 'All built files' we mean the 'HopscotchWebIDE.vfuel' and miscellaneous js and html files
 #   supporting the PWA, as well as the script 'serve-newspeak.sh', which starts the HTTP server.
 
 # Arguments:
@@ -40,25 +40,25 @@
 
 # Usage Examples:
 #
-#   1. Deploy files for server running from
-#      the '~/servers/newspeak-http-server' directory, serving as 'localhost'
+#   1. Deploy files to server running from
+#      the '~/servers/newspeak-http-server' directory, serving as 'localhost'.
 #      - cd tool
 #      - ./deploy-webide-vfuel-as-pwa.sh  ~/servers/newspeak-http-server  localhost
 #
-#   2. Deploy files for server running from
+#   2. Deploy files to server running from
 #      the '~/servers/newspeak-http-server' directory, serving as 'newspeaklanguage.org'
 #      - cd tool
 #      - ./deploy-webide-vfuel-as-pwa.sh  ~/servers/newspeak-http-server  newspeaklanguage.org
 #
 #      'newspeaklanguage.org' is a special case in the sense that git does NOT ignore
 #      it's version file, the '$NEWSPEAK/pwa-deployed-versions/newspeaklanguage.org.version'.
-#      This ensures a global uniqueness of the PWA version served from 'https://newspeaklanguage.org'.
+#      This ensures the global uniqueness of the PWA version served from 'https://newspeaklanguage.org'.
 #
-#   3. Deploy files for server running from
-#      the '../out' directory, serving as 'localhost'
+#   3. Deploy files to server running from
+#      the '../out' directory, serving as 'localhost'.
 #      This mimicks (I think) how the server ran before this change.
 #      The advantage of serving from the '../out' directory is that 
-#      *You ONLY need to run this 'deploy' script once, after, just keep running the 'build' script.*
+#      *you ONLY need to run this 'deploy' script once, after, just keep running the 'build.sh' script.*
 #      - cd tool
 #      - ./deploy-webide-vfuel-as-pwa.sh  ../out  localhost
 

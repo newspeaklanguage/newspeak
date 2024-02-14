@@ -2,8 +2,9 @@
 
 ##
 ## Description:
-##   This file is sourced in any script running Newspeak build.
-##   It does set environment variables, for functions in 'util.sh'.
+##   This file sets environment variables for functions in 'newspeak_util.sh'.
+##   It is sourced in all scripts running Newspeak build and deploy,
+##   indirectly through 'newspeak_util.sh'.
 ##
 
 #

@@ -20,11 +20,11 @@ Note: below, the terms related to 'serve', 'server' refers to
 
 This is only a terse introduction to creating and serving Newspeak applications.
 
-A Newspeak application is a Newspeak class which adheres to a few specific API naming conventions.  This class can be saved to a `.ns` source file, then 'build' (compiled) to a binary `.vfuel`, which is deployed and served.
+A Newspeak application is a Newspeak class which adheres to a few specific API naming conventions.  This class can be saved to a `.ns` source file, then 'built' (compiled) to a binary `.vfuel`, which is deployed and served.
 
 A `.vfuel` file can be created from its source class in one of two ways:
 
-1. From the locally served or online [Newspeak IDE](http://www.newspeaklanguage.org/) by clicking the **[deploy]** link beside the application class.  This process can be slow, currently not working **(todo is it not?)**, and is not described here.
+1. From the locally served or online [Newspeak IDE](http://www.newspeaklanguage.org/webIDE) by clicking the **[deploy]** link beside the application class.  This process can be slow, and is not described in this document.
 
 2. From a command line, by first saving the application class to a `.ns` source file, then running the `build.sh` script described below.  To use this command line method, you need to install several items.  This process is described in the [Building Newspeak from scratch](#3.-building-newspeak-from-scratch) section and its subsections.
 
@@ -32,7 +32,7 @@ To serve a Newspeak application in a HTTP server, you need a binary file with `.
 
 # 3. Building Newspeak from scratch
 
-TL;DR: If you want to build the Newspeak IDE or any Newspeak application from scratch, follow the intallation steps in the section 3.1 and subsection 3.1.1 (one-time only). Then follow the steps in section 4.1 (for Newspeak IDE running as PWA) or 4.2 (for application running as a website). The steps in section 4.1 or 4.2 are repeated after after any change in the application.
+TL;DR: If you want to build the Newspeak IDE or any Newspeak application from scratch, follow the intallation steps in section 3.1 and subsection 3.1.1 (each only needs to be performed one-time). Then follow the steps in section 4.1 (for Newspeak IDE running as a PWA) or 4.2 (for application running as a website). The steps in section 4.1 or 4.2 are repeated after after any change in the application.
 
 In addition to using the online version of the [Newspeak IDE](http://www.newspeaklanguage.org/), you can build, deploy, and serve the Newspeak system, or any Newspeak application, on your computer. There may be a few reasons to build and use the Newspeak system this way:
 
@@ -45,26 +45,25 @@ Read and follow the steps below to build Newspeak locally (on your computer) fro
 
 This is needed one-time only.
 
-On a high level, to build Newspeak locally requires some software to be downloaded or installed: *Newspeak*, *Primordialsoup* and it's dependecies and targets: *Emscripten*, *Scons*, *g++-multilib*. Details of the installing the required software are below.
+On a high level, building Newspeak locally requires some software to be downloaded, cloned from Github, or installed: *Newspeak*, *Primordialsoup* and it's dependecies and targets: *Emscripten*, *Scons*, *g++-multilib*. Details of how to install the required software are below.
 
-The default directories to which you install Newspeak are
-
+The default directories for installing *Newspeak*, *Primordialsoup* and *Emscripten* are determined by environment variables set in `newspeak/tool/newspeak_env.sh`. These variables and their default values are 
+ 
 ```sh
-~/software/emsdk # Emscripten directory
-~/software/nswasm/newspeak # Newspeak directory
-~/software/nswasm/primordialsoup # Primordialsoup directory
+export EMSDK=~/software/emsdk                           # Emscripten directory
+export NEWSPEAK=~/software/nswasm/newspeak              # Newspeak directory
+export PRIMORDIALSOUP=~/software/nswasm/primordialsoup  # Primordialsoup directory
 ```
 
-If you wish to use different directories, you will need to do two things: 
+We use these defaults throughout the rest of this document. If you wish to use different directories, you will need to do two things: 
 
-- Adjust the above directory names in this document
+- Adjust references to the above directory names in this document
 - After cloning Newspeak in the steps below, edit the file `newspeak/tool/newspeak_env.sh` and adjust the directory names to your situation.
 
 The installation steps:
 
-1. Start with setting up a directory for Newspeak and Primordialsoup, `~/software/nswasm` and then clone this repo under it.
-2. In the same directory, clone
-<https://github.com/newspeaklanguage/primordialsoup> and switch to the branch called `extraRevs`.
+1. Start with creating a directory for Newspeak and Primordialsoup, `~/software/nswasm` and then clone this repo under it.
+2. In `~/software/nswasm`, also clone <https://github.com/newspeaklanguage/primordialsoup> and switch to the branch called `extraRevs`.
 
 You can use the following commands to execute 1. and 2. just above:
 
@@ -80,13 +79,7 @@ git checkout extraRevs
 To be clear: at this point, you should now have a directory named `~/software/nswasm`, with two
 subdirectories; `newspeak`, containing this repository, and `primordialsoup`, containing the `extraRevs` branch of <https://github.com/newspeaklanguage/primordialsoup>.
 
-**Important:** If you are using 'non default' directories for your installation, now edit the `newspeak/tool/newspeak_env.sh`, change the exported variables there, and save the file. The default unedited `newspeak/tool/newspeak_env.sh` is:
-
-```sh
-export EMSDK=~/software/emsdk                           # Emscripten directory
-export NEWSPEAK=~/software/nswasm/newspeak              # Newspeak directory
-export PRIMORDIALSOUP=~/software/nswasm/primordialsoup  # Primordialsoup directory
-```
+**Important:** If you are using 'non default' directories for your installation, now edit the file `newspeak/tool/newspeak_env.sh`, change the exported variables there, and save the file. 
 
 ### 3.1.1 Building Newspeak: installing Primordialsoup dependencies
 
@@ -113,9 +106,9 @@ Unless you are targetting Fuchsia, follow the steps 1 to 3 in this section to in
 
     Clone the Emscripten SDK (`emsdk`) using these steps
     ```sh
-    # Set the Newspeak environment
+    # Set the Newspeak environment.
     cd ~/software/nswasm/newspeak # Adjust to your directory path
-    . ./tool/newspeak_env.sh
+    . ./tool/newspeak_env.sh      # The '. ' at the beginning is required
     
     # Clone the emsdk
     cd $EMSDK/..
@@ -140,7 +133,7 @@ Unless you are targetting Fuchsia, follow the steps 1 to 3 in this section to in
        '-s', 'EXPORTED_FUNCTIONS=["_load_snapshot", "_handle_message", "_handle_signal", "_free", "_malloc"]',
        '-s', 'EXPORTED_RUNTIME_METHODS=["stringToUTF8"]',
     ```
-    to be clear, the first (default) works with `emsdk` version '2.0.0', the second with 'latest'.
+    to be clear, the first (default) works with `emsdk` version '2.0.0', the second with 'latest'. As of February 12 2024, 'latest' emsdk corresponds to version '3.1.53'.
 
 3. **Build Primordialsoup (optional):** You can now build primordialsoup to make sure everything installed. This step is not necessary as Primordialsoup build is part of the Newspeak build in the next section - but running it should catch any dependencies issues early.
 
@@ -158,21 +151,25 @@ Note: For original instructions of Primordialsoup dependencies that include Fuch
 
 ## 3.2 Building and deploying Newspeak applications: lifecycle
 
-The above section [Building Newspeak: installing required software](#3.1-building-newspeak:-installing-required-software) including its subsection [Building Newspeak: installing Primordialsoup dependencies](#3.1.1-building-newspeak:-installing-primordialsoup-dependencies) are **only need to be performed one-time during installation**. 
+The above section [Building Newspeak: installing required software](#3.1-building-newspeak:-installing-required-software) including its subsection [Building Newspeak: installing Primordialsoup dependencies](#3.1.1-building-newspeak:-installing-primordialsoup-dependencies) **only need to be performed one-time during installation**. 
 
 This section and sections below describe the repeated 'build', 'deploy', 'serve' lifecycle of Newspeak applications.
 
 **You need to run the 'build' and 'deploy' steps in one of the sections below after you made a change to a Newspeak source, and saved it to a `.ns` file.**  The changed file(s) may be one of the Newspeak core classes, or a class that is a part of your application you are building in Newspeak.  You need to run a 'build' to regenerate the application's `.vfuel` file, and run one of the 'deploy' scripts to copy the results to the 'deployment directory'. You also need to start the HTTP server in the 'deployment directory'.
 
-**Important:** All scripts to build and deploy a Newspeak application are in the `newspeak/tool` directory, and must be executed from the `newspeak/tool` directory. The Newspeak IDE is only one of possible Newspeak applications.
+**Important:** All scripts to build and deploy a Newspeak application are in the `newspeak/tool` directory, and must be executed from the `newspeak/tool` directory. The Newspeak IDE is only one possible Newspeak application.
 
 The term **build** refers to the process which creates the `.vfuel` binary files from the application source `.ns` files.  The script `newspeak/tool/build.sh` is the build script.
 
-The term **deploy** refers to the process of copying the Newspeak application `.vfuel` file and other files and resources (`.html`, `.js`, `.png`) to the 'deploy directory' where an HTTP server is or will be running.  The 'deploy' step also copies scripts that can start an HTTP server to the 'deploy directory'. Newspeak applications can be deployed in two ways: as a Progressive Web App (PWA) or as a regular website. The 'PWA deploy' is performed by the script `newspeak/tool/deploy-webide-vfuel-as-pwa.sh`, the 'website deploy' is performed by the script `deploy-all-vfuels-as-website.sh`
+The term **deploy** refers to the process of copying the Newspeak application `.vfuel` file and other files and resources (`.html`, `.js`, `.png`) to the 'deploy directory' where an HTTP server is or will be running.  The 'deploy' step also copies scripts that can start an HTTP server to the 'deploy directory'.  Newspeak applications can be deployed in two ways: as a regular website or as a Progressive Web App (PWA). 
+- *Deploying as a website*: is performed by the script `deploy-all-vfuels-as-website.sh`.  Running this script deploys all `.vfuel` files built by the script `newspeak/tool/build.sh`.
+- *Deploying as a PWA*: Currently, only the Newspeak IDE application binary `HopscotchWebIDE.vfuel` (referred to as `webIDE`) can be deployed and served as a PWA out of the box. This deployment of the `webIDE` is performed by the script `newspeak/tool/deploy-webide-vfuel-as-pwa.sh`.
+
+Refer to section [4. Building, deploying, and serving Newspeak application(s)](4.-Building,-deploying,-and-serving-Newspeak applications) for more details regarding the two deployment methods.
 
 The term **serve** refers to running the HTTP server in a directory where the Newspeak application was 'deploy'ed.
 
-Note: If you want to deploy other application's `.vfuel` as a PWA, you can use the directory structure under [webIDE](https://github.com/newspeaklanguage/newspeak/tree/master/platforms/webIDE), rename it, make changes to `index.html`, `manifest.json`, `sw.js`, `primordialsoup-setup.js`, also remove files not applicable to your application, and copy your application's `.vfuel` in the location of `HopscotchWebIDE.vfuel`. 
+Note: If you want to deploy other application's `.vfuel` as a PWA, you can clone the directory structure under [webIDE](https://github.com/newspeaklanguage/newspeak/tree/master/platforms/webIDE), rename it, make changes to `index.html`, `manifest.json`, `sw.js`, `primordialsoup-setup.js`, remove files not applicable to your application, and replace `HopscotchWebIDE.vfuel` with your application's `.vfuel`. 
 
 ## 3.3 Building Newspeak applications: the build.sh script
 
@@ -193,11 +190,13 @@ Below are two examples of building:
     ./build.sh RuntimeForHopscotchForHTML CheckedItemApp CheckedItemApp.vfuel
     ```
 
-# 4. Building, deploying, and serving Newspeak application(s)
+# 4. Building, deploying, and serving Newspeak applications
 
-As described in [Building and deploying Newspeak: lifecycle](#Building-and-deploying-Newspeak-applications:-lifecycle), Newspeak applications can be deployed and served as a Progressive Web App (PWA), or a 'regular' website.  Only the Newspeak IDE application, the `webIDE`, can be deployed and served as a PWA out of the box.
+As described in [Building and deploying Newspeak: lifecycle](#Building-and-deploying-Newspeak-applications:-lifecycle), Newspeak applications can be deployed and served as a Progressive Web App (PWA), or a 'regular' website.  Currently, only the Newspeak IDE application, the `webIDE`, can be deployed and served as a PWA out of the box.
 
-Reflecting the above, there are two 'deploy' scripts, `deploy-webide-vfuel-as-pwa.sh` and `deploy-all-vfuels-as-website.sh`. Both require an argument containing a name of the directory from which the Newspeak application(s) are served by the script `serve-newspeak.sh`. The first (PWA) deploy script also requires a name of the PWA version file (usually 'localhost'; otherwise 'newspeaklanguage.org', 'myApp.com' or similar).
+Reflecting the above, there are two 'deploy' scripts, `deploy-webide-vfuel-as-pwa.sh` and `deploy-all-vfuels-as-website.sh`. Both require an argument containing a name of the directory from which the Newspeak applications are served by the script `serve-newspeak.sh`. The first (PWA) deploy script also requires a name of the PWA version file (usually 'localhost'; otherwise 'newspeaklanguage.org', 'myApp.com' or similar).
+
+todo switch the sequence of 4.1 (website) and 4.2 (PWA)
 
 ## 4.1 Building, deploying, and serving Newspeak IDE as a Progressive Web Application (PWA)
 
@@ -226,7 +225,7 @@ cd tool
 #   Copies all built files to the Newspeak HTTPs server directory
 #   specified in the first argument, and updates the PWA Service Worker version file
 #   specified in the second argument. The updated version is used as the PWA cache version.
-#   By 'All built files' we mean the 'HopscotchWebIDE.vfuel' and miscelaneous js and html files
+#   By 'All built files' we mean the 'HopscotchWebIDE.vfuel' and miscellaneous js and html files
 #   supporting the PWA, as well as the script 'serve-newspeak.sh', which starts the HTTP server.
 #
 # Arguments:
@@ -237,24 +236,25 @@ cd tool
 #
 # Usage Examples:
 #
-#   1. Deploy files for server running from
+#   1. Deploy files to server running from
 #      the '~/servers/newspeak-http-server' directory, serving as 'localhost'
 #      - cd tool
 #      - ./deploy-webide-vfuel-as-pwa.sh  ~/servers/newspeak-http-server  localhost
 #
-#   2. Deploy files for server running from
+#   2. Deploy files to server running from
 #      the '~/servers/newspeak-http-server' directory, serving as 'newspeaklanguage.org'
 #      - cd tool
 #      - ./deploy-webide-vfuel-as-pwa.sh  ~/servers/newspeak-http-server  newspeaklanguage.org
 #
 #      'newspeaklanguage.org' is a special case in the sense that git does NOT ignore
 #      it's version file, the '$NEWSPEAK/pwa-deployed-versions/newspeaklanguage.org.version'.
-#      This ensures a global uniqueness of the PWA version served from 'https://newspeaklanguage.org'.
+#      This ensures the global uniqueness of the PWA version served from 'https://newspeaklanguage.org'.
 #
-#   3. Deploy files for server running from
+#   3. Deploy files to server running from
+#      the '../out' directory, serving as 'localhost'. 
 #      This mimicks (I think) how the server ran before this change.
 #      The advantage of serving from the '../out' directory is that 
-#      *You ONLY need to run the 'deploy' script once, after, just keep running the 'build' script.*
+#      *you ONLY need to run the 'deploy' script once, after, just keep running the 'build.sh' script.*
 #      - cd tool
 #      - ./deploy-webide-vfuel-as-pwa.sh  ../out  localhost
 
@@ -278,7 +278,7 @@ cd "$httpServerRunPath"
 #
 ```
 
-Running the above commands would build, deploy, and serve the `HopscotchWebIDE.vfuel` as PWA.
+Running the above commands would build, deploy, and serve the `HopscotchWebIDE.vfuel` as a PWA.
     
 ## 4.2 Building, deploying, and serving any Newspeak application (.vfuel) as a website
     
@@ -304,7 +304,7 @@ cd tool
 #   Copies all built files to the Newspeak HTTPs server directory
 #   specified in the first argument.
 #   By 'All built files' we mean all '.vfuel' files built by 'build.sh',
-#   and miscelaneous js and html files supporting the website.
+#   and miscellaneous js and html files supporting the website.
 #
 # Arguments:
 #
@@ -314,15 +314,15 @@ cd tool
 #   See function 'args_parse_for_deploy_as_website' for details
 #
 # Usage Examples:
-#   1. Deploy files for server running from
+#   1. Deploy files to server running from
 #      the '~/servers/newspeak-http-server' directory
 #     - cd tool
 #     - ./deploy-all-vfuels-as-website.sh  ~/servers/newspeak-http-server
-#   2. Deploy files for server running from
+#   2. Deploy files to server running from
 #      the '../out' directory.
 #      This mimicks (I think) how the server ran before this change 
 #      The advantage of serving from the '../out' directory is that 
-#      *You ONLY need to run this 'deploy' script once, after, just keep running the 'build' script.*
+#      *You ONLY need to run this 'deploy' script once, after, just keep running the 'build.sh' script.*
 #     - cd tool
 #     - ./deploy-all-vfuels-as-website.sh  ../out
 

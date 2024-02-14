@@ -29,25 +29,25 @@
 #   Copies all built files to the Newspeak HTTPs server directory
 #   specified in the first argument.
 #   By 'All built files' we mean all '.vfuel' files built by 'build.sh',
-#   and miscelaneous js and html files supporting the website.
+#   and miscellaneous js and html files supporting the website.
 
 # Arguments:
 #
 #   1. http-server-dir
 #   Note: there is no need for the second argument as in the PWA script -
 #         we do not need a PWA version number.
-#   See function 'args_parse_for_deploy_as_website' for details
+#   See function 'args_parse_for_deploy_as_website' for details.
 
 # Usage Examples:
-#   1. Deploy files for server running from
+#   1. Deploy files to server running from
 #      the '~/servers/newspeak-http-server' directory
 #     - cd tool
 #     - ./deploy-all-vfuels-as-website.sh  ~/servers/newspeak-http-server
-#   2. Deploy files for server running from
+#   2. Deploy files to server running from
 #      the '../out' directory.
-#      This mimicks (I think) how the server ran before this change 
+#      This mimicks (I think) how the server ran before this change.
 #      The advantage of serving from the '../out' directory is that 
-#      *You ONLY need to run this 'deploy' script once, after, just keep running the 'build' script.*
+#      *you ONLY need to run this 'deploy' script once, after, just keep running the 'build.sh' script.*
 #     - cd tool
 #     - ./deploy-all-vfuels-as-website.sh  ../out
 

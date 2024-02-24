@@ -1,6 +1,6 @@
 # 1. Newspeak
 
-[Newspeak](http://www.newspeaklanguage.org/) is a new programming language in the tradition of Self and Smalltalk.
+[Newspeak](http://www.newspeaklanguage.org/webIDE/) is a new programming language in the tradition of Self and Smalltalk.
 
 Newspeak IDE is delivered via the web on the above link as a Progressive Web App (PWA). 
 This means that you can install it locally on your device, and then run it 

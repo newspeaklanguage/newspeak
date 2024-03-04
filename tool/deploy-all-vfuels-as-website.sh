@@ -45,7 +45,7 @@
 #     - ./deploy-all-vfuels-as-website.sh  ~/servers/newspeak-http-server
 #   2. Deploy files to server running from
 #      the '../out' directory.
-#      This mimicks (I think) how the server ran before this change.
+#      This mimicks how the server was originally used, serving from the '../out' directory.
 #      The advantage of serving from the '../out' directory is that 
 #      *you ONLY need to run this 'deploy' script once, after, just keep running the 'build.sh' script.*
 #     - cd tool

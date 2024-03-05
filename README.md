@@ -82,7 +82,7 @@ The installation steps:
 You can use the following commands to execute 1. and 2. just above:
 
 ```sh
-mkdir ~/software/nswasm
+mkdir --parent ~/software/nswasm
 cd ~/software/nswasm # Adjust to your directory path
 git clone https://github.com/newspeaklanguage/newspeak.git
 git clone https://github.com/newspeaklanguage/primordialsoup.git
@@ -282,7 +282,7 @@ cd tool
 #
 #   3. Deploy files to server running from
 #      the '../out' directory, serving as 'localhost'. 
-#      This mimicks (I think) how the server ran before this change.
+#      This mimicks how the server was originally used, serving from the '../out' directory.
 #      The advantage of serving from the '../out' directory is that 
 #      *you ONLY need to run the 'deploy' script once, after, just keep running the 'build.sh' script.*
 #      - cd tool
@@ -350,7 +350,7 @@ cd tool
 #     - ./deploy-all-vfuels-as-website.sh  ~/servers/newspeak-http-server
 #   2. Deploy files to server running from
 #      the '../out' directory.
-#      This mimicks (I think) how the server ran before this change 
+#      This mimicks how the server was originally used, serving from the '../out' directory.
 #      The advantage of serving from the '../out' directory is that 
 #      *You ONLY need to run this 'deploy' script once, after, just keep running the 'build.sh' script.*
 #     - cd tool

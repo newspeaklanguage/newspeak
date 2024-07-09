@@ -47,9 +47,9 @@
 //  - The changed bits happen to be a 'version number',
 //    which we also use to version the cache, and to delete the old cache versions.
 //  - The bits change will cause the PWA to 'install' and 'activate' the new sw.js,
-//    by trigerring the 'install' and 'activate' events on the listeners which the sw.js registered.
-//    The 'install' event is trigerred only once ever, when the server's sw.js is changed.
-//  - After 'install', the 'activate' event is trigerred.
+//    by triggering the 'install' and 'activate' events on the listeners which the sw.js registered.
+//    The 'install' event is triggered only once ever, when the server's sw.js is changed.
+//  - After 'install', the 'activate' event is triggered.
 //  - We use the 'version' number to version caches, and we use the 'activate'
 //    event listener to delete old caches.
 
@@ -65,7 +65,7 @@
 // The version update can be done either manually (we rely on this),
 // or by applying some framework that generates this sw.js worker script.
 
-const pwaVersion = 131;
+const pwaVersion = 132;
 
 // Cache name used by the 'caches' global variable.
 // The pwaCacheName now includes the pwaVersion;

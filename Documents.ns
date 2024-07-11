@@ -6,7 +6,7 @@ This module supports the live editing of documents that include rich text and li
 
 It implements an editor with two views: one view is a text editor on raw HTML, and the second is the same HTML, rendered. The editor is live - every edit causes immediate change in the rendered HTML.
 
-Importantly, the HTML can specify embedded Hopscotch fragments using Ampleforth.  Indeed, the primary purpose here is to facilitate the creation of live documents which include programmed UI elements such as live literate programs. Going further, we expect to create documents that function as full fledged applications. Therefore, the editor must be a complete development environment, and so this module is part of the IDE.
+Importantly, the HTML can specify embedded Hopscotch fragments using Ampleforth.  Indeed, the primary purpose here is to facilitate the creation of live documents which include programmed UI elements such as live literate programs, or documents that function as full fledged applications. Therefore, the editor must be a complete development environment, and so this module is part of the IDE.
 
 For convenience, we allow direct access all standard fragment construction methods within a document. We also allow easy access to the ide root namespace, even though this tends to runs counter to Newspeak's modularity philosophy. 
 
@@ -45,7 +45,7 @@ Saving, in the traditional sense, saves content (and its dependencies), in a zip
 
 Content could of course include multiple units (say, a list of presentations). Each player knows how to interpret content. Content might come with an external resource to guide it (say, a class with code).
 
-Copyright Gilad Bracha 2022-2024
+Copyright Gilad Bracha 2022-2025
 *)
     |	
     private Map = p collections Map.
@@ -122,6 +122,28 @@ public named: n <String> initialContents: s <String> = (
 )
 )
 public class TwoViewEditorPresenter onDocumentSubject: s <TwoViewEditorSubject> = Presenter onSubject: s (
+(*
+This presenter shows the document HTML (aka the raw view) source side-by-side with the rendered document (aka the live view). The raw view is collapsible. 
+The live view is kept in a holder, #rendered, so that it can easily be replaced as a whole.
+
+The life cycle of the document display is always rooted in the HTML source for the document.
+When the HTML is updated, by whatever means, the raw and live views must be updated accordingly.
+The raw view simply shows the HTML text; for the live view, a new AmpleforthFragment based upon new HTML is inserted into #render. It will process the amplets therein, producing a visual consisting the DOM for the live view. The method driving this is #updateFromRawView.
+
+At this point, the view may change for one of three reasons:
+
+1. The raw view is edited. This is an edit to a CodeMirrorFragment, which is set to trigger action on every change. That action updates the HTML based on the editor contents, which will initiate the process described directly above. See #definition for details.
+2. The live view is edited, either by inserting an amplet (#makeAmplet:), using the UI to manipulate the DOM (e.g., by inserting a list or a heading - see #replaceSelectionUsing:) or or by editing the text directly. The latter is handled by the browser's own text editor, which is given a handler, defined by #updater, that will update the DOM on every character edit. In all cases, handler must copy the current, revised, DOM, scrub it to remove the computed widget trees of the amplets, extract the HTML (these two actions are done in #scrubbedLiveViewSource) and reset the document source based on this new HTML, triggering the document recomputation via #updateFromRawView. All this functionality is driven by #updateAfterEdit.
+3. A UI update occurs. This can occur for all sorts of reasons. Examples:
+  a. An interaction with a widget in the document causes it to update the system in some way, such that the widget itself, and/or or some other widget(s) displayed in the document might need to update their display
+  b. The document is displayed as part of a larger presenter (e.g., an object presenter on the document) and some interaction with another part of the enclosing presenter triggers a UI change.
+  c. We were viewing a different presenter where some UI change was initiated, and we are now returning to a view where the document is included.
+  A UI update works through the usual Hopscotch reactive mechanism.  The relevant parts of that process are the #updateVisualsFromSameKind: methods here and, especially, in AmpleforthFragment. AmpleforthFragment needs to recursively invoke the update process on all amplets. To this end, two maps are maintained. The first, #fragmentMapping, maps every amplet ids or names [1] to their fragments. The second, #expressionMapping, maps amplet ids to the defining expressions of the amplets. This enables an optimization, whereby recomputation can be avoided if the amplet's defining expression is unchanged.
+  
+These maps are stored here so that they can be passed to newly created AmpleforthFragments, which update them as needed.
+  
+[1] Note that only amplets defined via the #ampleforth tag have ids.  Amplets may be defined via the API are given names (see a #help method for an example).  
+*)
   |
   public fragmentMapping <Map[Symbol, Fragment]> = Map new at: 'AmpleforthTargetDocument' put: subject document; yourself.
   public expressionMapping <Map[Symbol, String]> = Map new.
@@ -301,30 +323,6 @@ public respondToMakeSuperscript = (
 )
 public respondToMakeSubscript = (
   respondToMake: 'SUB'
-)
-public replaceSelectionUsing: fos <[:Alien[Selection]]> = (
-  (* Replace the selection with the result of invoking fos; fos is a function of the selection, which we pass into it so it can compute the replacement *)
-  | 
-  jsDoc <Alien[Document]> =  retainedPlatform js global at: #document.
-  selection <Alien[Selection]> = jsDoc getSelection.
-  replacement <Alien[Element]>
-  selectionPostRemoval <Alien[Selection]>
-  range <Alien[Range]>
-  |
-  (* No selection. We might warn about this *)
-  (selection at: #type) = #None ifTrue: [^self].
-  (* compute replacement value based on selection *)
-  replacement:: fos value: selection.
-    (* Remove the selection. This must be done after computing the replacement. Otherwise, the seelction is garbage by the time fos sees it *)
-  selection deleteFromDocument.
-  selectionPostRemoval:: (retainedPlatform js global at: #document) getSelection.
-  range:: selectionPostRemoval getRangeAt: 0.
-  range insertNode: replacement.
-  (* force an update of the live view; this will update the raw view to include the changes *)  
-  updater value.
-  subject setText: scrubbedLiveViewSource.
-  (* Then force a re-rendering based on the updated raw view to activate the amplet*)
-  updateFromRawView
 )
 cleanUpElement: e <Alien[Element]> = (
   |
@@ -615,6 +613,10 @@ updater = (
     rendered content html: newHTML.
     nil]
 )
+render ^ <AmpleforthFragment> = (
+  | result <AmpleforthFragment> = subject isAmpleforth ifTrue: [ampleforth: subject text mapping: fragmentMapping expressions: expressionMapping] ifFalse: [html: subject text]. |
+  ^result
+)
 public makeAmplet: ampletGenerator <[:String | String]> = (
 (*Takes a closure, ampletGenerator, that takes the  text and returns a Newspeak expression. The closure is fed the selected text, and the resulting expression defines the name attribute of an HTML amplet definition using the method #ampletNamed:. This will be used to compute a Hopscotch fragment whose visual will be inserted in the DOM in place of the selection. *)
   (* Extract the text from the selection *)
@@ -636,14 +638,27 @@ public makeAmplet: ampletGenerator <[:String | String]> = (
   (* compute the amplet using ampletGenerator and set its HTML definition accordingly *)
   amplet at: #outerHTML  put: ( ampletNamed: (ampletGenerator value: ampletName)).
   (* force an update of the live view; this will update the raw view to include the changes *)
-  updater value.
-  subject setText: scrubbedLiveViewSource.
-  (* Then force a re-rendering based on the updated raw view to activate the amplet*)
-  updateFromRawView
+  updateAfterEdit
 )
-render ^ <AmpleforthFragment> = (
-  | result <AmpleforthFragment> = subject isAmpleforth ifTrue: [ampleforth: subject text mapping: fragmentMapping expressions: expressionMapping] ifFalse: [html: subject text]. |
-  ^result
+public replaceSelectionUsing: fos <[:Alien[Selection]]> = (
+  (* Replace the selection with the result of invoking fos; fos is a function of the selection, which we pass into it so it can compute the replacement *)
+  | 
+  jsDoc <Alien[Document]> =  retainedPlatform js global at: #document.
+  selection <Alien[Selection]> = jsDoc getSelection.
+  replacement <Alien[Element]>
+  selectionPostRemoval <Alien[Selection]>
+  range <Alien[Range]>
+  |
+  (* No selection. We might warn about this *)
+  (selection at: #type) = #None ifTrue: [^self].
+  (* compute replacement value based on selection *)
+  replacement:: fos value: selection.
+    (* Remove the selection. This must be done after computing the replacement. Otherwise, the seelction is garbage by the time fos sees it *)
+  selection deleteFromDocument.
+  selectionPostRemoval:: (retainedPlatform js global at: #document) getSelection.
+  range:: selectionPostRemoval getRangeAt: 0.
+  range insertNode: replacement.
+  updateAfterEdit
 )
 ) : (
 public onSubject: os <ObjectSubject> ^ <Instance> = (

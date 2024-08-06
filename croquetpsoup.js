@@ -1386,8 +1386,15 @@ var __ATPOSTRUN__ = []; // functions called after the main() is called
 var runtimeInitialized = false;
 var runtimeExited = false;
 
+var croquetDepId;
+var croquetInitDone = false;
 
 function preRun() {
+
+  croquetDepId = getUniqueRunDependency('croquet');
+    if (!croquetInitDone) {
+	  addRunDependency(croquetDepId);
+    }
 
   if (Module['preRun']) {
     if (typeof Module['preRun'] == 'function') Module['preRun'] = [Module['preRun']];
@@ -1539,7 +1546,6 @@ function getUniqueRunDependency(id) {
 
 function addRunDependency(id) {
   runDependencies++;
-
   if (Module['monitorRunDependencies']) {
     Module['monitorRunDependencies'](runDependencies);
   }
@@ -3270,7 +3276,8 @@ function run(args) {
     return;
   }
 
-  writeStackCookie();
+    writeStackCookie();
+    
 
   preRun();
 
@@ -3381,30 +3388,17 @@ function exit(status, implicit) {
 	noExitRuntime = true;
 
 var theModel;
-var theRealView;
-var theView = new Promise(function(resolve, reject) {
-    setTimeout(() => resolve(theRealView), 1000);
-});
-var NSCroquetButtonView;
-var NSCroquetImageButtonView;
-var NSCroquetRadioButtonView;
-var NSCroquetCheckboxView;
-var NSCroquetHyperlinkView;
-var NSCroquetHyperlinkImageView;
-var NSCroquetCodeMirrorView;
+var theView;
+var NSCroquetFragmentView;
 
 function storeModelAndView(m, v) {
     theModel = m;
-    theRealView = v;
-    NSCroquetButtonView = NewspeakCroquetButtonView;
-    NSCroquetImageButtonView = NewspeakCroquetImageButtonView;
-    NSCroquetRadioButtonView = NewspeakCroquetRadioButtonView;
-    NSCroquetCheckboxView = NewspeakCroquetCheckboxView;
-    NSCroquetHyperlinkView = NewspeakCroquetHyperlinkView;
-    NSCroquetHyperlinkImageView = NewspeakCroquetHyperlinkImageView;
-    NSCroquetToggleComposerView = NewspeakCroquetToggleComposerView;                  
-    NSCroquetCodeMirrorView = NewspeakCroquetCodeMirrorView;        
+    theView = v;
+    NSCroquetFragmentView = NewspeakCroquetFragmentView;
+    croquetInitDone = true;
 }
+
+// ButtonFragment support
 
 class NewspeakCroquetButtonModel extends Croquet.Model {
     init(options) {
@@ -3416,7 +3410,7 @@ class NewspeakCroquetButtonModel extends Croquet.Model {
     }
 }
 
-class NewspeakCroquetButtonView extends Croquet.View {
+class NewspeakCroquetFragmentView extends Croquet.View {
     constructor(model, presenter) {
 	super(model);
     }
@@ -3427,51 +3421,35 @@ class NewspeakCroquetButtonView extends Croquet.View {
 
 NewspeakCroquetButtonModel.register("NewspeakCroquetButtonModel");
 
+// ImageButtonFragment support
+
 class NewspeakCroquetImageButtonModel extends Croquet.Model {
     init(options) {
-	this.nsImageButtonId = options.nsImageButtonId;
-	this.subscribe(this.nsImageButtonId, 'click', this.click);
+	this.nsButtonId = options.nsButtonId;
+	this.subscribe(this.nsButtonId, 'click', this.click);
     }
     click(){
-	this.publish(this.nsImageButtonId, 'model_click');
-    }
-}
-
-class NewspeakCroquetImageButtonView extends Croquet.View {
-    constructor(model, presenter) {
-	super(model);
-    }
-    modelID() {
-	return model.id
+	this.publish(this.nsButtonId, 'model_click');
     }
 }
 
 NewspeakCroquetImageButtonModel.register("NewspeakCroquetImageButtonModel");
 
-class NewspeakCroquetRadioButtonModel extends Croquet.Model {
+// HyperlinkFragment support
+
+class NewspeakCroquetHyperlinkModel extends Croquet.Model {
     init(options) {
-	this.nsRadioButtonId = options.nsRadioButtonId;
-	this.subscribe(this.nsRadioButtonId, 'pressed', this.pressed);
-	this.subscribe(this.nsRadioButtonId, 'released', this.released);	
+	this.nsLinkId = options.nsLinkId;
+	this.subscribe(this.nsLinkId, 'click', this.click);
     }
-    pressed(){
-	this.publish(this.nsRadioButtonId, 'model_pressed');
-    }
-    released(){
-	this.publish(this.nsRadioButtonId, 'model_released');
-    }    
-}
-
-class NewspeakCroquetRadioButtonView extends Croquet.View {
-    constructor(model, presenter) {
-	super(model);
-    }
-    modelID() {
-	return model.id
+    click(){
+	this.publish(this.nsLinkId, 'model_click');
     }
 }
 
-NewspeakCroquetRadioButtonModel.register("NewspeakCroquetRadioButtonModel");
+NewspeakCroquetHyperlinkModel.register("NewspeakCroquetHyperlinkModel");
+
+// CheckboxFragment support
 
 class NewspeakCroquetCheckboxModel extends Croquet.Model {
     init(options) {
@@ -3487,100 +3465,54 @@ class NewspeakCroquetCheckboxModel extends Croquet.Model {
     }    
 }
 
-class NewspeakCroquetCheckboxView extends Croquet.View {
-    constructor(model, presenter) {
-	super(model);
-    }
-    modelID() {
-	return model.id
-    }
-}
-
 NewspeakCroquetCheckboxModel.register("NewspeakCroquetCheckboxModel");
 
-class NewspeakCroquetHyperlinkModel extends Croquet.Model {
+// RadioButtonFragment support
+
+class NewspeakCroquetRadioButtonModel extends Croquet.Model {
     init(options) {
-	this.nsHyperlinkId = options.nsHyperlinkId;
-	this.subscribe(this.nsHyperlinkId, 'click', this.click);
+	this.nsRadioButtonId = options.nsRadioButtonId;
+	this.subscribe(this.nsRadioButtonId, 'released', this.released);
+	this.subscribe(this.nsRadioButtonId, 'pressed', this.pressed);	
     }
-    click(){
-	this.publish(this.nsHyperlinkId, 'model_click');
+    released(){
+	this.publish(this.nsRadioButtonId, 'model_released');
     }
+    pressed(){
+	this.publish(this.nsRadioButtonId, 'model_pressed');
+    }    
 }
 
-class NewspeakCroquetHyperlinkView extends Croquet.View {
-    constructor(model, presenter) {
-	super(model);
-    }
-    modelID() {
-	return model.id
-    }
-}
+NewspeakCroquetRadioButtonModel.register("NewspeakCroquetRadioButtonModel");
 
-NewspeakCroquetHyperlinkModel.register("NewspeakCroqueteHyperlinkModel");
+// TextEditorFragment support
 
-class NewspeakCroquetHyperlinkImageModel extends Croquet.Model {
+class NewspeakCroquetTextEditorModel extends Croquet.Model {
     init(options) {
-	this.nsHyperlinkImageId = options.nsHyperlinkImageId;
-	this.subscribe(this.nsHyperlinkImageId, 'click', this.click);
+	this.nsTextEditorId = options.nsTextEditorId;
+	this.subscribe(this.nsTextEditorId, 'accept', this.accept);
+	this.subscribe(this.nsTextEditorId, 'changed', this.changed);
+	this.subscribe(this.nsTextEditorId, 'cancel', this.cancel);		
     }
-    click(){
-	this.publish(this.nsHyperlinkImageId, 'model_click');
+    accept(textBeingAccepted){
+	console.log('Accepted text ' + textBeingAccepted);
+	this.publish(this.nsTextEditorId, 'model_accept', textBeingAccepted);
     }
+    changed(textBeingAccepted){
+	console.log('Changed text ' + textBeingAccepted);
+	this.publish(this.nsTextEditorId, 'model_changed', textBeingAccepted);
+    }
+    cancel(textBeingAccepted){
+	console.log('Canceled text ' + textBeingAccepted);
+	this.publish(this.nsTextEditorId, 'model_cancel', textBeingAccepted);
+    }     
 }
 
-class NewspeakCroquetHyperlinkImageView extends Croquet.View {
-    constructor(model, presenter) {
-	super(model);
-    }
-    modelID() {
-	return model.id
-    }
-}
 
-NewspeakCroquetHyperlinkImageModel.register("NewspeakCroquetHyperlinkImageModel");
+NewspeakCroquetTextEditorModel.register("NewspeakCroquetTextEditorModel");
 
-class NewspeakCroquetToggleComposerModel extends Croquet.Model {
-    init(options) {
-	this.nsToggleComposerId = options.nsToggleComposerId;
-	this.subscribe(this.nsToggleComposerId, 'toggle', this.toggle);
-    }
-    toggle(){
-	this.publish(this.nsToggleComposerId, 'model_toggle');
-    }
-}
 
-class NewspeakCroquetToggleComposerView extends Croquet.View {
-    constructor(model, presenter) {
-	super(model);
-    }
-    modelID() {
-	return model.id
-    }
-}
-
-NewspeakCroquetToggleComposerModel.register("NewspeakCroquetToggleComposerModel");
-
-class NewspeakCroquetCodeMirrorModel extends Croquet.Model {
-    init(options) {
-	this.nsCodeMirrorId = options.nsCodeMirrorId;
-	this.subscribe(this.nsCodeMirrorId, 'keydown', this.keydown);
-    }
-    keydown(key){
-	this.publish(this.nsCodeMirrorId, 'model_keydown', key);
-    }
-}
-
-class NewspeakCroquetCodeMirrorView extends Croquet.View {
-    constructor(model, presenter) {
-	super(model);
-    }
-    modelID() {
-	return model.id
-    }
-}
-
-NewspeakCroquetCodeMirrorModel.register("NewspeakCroquetCodeMirrorModel");
+// Root model
 
 class NewspeakCroquetModel extends Croquet.Model {
 
@@ -3588,12 +3520,10 @@ class NewspeakCroquetModel extends Croquet.Model {
 	this.fragments = new Map();
 	this.subscribe('newspeak_croquet_button', 'createButton', this.createButton);
 	this.subscribe('newspeak_croquet_image_button', 'createImageButton', this.createImageButton);
+	this.subscribe('newspeak_croquet_hyperlink', 'createHyperlink', this.createHyperlink);
+	this.subscribe('newspeak_croquet_checkbox', 'createCheckbox', this.createCheckbox);
 	this.subscribe('newspeak_croquet_radio_button', 'createRadioButton', this.createRadioButton);
-	this.subscribe('newspeak_croquet_checkbox', 'createCheckbox', this.createCheckbox);		
-	this.subscribe('newspeak_croquet_hyperlink', 'createHyperlink', this.createHyperlink);		
-	this.subscribe('newspeak_croquet_hyperlink_image', 'createHyperlinkImage', this.createHyperlinkImage);
-	this.subscribe('newspeak_croquet_toggle_composer', 'createToggleComposer', this.createToggleComposer);	
-	this.subscribe('newspeak_croquet_code_mirror', 'createCodeMirror', this.createCodeMirror);
+	this.subscribe('newspeak_croquet_text_editor', 'createTextEditor', this.createTextEditor);	
     }
     createButton(bid) {
 	var m;
@@ -3610,20 +3540,20 @@ class NewspeakCroquetModel extends Croquet.Model {
 	if (this.fragments.has(bid)) {
 	    m = this.fragments.get(bid)
 	} else {
-	    m = NewspeakCroquetImageButtonModel.create({nsImageButtonId: bid});
+	    m = NewspeakCroquetImageButtonModel.create({nsButtonId: bid});
 	    this.fragments.set(bid, m);
 	}
 	this.publish(bid , 'model_createImageButton', m);
     }
-    createRadioButton(bid) {
+    createHyperlink(bid) {
 	var m;
 	if (this.fragments.has(bid)) {
 	    m = this.fragments.get(bid)
 	} else {
-	    m = NewspeakCroquetImageButtonModel.create({nsRadioButtonId: bid});
+	    m = NewspeakCroquetHyperlinkModel.create({nsLinkId: bid});
 	    this.fragments.set(bid, m);
 	}
-	this.publish(bid , 'model_createRadioButton', m);
+	this.publish(bid , 'model_createHyperlink', m);
     }
     createCheckbox(bid) {
 	var m;
@@ -3635,47 +3565,29 @@ class NewspeakCroquetModel extends Croquet.Model {
 	}
 	this.publish(bid , 'model_createCheckbox', m);
     }
-    createHyperlink(bid) {
+    createRadioButton(bid) {
 	var m;
 	if (this.fragments.has(bid)) {
 	    m = this.fragments.get(bid)
 	} else {
-	    m = NewspeakCroquetHyperlinkModel.create({nsHyperlinkId: bid});
+	    m = NewspeakCroquetRadioButtonModel.create({nsRadioButtonId: bid});
 	    this.fragments.set(bid, m);
 	}
-	this.publish(bid , 'model_createHyperlink', m);
-    }     
-    createHyperlinkImage(bid) {
-	var m;
-	if (this.fragments.has(bid)) {
-	    m = this.fragments.get(bid)
-	} else {
-	    m = NewspeakCroquetHyperlinkImageModel.create({nsHyperlinkImageId: bid});
-	    this.fragments.set(bid, m);
-	}
-	this.publish(bid , 'model_createHyperlinkImage', m);
+	this.publish(bid , 'model_createRadioButton', m);
     }
-    createToggleComposer(bid) {
+    createTextEditor(bid) {
 	var m;
+	console.log('Creating text editor ' + bid);
 	if (this.fragments.has(bid)) {
 	    m = this.fragments.get(bid)
 	} else {
-	    m = NewspeakCroquetToggleComposereModel.create({nsToggleComposerId: bid});
+	    m = NewspeakCroquetRadioButtonModel.create({nsTextEditorId: bid});
 	    this.fragments.set(bid, m);
 	}
-	this.publish(bid , 'model_createToggleComposer', m);
-    }    
-    createCodeMirror(bid) {
-	var m;
-	if (this.fragments.has(bid)) {
-	    m = this.fragments.get(bid)
-	} else {
-	    m = NewspeakCroquetCodeMirrorModel.create({nsCodeMirrorId: bid});
-	    this.fragments.set(bid, m);
-	}
-	this.publish(bid , 'model_createCodeMirror', m);
+	this.publish(bid , 'model_createTextEditor', m);
     }    
 }
+
 
 NewspeakCroquetModel.register("NewspeakCroquetModel");
 
@@ -3684,8 +3596,7 @@ class NewspeakCroquetView extends Croquet.View {
 	super(model);
 	this.presenter = presenter;
 	storeModelAndView(model, this);
-	// run Newspeak. Ultimately deal with deserializing state from Croquet model
-	run();
+	removeRunDependency(croquetDepId);
   }
 }
 

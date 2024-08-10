@@ -3449,6 +3449,20 @@ class NewspeakCroquetHyperlinkModel extends Croquet.Model {
 
 NewspeakCroquetHyperlinkModel.register("NewspeakCroquetHyperlinkModel");
 
+// HyperlinkImageFragment support
+
+class NewspeakCroquetHyperlinkImageModel extends Croquet.Model {
+    init(options) {
+	this.nsLinkImageId = options.nsLinkImageId;
+	this.subscribe(this.nsLinkImageId, 'click', this.click);
+    }
+    click(){
+	this.publish(this.nsLinkImageId, 'model_click');
+    }
+}
+
+NewspeakCroquetHyperlinkImageModel.register("NewspeakCroquetHyperlinkImageModel");
+
 // CheckboxFragment support
 
 class NewspeakCroquetCheckboxModel extends Croquet.Model {
@@ -3491,16 +3505,16 @@ class NewspeakCroquetTextEditorModel extends Croquet.Model {
     init(options) {
 	this.nsTextEditorId = options.nsTextEditorId;
 	this.subscribe(this.nsTextEditorId, 'accept', this.accept);
-	this.subscribe(this.nsTextEditorId, 'changed', this.changed);
-	this.subscribe(this.nsTextEditorId, 'cancel', this.cancel);		
+	this.subscribe(this.nsTextEditorId, 'change', this.change);
+	this.subscribe(this.nsTextEditorId, 'cancel', this.cancel);
     }
     accept(textBeingAccepted){
 	console.log('Accepted text ' + textBeingAccepted);
 	this.publish(this.nsTextEditorId, 'model_accept', textBeingAccepted);
     }
-    changed(textBeingAccepted){
+    change(textBeingAccepted){
 	console.log('Changed text ' + textBeingAccepted);
-	this.publish(this.nsTextEditorId, 'model_changed', textBeingAccepted);
+	this.publish(this.nsTextEditorId, 'model_change', textBeingAccepted);
     }
     cancel(textBeingAccepted){
 	console.log('Canceled text ' + textBeingAccepted);
@@ -3511,7 +3525,129 @@ class NewspeakCroquetTextEditorModel extends Croquet.Model {
 
 NewspeakCroquetTextEditorModel.register("NewspeakCroquetTextEditorModel");
 
+// CodeMirrorFragment support
 
+class NewspeakCroquetCodeMirrorModel extends Croquet.Model {
+    init(options) {
+	this.nsCodeMirrorId = options.nsCodeMirrorId;
+	this.subscribe(this.nsCodeMirrorId, 'accept', this.accept);
+	this.subscribe(this.nsCodeMirrorId, 'change', this.change);
+	this.subscribe(this.nsCodeMirrorId, 'cancel', this.cancel);		
+    }
+    accept(textBeingAccepted){
+	console.log('Accepted text ' + textBeingAccepted);
+	this.publish(this.nsCodeMirrorId, 'model_accept', textBeingAccepted);
+    }
+    change(textBeingAccepted){
+	console.log('Changed text ' + textBeingAccepted);
+	this.publish(this.nsCodeMirrorId, 'model_change', textBeingAccepted);
+    }
+    cancel(textBeingAccepted){
+	console.log('Canceled text ' + textBeingAccepted);
+	this.publish(this.nsCodeMirrorId, 'model_cancel', textBeingAccepted);
+    }     
+}
+
+
+NewspeakCroquetCodeMirrorModel.register("NewspeakCroquetCodeMirrorModel");
+
+// ToggleComposer support
+
+class NewspeakCroquetToggleComposerModel extends Croquet.Model {
+    init(options) {
+	this.nsToggleComposerId = options.nsToggleComposerId;
+	this.subscribe(this.nsToggleComposerId, 'toggle', this.toggle);		
+    }
+    toggle(i){
+	console.log('Toggle ' + i);
+	this.publish(this.nsToggleComposerId, 'model_toggle', i);
+    }     
+}
+
+NewspeakCroquetToggleComposerModel.register("NewspeakCroquetToggleComposerModel")
+
+// Picker support
+
+class NewspeakCroquetPickerModel extends Croquet.Model {
+    init(options) {
+	this.nsPickerId = options.nsPickerId;
+	this.subscribe(this.nsPickerId, 'input', this.input);		
+    }
+    input(i){
+	console.log('Input ' + i);
+	this.publish(this.nsPickerId, 'model_input', i);
+    }     
+}
+
+NewspeakCroquetPickerModel.register("NewspeakCroquetPickerModel")
+
+
+// ColorPicker support
+
+
+class NewspeakCroquetColorPickerModel extends Croquet.Model {
+    init(options) {
+	this.nsColorPickerId = options.nsColorPickerId;
+	this.subscribe(this.nsColorPickerId, 'input', this.input);		
+    }
+    
+    input(i){
+	console.log('Input ' + i);
+	this.publish(this.nsColorPickerId, 'model_input', i);
+    }     
+}
+
+NewspeakCroquetColorPickerModel.register("NewspeakCroquetColorPickerModel")
+
+// DatePicker support
+
+
+class NewspeakCroquetDatePickerModel extends Croquet.Model {
+    init(options) {
+	this.nsDatePickerId = options.nsDatePickerId;
+	this.subscribe(this.nsDatePickerId, 'input', this.input);		
+    }
+    input(i){
+	console.log('Input ' + i);
+	this.publish(this.nsDatePickerId, 'model_input', i);
+    }     
+}
+
+NewspeakCroquetDatePickerModel.register("NewspeakCroquetDatePickerModel")
+
+
+// TimePicker support
+
+class NewspeakCroquetTimePickerModel extends Croquet.Model {
+    init(options) {
+	this.nsTimePickerId = options.nsTimePickerId;
+	this.subscribe(this.nsTimePickerId, 'input', this.input);		
+    }
+    input(i){
+	console.log('Input ' + i);
+	this.publish(this.nsTimePickerId, 'model_input', i);
+    }     
+}
+
+
+NewspeakCroquetTimePickerModel.register("NewspeakCroquetTimePickerModel")
+
+
+// Slider support
+
+class NewspeakCroquetSliderModel extends Croquet.Model {
+    init(options) {
+	this.nsSliderId = options.nsSliderId;
+	this.subscribe(this.nsSliderId, 'input', this.input);		
+    }
+    input(i){
+	console.log('Input ' + i);
+	this.publish(this.nsSliderId, 'model_input', i);
+    }     
+}
+
+
+NewspeakCroquetTimePickerModel.register("NewspeakCroquetTimePickerModel")
 // Root model
 
 class NewspeakCroquetModel extends Croquet.Model {
@@ -3521,9 +3657,16 @@ class NewspeakCroquetModel extends Croquet.Model {
 	this.subscribe('newspeak_croquet_button', 'createButton', this.createButton);
 	this.subscribe('newspeak_croquet_image_button', 'createImageButton', this.createImageButton);
 	this.subscribe('newspeak_croquet_hyperlink', 'createHyperlink', this.createHyperlink);
+	this.subscribe('newspeak_croquet_hyperlink_image', 'createHyperlinkImage', this.createHyperlinkImage);	
 	this.subscribe('newspeak_croquet_checkbox', 'createCheckbox', this.createCheckbox);
 	this.subscribe('newspeak_croquet_radio_button', 'createRadioButton', this.createRadioButton);
-	this.subscribe('newspeak_croquet_text_editor', 'createTextEditor', this.createTextEditor);	
+	this.subscribe('newspeak_croquet_text_editor', 'createTextEditor', this.createTextEditor);
+	this.subscribe('newspeak_croquet_code_mirror', 'createCodeMirror', this.createCodeMirror);
+	this.subscribe('newspeak_croquet_picker', 'createPicker', this.createPicker);
+	this.subscribe('newspeak_croquet_color_picker', 'createColorPicker', this.createColorPicker);
+	this.subscribe('newspeak_croquet_date_picker', 'createDatePicker', this.createDatePicker);
+	this.subscribe('newspeak_croquet_time_picker', 'createTimePicker', this.createTimePicker);
+	this.subscribe('newspeak_croquet_slider', 'createSlider', this.createSlider);		
     }
     createButton(bid) {
 	var m;
@@ -3555,6 +3698,16 @@ class NewspeakCroquetModel extends Croquet.Model {
 	}
 	this.publish(bid , 'model_createHyperlink', m);
     }
+    createHyperlinkImage(bid) {
+	var m;
+	if (this.fragments.has(bid)) {
+	    m = this.fragments.get(bid)
+	} else {
+	    m = NewspeakCroquetHyperlinkImageModel.create({nsLinkImageId: bid});
+	    this.fragments.set(bid, m);
+	}
+	this.publish(bid , 'model_createHyperlinkImage', m);
+    }    
     createCheckbox(bid) {
 	var m;
 	if (this.fragments.has(bid)) {
@@ -3581,11 +3734,88 @@ class NewspeakCroquetModel extends Croquet.Model {
 	if (this.fragments.has(bid)) {
 	    m = this.fragments.get(bid)
 	} else {
-	    m = NewspeakCroquetRadioButtonModel.create({nsTextEditorId: bid});
+	    m = NewspeakCroquetTextEditorModel.create({nsTextEditorId: bid});
 	    this.fragments.set(bid, m);
 	}
 	this.publish(bid , 'model_createTextEditor', m);
+    }
+    createCodeMirror(bid) {
+	var m;
+	console.log('Creating code mirror ' + bid);
+	if (this.fragments.has(bid)) {
+	    m = this.fragments.get(bid)
+	} else {
+	    m = NewspeakCroquetCodeMirrorModel.create({nsCodeMirrorId: bid});
+	    this.fragments.set(bid, m);
+	}
+	this.publish(bid , 'model_createCodeMirror', m);
+    }
+    createToggleComposer(bid) {
+	var m;
+	console.log('Creating toggle composer ' + bid);
+	if (this.fragments.has(bid)) {
+	    m = this.fragments.get(bid)
+	} else {
+	    m = NewspeakCroquetToggleComposerModel.create({nsToggleComposerId: bid});
+	    this.fragments.set(bid, m);
+	}
+	this.publish(bid , 'model_createToggleComposer', m);
     }    
+    createPicker(bid) {
+	var m;
+	console.log('Creating picker ' + bid);
+	if (this.fragments.has(bid)) {
+	    m = this.fragments.get(bid)
+	} else {
+	    m = NewspeakCroquetPickerModel.create({nsPickerId: bid});
+	    this.fragments.set(bid, m);
+	}
+	this.publish(bid , 'model_createPicker', m);
+    }
+    createColorPicker(bid) {
+	var m;
+	console.log('Creating color picker ' + bid);
+	if (this.fragments.has(bid)) {
+	    m = this.fragments.get(bid)
+	} else {
+	    m = NewspeakCroquetColorPickerModel.create({nsColorPickerId: bid});
+	    this.fragments.set(bid, m);
+	}
+	this.publish(bid , 'model_createColorPicker', m);
+    }
+    createDatePicker(bid) {
+	var m;
+	console.log('Creating date picker ' + bid);
+	if (this.fragments.has(bid)) {
+	    m = this.fragments.get(bid)
+	} else {
+	    m = NewspeakCroquetDatePickerModel.create({nsDatePickerId: bid});
+	    this.fragments.set(bid, m);
+	}
+	this.publish(bid , 'model_createDatePicker', m);
+    }
+    createTimePicker(bid) {
+	var m;
+	console.log('Creating time picker ' + bid);
+	if (this.fragments.has(bid)) {
+	    m = this.fragments.get(bid)
+	} else {
+	    m = NewspeakCroquetTimePickerModel.create({nsTimePickerId: bid});
+	    this.fragments.set(bid, m);
+	}
+	this.publish(bid , 'model_createTimePicker', m);
+    }
+    createSlider(bid) {
+	var m;
+	console.log('Creating slider ' + bid);
+	if (this.fragments.has(bid)) {
+	    m = this.fragments.get(bid)
+	} else {
+	    m = NewspeakCroquetSliderModel.create({nsSliderId: bid});
+	    this.fragments.set(bid, m);
+	}
+	this.publish(bid , 'model_createSlider', m);
+    }     
 }
 
 

@@ -3391,6 +3391,60 @@ var theModel;
 var theView;
 var NSCroquetFragmentView;
 
+function replaceUndefined(obj) {
+    // Check if the current value is an object and not null
+    if (obj && typeof obj === 'object') {
+        // Create a copy of the object or array
+        let copy = Array.isArray(obj) ? [] : {};
+        
+        // Recursively process each key/value pair
+        for (let key in obj) {
+            if (obj.hasOwnProperty(key)) {
+                // Replace `undefined` with an empty object
+                if (obj[key] === undefined) {
+                    copy[key] = {};
+                } else {
+                    // Recursively process the value
+                    copy[key] = replaceUndefined(obj[key]);
+                }
+            }
+        }
+        return copy;
+    }
+    
+    // Return the value if it's not an object (base case)
+    return obj;
+}
+
+function printJSObjectTree(obj, indent = 0) {
+    // Create a string of spaces for indentation
+    const indentString = ' '.repeat(indent);
+
+    // Check if the current value is an object and not null
+    if (obj && typeof obj === 'object') {
+        // If it's an array, print each element
+        if (Array.isArray(obj)) {
+            console.log(indentString + '[Array]');
+            obj.forEach((item, index) => {
+                console.log(indentString + `  [${index}]`);
+                printJSObjectTree(item, indent + 4);
+            });
+        } else {
+            // If it's an object, print each key/value pair
+            console.log(indentString + '{Object}');
+            for (let key in obj) {
+                if (true) {
+                    console.log(indentString + `  ${key}:`);
+                    printJSObjectTree(obj[key], indent + 4);
+                }
+            }
+        }
+    } else {
+        // If it's not an object, just print the value
+        console.log(indentString + obj);
+    }
+}
+
 function storeModelAndView(m, v) {
     theModel = m;
     theView = v;
@@ -3398,6 +3452,67 @@ function storeModelAndView(m, v) {
     croquetInitDone = true;
 }
 
+
+// LeafFragment support - WIP
+
+class NewspeakCroquetLeafFragmentModel extends Croquet.Model {
+    init(options) {
+	this.nsFragmentId = options.nsFragmentId;
+	this.subscribe(this.nsFragmentId, 'onMouseDown', this.mouseDown);		this.subscribe(this.nsFragmentId, 'onMouseEnter', this.mouseEnter);
+	this.subscribe(this.nsFragmentId, 'onMouseMove', this.mouseMove);
+	this.subscribe(this.nsFragmentId, 'onMouseOut', this.mouseOut);
+	this.subscribe(this.nsFragmentId, 'onMouseOver', this.mouseOver);
+	this.subscribe(this.nsFragmentId, 'onMouseUp', this.mouseUp);
+	this.subscribe(this.nsFragmentId, 'onTouchCancel', this.touchCancel);
+	this.subscribe(this.nsFragmentId, 'onTouchEnd', this.touchEnd);
+	this.subscribe(this.nsFragmentId, 'onTouchMove', this.touchMove);
+	this.subscribe(this.nsFragmentId, 'onTouchStart', this.touchStart);		this.subscribe(this.nsFragmentId, 'onWheel', this.wheel);	
+    }
+    mouseDown(i){
+	console.log('MouseDown ' + i);
+	this.publish(this.nsFragmentId, 'model_mouseDown', i);
+    }
+    mouseEnter(i){
+	console.log('MouseEnter ' + i);
+	this.publish(this.nsFragmentId, 'model_mouseEnter', i);
+    }
+    mouseMove(i){
+	console.log('MouseMove ' + i);
+	this.publish(this.nsFragmentId, 'model_mouseMove', i);
+    }
+    mouseOut(i){
+	console.log('MouseOut ' + i);
+	this.publish(this.nsFragmentId, 'model_mouseOut', i);
+    }
+    mouseOver(i){
+	console.log('MouseOver ' + i);
+	this.publish(this.nsFragmentId, 'model_mouseOver', i);
+    }
+   mouseUp(i){
+	console.log('MouseUp ' + i);
+	this.publish(this.nsFragmentId, 'model_mouseUp', i);
+   }
+   touchCancel(i){
+	console.log('TouchCancel ' + i);
+	this.publish(this.nsFragmentId, 'model_touchCancel', i);
+   }
+   touchEnd(i){
+	console.log('TouchEnd ' + i);
+	this.publish(this.nsFragmentId, 'model_touchEnd', i);
+   }	
+   touchMove(i){
+	console.log('TouchMove ' + i);
+	this.publish(this.nsFragmentId, 'model_touchMove', i);
+   }
+   touchStart(i){
+	console.log('TouchStart ' + i);
+	this.publish(this.nsFragmentId, 'model_touchStart', i);
+   }
+   wheel(i){
+	console.log('Wheel ' + i);
+	this.publish(this.nsFragmentId, 'model_wheel', i);
+   }	
+}
 // ButtonFragment support
 
 class NewspeakCroquetButtonModel extends Croquet.Model {
@@ -3490,9 +3605,11 @@ class NewspeakCroquetRadioButtonModel extends Croquet.Model {
 	this.subscribe(this.nsRadioButtonId, 'pressed', this.pressed);	
     }
     released(){
+	console.log('released ');
 	this.publish(this.nsRadioButtonId, 'model_released');
     }
     pressed(){
+	console.log('pressed ');
 	this.publish(this.nsRadioButtonId, 'model_pressed');
     }    
 }
@@ -3530,21 +3647,21 @@ NewspeakCroquetTextEditorModel.register("NewspeakCroquetTextEditorModel");
 class NewspeakCroquetCodeMirrorModel extends Croquet.Model {
     init(options) {
 	this.nsCodeMirrorId = options.nsCodeMirrorId;
-	this.subscribe(this.nsCodeMirrorId, 'accept', this.accept);
+	this.subscribe(this.nsCodeMirrorId, 'beforeChange', this.beforeChange);
 	this.subscribe(this.nsCodeMirrorId, 'change', this.change);
-	this.subscribe(this.nsCodeMirrorId, 'cancel', this.cancel);		
+	this.subscribe(this.nsCodeMirrorId, 'keydown', this.keydown);		
     }
-    accept(textBeingAccepted){
-	console.log('Accepted text ' + textBeingAccepted);
-	this.publish(this.nsCodeMirrorId, 'model_accept', textBeingAccepted);
+    beforeChange(textBeingAccepted){
+	console.log('Codemirror Before change text ' + textBeingAccepted);
+	this.publish(this.nsCodeMirrorId, 'model_beforeChange', textBeingAccepted);
     }
     change(textBeingAccepted){
-	console.log('Changed text ' + textBeingAccepted);
+	console.log('Codemirror Changed text ' + textBeingAccepted);
 	this.publish(this.nsCodeMirrorId, 'model_change', textBeingAccepted);
     }
-    cancel(textBeingAccepted){
-	console.log('Canceled text ' + textBeingAccepted);
-	this.publish(this.nsCodeMirrorId, 'model_cancel', textBeingAccepted);
+    keydown(textBeingAccepted){
+	console.log('Codemirror Keydown text ' + textBeingAccepted);
+	this.publish(this.nsCodeMirrorId, 'model_keydown', textBeingAccepted);
     }     
 }
 
@@ -3574,7 +3691,6 @@ class NewspeakCroquetPickerModel extends Croquet.Model {
 	this.subscribe(this.nsPickerId, 'input', this.input);		
     }
     input(i){
-	console.log('Input ' + i);
 	this.publish(this.nsPickerId, 'model_input', i);
     }     
 }
@@ -3588,12 +3704,11 @@ NewspeakCroquetPickerModel.register("NewspeakCroquetPickerModel")
 class NewspeakCroquetColorPickerModel extends Croquet.Model {
     init(options) {
 	this.nsColorPickerId = options.nsColorPickerId;
-	this.subscribe(this.nsColorPickerId, 'input', this.input);		
+	this.subscribe(this.nsColorPickerId, 'pick', this.pick);		
     }
     
-    input(i){
-	console.log('Input ' + i);
-	this.publish(this.nsColorPickerId, 'model_input', i);
+    pick(i){
+	this.publish(this.nsColorPickerId, 'model_pick', i);
     }     
 }
 
@@ -3608,7 +3723,6 @@ class NewspeakCroquetDatePickerModel extends Croquet.Model {
 	this.subscribe(this.nsDatePickerId, 'input', this.input);		
     }
     input(i){
-	console.log('Input ' + i);
 	this.publish(this.nsDatePickerId, 'model_input', i);
     }     
 }
@@ -3624,7 +3738,6 @@ class NewspeakCroquetTimePickerModel extends Croquet.Model {
 	this.subscribe(this.nsTimePickerId, 'input', this.input);		
     }
     input(i){
-	console.log('Input ' + i);
 	this.publish(this.nsTimePickerId, 'model_input', i);
     }     
 }
@@ -3638,16 +3751,49 @@ NewspeakCroquetTimePickerModel.register("NewspeakCroquetTimePickerModel")
 class NewspeakCroquetSliderModel extends Croquet.Model {
     init(options) {
 	this.nsSliderId = options.nsSliderId;
-	this.subscribe(this.nsSliderId, 'input', this.input);		
+	this.subscribe(this.nsSliderId, 'pick', this.pick);		
     }
-    input(i){
-	console.log('Input ' + i);
-	this.publish(this.nsSliderId, 'model_input', i);
+    pick(i){
+	this.publish(this.nsSliderId, 'model_pick', i);
     }     
 }
 
 
-NewspeakCroquetTimePickerModel.register("NewspeakCroquetTimePickerModel")
+NewspeakCroquetSliderModel.register("NewspeakCroquetSliderModel")
+
+
+// SearchField support
+
+class NewspeakCroquetSearchFieldModel extends Croquet.Model {
+    init(options) {
+	this.nsSearchFieldId = options.nsSearchFieldId;
+	this.subscribe(this.nsSearchFieldId, 'keydown', this.keydown);		
+    }
+    keydown(i){
+	console.log('Search Keydown ' + i);
+	this.publish(this.nsSearchFieldId, 'model_keydown', i);
+    }     
+}
+
+NewspeakCroquetSearchFieldModel.register("NewspeakCroquetSearchFieldModel")
+
+// DropDownMenu support
+
+class NewspeakCroquetDropDownMenuModel extends Croquet.Model {
+    init(options) {
+	this.nsDropDownMenuId = options.nsDropDownMenuId;
+	this.subscribe(this.nsDropDownMenuId, 'click', this.input);		
+    }
+    input(i){
+	console.log('Menu Input ' + i);
+	this.publish(this.nsDropDownMenuId, 'model_click', i);
+    }     
+}
+
+
+NewspeakCroquetDropDownMenuModel.register("NewspeakCroquetDropDownMenuModel")
+
+
 // Root model
 
 class NewspeakCroquetModel extends Croquet.Model {
@@ -3666,7 +3812,9 @@ class NewspeakCroquetModel extends Croquet.Model {
 	this.subscribe('newspeak_croquet_color_picker', 'createColorPicker', this.createColorPicker);
 	this.subscribe('newspeak_croquet_date_picker', 'createDatePicker', this.createDatePicker);
 	this.subscribe('newspeak_croquet_time_picker', 'createTimePicker', this.createTimePicker);
-	this.subscribe('newspeak_croquet_slider', 'createSlider', this.createSlider);		
+	this.subscribe('newspeak_croquet_slider', 'createSlider', this.createSlider);
+	this.subscribe('newspeak_croquet_search_field', 'createSearchField', this.createSearchField);
+	this.subscribe('newspeak_croquet_drop_down_menu', 'createDropDownMenu', this.createDropDownMenu);		
     }
     createButton(bid) {
 	var m;
@@ -3815,7 +3963,29 @@ class NewspeakCroquetModel extends Croquet.Model {
 	    this.fragments.set(bid, m);
 	}
 	this.publish(bid , 'model_createSlider', m);
-    }     
+    }
+    createSearchField(bid) {
+	var m;
+	console.log('Creating search field ' + bid);
+	if (this.fragments.has(bid)) {
+	    m = this.fragments.get(bid)
+	} else {
+	    m = NewspeakCroquetSliderModel.create({nsSearchFieldId: bid});
+	    this.fragments.set(bid, m);
+	}
+	this.publish(bid , 'model_createSearchField', m);
+    }
+    createDropDownMenu(bid) {
+	var m;
+	console.log('Creating drop down menu ' + bid);
+	if (this.fragments.has(bid)) {
+	    m = this.fragments.get(bid)
+	} else {
+	    m = NewspeakCroquetDropDownMenuModel.create({nsDropDownMenuId: bid});
+	    this.fragments.set(bid, m);
+	}
+	this.publish(bid , 'model_createDropDownMenu', m);
+    }    
 }
 
 

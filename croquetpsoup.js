@@ -3466,6 +3466,10 @@ function storeModelAndView(m, v) {
     croquetInitDone = true;
 }
 
+function newspeakFragmentData(fid, data) {
+    return {fid: fid, data: data}
+}
+
 // Root model
 
 class NewspeakCroquetModel extends Croquet.Model {
@@ -3486,26 +3490,26 @@ class NewspeakCroquetModel extends Croquet.Model {
 	this.subscribe('nsImagebutton_', 'image_button_click', this.image_button_click);
 	this.subscribe('nshyperlink_', 'hyperlink_click', this.hyperlink_click);
 	this.subscribe('nshyperlinkImage_', 'hyperlink_image_click', this.hyperlink_image_click);
-	this.subscribe('nscheckBox_', 'checkBox_checked', this.checkBox_checked);
-	this.subscribe('nscheckBox_', 'checkBox_unchecked', this.checkBox_unchecked);	
-	this.subscribe('nsradioButton_', 'radioButton_released', this.radioButton_released);
-	this.subscribe('nsradioButton_', 'radioButton_pressed', this.radioButton_pressed);	
-	this.subscribe('nscodeMirror_', 'codeMirror_beforeChange', this.codeMirror_beforeChange);
-	this.subscribe('nscodeMirror_', 'codeMirror_change', this.codeMirror_change);
-	this.subscribe('nscodeMirror_', 'codeMirror_keydown', this.codeMirror_keydown);
-	this.subscribe('nscodeMirror_', 'codeMirror_accept', this.codeMirror_accept);
-	this.subscribe('nscodeMirror_', 'codeMirror_cancel', this.codeMirror_cancel);
-	this.subscribe('nstextEditor_', 'textEditor_accept', this.textEditor_accept);
-	this.subscribe('nstextEditor_', 'textEditor_change', this.textEditor_change);
-	this.subscribe('nstextEditor_', 'textEditor_cancel', this.textEditor_cancel);
-	this.subscribe('nstoggleComposer_', 'toggle', this.toggleComposer_toggle)
-	this.subscribe('nspicker_', 'picker_pick', this.picker_pic );
-	this.subscribe('nscolorPicker_', 'color_picker_pick', this.color_picker_pic );
-	this.subscribe('nsdatePicker_', 'date_picker_pick', this.date_picker_pic );
-	this.subscribe('nstimePicker_', 'time_picker_pick', this.time_picker_pic );	
-	this.subscribe('nsslider_', 'slider_pick', this.slider_pick);	
-	this.subscribe('nssearchField_', 'searchField_keydown', this.searchField_keydown);		
-	this.subscribe('nsdropDownMenu_', 'dropDownMenu_click', this.dropDownMenu_click);
+	this.subscribe('nscheckbox_', 'checkBox_checked', this.checkBox_checked);
+	this.subscribe('nscheckbox_', 'checkBox_unchecked', this.checkBox_unchecked);	
+	this.subscribe('nsradiobutton_', 'radioButton_released', this.radioButton_released);
+	this.subscribe('nsradiobutton_', 'radioButton_pressed', this.radioButton_pressed);	
+	this.subscribe('nscodemirror_', 'codeMirror_beforeChange', this.codeMirror_beforeChange);
+	this.subscribe('nscodemirror_', 'codeMirror_change', this.codeMirror_change);
+	this.subscribe('nscodemirror_', 'codeMirror_keydown', this.codeMirror_keydown);
+	this.subscribe('nscodemirror_', 'codeMirror_accept', this.codeMirror_accept);
+	this.subscribe('nscodemirror_', 'codeMirror_cancel', this.codeMirror_cancel);
+	this.subscribe('nstexteditor_', 'textEditor_accept', this.textEditor_accept);
+	this.subscribe('nstexteditor_', 'textEditor_change', this.textEditor_change);
+	this.subscribe('nstexteditor_', 'textEditor_cancel', this.textEditor_cancel);
+	this.subscribe('nstogglecomposer_', 'toggleComposer_toggle', this.toggleComposer_toggle)
+	this.subscribe('nspicker_', 'picker_pick', this.picker_pick);
+	this.subscribe('nscolorpicker_', 'colorPicker_pick', this.color_picker_pick);
+	this.subscribe('nsdatepicker_', 'datePicker_pick', this.date_picker_pick);
+	this.subscribe('nstimepicker_', 'timePicker_pick', this.time_picker_pick);
+	this.subscribe('nsslider_', 'slider_pick', this.slider_pick);
+	this.subscribe('nssearchfield_', 'searchField_keydown', this.searchField_keydown);		
+	this.subscribe('nsdropdownmenu_', 'dropDownMenu_click', this.dropDownMenu_click);
         this.subscribe('nsmenu_', 'menu_click', this.menu_click);
     }
     // same issues with scope for these methods
@@ -3554,7 +3558,6 @@ class NewspeakCroquetModel extends Croquet.Model {
 	this.publish(this.nsFragmentId, 'model_wheel');
    }    // end leaf methods
     button_click(fid){
-	console.log('model button click');
 	this.publish('nsbutton_' + fid, 'model_button_click');
     }
     image_button_click(fid){
@@ -3568,78 +3571,82 @@ class NewspeakCroquetModel extends Croquet.Model {
     }
     
     checkBox_checked(fid){
-	this.publish('nscheckBox_' + fid, 'model_checkBox_checked');
+	console.log('model checkbox checked');
+	this.publish('nscheckbox_' + fid, 'model_checkBox_checked');
     }
     checkBox_unchecked(fid){
-	this.publish('nscheckBox_' + fid, 'model_checkBox_unchecked');
+	console.log('model checkbox unchecked');	
+	this.publish('nscheckbox_' + fid, 'model_checkBox_unchecked');
     }
     radioButton_released(fid){
-	console.log('released ' + fid);
-	this.publish('nsradioButton_' + fid, 'model_radioButton_released');
+	this.publish('nsradiobutton_' + fid, 'model_radioButton_released');
     }
     radioButton_pressed(fid){
-	console.log('pressed ' + fid);
-	this.publish('nsradioButton_' + fid, 'model_radioButton_pressed');
+	this.publish('nsradiobutton_' + fid, 'model_radioButton_pressed');
     }
     // code mirror have and text editor have issues - parameter needs to combine text and fid - will need more work in NS side
     codeMirror_beforeChange(nsOptions){
 	console.log('Codemirror Before change text ' + nsOptions.data);
-	this.publish('nscodeMirror_' + nsOptions.fid, 'model_beforeChange', nsOptions.data);
+	this.publish('nscodemirror_' + nsOptions.fid, 'model_codeMirror_beforeChange', nsOptions.data);
     }
     codeMirror_change(nsOptions){
 	console.log('Codemirror Changed text ' + nsOptions.textBeingAccepted);
-	this.publish('nscodeMirror_' + nsOptions.fid, 'model_change', nsOptions.data);
+	this.publish('nscodemirror_' + nsOptions.fid, 'model_codeMirror_change', nsOptions.data);
     }
     codeMirror_keydown(nsOptions){
 	console.log('Codemirror Keydown text ' + nsOptions.textBeingAccepted);
-	this.publish('nscodeMirror_' + nsOptions.fid, 'model_keydown', nsOptions.data);
+	this.publish('nscodemirror_' + nsOptions.fid, 'model_codeMirror_keydown', nsOptions.data);
     }
     codeMirror_accept(nsOptions){
 	console.log('Codemirror Accept text ' + nsOptions.data);
-	this.publish('nscodeMirror_' + nsOptions.fid, 'model_accept', nsOptions.data);
+	this.publish('nscodemirror_' + nsOptions.fid, 'model_codeMirror_accept', nsOptions.data);
     }
     codeMirror_cancel(nsOptions){
 	console.log('Codemirror Cancel ');
-	this.publish('nscodeMirror_' + nsOptions.fid, 'model_cancel', nsOptions.data);
+	this.publish('nscodemirror_' + nsOptions.fid, 'model_codeMirror_cancel', nsOptions.data);
     }
     textEditor_accept(nsOptions){
 	console.log('Accepted text ' + nsOptions.textBeingAccepted);
-	this.publish('nstextEditor_' + nsOptions.fid, 'model_accept', nsOptions.data);
+	this.publish('nstexteditor_' + nsOptions.fid, 'model_textEditor_accept', nsOptions.data);
     }
     textEditor_change(nsOptions){
 	console.log('Changed text ' + nsOptions.data);
-	this.publish('nstextEditor_' + nsOptions.fid, 'model_change', nsOptions.data);
+	this.publish('nstexteditor_' + nsOptions.fid, 'model_textEditor_change', nsOptions.data);
     }
     textEditor_cancel(nsOptions){
 	console.log('Canceled text ' + nsOptions.data);
-	this.publish('nstextEditor_' + nsOptions.fid, 'model_cancel', nsOptions.data);
+	this.publish('nstexteditor_' + nsOptions.fid, 'model_textEditor_cancel', nsOptions.data);
     }
     toggleComposer_toggle(fid){
 	console.log('Toggle ' + fid);
-	this.publish'nstoggleComposer_' + nsOptions.fid, 'model_toggle');
+	this.publish('nstogglecomposer_' + nsOptions.fid, 'model_toggleComposer_toggle');
     }     
     picker_pick(nsOptions){
+	console.log('model picker pick ' + nsOptions.fid);	
 	this.publish('nspicker_' + nsOptions.fid, 'model_picker_pick', nsOptions.data);
     }
     color_picker_pick(nsOptions){
-	this.publish('nscolorPicker_' + nsOptions.fid, 'model_color_picker_pick', nsOptions.data);
+	console.log('model color picker pick ' + nsOptions.fid);		
+	this.publish('nscolorpicker_' + nsOptions.fid, 'model_colorPicker_pick', nsOptions.data);
     }
     date_picker_pick(nsOptions){
-	this.publish('nsdatePicker_' + nsOptions.fid, 'model_date_picker_pick', nsOptions.data);
+	console.log('model date picker pick ' + nsOptions.fid);		
+	this.publish('nsdatepicker_' + nsOptions.fid, 'model_datePicker_pick', nsOptions.data);
     }    
     time_picker_pick(nsOptions){
-	this.publish('nstimePicker_' + nsOptions.fid, 'model_time_picker_pick', nsOptions.data);
+	console.log('model time picker pick ' + nsOptions.fid);			
+	this.publish('nstimepicker_' + nsOptions.fid, 'model_timePicker_pick', nsOptions.data);
     }
     slider_pick(nsOptions){
 	this.publish('nsslider_' + nsOptions.fid, 'model_slider_pick', nsOptions.data);
     }     
     searchField_keydown(nsOptions){
 	console.log('Search Keydown ' + nsOptions.fid);
-	this.publish('nssearchField_' + nsOptions.fid, 'model_keydown', nsOptions.data);
+	this.publish('nssearchfield_' + nsOptions.fid, 'model_searchField_keydown', nsOptions.data);
     }    
     dropDownMenu_click(fid){
 	console.log('Drop down Menu Input ' + fid);
-	this.publish('nsdropDownMenu_' + fid, 'model_dropDownMenu_click');
+	this.publish('nsdropdownmenu_' + fid, 'model_dropDownMenu_click');
     }
     menu_click(nsOptions){
 	console.log('Menu Input ' + nsOptions.fid);

@@ -3449,7 +3449,17 @@ function printJSObjectTree(obj, indent = 0) {
         console.log(indentString + obj);
     }
 }
-    
+
+function sanitizeKeydownEvent(kde) {
+    return {
+        key: kde.key,
+	metaKey: kde.metaKey,
+	ctrlKey: kde.ctrlKey,
+	shiftKey: kde.shiftKey,
+	altKey: kde.altKey
+    }
+
+}
 function storeModelAndView(m, v) {
     theModel = m;
     theView = v;
@@ -3579,11 +3589,10 @@ class NewspeakCroquetModel extends Croquet.Model {
 	this.publish('nscodemirror_' + nsOptions.fid, 'model_codeMirror_beforeChange', nsOptions.data);
     }
     codeMirror_change(nsOptions){
-	console.log('Codemirror Changed text ' + nsOptions.textBeingAccepted);
+	console.log('Codemirror Changed text ' + nsOptions.data);
 	this.publish('nscodemirror_' + nsOptions.fid, 'model_codeMirror_change', nsOptions.data);
     }
     codeMirror_keydown(nsOptions){
-	console.log('Codemirror Keydown text ');
 	this.publish('nscodemirror_' + nsOptions.fid, 'model_codeMirror_keydown', nsOptions.data);
     }
     codeMirror_accept(nsOptions){
@@ -3591,7 +3600,6 @@ class NewspeakCroquetModel extends Croquet.Model {
 	this.publish('nscodemirror_' + nsOptions.fid, 'model_codeMirror_accept', nsOptions.data);
     }
     codeMirror_cancel(nsOptions){
-	console.log('Codemirror Cancel ');
 	this.publish('nscodemirror_' + nsOptions.fid, 'model_codeMirror_cancel', nsOptions.data);
     }
     textEditor_accept(nsOptions){
@@ -3607,8 +3615,7 @@ class NewspeakCroquetModel extends Croquet.Model {
 	this.publish('nstexteditor_' + nsOptions.fid, 'model_textEditor_cancel', nsOptions.data);
     }
     toggleComposer_toggle(fid){
-	console.log('Toggle ' + fid);
-	this.publish('nstogglecomposer_' + nsOptions.fid, 'model_toggleComposer_toggle');
+	this.publish('nstogglecomposer_' + fid, 'model_toggleComposer_toggle');
     }     
     picker_pick(nsOptions){
 	this.publish('nspicker_' + nsOptions.fid, 'model_picker_pick', nsOptions.data);

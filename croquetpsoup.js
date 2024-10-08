@@ -3470,6 +3470,23 @@ function newspeakFragmentData(fid, data) {
     return {fid: fid, data: data}
 }
 
+function nsCodeMirrorChange(change) {
+    return {from: nsCursorPos(change.from.ch, change.from.line),
+	    to:  nsCursorPos(change.to.ch, change.to.line)
+	   }
+}
+
+function nsCursorPos(ch, line) {
+    return {ch: ch, line: line}
+}
+
+function nsCodeMirrorData(textBeingAccepted, change) {
+    return {
+	textBeingAccepted: textBeingAccepted,
+	change: change
+    }
+}
+
 // Root model
 
 class NewspeakCroquetModel extends Croquet.Model {

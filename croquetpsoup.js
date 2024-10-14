@@ -3471,8 +3471,15 @@ function newspeakFragmentData(fid, data) {
 }
 
 function nsCodeMirrorChange(change) {
+    console.log('from ch =' + change.from.ch);
+    console.log('from line =' + change.from.line);
+    console.log('to ch =' + change.to.ch);
+    console.log('to line =' + change.to.line);
+    console.log('textlength'+change.text.length);
     return {from: nsCursorPos(change.from.ch, change.from.line),
-	    to:  nsCursorPos(change.to.ch, change.to.line)
+	    to:  nsCursorPos(change.to.ch, change.to.line),
+	    text: change.text,
+	    removed: change.removed
 	   }
 }
 
@@ -3525,7 +3532,6 @@ class NewspeakCroquetModel extends Croquet.Model {
 	this.subscribe('nsdatepicker_', 'datePicker_pick', this.date_picker_pick);
 	this.subscribe('nstimepicker_', 'timePicker_pick', this.time_picker_pick);
 	this.subscribe('nsslider_', 'slider_pick', this.slider_pick);
-	this.subscribe('nssearchfield_', 'searchField_keydown', this.searchField_keydown);		
 	this.subscribe('nsdropdownmenu_', 'dropDownMenu_click', this.dropDownMenu_click);
         this.subscribe('nsmenu_', 'menu_click', this.menu_click);
     }
@@ -3649,10 +3655,6 @@ class NewspeakCroquetModel extends Croquet.Model {
     slider_pick(nsOptions){
 	this.publish('nsslider_' + nsOptions.fid, 'model_slider_pick', nsOptions.data);
     }     
-    searchField_keydown(nsOptions){
-	console.log('Search Keydown ' + nsOptions.fid);
-	this.publish('nssearchfield_' + nsOptions.fid, 'model_searchField_keydown', nsOptions.data);
-    }    
     dropDownMenu_click(fid){
 	this.publish('nsdropdownmenu_' + fid, 'model_dropDownMenu_click', fid);
     }

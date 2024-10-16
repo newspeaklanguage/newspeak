@@ -3471,11 +3471,6 @@ function newspeakFragmentData(fid, data) {
 }
 
 function nsCodeMirrorChange(change) {
-    console.log('from ch =' + change.from.ch);
-    console.log('from line =' + change.from.line);
-    console.log('to ch =' + change.to.ch);
-    console.log('to line =' + change.to.line);
-    console.log('textlength'+change.text.length);
     return {from: nsCursorPos(change.from.ch, change.from.line),
 	    to:  nsCursorPos(change.to.ch, change.to.line),
 	    text: change.text,
@@ -3623,15 +3618,12 @@ class NewspeakCroquetModel extends Croquet.Model {
 	this.publish('nscodemirror_' + nsOptions.fid, 'model_codeMirror_cancel', nsOptions.data);
     }
     textEditor_accept(nsOptions){
-	console.log('Accepted text ' + nsOptions.textBeingAccepted);
 	this.publish('nstexteditor_' + nsOptions.fid, 'model_textEditor_accept', nsOptions.data);
     }
     textEditor_change(nsOptions){
-	console.log('Changed text ' + nsOptions.data);
 	this.publish('nstexteditor_' + nsOptions.fid, 'model_textEditor_change', nsOptions.data);
     }
     textEditor_cancel(nsOptions){
-	console.log('Canceled text ' + nsOptions.data);
 	this.publish('nstexteditor_' + nsOptions.fid, 'model_textEditor_cancel', nsOptions.data);
     }
     toggleComposer_toggle(fid){

@@ -1685,7 +1685,7 @@ function isDataURI(filename) {
 
 
 
-var wasmBinaryFile = 'primordialsoup.wasm';
+var wasmBinaryFile = 'croquetpsoup.wasm';
 if (!isDataURI(wasmBinaryFile)) {
   wasmBinaryFile = locateFile(wasmBinaryFile);
 }

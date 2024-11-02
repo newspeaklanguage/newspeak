@@ -3478,6 +3478,14 @@ function nsCodeMirrorChange(change) {
 	   }
 }
 
+function nsCodeMirrorSelectionChange(change) {
+    var from = change.ranges[0].anchor;
+    var to = change.ranges[0].head;
+    return {anchor: {line: from.line, ch: from.ch},
+	    head: {line: to.line, ch: to.ch}
+	   }
+}
+
 function nsCursorPos(ch, line) {
     return {ch: ch, line: line}
 }
@@ -3518,6 +3526,7 @@ class NewspeakCroquetModel extends Croquet.Model {
 	this.subscribe('nscodemirror_', 'codeMirror_keydown', this.codeMirror_keydown);
 	this.subscribe('nscodemirror_', 'codeMirror_accept', this.codeMirror_accept);
 	this.subscribe('nscodemirror_', 'codeMirror_cancel', this.codeMirror_cancel);
+	this.subscribe('nscodemirror_', 'codeMirror_beforeSelectionChange', this.codeMirror_beforeSelectionChange);	
 	this.subscribe('nstexteditor_', 'textEditor_accept', this.textEditor_accept);
 	this.subscribe('nstexteditor_', 'textEditor_change', this.textEditor_change);
 	this.subscribe('nstexteditor_', 'textEditor_cancel', this.textEditor_cancel);
@@ -3603,20 +3612,29 @@ class NewspeakCroquetModel extends Croquet.Model {
 	this.publish('nsradiobutton_' + fid, 'model_radioButton_pressed');
     }
     codeMirror_beforeChange(nsOptions){
+	console.log('before_change ' + nsOptions.fid);
 	this.publish('nscodemirror_' + nsOptions.fid, 'model_codeMirror_beforeChange', nsOptions.data);
     }
     codeMirror_change(nsOptions){
+	console.log('change ' + nsOptions.fid);	
 	this.publish('nscodemirror_' + nsOptions.fid, 'model_codeMirror_change', nsOptions.data);
     }
     codeMirror_keydown(nsOptions){
+	console.log('keydown ' + nsOptions.fid);	
 	this.publish('nscodemirror_' + nsOptions.fid, 'model_codeMirror_keydown', nsOptions.data);
     }
     codeMirror_accept(nsOptions){
+	console.log('accept ' + nsOptions.fid);		
 	this.publish('nscodemirror_' + nsOptions.fid, 'model_codeMirror_accept', nsOptions.data);
     }
     codeMirror_cancel(nsOptions){
+	console.log('cancel ' + nsOptions.fid);		
 	this.publish('nscodemirror_' + nsOptions.fid, 'model_codeMirror_cancel', nsOptions.data);
     }
+    codeMirror_beforeSelectionChange(nsOptions){
+	console.log('before selection change ' + nsOptions.fid + ' data = ' + nsOptions.data);		
+	this.publish('nscodemirror_' + nsOptions.fid, 'model_codeMirror_beforeSelectionChange', nsOptions.data);
+    }    
     textEditor_accept(nsOptions){
 	this.publish('nstexteditor_' + nsOptions.fid, 'model_textEditor_accept', nsOptions.data);
     }

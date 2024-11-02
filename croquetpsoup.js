@@ -3631,8 +3631,7 @@ class NewspeakCroquetModel extends Croquet.Model {
 	console.log('cancel ' + nsOptions.fid);		
 	this.publish('nscodemirror_' + nsOptions.fid, 'model_codeMirror_cancel', nsOptions.data);
     }
-    codeMirror_beforeSelectionChange(nsOptions){
-	console.log('before selection change ' + nsOptions.fid + ' data = ' + nsOptions.data);		
+    codeMirror_beforeSelectionChange(nsOptions){		
 	this.publish('nscodemirror_' + nsOptions.fid, 'model_codeMirror_beforeSelectionChange', nsOptions.data);
     }    
     textEditor_accept(nsOptions){

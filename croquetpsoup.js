@@ -3486,6 +3486,10 @@ function nsCodeMirrorSelectionChange(change) {
 	   }
 }
 
+function nsPopstateData(event){
+    return {state: event.state}
+}
+
 function nsCursorPos(ch, line) {
     return {ch: ch, line: line}
 }
@@ -3538,6 +3542,7 @@ class NewspeakCroquetModel extends Croquet.Model {
 	this.subscribe('nsslider_', 'slider_pick', this.slider_pick);
 	this.subscribe('nsdropdownmenu_', 'dropDownMenu_click', this.dropDownMenu_click);
         this.subscribe('nsmenu_', 'menu_click', this.menu_click);
+        this.subscribe('nsshell_', 'shell_userBack', this.shell_userBack);	
     }
     // same issues with scope for these methods
     mouseDown(fid){
@@ -3666,7 +3671,10 @@ class NewspeakCroquetModel extends Croquet.Model {
     }
     menu_click(nsOptions){
 	this.publish('nsmenu_' + nsOptions.fid, 'model_menu_click', nsOptions.data);
-    }    
+    }
+    shell_userBack(nsOptions){
+	this.publish('nsshell_' + nsOptions.fid, 'model_shell_userBack', nsOptions.data);
+    }     
 }
 
 

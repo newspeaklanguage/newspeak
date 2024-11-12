@@ -3617,15 +3617,12 @@ class NewspeakCroquetModel extends Croquet.Model {
 	this.publish('nsradiobutton_' + fid, 'model_radioButton_pressed');
     }
     codeMirror_beforeChange(nsOptions){
-	console.log('before_change ' + nsOptions.fid);
 	this.publish('nscodemirror_' + nsOptions.fid, 'model_codeMirror_beforeChange', nsOptions.data);
     }
     codeMirror_change(nsOptions){
-	console.log('change ' + nsOptions.fid);	
 	this.publish('nscodemirror_' + nsOptions.fid, 'model_codeMirror_change', nsOptions.data);
     }
     codeMirror_keydown(nsOptions){
-	console.log('keydown ' + nsOptions.fid);	
 	this.publish('nscodemirror_' + nsOptions.fid, 'model_codeMirror_keydown', nsOptions.data);
     }
     codeMirror_accept(nsOptions){
@@ -3633,7 +3630,6 @@ class NewspeakCroquetModel extends Croquet.Model {
 	this.publish('nscodemirror_' + nsOptions.fid, 'model_codeMirror_accept', nsOptions.data);
     }
     codeMirror_cancel(nsOptions){
-	console.log('cancel ' + nsOptions.fid);		
 	this.publish('nscodemirror_' + nsOptions.fid, 'model_codeMirror_cancel', nsOptions.data);
     }
     codeMirror_beforeSelectionChange(nsOptions){		

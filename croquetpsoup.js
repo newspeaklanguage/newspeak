@@ -3501,6 +3501,15 @@ function nsCodeMirrorData(textBeingAccepted, change) {
     }
 }
 
+
+function nsTextEditorData(textBeingAccepted, selectionStart, selectionEnd) {
+    return {
+	textBeingAccepted: textBeingAccepted,
+	selectionStart: selectionStart,
+	selectionEnd: selectionEnd
+    }
+}
+
 // Root model
 
 class NewspeakCroquetModel extends Croquet.Model {

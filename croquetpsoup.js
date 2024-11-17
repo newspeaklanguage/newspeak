@@ -3510,6 +3510,14 @@ function nsTextEditorData(textBeingAccepted, selectionStart, selectionEnd) {
     }
 }
 
+function fileish(f) {
+    return {
+        text: function() {
+            return Promise.resolve(f);
+        }
+    };
+}
+
 // Root model
 
 class NewspeakCroquetModel extends Croquet.Model {
@@ -3551,7 +3559,8 @@ class NewspeakCroquetModel extends Croquet.Model {
 	this.subscribe('nsslider_', 'slider_pick', this.slider_pick);
 	this.subscribe('nsdropdownmenu_', 'dropDownMenu_click', this.dropDownMenu_click);
         this.subscribe('nsmenu_', 'menu_click', this.menu_click);
-        this.subscribe('nsshell_', 'shell_userBack', this.shell_userBack);	
+        this.subscribe('nsshell_', 'shell_userBack', this.shell_userBack);
+	this.subscribe('nsfilechooser_', 'fileChooser_click', this.fileChooser_click);
     }
     // same issues with scope for these methods
     mouseDown(fid){
@@ -3679,7 +3688,10 @@ class NewspeakCroquetModel extends Croquet.Model {
     }
     shell_userBack(nsOptions){
 	this.publish('nsshell_' + nsOptions.fid, 'model_shell_userBack', nsOptions.data);
-    }     
+    }
+    fileChooser_click(nsOptions){
+	this.publish('nsfilechooser_' + nsOptions.fid, 'model_fileChooser_click', nsOptions.data);
+    }    
 }
 
 

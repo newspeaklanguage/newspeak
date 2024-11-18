@@ -3510,10 +3510,39 @@ function nsTextEditorData(textBeingAccepted, selectionStart, selectionEnd) {
     }
 }
 
-function fileish(f) {
+function fileish(fd) {
+    /* Why not just create a File object? Because the File API is not invertible; you cannot pass it the webkitRelativePath property. On the other hand,
+some APIs we use (like JSZip) insist on taking File. So we probably will scrap this code. */
+    buffer = fd.arrayBuff;
+    
     return {
+	name: fd.name,
+	type: fd.type,
+	lastModified: fd.lastModified,
+	webkitRelativePath: fd.webkitRelativePath,
+        arrayBuffer: function() {
+            return Promise.resolve(buffer);
+        },
+        bytes: function() {
+            return Promise.resolve(new Uint8Array(buffer));
+        },
+        slice: function(start = 0, end = buffer.byteLength) {
+            const slicedBuffer = buffer.slice(start, end);
+            return Promise.resolve(slicedBuffer);
+        },
+        stream: function() {
+            const readableStream = new ReadableStream({
+                start(controller) {
+                    controller.enqueue(new Uint8Array(buffer));
+                    controller.close();
+                }
+            });
+            return Promise.resolve(readableStream);
+        },
         text: function() {
-            return Promise.resolve(f);
+            const decoder = new TextDecoder();
+            const text = decoder.decode(buffer);
+            return Promise.resolve(text);
         }
     };
 }

@@ -36,7 +36,7 @@ cd ${NEWSPEAK} || exit 1
 #   - All primordialsoup built snapshots of vfuel files such as WebCompiler.vfuel
 #   - Note that primordialsoup.* have a copy in primordialsoup repo and multiple
 #     copies in the newspeak repo. Deployments use the versions from the primordialsoup repo.
-mkdir --parent out
+mkdir -p out
 cp ${PRIMORDIALSOUP}/out/ReleaseEmscriptenWASM/primordialsoup.* out
 cp ${PRIMORDIALSOUP}/out/snapshots/*.vfuel out
 # 6. Copy Psoup Newspeak code
@@ -79,7 +79,7 @@ cd ${NEWSPEAK}/out || exit 1
 #    from ns files (ex: HopscotchWebIDE.ns) and
 #    additional resources (*.ns, *.png).
 #
-${PRIMORDIALSOUP}/out/ReleaseX64/primordialsoup \
+${PRIMORDIALSOUP}/out/ReleaseARM64/primordialsoup \
     ${PRIMORDIALSOUP}/out/snapshots/WebCompiler.vfuel \
     ./*.ns \
     ./*.png \

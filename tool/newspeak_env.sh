@@ -11,7 +11,7 @@
 # Environment variables for directories needed to build Newspeak.
 # Modify them according to your directory structure, but do not push.
 #
-export EMSDK=~/software/emsdk                           # Emscripten directory
-export NEWSPEAK=~/software/nswasm/newspeak              # Newspeak directory
-export PRIMORDIALSOUP=~/software/nswasm/primordialsoup  # Primordialsoup directory
+export EMSDK=~/personal/newspeak/emsdk                    # Emscripten directory
+export NEWSPEAK=~/personal/newspeak/newspeak              # Newspeak directory
+export PRIMORDIALSOUP=~/personal/newspeak/primordialsoup  # Primordialsoup directory
 echo "$0: EXPORTING: EMSDK=$EMSDK, NEWSPEAK=$NEWSPEAK, PRIMORDIALSOUP=$PRIMORDIALSOUP"

@@ -237,8 +237,8 @@ copy_codemirror_for_deploy_as_website() {
     # Ensures the server directory contains CodeMirror directories
     #   expected by 'primordialsoup.html' and copies CodeMirror
     #   files from git in the directories.
-    mkdir --parent "$httpServerDir/CodeMirror/lib/"
-    mkdir --parent "$httpServerDir/CodeMirror/addon/display/"
+    mkdir -p "$httpServerDir/CodeMirror/lib/"
+    mkdir -p "$httpServerDir/CodeMirror/addon/display/"
     cp ../platforms/webIDE/public/assets/lib/codemirror.js "$httpServerDir/CodeMirror/lib/"
     cp ../platforms/webIDE/public/assets/lib/codemirror.css "$httpServerDir/CodeMirror/lib/"
     cp ../platforms/webIDE/public/assets/lib/codemirror_autorefresh.js "$httpServerDir/CodeMirror/addon/display/autorefresh.js"
@@ -256,7 +256,7 @@ copy_common_files_to_http_server_dir_for_deploy() {
     
     httpLibDir="$1"
     echo "Setting and making httpLibDir=$httpLibDir"
-    mkdir --parent "$httpLibDir/"
+    mkdir -p "$httpLibDir/"
     
     # 1. Copy top level images to the top of the server directory, (to the same level as webIDE).
     # The top location is needed due to a serialization bug where image aliens
@@ -283,7 +283,7 @@ copy_files_to_http_server_for_deploy_as_pwa() {
 
     httpLibDir="$httpServerDir/webIDE/public/assets/lib"
     echo "Setting and making httpLibDir=$httpLibDir"
-    mkdir --parent "$httpLibDir/"
+    mkdir -p "$httpLibDir/"
 
     copy_common_files_to_http_server_dir_for_deploy "$httpLibDir"
 
@@ -316,7 +316,7 @@ copy_files_to_http_server_for_deploy_as_website() {
 
     httpLibDir="$httpServerDir"
     echo "Setting and making httpLibDir=$httpLibDir"
-    mkdir --parent "$httpLibDir/"
+    mkdir -p "$httpLibDir/"
     
     copy_common_files_to_http_server_dir_for_deploy "$httpLibDir"
 

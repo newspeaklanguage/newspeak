@@ -65,6 +65,7 @@ Ultimately, we hope to go beyond the above, and be able to diff the saved model 
   menuCount <Integer> ::= 0.
   windowCount <Integer> ::= 0.
   fileChooserCount <Integer> ::= 0.
+  liveFileChoosers = List new.
   (* JS access *)
   js = p js.   
 |
@@ -694,13 +695,15 @@ This fragment is a bit unusual. We deviate somewhat from this module's standard 
 As a result, only the client where the request to load files was initiated can respond with a file dialog, and only in the same turn.  This means we must take action to read files immediately, and so the #chooseFileList: method calls the super method. However, it sends it a different closure than the one passed in to it.
 The original closure is stored in the #lastAction slot, while super method is passed a closure accepts the locally read file list, and forwards that data as part of the event sent to the croquet reflector.  When the reflector responds, the data is fed into the original closure kept in #lastAction. See #setupCroquetView for the details.
 
-A complication is that the file API is asynchronous, so we only have promises initially. We must wait for these promises to be resolved to obtain the required data which we will forward to the reflector. This is handled in #fileChoiceData:whenReady:.
+A complication is that the file API is asynchronous, so we only have promises initially. We must wait for these promises to be resolved to obtain the required data which we will forward to the reflector. This is handled in #extractFileData:whenReady:.
 *)
     |
     fragmentId <Integer> ::= newFileChooserId.
     scope_slot <String>
     lastAction <[:List[Alien[File]]]>
     |
+    ('creating file chooser ', fragmentId printString) out.
+    liveFileChoosers add: self.
     croquetView
 ) (
 public scope ^ <String> = (
@@ -712,55 +715,105 @@ updateVisualsFromSameKind: oldFragment <FileChooserFragment>  ^ <Alien[Node]> = 
   scope_slot: oldFragment scope.
   ^self.
 )
-public chooseFileList:  blk <[:List[Alien[File]]]> = (
-  (* Save the original closure for later *)
-  lastAction:: blk.
-  (* locally read the files and pass their data to the reflector *)
-  super chooseFileList: [:fs <List[Alien[File]]> |  
-    (* For now, the data is their contents, presumed to be strings. Really should be an interface to the general data in a File *)
-    extractFileData: fs whenReady: [:fds <JSArray[JSObject]> |
-      rootView <-: publish: 'nsfilechooser_' event: #fileChooser_click data: (js global newspeakFragmentData: fragmentId data: fds)
-      ]
-    ]
-)
-setupCroquetView = (
-        (* When the Croquet view is notified of the chosen files, it will message us back with the file data, which we want to submit to the original action block. 
-        The block wants a list of Files, so we need to feed it objects with the same API - including async methods that return the data. Of course, we actually resolved that data before posting the original event, and so the incoming data needs to repackaged into File-like objects with a fake async API.
-        *)
-        rootView <-: subscribe: scope eventSpec: #model_fileChooser_click handler: [:e <JSArray[JSObject]> | 
-          | len <Integer> = e at: #length. fds <List[Alien[File]]> = List new. |
-          (* repackage the file data into File-ish objects *)
-          1 to: len do: [:i <Integer> | fds add: (createFile: (e at: i-1))].
-          (* feed the resulting 'Files' into the original closure *)
-          lastAction value: fds. 
-          nil
-          ]
-)
-extractFileData: fs <List[Alien[File]]> whenReady: blk <[:JSArray[JSObject]]> = (
-(* In principle, the data is the file list, fs. However, we cannot serialize File objects. We must obtain their contents via their asynchronous API, and package it up. When that data is received by clients (including the one that sent it), it will be placed in File-like objects so that the original closure (now stored in #lastAction) can consume it.  See #setupCroquetView for details. *)
-  |
-  ps <List[Alien[Promise[[ArrayBuffer]]]]>  = (js global at: 'Array') new: fs size.
-  fds <JSArray[JSObject]>  = (js global at: 'Array') new: fs size.
-  |
-  1 to: fs size do: [:i <Integer> | | f <Alien[File]> = fs at: i. |
-    ps at: i - 1 put: (fs at: i) arrayBuffer.
-    fds at: i - 1 put: JSObject new.
-    {#name. #type. #lastModified. #webkitRelativePath } do: [:pn <Symbol> |
-      (fds at: i - 1) at: pn put: (f at: pn)
-      ]
-  ].
-  ((js global at: 'Promise') all: ps) then: [:buffers <JSArray[ArrayBuffer]> |
-      0 to: fs size -1 do: [:i <Integer> | (fds at: i) at: #arrayBuff put: (buffers at: i)].
-	  [blk value: fds. nil] on: Error do:  [:ex | alert: ex printString. nil].
-      nil
-	] onError: [:ex |  alert: ex printString. nil]
-)
-createFile: fd ^ <Alien[File]> = (
+createFile: fd <JSObject> ^ <Alien[File]> = (
+(* 
+Given a file description, return a corresponding JS File object.
+The argument is of the form 
+{name: String, type: String, lastModified: Float, webkitRelativePath: String, handle: JSPromise, arrayBuff: JSArrayBuffer}
+    *)
   | contents <JSArray> = (js global at: 'Array') new: 1. options = JSObject new. |
   contents at: 0 put: (fd at: #arrayBuff).
   options at: #type put: (fd at: #type);
                at: #lastModified put: (fd at: #lastModified).
   ^ (js global at: #File) new: contents name:  (fd at: #name) options: options
+)
+descriptorFor: fd <JSObject> ^ <JSObject> = (
+(* Given a file description, produce a description of the metadata only, without the contents*)
+  | descriptor = JSObject new. |
+  (* Copy all the data except the actual file contents (the array buffer) to the incoming file descriptor *)
+  {#name. #type. #lastModified. #webkitRelativePath } do: [:pn <Symbol> |
+      descriptor at: pn put: (fd at: pn)
+      ].
+   ^descriptor
+)
+public chooseFileList:  blk <[:List[Alien[File]]]> = (
+  (* Save the original closure for later *)
+  lastAction:: blk.
+  (* Locally read the files and pass their data to the reflector. In more detail:
+      Once we've extracted the actual file contents, we can store them on the Croquet server. We then separate out the file metadata and pass that in the Croquet event. When that data is received by clients (including the one that sent it), it will be placed in File-like objects so that the original closure (now stored in #lastAction) can consume it.  See #setupCroquetView for details.
+  *)
+  super chooseFileList: [:fs <List[Alien[File]]> |  
+    extractFileData: fs whenReady: [:fds <JSArray[JSObject]> |
+      | 
+      ps <List[Alien[Promise[[ArrayBuffer]]]]>  = (js global at: 'Array') new: fds at: #length. 
+      descriptors =  (js global at: 'Array') new: fs size.
+      |
+      1 to: fs size do: [:i <Integer> |  | fd <JSObject> = fds at: i -1. |
+        (* store the file contents in the reflector *)
+        ps at: i - 1 put: (rootView storedData store: (fd at: #arrayBuff)).
+        (* Gather file metadata, to be published to all clients *)
+        descriptors at: i -1 put: (descriptorFor: fd).
+      ].
+      (* When data has been stored, publish notification, which will be passed on to all clients *)
+      ((js global at: 'Promise') all: ps) then: [:handles <JSArray[CroquetHandle]> |
+        0 to: fs size - 1 do: [:i <Integer> | (descriptors at: i)  at: #handle put: (handles at: i)].
+        rootView <-: publish: 'nsfilechooser_' event: #fileChooser_click data: (js global newspeakFragmentData: fragmentId data: descriptors).
+        'published' out.
+        ] onError: [:ex |  alert: 'HopscotchForCroquet FileChooserFragment chooseFileList: ', ex printString. nil].
+      ]
+    ]
+)
+extractFileData: fs <List[Alien[File]]> whenReady: blk <[:JSArray[JSObject]]> = (
+(* In principle, the data is the file list, fs. However, files cannot be serialized as part of a Croquet event. Even if they could, they are often too large. We must obtain their contents via their asynchronous API and package that up. We then feed the data into the blk parameter for further processing. See #chooseFileList: for what that further processing looks like.
+ *)
+  |
+  ps <List[Alien[Promise[[ArrayBuffer]]]]>  = (js global at: 'Array') new: fs size.
+  (* An array of file descriptors - JS objects of the form 
+  {name: String, type: String, lastModified: Float, webkitRelativePath: String, handle: JSPromise, arrayBuff: Blob}
+  *)
+  fds <JSArray[JSObject]>  = (js global at: 'Array') new: fs size.
+  |
+  1 to: fs size do: [:i <Integer> | | f <Alien[File]> = fs at: i. |
+    ps at: i - 1 put: (fs at: i) arrayBuffer.
+    fds at: i - 1 put:  (descriptorFor: f).
+  ].
+  ((js global at: 'Promise') all: ps) then: [:buffers <JSArray[ArrayBuffer]> |
+      0 to: fs size -1 do: [:i <Integer> | (fds at: i) at: #arrayBuff put: (buffers at: i)].
+	  [blk value: fds. nil] on: Error do:  [:ex | alert:  'HopscotchForCroquet FileChooserFragment extractFileData:whenReady ', ex printString. nil].
+      nil
+	] onError: [:ex |  alert: ex printString. nil]
+)
+setupCroquetView = (
+        (* When the Croquet view is notified of the chosen files, it will message us back with the file metadata. We will us ethat metadata to extract the file contents, stored on the Croquet server. We want to submit all that information to the original action block passed into #chooseFileList:. 
+        The block wants a list of Files, so we need to feed it objects with the same API - including async methods that return the data. Of course, we actually resolved that data before posting the original event, and so the incoming data needs to repackaged into File-like objects with a fake async API.
+        *)
+        rootView <-: subscribe: scope eventSpec: #model_fileChooser_click handler: [
+          (* The event data: an array of file descriptors - JS objects of the form 
+             {name: String, type: String, lastModified: Float, webkitRelativePath: String, handle:   JSPromise *)
+          :e <JSArray[JSObject]> | 
+          | 
+          len <Integer> = e at: #length.
+          fds <List[Alien[File]]> = List new: len. 
+          contents <JSArray[JSPromise]> = (js global at: 'Array') new: len.
+          |
+          (* repackage the file data into File-ish objects *)
+          'processing subscription' out.
+          (* Get the data from the server *)
+          0 to: len - 1 do: [:i <Integer> | | fd <JSObject> =  e at: i. |
+            contents at: i put:  (rootView storedData fetch: (fd at: #handle))
+            ].
+          (* Wait for data to resolve, and generate the File objects*)
+          ((js global at: 'Promise') all: contents) then: [:cs |
+             0 to: len -1 do: [:i <Integer> | 
+               (e at: i) at: #arrayBuff put: (cs at: i).
+               fds add: (createFile: (e at: i)).
+               ].
+               lastAction value: fds. 
+               liveFileChoosers remove: self.
+             nil
+             ] onError: [:ex |  alert:  'HopscotchForCroquet FileChooserFragment setupCroquetView: ', ex printString. nil].
+             nil.
+        ]
 )
 ) : (
 public new ^ <Instance> = (

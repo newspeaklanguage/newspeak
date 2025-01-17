@@ -138,7 +138,7 @@ At this point, the view may change for one of three reasons:
   a. An interaction with a widget in the document causes it to update the system in some way, such that the widget itself, and/or or some other widget(s) displayed in the document might need to update their display
   b. The document is displayed as part of a larger presenter (e.g., an object presenter on the document) and some interaction with another part of the enclosing presenter triggers a UI change.
   c. We were viewing a different presenter where some UI change was initiated, and we are now returning to a view where the document is included.
-  A UI update works through the usual Hopscotch reactive mechanism.  The relevant parts of that process are the #updateVisualsFromSameKind: methods here and, especially, in AmpleforthFragment. AmpleforthFragment needs to recursively invoke the update process on all amplets. To this end, two maps are maintained. The first, #fragmentMapping, maps every amplet ids or names [1] to their fragments. The second, #expressionMapping, maps amplet ids to the defining expressions of the amplets. This enables an optimization, whereby recomputation can be avoided if the amplet's defining expression is unchanged.
+  A UI update works through the usual Hopscotch reactive mechanism.  The relevant parts of that process are the #updateVisualsFromSameKind: methods here and, especially, in AmpleforthFragment. AmpleforthFragment needs to recursively invoke the update process on all amplets. To this end, two maps are maintained. The first, #fragmentMapping, maps every amplet's id or name [1] to its fragment. The second, #expressionMapping, maps amplet ids to the defining expressions of the amplets. This enables an optimization, whereby recomputation can be avoided if the amplet's defining expression is unchanged.
   
 These maps are stored here so that they can be passed to newly created AmpleforthFragments, which update them as needed.
   
@@ -694,20 +694,25 @@ public onSubject: os <ObjectSubject> ^ <Instance> = (
 )
 public class Document named: n <String> contents: s <String> = ProgrammingPresenter onSubject: dummySubject (
 (*
-A Document provides a context for evaluating Newspeak code, in order to present live Hopscotch fragments within the text. Access to the all the standard fragments is provided by inheriting them from ProgrammingPresenter. This inheritance is done only for that purpose; Document isn't a Presenter! This should be cleaned up. See PrefixPresenter for an example of how to do that.
+A Document provides a context for evaluating Newspeak code, in order to present live Hopscotch fragments within the text. Access to all the standard fragments is provided by inheriting them from ProgrammingPresenter. This inheritance is done only for that purpose; Document isn't a Presenter! This should be cleaned up. See PrefixPresenter for an example of how to do that.
 
 We also want access to the IDE namespace, in support of literate programming. The #doesNotUnderstand: method provides this access.
 Lastly, we implement the  #evaluateFragment: method that allows for evaluating expressions in the context of the Document, for reasons explained below.
 
-By convention, the Document is made available to AmpleforthFragment via the mapping, under the key 'AmpleforthTargetDocument'. This allows AmpleforthFragment to process amplets, DOM nodes containing arbitrary Newspeak code snippets that produce Hopscotch fragments, by evaluating them as message sends in the scope of the Document. We use this convention because we don't want Hopscotch to depend on mirrors (most UI applications do not need mirrors as part of the platform) - neither directly or indirectly via Document. Hence Hopscotch, and in particular, AmpleforthFragment, cannot implement such evaluation by itself and must be given the Document instead. We can't give it the mirror, because the mapping must only consist of fragments.
+By convention, the Document is made available to the AmpleforthFragment that displays its live view. This done via the AmpleforthFragment's fragment mapping, under the key 'AmpleforthTargetDocument'. This allows AmpleforthFragment to process amplets, DOM nodes containing arbitrary Newspeak code snippets that produce Hopscotch fragments, by evaluating them as message sends in the scope of the Document. We use this convention because we don't want Hopscotch to depend on mirrors (most UI applications do not need mirrors as part of the platform) - neither directly or indirectly via Document. Hence Hopscotch, and in particular, AmpleforthFragment, cannot implement such evaluation by itself and must be given the Document instead. We can't give it the mirror, because the mapping must only consist of fragments.
 
-The ampletCache holds stateful subjects the document requires. For example, if we embed an object presenter in a document via an amplet, it's subject holds on to an evaluator of its own, with a list of results etc. If we want this state to be retained as the document recomputes itself, we need to hold on to that subject and not  recompute it when the amplet gets processed. The ampletCache is where we can store this information. This avoids having each document class have specific fields to cache particular amplets. Furthermore, common usages (like embedding a workspace or an object presenter) are supported by convenience methods like #workspaceTagged: etc., which use the ampletCache, relieving the document author from having to deal with the subtleties of caching subjects.
+Common usages (like embedding a workspace or an object presenter) are supported by convenience methods like #workspace:, #inspect: etc.
 *)
 	|
     public name <String> ::= n.
 	public contents <String> ::= s.
     public mirror = ObjectMirror reflecting: self.
+    (* A counter for amplets, so each amplet gets a unique id *)
     public maxAmpletCount <Integer> ::= 0.
+    (* All external media used by the document are stored in maps keyed by the media's path *)
+    public imageMap <Map[String, Alien[Promise[Alien[Blob]]]]> = Map new.
+    public videoMap <Map[String, Alien[Promise[Alien[Blob]]]]> = Map new.
+    public audioMap <Map[String, Alien[Promise[Alien[Blob]]]]> = Map new.  
 	|
 ) (
 public isKindOfDocument ^ <Boolean> = (
@@ -1268,19 +1273,6 @@ public cloneNamed: n <String>  (* :exemplar: cloneNamed: #Dummy *)= (
    (* instantiate cloned class, and use it as model for an instance of my class, which we return *)
    ^class onModel: ((((ObjectMirror reflecting: ide documentHolder) evaluate: n) result reflectee) contents: document contents)
 )
-processImagesFromDom: dom usingFolder: folder = (
-  | 
-  images = dom getElementsByTagName: #img.
-  imageFolder = folder getFolder: 'images'.
-  |
-  (* for each image in the main document, save contents to file in zip folder 'images' *)
-  (0 to: (images at: #length) -1) do: [:i <Integer> | 
-  | img <Alien[Node]> = images at: i.  fn <String> = img at: #name. |
-    imageFolder file: fn contents: ((retainedPlatform js global fetch: (img at: #src)) then: [:r | r blob]). 
-    (* revise src attribute to an extenally valid URI *)
-    img at: #src put: './images/', fn.
-  ].
-)
 public savedHTMLFor: dom <Alien[Node]> ^ <String>  = (
   ^'<div class = "ampleforthDocumentClass" name = "', 
   document name, 
@@ -1345,27 +1337,6 @@ dependenciesUsing: dom ^ <List> = (
   (* Lookup the values of the dependencies and return them *)
   ^importedNames collect: [:k <String> | ide namespacing Root at: k] 
 )
-public createFolder ^ <Folder> = (
-(*
-This method creates an in-memory zip folder representing the current document. See the class comment for details of the persistent representation
-*)
-  | 
-  folder <Folder> = (* Create a zip folder *) ide webFiles Folder named: name. 
-    (* add contents subfolder *)
-  innerFolder = folder addFolder: 'contents'.
-  (* Copy the DOM so we can modify it before saving *)
-  dom = DOMParser new parseFromString: document contents mimeType: 'text/html'.
-  |
-  (* add images to folder *)
-  processMediaFromDom: dom usingFolder: folder.
-  (* process objects accessed from the IDE root namespace, such as classes and transcluded documents *)
-  processObjectsFromDom: dom usingFolder: folder.
-  (* add contents if any *)
-  model addContentsUsingFolder: innerFolder.
-  (* add main document to folder; we do this last, so service methods can update the copied dom first *)
-  folder addTextFile: name, '.html' contents: (savedHTMLFor: dom).  
-  ^folder
-)
 processMediaFromDom: dom usingFolder: folder = (
  (* for now, use old way to deal with images for compatibility *)
   processImagesFromDom: dom usingFolder: folder.
@@ -1411,6 +1382,43 @@ gatherMessagesOf: c <ClassDeclarationMirror> into: importCandidates <Set[String]
     ].
   (* Remove c's name, if it shows up,  to prevent infinite regress *)
   importCandidates remove: c name ifAbsent: []. 
+)
+public createFolder ^ <Folder> = (
+(*
+This method creates an in-memory zip folder representing the current document. See the class comment for details of the persistent representation
+*)
+  | 
+  folder <Folder> = (* Create a zip folder *) ide webFiles Folder named: name. 
+    (* add contents subfolder *)
+  innerFolder = folder addFolder: 'contents'.
+  (* Copy the DOM so we can modify it before saving *)
+  dom = DOMParser new parseFromString: document contents mimeType: 'text/html'.
+  |
+  (* add media to folder *)
+  processMediaFromDom: dom usingFolder: folder.
+  (* process objects accessed from the IDE root namespace, such as classes and transcluded documents *)
+  processObjectsFromDom: dom usingFolder: folder.
+  (* add contents if any *)
+  model addContentsUsingFolder: innerFolder.
+  (* add main document to folder; we do this last, so service methods can update the copied dom first *)
+  folder addTextFile: name, '.html' contents: (savedHTMLFor: dom).  
+  ^folder
+)
+processImagesFromDom: dom usingFolder: folder =	 (
+  | 
+  images = dom getElementsByTagName: #img.
+  imageFolder = folder getFolder: 'images'.
+  |
+  (* for each image in the main document, save contents to file in zip folder 'images' *)
+  (* first, any images directly used in the DOM *)
+  (0 to: (images at: #length) -1) do: [:i <Integer> | 
+  | img <Alien[Node]> = images at: i.  fn <String> = img at: #name. |
+    imageFolder file: fn contents: ((retainedPlatform js global fetch: (img at: #src)) then: [:r | r blob]). 
+    (* revise src attribute to an externally valid URI *)
+    img at: #src put: './images/', fn.
+  ].
+  (* Any images used by amplets must be added as well *)
+  imageMap keysAndValuesDo: [:k :v | imageFolder file: k contents: v]
 )
 ) : (
 )
@@ -1718,90 +1726,6 @@ public loadDocument2: jsz <Alien[JSZip]> named: n <String> into: namespace <Name
       nil.  
   ] onError: [:ex | failureBlock value:  'Error loading main document: ', ex printString. nil].
 )
-public loadDocument: jsz <Alien[JSZip]> named: n <String> into: namespace <NamespaceSubject> ifSuccess: successBlock <[]> ifFailure: failureBlock <[:List[String]]> = (
-(* Takes a zipfile representing a Document and converts it into a live Document. *)
-  |
-  images <Alien[JSZip]> = jsz folder: n, '/images'.
-  videoFolder <Alien[JSZip]> = jsz folder: n, '/video'.
-  audioFolder <Alien[JSZip]> = jsz folder: n, '/audio'.
-  classFolder <Alien[JSZip]> = jsz folder: n, '/classes'.
-  documentFolder <Alien[JSZip]> = jsz folder: n, '/documents'.
-  imageMap <Map[String, Alien[Promise[Alien[Blob]]]]> = Map new.
-  videoMap <Map[String, Alien[Promise[Alien[Blob]]]]> = Map new.
-  audioMap <Map[String, Alien[Promise[Alien[Blob]]]]> = Map new.  
-  contents <Alien[JSZip]> = jsz folder: n,  '/contents'.
-  (* get main document *)
-  main <Alien[ZipObject]> = jsz file: n, '/', n, '.html'.
-  |
-  loadClasses: classFolder into: namespace ifSuccess: [ 
-    loadTranscluded: documentFolder into: namespace ifSuccess: [
-       images forEach: [:path <String> :zo <Alien[ZipObject]> |  
-         | 
-         (* The path argument is not working as specified, so we rely on an undocumented feature - the #unsafeOriginalName field.
-         This is obviously undesirable, but so far we don't have a better solution.
-         *)
-         imageName <String> = (path at: #unsafeOriginalName) copyFrom: n size + 9 to: (path at: #unsafeOriginalName) size.
-         |
-         (* Create blob from image and store in a map keyed by image name *)       
-         imageMap at: imageName put: (zo async: #blob)
-         ].
-       (* Extract main document contents *)     
-      (main async: #string) then: [:f  <String> | 
-         |
-         (* parse main document *)
-         dom <Alien[HTMLDocument]>  = DOMParser new parseFromString: f mimeType: 'text/html'.
-         (*find all image nodes *)
-         imageNodes <Alien[HTMLCollection[Node]]> = dom getElementsByTagName: #img.  
-         imgPromises <JSArray[Promise[Alien[Blob]]]> = JSArray new: (imageNodes at: #length).
-         (*find all video nodes *)
-         videoNodes <Alien[HTMLCollection[HTMLVideoElement]]> = dom getElementsByTagName: #video.  
-         videoPromises <JSArray[Promise[Alien[Blob]]]> = JSArray new: (videoNodes at: #length).
-         (*find all audio nodes *)
-         audioNodes <Alien[HTMLCollection[HTMLAudioElement]]> = dom getElementsByTagName: #audio.  
-         audioPromises <JSArray[Promise[Alien[Blob]]]> = JSArray new: (audioNodes at: #length).
-         |
-         (* Collect images in an array, in 1:1 correspondence with img nodes *)
-         0 to: (imageNodes at: #length) - 1 do: [:i <Integer> |  
-             imgPromises at: i put: (imageMap at: ((imageNodes at: i) at: #name)).
-             ].
-         (* Collect videos in an array, in 1:1 correspondence with video nodes *)
-         buildMap: videoMap for: videoFolder withinDocumentNamed: n.
-         collect: videoNodes into: videoPromises using: videoMap.
-         (* Collect audios in an array, in 1:1 correspondence with audio nodes *)
-         buildMap: audioMap for: audioFolder withinDocumentNamed: n.
-         collect: audioNodes into: audioPromises using: audioMap.
-         (* Resolve image promises and process them *)
-        (JSPromise all: imgPromises) then: [:imgs <JSArray[Alien[Blob]]> |  
-             (* Create internal URIs for images and update img nodes accordingly *)
-             0 to: (imgs at: #length) - 1 do: [:i <Integer> |    
-               (imageNodes at: i) at: #src put: (URL createObjectURL: (imgs at: i)).
-               ]. 
-             (* Resolve video promises and process them *)
-             (JSPromise all: videoPromises) then: [:videos <JSArray[Alien[Blob]]> |  
-               (* Create internal URIs for videos and update video nodes accordingly *)
-               0 to: (videos at: #length) - 1 do: [:j <Integer> |   
-                 (videoNodes at: j) at: #src put: (URL createObjectURL: (videos at: j)).
-                 ].  
-                 (* Resolve audio promises and process them *)
-                 (JSPromise all: audioPromises) then: [:audios <JSArray[Alien[Blob]]> |  
-                 (* Create internal URIs for audios and update audio nodes accordingly *)
-                 0 to: (audios at: #length) - 1 do: [:k <Integer> |    
-                   (audioNodes at: k) at: #src put: (URL createObjectURL: (audios at: k)).
-                   ].              
-                  (* Create a regular doc from the revised DOM, and give it a chance to load docu-app specific content *)
-                  (namespace model at: n put: (ide documents freshDocumentFromDOM: dom)) loadContentsUsingFolder: contents. 
-                  successBlock value.
-                  nil.
-                  ] onError: [:ex | failureBlock value:  'Error loading document: ', ex printString. nil].
-               ] onError: [:ex | failureBlock value:  'Error loading document: ', ex printString. nil].
-             ] onError: [:ex | failureBlock value:  'Error loading document: ', ex printString. nil].
-             nil
-         ] onError: [:ex | failureBlock value:  'Error loading document: ', ex printString. nil].
-         nil
-       ] ifFailure: [:ex | failureBlock value:  'Failure loading transcluded documents: ', ex printString. nil].
-       nil.
-     ] ifFailure: [:ex | failureBlock value:  'Failure loading document: ', ex printString. nil].
-)
 public loadTranscluded: documentFolder <Alien[JSZip]> into: namespace <NamespaceSubject> ifSuccess: successBlock <[]> ifFailure: failureBlock <[:List[String]]>= (
   |
   documentPromises <List[JSPromise[Blob]]> = List new.
@@ -1863,6 +1787,94 @@ defaultAmpleforthDocumentBodyInnerHTML: userText <String> ^ <String> = (
 
         const textContainer = document.querySelector(''p'');
 </div>'
+)
+public loadDocument: jsz <Alien[JSZip]> named: n <String> into: namespace <NamespaceSubject> ifSuccess: successBlock <[]> ifFailure: failureBlock <[:List[String]]> = (
+(* Takes a zipfile representing a Document and converts it into a live Document. *)
+  |
+  images <Alien[JSZip]> = jsz folder: n, '/images'.
+  videoFolder <Alien[JSZip]> = jsz folder: n, '/video'.
+  audioFolder <Alien[JSZip]> = jsz folder: n, '/audio'.
+  classFolder <Alien[JSZip]> = jsz folder: n, '/classes'.
+  documentFolder <Alien[JSZip]> = jsz folder: n, '/documents'.
+  imageMap <Map[String, Alien[Promise[Alien[Blob]]]]> = Map new.
+  videoMap <Map[String, Alien[Promise[Alien[Blob]]]]> = Map new.
+  audioMap <Map[String, Alien[Promise[Alien[Blob]]]]> = Map new.  
+  contents <Alien[JSZip]> = jsz folder: n,  '/contents'.
+  (* get main document *)
+  main <Alien[ZipObject]> = jsz file: n, '/', n, '.html'.
+  doc <Document>
+  |
+  loadClasses: classFolder into: namespace ifSuccess: [ 
+    loadTranscluded: documentFolder into: namespace ifSuccess: [
+       images forEach: [:path <String> :zo <Alien[ZipObject]> |  
+         | 
+         (* The path argument is not working as specified, so we rely on an undocumented feature - the #unsafeOriginalName field.
+         This is obviously undesirable, but so far we don't have a better solution.
+         *)
+         imageName <String> = (path at: #unsafeOriginalName) copyFrom: n size + 9 to: (path at: #unsafeOriginalName) size.
+         |
+         (* Create blob from image and store in a map keyed by image name *)       
+         imageMap at: imageName put: (zo async: #blob)
+         ].
+       (* Extract main document contents *)     
+      (main async: #string) then: [:f  <String> | 
+         |
+         (* parse main document *)
+         dom <Alien[HTMLDocument]>  = DOMParser new parseFromString: f mimeType: 'text/html'.
+         (*find all image nodes *)
+         imageNodes <Alien[HTMLCollection[Node]]> = dom getElementsByTagName: #img.  
+         imgPromises <JSArray[Promise[Alien[Blob]]]> = JSArray new: (imageNodes at: #length).
+         (*find all video nodes *)
+         videoNodes <Alien[HTMLCollection[HTMLVideoElement]]> = dom getElementsByTagName: #video.  
+         videoPromises <JSArray[Promise[Alien[Blob]]]> = JSArray new: (videoNodes at: #length).
+         (*find all audio nodes *)
+         audioNodes <Alien[HTMLCollection[HTMLAudioElement]]> = dom getElementsByTagName: #audio.  
+         audioPromises <JSArray[Promise[Alien[Blob]]]> = JSArray new: (audioNodes at: #length).
+         |
+         (* Collect images in an array, in 1:1 correspondence with img nodes *)
+         0 to: (imageNodes at: #length) - 1 do: [:i <Integer> |  
+             imgPromises at: i put: (imageMap at: ((imageNodes at: i) at: #name)).
+             ].
+         (* Collect videos in an array, in 1:1 correspondence with video nodes *)
+         buildMap: videoMap for: videoFolder withinDocumentNamed: n.
+         collect: videoNodes into: videoPromises using: videoMap.
+         (* Collect audios in an array, in 1:1 correspondence with audio nodes *)
+         buildMap: audioMap for: audioFolder withinDocumentNamed: n.
+         collect: audioNodes into: audioPromises using: audioMap.
+         (* Resolve image promises and process them *)
+        (JSPromise all: imgPromises) then: [:imgs <JSArray[Alien[Blob]]> |  
+             (* Create internal URIs for images and update img nodes accordingly *)
+             0 to: (imgs at: #length) - 1 do: [:i <Integer> |    
+               (imageNodes at: i) at: #src put: (URL createObjectURL: (imgs at: i)).
+               ]. 
+             (* Resolve video promises and process them *)
+             (JSPromise all: videoPromises) then: [:videos <JSArray[Alien[Blob]]> |  
+               (* Create internal URIs for videos and update video nodes accordingly *)
+               0 to: (videos at: #length) - 1 do: [:j <Integer> |   
+                 (videoNodes at: j) at: #src put: (URL createObjectURL: (videos at: j)).
+                 ].  
+                 (* Resolve audio promises and process them *)
+                 (JSPromise all: audioPromises) then: [:audios <JSArray[Alien[Blob]]> |  
+                 (* Create internal URIs for audios and update audio nodes accordingly *)
+                 0 to: (audios at: #length) - 1 do: [:k <Integer> |    
+                   (audioNodes at: k) at: #src put: (URL createObjectURL: (audios at: k)).
+                   ].              
+                  (* Create a regular doc from the revised DOM, and give it a chance to load docu-app specific content *)
+                  doc:: ide documents freshDocumentFromDOM: dom.
+                  namespace model at: n put: doc.
+                  doc loadContentsUsingFolder: contents. 
+                  imageMap keysAndValuesDo: [:k :v | doc imageMap at: k put: v ].
+                  successBlock value.
+                  nil.
+                  ] onError: [:ex | failureBlock value:  'Error loading document: ', ex printString. nil].
+               ] onError: [:ex | failureBlock value:  'Error loading document: ', ex printString. nil].
+             ] onError: [:ex | failureBlock value:  'Error loading document: ', ex printString. nil].
+             nil
+         ] onError: [:ex | failureBlock value:  'Error loading document: ', ex printString. nil].
+         nil
+       ] ifFailure: [:ex | failureBlock value:  'Failure loading transcluded documents: ', ex printString. nil].
+       nil.
+     ] ifFailure: [:ex | failureBlock value:  'Failure loading document: ', ex printString. nil].
 )
 ) : (
 )

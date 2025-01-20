@@ -679,12 +679,15 @@ dropHandler ^ <[:Alien[JSDropEvent]]> = (
 (* Handle drop events. Asks hopscotch to provide URIs and inserts suitable amplets *)
   ^[:e <Alien[JSDropEvent]> |  
       e preventDefault; stopPropagation.     
-      retainedPlatform hopscotch onDrop: e do: [:fns <List[String]> :types <List[String]> :pos <Point>  |  
+      retainedPlatform hopscotch onDrop: e do: [:fs <List[JSFile]>  :pos <Point>  |   
         (* For each file name, create a media amplet *)
-        fns with: types do: [:fn <String> :type <String> | insertMediaAmplet: fn type: type at: pos. updater value.].
-        
-      ].
-      nil
+        fs do: [:f <JSFile> | | fn <String> = f at: #name. |
+           subject document mediaRegistry at: fn put: f.
+           insertMediaAmplet: fn type: (f at: #type) at: pos. 
+           updater value
+           ].
+        ].
+        nil
     ]
 )
 ) : (
@@ -701,6 +704,10 @@ Lastly, we implement the  #evaluateFragment: method that allows for evaluating e
 
 By convention, the Document is made available to the AmpleforthFragment that displays its live view. This done via the AmpleforthFragment's fragment mapping, under the key 'AmpleforthTargetDocument'. This allows AmpleforthFragment to process amplets, DOM nodes containing arbitrary Newspeak code snippets that produce Hopscotch fragments, by evaluating them as message sends in the scope of the Document. We use this convention because we don't want Hopscotch to depend on mirrors (most UI applications do not need mirrors as part of the platform) - neither directly or indirectly via Document. Hence Hopscotch, and in particular, AmpleforthFragment, cannot implement such evaluation by itself and must be given the Document instead. We can't give it the mirror, because the mapping must only consist of fragments.
 
+Media resources (image, video or audio) are referenced via the mediaRegistry. The registry may be referenced by amplets that embed media; this is the preferred way. It is also possible to refer to media via the DOM directly; this is the "legacy way". In both cases, the media are saved as part of the document so that it can be reliably reloaded from storage. When documents are loaded, or media are added via drag and drop,  the media are placed in the mediaRegistry
+
+The registry is public and mutable. Because the media may be referenced from the DOM used to create the document, it is convenient, when loading a document from secondary storage, to load the media before the document is created. Usually one would then pass the media registry in to the primary factory.  However, each document has its own dedicated class, which is a subclass of document; we do not want to burden these subclasses with managing the media registry. 
+
 Common usages (like embedding a workspace or an object presenter) are supported by convenience methods like #workspace:, #inspect: etc.
 *)
 	|
@@ -709,10 +716,8 @@ Common usages (like embedding a workspace or an object presenter) are supported 
     public mirror = ObjectMirror reflecting: self.
     (* A counter for amplets, so each amplet gets a unique id *)
     public maxAmpletCount <Integer> ::= 0.
-    (* All external media used by the document are stored in maps keyed by the media's path *)
-    public imageMap <Map[String, Alien[Promise[Alien[Blob]]]]> = Map new.
-    public videoMap <Map[String, Alien[Promise[Alien[Blob]]]]> = Map new.
-    public audioMap <Map[String, Alien[Promise[Alien[Blob]]]]> = Map new.  
+    (* All external media used by the document are stored in a map keyed by the media's path *) 
+    public mediaRegistry <Map[String, Blob]> ::= Map new.
 	|
 ) (
 public isKindOfDocument ^ <Boolean> = (
@@ -896,20 +901,6 @@ public classSource ^ <String> = (
 public loadContentsUsingFolder: folder = (
   (* Docu-apps that have specific data representations they need to be able to load should do this here. By default, do nothing *)
 )
-public cloneButDontInstall: newName <String> ^ <Document> = (
-  | 
-  revisedContents =  '<div class = "ampleforthDocumentClass" name = "', 
-  newName, 
-  '" classBody = "',
-  classSource,
-  '" </div><div class = "ampleforthDocumentBody">', 
-  contents, 
-  '</div>'.
-  clone = freshDocumentWithContents: revisedContents.
-  |
-  
-  ^clone
-)
 public cloneNamed: newName <String> ^ <Document> = (
   | clone = cloneButDontInstall: newName. |
   (* Iff this is a top level document, install the clone *)
@@ -993,6 +984,30 @@ presenterForMethod: n <Symbol> ofClass: c <Behavior | ClassMirror | ClassDeclara
 | cdm = mirrorFor: c. |
 
  ^(ide browsing MethodSubject onModel: (methodMirrorFor: n of: c)) presenter
+)
+mediaFromFileNamed: f <String> type: t <String> ^ <MediaCreatorFragment> = (
+(* used by amplets to reference media in documents. Calls the inherited method form Presenter, with the dociuments mediaRegistry as an additional argument *)
+  ^mediaFromFileNamed: f type: t registry: mediaRegistry
+)
+URL = (
+  ^ outer Documents URL
+)
+public cloneButDontInstall: newName <String> ^ <Document> = (
+  | 
+  revisedContents =  '<div class = "ampleforthDocumentClass" name = "', 
+  newName, 
+  '" classBody = "',
+  classSource,
+  '" </div><div class = "ampleforthDocumentBody">', 
+  contents, 
+  '</div>'.
+  clone = freshDocumentWithContents: revisedContents.
+  |
+  
+  mediaRegistry isEmpty ifFalse: [
+    mediaRegistry keysAndValuesDo: [:k :v | clone mediaRegistry at: k put: v].
+  ].
+  ^clone
 )
 ) : (
 )
@@ -1423,7 +1438,7 @@ processImagesFromDom: dom usingFolder: folder =	 (
       | amplet = amplets at: i. aName = amplet getAttribute: #name.  |
       ((aName startsWith: 'mediaFromFileNamed:') and: [aName endsWith: 'image/jpeg'''  ]) ifTrue: [
         | fname = aName copyFrom: 21 to: aName size - 19. |
-        imageFolder file: fname contents: (retainedPlatform hopscotch mediaRegistry at: fname)
+        imageFolder file: fname contents: (document mediaRegistry at: fname)
       ]
   ].
 )
@@ -1504,37 +1519,6 @@ blankDocumentText ^ <String>= (
 defaultAmpleforthDocumentBodyInnerHTML ^ <String> = (
   ^defaultAmpleforthDocumentBodyInnerHTML: blankDocumentText
 )
-public loadTranscluded: documentFolder <Alien[JSZip]> into: namespace <NamespaceSubject> ifSuccess: successBlock <[]> ifFailure: failureBlock <[:List[String]]>= (
-  |
-  documentPromises <List[JSPromise[Blob]]> = List new.
-  documentNames = List new.
-  blobArray <JSArray[JSPromise[Blob]]>
-  documentArray <JSArray[JSPromise[JSZip]]>
-  |
-  documentFolder forEach: [:path <String> :zo <ZipObject> |
-    (* Again we rely on an undocumented feature - the #unsafeOriginalName field. See comments in #loadDocument:named:ifSuccess:ifFailure: *)
-    ((path at: #unsafeOriginalName) endsWith: '.DS_Store') ifFalse: [
-      documentNames add:  (path at: #unsafeOriginalName).
-      documentPromises add: (zo async: #blob). 
-      nil
-    ]
-    ].
-  blobArray::  JSArray new: documentPromises size.
-  documentArray::  JSArray new: documentPromises size.
-  0 to: documentPromises size -1 do: [:i <Integer> | blobArray at: i put: (documentPromises at: i+1)].
-  (JSPromise all: blobArray) then: [:blobs <JSArray[Blob]> |
-     0 to: (blobs at: #length) -1 do: [:i <Integer> | 
-       documentArray at: i put: (JSZip loadAsync: (blobs at: i)) 
-     ].
-     (JSPromise all: documentArray) then: [:docs <JSArray[JSZip]> | 
-       loadDocNumber: 0 from: docs names: documentNames into: namespace 
-       ifSuccess: successBlock
-       ifFailure: failureBlock.
-       nil
-     ] onError: [:ex | failureBlock value:  'Error loading transcluded documents ', ex printString. nil].
-     nil
-  ] onError: [:ex | failureBlock value:  'Error reading transcluded documents: ', ex printString. nil].
-)
 loadDocNumber: i <Integer> from: zipArray <JSArray[JSzip]> names: names into: namespace ifSuccess: successBlock ifFailure: failureBlock = (
   | 
   doc <JSZip> = i >=  (zipArray at: #length) ifFalse: [zipArray at: i] ifTrue: [^successBlock value].  
@@ -1589,41 +1573,6 @@ promisesFrom: map <Map[String, JSPromise[JSBlob]]> ^ <JSArray[JSPromise[JSBlob]]
   0 to: map size -1 do: [:i <Integer> | promises at: i put: (map values at: i + 1)].
   ^promises
 )
-updateURIsOf: nodes <JSHTMLCollection[JSHTMLMediaElement]> fromBlobs: blobs  <JSArray[JSBlob]> withMap: map <Map[String, JSPromise[JSBlob]]> = (
-  | keys = map keys. |
-  0 to: map size - 1 do: [:i <Integer> |
-    retainedPlatform hopscotch mediaRegistry at: (keys at: i + 1) put: (blobs at: i).
-  ].
-    (* Create internal URIs for blobs referenced by nodes and update nodes accordingly *)
-    0 to: (nodes at: #length) - 1 do: [:j <Integer> |   
-       | 
-       node <JSHTMLMediaElement> = nodes at: j. 
-       path <String> = retainedPlatform  js global decodeURI: (node at: #src).
-       n <String> =   path copyFrom: (path lastIndexOf: '/' startingAt: path size) + 1 to: path size.
-       |
-       node at: #src put: (URL createObjectURL: (retainedPlatform hopscotch mediaRegistry at: n)).
-    ].   
-)
-loadImagesFrom: imageFolder dom: dom documentName: n ifSuccess: successBlock ifFailure: failureBlock = (
-  loadMediaOfType: #img from: imageFolder dom: dom folderName: n, '/images/' ifSuccess: successBlock ifFailure: failureBlock
-)
-loadVideosFrom: videoFolder dom: dom documentName: n ifSuccess: successBlock ifFailure: failureBlock = (
-  loadMediaOfType: #video from: videoFolder dom: dom folderName: n, '/video/' ifSuccess: successBlock ifFailure: failureBlock
-)
-loadMediaOfType: tag from: folder dom: dom folderName: n ifSuccess: successBlock ifFailure: failureBlock = (
-  |
-         map <Map[String, JSPromise[JSBlob]]> = mediaMapFor: folder withinFolderNamed: n.
-         (*find all nodes matching #tag *)
-         nodes <JSHTMLCollection[JSNode]> = dom getElementsByTagName: tag.  
-         promises <JSArray[JSPromise[JSBlob]]> = promisesFrom: map.
-  |
-  (* Resolve promises and process them *)
-  (JSPromise all: promises) then: [:blobs <JSArray[JSBlob]> | 
-        updateURIsOf: nodes fromBlobs: blobs withMap: map.
-        successBlock value.
-        nil
-  ] onError: [:ex | failureBlock value: ex. nil]
-)
 mediaMapFor: folder <JSZip> withinFolderNamed: n <String> ^ <Map[String, JSPromise[JSBlob]]> = (
   |  map <Map[String, JSPromise[JSBlob]]> = Map new.  |
   folder forEach: [:path <String> :zo <JSZipObject> |  
@@ -1638,6 +1587,24 @@ mediaMapFor: folder <JSZip> withinFolderNamed: n <String> ^ <Map[String, JSPromi
   ].
   ^map      
 )
+updateURIsOf: nodes <JSHTMLCollection[JSHTMLMediaElement]> 
+fromBlobs: blobs  <JSArray[JSBlob]> 
+withMap: map <Map[String, JSPromise[JSBlob]]> 
+registry: mediaRegistry <Map[String, Blob]> = (
+  | keys = map keys. |
+  0 to: map size - 1 do: [:i <Integer> |
+    mediaRegistry at: (keys at: i + 1) put: (blobs at: i).
+  ].
+    (* Create internal URIs for blobs referenced by nodes and update nodes accordingly *)
+    0 to: (nodes at: #length) - 1 do: [:j <Integer> |   
+       | 
+       node <JSHTMLMediaElement> = nodes at: j. 
+       path <String> = retainedPlatform  js global decodeURI: (node at: #src).
+       n <String> =   path copyFrom: (path lastIndexOf: '/' startingAt: path size) + 1 to: path size.
+       |
+       node at: #src put: (URL createObjectURL: (mediaRegistry at: n)).
+    ].   
+)
 public loadDocument: jsz <JSZip> named: n <String> into: namespace <NamespaceSubject> ifSuccess: successBlock <[]> ifFailure: failureBlock <[:List[String]]> = (
 (* Takes a zipfile representing a Document and converts it into a live Document. *)
   |
@@ -1649,6 +1616,7 @@ public loadDocument: jsz <JSZip> named: n <String> into: namespace <NamespaceSub
   contents <JSZip> = jsz folder: n,  '/contents'.
   (* get main document *)
   main <JSZipObject> = jsz file: n, '/', n, '.html'.
+  mediaRegistry <Map[String, Blob]> = Map new.
   doc <Document>
   |
   loadClasses: classFolder into: namespace ifSuccess: [ 
@@ -1659,11 +1627,11 @@ public loadDocument: jsz <JSZip> named: n <String> into: namespace <NamespaceSub
          (* parse main document *)
          dom <JSHTMLDocument>  = DOMParser new parseFromString: f mimeType: 'text/html'. 
          |
-         loadImagesFrom: imageFolder dom: dom documentName: n ifSuccess: [
-           loadVideosFrom: videoFolder dom: dom documentName: n ifSuccess: [
-             loadAudiosFrom: audioFolder dom: dom documentName: n ifSuccess: [
+         loadImagesFrom: imageFolder dom: dom documentName: n registry: mediaRegistry ifSuccess: [
+           loadVideosFrom: videoFolder dom: dom documentName: n registry: mediaRegistry ifSuccess: [
+             loadAudiosFrom: audioFolder dom: dom documentName: n registry: mediaRegistry ifSuccess: [
                  (* Create a regular doc from the revised DOM, and give it a chance to load docu-app specific content *)
-                 doc:: ide documents freshDocumentFromDOM: dom.
+                 doc:: ide documents freshDocumentFromDOM: dom registry: mediaRegistry.
                  namespace model at: n put: doc.
                  doc loadContentsUsingFolder: contents. 
                  successBlock value. 
@@ -1676,8 +1644,113 @@ public loadDocument: jsz <JSZip> named: n <String> into: namespace <NamespaceSub
      ] ifFailure: [:ex | failureBlock value:  'Error loading transcluded documents folder: ', ex printString]. nil.
    ] ifFailure: [:ex | failureBlock value:  'Error loading class folder: ', ex printString].
 )
-loadAudiosFrom: audioFolder dom: dom documentName: n ifSuccess: successBlock ifFailure: failureBlock = (
-  loadMediaOfType: #audio from: audioFolder dom: dom folderName: n, '/audio/' ifSuccess: successBlock ifFailure: failureBlock
+public freshDocumentFromDOM: dom <Alien[Node]> registry: registry <Map[String, Blob]> ^ <Document> = (
+  | 
+  amplets = dom getElementsByClassName: #ampleforth.
+  doc <Document> 
+  |
+  (* Assign ids to the amplets in the document (in case they didn't have any) *)
+  1 to: (amplets at: 'length') do:
+		[:index | (amplets at: index - 1) setAttribute: #ampletId to: index printString].
+
+  doc:: (classOfHTMLDocument: dom) contents: (textOfHTMLDocument: dom).
+  doc mediaRegistry: registry.
+  (* Set the doc's amplet count *)
+  doc maxAmpletCount: (amplets at: 'length').
+  ^doc
+)
+loadImagesFrom: imageFolder <JSZip>
+dom: dom <JSHTMLElement>
+documentName: n <String> 
+registry: mediaRegistry <Map[String, Blob]>
+ifSuccess: successBlock <[]>
+ifFailure: failureBlock <[:List[String]]> = (  
+  loadMediaOfType: #img 
+  from: imageFolder 
+  dom: dom 
+  folderName: n, '/images/' 
+  registry: mediaRegistry 
+  ifSuccess: successBlock 
+  ifFailure: failureBlock
+)
+loadVideosFrom: videoFolder <JSZip>
+dom: dom <JSHTMLElement>
+documentName: n <String> 
+registry: mediaRegistry <Map[String, Blob]>
+ifSuccess: successBlock <[]>
+ifFailure: failureBlock <[:List[String]]> = (
+  loadMediaOfType: #video 
+  from: videoFolder 
+  dom: dom 
+  folderName: n, '/videos/' 
+  registry: mediaRegistry
+  ifSuccess: successBlock 
+  ifFailure: failureBlock
+)
+public loadTranscluded: documentFolder <JSZip> into: namespace <NamespaceSubject> ifSuccess: successBlock <[]> ifFailure: failureBlock <[:List[String]]>= (
+  |
+  documentPromises <List[JSPromise[Blob]]> = List new.
+  documentNames = List new.
+  blobArray <JSArray[JSPromise[Blob]]>
+  documentArray <JSArray[JSPromise[JSZip]]>
+  |
+  documentFolder forEach: [:path <String> :zo <ZipObject> |
+    (* Again we rely on an undocumented feature - the #unsafeOriginalName field. See comments in #loadDocument:named:ifSuccess:ifFailure: *)
+    ((path at: #unsafeOriginalName) endsWith: '.DS_Store') ifFalse: [
+      documentNames add:  (path at: #unsafeOriginalName).
+      documentPromises add: (zo async: #blob). 
+      nil
+    ]
+    ].
+  blobArray::  JSArray new: documentPromises size.
+  documentArray::  JSArray new: documentPromises size.
+  0 to: documentPromises size -1 do: [:i <Integer> | blobArray at: i put: (documentPromises at: i+1)].
+  (JSPromise all: blobArray) then: [:blobs <JSArray[Blob]> |
+     0 to: (blobs at: #length) -1 do: [:i <Integer> | 
+       documentArray at: i put: (JSZip loadAsync: (blobs at: i)) 
+     ].
+     (JSPromise all: documentArray) then: [:docs <JSArray[JSZip]> | 
+       loadDocNumber: 0 from: docs names: documentNames into: namespace 
+       ifSuccess: successBlock
+       ifFailure: failureBlock.
+       nil
+     ] onError: [:ex | failureBlock value:  'Error loading transcluded documents ', ex printString. nil].
+     nil
+  ] onError: [:ex | failureBlock value:  'Error reading transcluded documents: ', ex printString. nil].
+)
+loadMediaOfType: tag <String>
+from: folder <JSZip>
+dom: dom <JSHTMLElement>
+folderName: n <String> 
+registry: mediaRegistry <Map[String, Blob]>
+ifSuccess: successBlock <[]>
+ifFailure: failureBlock <[:List[String]]> = (
+  |
+         map <Map[String, JSPromise[JSBlob]]> = mediaMapFor: folder withinFolderNamed: n.
+         (*find all nodes matching #tag *)
+         nodes <JSHTMLCollection[JSNode]> = dom getElementsByTagName: tag.  
+         promises <JSArray[JSPromise[JSBlob]]> = promisesFrom: map.
+  |
+  (* Resolve promises and process them *)
+  (JSPromise all: promises) then: [:blobs <JSArray[JSBlob]> | 
+        updateURIsOf: nodes fromBlobs: blobs withMap: map registry: mediaRegistry.
+        successBlock value.
+        nil
+  ] onError: [:ex | failureBlock value: ex. nil]
+)
+loadAudiosFrom: audioFolder <JSZip>
+dom: dom <JSHTMLElement>
+documentName: n <String> 
+registry: mediaRegistry <Map[String, Blob]>
+ifSuccess: successBlock <[]>
+ifFailure: failureBlock <[:List[String]]> = (
+  loadMediaOfType: #audio 
+  from: audioFolder 
+  dom: dom 
+  folderName: n, '/audio/' 
+  registry: mediaRegistry
+  ifSuccess: successBlock
+  ifFailure: failureBlock
 )
 ) : (
 )

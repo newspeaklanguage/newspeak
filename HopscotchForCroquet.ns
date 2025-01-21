@@ -65,7 +65,9 @@ Ultimately, we hope to go beyond the above, and be able to diff the saved model 
   menuCount <Integer> ::= 0.
   windowCount <Integer> ::= 0.
   fileChooserCount <Integer> ::= 0.
+  mediaId <Integer> ::= 0.
   liveFileChoosers = List new.
+  fragmentReplayMap <Map[String, Map[Integer, [CroquetEvent]]]> = Map new.
   (* JS access *)
   js = p js.   
 |
@@ -640,6 +642,14 @@ setupCroquetView = (
   (* only fragments that actively need croquet support need this *)
   subclassResponsibility
 )
+subscribe: eventSpec <String> with: blk <[CroquetEvent]> = (
+(* For every subscription to a croquet event, record the handler so it is available for replay after rejoining the session, then subscribe. *)
+  | (* Find the handler map for this type of event *) emap <Map[Integer, [CroquetEvent]]> = fragmentMap at: eventSpec ifAbsentPut: [Map new]. |
+  (* Record the handler for replay *)
+  emap at: fragmentId put: blk.
+  (* subscribe to croquet as usual*)
+  rootView <-: subscribe: scope eventSpec: eventSpec handler: blk
+)
 ) : (
 )
 public class Menu supplier: ms <[{Symbol | {String. []}}]>  = (
@@ -715,18 +725,6 @@ updateVisualsFromSameKind: oldFragment <FileChooserFragment>  ^ <Alien[Node]> = 
   scope_slot: oldFragment scope.
   ^self.
 )
-createFile: fd <JSObject> ^ <Alien[File]> = (
-(* 
-Given a file description, return a corresponding JS File object.
-The argument is of the form 
-{name: String, type: String, lastModified: Float, webkitRelativePath: String, handle: JSPromise, arrayBuff: JSArrayBuffer}
-    *)
-  | contents <JSArray> = (js global at: 'Array') new: 1. options = JSObject new. |
-  contents at: 0 put: (fd at: #arrayBuff).
-  options at: #type put: (fd at: #type);
-               at: #lastModified put: (fd at: #lastModified).
-  ^ (js global at: #File) new: contents name:  (fd at: #name) options: options
-)
 descriptorFor: fd <JSObject> ^ <JSObject> = (
 (* Given a file description, produce a description of the metadata only, without the contents*)
   | descriptor = JSObject new. |
@@ -784,7 +782,7 @@ extractFileData: fs <List[Alien[File]]> whenReady: blk <[:JSArray[JSObject]]> = 
 	] onError: [:ex |  alert: ex printString. nil]
 )
 setupCroquetView = (
-        (* When the Croquet view is notified of the chosen files, it will message us back with the file metadata. We will us ethat metadata to extract the file contents, stored on the Croquet server. We want to submit all that information to the original action block passed into #chooseFileList:. 
+        (* When the Croquet view is notified of the chosen files, it will message us back with the file metadata. We will use that metadata to extract the file contents, stored on the Croquet server. We want to submit all that information to the original action block passed into #chooseFileList:. 
         The block wants a list of Files, so we need to feed it objects with the same API - including async methods that return the data. Of course, we actually resolved that data before posting the original event, and so the incoming data needs to repackaged into File-like objects with a fake async API.
         *)
         rootView <-: subscribe: scope eventSpec: #model_fileChooser_click handler: [
@@ -819,6 +817,60 @@ setupCroquetView = (
 public new ^ <Instance> = (
   ^allowMultiples: false
 )
+)
+class MediaCreatorFragment type: t <Symbol> name: fn <String> = super MediaCreatorFragment type: t name: fn (
+) (
+updateVisualsFromSameKind: oldFragment <MediaCreatorFragment>  ^ <Alien[Element]> = (
+  scope_slot: oldFragment scope.
+  ^super updateVisualsFromSameKind: oldFragment.
+)
+public setFile: f <Alien[File]> = (
+  (* publish event *)
+  extractFileData: {f} whenReady: [:fds <JSArray[JSObject]> | 
+      | 
+      fd = fds at: 0.
+      (* store the file contents in the reflector *)
+      p = rootView storedData store: (fd at: #arrayBuff).
+      (* Gather file metadata, to be published to all clients *)
+      d = descriptorFor: fd.
+      |
+      (* When data has been stored, publish notification, which will be passed on to all clients *)
+      p then: [:handle <[CroquetHandle]> |
+        (* update descriptor with handle *)
+        descriptor  at: #handle put: handle.
+        (* publish *)
+        rootView <-: publish: 'nsmediacreator_' event: #mediacreator_setFile data: (js global newspeakFragmentData: mediaCounter data: descriptor).
+        ] onError: [:ex |  alert: 'HopscotchForCroquet mediaForFile: ', ex printString. nil].    
+  ].  
+)
+public scope ^ <String> = (
+  scope_slot isNil ifTrue: [scope_slot: 'nsmediaCreator_', fragmentId printString].
+  ^scope_slot
+)
+file: f <Alien[File]> = (
+  | uri = blobURIFor: f. |
+  holder content: (computeHolderContentsFrom: uri)
+)
+setupCroquetView = (
+        rootView <-: subscribe: scope eventSpec: #model_mediaCreator_setFile handler: [:e | 
+          |
+          (* extract handle from event *)
+          handle <[CroquetHandle]> = e at: #handle.
+          (* retrieve file data *)
+          p <JSPromise> = rootView storedData fetch: handle.
+          |
+          (* when the file data is actually ready ... *)
+          p then: [:fd <Alien[JSObject]> |
+             (* get the file contents and add to the file descriptor *)
+             e at: #arrayBuff put: fd.
+             (* derive a file object and pass to the super method to do the actual update *)
+             file: (createFile: e). 
+             nil
+          ] onError: [:ex |  alert:  'HopscotchForCroquet MediaCreatorFragment setupCroquetView: ', ex printString. nil]
+        nil
+        ]     
+)
+) : (
 )
 lazy rootView <Alien[NewspeakCroquetView]> = js global at: #theView.
 newImageButtonId ^ <Integer> = (
@@ -918,6 +970,50 @@ newButtonId ^ <Integer> = (
 )
 JSObject  = ((* make JS Object constructor available to nested classes *)
   ^super JSObject
+)
+descriptorFor: fd <JSObject> ^ <JSObject> = (
+(* Given a file description, produce a description of the metadata only, without the contents*)
+  | descriptor = JSObject new. |
+  (* Copy all the data except the actual file contents (the array buffer) to the incoming file descriptor *)
+  {#name. #type. #lastModified. #webkitRelativePath } do: [:pn <Symbol> |
+      descriptor at: pn put: (fd at: pn)
+      ].
+   ^descriptor
+)
+extractFileData: fs <List[Alien[File]]> whenReady: blk <[:JSArray[JSObject]]> = (
+(* In principle, the data is the file list, fs. However, files cannot be serialized as part of a Croquet event. Even if they could, they are often too large. We must obtain their contents via their asynchronous API and package that up. We then feed the data into the blk parameter for further processing. See #chooseFileList: for what that further processing looks like.
+ *)
+  |
+  ps <List[Alien[Promise[[ArrayBuffer]]]]>  = (js global at: 'Array') new: fs size.
+  (* An array of file descriptors - JS objects of the form 
+  {name: String, type: String, lastModified: Float, webkitRelativePath: String, handle: JSPromise, arrayBuff: Blob}
+  *)
+  fds <JSArray[JSObject]>  = (js global at: 'Array') new: fs size.
+  |
+  1 to: fs size do: [:i <Integer> | | f <Alien[File]> = fs at: i. |
+    ps at: i - 1 put: (fs at: i) arrayBuffer.
+    fds at: i - 1 put:  (descriptorFor: f).
+  ].
+  ((js global at: 'Promise') all: ps) then: [:buffers <JSArray[ArrayBuffer]> |
+      0 to: fs size -1 do: [:i <Integer> | (fds at: i) at: #arrayBuff put: (buffers at: i)].
+	  [blk value: fds. nil] on: Error do:  [:ex | alert:  'HopscotchForCroquet FileChooserFragment extractFileData:whenReady ', ex printString. nil].
+      nil
+	] onError: [:ex |  alert: ex printString. nil]
+)
+processMediaUpdatesFromFiles: files <List[Alien[File]]> = (
+  
+)
+createFile: fd <JSObject> ^ <Alien[File]> = (
+(* 
+Given a file description, return a corresponding JS File object.
+The argument is of the form 
+{name: String, type: String, lastModified: Float, webkitRelativePath: String, handle: JSPromise, arrayBuff: JSArrayBuffer}
+    *)
+  | contents <JSArray> = (js global at: 'Array') new: 1. options = JSObject new. |
+  contents at: 0 put: (fd at: #arrayBuff).
+  options at: #type put: (fd at: #type);
+               at: #lastModified put: (fd at: #lastModified).
+  ^ (js global at: #File) new: contents name:  (fd at: #name) options: options
 )
 ) : (
 )

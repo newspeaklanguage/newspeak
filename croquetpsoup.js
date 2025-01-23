@@ -3590,6 +3590,7 @@ class NewspeakCroquetModel extends Croquet.Model {
         this.subscribe('nsmenu_', 'menu_click', this.menu_click);
         this.subscribe('nsshell_', 'shell_userBack', this.shell_userBack);
 	this.subscribe('nsfilechooser_', 'fileChooser_click', this.fileChooser_click);
+	this.subscribe('nsmediacreator_', 'mediacreator_setFile', this.mediaCreator_setFile)	
     }
     // same issues with scope for these methods
     mouseDown(fid){
@@ -3720,7 +3721,10 @@ class NewspeakCroquetModel extends Croquet.Model {
     }
     fileChooser_click(nsOptions){
 	this.publish('nsfilechooser_' + nsOptions.fid, 'model_fileChooser_click', nsOptions.data);
-    }    
+    }
+    mediaCreator_setFile(nsOptions){
+	this.publish('nsmediacreator_' + nsOptions.fid, 'model_mediaCreator_setFile', nsOptions.data);
+    }     
 }
 
 
@@ -3732,7 +3736,9 @@ class NewspeakCroquetView extends Croquet.View {
 	this.presenter = presenter;
 	storeModelAndView(model, this);
 	removeRunDependency(croquetDepId);
-  }
+    }
+
+    storedData() {return this.session.data}
 }
 
 const apiKey = "1g8dBJxALIxjKuCIblCBIttBxKOvNxOKfNgaK6ufq"; // paste from croquet.io/keys

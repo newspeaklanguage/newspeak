@@ -1388,13 +1388,16 @@ var runtimeExited = false;
 
 var croquetDepId;
 var croquetInitDone = false;
+var croquetDepActive = false;
 
 function preRun() {
 
-  croquetDepId = getUniqueRunDependency('croquet');
-    if (!croquetInitDone) {
-	  addRunDependency(croquetDepId);
-    }
+croquetDepId = getUniqueRunDependency('croquet');
+  if (!croquetInitDone) {
+      console.log('Added run dependency ' + croquetDepId);
+      croquetDepActive = true;
+      addRunDependency(croquetDepId);
+  }
 
   if (Module['preRun']) {
     if (typeof Module['preRun'] == 'function') Module['preRun'] = [Module['preRun']];
@@ -3389,6 +3392,7 @@ function exit(status, implicit) {
 
 var theModel;
 var theView;
+var localViewId;
 
 function replaceUndefined(obj, seen = new Map()) {
     // Check if the current value is an object and not null
@@ -3547,14 +3551,85 @@ some APIs we use (like JSZip) insist on taking File. So we probably will scrap t
     };
 }
 
+// The number of the last event processed by this client
+var lastProcessedEvent = 0;
+
+// convenience method to increment the processed event count. Easier to call from Newspeak.
+function eventProcessed() {
+    lastProcessedEvent++;
+}
+
+// A map of event specifications (including scope) to the model's handlers. We use this when replaying events that
+// this client has not seen yet. The model has a list of all events processed. When we start from a snapshot,
+// we go thru these, look up  their handlers in this map, and run them. See replayEvents()
+var eventHandlerMap = {}
+
+// A list describing all the subscription handlers Newspeak has to Croquet events.
+// Each entry lists the scope, event spec and handler for a given subscription.
+// This is needed, so that we can replay them
+// when Croquet creates a new view, which it odes when it restores from a snapshot. At that point, all our existing
+// subscriptions are gone, and we have to resubscribe. See replaySubscriptions()
+var newspeakSubscriptions = [];
+
+function replaySubscriptions() {
+    for (let s of newspeakSubscriptions){
+	theView.subscribe(s.scope, s.eventSpec, s.handler);
+    }
+}
+
 // Root model
 
 class NewspeakCroquetModel extends Croquet.Model {
+    addEvent(e){
+	this.newspeakEvents.push(e);
+	console.log("adding event");
+    }
 
+    publishEventAndData(scope, eventSpec, data, fid) {
+	this.addEvent({scope: scope, eventSpec: eventSpec, data: data});
+	this.publish(scope + fid, eventSpec, data);
+    }
+
+    publishEvent(scope, eventSpec, fid) {
+	this.addEvent({scope: scope, eventSpec: eventSpec, data: fid});
+	this.publish(scope + fid, eventSpec);
+    }
+    joinView(viewId){
+	console.log('Joined ' + viewId + ' at view ' + localViewId);
+	if ((localViewId == viewId) || (localViewId === undefined)) {
+	    console.log('Joined view ' + viewId);
+	    replaySubscriptions();	    
+	    this.replayEvents(lastProcessedEvent+1);
+	}
+    }
+    exitView(viewId){
+	if (localViewId == viewId) {
+	    console.log('Exiting view ' + viewId);
+	}
+    }
+
+    subscribeAndRecord(scope, eventSpec, f) {
+	eventHandlerMap[scope + eventSpec] = f.bind(this);
+	this.subscribe(scope, eventSpec, f);
+    }
+    
+    replayEvents(from) {
+	for (var i = from; i < this.newspeakEvents.length; i++) {
+            var e = this.newspeakEvents[from];
+	    console.log(e.scope + e.eventSpec);
+	    eventHandlerMap[e.scope + e.eventSpec.slice(6)](e.data);
+	}
+    }
+    
     init() {  // only runs once, when a new session is initiated. Thus, not the right place to start up Newspeak
-	this.fragments = new Map();
+	this.newspeakEvents = [];
+
+        this.subscribe(this.sessionId, 'view-join', this.joinView);
+        this.subscribe(this.sessionId, 'view-exit', this.exitView);
+	
 	// Leaf fragment support; issues: scope differs by fragment class (no such thing as nsFragmentId)
-	this.subscribe(this.nsFragmentId, 'onMouseDown', this.mouseDown);		this.subscribe(this.nsFragmentId, 'onMouseEnter', this.mouseEnter);
+	this.subscribe(this.nsFragmentId, 'onMouseDown', this.mouseDown);
+	this.subscribe(this.nsFragmentId, 'onMouseEnter', this.mouseEnter);
 	this.subscribe(this.nsFragmentId, 'onMouseMove', this.mouseMove);
 	this.subscribe(this.nsFragmentId, 'onMouseOut', this.mouseOut);
 	this.subscribe(this.nsFragmentId, 'onMouseOver', this.mouseOver);
@@ -3562,35 +3637,37 @@ class NewspeakCroquetModel extends Croquet.Model {
 	this.subscribe(this.nsFragmentId, 'onTouchCancel', this.touchCancel);
 	this.subscribe(this.nsFragmentId, 'onTouchEnd', this.touchEnd);
 	this.subscribe(this.nsFragmentId, 'onTouchMove', this.touchMove);
-	this.subscribe(this.nsFragmentId, 'onTouchStart', this.touchStart);		this.subscribe(this.nsFragmentId, 'onWheel', this.wheel);
-	this.subscribe('nsbutton_', 'button_click', this.button_click);
-	this.subscribe('nsImagebutton_', 'image_button_click', this.image_button_click);
-	this.subscribe('nshyperlink_', 'hyperlink_click', this.hyperlink_click);
-	this.subscribe('nshyperlinkImage_', 'hyperlink_image_click', this.hyperlink_image_click);
-	this.subscribe('nscheckbox_', 'checkBox_checked', this.checkBox_checked);
-	this.subscribe('nscheckbox_', 'checkBox_unchecked', this.checkBox_unchecked);	
-	this.subscribe('nsradiobutton_', 'radioButton_released', this.radioButton_released);
-	this.subscribe('nsradiobutton_', 'radioButton_pressed', this.radioButton_pressed);	
-	this.subscribe('nscodemirror_', 'codeMirror_beforeChange', this.codeMirror_beforeChange);
-	this.subscribe('nscodemirror_', 'codeMirror_change', this.codeMirror_change);
-	this.subscribe('nscodemirror_', 'codeMirror_keydown', this.codeMirror_keydown);
-	this.subscribe('nscodemirror_', 'codeMirror_accept', this.codeMirror_accept);
-	this.subscribe('nscodemirror_', 'codeMirror_cancel', this.codeMirror_cancel);
-	this.subscribe('nscodemirror_', 'codeMirror_beforeSelectionChange', this.codeMirror_beforeSelectionChange);	
-	this.subscribe('nstexteditor_', 'textEditor_accept', this.textEditor_accept);
-	this.subscribe('nstexteditor_', 'textEditor_change', this.textEditor_change);
-	this.subscribe('nstexteditor_', 'textEditor_cancel', this.textEditor_cancel);
-	this.subscribe('nstogglecomposer_', 'toggleComposer_toggle', this.toggleComposer_toggle)
-	this.subscribe('nspicker_', 'picker_pick', this.picker_pick);
-	this.subscribe('nscolorpicker_', 'colorPicker_pick', this.color_picker_pick);
-	this.subscribe('nsdatepicker_', 'datePicker_pick', this.date_picker_pick);
-	this.subscribe('nstimepicker_', 'timePicker_pick', this.time_picker_pick);
-	this.subscribe('nsslider_', 'slider_pick', this.slider_pick);
-	this.subscribe('nsdropdownmenu_', 'dropDownMenu_click', this.dropDownMenu_click);
-        this.subscribe('nsmenu_', 'menu_click', this.menu_click);
-        this.subscribe('nsshell_', 'shell_userBack', this.shell_userBack);
-	this.subscribe('nsfilechooser_', 'fileChooser_click', this.fileChooser_click);
-	this.subscribe('nsmediacreator_', 'mediacreator_setFile', this.mediaCreator_setFile)	
+	this.subscribe(this.nsFragmentId, 'onTouchStart', this.touchStart);
+	this.subscribe(this.nsFragmentId, 'onWheel', this.wheel);
+	
+	this.subscribeAndRecord('nsbutton_', 'button_click', this.button_click);
+	this.subscribeAndRecord('nsImagebutton_', 'image_button_click', this.image_button_click);
+	this.subscribeAndRecord('nshyperlink_', 'hyperlink_click', this.hyperlink_click);
+	this.subscribeAndRecord('nshyperlinkImage_', 'hyperlink_image_click', this.hyperlink_image_click);
+	this.subscribeAndRecord('nscheckbox_', 'checkBox_checked', this.checkBox_checked);
+	this.subscribeAndRecord('nscheckbox_', 'checkBox_unchecked', this.checkBox_unchecked);	
+	this.subscribeAndRecord('nsradiobutton_', 'radioButton_released', this.radioButton_released);
+	this.subscribeAndRecord('nsradiobutton_', 'radioButton_pressed', this.radioButton_pressed);	
+	this.subscribeAndRecord('nscodemirror_', 'codeMirror_beforeChange', this.codeMirror_beforeChange);
+	this.subscribeAndRecord('nscodemirror_', 'codeMirror_change', this.codeMirror_change);
+	this.subscribeAndRecord('nscodemirror_', 'codeMirror_keydown', this.codeMirror_keydown);
+	this.subscribeAndRecord('nscodemirror_', 'codeMirror_accept', this.codeMirror_accept);
+	this.subscribeAndRecord('nscodemirror_', 'codeMirror_cancel', this.codeMirror_cancel);
+ 	this.subscribeAndRecord('nscodemirror_', 'codeMirror_beforeSelectionChange', this.codeMirror_beforeSelectionChange);	
+	this.subscribeAndRecord('nstexteditor_', 'textEditor_accept', this.textEditor_accept);
+	this.subscribeAndRecord('nstexteditor_', 'textEditor_change', this.textEditor_change);
+	this.subscribeAndRecord('nstexteditor_', 'textEditor_cancel', this.textEditor_cancel);
+	this.subscribeAndRecord('nstogglecomposer_', 'toggleComposer_toggle', this.toggleComposer_toggle)
+	this.subscribeAndRecord('nspicker_', 'picker_pick', this.picker_pick);
+	this.subscribeAndRecord('nscolorpicker_', 'colorPicker_pick', this.color_picker_pick);
+	this.subscribeAndRecord('nsdatepicker_', 'datePicker_pick', this.date_picker_pick);
+	this.subscribeAndRecord('nstimepicker_', 'timePicker_pick', this.time_picker_pick);
+	this.subscribeAndRecord('nsslider_', 'slider_pick', this.slider_pick);
+	this.subscribeAndRecord('nsdropdownmenu_', 'dropDownMenu_click', this.dropDownMenu_click);
+        this.subscribeAndRecord('nsmenu_', 'menu_click', this.menu_click);
+        this.subscribeAndRecord('nsshell_', 'shell_userBack', this.shell_userBack);
+	this.subscribeAndRecord('nsfilechooser_', 'fileChooser_click', this.fileChooser_click);
+	this.subscribeAndRecord('nsmediacreator_', 'mediaCreator_setFile', this.mediaCreator_setFile);	
     }
     // same issues with scope for these methods
     mouseDown(fid){
@@ -3613,7 +3690,7 @@ class NewspeakCroquetModel extends Croquet.Model {
 	console.log('MouseOver ' + fid);
 	this.publish(this.nsFragmentId, 'model_mouseOver');
     }
-   mouseUp(fid){
+    mouseUp(fid){
 	console.log('MouseUp ' + fid);
 	this.publish(this.nsFragmentId, 'model_mouseUp');
    }
@@ -3638,93 +3715,93 @@ class NewspeakCroquetModel extends Croquet.Model {
 	this.publish(this.nsFragmentId, 'model_wheel');
    }    // end leaf methods
     button_click(fid){
-	this.publish('nsbutton_' + fid, 'model_button_click');
+	this.publishEvent('nsbutton_', 'model_button_click', fid);
     }
     image_button_click(fid){
-	this.publish('nsImagebutton_' + fid, 'model_image_button_click');
+	this.publishEvent('nsImagebutton_', 'model_image_button_click', fid);
     }
     hyperlink_click(fid){
-	this.publish('nshyperlink_' + fid, 'model_hyperlink_click');
+	this.publishEvent('nshyperlink_', 'model_hyperlink_click', fid);
     }
     hyperlink_image_click(fid){
-	this.publish('nshyperlinkImage_' + fid, 'model_hyperlink_image_click');
+	this.publishEvent('nshyperlinkImage_', 'model_hyperlink_image_click', fid);
     }
     
     checkBox_checked(fid){
 	console.log('model checkbox checked');
-	this.publish('nscheckbox_' + fid, 'model_checkBox_checked');
+	this.publishEvent('nscheckbox_', 'model_checkBox_checked', fid);
     }
     checkBox_unchecked(fid){
 	console.log('model checkbox unchecked');	
-	this.publish('nscheckbox_' + fid, 'model_checkBox_unchecked');
+	this.publishEvent('nscheckbox_', 'model_checkBox_unchecked', fid);
     }
     radioButton_released(fid){
-	this.publish('nsradiobutton_' + fid, 'model_radioButton_released');
+	this.publishEvent('nsradiobutton_', 'model_radioButton_released', fid);
     }
     radioButton_pressed(fid){
-	this.publish('nsradiobutton_' + fid, 'model_radioButton_pressed');
+	this.publishEvent('nsradiobutton_', 'model_radioButton_pressed', fid);
     }
     codeMirror_beforeChange(nsOptions){
-	this.publish('nscodemirror_' + nsOptions.fid, 'model_codeMirror_beforeChange', nsOptions.data);
+	this.publishEventAndData('nscodemirror_', 'model_codeMirror_beforeChange', nsOptions.data, nsOptions.fid);
     }
     codeMirror_change(nsOptions){
-	this.publish('nscodemirror_' + nsOptions.fid, 'model_codeMirror_change', nsOptions.data);
+	this.publishEventAndData('nscodemirror_', 'model_codeMirror_change', nsOptions.data, nsOptions.fid);
     }
     codeMirror_keydown(nsOptions){
-	this.publish('nscodemirror_' + nsOptions.fid, 'model_codeMirror_keydown', nsOptions.data);
+	this.publishEventAndData('nscodemirror_', 'model_codeMirror_keydown', nsOptions.data, nsOptions.fid);
     }
     codeMirror_accept(nsOptions){
 	console.log('accept ' + nsOptions.fid);		
-	this.publish('nscodemirror_' + nsOptions.fid, 'model_codeMirror_accept', nsOptions.data);
+	this.publishEventAndData('nscodemirror_', 'model_codeMirror_accept', nsOptions.data, nsOptions.fid);
     }
     codeMirror_cancel(nsOptions){
-	this.publish('nscodemirror_' + nsOptions.fid, 'model_codeMirror_cancel', nsOptions.data);
+	this.publishEventAndData('nscodemirror_', 'model_codeMirror_cancel', nsOptions.data, nsOptions.fid);
     }
     codeMirror_beforeSelectionChange(nsOptions){		
-	this.publish('nscodemirror_' + nsOptions.fid, 'model_codeMirror_beforeSelectionChange', nsOptions.data);
+	this.publishEventAndData('nscodemirror_', 'model_codeMirror_beforeSelectionChange', nsOptions.data, nsOptions.fid);
     }    
     textEditor_accept(nsOptions){
-	this.publish('nstexteditor_' + nsOptions.fid, 'model_textEditor_accept', nsOptions.data);
+	this.publishEventAndData('nstexteditor_', 'model_textEditor_accept', nsOptions.data, nsOptions.fid);
     }
     textEditor_change(nsOptions){
-	this.publish('nstexteditor_' + nsOptions.fid, 'model_textEditor_change', nsOptions.data);
+	this.publishEventAndData('nstexteditor_', 'model_textEditor_change', nsOptions.data, nsOptions.fid);
     }
     textEditor_cancel(nsOptions){
-	this.publish('nstexteditor_' + nsOptions.fid, 'model_textEditor_cancel', nsOptions.data);
+	this.publishEventAndData('nstexteditor_', 'model_textEditor_cancel', nsOptions.data, nsOptions.fid);
     }
     toggleComposer_toggle(fid){
-	this.publish('nstogglecomposer_' + fid, 'model_toggleComposer_toggle');
+	this.publishEvent('nstogglecomposer_', 'model_toggleComposer_toggle', fid);
     }     
     picker_pick(nsOptions){
-	this.publish('nspicker_' + nsOptions.fid, 'model_picker_pick', nsOptions.data);
+	this.publishEventAndData('nspicker_', 'model_picker_pick', nsOptions.data, nsOptions.fid);
     }
     color_picker_pick(nsOptions){
-	this.publish('nscolorpicker_' + nsOptions.fid, 'model_colorPicker_pick', nsOptions.data);
+	this.publishEventAndData('nscolorpicker_', 'model_colorPicker_pick', nsOptions.data, nsOptions.fid);
     }
     date_picker_pick(nsOptions){
-	this.publish('nsdatepicker_' + nsOptions.fid, 'model_datePicker_pick', nsOptions.data);
+	this.publishEventAndData('nsdatepicker_', 'model_datePicker_pick', nsOptions.data, nsOptions.fid);
     }    
     time_picker_pick(nsOptions){
-	this.publish('nstimepicker_' + nsOptions.fid, 'model_timePicker_pick', nsOptions.data);
+	this.publishEventAndData('nstimepicker_', 'model_timePicker_pick', nsOptions.data, nsOptions.fid);
     }
     slider_pick(nsOptions){
-	this.publish('nsslider_' + nsOptions.fid, 'model_slider_pick', nsOptions.data);
+	this.publishEventAndData('nsslider_', 'model_slider_pick', nsOptions.data, nsOptions.fid);
     }     
     dropDownMenu_click(fid){
-	this.publish('nsdropdownmenu_' + fid, 'model_dropDownMenu_click', fid);
+	this.publishEvent('nsdropdownmenu_', 'model_dropDownMenu_click', fid);
     }
     menu_click(nsOptions){
-	this.publish('nsmenu_' + nsOptions.fid, 'model_menu_click', nsOptions.data);
+	this.publishEventAndData('nsmenu_', 'model_menu_click', nsOptions.data, nsOptions.fid);
     }
     shell_userBack(nsOptions){
-	this.publish('nsshell_' + nsOptions.fid, 'model_shell_userBack', nsOptions.data);
+	this.publishEventAndData('nsshell_', 'model_shell_userBack', nsOptions.data, nsOptions.fid);
     }
     fileChooser_click(nsOptions){
-	this.publish('nsfilechooser_' + nsOptions.fid, 'model_fileChooser_click', nsOptions.data);
+	this.publishEventAndData('nsfilechooser_', 'model_fileChooser_click', nsOptions.data, nsOptions.fid);
     }
     mediaCreator_setFile(nsOptions){
-	this.publish('nsmediacreator_' + nsOptions.fid, 'model_mediaCreator_setFile', nsOptions.data);
-    }     
+	this.publishEventAndData('nsmediacreator_', 'model_mediaCreator_setFile', nsOptions.data, nsOptions.fid);
+    }    
 }
 
 
@@ -3733,11 +3810,21 @@ NewspeakCroquetModel.register("NewspeakCroquetModel");
 class NewspeakCroquetView extends Croquet.View {
     constructor(model, presenter) {
 	super(model);
+	localViewId = this.viewId;
+	console.log('view id = ' + this. id + ' viewId = ' + this.viewId);
 	this.presenter = presenter;
-	storeModelAndView(model, this);
-	removeRunDependency(croquetDepId);
+        storeModelAndView(model, this);
+	console.log('croquetInitDone = ' + croquetInitDone);
+	if (croquetDepActive) {
+	    removeRunDependency(croquetDepId);
+	    console.log('Removing dependency ' + croquetDepId);
+	    croquetDepActive = false;
+        }
     }
 
+    addSubscription(scope, eventSpec, handler) {
+	newspeakSubscriptions.push({scope: scope, eventSpec: eventSpec, handler: handler});
+    } 
     storedData() {return this.session.data}
 }
 

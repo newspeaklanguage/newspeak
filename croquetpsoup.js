@@ -3557,11 +3557,15 @@ var lastProcessedEvent = 0;
 // convenience method to increment the processed event count. Easier to call from Newspeak.
 function eventProcessed() {
     lastProcessedEvent++;
+    console.log('last processed event incremented to ' + lastProcessedEvent);
 }
 
-// A map of event specifications (including scope) to the model's handlers. We use this when replaying events that
+// A map of event specifications (including scope) to the names model's handler methods.
+// We use this when replaying events that
 // this client has not seen yet. The model has a list of all events processed. When we start from a snapshot,
-// we go thru these, look up  their handlers in this map, and run them. See replayEvents()
+// we go thru these, look up their handler's names in this map, and run them. See replayEvents().
+// Why not have the handlers themselves rather than their names? Because they are methods, and reusing them directly
+// requires use of bind(), which runs afoul of Croquet's checks to enforce use by the model.
 var eventHandlerMap = {}
 
 // A list describing all the subscription handlers Newspeak has to Croquet events.
@@ -3569,10 +3573,17 @@ var eventHandlerMap = {}
 // This is needed, so that we can replay them
 // when Croquet creates a new view, which it odes when it restores from a snapshot. At that point, all our existing
 // subscriptions are gone, and we have to resubscribe. See replaySubscriptions()
-var newspeakSubscriptions = [];
+var newspeakSubscriptions = new Map();
+
+
+// Keep track of whether we are replaying or not. When we aren't, each event
+// the model processes must be added to the model's list of events.
+// When replaying, it must not.
+var replaying = false;
 
 function replaySubscriptions() {
-    for (let s of newspeakSubscriptions){
+    console.log('replaying ' + newspeakSubscriptions.size + ' subscriptions');
+    for (let s of newspeakSubscriptions.values()){
 	theView.subscribe(s.scope, s.eventSpec, s.handler);
     }
 }
@@ -3582,24 +3593,29 @@ function replaySubscriptions() {
 class NewspeakCroquetModel extends Croquet.Model {
     addEvent(e){
 	this.newspeakEvents.push(e);
-	console.log("adding event");
+	console.log("adding event " + e.scope + e.eventSpec);
     }
 
     publishEventAndData(scope, eventSpec, data, fid) {
-	this.addEvent({scope: scope, eventSpec: eventSpec, data: data});
+	console.log('publishEventAndData model id = ', this.id);
+	if (!replaying) {
+	    this.addEvent({scope: scope, eventSpec: eventSpec, fid: fid, data: data});
+	}
 	this.publish(scope + fid, eventSpec, data);
     }
 
     publishEvent(scope, eventSpec, fid) {
-	this.addEvent({scope: scope, eventSpec: eventSpec, data: fid});
+	console.log('publishEvent model id = ', this.id);
+	if (!replaying){
+	    this.addEvent({scope: scope, eventSpec: eventSpec, fid: fid, data: fid});
+	}
 	this.publish(scope + fid, eventSpec);
     }
     joinView(viewId){
-	console.log('Joined ' + viewId + ' at view ' + localViewId);
+	console.log('Join view event for viewId ' + viewId + ' at view ' + localViewId);
 	if ((localViewId == viewId) || (localViewId === undefined)) {
 	    console.log('Joined view ' + viewId);
-	    replaySubscriptions();	    
-	    this.replayEvents(lastProcessedEvent+1);
+	    //this.replayEvents(lastProcessedEvent+1);
 	}
     }
     exitView(viewId){
@@ -3609,19 +3625,14 @@ class NewspeakCroquetModel extends Croquet.Model {
     }
 
     subscribeAndRecord(scope, eventSpec, f) {
-	eventHandlerMap[scope + eventSpec] = f.bind(this);
+//	console.log('subscribing model to event ' + scope + eventSpec);
+	eventHandlerMap[scope + eventSpec] = f.name;
 	this.subscribe(scope, eventSpec, f);
     }
     
-    replayEvents(from) {
-	for (var i = from; i < this.newspeakEvents.length; i++) {
-            var e = this.newspeakEvents[from];
-	    console.log(e.scope + e.eventSpec);
-	    eventHandlerMap[e.scope + e.eventSpec.slice(6)](e.data);
-	}
-    }
-    
-    init() {  // only runs once, when a new session is initiated. Thus, not the right place to start up Newspeak
+    init() {  // runs when a new session is initiated OR when a new shapshot is deserialized. Thus, not the right place to start up Newspeak
+	console.log('Initiating model ', this.id);
+	if (theModel) theModel.unsubscribeAll();	
 	this.newspeakEvents = [];
 
         this.subscribe(this.sessionId, 'view-join', this.joinView);
@@ -3667,7 +3678,7 @@ class NewspeakCroquetModel extends Croquet.Model {
         this.subscribeAndRecord('nsmenu_', 'menu_click', this.menu_click);
         this.subscribeAndRecord('nsshell_', 'shell_userBack', this.shell_userBack);
 	this.subscribeAndRecord('nsfilechooser_', 'fileChooser_click', this.fileChooser_click);
-	this.subscribeAndRecord('nsmediacreator_', 'mediaCreator_setFile', this.mediaCreator_setFile);	
+	this.subscribeAndRecord('nsmediacreator_', 'mediaCreator_setFile', this.mediaCreator_setFile);
     }
     // same issues with scope for these methods
     mouseDown(fid){
@@ -3715,15 +3726,19 @@ class NewspeakCroquetModel extends Croquet.Model {
 	this.publish(this.nsFragmentId, 'model_wheel');
    }    // end leaf methods
     button_click(fid){
+	console.log('Button click ' + fid + ' + model id = ', this.id, ' modelId = ', this.modelId);
 	this.publishEvent('nsbutton_', 'model_button_click', fid);
     }
     image_button_click(fid){
+	console.log('Image button click ' + fid + ' + model id = ', this.id, ' modelId = ', this.modelId);
 	this.publishEvent('nsImagebutton_', 'model_image_button_click', fid);
     }
     hyperlink_click(fid){
+	console.log('Hyperlink click ' + fid + ' + model id = ', this.id, ' modelId = ', this.modelId);	
 	this.publishEvent('nshyperlink_', 'model_hyperlink_click', fid);
     }
     hyperlink_image_click(fid){
+	console.log('Hyperlink image click ' + fid + ' + model id = ', this.id, ' modelId = ', this.modelId);	
 	this.publishEvent('nshyperlinkImage_', 'model_hyperlink_image_click', fid);
     }
     
@@ -3736,18 +3751,23 @@ class NewspeakCroquetModel extends Croquet.Model {
 	this.publishEvent('nscheckbox_', 'model_checkBox_unchecked', fid);
     }
     radioButton_released(fid){
+	console.log('Radio button release ' + fid + ' + model id = ', this.id, ' modelId = ', this.modelId);		
 	this.publishEvent('nsradiobutton_', 'model_radioButton_released', fid);
     }
     radioButton_pressed(fid){
+	console.log('Radio button press ' + fid + ' + model id = ', this.id, ' modelId = ', this.modelId);		
 	this.publishEvent('nsradiobutton_', 'model_radioButton_pressed', fid);
     }
     codeMirror_beforeChange(nsOptions){
+	console.log('Codemirror before change ' + nsOptions.fid + ' + model id = ', this.id, ' modelId = ', this.modelId);		
 	this.publishEventAndData('nscodemirror_', 'model_codeMirror_beforeChange', nsOptions.data, nsOptions.fid);
     }
     codeMirror_change(nsOptions){
+	console.log('Codemirror change ' + nsOptions.fid + ' + model id = ', this.id, ' modelId = ', this.modelId);			
 	this.publishEventAndData('nscodemirror_', 'model_codeMirror_change', nsOptions.data, nsOptions.fid);
     }
     codeMirror_keydown(nsOptions){
+	console.log('Codemirror keydown ' + nsOptions.fid + ' + model id = ', this.id, ' modelId = ', this.modelId);	
 	this.publishEventAndData('nscodemirror_', 'model_codeMirror_keydown', nsOptions.data, nsOptions.fid);
     }
     codeMirror_accept(nsOptions){
@@ -3755,21 +3775,27 @@ class NewspeakCroquetModel extends Croquet.Model {
 	this.publishEventAndData('nscodemirror_', 'model_codeMirror_accept', nsOptions.data, nsOptions.fid);
     }
     codeMirror_cancel(nsOptions){
+	console.log('Codemirror cancel ' + nsOptions.fid + ' + model id = ', this.id, ' modelId = ', this.modelId);	
 	this.publishEventAndData('nscodemirror_', 'model_codeMirror_cancel', nsOptions.data, nsOptions.fid);
     }
-    codeMirror_beforeSelectionChange(nsOptions){		
+    codeMirror_beforeSelectionChange(nsOptions){
+	console.log('Codemirror before selection change ' + nsOptions.fid + ' + model id = ', this.id, ' modelId = ', this.modelId);	
 	this.publishEventAndData('nscodemirror_', 'model_codeMirror_beforeSelectionChange', nsOptions.data, nsOptions.fid);
     }    
     textEditor_accept(nsOptions){
+	console.log('Text editor accept ' + nsOptions.fid + ' + model id = ', this.id, ' modelId = ', this.modelId);	
 	this.publishEventAndData('nstexteditor_', 'model_textEditor_accept', nsOptions.data, nsOptions.fid);
     }
     textEditor_change(nsOptions){
+	console.log('Text editor change ' + nsOptions.fid + ' + model id = ', this.id, ' modelId = ', this.modelId);	
 	this.publishEventAndData('nstexteditor_', 'model_textEditor_change', nsOptions.data, nsOptions.fid);
     }
     textEditor_cancel(nsOptions){
+	console.log('Text editor cancel ' + nsOptions.fid + ' + model id = ', this.id, ' modelId = ', this.modelId);	
 	this.publishEventAndData('nstexteditor_', 'model_textEditor_cancel', nsOptions.data, nsOptions.fid);
     }
     toggleComposer_toggle(fid){
+	console.log('Toggle ' + fid + ' + model id = ', this.id, ' modelId = ', this.modelId);		
 	this.publishEvent('nstogglecomposer_', 'model_toggleComposer_toggle', fid);
     }     
     picker_pick(nsOptions){
@@ -3788,12 +3814,15 @@ class NewspeakCroquetModel extends Croquet.Model {
 	this.publishEventAndData('nsslider_', 'model_slider_pick', nsOptions.data, nsOptions.fid);
     }     
     dropDownMenu_click(fid){
+	console.log('Dropdown menu click ' + fid + ' + model id = ', this.id, ' modelId = ', this.modelId);		
 	this.publishEvent('nsdropdownmenu_', 'model_dropDownMenu_click', fid);
     }
     menu_click(nsOptions){
+	console.log('Menu click ' + nsOptions.fid + ' + model id = ', this.id, ' modelId = ', this.modelId);		
 	this.publishEventAndData('nsmenu_', 'model_menu_click', nsOptions.data, nsOptions.fid);
     }
     shell_userBack(nsOptions){
+	console.log('Shell back ' + nsOptions.fid + ' + model id = ', this.id, ' modelId = ', this.modelId);		
 	this.publishEventAndData('nsshell_', 'model_shell_userBack', nsOptions.data, nsOptions.fid);
     }
     fileChooser_click(nsOptions){
@@ -3811,9 +3840,12 @@ class NewspeakCroquetView extends Croquet.View {
     constructor(model, presenter) {
 	super(model);
 	localViewId = this.viewId;
-	console.log('view id = ' + this. id + ' viewId = ' + this.viewId);
+	console.log('Constructing view id = ' + this. id + ' viewId = ' + this.viewId);
 	this.presenter = presenter;
         storeModelAndView(model, this);
+	// do we need to unsubscribe the old view?
+        replaySubscriptions();
+	this.replay();   	
 	console.log('croquetInitDone = ' + croquetInitDone);
 	if (croquetDepActive) {
 	    removeRunDependency(croquetDepId);
@@ -3823,14 +3855,38 @@ class NewspeakCroquetView extends Croquet.View {
     }
 
     addSubscription(scope, eventSpec, handler) {
-	newspeakSubscriptions.push({scope: scope, eventSpec: eventSpec, handler: handler});
-    } 
+	newspeakSubscriptions.set(scope + eventSpec, {scope: scope, eventSpec: eventSpec, handler: handler});
+    }
+    
     storedData() {return this.session.data}
+    
+    replayEvents(from) {
+	replaying = true;
+	console.log('Replaying from ' + from + ' to ' +  theModel.newspeakEvents.length);
+	for (var i = from; i < theModel.newspeakEvents.length; i++) {
+            var e = theModel.newspeakEvents[i];
+	    var k = e.scope + e.fid + e.eventSpec;
+	    // the key to find the handler is the event scope (indicating the
+	    // type of fragment) followed by the fragment id
+	    // followed by the eventSpec
+	    if (newspeakSubscriptions.size > 0) {
+	        console.log('replaying ' + i + ' event ' +  k); 		
+		newspeakSubscriptions.get(k).handler(e.data);
+	    }
+	    // The first time we run, Newspeak has not run yet and
+	    // newspeakSubscriptions will be empty,so we can't replay yet.
+	   // We'll have to wait for Newspeak to run and ask us to replay
+	    console.log("replayed");
+	}
+	replaying = false;
+    }
+
+    replay() {this.replayEvents(lastProcessedEvent)};
 }
 
 const apiKey = "1g8dBJxALIxjKuCIblCBIttBxKOvNxOKfNgaK6ufq"; // paste from croquet.io/keys
-const appId = "org.newspeaklanguage.counter";
-const name = "NSCounterDevelopment"; //Croquet.App.autoSession();
+const appId = "org.newspeaklanguage.webIDE";
+const name = "NSCroquetIDEDevelopment-session27"; //Croquet.App.autoSession();
 const password = "neverMind"; // Croquet.App.autoPassword();
 
 // classes aren't stored in the global object, so assign them to

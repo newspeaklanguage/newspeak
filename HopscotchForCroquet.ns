@@ -31,7 +31,7 @@ The fragment notifies the Croquet root view when an interaction occurs. The croq
 
 As a general recipe:
 
-Every fragment type has a per type croquet event scope id, of the form #ns<fragmentypename>_, and, for each of its actions, a croquet event.  When an action occurs, we publish an event with the fragment type scope id, the action-specific event name, and event specific data. Usually this data is  a JS object with two fields: fid, containing the individual fragment id publishing, and a data field for additional even info. We produce these objects by calling out to JS via #newspeakFragmentData:data:. This JS function takes a fragment id and a data object, which can be anything that Croquet can serialize (so numbers, strings or vanilla objects, but not instances of specific classes with function valued fields etc.).
+Every fragment type has a per type croquet event scope id, of the form #ns<fragmentypename>_, and, for each of its actions, a croquet event.  When an action occurs, we publish an event with the fragment type scope id, the action-specific event name, and event specific data. Usually this data is  a JS object with two fields: fid, containing the individual fragment id publishing, and a data field for additional event info. We produce these objects by calling out to JS via #newspeakFragmentData:data:. This JS function takes a fragment id and a data object, which can be anything that Croquet can serialize (so numbers, strings or vanilla objects, but not instances of specific classes with function valued fields etc.).
 
 Back in Javascript, the root model subscribes to these events , scoping them using the aforementioned fragment type scope id.  The subscription specifies a root model method. When an event is detected, the method will be called with the event data as a parameter. The method in turn publishes an event whose name is of the form #model_<fragment specific scope>_ <action>. The fragment specific scope is the concatenation of the fragment type scope id and a fragment id number, which is usually found in the fid field of the incoming method argument. Associated with the event is the data from the incoming parameter.
 
@@ -41,7 +41,9 @@ The scheme is designed so that we only generate events upon user interaction. Th
 
 A series of croquet clients running a Newspeak application can be synchronized, without any modification to the Newspeak application code; the only requirement is that application be deployed using a platform object that uses an instance of this class as its GUI.
 
-To reach that goal, we have to implement all interactive Hopscotch fragments here, and we have to deal with the problem of saving a model of the application as a whole to the Croquet root model; presumably by adding an image mechanism to Newspeak.
+A complication to the above scheme is Croquet's use of snapshotting. Croquet expects all application state to be stored as serializable data in a Javascript Croquet model object, with the UI managed by the Croquet view objects that are essentially stateless. We are of course subverting this model, as all our state is in the Newspeak heap. In principle, we could add an image mechanism to Newspeak, store that image as a blob in the Croquet model and use it to restore the system. For now, we use a different solution. We store the entire event history in the model. This is a legitimate representation of the application state, as it can always be reconstructed from its initial state (the vfuel) by applying all events in order. 
+
+When restoring a client from a Croquet snapshot, we play back any events in the snapshot that have not yet been seen by the client, bringing into sync. The logic managing the above process is located mainly in Javascript code. When the client starts up, it sets up Croquet before activating Newspeak. Usually, this will include playing back unprocessed events.  However, in the case where a fresh client starts up, Newspeak has not yet been run, no Hopscotch fragments have been created, and so no fragments have subscribed to events.  Hence, replaying events would have no effect in a fresh client. To remedy this, we have Hopscotch notify the JS code to replay after the very first presenter has been displayed. This is managed in #HopscotchShell>>displayPresenter:. We track whether this is the first presenter via the flag #isStartingUp.
 
 Ultimately, we hope to go beyond the above, and be able to diff the saved model state and extend this to full local-first solution.
 *)
@@ -278,15 +280,6 @@ respondToKeyDown: event <Alien[Event]> = (
 respondToAccept: event <Alien[Event]> = (
   reflecting ifTrue: [publish: 'nscodemirror_' event: #codeMirror_accept data: codeMirrorData]
 )
-respondToBeforeChange: event <Alien[Event]> = (
- ('code mirror respond before change event ', fragmentId printString) out.
-   reflecting ifTrue: [publish: 'nscodemirror_' event: #codeMirror_beforeChange data: codeMirrorData]
-)
-respondToChange: change <Alien[CodeMirrorChangeObject]> = (
- ('code mirror respond change event: ', fragmentId printString) out.
-  
-  reflecting ifTrue: [publish: 'nscodemirror_' event: #codeMirror_change data: (codeMirrorData: (js global nsCodeMirrorChange: change))]
-)
 selectionEventData: event = (
   ^js global nsCodeMirrorSelectionChange: event 
 )
@@ -321,6 +314,12 @@ setupCroquetView = (
    subscribe: #model_codeMirror_accept handler: [:e | reflecting ifTrue: [reflecting:: false. super respondToAccept: e. reflecting:: true] ifFalse: [reflecting:: true]].
    subscribe: #model_codeMirror_cancel handler: [:e | reflecting ifTrue: [reflecting:: false. super respondToCancel. reflecting:: true] ifFalse: [reflecting:: true]].
       subscribe: #model_codeMirror_beforeSelectionChange handler: [:e | reflecting ifTrue: [reflecting:: false. adjustSelection: e. reflecting:: true] ifFalse: [reflecting:: true]]
+)
+respondToChange: change <Alien[CodeMirrorChangeObject]> = (
+  reflecting ifTrue: [publish: 'nscodemirror_' event: #codeMirror_change data: (codeMirrorData: (js global nsCodeMirrorChange: change))]
+)
+respondToBeforeChange: event <Alien[Event]> = (
+   reflecting ifTrue: [publish: 'nscodemirror_' event: #codeMirror_beforeChange data: codeMirrorData]
 )
 ) : (
 )
@@ -588,6 +587,10 @@ setupCroquetView = (
 ) : (
 )
 public class DropDownMenuFragment menu: ms image: img <Image> alignment: side <Symbol> = super DropDownMenuFragment menu: ms image: img alignment: side (
+(*
+Dropdown menus operate in two stages: first, the menu button is clicked, to display the actual menu.  This is handled in this class, via #clickHandler, which publishes the #dropDownMenu_click event.
+Once the menu is displayed, individual entries in it can be clicked.  This is handled via class #Menu. Here we compute an instance of #Menu based on the menu contents; this is what gets displayed.
+*)
     |
     fragmentId <Integer> = newDropDownMenuId.
     public scope <String> =  'nsdropdownmenu_', fragmentId printString.
@@ -604,12 +607,12 @@ updateContent ^ <Alien[Element]> = (
 	showMenu: menu forShell: shell inVisual: visual.
     ^menu.
 )
-clickHandler ^ <[:Alien | Boolean]> = (
-  ^[:event | publish: 'nsdropdownmenu_' event: #dropDownMenu_click data: fragmentId. nil]
-)
 setupCroquetView = (
   (* When the Croquet view is notified of a click, it will call back to the Newspeak button to perform its normal action *)
   subscribe: #model_dropDownMenu_click handler: [:e | super clickHandler value: e]
+)
+clickHandler ^ <[:Alien | Boolean]> = (
+  ^[:event | publish: 'nsdropdownmenu_' event: #dropDownMenu_click data: fragmentId. nil]
 )
 ) : (
 public menu: ms  <[Tuple[Symbol | Tuple[String, []]]]> ^ <Instance> = (
@@ -644,6 +647,12 @@ subscribe: eventSpec <String> handler: blk <[CroquetEvent]> = (
 ) : (
 )
 public class Menu supplier: ms <[{Symbol | {String. []}}]>  = (
+(*
+This class reifies the structure displayed by a dropdown menu when it is clicked, ergo, the list of menu entries (the actual menu). The handling of the latter clicking is done in #DropDownMenuFragment.
+
+Instances of this class are not proper fragments in and of themselves (perhaps an oversight in the Hopscotch menu design for the web).
+Nevertheless, it operates in a similar manner. Each entry shows the original menu text, but wraps the corresponding action so that when the entry is clicked, an event will get published indicating what entry was selected.  A handler is set up, subscribing to the notification events from the model, that uses the name of the netry provided by the event to choose the appropriate action. This is done by looking it up in a map, #menuItemMap, which is constructed from the original menu supplier, #ms, via the #buildMenuItemMap method.
+*)
 	| 
     fragmentId <Integer> = newMenuId.
     public menuContents <List[Symbol | {String. []}]> = List new.
@@ -690,8 +699,10 @@ userBack: event  = (
 )
 public displayPresenter: p = (
   super displayPresenter: p.
+  (* As explained in the class comment, the very first presenter we display needs to notify the JS code that a replay of any unprocessed events should be done.*)
   isStartingUp ifTrue: [
     isStartingUp:: false. 
+    (* Notify croquet that it can reply. We cannot the replay code synchronously at this point. because the event handlers that will be replayed assume that all Newspeak processing for the turn was completed by the time they are called (as it is in normal execution).  Hence the async message send. *)
     rootView <-: replay
     ]. 
 )

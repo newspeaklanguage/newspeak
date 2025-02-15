@@ -3558,19 +3558,10 @@ function eventProcessed() {
     lastProcessedEvent++;
 }
 
-// A map of event specifications (including scope) to the names model's handler methods.
-// We use this when replaying events that
-// this client has not seen yet. The model has a list of all events processed. When we start from a snapshot,
-// we go thru these, look up their handler's names in this map, and run them. See replayEvents().
-// Why not have the handlers themselves rather than their names? Because they are methods, and reusing them directly
-// requires use of bind(), which runs afoul of Croquet's checks to enforce use by the model.
-var eventHandlerMap = {}
-
-// A list describing all the subscription handlers Newspeak has to Croquet events.
-// Each entry lists the scope, event spec and handler for a given subscription.
-// This is needed, so that we can replay them
-// when Croquet creates a new view, which it odes when it restores from a snapshot. At that point, all our existing
-// subscriptions are gone, and we have to resubscribe. See replaySubscriptions()
+/* 
+A map describing all the subscription handlers Newspeak has to Croquet events. 
+Each entry lists the scope, event spec and handler for a given subscription. This is needed, so that we can replay them when Croquet creates a new view, which it does when it restores from a snapshot. At that point, all our existing subscriptions are gone, and we have to resubscribe. See replaySubscriptions()
+*/
 var newspeakSubscriptions = new Map();
 
 function replaySubscriptions() {
@@ -3579,9 +3570,26 @@ function replaySubscriptions() {
     }
 }
 
-// Root model
+// Root model. See HopscotchForCroquet.ns for an overview of how
+// things work.
 
 class NewspeakCroquetModel extends Croquet.Model {
+/*
+Several things that are not evident from the Croquet docs.
+
+When Croquet restores the model from a snapshot, a fresh instance of the root model class is instantiated. The instance's init() method is called (this seems to contradict the docs, which say init() is called only once per session). 
+
+This of course implies that it explicitly resubscribes; we explictly unsubscribe the old model.
+
+Now, the view-join event is  processed. 
+
+Hence no snapshot state is available at that point. 
+
+Note that a view-join can happen even without a snapshot.
+
+Only afterward is the snapshot state restored in the new model. Next a new root view object is instantiated, with the new model as an argument. 
+*/
+    
     addEvent(e){
 	this.newspeakEvents.push(e);
     }
@@ -3595,17 +3603,13 @@ class NewspeakCroquetModel extends Croquet.Model {
 	this.addEvent({scope: scope, eventSpec: eventSpec, fid: fid, data: fid});
 	this.publish(scope + fid, eventSpec);
     }
-
-    subscribeAndRecord(scope, eventSpec, f) {
-	eventHandlerMap[scope + eventSpec] = f.name;
-	this.subscribe(scope, eventSpec, f);
-    }
     
     init() {  // runs when a new session is initiated OR when a new shapshot is deserialized. Thus, not the right place to start up Newspeak
 
 	// If we had a prior model (every time this runs except the first)
 	// then we get rid of its subscriptions
-	if (theModel) theModel.unsubscribeAll();	
+	if (theModel) theModel.unsubscribeAll();
+	// A list of all events ever sent to the model
 	this.newspeakEvents = [];
 
 	// Leaf fragment support; issues: scope differs by fragment class (no such thing as nsFragmentId)
@@ -3621,34 +3625,34 @@ class NewspeakCroquetModel extends Croquet.Model {
 	this.subscribe(this.nsFragmentId, 'onTouchStart', this.touchStart);
 	this.subscribe(this.nsFragmentId, 'onWheel', this.wheel);
 	
-	this.subscribeAndRecord('nsbutton_', 'button_click', this.button_click);
-	this.subscribeAndRecord('nsImagebutton_', 'image_button_click', this.image_button_click);
-	this.subscribeAndRecord('nshyperlink_', 'hyperlink_click', this.hyperlink_click);
-	this.subscribeAndRecord('nshyperlinkImage_', 'hyperlink_image_click', this.hyperlink_image_click);
-	this.subscribeAndRecord('nscheckbox_', 'checkBox_checked', this.checkBox_checked);
-	this.subscribeAndRecord('nscheckbox_', 'checkBox_unchecked', this.checkBox_unchecked);	
-	this.subscribeAndRecord('nsradiobutton_', 'radioButton_released', this.radioButton_released);
-	this.subscribeAndRecord('nsradiobutton_', 'radioButton_pressed', this.radioButton_pressed);	
-	this.subscribeAndRecord('nscodemirror_', 'codeMirror_beforeChange', this.codeMirror_beforeChange);
-	this.subscribeAndRecord('nscodemirror_', 'codeMirror_change', this.codeMirror_change);
-	this.subscribeAndRecord('nscodemirror_', 'codeMirror_keydown', this.codeMirror_keydown);
-	this.subscribeAndRecord('nscodemirror_', 'codeMirror_accept', this.codeMirror_accept);
-	this.subscribeAndRecord('nscodemirror_', 'codeMirror_cancel', this.codeMirror_cancel);
- 	this.subscribeAndRecord('nscodemirror_', 'codeMirror_beforeSelectionChange', this.codeMirror_beforeSelectionChange);	
-	this.subscribeAndRecord('nstexteditor_', 'textEditor_accept', this.textEditor_accept);
-	this.subscribeAndRecord('nstexteditor_', 'textEditor_change', this.textEditor_change);
-	this.subscribeAndRecord('nstexteditor_', 'textEditor_cancel', this.textEditor_cancel);
-	this.subscribeAndRecord('nstogglecomposer_', 'toggleComposer_toggle', this.toggleComposer_toggle)
-	this.subscribeAndRecord('nspicker_', 'picker_pick', this.picker_pick);
-	this.subscribeAndRecord('nscolorpicker_', 'colorPicker_pick', this.color_picker_pick);
-	this.subscribeAndRecord('nsdatepicker_', 'datePicker_pick', this.date_picker_pick);
-	this.subscribeAndRecord('nstimepicker_', 'timePicker_pick', this.time_picker_pick);
-	this.subscribeAndRecord('nsslider_', 'slider_pick', this.slider_pick);
-	this.subscribeAndRecord('nsdropdownmenu_', 'dropDownMenu_click', this.dropDownMenu_click);
-        this.subscribeAndRecord('nsmenu_', 'menu_click', this.menu_click);
-        this.subscribeAndRecord('nsshell_', 'shell_userBack', this.shell_userBack);
-	this.subscribeAndRecord('nsfilechooser_', 'fileChooser_click', this.fileChooser_click);
-	this.subscribeAndRecord('nsmediacreator_', 'mediaCreator_setFile', this.mediaCreator_setFile);
+	this.subscribe('nsbutton_', 'button_click', this.button_click);
+	this.subscribe('nsImagebutton_', 'image_button_click', this.image_button_click);
+	this.subscribe('nshyperlink_', 'hyperlink_click', this.hyperlink_click);
+	this.subscribe('nshyperlinkImage_', 'hyperlink_image_click', this.hyperlink_image_click);
+	this.subscribe('nscheckbox_', 'checkBox_checked', this.checkBox_checked);
+	this.subscribe('nscheckbox_', 'checkBox_unchecked', this.checkBox_unchecked);	
+	this.subscribe('nsradiobutton_', 'radioButton_released', this.radioButton_released);
+	this.subscribe('nsradiobutton_', 'radioButton_pressed', this.radioButton_pressed);	
+	this.subscribe('nscodemirror_', 'codeMirror_beforeChange', this.codeMirror_beforeChange);
+	this.subscribe('nscodemirror_', 'codeMirror_change', this.codeMirror_change);
+	this.subscribe('nscodemirror_', 'codeMirror_keydown', this.codeMirror_keydown);
+	this.subscribe('nscodemirror_', 'codeMirror_accept', this.codeMirror_accept);
+	this.subscribe('nscodemirror_', 'codeMirror_cancel', this.codeMirror_cancel);
+ 	this.subscribe('nscodemirror_', 'codeMirror_beforeSelectionChange', this.codeMirror_beforeSelectionChange);	
+	this.subscribe('nstexteditor_', 'textEditor_accept', this.textEditor_accept);
+	this.subscribe('nstexteditor_', 'textEditor_change', this.textEditor_change);
+	this.subscribe('nstexteditor_', 'textEditor_cancel', this.textEditor_cancel);
+	this.subscribe('nstogglecomposer_', 'toggleComposer_toggle', this.toggleComposer_toggle);
+	this.subscribe('nspicker_', 'picker_pick', this.picker_pick);
+	this.subscribe('nscolorpicker_', 'colorPicker_pick', this.color_picker_pick);
+	this.subscribe('nsdatepicker_', 'datePicker_pick', this.date_picker_pick);
+	this.subscribe('nstimepicker_', 'timePicker_pick', this.time_picker_pick);
+	this.subscribe('nsslider_', 'slider_pick', this.slider_pick);
+	this.subscribe('nsdropdownmenu_', 'dropDownMenu_click', this.dropDownMenu_click);
+        this.subscribe('nsmenu_', 'menu_click', this.menu_click);
+        this.subscribe('nsshell_', 'shell_userBack', this.shell_userBack);
+	this.subscribe('nsfilechooser_', 'fileChooser_click', this.fileChooser_click);
+	this.subscribe('nsmediacreator_', 'mediaCreator_setFile', this.mediaCreator_setFile);
     }
     // same issues with scope for these methods
     mouseDown(fid){
@@ -3750,6 +3754,7 @@ class NewspeakCroquetModel extends Croquet.Model {
 	this.publishEventAndData('nstexteditor_', 'model_textEditor_cancel', nsOptions.data, nsOptions.fid);
     }
     toggleComposer_toggle(fid){
+	console.log(' toggleComposer_toggle ' + fid);
 	this.publishEvent('nstogglecomposer_', 'model_toggleComposer_toggle', fid);
     }     
     picker_pick(nsOptions){
@@ -3768,7 +3773,7 @@ class NewspeakCroquetModel extends Croquet.Model {
 	this.publishEventAndData('nsslider_', 'model_slider_pick', nsOptions.data, nsOptions.fid);
     }     
     dropDownMenu_click(fid){
-	this.publishEvent('nsdropdownmenu_', 'model_dropDownMenu_click', fid);
+	this.publishEventAndData('nsdropdownmenu_', 'model_dropDownMenu_click', fid, fid);
     }
     menu_click(nsOptions){
 	this.publishEventAndData('nsmenu_', 'model_menu_click', nsOptions.data, nsOptions.fid);
@@ -3801,6 +3806,7 @@ class NewspeakCroquetView extends Croquet.View {
         }
     }
 
+    // Called by Newspeak when any fragment subscribes to an event.
     addSubscription(scope, eventSpec, handler) {
 	newspeakSubscriptions.set(scope + eventSpec, {scope: scope, eventSpec: eventSpec, handler: handler});
     }
@@ -3823,13 +3829,13 @@ class NewspeakCroquetView extends Croquet.View {
 	    }
 	}
     }
-
+    // Also called by Newspeak when it starts up the first time
     replay() {this.replayEvents(lastProcessedEvent)};
 }
 
 const apiKey = "1g8dBJxALIxjKuCIblCBIttBxKOvNxOKfNgaK6ufq"; // paste from croquet.io/keys
 const appId = "org.newspeaklanguage.webIDE";
-const name = "NSCroquetIDEDevelopment-session30"; //Croquet.App.autoSession();
+const name = "NSCroquetIDEDevelopment-session46"; //Croquet.App.autoSession();
 const password = "neverMind"; // Croquet.App.autoPassword();
 
 // classes aren't stored in the global object, so assign them to

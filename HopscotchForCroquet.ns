@@ -19,7 +19,8 @@ public class Hopscotch usingPlatform: p <Platform> images: images ducts: ds =
 
 (
 (*
-This class overrides the normal Hopscotch UI module to allow the UI to synchronize using croquet.io.
+This class overrides the normal Hopscotch UI module to allow the UI to synchronize using croquet.io. A series of croquet clients running a Newspeak application can be synchronized, without any modification to the Newspeak application code; the only requirement is that application be deployed using a platform object that uses an instance of this class as its GUI.
+
 For every interactive fragment class, we maintain:
 
 1) A subclass, defined here, that manages the interaction with Croquet.
@@ -39,11 +40,11 @@ Each fragment subscribes to such an event for each of its actions. Thus, it will
 
 The scheme is designed so that we only generate events upon user interaction. Thus the event pressure is bounded by the speed of human input. 
 
-A series of croquet clients running a Newspeak application can be synchronized, without any modification to the Newspeak application code; the only requirement is that application be deployed using a platform object that uses an instance of this class as its GUI.
-
 A complication to the above scheme is Croquet's use of snapshotting. Croquet expects all application state to be stored as serializable data in a Javascript Croquet model object, with the UI managed by the Croquet view objects that are essentially stateless. We are of course subverting this model, as all our state is in the Newspeak heap. In principle, we could add an image mechanism to Newspeak, store that image as a blob in the Croquet model and use it to restore the system. For now, we use a different solution. We store the entire event history in the model. This is a legitimate representation of the application state, as it can always be reconstructed from its initial state (the vfuel) by applying all events in order. 
 
 When restoring a client from a Croquet snapshot, we play back any events in the snapshot that have not yet been seen by the client, bringing into sync. The logic managing the above process is located mainly in Javascript code. When the client starts up, it sets up Croquet before activating Newspeak. Usually, this will include playing back unprocessed events.  However, in the case where a fresh client starts up, Newspeak has not yet been run, no Hopscotch fragments have been created, and so no fragments have subscribed to events.  Hence, replaying events would have no effect in a fresh client. To remedy this, we have Hopscotch notify the JS code to replay after the very first presenter has been displayed. This is managed in #HopscotchShell>>displayPresenter:. We track whether this is the first presenter via the flag #isStartingUp.
+
+A few other details also complicate the picture. These have to do with file handling, drag and drop, and menus, and are described in classes #FileChooserFragment, #MediaCreatorFragment and #Menu respectively.
 
 Ultimately, we hope to go beyond the above, and be able to diff the saved model state and extend this to full local-first solution.
 *)
@@ -601,18 +602,19 @@ updateVisualsFromSameKind: oldFragment <DropDownMenuFragment>  ^ <Alien[InputEle
   scope_slot: oldFragment scope.
   ^super updateVisualsFromSameKind: oldFragment.
 )
-updateContent ^ <Alien[Element]> = (
-    | menu <Alien[Div]> = computeContentForMenu: [(Menu supplier: menuSupplier) menuContents] . |
-    isActive: true.
-	showMenu: menu forShell: shell inVisual: visual.
-    ^menu.
-)
 setupCroquetView = (
   (* When the Croquet view is notified of a click, it will call back to the Newspeak button to perform its normal action *)
   subscribe: #model_dropDownMenu_click handler: [:e | super clickHandler value: e]
 )
 clickHandler ^ <[:Alien | Boolean]> = (
   ^[:event | publish: 'nsdropdownmenu_' event: #dropDownMenu_click data: fragmentId. nil]
+)
+updateContent ^ <Alien[Element]> = (
+   (* Overriden so as to wrap the menu items so that their actions post Croquet events *)
+    | menu <Alien[Div]> = computeContentForMenu: [(Menu supplier: menuSupplier) menuContents] . |
+    isActive: true.
+	showMenu: menu forShell: shell inVisual: visual.
+    ^menu.
 )
 ) : (
 public menu: ms  <[Tuple[Symbol | Tuple[String, []]]]> ^ <Instance> = (
@@ -651,7 +653,7 @@ public class Menu supplier: ms <[{Symbol | {String. []}}]>  = (
 This class reifies the structure displayed by a dropdown menu when it is clicked, ergo, the list of menu entries (the actual menu). The handling of the latter clicking is done in #DropDownMenuFragment.
 
 Instances of this class are not proper fragments in and of themselves (perhaps an oversight in the Hopscotch menu design for the web).
-Nevertheless, it operates in a similar manner. Each entry shows the original menu text, but wraps the corresponding action so that when the entry is clicked, an event will get published indicating what entry was selected.  A handler is set up, subscribing to the notification events from the model, that uses the name of the netry provided by the event to choose the appropriate action. This is done by looking it up in a map, #menuItemMap, which is constructed from the original menu supplier, #ms, via the #buildMenuItemMap method.
+Nevertheless, it operates in a similar manner. Each entry shows the original menu text, but wraps the corresponding action so that when the entry is clicked, an event will get published indicating what entry was selected.  A handler is set up, subscribing to the notification events from the model, that uses the name of the entry provided by the event to choose the appropriate action. This is done by looking it up in a map, #menuItemMap, which is constructed from the original menu supplier, #ms, via the #buildMenuItemMap method.
 *)
 	| 
     fragmentId <Integer> = newMenuId.
@@ -712,7 +714,7 @@ class FileChooserFragment allowMultiples: b <Boolean> = super FileChooserFragmen
 (*
 This fragment is a bit unusual. We deviate somewhat from this module's standard formula for overriding fragments. The browser will not allow the standard (i.e., inherited) FileChooserFragment action to take place unless there was an actual user action (i.e., the user activated the UI).
 As a result, only the client where the request to load files was initiated can respond with a file dialog, and only in the same turn.  This means we must take action to read files immediately, and so the #chooseFileList: method calls the super method. However, it sends it a different closure than the one passed in to it.
-The original closure is stored in the #lastAction slot, while super method is passed a closure accepts the locally read file list, and forwards that data as part of the event sent to the croquet reflector.  When the reflector responds, the data is fed into the original closure kept in #lastAction. See #setupCroquetView for the details.
+The original closure is stored in the #lastAction slot, while the super method is passed a closure that accepts the locally read file metadata, and forwards that data as part of the event sent to the croquet reflector.  The actual file contents are stored on the croquet server as well. The separation of metadata and file contents is needed because of size restrictions on events. When the reflector responds, the data is used to look up file contents on the server so they can be fed into the original closure kept in #lastAction. See  #chooseFlieList: and #setupCroquetView for the details.
 
 A complication is that the file API is asynchronous, so we only have promises initially. We must wait for these promises to be resolved to obtain the required data which we will forward to the reflector. This is handled in #extractFileData:whenReady:.
 *)
@@ -958,17 +960,6 @@ newMenuId ^ <Integer> = (
   menuCount::menuCount + 1.
   ^menuCount
 )
-openMenu: aMenu <Menu> = (	
-	showMenu: (computeContentForMenu: [(Menu supplier: [aMenu]) menuContents]) forShell: shell inVisual: visual.
-)
-computeContentForMenu: menuSupplier <[Menu]> ^ <Alien[Div]> = (
-  ^super computeContentForMenu: menuSupplier
-)
-showMenu: menu <Alien[Div]> 
-		forShell: s <HopscotchShell> 
-		inVisual: v <Visual> = (
-   super showMenu: menu forShell: s inVisual: v 
-)
 newWindowId ^ <Integer> = (
   windowCount:: windowCount + 1.
   ^windowCount
@@ -1051,6 +1042,20 @@ subscribeFragment: fragmentId scope: scope eventSpec: eventSpec <String> handler
   rootView addSubscription: scope eventSpec: eventSpec handler: handler. 
   (* subscribe to croquet as usual*)
   rootView <-: subscribe: scope eventSpec: eventSpec handler: handler
+)
+showMenu: menu <Alien[Div]> 
+		forShell: s <HopscotchShell> 
+		inVisual: v <Visual> = (
+        (* Make the inherited method visible to nested classes *)
+   super showMenu: menu forShell: s inVisual: v 
+)
+computeContentForMenu: menuSupplier <[Menu]> ^ <Alien[Div]> = (
+(* Make the inherited method visible to nested classes *)
+  ^super computeContentForMenu: menuSupplier
+)
+openMenu: aMenu <Menu> = (	
+   (* Overriden so as to wrap the menu items so that their actions post Croquet events *)
+	showMenu: (computeContentForMenu: [(Menu supplier: [aMenu]) menuContents]) forShell: shell inVisual: visual.
 )
 ) : (
 )

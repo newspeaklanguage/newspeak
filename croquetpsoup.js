@@ -3833,17 +3833,63 @@ class NewspeakCroquetView extends Croquet.View {
     replay() {this.replayEvents(lastProcessedEvent)};
 }
 
-const apiKey = "1g8dBJxALIxjKuCIblCBIttBxKOvNxOKfNgaK6ufq"; // paste from croquet.io/keys
-const appId = "org.newspeaklanguage.webIDE";
-const name = "NSCroquetIDEDevelopment-session46"; //Croquet.App.autoSession();
-const password = "neverMind"; // Croquet.App.autoPassword();
+/**
+ * getURIParam(paramName)
+ * 
+ * Retrieves a named parameter from the current page's URL or, if not found, from localStorage.
+ * 
+ * Behavior:
+ * 1. Checks the current URL's query string for the parameter.
+ * 2. If found, stores the value in localStorage under the same key for persistence.
+ * 3. If not found in the URL, attempts to retrieve the value from localStorage.
+ * 4. Returns the value as a string if found, or null if not found in either place.
+ * 
+ * Design decisions:
+ * - If the value is only found in localStorage, it is *not* written back to the URL.
+ *   This avoids exposing potentially sensitive information in the address bar.
+ * - The return value is consistently `null` when the parameter is not found, never `undefined`.
+ * - This pattern supports one-time setup via query parameters, with silent persistence afterward.
+ * 
+ * Example usage:
+ *   getURIParam("sessionId"); // "abc123" or null
+ * 
+ * Notes:
+ * - If you want to force the value into the URL for bookmarking/sharing, you could extend
+ *   this function later to support an optional `syncToURL` flag.
+ */
+function getURIParam(paramName) {
+  const url = new URL(window.location.href);
+  let value = url.searchParams.get(paramName);
+
+  if (value !== null) {
+    // Found in URL — persist to localStorage
+    localStorage.setItem(paramName, value);
+  } else {
+    // Not in URL — try getting from localStorage
+    value = localStorage.getItem(paramName);
+  }
+  return value;
+}
+
+
+
+var sessionId = getURIParam("sessionId"); // originates from croquet.io/keys
+// or else Croquet.App.autoSession();
+var apiKey = getURIParam("apiKey");
+var appId = getURIParam("appId");
+var password = getURIParam("pwd"); // Croquet.App.autoPassword();
+
+ 
+
+
+
 
 // classes aren't stored in the global object, so assign them to
 // variables so we can easily get them from Newspeak
 var NSCroquetModel = NewspeakCroquetModel;
 var NSCroquetView = NewspeakCroquetView;
 
-Croquet.Session.join({ apiKey, appId, name, password, model: NewspeakCroquetModel, view: NewspeakCroquetView });
+Croquet.Session.join({ apiKey, appId, sessionId, password, model: NewspeakCroquetModel, view: NewspeakCroquetView });
 
 
 // {{MODULE_ADDITIONS}}

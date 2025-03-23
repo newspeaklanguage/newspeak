@@ -20,7 +20,7 @@
 //   - During the above registration, this sw.js file is compared to the server version.
 //   - ONLY if the server sw.js changes:
 //       the PWA starts to install the new server version sw.js to the local PWA;
-//       this local install is done by trigerring listeners registered
+//       this local install is done by triggering listeners registered
 //       on the 'install' and 'activate' events on the
 //       local running sw.js. We use the 'activate' event to update the local PWA caches.
 //     else:
@@ -65,7 +65,7 @@
 // The version update can be done either manually (we rely on this),
 // or by applying some framework that generates this sw.js worker script.
 
-const pwaVersion = 559;
+const pwaVersion = 566;
 
 // Cache name used by the 'caches' global variable.
 // The pwaCacheName now includes the pwaVersion;

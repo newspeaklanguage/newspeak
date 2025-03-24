@@ -3795,6 +3795,7 @@ NewspeakCroquetModel.register("NewspeakCroquetModel");
 class NewspeakCroquetView extends Croquet.View {
     constructor(model, presenter) {
 	super(model);
+	console.log("croquet sessio id = " + this.sessionId);
 	localViewId = this.viewId;
 	this.presenter = presenter;
         storeModelAndView(model, this);
@@ -3832,6 +3833,59 @@ class NewspeakCroquetView extends Croquet.View {
     // Also called by Newspeak when it starts up the first time
     replay() {this.replayEvents(lastProcessedEvent)};
 }
+
+/**
+Produce an object emulating window.localStorage. We want to have distinct
+local storage per croquet session, so that apps and sessions don't step on each other's persistent state, invalidating the sync process.
+
+Each such per-session object gets stored in regular local storage.
+Therefore, we must JSONify and de-JSONify the data.
+*/
+function createSessionStorage(sessionId, {prefix = "app-session:"} = {}) {
+  const storageKey = `${prefix}${sessionId}`;
+
+  function load() {
+    const raw = localStorage.getItem(storageKey);
+    return raw ? JSON.parse(raw) : {};
+  }
+
+  function save(data) {
+    localStorage.setItem(storageKey, JSON.stringify(data));
+  }
+
+  return {
+    getItem(key) {
+      const data = load();
+      return data.hasOwnProperty(key) ? data[key] : null;
+    },
+
+    setItem(key, value) {
+      const data = load();
+      data[key] = String(value); // match localStorage behavior
+      save(data);
+    },
+
+    removeItem(key) {
+      const data = load();
+      delete data[key];
+      save(data);
+    },
+
+    clear() {
+      save({});
+    },
+
+    key(index) {
+      const keys = Object.keys(load());
+      return keys[index] || null;
+    },
+
+    get length() {
+      return Object.keys(load()).length;
+    }
+  };
+}
+
 
 /**
  * getURIParam(paramName)
@@ -3872,12 +3926,11 @@ function getURIParam(paramName) {
 }
 
 
-
-var sessionId = getURIParam("sessionId"); // originates from croquet.io/keys
+const name = getURIParam("sessionId"); 
 // or else Croquet.App.autoSession();
-var apiKey = getURIParam("apiKey");
-var appId = getURIParam("appId");
-var password = getURIParam("pwd"); // Croquet.App.autoPassword();
+const apiKey = getURIParam("apiKey");// originates from croquet.io/keys
+const appId = getURIParam("appId");
+const password = getURIParam("pwd"); // Croquet.App.autoPassword();
 
  
 
@@ -3889,7 +3942,7 @@ var password = getURIParam("pwd"); // Croquet.App.autoPassword();
 var NSCroquetModel = NewspeakCroquetModel;
 var NSCroquetView = NewspeakCroquetView;
 
-Croquet.Session.join({ apiKey, appId, sessionId, password, model: NewspeakCroquetModel, view: NewspeakCroquetView });
+Croquet.Session.join({ apiKey, appId, name, password, model: NewspeakCroquetModel, view: NewspeakCroquetView });
 
 
 // {{MODULE_ADDITIONS}}

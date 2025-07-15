@@ -44,7 +44,7 @@ TL;DR: If you want to build the Newspeak IDE or any Newspeak
 application from scratch, follow the installation steps in section 3.1
 and subsection 3.1.1 (each only needs to be performed once). Then
 follow the steps in section 4.1 (for the Newspeak IDE running as a
-PWA) or 4.2 (for any application, running as a website). The steps in section 4.1 or 4.2 are repeated after after any change in the application.
+PWA) or 4.2 (for any application, running as a website). The steps in section 4.1 or 4.2 are repeated after any change in the application.
 
 In addition to using the online version of the [Newspeak IDE](http://www.newspeaklanguage.org/webIDE/), you can build, deploy, and serve the Newspeak system, or any Newspeak application, on your computer. There may be a few reasons to build and use the Newspeak system this way:
 
@@ -59,7 +59,7 @@ This is needed one-time only.
 
 Building Newspeak locally requires some software to be downloaded,
 cloned from Github, or installed: *Newspeak*, *Primordialsoup* and
-it's dependencies and targets: *Emscripten*, *Scons*, and *g++-multilib*. Details of how to install the required software are below.
+its dependencies and targets: *Emscripten*, *Scons*, and *g++-multilib*. Details of how to install the required software are below.
 
 The default directories for installing *Newspeak*, *Primordialsoup* and *Emscripten* are determined by environment variables set in `newspeak/tool/newspeak_env.sh`. These variables and their default values are 
  

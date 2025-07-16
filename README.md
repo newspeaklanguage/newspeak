@@ -34,7 +34,7 @@ A `.vfuel` file can be created from its source class in one of two ways:
 
 1. From the locally served or online [Newspeak IDE](http://www.newspeaklanguage.org/webIDE) by clicking the **[deploy]** link beside the application class.  This process is not described in this document.
 
-2. From a command line, by first saving the application class to a `.ns` source file, then running the `build.sh` script described below.  To use this command line method, you need to install several items.  This process is described in the [Building Newspeak from scratch](#3.-building-newspeak-from-scratch) section and its subsections.
+2. From a command line, by first saving the application class to a `.ns` source file, then running the `build.sh` script described below.  To use this command line method, you need to install several items.  This process is described in the [Building Newspeak from scratch](#3-building-newspeak-from-scratch) section and its subsections.
 
 To serve a Newspeak application in a HTTP server, you need a binary file with `.vfuel` extension, one or more HTML files, and at least two files, 'primordialsoup.js' and 'primordialsoup.wasm' (both created by `build.sh`), and potentially other application specific resources.
 

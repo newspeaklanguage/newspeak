@@ -191,7 +191,7 @@ The term **deploy** refers to the process of copying the Newspeak application `.
 
 Note: If you want to deploy other application's `.vfuel` as a PWA, you can clone the directory structure under [webIDE](https://github.com/newspeaklanguage/newspeak/tree/master/platforms/webIDE), rename it, make changes to `index.html`, `manifest.json`, `sw.js`, `primordialsoup-setup.js`, remove files not applicable to your application, and replace `HopscotchWebIDE.vfuel` with your application's `.vfuel`. 
 
-Refer to section [4. Building, deploying, and serving Newspeak application(s)](4.-Building,-deploying,-and-serving-Newspeak applications) for more details regarding the two deployment methods.
+Refer to section [4. Building, deploying, and serving Newspeak application(s)](#4-building-deploying-and-serving-newspeak-applications) for more details regarding the two deployment methods.
 
 The term **serve** refers to running the HTTP server in a directory
 where the Newspeak application was 'deploy'ed. You also need to start

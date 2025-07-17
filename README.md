@@ -34,7 +34,7 @@ A `.vfuel` file can be created from its source class in one of two ways:
 
 1. From the locally served or online [Newspeak IDE](http://www.newspeaklanguage.org/webIDE) by clicking the **[deploy]** link beside the application class.  This process is not described in this document.
 
-2. From a command line, by first saving the application class to a `.ns` source file, then running the `build.sh` script described below.  To use this command line method, you need to install several items.  This process is described in the [Building Newspeak from scratch](#3.-building-newspeak-from-scratch) section and its subsections.
+2. From a command line, by first saving the application class to a `.ns` source file, then running the `build.sh` script described below.  To use this command line method, you need to install several items.  This process is described in the [Building Newspeak from scratch](#3-building-newspeak-from-scratch) section and its subsections.
 
 To serve a Newspeak application in a HTTP server, you need a binary file with `.vfuel` extension, one or more HTML files, and at least two files, 'primordialsoup.js' and 'primordialsoup.wasm' (both created by `build.sh`), and potentially other application specific resources.
 
@@ -44,7 +44,7 @@ TL;DR: If you want to build the Newspeak IDE or any Newspeak
 application from scratch, follow the installation steps in section 3.1
 and subsection 3.1.1 (each only needs to be performed once). Then
 follow the steps in section 4.1 (for the Newspeak IDE running as a
-PWA) or 4.2 (for any application, running as a website). The steps in section 4.1 or 4.2 are repeated after after any change in the application.
+PWA) or 4.2 (for any application, running as a website). The steps in section 4.1 or 4.2 are repeated after any change in the application.
 
 In addition to using the online version of the [Newspeak IDE](http://www.newspeaklanguage.org/webIDE/), you can build, deploy, and serve the Newspeak system, or any Newspeak application, on your computer. There may be a few reasons to build and use the Newspeak system this way:
 
@@ -59,7 +59,7 @@ This is needed one-time only.
 
 Building Newspeak locally requires some software to be downloaded,
 cloned from Github, or installed: *Newspeak*, *Primordialsoup* and
-it's dependencies and targets: *Emscripten*, *Scons*, and *g++-multilib*. Details of how to install the required software are below.
+its dependencies and targets: *Emscripten*, *Scons*, and *g++-multilib*. Details of how to install the required software are below.
 
 The default directories for installing *Newspeak*, *Primordialsoup* and *Emscripten* are determined by environment variables set in `newspeak/tool/newspeak_env.sh`. These variables and their default values are 
  
@@ -191,7 +191,7 @@ The term **deploy** refers to the process of copying the Newspeak application `.
 
 Note: If you want to deploy other application's `.vfuel` as a PWA, you can clone the directory structure under [webIDE](https://github.com/newspeaklanguage/newspeak/tree/master/platforms/webIDE), rename it, make changes to `index.html`, `manifest.json`, `sw.js`, `primordialsoup-setup.js`, remove files not applicable to your application, and replace `HopscotchWebIDE.vfuel` with your application's `.vfuel`. 
 
-Refer to section [4. Building, deploying, and serving Newspeak application(s)](4.-Building,-deploying,-and-serving-Newspeak applications) for more details regarding the two deployment methods.
+Refer to section [4. Building, deploying, and serving Newspeak application(s)](#4-building-deploying-and-serving-newspeak-applications) for more details regarding the two deployment methods.
 
 The term **serve** refers to running the HTTP server in a directory
 where the Newspeak application was 'deploy'ed. You also need to start

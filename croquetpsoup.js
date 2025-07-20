@@ -3613,17 +3613,17 @@ Only afterward is the snapshot state restored in the new model. Next a new root 
 	this.newspeakEvents = [];
 
 	// Leaf fragment support; issues: scope differs by fragment class (no such thing as nsFragmentId)
-	this.subscribe(this.nsFragmentId, 'onMouseDown', this.mouseDown);
-	this.subscribe(this.nsFragmentId, 'onMouseEnter', this.mouseEnter);
-	this.subscribe(this.nsFragmentId, 'onMouseMove', this.mouseMove);
-	this.subscribe(this.nsFragmentId, 'onMouseOut', this.mouseOut);
-	this.subscribe(this.nsFragmentId, 'onMouseOver', this.mouseOver);
-	this.subscribe(this.nsFragmentId, 'onMouseUp', this.mouseUp);
-	this.subscribe(this.nsFragmentId, 'onTouchCancel', this.touchCancel);
-	this.subscribe(this.nsFragmentId, 'onTouchEnd', this.touchEnd);
-	this.subscribe(this.nsFragmentId, 'onTouchMove', this.touchMove);
-	this.subscribe(this.nsFragmentId, 'onTouchStart', this.touchStart);
-	this.subscribe(this.nsFragmentId, 'onWheel', this.wheel);
+	this.subscribe(this.sessionId, 'onMouseDown', this.mouseDown);
+	this.subscribe(this.sessionId, 'onMouseEnter', this.mouseEnter);
+	this.subscribe(this.sessionId, 'onMouseMove', this.mouseMove);
+	this.subscribe(this.sessionId, 'onMouseOut', this.mouseOut);
+	this.subscribe(this.sessionId, 'onMouseOver', this.mouseOver);
+	this.subscribe(this.sessionId, 'onMouseUp', this.mouseUp);
+	this.subscribe(this.sessionId, 'onTouchCancel', this.touchCancel);
+	this.subscribe(this.sessionId, 'onTouchEnd', this.touchEnd);
+	this.subscribe(this.sessionId, 'onTouchMove', this.touchMove);
+	this.subscribe(this.sessionId, 'onTouchStart', this.touchStart);
+	this.subscribe(this.sessionId, 'onWheel', this.wheel);
 	
 	this.subscribe('nsbutton_', 'button_click', this.button_click);
 	this.subscribe('nsImagebutton_', 'image_button_click', this.image_button_click);
@@ -3657,47 +3657,47 @@ Only afterward is the snapshot state restored in the new model. Next a new root 
     // same issues with scope for these methods
     mouseDown(fid){
 	console.log('MouseDown ' + fid);
-	this.publish(this.nsFragmentId + fid, 'model_mouseDown');
+	this.publish(fid, 'model_mouseDown');
     }
     mouseEnter(fid){
 	console.log('MouseEnter ' + fid);
-	this.publish(this.nsFragmentId + fid, 'model_mouseEnter');
+	this.publish(fid, 'model_mouseEnter');
     }
     mouseMove(fid){
 	console.log('MouseMove ' + fid);
-	this.publish(this.nsFragmentId, 'model_mouseMove');
+	this.publish(fid, 'model_mouseMove');
     }
     mouseOut(fid){
 	console.log('MouseOut ' + fid);
-	this.publish(this.nsFragmentId, 'model_mouseOut');
+	this.publish(fid, 'model_mouseOut');
     }
     mouseOver(fid){
 	console.log('MouseOver ' + fid);
-	this.publish(this.nsFragmentId, 'model_mouseOver');
+	this.publish(fid, 'model_mouseOver');
     }
     mouseUp(fid){
 	console.log('MouseUp ' + fid);
-	this.publish(this.nsFragmentId, 'model_mouseUp');
+	this.publish(fid, 'model_mouseUp');
    }
    touchCancel(fid){
 	console.log('TouchCancel ' + fid);
-	this.publish(this.nsFragmentId, 'model_touchCancel');
+	this.publish(fid, 'model_touchCancel');
    }
    touchEnd(fid){
 	console.log('TouchEnd ' + fid);
-	this.publish(this.nsFragmentId, 'model_touchEnd');
+	this.publish(fid, 'model_touchEnd');
    }	
    touchMove(fid){
 	console.log('TouchMove ' + fid);
-	this.publish(this.nsFragmentId, 'model_touchMove');
+	this.publish(fid, 'model_touchMove');
    }
    touchStart(fid){
 	console.log('TouchStart ' + fid);
-	this.publish(this.nsFragmentId, 'model_touchStart');
+	this.publish(fid, 'model_touchStart');
    }
    wheel(fid){
 	console.log('Wheel ' + fid);
-	this.publish(this.nsFragmentId, 'model_wheel');
+	this.publish(fid, 'model_wheel');
    }    // end leaf methods
     button_click(fid){
 	this.publishEvent('nsbutton_', 'model_button_click', fid);
@@ -3754,7 +3754,6 @@ Only afterward is the snapshot state restored in the new model. Next a new root 
 	this.publishEventAndData('nstexteditor_', 'model_textEditor_cancel', nsOptions.data, nsOptions.fid);
     }
     toggleComposer_toggle(fid){
-	console.log(' toggleComposer_toggle ' + fid);
 	this.publishEvent('nstogglecomposer_', 'model_toggleComposer_toggle', fid);
     }     
     picker_pick(nsOptions){

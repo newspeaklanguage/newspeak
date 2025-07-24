@@ -25,10 +25,11 @@ specific API naming conventions.  Its class can be saved to a `.ns`
 source file, and used to create an instance that is serialized into a
 binary `.vfuel`, which is deployed and served.
 
-**Note:**: You can usually run the application inside the IDE for
-  purposes of testing and development, provided you have the source
-  code loaded in the IDE. We won't discuss that here - this document
-  is focused on application deployment.
+> [!NOTE]
+> You can usually run the application inside the IDE for
+> purposes of testing and development, provided you have the source
+> code loaded in the IDE. We won't discuss that here - this document
+> is focused on application deployment.
 
 A `.vfuel` file can be created from its source class in one of two ways:
 
@@ -93,7 +94,8 @@ git checkout extraRevs
 To be clear: at this point, you should now have a directory named `~/software/nswasm`, with two
 subdirectories; `newspeak`, containing this repository, and `primordialsoup`, containing the `extraRevs` branch of <https://github.com/newspeaklanguage/primordialsoup>.
 
-**Important:** If you are using 'non default' directories for your installation, now edit the file `newspeak/tool/newspeak_env.sh`, change the exported variables there, and save the file. 
+> [!IMPORTANT]
+> If you are using 'non default' directories for your installation, now edit the file `newspeak/tool/newspeak_env.sh`, change the exported variables there, and save the file.
 
 ### 3.1.1 Building Newspeak: installing Primordialsoup dependencies
 
@@ -171,7 +173,8 @@ The above section [Building Newspeak: installing required software](#3.1-buildin
 
 This section and sections below describe the repeated 'build', 'deploy', 'serve' lifecycle of Newspeak applications.
 
-**Important:** All scripts to build and deploy a Newspeak application are in the `newspeak/tool` directory, and must be executed from the `newspeak/tool` directory. The Newspeak IDE is only one possible Newspeak application.
+> [!IMPORTANT]
+> All scripts to build and deploy a Newspeak application are in the `newspeak/tool` directory, and must be executed from the `newspeak/tool` directory. The Newspeak IDE is only one possible Newspeak application.
 
 The term **build** refers to the process which creates the `.vfuel`
 binary files from the application source `.ns` files.  The script

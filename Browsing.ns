@@ -29,8 +29,10 @@ class Browsing usingPlatform: p ide: webIde
     private Message = p kernel Message.
     private ClassDeclarationBuilder = p mirrors ClassDeclarationBuilder.
     private Snapshotter = p operatingSystem = 'emscripten' ifTrue: [p victoryFuel Snapshotter].
+    private Deserializer = p operatingSystem = 'emscripten' ifTrue: [p victoryFuel Deserializer].    
     private JSObject = p js global at: 'Object'.
     private JSArray = p js global at: 'Array'.
+    private JSUint8Array = p js global at: #Uint8Array.
     private JSMath = p js global at: 'Math'.
     private JSPromise = p js global at: 'Promise'.
     private JSZip = p js global at: 'JSZip'.
@@ -268,19 +270,6 @@ future_deployAction = (
 			)
 		]
 )
-respondToRunApp: paused = (
-	(* bogus: The subject might not be in the root namespace. *)
-	| appConfig manifest platform args thread |
-	appConfig:: ide namespacing Root at: subject name.
-	manifest:: ide namespacing manifest.
-	platform:: cachedPlatform.
-	args:: {}.
-	thread:: platform mirrors ActivationMirror invokeSuspended:
-		[(appConfig packageUsing: manifest) main: AppPlatform new args: args].
-	paused ifFalse: [thread resume].
-	thread isFulfilled ifFalse:
-		[enterSubject:: ide debugging ThreadSubject onModel: thread].
-)
 respondToRunTests = (
 	| thread |
 	thread:: cachedPlatform mirrors ActivationMirror invokeSuspended:
@@ -326,10 +315,17 @@ deployAsVictoryFuelWithHopscotch = (
       | bytes = subject bytesForVictoryFuelWithHopscotch. |
   	ide webFiles downloadFileName: subject name, '.vfuel' fromBytes: bytes.
 )
+respondToRunApp: paused = (
+  subject runApp: paused
+)
+deployAsNSO = (
+	subject deployAsNSO
+)
 public deployAction = (
 	subject isApplicationConfiguration ifFalse: [^nothing].
 	^(link: '[deploy]' action: [
 			openMenu:: menuWithLabelsAndActions: {
+                {'as Newspeak Object (NSO)'. [deployAsNSO]}.
 				{'as VictoryFuel'. [deployAsVictoryFuel]}.
 				{'as VictoryFuel with Mirrors'. [deployAsVictoryFuelWithMirrors]}.
                 {'as VictoryFuel with Hopscotch'. [deployAsVictoryFuelWithHopscotch]}.
@@ -950,12 +946,6 @@ public testingSubject = (
 public title = (
 	^name
 )
-public runApp = (
-	| appDef <Class> app <Object> |
-	appDef:: ide namespacing Root at: name.
-	app:: appDef packageUsing: ide namespacing manifest.
-	app main: cachedPlatform args: {}
-)
 public bytesForVictoryFuel ^ <ByteArray> = (
 	^bytesForVictoryFuelWithRuntime: ide psoupDeploymentRuntime
 )
@@ -1082,6 +1072,26 @@ public bytesForVictoryFuelWithHopscotch ^ <ByteArray> = (
 )
 public nonExemplarPresenter ^ <ClassPresenter> = (
   ^ClassPresenter onSubject: self
+)
+public deployAsNSO = (
+	| appDef <Class> =  ide namespacing Root at: name. |
+    ide deployment deployApp: appDef
+)
+public runApp: paused = (
+	| manifest = ide namespacing manifest.  appConfig args = {}.  thread |
+	appConfig:: ide namespacing Root at: name ifAbsent: [
+       (* If the app's class was not in the IDE namespace, we will put it there *)
+       (* An app must be top level; it cannot be dependent on an enclosing instance *)
+       isTopLevel ifFalse: ['runApp: says Apps must be top level' out. ^self]. 
+       (* Put the app's class in the IDE namespace *)
+       ide namespacing Root at: name put: classMirror applyToObject reflectee.
+       ].
+	thread:: ActivationMirror invokeSuspended:
+    	(* bogus: No guarantee that all the dependencies are in the root namespace. *)
+		[(appConfig packageUsing: manifest) main: AppPlatform new args: args].
+	paused ifFalse: [thread resume].
+	thread isFulfilled ifFalse:
+		[Utilities enterSubject: (ide debugging ThreadSubject onModel: thread)].
 )
 ) : (
 public fromModel: cm <ClassModel> ^ <Instance> = (
@@ -2748,9 +2758,6 @@ class ClassEntryPresenter onSubject: s <ClassSubject> = outer Browsing ClassEntr
 accessIndicator = (
 	^nothing
 )
-entryActionsMenu = (
-	^dropDownMenu: [entryActionsMenuFor: subject name].
-)
 public tag = (
   ^subject name
 )
@@ -2780,6 +2787,9 @@ helpText = (
   </ul>
   '
   mapping: mapping
+)
+entryActionsMenu = (
+	^dropDownMenu: [entryActionsMenuFor: subject name].
 )
 ) : (
 )
@@ -3134,14 +3144,6 @@ acceptNewNamespaceDefinitionFrom: aTemplate = (
 		ifFailure:
 			[:msg | aTemplate editor showMessage: msg]
 )
-namespaceMenu = (
-	^menuWithLabelsAndActions: {
-		{'Inspect Presenter' . [respondToInspectPresenter]}.
-		#separator.
-		{'Compile File(s)'. [respondToCompileFiles]}.
-		{'Load Document(s)'. [respondToLoadDocuments]}.      
-	}
-)
 respondToLoadDocuments = (
    multipleFileChooser chooseFileList: [:fl | 
 	    subject loadDocuments:  fl
@@ -3168,6 +3170,18 @@ greyIcon = Utilities uriForIconNamed: #classUnknownImage.
 )
 listDescription ^ <String> = (
   ^'namespace list'
+)
+namespaceMenu = (
+	^menuWithLabelsAndActions: {
+		{'Inspect Presenter' . [respondToInspectPresenter]}.
+		#separator.
+		{'Compile File(s)'. [respondToCompileFiles]}.
+		{'Load Document(s)'. [respondToLoadDocuments]}.
+        {'Load App'. [respondToLoadApp]}.
+	}
+)
+respondToLoadApp = (
+  fileChooser chooseSingleFile: [:f | subject loadAppFromNSO: f ifFail: [:msg | alert: msg. nil]]
 )
 ) : (
 )
@@ -3333,6 +3347,22 @@ public summaryText = (
     s:: sb asString.
     s size > 20 ifTrue: [^(s copyFrom: 1 to: 20), '...'].
 	^s
+)
+public loadAppFromNSO: f <Alien[File]> ifFail: blk  <[String]> = (
+     loadBytesFromNSO: f ifSuccess: [:bytes <Alien[Uint8Array]>  | 
+          |  app = Deserializer new deserialize: bytes. |
+          app main: AppPlatform new args: {}.
+          nil.
+          ] 
+     ifFailure: [:msg | blk value: msg]  
+)
+loadBytesFromNSO: f <Alien[File]> ifSuccess: successBlock  <[Alien[Uint8Array]]> ifFailure: failBlock <[String]>  = (
+  | promise <Alien[JSPromise[ArrayBuffer]]> = f arrayBuffer. |
+	    promise then: [:ab <Alien[ArrayBuffer]> |  
+          | jsArray = JSUint8Array new: ab.  nsArray = Array new: (jsArray at: #length). |
+          1 to: nsArray size do: [ :i | nsArray at: i put: (jsArray at: i - 1)].
+          [successBlock value: nsArray] on: Error do:  [:ex | failBlock value:   'Error loading app from file ', (f at: #name), ' :', ex printString].
+        ] onError: [:ex | failBlock value:  'Error loading app from file ', (f at: #name), ' :', ex printString. nil].
 )
 ) : (
 public new = (
@@ -5229,6 +5259,9 @@ public doesNotUnderstand: message <Message> = (
 )
 public HopscotchWindow = (
   ^Window
+)
+core = (
+  ^self
 )
 ) : (
 )

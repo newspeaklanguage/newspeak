@@ -65,7 +65,7 @@
 // The version update can be done either manually (we rely on this),
 // or by applying some framework that generates this sw.js worker script.
 
-const pwaVersion = 689;
+const pwaVersion = 692;
 
 // Cache name used by the 'caches' global variable.
 // The pwaCacheName now includes the pwaVersion;
@@ -95,32 +95,32 @@ const pwaAppResources = [
     // as the scope looks at the source of the request - which is below /webIDE/, so in scope.
     
     '/accept16px.png',
+    '/addImage.png',
     '/ampleforthDocument.png',
+    '/backImage.png',    
     '/cancel16px.png',
+    '/classImage.png',
     '/classPresenterImage.png',
     '/classUnknownImage.png',
     '/clearImage.png',
+    '/collapseImage.png',    
     '/disclosureClosedImage.png',
     '/disclosureOpenImage.png',
     '/downloadImage.png',
+    '/dropdownImage.png',
+    '/expandImage.png',    
     '/findImage.png',
+    '/forwardImage.png',    
     '/helpImage.png',
-    '/hsAddImage.png',
-    '/hsBackImage.png',
-    '/hsCollapseImage.png',
-    '/hsDropdownImage.png',
-    '/hsExpandImage.png',
-    '/hsForwardImage.png',
-    '/hsHistoryImage.png',
-    '/hsHomeImage.png',
-    '/hsNewImage.png',
-    '/hsRefreshImage.png',
+    '/historyImage.png',
+    '/homeImage.png',
     '/itemReferencesImage.png',
-    '/languageNewspeak3.png',
+    '/newImage.png',
     '/peekingeye1610.png',
-    '/privateImage.png',
-    '/protectedImage.png',
-    '/publicImage.png',
+    '/privateAccessImage.png',
+    '/protectedAccessImage.png',
+    '/publicAccessImage.png',
+    '/refreshImage.png',    
     '/saveImage.png',
 ];
 

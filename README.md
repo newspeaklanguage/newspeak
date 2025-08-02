@@ -124,35 +124,20 @@ Unless you are targetting Fuchsia, follow steps 1 to 3 in this section to instal
 
     Clone the Emscripten SDK (`emsdk`) using these steps
     ```sh
-    # Set the Newspeak environment.
-    cd ~/software/nswasm/newspeak # Adjust to your directory path
-    . ./tool/newspeak_env.sh      # The '. ' at the beginning is required
-    
-    # Clone the emsdk
-    cd $EMSDK/..
+    # Clone the emsdk repository
+    cd ~/software/nswasm
     git clone https://github.com/emscripten-core/emsdk.git
     
-    # Install the emsdk version 2.0.0
+    # Install the emsdk version 4.0.11
     cd emsdk
-    ./emsdk install 2.0.0
-    ./emsdk activate 2.0.0
+    ./emsdk install 4.0.11
+    ./emsdk activate 4.0.11
     . ./emsdk_env.sh
     
     # List the emsdk installed
     ./emsdk list
     ```
     
-    Note: '2.0.0' is the default supported version of `emsdk`. To use the latest Emscripten SDK, you can replace '2.0.0' with 'latest' in the script above.  BUT, if you do that, you also have to edit the scons build file named `SConstruct` in the `$PRIMORDIALSOUP` directory, and replace the following line
-    ```python
-       '-s', 'EXPORTED_FUNCTIONS=["_load_snapshot", "_handle_message", "_handle_signal"]',
-    ```
-    with
-    ```python
-       '-s', 'EXPORTED_FUNCTIONS=["_load_snapshot", "_handle_message", "_handle_signal", "_free", "_malloc"]',
-       '-s', 'EXPORTED_RUNTIME_METHODS=["stringToUTF8"]',
-    ```
-    to be clear, the first (default) works with `emsdk` version '2.0.0', the second with 'latest'. As of February 12 2024, 'latest' emsdk corresponds to version '3.1.53'.
-
 3. **Build Primordialsoup (optional):** You can now build primordialsoup to make sure everything installed. This step is not necessary as Primordialsoup build is part of the Newspeak build in the next section - but running it should catch any dependencies issues early.
 
     ```sh

@@ -83,7 +83,7 @@ The installation steps:
 You can use the following commands to execute 1. and 2. just above:
 
 ```sh
-mkdir --parent ~/software/nswasm
+mkdir -p ~/software/nswasm
 cd ~/software/nswasm # Adjust to your directory path
 git clone https://github.com/newspeaklanguage/newspeak.git
 git clone https://github.com/newspeaklanguage/primordialsoup.git

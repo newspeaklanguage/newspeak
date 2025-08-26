@@ -3651,6 +3651,7 @@ Only afterward is the snapshot state restored in the new model. Next a new root 
 	this.subscribe('nsdropdownmenu_', 'dropDownMenu_click', this.dropDownMenu_click);
         this.subscribe('nsmenu_', 'menu_click', this.menu_click);
         this.subscribe('nsshell_', 'shell_userBack', this.shell_userBack);
+        this.subscribe('nsshell_', 'shell_activeMenuBlurred', this.shell_activeMenuBlurred);	
 	this.subscribe('nsfilechooser_', 'fileChooser_click', this.fileChooser_click);
 	this.subscribe('nsmediacreator_', 'mediaCreator_setFile', this.mediaCreator_setFile);
     }
@@ -3780,6 +3781,10 @@ Only afterward is the snapshot state restored in the new model. Next a new root 
     shell_userBack(nsOptions){
 	this.publishEventAndData('nsshell_', 'model_shell_userBack', nsOptions.data, nsOptions.fid);
     }
+    shell_activeMenuBlurred(fid){
+	console.log('shell_activeMenuBlurred ' + fid);
+	this.publishEvent('nsshell_', 'model_shell_activeMenuBlurred', fid);
+    }     
     fileChooser_click(nsOptions){
 	this.publishEventAndData('nsfilechooser_', 'model_fileChooser_click', nsOptions.data, nsOptions.fid);
     }

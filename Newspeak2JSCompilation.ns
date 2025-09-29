@@ -300,11 +300,31 @@ public propertyCallNode: node <PropertyCallAST> ^ <PropertyCallAST> = (
 setterBlockArgName = (
 	^('setter_arg') asSymbol
 )
+public unresolvedSendNode: node <UnresolvedSendAST> ^ <AST> = (
+	#BOGUS. (* Eventual sends trump inlining, but we shouldn't need to duplicate the eventual send check. Maybe the inlining should be deferred until we know it is an immediate ordinary send? *)
+	(node message isEventual)
+		ifTrue: [^processEventualSend: node].
+
+	(inlineOperators and: [isInlinableNumericOperator: node]) ifTrue:
+		[^inline: node as: InlinedOperatorAST
+			selector: (inlinableNumericOperators at: node message selector)
+			rewriteArgsAs: [:each | applyForValueTo: each]].
+	(inlineOperators and: [isInlinableOperator: node]) ifTrue:
+		[^inline: node as: InlinedOperatorAST
+			selector: (inlinableOperators at: node message selector)
+			rewriteArgsAs: [:each | applyForValueTo: each]].
+	(inlineOperators and: [isInlinableBooleanOperator: node]) ifTrue:
+		[^inline: node as: InlinedOperatorAST
+			selector: (node message selector = 'and:' ifTrue: ['&&'] ifFalse: ['||']) (* BOGUS *)
+			rewriteArgsAs: [:each <BlockAST> | applyForValueTo: each body statements first]].
+
+	^super unresolvedSendNode: node
+)
 public setterSendNode: node <SetterSendAST> ^ <AST> = (
 (* Rewrite a double-colon setter send. The value of the entire expression should be the value of the argument of the send, NOT the value returned by the setter method. This general case is somewhat inefficient, but in most cases the value of the expression is ignored by the parent so we can use a cheaper regular message send. *)
 	| binding block blockArg blockParam blockScope send rewrittenSetterSend |
 	binding:: currentScope at: node message selector ifAbsent: [MessageAST new].
-	binding isLocalBinding ifTrue:
+	binding isKindOfLocalBinding ifTrue:
 		(* This is an assignment to a temporary; no special handling is needed
 		as the value of the expression is the value being assigned. *)
 		[^processLocalAccess: node message of: binding].
@@ -350,26 +370,6 @@ public setterSendNode: node <SetterSendAST> ^ <AST> = (
 				start: node message start; end: node message end);
 				start: node start; end: node end.
 	^applyForValueTo: rewrittenSetterSend
-)
-public unresolvedSendNode: node <UnresolvedSendAST> ^ <AST> = (
-	#BOGUS. (* Eventual sends trump inlining, but we shouldn't need to duplicate the eventual send check. Maybe the inlining should be deferred until we know it is an immediate ordinary send? *)
-	(node message isEventual)
-		ifTrue: [^processEventualSend: node].
-
-	(inlineOperators and: [isInlinableNumericOperator: node]) ifTrue:
-		[^inline: node as: InlinedOperatorAST
-			selector: (inlinableNumericOperators at: node message selector)
-			rewriteArgsAs: [:each | applyForValueTo: each]].
-	(inlineOperators and: [isInlinableOperator: node]) ifTrue:
-		[^inline: node as: InlinedOperatorAST
-			selector: (inlinableOperators at: node message selector)
-			rewriteArgsAs: [:each | applyForValueTo: each]].
-	(inlineOperators and: [isInlinableBooleanOperator: node]) ifTrue:
-		[^inline: node as: InlinedOperatorAST
-			selector: (node message selector = 'and:' ifTrue: ['&&'] ifFalse: ['||']) (* BOGUS *)
-			rewriteArgsAs: [:each <BlockAST> | applyForValueTo: each body statements first]].
-
-	^super unresolvedSendNode: node
 )
 ) : (
 )
@@ -470,33 +470,6 @@ public localReadNode: node <LocalReadAST> = (
 )
 public localWriteNode: node <LocalWriteAST> = (
 	^js assign: (js ident: (names mangleLocal: node name)) toBe: (node value apply: self)
-)
-public loopNode: node <LoopAST> = (
-	(* prologue; while(cond==whileTrue) {body}; *)
-
-	|
-	prologue = node prologue ifNil: [js block: {}] ifNotNil: [:it | it apply: self].
-	cond = node condition apply: self.
-	body = node body ifNil: [js block: {}] ifNotNil: [:it | it apply: self].
-
-	(* Split the condition is it isn't a single expression *)
-	condExpression ::= cond statements last.
-	condPrologue = cond statements asOrderedCollection removeLast; yourself.
-	|
-
-	node isWhileTrue ifFalse: [
-		condExpression:: js prefixOperator: '!' on: condExpression].
-
-	(* Flatten prologue so its declarations are in scope for the loop *)
-
-	^js block:
-		prologue statements,
-		condPrologue, {
-		js
-			for: (js verbatim: '')
-			while: condExpression
-			step: (js verbatim: '')
-			do: (js block: body statements, condPrologue)}
 )
 maybeCaptureReceiver = (
 	methodIsPrivate
@@ -681,7 +654,35 @@ processLexicalSend: message to: jsReceiver binding: binding = (
 processIntrinsic: msg <MessageAST> = (
 	^jsMirror perform: msg selector
 		with: (msg arguments collect: [:arg | processIntrinsicArg: arg]) asArray
-        ifFail: [:e |  'Failed to process an intrinsic during JS translation' out].
+        ifFail: [:e |  ('Failed to process an intrinsic during JS translation ', e printString) out].
+)
+public loopNode: node <LoopAST> = (
+	(* prologue; while(cond==whileTrue) {body}; *)
+
+	|
+    nodePrologue = node prologue.
+	prologue = nodePrologue isNil ifTrue: [js block: {}] ifFalse: [nodePrologue apply: self].
+	cond = node condition apply: self.
+	body = node body isNil ifTrue: [js block: {}] ifFalse: [node body apply: self].
+
+	(* Split the condition is it isn't a single expression *)
+	condExpression ::= cond statements last.
+	condPrologue = (List withAll: cond statements) removeLast; yourself.
+	|
+
+	node isWhileTrue ifFalse: [
+		condExpression:: js prefixOperator: '!' on: condExpression].
+
+	(* Flatten prologue so its declarations are in scope for the loop *)
+
+	^js block:
+		prologue statements,
+		condPrologue, {
+		js
+			for: (js verbatim: '')
+			while: condExpression
+			step: (js verbatim: '')
+			do: (js block: body statements, condPrologue)}
 )
 ) : (
 )
@@ -1564,8 +1565,10 @@ public printOn: stm = (
 )
 class NameMangler = (|
 	private specialCharacterManglings = Map new.
-|specialCharacterManglings
-		at: "+" put: '$plus';
+|
+{"+". "-" . "*" . "/". "\". "<". ">".  "~". "=". "@". "%". "|". "&". "?". "!". ","} with: { '$plus'. '$minus'. '$times'. '$over'. '$back'. '$less'. '$greater'. '$tilde'. '$equal'. '$at'. '$percent'. '$pipe'. '$amp'. '$question'. '$bang'. '$comma'} do: [:char :mangling | specialCharacterManglings at: (char runeAt: 1) put: mangling].
+(*specialCharacterManglings 
+		at: ("+" put: '$plus';
 		at: "-" put: '$minus';
 		at: "*" put: '$times';
 		at: "/" put: '$over';
@@ -1580,7 +1583,8 @@ class NameMangler = (|
 		at: "&" put: '$amp';
 		at: "?" put: '$question';
 		at: "!" put: '$bang';
-		at: "," put: '$comma') (
+		at: "," put: '$comma')*)
+        ) (
 public fullyQualifiedNameToSimple: fullName <String> = (
 	| parts |
 

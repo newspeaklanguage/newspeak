@@ -38,7 +38,7 @@
 //    the cached resources.
 //  - Also (I assume) we want to keep the cache-first strategy of looking up
 //    resources, currently implemented in the 'fetch' event.
-//    I assume cache-first is used for simplicity and savind the server resources.
+//    I assume cache-first is used for simplicity and saving the server resources.
 //
 // Goals implementation:
 //
@@ -65,7 +65,7 @@
 // The version update can be done either manually (we rely on this),
 // or by applying some framework that generates this sw.js worker script.
 
-const pwaVersion = 749;
+const pwaVersion = 781;
 
 // Cache name used by the 'caches' global variable.
 // The pwaCacheName now includes the pwaVersion;

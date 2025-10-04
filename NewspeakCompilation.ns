@@ -35,8 +35,9 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 	private NumberAST = asts NumberAST.
 	private ReturnStatAST = asts ReturnStatAST.
 	private TupleAST = asts TupleAST.
+    private VarDeclAST = asts VarDeclAST.
 	private VariableAST = asts VariableAST.
-
+    
 	public namer = Namer new.
 |) (
 class ClassEntry forDeclaration: cd atDepth: d = SymbolTableEntry forAST: cd atDepth: d (|
@@ -945,6 +946,188 @@ public compileMethodSource: source <String> within: enclosing <IntermediateMixin
 public compileLazySlotSource: src <String> within: enclosingIR <IntermediateMixin> ^ <IntermediateLazySlot> = (
 	subclassResponsibility
 )
+public slotNameForLazySlotNamed: selector <Symbol> ^ <Symbol> = (
+  ^(selector, '`cache`slot') asSymbol
+)
+astForLazySlotGetter: tree <SlotDefAST> = (
+(* Build an AST for a method that would lazily create a execute the expression in a lazy slot, and cache it. The generated code has the form
+
+simpleName = (
+	self simpleName`slot isNil ifTrue:
+		[self simpleName`slot: initLazySlotExpression].
+	^self simpleName`slot
+)
+
+*)
+
+	| initMethodName cacheSlotName selector cacheSlot  assignSlot nilCheck block if return initValue  
+    stmts = List new. 
+    blockStmts = List new.
+    |
+
+	selector:: tree name asSymbol.
+
+	initMethodName:: initMethodNameForLazySlotNamed: selector.
+	cacheSlotName:: slotNameForLazySlotNamed: selector.
+
+	cacheSlot:: UnresolvedSendAST new
+		to: selfNode
+		send: cacheSlotName with: {}.
+
+
+	initValue:: UnresolvedSendAST new
+		to: selfNode
+		send: initMethodName
+		with: {}.
+
+
+	assignSlot:: UnresolvedSendAST new
+		to: selfNode
+		send: (cacheSlotName, ':') asSymbol
+		with: {initValue}.
+
+	nilCheck:: UnresolvedSendAST new
+		to: cacheSlot
+		send: #isNil
+		with: {}.
+
+    blockStmts add: assignSlot.
+	block:: BlockAST new
+		body: (CodeBodyAST new
+			parameters: {}
+			temporaries: {}
+			statements: blockStmts).
+
+	if:: UnresolvedSendAST new
+		to: nilCheck
+		send: #ifTrue:
+		with: {block}.
+	return:: ReturnStatAST new expression: cacheSlot.
+    stmts add: if; add: return.
+
+	^MethodAST new
+		pattern: (MessagePatternAST new
+			accessModifier: tree accessModifier;
+			selector: selector
+			parameters: {});
+		body: (CodeBodyAST new
+			parameters: {}
+			temporaries: {}
+			statements: stmts);
+		copyPositionFrom: tree
+)
+public initMethodNameForLazySlotNamed: selector <Symbol> ^ <Symbol> = (
+  ^(selector, '`method') asSymbol
+)
+astForLazySlotInitializer: tree <SlotDefAST> do: astAndSourceBlock <[:MethodAST :String]> = (
+	| 
+    initializer 
+    initMethodName <Symbol>
+    selector <String>
+    messagePattern <MessagePatternAST>
+    body <CodeBodyAST>
+    return <ReturnStatAST>
+    newAST <MethodAST>
+    binding <String> = tree isMutable ifTrue: [' ::= '] ifFalse: [' = '].
+    newSource <String>
+    stmts <List> = List new.  
+    |
+
+
+	selector:: tree name.
+	initializer:: tree initializer.
+
+	initMethodName:: initMethodNameForLazySlotNamed: selector.
+
+	messagePattern:: (MessagePatternAST new
+		selector: initMethodName;
+		accessModifier: #protected;
+		parameters: {}).
+
+	return:: ReturnStatAST new
+		expression: initializer;
+		yourself.
+
+    stmts add: return.
+	body:: (CodeBodyAST new
+		parameters: {}
+		temporaries: {}
+	      statements: stmts).
+
+
+	newAST:: MethodAST new
+		pattern: messagePattern;
+		body: body;
+		copyPositionFrom: tree.
+
+    newSource:: selector, binding, (sourceForNode: initializer).
+	astAndSourceBlock value: newAST value: newSource.
+)
+astForLazySlotSetter: tree <SlotDefAST> = (
+	| cacheSlotName selector assignToSlot newValueParameter parameterName parameter stmts = List new. |
+
+	selector:: tree name asSymbol.
+	cacheSlotName:: slotNameForLazySlotNamed: selector.
+	parameterName:: #p1.
+
+	parameter:: UnresolvedSendAST new
+		to: hereNode
+		send: parameterName
+		with: {}.
+
+	assignToSlot:: UnresolvedSendAST new
+		to: selfNode
+		send: (cacheSlotName, ':') asSymbol
+		with: {parameter}.
+
+    stmts add: assignToSlot.
+	newValueParameter:: VarDeclAST name: parameterName type: nil.
+
+	^MethodAST new
+		pattern: (MessagePatternAST new
+			accessModifier: tree accessModifier;
+			selector: (selector, ':') asSymbol
+			parameters: { newValueParameter});
+		body: (CodeBodyAST new
+			parameters: {newValueParameter}
+			temporaries: {}
+			statements: stmts);
+		copyPositionFrom: tree
+)
+compileLazySlotNoAdd: tree <SlotDefAST> ^ <IntermediateLazySlot> = (
+	| 
+    intermediateLS <IntermediateLazySlot> 
+    treeMainMethod <SlotDefAST>
+    initMethod <IntermediateMethod>  
+    mainMethod <IntermediateMethod>
+    |
+	intermediateLS:: IntermediateLazySlot new.
+
+	(* cache slot is created by IntermediateLazySlot *)
+
+	(* init method *)
+	 astForLazySlotInitializer: tree do:
+		[:treeInitMethod :newSource |
+		initMethod:: compileMethod: treeInitMethod.
+		initMethod isSynthetic: true.
+		intermediateLS intermediateInitMethod: initMethod].
+
+	(* main method  *)
+	treeMainMethod:: astForLazySlotGetter: tree.
+	mainMethod:: compileMethod: treeMainMethod.
+	mainMethod isSynthetic: true.
+	intermediateLS intermediateMainMethod: mainMethod.
+
+	(* setter Method*)
+	tree isMutable ifTrue:
+		[ | treeSetterMethod setterMethod |
+		treeSetterMethod:: astForLazySlotSetter: tree.
+		setterMethod:: compileMethod: treeSetterMethod.
+		setterMethod isSynthetic: true.
+		intermediateLS intermediateSetterMethod: setterMethod].
+
+	^intermediateLS
+)
 ) : (
 )
 class LocalEntry forDeclaration: decl <VarDeclAST> atDepth: d <Integer> = SymbolTableEntry forAST: decl atDepth: d (
@@ -1080,6 +1263,9 @@ public isKindOfMethodBinding ^<Boolean> = (
 	^false
 )
 ) : (
+)
+IntermediateLazySlot = (
+  subclassResponsibility
 )
 ) : (
 )

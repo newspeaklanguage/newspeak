@@ -3382,43 +3382,68 @@ if (Module['preInit']) {
 
   noExitRuntime = true;
 
+/**
+ * Safely downloads a Blob, using showSaveFilePicker (FSAA) if available,
+ * and falling back to the standard <a> tag download otherwise.
+ *
+ * @param {string} fileName - The desired name for the file (e.g., 'ActorsForJs.ns').
+ * @param {Blob} fileBlob - The content to be saved as a Blob object.
+ * @returns {Promise<object>} - A promise that resolves with a success/failure object.
+ */
+async function safeDownloadBlob(fileName, fileBlob) {
+    // 1. Feature Detection: Check if the File System Access API is supported.
+    if ('showSaveFilePicker' in window) {
+        // --- A. USE FILE SYSTEM ACCESS API (for Chrome/Edge/etc.) ---
+        try {
+            const options = { suggestedName: fileName };
+            
+            // 2. Opens the OS Save As dialog (relies on active user gesture)
+            const fileHandle = await window.showSaveFilePicker(options);
 
-async function saveBlobWithSaveFilePicker(fileName, fileBlob) {
-    let fileHandle;
-    let writableStream;
+            // 3. Get the writable stream immediately (maintains transient activation)
+            const writableStream = await fileHandle.createWritable();
 
-    try {
-        // 1. Define options (suggested name)
-        const options = { suggestedName: fileName };
+            try {
+                // 4. Write the content and close
+                await writableStream.write(fileBlob);
+            } finally {
+                await writableStream.close();
+            }
+            
+            return { success: true, method: 'FSAA' };
 
-        // 2. Open OS Save As dialog (MUST be called within user gesture)
-        fileHandle = await window.showSaveFilePicker(options);
+        } catch (error) {
+            // Handle user cancellation (AbortError) or permission issues (NotAllowedError)
+            console.error('FSAA Download failed (may be user cancelled):', error);
+            // Treat user cancellation as a successful skip, otherwise an error.
+            if (error.name === 'AbortError') {
+                return { success: true, method: 'FSAA', message: 'User cancelled save.' };
+            }
+            return { success: false, method: 'FSAA', error: error.name || 'UnknownError' };
+        }
 
-        // **CRUCIAL:** Immediately create the writable stream.
-        // If the browser grants implicit write permission based on the user gesture,
-        // it happens here. We skip the explicit requestPermission() call.
-        writableStream = await fileHandle.createWritable();
-
-        // 3. Write the Blob content
-        await writableStream.write(fileBlob);
-
-        // 4. Close the stream to finalize the file
-        await writableStream.close();
+    } else {
+        // --- B. FALLBACK: USE STANDARD <a> TAG DOWNLOAD (for Firefox/Safari/etc.) ---
         
-        return { success: true };
+        console.warn('FSAA not supported. Falling back to standard download.');
 
-    } catch (error) {
-        // Handle common errors:
-        // - AbortError (User cancelled the dialog)
-        // - NotAllowedError (If implicit permission failed, as you saw)
+        // 2. Create a temporary object URL for the Blob
+        const url = URL.createObjectURL(fileBlob);
         
-        console.error('File saving failed:', error);
+        // 3. Create and click a temporary anchor tag
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = fileName; // This triggers the browser's automatic renaming behavior
+        document.body.appendChild(a);
+        a.click();
         
-        // Return an error object for the Newspeak side to handle
-        return { success: false, error: error.name || 'UnknownError', message: error.message };
+        // 4. Cleanup
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        
+        return { success: true, method: 'Standard', message: 'Standard download started (may be renamed by browser).' };
     }
 }
-
 
 run();
 

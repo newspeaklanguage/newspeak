@@ -3382,6 +3382,44 @@ if (Module['preInit']) {
 
   noExitRuntime = true;
 
+
+async function saveBlobWithSaveFilePicker(fileName, fileBlob) {
+    let fileHandle;
+    let writableStream;
+
+    try {
+        // 1. Define options (suggested name)
+        const options = { suggestedName: fileName };
+
+        // 2. Open OS Save As dialog (MUST be called within user gesture)
+        fileHandle = await window.showSaveFilePicker(options);
+
+        // **CRUCIAL:** Immediately create the writable stream.
+        // If the browser grants implicit write permission based on the user gesture,
+        // it happens here. We skip the explicit requestPermission() call.
+        writableStream = await fileHandle.createWritable();
+
+        // 3. Write the Blob content
+        await writableStream.write(fileBlob);
+
+        // 4. Close the stream to finalize the file
+        await writableStream.close();
+        
+        return { success: true };
+
+    } catch (error) {
+        // Handle common errors:
+        // - AbortError (User cancelled the dialog)
+        // - NotAllowedError (If implicit permission failed, as you saw)
+        
+        console.error('File saving failed:', error);
+        
+        // Return an error object for the Newspeak side to handle
+        return { success: false, error: error.name || 'UnknownError', message: error.message };
+    }
+}
+
+
 run();
 
 

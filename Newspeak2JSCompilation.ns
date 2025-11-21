@@ -38,7 +38,7 @@ A full description of the access control scheme is available at:
 
 https://docs.google.com/document/d/1CHTjsOsamXv9AwGTvkhe871QVY5vpZP9sDfz6I40gaA/
 
-[PERFORMANCE NOTE] It is important that we use legal identifiers for our property names. The earlier NS2JS did not mangle selectors and instead used square bracket notation to access properties. For example, foo at: 1 put: 2 would become foo["#at:put:"](1,2) rather than foo.at$put$(1,2). V8 eagerly transitions objects like these to dictionary mode, which means they do not have fast property access. This is the most important difference between NS2JS and the current system.
+[PERFORMANCE NOTE] It is important that we use legal identifiers for our property names. The earlier NS2JS did not mangle selectors and instead used square bracket notation to access properties. For example, foo at: 1 put: 2 would become foo["#at:put:"](1,2) rather than foo.at$put$(1,2). V8 eagerly transitions objects like these to dictionary mode, which means they do not have fast property access. This is the most important difference between NS2JS and the current system. BUT: THis is not quite accurate. The current system does use array nottaion, even though it uses mangled selectors. Performance is as good as it ever was - so either V8 fixed this, or there is more to be gained.
 
 Non-local return is implemented using exceptions. The body of a method containing an NLR is wrapped in a try-catch block. At the beginning, an object is created to represent the current activation. When there is a non-local return, the return value is assigned to a property of this object and the object is thrown. The catch clause checks if the object thrown corresponds to its NLR object, and if so extracts the value and does a Javascript (local) return. Otherwise the object is re-thrown.
 
@@ -426,10 +426,6 @@ public conditionalNode: node <ConditionalAST> = (
 public enclosingObjectNode: node <EnclosingObjectAST> = (
 	^processOuterReceiverAtDepth: node depth
 )
-public implicitReceiverSendNode: node <ImplicitReceiverSendAST> = (
-	| receiver = processOuterReceiverAtDepth: node depth. |
-	^processLexicalSend: node message to: receiver binding: node binding
-)
 public inlinableAsExpressionConditionalNode: node <InlinableConditionalAST> = (
 	| truePath falsePath condition |
 
@@ -533,10 +529,6 @@ public ordinarySendNode: node <OrdinarySendAST> = (
 		call: (_js propertyOf: (node receiver apply: self) at: (publicMessage: node message))
 		with: (node message arguments collect: [:each | each apply: self]) asArray
 )
-public outerSendNode: node <OuterSendAST> = (
-	| receiver = processOuterReceiverAtDepth: node depth. |
-	^processLexicalSend: node message to: receiver binding: node binding
-)
 public parameterDeclNode: node <ParameterAST> = (
 	^names mangleLocal: node name
 )
@@ -581,10 +573,6 @@ public schedulerNode: node <SchedulerAST> = (
 )
 selfName = (
 	^'self'
-)
-public selfSendNode: node <SelfSendAST> = (
-	| receiver = _js ident: selfName. |
-	^processLexicalSend: node message to: receiver binding: node binding
 )
 public stringNode: node <StringAST> = (
 	^_js literal: node value
@@ -635,22 +623,6 @@ wrapBodyForNlrHandling: body <Block> = (
 wrapBodyNoNlrHandling: body <Block> = (
 	^_js block: maybeCaptureReceiver, body statements
 )
-processLexicalSend: message to: jsReceiver binding: binding = (
-	(binding isNil not and: [binding ast accessModifier = #private]) ifTrue: [
-		(* Do early binding. *)
-		|
-		definingMixinDepth = binding depth - 1.
-		definingMixin = _js ident: '$', definingMixinDepth printString.
-		targetMethod = _js propertyOf: definingMixin at: (publicMessage: message).
-		|
-		^_js call: targetMethod (*(_js propertyOf: targetMethod at: (_js literal: 'call'))*)
-			with: {jsReceiver}, (message arguments collect: [:each | each apply: self]) asArray
-	].
-
-	^_js
-		call: (_js propertyOf: jsReceiver at: (protectedMessage: message))
-		with: (message arguments collect: [:each | each apply: self]) asArray
-)
 processIntrinsic: msg <MessageAST> = (
 	^jsMirror perform: msg selector
 		with: (msg arguments collect: [:arg | processIntrinsicArg: arg]) asArray
@@ -684,6 +656,33 @@ public loopNode: node <LoopAST> = (
 			step: (_js verbatim: '')
 			do: (_js block: body statements, condPrologue)}
 )
+public outerSendNode: node <OuterSendAST> = (
+	| receiver = processOuterReceiverAtDepth: node depth. |
+	^processLexicalSend: node message to: receiver binding: node binding
+)
+public implicitReceiverSendNode: node <ImplicitReceiverSendAST> = (
+	| receiver = processOuterReceiverAtDepth: node depth. |
+	^processLexicalSend: node message to: receiver binding: node binding
+)
+processLexicalSend: message to: jsReceiver binding: binding = (
+	(binding isNil not and: [binding ast accessModifier = #private]) ifTrue: [
+		(* Do early binding. *)
+		|
+		definingMixinDepth = binding depth - 1.
+		definingMixin = _js ident: '$', definingMixinDepth printString.
+		targetMethod = _js propertyOf: definingMixin at: (publicMessage: message).
+		|
+		^_js call: targetMethod (*(_js propertyOf: targetMethod at: (_js literal: 'call'))*)
+			with: {jsReceiver}, (message arguments collect: [:each | each apply: self]) asArray
+	].
+	^_js
+		call: (_js propertyOf: jsReceiver at: (protectedMessage: message))
+		with: (message arguments collect: [:each | each apply: self]) asArray
+)
+public selfSendNode: node <SelfSendAST> = (
+	| receiver = _js ident: selfName. |
+	^processLexicalSend: node message to: receiver binding: node binding
+)
 ) : (
 )
 accessorForNestedClassNamed: simpleName <String> in: mixinName <String> superCall: superAccessor <Node> ^ <String> = (
@@ -716,46 +715,6 @@ accessorForSuperclass: superclassCall <AST> inScope: s <Scope> ^<Node> = (
 
 	translator beginNewTranslationCycle.
 	^send apply: translator
-)
-buildIncrementalScopeFor: mm <MixinMirror> = (
-	| enclosingClass thisClass |
-	enclosingClass:: mm declaration enclosingClass.
-	nil = enclosingClass ifFalse: [buildIncrementalScopeFor: enclosingClass instanceSide].
-
-	thisClass:: ClassEntry
-		forDeclaration: (MessagePatternAST new selector: mm declaration name)
-		atDepth: currentDepth.
-	thisClass enclosingClass: (currentScope at: #'@currentClass' ifAbsent: [nil]).
-
-	pushScope:: Scope parent: currentScope.
-	currentDepth:: currentDepth + 1.
-
-	currentScope at: #'@currentClass' put: thisClass.
-
-	mm slots do:
-		[:s <SlotMirror> |
-		| se = SlotEntry
-			forDeclaration: (MessagePatternAST new selector: s name; accessModifier: s accessModifier)
-			atDepth: currentDepth. |
-		currentScope at: (namer selectorForSlotInitializer: s) put: se.
-		currentScope at: (namer selectorForSlotGetter: s) put: se.
-		s isMutable ifTrue:
-			[currentScope at: (namer selectorForSlotSetter: s) put: se]].
-
-	mm methods do:
-		[:m <MethodMirror> |
-		| me = MethodEntry
-			forDeclaration: (MessagePatternAST new selector: m name; accessModifier: m accessModifier)
-			atDepth: currentDepth. |
-		currentScope at: m name put: me].
-
-	mm nestedClasses do:
-		[:c <ClassDeclarationMirror> |
-		| ce = ClassEntry
-			forDeclaration: (MessagePatternAST new selector: c name; accessModifier: c accessModifier)
-			atDepth: currentDepth. |
-		ce enclosingClass: thisClass.
-		currentScope at: c name put: ce].
 )
 checkForDuplicateNames: aNode = (
 	| namesWithDuplicates names duplicateNames |
@@ -791,29 +750,6 @@ checkForDuplicateNames: aNode = (
 )
 checkForReservedWord: selector = (
 	^super checkForReservedWord: selector
-)
-public compileClassSource: source <String> within: enclosingIR <IntermediateMixin> ^<IntermediateClassDeclaration> = (
-	| tree <AST> intermediate <IntermediateClassDeclaration> |
-	
-	setInput: source.
-	currentScope:: Scope new.
-	currentDepth:: 0.
-	
-	tree:: nil = enclosingIR
-		ifTrue:
-			[parser compilationUnit parseString: source]
-		ifFalse:
-			[buildIncrementalScopeFor: enclosingIR builder.
-			 parser classDecl parseString: source].
-
-	toScope: currentScope addClass: tree.
-
-	(*sentSelectors:: Set new.*)
-	intermediate:: nil = enclosingIR
-		ifTrue: [classNode: tree within: nil]
-		ifFalse: [compileNestedClassAST: tree into: enclosingIR].
-
-	^intermediate
 )
 public compileExpressionSource: expression <String> inMixin: enclosing <MixinMirror> withScope: withScope <Map> ^<MethodIR> = (
 	|
@@ -1289,14 +1225,6 @@ toScope: scope <Scope> addSlot: slotNode <SlotDeclAST> = (
 	slotNode isMutable ifTrue:
 		[scope at: (namer selectorForSlotSetter: slotNode) put: entry].
 )
-toScope: scope <Scope> addLazySlot: slotNode <SlotDefAST> = (
-	| entry = SlotEntry forDeclaration: slotNode atDepth: currentDepth. |
-	checkForReservedWord: slotNode name.
-	scope at: (namer selectorForSlotInitializer: slotNode) put: entry.
-	scope at: (namer selectorForSlotGetter: slotNode) put: entry.
-	slotNode isMutable ifTrue:
-		[scope at: (namer selectorForSlotSetter: slotNode) put: entry].
-)
 public compileLazySlotSource: src <String> within: enclosing <MixinMirror> ^<IntermediateLazySlot> = (
 	| tree <SlotDefAST> |
 
@@ -1314,30 +1242,6 @@ public compileLazySlotSource: src <String> within: enclosing <MixinMirror> ^<Int
 )
 compileMethod: aNode <MethodAST> ^ <IntermediateMethod> = (
 	^methodNode: aNode
-)
-generateLazySlotAccessorsFor: mixinIR <MixinIR> = (
-	mixinIR lazySlots do:
-		[:slotIR | slotIR addMethodsTo: mixinIR methods].
-)
-classNode: aNode <ClassDeclarationAST> within: mixinIR ^ <IntermediateClassDeclaration> = (
-	| ir <IntermediateClassDeclaration> priorMixinUID <String> |
-	aNode name = #Newspeak2JSCompilation ifTrue: [
-		#BOGUS. (* The flaw in the _js intrinsic scheme. *)
-		enableIntrinsics: false].
-	checkForDuplicateNames: aNode.
-	ir:: computeMixinFrom: aNode header within: mixinIR.
-	ir accessModifier: aNode accessModifier.
-	priorMixinUID:: currentMixinUID.
-	currentMixinUID:: ir qualifiedName.
-	currentDepth:: currentDepth + 1.
-	processInstanceSideOf: aNode ofMixin: ir instanceSide.
-	generateSlotAccessorsFor: ir instanceSide.
-    generateLazySlotAccessorsFor: ir instanceSide.
-	(* must be called after nested classes are processed, so all synthetic slots have been added *)
-	processClassSideOf: aNode ofMixin: ir classSide.
-	currentDepth:: currentDepth - 1.
-	currentMixinUID:: priorMixinUID.
-	^ir
 )
 processInstanceSideOf: classNode <ClassDeclarationAST> ofMixin: mixinIR <MixinIR> ^ <Collection[MixinRep]> = (
 	| thisClass <ClassEntry> |
@@ -1363,6 +1267,104 @@ processInstanceSideOf: classNode <ClassDeclarationAST> ofMixin: mixinIR <MixinIR
 )
 public parser = (
   ^outer Newspeak2JSCompilation parser
+)
+classNode: aNode <ClassDeclarationAST> within: mixinIR ^ <IntermediateClassDeclaration> = (
+	| ir <IntermediateClassDeclaration> priorMixinUID <String> |
+	aNode name = #Newspeak2JSCompilation ifTrue: [
+		#BOGUS. (* The flaw in the _js intrinsic scheme. *)
+		enableIntrinsics: false].
+	checkForDuplicateNames: aNode.
+	ir:: computeMixinFrom: aNode header within: mixinIR.
+	ir accessModifier: aNode accessModifier.
+	priorMixinUID:: currentMixinUID.
+	currentMixinUID:: ir qualifiedName.
+	currentDepth:: currentDepth + 1.
+	processInstanceSideOf: aNode ofMixin: ir instanceSide.
+    generateLazySlotAccessorsFor: ir instanceSide. 
+    (* add slot accessors after lazy slot processing, to ensure lazy slot cache accessors are generated *)
+	generateSlotAccessorsFor: ir instanceSide.
+	(* must be called after nested classes are processed, so all synthetic slots have been added *)
+	processClassSideOf: aNode ofMixin: ir classSide.
+	currentDepth:: currentDepth - 1.
+	currentMixinUID:: priorMixinUID.
+	^ir
+)
+generateLazySlotAccessorsFor: mixinIR <MixinIR> = (
+	mixinIR lazySlots do: [:slotIR | 
+      slotIR addMethodsTo: mixinIR methods.
+      slotIR addSlotsInto: mixinIR slots.      
+      ].
+)
+buildIncrementalScopeFor: mm <MixinMirror> = (
+	| enclosingClass thisClass |
+	enclosingClass:: mm declaration enclosingClass.
+	nil = enclosingClass ifFalse: [buildIncrementalScopeFor: enclosingClass instanceSide].
+
+	thisClass:: ClassEntry
+		forDeclaration: (MessagePatternAST new selector: mm declaration name)
+		atDepth: currentDepth.
+	thisClass enclosingClass: (currentScope at: #'@currentClass' ifAbsent: [nil]).
+
+	pushScope:: Scope parent: currentScope.
+	currentDepth:: currentDepth + 1.
+
+	currentScope at: #'@currentClass' put: thisClass.
+
+	mm slots do:
+		[:s <SlotMirror> |
+		| se = SlotEntry
+			forDeclaration: (MessagePatternAST new selector: s name; accessModifier: s accessModifier)
+			atDepth: currentDepth. |
+		currentScope at: (namer selectorForSlotInitializer: s) put: se.
+		currentScope at: (namer selectorForSlotGetter: s) put: se.
+		s isMutable ifTrue:
+			[currentScope at: (namer selectorForSlotSetter: s) put: se]].
+
+	mm methods do:
+		[:m <MethodMirror> |
+		| me = MethodEntry
+			forDeclaration: (MessagePatternAST new selector: m name; accessModifier: m accessModifier)
+			atDepth: currentDepth. |
+		currentScope at: m name put: me].
+
+	mm nestedClasses do:
+		[:c <ClassDeclarationMirror> |
+		| ce = ClassEntry
+			forDeclaration: (MessagePatternAST new selector: c name; accessModifier: c accessModifier)
+			atDepth: currentDepth. |
+		ce enclosingClass: thisClass.
+		currentScope at: c name put: ce].
+)
+toScope: scope <Scope> addLazySlot: slotNode <SlotDefAST> = (
+	| entry = SlotEntry forDeclaration: slotNode atDepth: currentDepth. |
+	checkForReservedWord: slotNode name.
+(*	scope at: (namer selectorForSlotInitializer: slotNode) put: entry. *)
+	scope at: (namer selectorForSlotGetter: slotNode) put: entry.
+	slotNode isMutable ifTrue:
+		[scope at: (namer selectorForSlotSetter: slotNode) put: entry].
+)
+public compileClassSource: source <String> within: enclosingIR <IntermediateMixin> ^<IntermediateClassDeclaration> = (
+	| tree <AST> intermediate <IntermediateClassDeclaration> |
+	
+	setInput: source.
+	currentScope:: Scope new.
+	currentDepth:: 0.
+	
+	tree:: nil = enclosingIR
+		ifTrue:
+			[parser compilationUnit parseString: source]
+		ifFalse:
+			[buildIncrementalScopeFor: enclosingIR builder.
+			 parser classDecl parseString: source].
+
+	toScope: currentScope addClass: tree.
+
+	(*sentSelectors:: Set new.*)
+	intermediate:: nil = enclosingIR
+		ifTrue: [classNode: tree within: nil]
+		ifFalse: [compileNestedClassAST: tree into: enclosingIR].
+
+	^intermediate
 )
 ) : (
 )
@@ -1526,13 +1528,12 @@ public runtimeMixin = (
 		_js assign: (_js propertyOf: (_js ident: 'this') at: (_js literal: 'name')) toBe: (_js literal: qualifiedName).
 		_js assign: (_js propertyOf: (_js ident: 'this') at: (_js literal: 'header')) toBe: (encodeSource: headerSource).
 		_js assign: (_js propertyOf: (_js ident: 'this') at: (_js literal: 'slots')) toBe: slotsMetadata.
-        (* _js assign: (_js propertyOf: (_js ident: 'this') at: (_js literal: 'lazySlots')) toBe: lazySlotsMetadata.*)
+         _js assign: (_js propertyOf: (_js ident: 'this') at: (_js literal: 'lazySlots')) toBe: lazySlotsMetadata.
 		_js assign: (_js propertyOf: (_js ident: 'this') at: (_js literal: 'methods')) toBe: methodsMetadata.
 		_js assign: (_js propertyOf: (_js ident: 'this') at: (_js literal: 'nestedClasses')) toBe: nestedClassesMetadata.
 		_js assign: (_js propertyOf: (_js ident: 'this') at: (_js literal: 'applications')) toBe: (_js array: {}).
 		},
-        (* lazy slot methods processing here? *)
-		(instanceSide methods collect: [:m |
+       (instanceSide methods collect: [:m |
 			_js assign: (_js propertyOf: (_js ident: 'this') at: (_js literal: (names manglePublic: m name))) toBe: m function]),
 		(instanceSide nestedClasses collect: [:ncd |
 			_js assign: (_js propertyOf: (_js ident: 'this') at: (_js literal: (names manglePublic: ncd qualifiedName))) toBe: ncd runtimeMixin]),
@@ -1551,10 +1552,18 @@ basicNew = (
 		_js call: (_js ident: 'superBasicNew.call') with: {_js ident: 'this'}.
 		},
 		(instanceSide slots collect: [:s |
-			_js assign: (_js propertyOf: (_js ident: 'this') at: (_js literal: (names mangleSlot: s name))) toBe: (_js ident: 'nil')]),
-		(instanceSide lazySlots collect: [:s |
-			_js assign: (_js propertyOf: (_js ident: 'this') at: (_js literal: (names mangleSlot: s intermediateSlotDeclaration name))) toBe: (_js ident: 'nil')])            
+			_js assign: (_js propertyOf: (_js ident: 'this') at: (_js literal: (names mangleSlot: s name))) toBe: (_js ident: 'nil')])
 	))
+)
+lazySlotsMetadata = (
+(* Do we need different data then regular slots? In which case, we must define LSM? *)
+	^_js array: (instanceSide lazySlots collect:
+		[:slot | _js new: (_js ident: 'SM') with: {
+			_js literal: slot name.
+			_js literal: slot accessModifier.
+			_js literal: slot isMutable.
+			_js literal: true
+	}]).
 )
 ) : (
 )
@@ -1593,19 +1602,25 @@ public class IntermediateMixin for: d <IntermediateClassDeclaration> isMeta: m <
 public qualifiedName = (
 	^declaration qualifiedName
 )
+public isKindOfIntermediateMixin ^ <Boolean> = (
+  ^true
+)
 ) : (
 )
-public class IntermediateSlotDeclaration named: n mutable: m accessModifier: am = (|
+public class IntermediateSlotDeclaration named: n <Symbol> mutable: m <Boolean> accessModifier: am <Symbol> isSynthetic: s <Boolean> = (|
 	public name = n.
 	public isMutable = m.
 	public accessModifier = am.
-	public isSynthetic ::= false.
+	public isSynthetic ::= s.
 |) (
 public printOn: stm = (
 	stm nextPutAll: 'SlotIR:'.
 	stm nextPutAll: name.
 )
 ) : (
+public named: n <Symbol> mutable: m <Boolean> accessModifier: am <Symbol> = (
+  ^named: n mutable: m accessModifier: am isSynthetic: false
+)
 )
 class NameMangler = (|
 	private specialCharacterManglings = Map new.
@@ -2116,22 +2131,32 @@ public debugInfo ^ <DebugInfo> = (
 (* If we want to debug, we'll be debugging the init expression *)
   ^intermediateInitMethod debugInfo
 )
-public isMutable = (
-	^intermediateSetterMethod isNil not.
-)
 public source = (
 	^intermediateMainMethod source
 )
 public name = (
 	^intermediateMainMethod name.
 )
+public accessModifier ^ <Symbol> = (
+	^intermediateMainMethod accessModifier
+)
+public isMutable ^ <Boolean> = (
+	^intermediateSetterMethod isNil not.
+)
 public intermediateSlotDeclaration = (
 	^IntermediateSlotDeclaration 
-        named: (slotNameForLazySlotNamed: name)
+        named: (class slotNameForLazySlotNamed: name)
 	    mutable: true
 	    accessModifier: #private
+        isSynthetic: true
 )
 ) : (
+public slotNameForLazySlotNamed: selector <Symbol> ^ <Symbol> = (
+  ^(selector, '`cache`slot') asSymbol
+)
+public initMethodNameForLazySlotNamed: selector <Symbol> ^ <Symbol> = (
+  ^(selector, '`method') asSymbol
+)
 )
 ClassEntry = (
 	^super ClassEntry

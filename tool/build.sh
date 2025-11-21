@@ -84,7 +84,6 @@ ${PRIMORDIALSOUP}/out/ReleaseX64/primordialsoup \
     ./*.ns \
     ./*.png \
     RuntimeForHopscotchForHTML HopscotchWebIDE HopscotchWebIDE.vfuel \
-    RuntimeForElectron HopscotchWebIDE HopscotchElectronIDE.vfuel \
     RuntimeForHopscotchForHTML Ampleforth Ampleforth.vfuel  \
     RuntimeForHopscotchForHTML AmpleforthViewer AmpleforthViewer.vfuel  \
     RuntimeForCroquet CounterApp CroquetCounterApp.vfuel \

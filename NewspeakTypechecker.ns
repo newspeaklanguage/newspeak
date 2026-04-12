@@ -147,6 +147,7 @@ dependentQueries <Map[Declaration, Set[Query]]> = Map new.
 cachedTypes <Map[Query, Type]> = Map new.
 superclassTable <Map[Mixin, Mixin]> = Map new.
 cycle = Object new.
+resolvingSignatures <Set[MethodMirror]> = Set new.
 |
 superclassTable at: klassMixin put: objectMixin.
 (* Pre-populate superclass table for built-in types to avoid cycle detection *)
@@ -833,17 +834,31 @@ public typeIdNode: node <TypeIdAST> ^ <ObjectType> = (
 	].
       m isKindOfMethodMirror ifTrue: [
 	  | returnType |
-	  s:: signatureFor: m.
-	  returnType:: s returnType.
-	  returnType = nil ifTrue: [returnType:: TypeIdAST new name: #Self].
-	  ^returnType apply: self
+	  (* Detect cycles when resolving method return types *)
+	  (resolvingSignatures includes: m) ifTrue: [
+	    (* Return error type to break the cycle *)
+	    ^errorType
+	  ].
+	  resolvingSignatures add: m.
+	  [
+	    s:: signatureFor: m.
+	    returnType:: s returnType.
+	    returnType = nil ifTrue: [returnType:: TypeIdAST new name: #Self].
+	    returnType:: returnType apply: self.
+	  ] ensure: [resolvingSignatures remove: m].
+	  ^returnType
 	].
+      (* If m is nil or unrecognized type, return error type *)
+      ^errorType
 )
 public unaryTypeOpNode: node <UnaryTypeOpAST> ^ <ObjectType> = (
       |
       operand <ObjectType> = node operand apply: self.
       m <MixinMirror | MethodMirror | ClassDeclarationMirror | SlotDeclarationMirror | TypeVariable | Nil>
       |
+      (* Handle error types gracefully *)
+      operand isKindOfErrorType ifTrue: [^errorType].
+
       node operator = #class ifTrue: [
 	  ^ObjectType forMixin: (operand mixin declaration classSide)
 	].
@@ -966,7 +981,7 @@ computeSuperclassOf: klass <MixinMirror> ^ <MixinMirror | Nil> = (
 	|
 	header = klass declaration header.
 	headerAst = parser parseClassHeader: header source.
-	superclassClause <SendAST> = headerAst superConstructorCall.
+	superclassClause <SendAST> = headerAst superclassCall.
 	superclassClauseType <ObjectType>
 	enclosing <MixinMirror | Nil> = klass enclosingMixin.
 	result
@@ -1384,7 +1399,17 @@ public typecheckMethodSource: src <String> ofClass: c <Class> ^ <Set[TypeError]>
 	^typecheckMethod: m ofClass: c.
 )
 public unresolvedSendNode: node <UnresolvedSendAST> ^ <ObjectType> = (
-	| functionType <FunctionType> domain <List[ObjectType]> argASTs <List[ExpressionAST]> args <List[ObjectType]> |
+	| functionType <FunctionType> domain <List[ObjectType]> argASTs <List[ExpressionAST]> args <List[ObjectType]> selector <Symbol> localType receiverType |
+
+(* Check if this is an unqualified send that could be a variable reference *)
+selector:: node message selector.
+receiverType:: node receiver apply: self.
+(* If receiver is self/here (SelfType, HereType, or TypeVariable named Self) and message has no arguments, check if it's a local variable *)
+((receiverType isKindOfSelfType or: [receiverType isKindOfHereType or: [receiverType isKindOfTypeVariable and: [receiverType name = #Self]]])
+ and: [node message arguments isEmpty]) ifTrue: [
+	localType:: typeOfLocal: selector.
+	localType isNil ifFalse: [^localType]
+].
 
 functionType:: functionTypeOf: node.
 domain:: functionType domain.
@@ -1399,7 +1424,11 @@ args:: node message apply: self.
 ^functionType range.
 )
 public varDeclNode: node = (
-	^currentScope at: node name put: (node type apply: typeBuilder).
+	| resolvedType |
+	node type isNil
+		ifTrue: [^currentScope at: node name put: errorType]
+		ifFalse: [resolvedType:: (node type apply: typeBuilder)].
+	^currentScope at: node name put: resolvedType.
 )
 public parameterDeclNode: node = (
 	(* Parameters are added to scope just like variable declarations *)
@@ -1426,6 +1455,7 @@ type: selector <Symbol> at: mixin <MixinMirror>
   selector = #Number ifTrue: [^numberMixin].
   selector = #Integer ifTrue: [^integerMixin].
   selector = #String ifTrue: [^stringMixin].
+  selector = #_Object ifTrue: [^objectMixin].
   selector = #_Array ifTrue: [^arrayMixin].
   result:: hereMember: selector in: mixin.
   result ~= nil ifTrue: [^result].

@@ -25,8 +25,22 @@ additionalNs="$*"
 . ${EMSDK}/emsdk_env.sh
 
 # 4. Build primordialsoup from it's directory.
-cd ${PRIMORDIALSOUP} || exit 1 
+cd ${PRIMORDIALSOUP} || exit 1
 ./build os=emscripten arch=wasm
+
+# 4a. Build NewspeakParser.vfuel for parse-validate.sh script
+./out/ReleaseX64/primordialsoup \
+  ./out/snapshots/WebCompiler.vfuel \
+  ./newspeak/*.ns \
+  ${NEWSPEAK}/NewspeakParser.ns \
+  RuntimeWithMirrorsForPrimordialSoup NewspeakParser ./out/snapshots/NewspeakParser.vfuel
+
+# 4b. Build NewspeakTestRunner.vfuel for run-tests.sh script
+./out/ReleaseX64/primordialsoup \
+  ./out/snapshots/WebCompiler.vfuel \
+  ./newspeak/*.ns \
+  ${NEWSPEAK}/NewspeakTestRunner.ns \
+  RuntimeWithMirrorsForPrimordialSoup NewspeakTestRunner ./out/snapshots/NewspeakTestRunner.vfuel
 
 # Back to 'newspeak'.
 cd ${NEWSPEAK} || exit 1
@@ -36,7 +50,7 @@ cd ${NEWSPEAK} || exit 1
 #   - All primordialsoup built snapshots of vfuel files such as WebCompiler.vfuel
 #   - Note that primordialsoup.* have a copy in primordialsoup repo and multiple
 #     copies in the newspeak repo. Deployments use the versions from the primordialsoup repo.
-mkdir --parent out
+mkdir -p out
 cp ${PRIMORDIALSOUP}/out/ReleaseEmscriptenWASM/primordialsoup.* out
 cp ${PRIMORDIALSOUP}/out/snapshots/*.vfuel out
 # 6. Copy Psoup Newspeak code
@@ -98,7 +112,6 @@ ${PRIMORDIALSOUP}/out/ReleaseX64/primordialsoup \
     RuntimeForHopscotchForHTML HopscotchGestureDemo HopscotchGestureDemo.vfuel \
     RuntimeForHopscotchForHTML HopscotchDemo HopscotchDemo.vfuel \
     RuntimeForHopscotchForHTML Particles Particles.vfuel \
-    RuntimeForHopscotchForHTML CheckedItemApp CheckedItemApp.vfuel \
     "$additionalNs"
 
 cd ${NEWSPEAK}/tool || exit 1

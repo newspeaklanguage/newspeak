@@ -121,6 +121,7 @@ parser <NewspeakParsing Parser> = p mirrors compiler parser.
 namespace <Map[Symbol, Object]> = ns.
 trail <Map[SubtypeQuery, Boolean]> = Map new.
 scopeStack <List[Scope]> = List new.
+mutableSlotsStack <List[Set[Symbol]]> = List new.
 typeBuilder <TypeBuilder>
 currentClass <MixinMirror>
 currentTopLevelClass <ClassDeclarationMirror>
@@ -517,7 +518,7 @@ signatureForSlot: m <SlotDeclarationMirror> withSelector: selector <Symbol> ^ <M
 	| ast <SlotDefAST> = parser parseSlotDeclaration: m source. slotType <AST> params |
 	slotType:: ast slotDecl type.
 	(* If no type annotation, leave slotType as nil - it will be handled by type inference *)
-	params:: ((selector last asString) = ':'
+	params:: (selector last = ':' last
 		ifTrue: [{VarDeclAST name: m name type: slotType}]
 		ifFalse: [{}]).
 	^MessagePatternAST new
@@ -529,6 +530,9 @@ signatureForSlot: m <SlotDeclarationMirror> withSelector: selector <Symbol> ^ <M
 )
 public subtypeOf: t <Type> ^ <Boolean> = (
 	| ot <ObjectType> sc <MixinMirror | Nil> |
+	(* nil is a subtype of all reference types *)
+	(mixin = nilMixin and: [t isKindOfObjectType]) ifTrue: [^true].
+
 	t = errorType ifTrue: [^true].
 	t isKindOfObjectType ifFalse: [^false] ifTrue: [ot:: t].
 
@@ -1046,6 +1050,10 @@ currentConflictNamespaceHasEntryFor: typeName <Symbol> = (
 	namespace at: (currentTopLevelClass simpleName, ' conflicts') asSymbol ifAbsent: [^false].
 	^true
 )
+currentMutableSlots ^ <Set[Symbol]> = (
+	mutableSlotsStack isEmpty ifTrue: [^Set new].
+	^mutableSlotsStack last
+)
 currentScope ^ <Scope> = (
 	^scopeStack last
 )
@@ -1270,6 +1278,7 @@ public numberNode: node = (
 	^literal: #Number
 )
 popScope ^ <Scope> = (
+	mutableSlotsStack removeLast.
 	^scopeStack removeLast
 )
 publicMember: selector <Symbol> at: mixin <MixinMirror> ^ <MethodMirror | ClassDeclarationMirror | SlotDeclarationMirror | Nil> = (
@@ -1279,7 +1288,8 @@ publicMember: selector <Symbol> at: mixin <MixinMirror> ^ <MethodMirror | ClassD
   ^inheritedPublicMember: selector in: (superclassOf: mixin)
 )
 pushScope: scope <Scope> = (
-	scopeStack addLast: scope
+	scopeStack addLast: scope.
+	mutableSlotsStack addLast: Set new
 )
 registerDependenciesOfQuery: q <Query> = (
 	(dependentDeclarations at: q ifAbsent: [dependentDeclarations at: q put: Set new]) add: currentDeclaration.
@@ -1318,7 +1328,7 @@ setClass: klass <MixinMirror> = (
 	typeBuilder:: TypeBuilder forTypesIn: klass.
 )
 public setterSendNode: node <SetterSendAST> ^ <Type> = (
-	| valueType <ObjectType> receiverType <ObjectType> selector <Symbol> setterType |
+	| valueType <ObjectType> receiverType <ObjectType> selector <Symbol> setterType slotName <Symbol> localType |
 
 	(* Type check the value being assigned *)
 	valueType:: (node message arguments first) apply: self.
@@ -1326,8 +1336,29 @@ public setterSendNode: node <SetterSendAST> ^ <Type> = (
 	(* Get the receiver type *)
 	receiverType:: node receiver apply: self.
 
-	(* Get the setter method signature *)
+	(* Get the setter selector *)
 	selector:: node message selector.
+
+	(* Check if this is setting a local slot *)
+	(* For setter sends on implicit receiver (self/here), check locals first *)
+	(receiverType isKindOfSelfType or: [receiverType isKindOfHereType]) ifTrue: [
+		(* Extract the slot name from the setter selector (e.g., x: -> x) *)
+		slotName:: (selector asString copyFrom: 1 to: selector asString size - 1) asSymbol.
+		localType:: typeOfLocal: slotName.
+		localType isNil ifFalse: [
+			(* Found a local variable - check if it's mutable *)
+			(currentMutableSlots includes: slotName) ifFalse: [
+				error: 'Cannot reassign immutable local slot ', slotName at: {node start. node end}.
+				^valueType
+			].
+			(* Check type compatibility *)
+			(type: valueType isSubtypeOf: localType)
+				ifFalse: [error: 'Value type does not match local slot type' at: {node start. node end}].
+			^valueType
+		]
+	].
+
+	(* Not a local slot - look up as a method *)
 	setterType:: receiverType at: selector.
 
 	(* Handle error types - report appropriate errors *)
@@ -1361,6 +1392,11 @@ public slotDefNode: node <SlotDefAST> ^ <ObjectType> = (
 
 	(* Add the slot to the current scope *)
 	currentScope at: node name put: declaredType.
+
+	(* Track if this is a mutable slot *)
+	node isMutable ifTrue: [
+		currentMutableSlots add: node name
+	].
 
 	^declaredType
 )
@@ -1449,7 +1485,7 @@ typeOfOuter ^ <ObjectType> = (
 	^OuterType forMixin: currentClass
 )
 typeOfSelf ^ <ObjectType> = (
-	| currentType <ObjectType> = SelfType forMixin: currentClass. |
+	| currentType <ObjectType> = ObjectType forMixin: currentClass. |
 	^TypeVariable named: #Self bound: currentType forType: currentType.
 )
 typeOfSuper ^ <ObjectType> = (
@@ -1466,9 +1502,15 @@ public unresolvedSendNode: node <UnresolvedSendAST> ^ <ObjectType> = (
 (* Check if this is an unqualified send that could be a variable reference *)
 selector:: node message selector.
 receiverType:: node receiver apply: self.
-(* If receiver is self/here (SelfType, HereType, or TypeVariable named Self) and message has no arguments, check if it's a local variable *)
+
+(* Handle pseudo-variables nil, true, false *)
 ((receiverType isKindOfSelfType or: [receiverType isKindOfHereType or: [receiverType isKindOfTypeVariable and: [receiverType name = #Self]]])
  and: [node message arguments isEmpty]) ifTrue: [
+	selector = #nil ifTrue: [^ObjectType forMixin: nilMixin].
+	selector = #true ifTrue: [^ObjectType forMixin: boolMixin].
+	selector = #false ifTrue: [^ObjectType forMixin: boolMixin].
+
+	(* Check if it's a local variable *)
 	localType:: typeOfLocal: selector.
 	localType isNil ifFalse: [^localType]
 ].
@@ -1497,12 +1539,15 @@ public parameterDeclNode: node = (
 	^currentScope at: node name put: (node type apply: typeBuilder).
 )
 public variableNode: node <VariableAST> ^ <ObjectType> = (
-	(* need to deal with #'@here', #self, #super, #outer, and local variables/parameters *)
+	(* need to deal with #'@here', #self, #super, #outer, #nil, #true, #false, and local variables/parameters *)
 	| varName <Symbol> = node name. localType |
 	varName = #'@here' ifTrue: [^typeOfHere].
-	varName = #self ifTrue: [^typeOfSelf].
+	varName = #self ifTrue: [^SelfType forMixin: currentClass].
 	varName = #super ifTrue: [^typeOfSuper].
 	varName = #outer ifTrue: [^typeOfOuter].
+	varName = #nil ifTrue: [^ObjectType forMixin: nilMixin].
+	varName = #true ifTrue: [^ObjectType forMixin: boolMixin].
+	varName = #false ifTrue: [^ObjectType forMixin: boolMixin].
 	(* Check if it's a local variable or parameter *)
 	localType:: typeOfLocal: varName.
 	nil ~= localType ifTrue: [^localType].

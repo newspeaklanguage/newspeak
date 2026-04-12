@@ -437,10 +437,30 @@ signatureFor: m <Mirror> withSelector: selector <Symbol> ^ <MessagePatternAST> =
 			parser parseMethodHeader: m source. (* parse the method header *)
 		]
 		] ifFalse: [
-		m isKindOfSlotDeclarationMirror
-			ifTrue: [signatureForSlot: m withSelector: selector]
-			ifFalse: [signatureForNestedClass: m]
+		m isKindOfSlotDeclarationMirror ifTrue: [
+			signatureForSlot: m withSelector: selector
+		] ifFalse: [
+			m isKindOfMixinMirror ifTrue: [
+				signatureForMixin: m
+			] ifFalse: [
+				signatureForNestedClass: m
+			]
+		]
 		].
+)
+signatureForMixin: m <MixinMirror> ^ <MessagePatternAST> = (
+	(* When a mixin is accessed as a member, it returns the class type *)
+	| classType <UnaryTypeOpAST> |
+	classType:: UnaryTypeOpAST new
+		operand: (TypeIdAST new name: m name; yourself);
+		operator: #class;
+		yourself.
+	^MessagePatternAST new
+		selector: m name;
+		parameters: {};
+		returnType: classType;
+		accessModifier: #public;  (* Mixins don't have access modifiers, assume public *)
+		yourself
 )
 signatureForNestedClass: m <ClassDeclarationMirror> ^ <MessagePatternAST> = (
 	| classType <UnaryTypeOpAST> |
@@ -459,7 +479,10 @@ signatureForSyntheticPrimaryFactory: m <MethodMirror> withSelector: selector <Sy
 	(* Synthetic primary factory methods have no source, so we create the signature programmatically *)
 	| mixin <MixinMirror> instanceClassName <Symbol> returnType <TypeIdAST> params <List> paramCount <Integer> |
 	mixin:: m definingMixin.
-	instanceClassName:: mixin declaration instanceSide name.
+	(* If the mixin is already the instance side, use its name directly *)
+	instanceClassName:: mixin isMeta
+		ifTrue: [mixin declaration instanceSide name]
+		ifFalse: [mixin name].
 	returnType:: TypeIdAST new name: instanceClassName; yourself.
 
 	(* Determine parameter count based on selector type:
@@ -602,7 +625,7 @@ public at: selector <Symbol> ^ <FunctionType> = (
  | result <Mirror> signature <MessagePatternAST> |
       result:: selfMember: selector at: mixin.
       result = nil ifTrue: [^errorTypeForSelector: selector].
-	signature:: signatureFor: m withSelector: selector.
+	signature:: signatureFor: result withSelector: selector.
 	 (* deal with substitution of Self, Instance? *)
 	^((signature apply: selfSubstitution) apply: myTypeBuilder) asFunctionType (* and build a function type *)
 )
@@ -1294,13 +1317,52 @@ setClass: klass <MixinMirror> = (
 	currentClass:: klass.
 	typeBuilder:: TypeBuilder forTypesIn: klass.
 )
-public setterSendNode: node ^ <Type> = (
-	| etype <ObjectType> |
+public setterSendNode: node <SetterSendAST> ^ <Type> = (
+	| valueType <ObjectType> receiverType <ObjectType> selector <Symbol> setterType |
 
-	etype:: node expr apply: self.
-	(type: etype isSubtypeOf: (node var type apply: self))
-	ifFalse: [error: etype name, ' is not a subtype of ', node var type name at: {node start. node end}].
-	^etype
+	(* Type check the value being assigned *)
+	valueType:: (node message arguments first) apply: self.
+
+	(* Get the receiver type *)
+	receiverType:: node receiver apply: self.
+
+	(* Get the setter method signature *)
+	selector:: node message selector.
+	setterType:: receiverType at: selector.
+
+	(* Handle error types - report appropriate errors *)
+	setterType isKindOfAccessErrorType ifTrue: [
+		error: selector, ' is defined, but is not accessible' at: {node start. node end}
+	] ifFalse: [
+		setterType isKindOfErrorType ifTrue: [
+			error: selector, ' is not defined on type ', receiverType name at: {node start. node end}
+		] ifFalse: [
+			(* Check that the value type matches the parameter type *)
+			(type: valueType isSubtypeOf: (setterType domain first))
+				ifFalse: [error: 'Value type does not match setter parameter type' at: {node start. node end}].
+		].
+	].
+
+	^valueType
+)
+public slotDefNode: node <SlotDefAST> ^ <ObjectType> = (
+	| declaredType <ObjectType> initializerType <ObjectType> |
+	(* Get the declared type of the slot *)
+	declaredType:: node type isNil
+		ifTrue: [errorType]
+		ifFalse: [node type apply: typeBuilder].
+
+	(* Type check the initializer if present *)
+	node initializer isNil ifFalse: [
+		initializerType:: node initializer apply: self.
+		(type: initializerType isSubtypeOf: declaredType)
+			ifFalse: [error: 'Initializer type does not match slot type' at: {node start. node end}].
+	].
+
+	(* Add the slot to the current scope *)
+	currentScope at: node name put: declaredType.
+
+	^declaredType
 )
 signatureFor: m <Mirror> ^ <MessagePatternAST | TypeIdAST | AST | Nil> = (
 (* Ugly.  This a case where Felix's pattern matching work would be nice *)
@@ -1391,7 +1453,7 @@ typeOfSelf ^ <ObjectType> = (
 	^TypeVariable named: #Self bound: currentType forType: currentType.
 )
 typeOfSuper ^ <ObjectType> = (
-	^SuperType forMixin: currentClass  superclass mixin: (superclassOf: currentClass)
+	^SuperType forMixin: currentClass
 )
 public typecheckMethodSource: src <String> ofClass: c <Class> ^ <Set[TypeError]> = (
 	| m <MethodAST> |
@@ -1452,9 +1514,12 @@ type: selector <Symbol> at: mixin <MixinMirror>
 
   selector = #Self ifTrue: [^typeOfSelf].
   selector = #Nil ifTrue: [^nilMixin].
+  selector = #UndefinedObject ifTrue: [^nilMixin].  (* UndefinedObject is synonym for Nil *)
+  selector = #Boolean ifTrue: [^boolMixin].
   selector = #Number ifTrue: [^numberMixin].
   selector = #Integer ifTrue: [^integerMixin].
   selector = #String ifTrue: [^stringMixin].
+  selector = #Symbol ifTrue: [^stringMixin].  (* Symbol is synonym for String *)
   selector = #_Object ifTrue: [^objectMixin].
   selector = #_Array ifTrue: [^arrayMixin].
   result:: hereMember: selector in: mixin.
@@ -1494,7 +1559,7 @@ public typecheckMethod: m <MethodAST> ofClass: c <Class> ^ <Set[TypeError]> = (
 	^errorSet
 )
 localMember: selector <Symbol> in: mixin <MixinMirror> ^ <MethodMirror | ClassDeclarationMirror | SlotDeclarationMirror | Nil> = (
-| result <Mirror> |
+| result <Mirror> selectorString <String> slotName <Symbol> |
 	mixin = nil ifTrue: [^nil].
 	(* ('searching for local member ', selector, ' in: ') out.
 	mixin out. *)
@@ -1506,8 +1571,10 @@ localMember: selector <Symbol> in: mixin <MixinMirror> ^ <MethodMirror | ClassDe
 		].
 	].
 	selector last = ':' last ifTrue: [
-			result:: mixin slots findMirrorNamed: selector allButLast asSymbol.
 			(* assume it's a setter and look for its slot *)
+			selectorString:: selector asString.
+			slotName:: (selectorString copyFrom: 1 to: selectorString size - 1) asSymbol.
+			result:: mixin slots findMirrorNamed: slotName.
 			(result ~= nil and: [result isMutable]) ifTrue: [(* 'found: ' out. result out. *) ^result]
 			] ifFalse: [
 				result:: mixin nestedClasses findMirrorNamed: selector.

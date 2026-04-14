@@ -136,6 +136,7 @@ nilMixin <MixinMirror> = ((kernelMixin nestedClasses findMirrorNamed: #Undefined
 boolMixin <MixinMirror> = ((kernelMixin nestedClasses findMirrorNamed: #Boolean) instanceSide).
 numberMixin <MixinMirror> = ((kernelMixin nestedClasses findMirrorNamed: #Number) instanceSide).
 integerMixin <MixinMirror> = ((kernelMixin nestedClasses findMirrorNamed: #Integer) instanceSide).
+floatMixin <MixinMirror> = ((kernelMixin nestedClasses findMirrorNamed: #Float) instanceSide).
 stringMixin <MixinMirror> = ((kernelMixin nestedClasses findMirrorNamed: #String) instanceSide).
 collectionMixin <MixinMirror> = ((kernelMixin nestedClasses findMirrorNamed: #Collection) instanceSide).
 closureMixin <MixinMirror> = ((kernelMixin nestedClasses findMirrorNamed: #Closure) instanceSide).
@@ -158,6 +159,7 @@ superclassTable at: nilMixin put: objectMixin.
 superclassTable at: boolMixin put: objectMixin.
 superclassTable at: numberMixin put: objectMixin.
 superclassTable at: integerMixin put: numberMixin.
+superclassTable at: floatMixin put: numberMixin.
 superclassTable at: stringMixin put: objectMixin.
 superclassTable at: collectionMixin put: objectMixin.
 (* Initialize arrayMixin - find _Array in KernelForPrimordialSoup's nested classes *)
@@ -175,16 +177,27 @@ public isKindOfAccessErrorType ^ <Boolean> = (
 ) : (
 )
 class BottomType = Type (
-(* The bottom of the type lattice. *)
+(* The bottom of the type lattice. Since bottom is a subtype of all types,
+   any operation on it is valid and also returns bottom. *)
 ) (
 public apply: v  = (
   ^v bottomType: self
 )
-public asFunctionType ^ <FunctionType> = (
-  ^FunctionType domain: List new range: self
+public asFunctionType = (
+  ^self
+)
+public at: o = (
+	(* One can ask a bottom type for the type of any selector, or for the type of the nth argument for any n *)
+	^self
+)
+public domain = (
+	^self
 )
 public mixin = (
 	^objectMixin
+)
+public range = (
+	^self
 )
 public subtypeOf: t <Type> ^ <Boolean> = (
 	^true
@@ -286,7 +299,18 @@ public apply: v = (
   ^v genericType: self
 )
 public at: selector <Symbol> ^ <FunctionType> = (
-	halt.
+	(* For generic types like Array<T>, handle method lookup with type substitution *)
+
+	(* Special case for at: method - return the element type *)
+	selector = #'at:' ifTrue: [
+		typeArguments isEmpty ifFalse: [
+			(* For Array<T>, at: should return T *)
+			^FunctionType domain: {ObjectType forMixin: integerMixin} range: (typeArguments first)
+		]
+	].
+
+	(* Otherwise delegate to base type *)
+	^generic at: selector
 )
 public hash ^ <Integer> = (
 	^(mixin hash bitXor: class hash) bitXor: typeArguments hash
@@ -309,7 +333,219 @@ public printOn: s = (
 	s nextPut: ']'.
 )
 public subtypeOf: t <Type> ^ <Boolean> = (
-	halt.
+	(* Generic types are subtypes if:
+	   1. They have the same generic base and covariant type arguments
+	   2. The base type relationship holds *)
+
+	(* If t is also a GenericType with the same base *)
+	t isKindOfGenericType ifTrue: [
+		| tGen = t. |
+		(* Check if same generic base *)
+		(generic mixin = tGen generic mixin) ifTrue: [
+			(* Check covariance of type arguments *)
+			typeArguments size = tGen typeArguments size ifFalse: [^false].
+			1 to: typeArguments size do: [:i |
+				((typeArguments at: i) subtypeOf: (tGen typeArguments at: i))
+					ifFalse: [^false]].
+			^true
+		]
+	].
+
+	(* Otherwise, delegate to base ObjectType subtyping *)
+	^(ObjectType forMixin: mixin) subtypeOf: t
+)
+) : (
+)
+class TupleType elementTypes: ets <List[ObjectType]> arrayType: at <GenericType> = ObjectType forMixin: at generic mixin (
+(* A tuple type with position-specific element types, e.g., {Number. String. Boolean}.
+   Tuples are subtypes of arrays with the union of their element types. *)
+|
+	public elementTypes <List[ObjectType]> = ets.
+	public arrayType <GenericType> = at.
+|) (
+public = o = (
+	o isKindOfTupleType ifFalse: [^false].
+	elementTypes size = o elementTypes size ifFalse: [^false].
+	1 to: elementTypes size do: [:i |
+		(elementTypes at: i) = (o elementTypes at: i) ifFalse: [^false]].
+	^true
+)
+public apply: v = (
+	^v tupleType: self
+)
+public at: selector <Symbol> ^ <FunctionType> = (
+	(* Override to provide position-specific types for at: method *)
+
+	(* For at: method, return a function that takes Integer and returns union of element types.
+	   Special handling for literal indices is done in unresolvedSendNode: *)
+	selector = #'at:' ifTrue: [
+		| unionOfElements <ObjectType> |
+		unionOfElements:: elementTypes size = 1
+			ifTrue: [elementTypes first]
+			ifFalse: [UnionType unifying: elementTypes].
+		^FunctionType domain: {ObjectType forMixin: integerMixin} range: unionOfElements
+	].
+
+	(* For other methods, delegate to the array type *)
+	^arrayType at: selector
+)
+public hash ^ <Integer> = (
+	| h |
+	h:: mixin hash.
+	elementTypes do: [:et | h:: h bitXor: et hash].
+	^h
+)
+public isKindOfTupleType ^ <Boolean> = (
+	^true
+)
+public isKindOfObjectType ^ <Boolean> = (
+	^false
+)
+public printOn: s = (
+	s nextPutAll: '{'.
+	elementTypes do: [:et <ObjectType> | s nextPutAll: et printString]
+	           separatedBy: [s nextPutAll: '. '].
+	s nextPut: '}'.
+)
+public subtypeOf: t <Type> ^ <Boolean> = (
+	(* Tuple types are subtypes of:
+	   1. Other tuple types with covariant element types (same arity)
+	   2. The array type with union of element types *)
+
+	(* Check if subtype of another tuple type *)
+	t isKindOfTupleType ifTrue: [
+		| tTuple = t. |
+		elementTypes size = tTuple elementTypes size ifFalse: [^false].
+		1 to: elementTypes size do: [:i |
+			((elementTypes at: i) subtypeOf: (tTuple elementTypes at: i))
+				ifFalse: [^false]].
+		^true
+	].
+
+	(* Check if subtype of the array type with union *)
+	^arrayType subtypeOf: t
+)
+) : (
+)
+class ClosureType parameterTypes: pts <List[ObjectType]> returnType: rt <ObjectType> = ObjectType forMixin: closureMixin (
+(* A closure/block type with accurate typing for value* methods.
+   Intercepts member lookup to provide precise types for value, value:, value:value:, etc. *)
+|
+	public parameterTypes <List[ObjectType]> = pts.
+	public returnType <ObjectType> = rt.
+|) (
+public = o = (
+	o isKindOfClosureType ifFalse: [^false].
+	parameterTypes size = o parameterTypes size ifFalse: [^false].
+	1 to: parameterTypes size do: [:i |
+		(parameterTypes at: i) = (o parameterTypes at: i) ifFalse: [^false]].
+	^returnType = o returnType
+)
+public apply: v = (
+	^v closureType: self
+)
+public at: selector <Symbol> ^ <FunctionType> = (
+	(* Intercept member lookup for value* methods to provide accurate types *)
+
+	(* Check for value (0-arg) *)
+	selector = #value ifTrue: [
+		parameterTypes isEmpty ifFalse: [^errorTypeForSelector: selector].
+		^FunctionType domain: {} range: returnType
+	].
+
+	(* Check for valueWithArguments: which takes a tuple *)
+	selector = #'valueWithArguments:' ifTrue: [
+		| tupleType |
+		tupleType:: parameterTypes isEmpty
+			ifTrue: [ObjectType forMixin: arrayMixin]
+			ifFalse: [
+				| sqActual arrayGenericType |
+				sqActual:: UnionType unifying: parameterTypes.
+				arrayGenericType:: GenericType generic: (ObjectType forMixin: arrayMixin) typeArguments: {sqActual}.
+				TupleType elementTypes: parameterTypes arrayType: arrayGenericType
+			].
+		^FunctionType domain: {tupleType} range: returnType
+	].
+
+	(* Check for value:, value:value:, etc. pattern *)
+	(isValueColonPattern: selector) ifTrue: [
+		| arity |
+		arity:: colonCount: selector.
+		arity = parameterTypes size ifFalse: [^errorTypeForSelector: selector].
+		^FunctionType domain: parameterTypes range: returnType
+	].
+
+	(* For other methods, delegate to parent ObjectType *)
+	^super at: selector
+)
+colonCount: selector <Symbol> ^ <Integer> = (
+	(* Count the number of colons in a selector *)
+	| count pos |
+	count:: 0.
+	pos:: 1.
+	[(pos:: selector indexOf: ':' startingAt: pos) > 0] whileTrue: [
+		count:: count + 1.
+		pos:: pos + 1
+	].
+	^count
+)
+public hash ^ <Integer> = (
+	| h |
+	h:: closureMixin hash.
+	parameterTypes do: [:pt | h:: h bitXor: pt hash].
+	h:: h bitXor: returnType hash.
+	^h
+)
+public isKindOfClosureType ^ <Boolean> = (
+	^true
+)
+public isKindOfObjectType ^ <Boolean> = (
+	^false
+)
+isValueColonPattern: selector <Symbol> ^ <Boolean> = (
+	(* Check if selector matches value:, value:value:, value:value:value:, etc. *)
+	| colonCount |
+	colonCount:: self colonCount: selector.
+	colonCount = 0 ifTrue: [^false]. (* Already handled value *)
+
+	(* Check if it's exactly "value:" repeated colonCount times *)
+	^selector = (valueColonRepeated: colonCount)
+)
+public printOn: s = (
+	s nextPut: '['.
+	parameterTypes do: [:pt <ObjectType> | s nextPutAll: pt printString]
+	           separatedBy: [s nextPutAll: ', '].
+	parameterTypes isEmpty ifFalse: [s nextPutAll: ' | '].
+	s nextPutAll: returnType printString.
+	s nextPut: ']'.
+)
+public subtypeOf: t <Type> ^ <Boolean> = (
+	(* Closure types use structural subtyping with contravariant parameters and covariant return types *)
+	| tClosure <ClosureType> |
+
+	t = errorType ifTrue: [^true].
+	t isKindOfClosureType ifFalse: [^super subtypeOf: t].
+
+	tClosure:: t.
+
+	(* Check parameter count matches *)
+	parameterTypes size = tClosure parameterTypes size ifFalse: [^false].
+
+	(* Check parameters (contravariant) *)
+	1 to: parameterTypes size do: [:i |
+		((tClosure parameterTypes at: i) subtypeOf: (parameterTypes at: i))
+			ifFalse: [^false]
+	].
+
+	(* Check return type (covariant) *)
+	^returnType subtypeOf: tClosure returnType
+)
+valueColonRepeated: n <Integer> ^ <Symbol> = (
+	(* Generate 'value:' repeated n times, e.g., 'value:value:' for n=2 *)
+	| str |
+	str:: ''.
+	1 to: n do: [:i | str:: str, 'value:'].
+	^str asSymbol
 )
 ) : (
 )
@@ -678,6 +914,10 @@ public binaryTypeOpNode: node <BinaryTypeOpAST> ^ <BinaryTypeOpAST> = (
 		rightOperand: (node rightOperand apply: self);
 		yourself
 )
+public blockTypeNode: node <BlockTypeAST> ^ <BlockTypeAST> = (
+	(* Block types don't typically need substitution, return as-is *)
+	^node
+)
 public genericInvocationNode: node <ParameterizedTypeAST> ^ <ParameterizedTypeAST> = (
 	^ParameterizedTypeAST new
 		generic: node generic;
@@ -797,6 +1037,21 @@ public genericType: g <GenericType> ^ <ParameterizedTypeAST> = (
       arguments: (g typeArguments collect: [:ta <ObjectType> | ta apply: self]);
       yourself
 )
+public closureType: ct <ClosureType> ^ <BlockTypeAST> = (
+  (* Convert ClosureType back to BlockTypeAST for type2AST conversion. *)
+  | formals returnAST |
+  formals:: ct parameterTypes collect: [:pt <ObjectType> |
+    (* Defensive: if parameter type is nil, use error type AST *)
+    VarDeclAST name: #'_' type: (pt isNil
+      ifTrue: [TypeIdAST new name: #ERROR; yourself]
+      ifFalse: [pt apply: self])
+  ].
+  (* Defensive: if return type is nil, use Nil type AST *)
+  returnAST:: ct returnType isNil
+    ifTrue: [TypeIdAST new name: #Nil; yourself]
+    ifFalse: [ct returnType apply: self].
+  ^BlockTypeAST formals: formals return: returnAST
+)
 public objectType: ot <ObjectType> ^ <TypeIdAST> = (
   ^TypeIdAST new name: ot name; yourself
 )
@@ -831,22 +1086,77 @@ public binaryTypeOpNode: node <BinaryTypeOpAST> ^ <Type> = (
 	^errorType
 )
 public blockTypeNode: node <BlockTypeAST> ^ <ObjectType> = (
-	(* Convert block type AST (e.g., [Number], [:String | Integer]) to ObjectType for Closure.
-	   This is a simplified implementation - eventually should use Fun[T1, T2, ..., R] generic.
-	   For now, we ignore the formals and return types and just return the Closure type. *)
-	^ObjectType forMixin: closureMixin
+	(* Convert block type AST (e.g., [Number], [:String | Integer]) to ClosureType
+	   with accurate parameter and return types. *)
+	| paramTypes returnT formals returnTypeAST |
+	formals:: node formals.
+	formals isNil
+		ifTrue: [paramTypes:: {}]
+		ifFalse: [
+			(* Formals in block types are type expressions, already ASTs to be converted to types *)
+			paramTypes:: formals collect: [:formalType |
+				formalType isNil
+					ifTrue: [errorType]
+					ifFalse: [formalType apply: self]
+			]
+		].
+
+	(* Get the return type from the 'return' property *)
+	returnTypeAST:: node return.
+	returnT:: returnTypeAST isNil
+		ifTrue: [ObjectType forMixin: nilMixin]
+		ifFalse: [returnTypeAST apply: self].
+	^ClosureType parameterTypes: paramTypes returnType: returnT
 )
 public genericInvocationNode: node <GenericType> = (
-	| generic <ObjectType> tas <List[ObjectType]> |
+	(* Handle parameterized types including Tuple<Number, String> *)
+	| genericName <Symbol> generic <ObjectType> tas <List[ObjectType]> |
 
+	(* Get the name of the generic type *)
+	genericName:: node generic name.
+
+	(* Check if this is a Tuple type *)
+	genericName = #Tuple ifTrue: [^tupleTypeNode: node].
+
+	(* Otherwise, handle as a generic type invocation *)
 	generic:: node generic apply: self.
 	tas:: node arguments collect: [:a <AST> | a apply: self].
 	^GenericType generic: generic typeArguments: tas
 )
 public messagePatternNode: node <MessagePatternAST> ^ <FunctionType> = (
 	^FunctionType
-		domain: (node parameters collect: [:p <VarDeclNode> | p type apply: self])
+		domain: (node parameters collect: [:p <VarDeclNode> |
+			(* Defensive: if parameter type is nil, use errorType *)
+			p type isNil
+				ifTrue: [errorType]
+				ifFalse: [p type apply: self]
+		])
 		range: ((returnTypeFor: node) apply: self)
+)
+public tupleTypeNode: node <ParameterizedTypeAST> ^ <ObjectType> = (
+	(* Convert tuple type annotation (e.g., {Number. String. Boolean}) to a TupleType
+	   with position-specific element types. *)
+	|
+	tupleActuals
+	sqActual <ObjectType>
+	arrayType <GenericType>
+	|
+
+	(* Apply the type builder to each element type in the tuple *)
+	tupleActuals:: node arguments collect: [:typeExpr <AST> | typeExpr apply: self].
+
+	(* Handle empty tuple case - return array of Object *)
+	tupleActuals isEmpty
+		ifTrue: [^ObjectType forMixin: arrayMixin].
+
+	(* Create union type of all element types *)
+	sqActual:: UnionType unifying: tupleActuals.
+
+	(* Create the array type with the union of element types *)
+	arrayType:: GenericType generic: (ObjectType forMixin: arrayMixin) typeArguments: {sqActual}.
+
+	(* Return tuple type with position-specific element types *)
+	^TupleType elementTypes: tupleActuals arrayType: arrayType
 )
 public typeIdNode: node <TypeIdAST> ^ <ObjectType> = (
     |
@@ -863,8 +1173,12 @@ public typeIdNode: node <TypeIdAST> ^ <ObjectType> = (
        ^ObjectType forMixin: m instanceSide
      ].
      m isKindOfSlotDeclarationMirror ifTrue: [
+	   | slotType |
 	   s:: signatureFor: m.
-	   ^s type apply: self
+	   slotType:: s type.
+	   (* Defensive: if type is nil, use errorType *)
+	   slotType isNil ifTrue: [^errorType].
+	   ^slotType apply: self
 	].
       m isKindOfMethodMirror ifTrue: [
 	  | returnType |
@@ -965,7 +1279,7 @@ public mixin = (
 	^objectMixin
 )
 public subtypeOf: t <Type> ^ <Boolean> = (
-	elements inject: true into: [:b <Boolean> :e <Type>  | b and: [e subtypeOf: t]]
+	^elements inject: true into: [:b <Boolean> :e <Type>  | b and: [e subtypeOf: t]]
 )
 ) : (
 )
@@ -980,15 +1294,21 @@ anyMember: selector <Symbol> at: mixin <MixinMirror> ^ <MethodMirror | ClassDecl
   ^inheritedInaccessibleMember: selector in: (superclassOf: mixin)
 )
 public blockNode: node ^ <ObjectType> = (
-(* Blocks/closures are typed as errorType for now, which accepts all operations.
-   A proper implementation would use a Fun[T1, T2, ..., R] type with value/value:/etc. methods,
-   but that doesn't exist yet in the standard library. *)
+(* Blocks/closures are typed using ClosureType with accurate parameter and return types. *)
 | domain range |
   nestScope: (Scope parent: currentScope).
-  domain:: node parameters collect: [:p <VarDecl> | p apply: self].
+  (* Defensive: filter out nil parameters and handle them as errorType *)
+  domain:: node parameters collect: [:p <VarDecl> |
+    p isNil
+      ifTrue: [
+        invalidDeclarations add: 'Block has nil parameter'.
+        errorType
+      ]
+      ifFalse: [p apply: self]
+  ].
   range:: node body apply: self.
   popScope.
-	^errorType
+	^ClosureType parameterTypes: domain returnType: range
 )
 public cascadedSendNode: node ^ <ObjectType> = (
 	node previousSend apply: self.
@@ -1108,7 +1428,7 @@ public genericInvocationNode: node ^ <ObjectType> = (
 (* This will have to change to accomodate generic terms that are not classes  - mixins, or (in the near future) reflective representatives of a types. We also need to verify that the target is a term. For the immediate future, this is sufficient to type generic classes only.
 *)
 
-myType:: UnaryTypeOpAST new target: (GenericApplicationType new apply: (TypeIdAST new setId: node target name) to: node actuals) selector: #class.
+myType:: UnaryTypeOpAST new target: (GenericApplicationType new apply: (TypeIdAST new name: node target name) to: node actuals) selector: #class.
 myType wellFormed.
 ^myType
 )
@@ -1284,7 +1604,10 @@ nonPrivate: m <Mirror> ^ <Boolean> = (
 	^m ~= nil and: [m accessModifier ~= #private]
 )
 public numberNode: node = (
-	^literal: #Number
+	(* Infer Integer for integer literals, Float for floating-point literals *)
+	| val |
+	val:: node value.
+	^(val isKindOfInteger) ifTrue: [literal: #Integer] ifFalse: [literal: #Float]
 )
 popScope ^ <Scope> = (
 	mutableSlotsStack removeLast.
@@ -1426,11 +1749,17 @@ superMember: selector <Symbol> at: mixin <MixinMirror> ^ <MethodMirror | ClassDe
   ^inheritedMember: selector in: (superclassOf: mixin)
 )
 public superclassOf: klass <MixinMirror> ^ <MixinMirror | Nil> = (
-     | result <MixinMirror | Nil>  |
+     | result <MixinMirror | Nil> instanceSide superInstanceSide |
 	klass = nil ifTrue: [^nil].
       (* 'looking for superclass of : ' out.
       klass out. *)
-	klass isMeta ifTrue: [(* 'found: ' out. klassMixin out. *) ^klassMixin].
+	klass isMeta ifTrue: [
+		(* For a metaclass, return the metaclass of the instance side's superclass *)
+		instanceSide:: klass declaration instanceSide.
+		superInstanceSide:: superclassOf: instanceSide.
+		superInstanceSide = nil ifTrue: [^klassMixin]. (* No superclass, return Class *)
+		^superInstanceSide declaration classSide (* Return superclass's metaclass *)
+	].
 	klass  = objectMixin ifTrue: [(* 'found nil' out. *) ^nil].
       result:: superclassTable at: klass ifAbsent: [computeSuperclassOf: klass].
       result = cycle
@@ -1445,32 +1774,26 @@ public symbolNode: node = (
 )
 public tupleNode: node ^ <ObjectType> = (
 	|
-sqTarget <TypeId>
-sqActuals <VarOrdCltn[ObjectType]>
-sqActual <ObjectType>
-sqType <GenericTypeApplication>
-tupleTarget <TypeId>
-tupleActuals <VarOrdCltn[ObjectType]>
-tupleType <TupleType>
-|
+	tupleActuals
+	sqActual <ObjectType>
+	arrayGenericType <GenericType>
+	|
 
-sqTarget:: TypeIdAST new setId: #SeqCltn;  start: 0; end: 0.
-sqActuals:: List(*[ObjectType]*)  new.
-tupleActuals:: node value collect: [:e <Literal> | e apply: self].
+	(* Get the types of all tuple elements *)
+	tupleActuals:: node elements collect: [:e <Literal> | e apply: self].
 
-tupleActuals isEmpty
-   ifTrue: [tupleActuals add: (TypeIdAST new setId: #DoesNotMatter)].
+	(* Handle empty tuple case *)
+	tupleActuals isEmpty
+		ifTrue: [^ObjectType forMixin: arrayMixin].
 
-sqActual:: UnionType unifying: tupleActuals asSet asOrderedCollection.
+	(* Create union type of all element types *)
+	sqActual:: UnionType unifying: tupleActuals.
 
-sqActuals add: sqActual.
-sqType:: GenericApplicationType new apply: sqTarget to: sqActuals.
+	(* Create the array type with the union of element types *)
+	arrayGenericType:: GenericType generic: (ObjectType forMixin: arrayMixin) typeArguments: {sqActual}.
 
-tupleTarget:: TypeIdAST new setId: #Tuple.
-tupleType:: TupleAST new apply: tupleTarget to: tupleActuals.
-
-
-^ProtocolMerge new type1: sqType type2: tupleType.
+	(* Create and return the tuple type with position-specific element types *)
+	^TupleType elementTypes: tupleActuals arrayType: arrayGenericType.
 )
 type: sub <Type> isSubtypeOf: sup <Type> ^ <Boolean> = (
 	| query |
@@ -1512,6 +1835,22 @@ public unresolvedSendNode: node <UnresolvedSendAST> ^ <ObjectType> = (
 selector:: node message selector.
 receiverType:: node receiver apply: self.
 
+(* Special handling for at: on TupleType with literal index *)
+(receiverType isKindOfTupleType and: [selector = #'at:']) ifTrue: [
+	| argAST index |
+	node message arguments size = 1 ifTrue: [
+		argAST:: node message arguments first.
+		(* Check if argument is a literal number *)
+		argAST isKindOfNumberNode ifTrue: [
+			index:: argAST value.
+			(* Check if index is in bounds *)
+			(index >= 1 and: [index <= receiverType elementTypes size]) ifTrue: [
+				^receiverType elementTypes at: index
+			]
+		]
+	]
+].
+
 (* Handle pseudo-variables nil, true, false *)
 ((receiverType isKindOfSelfType or: [receiverType isKindOfHereType or: [receiverType isKindOfTypeVariable and: [receiverType name = #Self]]])
  and: [node message arguments isEmpty]) ifTrue: [
@@ -1539,13 +1878,40 @@ args:: node message apply: self.
 public varDeclNode: node = (
 	| resolvedType |
 	node type isNil
-		ifTrue: [^currentScope at: node name put: errorType]
-		ifFalse: [resolvedType:: (node type apply: typeBuilder)].
+		ifTrue: [
+			(* No type declaration - use errorType and report error *)
+			invalidDeclarations add: (node name, ' must have a type declaration').
+			^currentScope at: node name put: errorType
+		]
+		ifFalse: [
+			resolvedType:: (node type apply: typeBuilder).
+			(* Defensive check - if typeBuilder returned nil, use errorType *)
+			resolvedType isNil ifTrue: [
+				invalidDeclarations add: (node name, ' has invalid type').
+				resolvedType:: errorType
+			]
+		].
 	^currentScope at: node name put: resolvedType.
 )
 public parameterDeclNode: node = (
-	(* Parameters are added to scope just like variable declarations *)
-	^currentScope at: node name put: (node type apply: typeBuilder).
+	(* Parameters are added to scope just like variable declarations.
+	   If no type is declared, use errorType and report an error. *)
+	| resolvedType |
+	node type isNil
+		ifTrue: [
+			(* Issue type error for missing parameter type *)
+			invalidDeclarations add: (node name, ' parameter must have a type declaration').
+			resolvedType:: errorType
+		]
+		ifFalse: [
+			resolvedType:: (node type apply: typeBuilder).
+			(* Defensive check - if typeBuilder returned nil, use errorType *)
+			resolvedType isNil ifTrue: [
+				invalidDeclarations add: (node name, ' parameter has invalid type').
+				resolvedType:: errorType
+			]
+		].
+	^currentScope at: node name put: resolvedType.
 )
 public variableNode: node <VariableAST> ^ <ObjectType> = (
 	(* need to deal with #'@here', #self, #super, #outer, #nil, #true, #false, and local variables/parameters *)
@@ -1564,19 +1930,32 @@ public variableNode: node <VariableAST> ^ <ObjectType> = (
 )
 type: selector <Symbol> at: mixin <MixinMirror>
   ^ <MixinMirror | MethodMirror | ClassDeclarationMirror | SlotDeclarationMirror | TypeVariable | Nil> = (
-  | result  <MethodMirror | ClassDeclarationMirror | SlotDeclarationMirror | Nil> namespaceResult classMirror |
+  | result  <MethodMirror | ClassDeclarationMirror | SlotDeclarationMirror | Nil> namespaceResult classMirror instanceMixin instanceType |
 
   selector = #Self ifTrue: [^typeOfSelf].
+  selector = #Instance ifTrue: [
+    (* Instance is only valid in class methods (metaclass side) *)
+    mixin isMeta ifFalse: [
+      invalidDeclarations add: 'Instance type is only valid in class methods'.
+      ^errorType
+    ].
+    (* Get the instance side mixin via declaration and create a TypeVariable for it *)
+    instanceMixin:: mixin declaration instanceSide.
+    instanceType:: ObjectType forMixin: instanceMixin.
+    ^TypeVariable named: #Instance bound: instanceType forType: instanceType
+  ].
   selector = #Nil ifTrue: [^nilMixin].
   selector = #UndefinedObject ifTrue: [^nilMixin].  (* UndefinedObject is synonym for Nil *)
   selector = #Boolean ifTrue: [^boolMixin].
   selector = #Number ifTrue: [^numberMixin].
   selector = #Integer ifTrue: [^integerMixin].
+  selector = #Float ifTrue: [^floatMixin].
   selector = #String ifTrue: [^stringMixin].
   selector = #Symbol ifTrue: [^stringMixin].  (* Symbol is synonym for String *)
   selector = #_Object ifTrue: [^objectMixin].
   selector = #_Array ifTrue: [^arrayMixin].
   selector = #Closure ifTrue: [^closureMixin].
+  selector = #DoesNotMatter ifTrue: [^BottomType new].  (* DoesNotMatter is a programmer-friendly alias for BottomType *)
   result:: hereMember: selector in: mixin.
   result ~= nil ifTrue: [^result].
 

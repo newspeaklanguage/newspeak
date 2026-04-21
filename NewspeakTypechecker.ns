@@ -272,7 +272,7 @@ public mixin = (
 )
 public subtypeOf: t <Type> ^ <Boolean> = (
  | ft <FunctionType> ftd <List[Type]> |
-	t = errorType ifTrue: [^true].
+	t isKindOfErrorType ifTrue: [^true].
 	t isKindOfFunctionType ifFalse: [^false] ifTrue: [ft:: t].
 
 	(range subtypeOf: ft range) ifFalse: [^false].
@@ -299,18 +299,29 @@ public apply: v = (
   ^v genericType: self
 )
 public at: selector <Symbol> ^ <FunctionType> = (
-	(* For generic types like Array<T>, handle method lookup with type substitution *)
+	(* For generic types like Array[T], handle method lookup with type substitution.
+	   Look up the method on the base type, then substitute errorTypes
+	   (which arise from unresolved type parameters like E, K, V)
+	   with the actual type arguments. *)
+	| baseFT <FunctionType> newDomain newRange |
 
-	(* Special case for at: method - return the element type *)
-	selector = #'at:' ifTrue: [
-		typeArguments isEmpty ifFalse: [
-			(* For Array<T>, at: should return T *)
-			^FunctionType domain: {ObjectType forMixin: integerMixin} range: (typeArguments first)
-		]
+	baseFT:: generic at: selector.
+
+	(* If lookup failed or no type arguments, return as-is *)
+	baseFT isKindOfErrorType ifTrue: [^baseFT].
+	typeArguments isEmpty ifTrue: [^baseFT].
+
+	(* Substitute errorTypes in the domain with actual type arguments *)
+	newDomain:: baseFT domain collect: [:d |
+		d isKindOfErrorType ifTrue: [typeArguments first] ifFalse: [d]
 	].
 
-	(* Otherwise delegate to base type *)
-	^generic at: selector
+	(* Substitute errorType in the range *)
+	newRange:: baseFT range isKindOfErrorType
+		ifTrue: [typeArguments first]
+		ifFalse: [baseFT range].
+
+	^FunctionType domain: newDomain range: newRange
 )
 public hash ^ <Integer> = (
 	^(mixin hash bitXor: class hash) bitXor: typeArguments hash
@@ -523,7 +534,7 @@ public subtypeOf: t <Type> ^ <Boolean> = (
 	(* Closure types use structural subtyping with contravariant parameters and covariant return types *)
 	| tClosure <ClosureType> |
 
-	t = errorType ifTrue: [^true].
+	t isKindOfErrorType ifTrue: [^true].
 	t isKindOfClosureType ifFalse: [^super subtypeOf: t].
 
 	tClosure:: t.
@@ -767,7 +778,7 @@ public subtypeOf: t <Type> ^ <Boolean> = (
 	(* nil is a subtype of all reference types *)
 	(mixin = nilMixin and: [t isKindOfObjectType]) ifTrue: [^true].
 
-	t = errorType ifTrue: [^true].
+	t isKindOfErrorType ifTrue: [^true].
 	(* Handle TypeVariables by checking against their bound *)
 	t isKindOfTypeVariable ifTrue: [^self subtypeOf: t bound].
 	t isKindOfObjectType ifFalse: [^false] ifTrue: [ot:: t].
@@ -1436,11 +1447,14 @@ declarationsForSubtypeQuery: q <SubtypeQuery> ^ <List[MixinMirror]> = (
 error: msg <String> at: location <Pair[Integer]> = (
 	errorSet add: (TypeError message: msg start: location first end: location last).
 )
-functionTypeOf: node <SendASTNode> ^ <MsgSignature> = (
+functionTypeOf: node <SendASTNode> receiverType: receiverType <ObjectType> ^ <MsgSignature> = (
 	(* A query *)
-	| query <Query> receiverType <ObjectType> cachedType <Type> selector <Symbol> |
+	| query <Query> cachedType <Type> selector <Symbol> |
 	selector:: node message selector.
-	receiverType:: node receiver apply: self.
+
+	(* If receiver is already an error type, don't report cascading errors *)
+	receiverType isKindOfErrorType ifTrue: [^errorType].
+
 	cachedType:: receiverType at: selector.
 	(* disable query system for initial testing *)
 (*	query:: SignatureQuery type: receiverType selector: selector.
@@ -1592,11 +1606,15 @@ public messagePatternNode: node ^ <FunctionType> = (
 	^node apply: typeBuilder
 	)
 public methodNode: node <MethodAST> ^ <MsgSignature> = (
-	| signature <FunctionType> |
+	| signature <FunctionType> params |
 	pushScope: Scope new.
 	signature:: node pattern apply: self.
-	(* Add parameters to scope so they can be referenced in the method body *)
-	node pattern parameters do: [:p <VarDecl> | p apply: self].
+	(* Add parameters to scope using the already-resolved types from the signature,
+	   rather than re-applying the type builder which would report duplicate errors. *)
+	params:: node pattern parameters.
+	1 to: params size do: [:i |
+		currentScope at: (params at: i) name put: (signature domain at: i)
+	].
 	currentReturnType:: signature range.
 	node body apply: self.
 	popScope.
@@ -1898,7 +1916,7 @@ receiverType:: node receiver apply: self.
 	localType isNil ifFalse: [^localType]
 ].
 
-functionType:: functionTypeOf: node.
+functionType:: functionTypeOf: node receiverType: receiverType.
 domain:: functionType domain.
 argASTs:: node message arguments.
 args:: node message apply: self.

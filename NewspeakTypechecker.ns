@@ -311,15 +311,56 @@ public at: selector <Symbol> ^ <FunctionType> = (
 	baseFT isKindOfErrorType ifTrue: [^baseFT].
 	typeArguments isEmpty ifTrue: [^baseFT].
 
-	(* Substitute errorTypes in the domain with actual type arguments *)
+	(* Substitute type parameters in the domain with actual type arguments.
+	   Use positional TypeParameterType when available (from classes with <[...]> declarations).
+	   Fall back to errorType substitution for classes without declared type parameters. *)
 	newDomain:: baseFT domain collect: [:d |
-		d isKindOfErrorType ifTrue: [typeArguments first] ifFalse: [d]
+		d isKindOfTypeParameterType
+			ifTrue: [
+				d index <= typeArguments size
+					ifTrue: [typeArguments at: d index]
+					ifFalse: [d]
+			]
+			ifFalse: [
+				d isKindOfErrorType
+					ifTrue: [typeArguments first]
+					ifFalse: [d]
+			]
 	].
 
-	(* Substitute errorType in the range *)
-	newRange:: baseFT range isKindOfErrorType
-		ifTrue: [typeArguments first]
-		ifFalse: [baseFT range].
+	(* Substitute type parameter in the range *)
+	newRange:: baseFT range isKindOfTypeParameterType
+		ifTrue: [
+			baseFT range index <= typeArguments size
+				ifTrue: [typeArguments at: baseFT range index]
+				ifFalse: [baseFT range]
+		]
+		ifFalse: [
+			baseFT range isKindOfErrorType
+				ifTrue: [typeArguments first]
+				ifFalse: [
+					(* Handle GenericType range like Array[E] — substitute type params in its arguments *)
+					baseFT range isKindOfGenericType
+						ifTrue: [
+							| substitutedArgs |
+							substitutedArgs:: baseFT range typeArguments collect: [:ta |
+								ta isKindOfTypeParameterType
+									ifTrue: [
+										ta index <= typeArguments size
+											ifTrue: [typeArguments at: ta index]
+											ifFalse: [ta]
+									]
+									ifFalse: [
+										ta isKindOfErrorType
+											ifTrue: [typeArguments first]
+											ifFalse: [ta]
+									]
+							].
+							GenericType generic: baseFT range generic typeArguments: substitutedArgs
+						]
+						ifFalse: [baseFT range]
+				]
+		].
 
 	^FunctionType domain: newDomain range: newRange
 )
@@ -1032,6 +1073,9 @@ class Type = (
 public asFunctionType  = (
   ^subclassResponsibility
 )
+public isKindOfTypeParameterType ^ <Boolean> = (
+	^false
+)
 public subtypeOf: t <Type> ^ <Boolean> = (
 	subclassResponsibility
 )
@@ -1073,6 +1117,9 @@ public closureType: ct <ClosureType> ^ <BlockTypeAST> = (
 )
 public objectType: ot <ObjectType> ^ <TypeIdAST> = (
   ^TypeIdAST new name: ot name; yourself
+)
+public typeParameterType: tp <TypeParameterType> ^ <TypeIdAST> = (
+  ^TypeIdAST new name: tp name; yourself
 )
 public typeVariable: tv <TypeVariable> ^ <TypeIdAST> = (
   ^TypeIdAST new name: tv name; yourself
@@ -1180,12 +1227,13 @@ public tupleTypeNode: node <ParameterizedTypeAST> ^ <ObjectType> = (
 )
 public typeIdNode: node <TypeIdAST> ^ <ObjectType> = (
     |
-    m  <MixinMirror | MethodMirror | ClassDeclarationMirror | SlotDeclarationMirror | TypeVariable | Nil> =
-       type: node name at: surroundingClass.
+    m  <MixinMirror | MethodMirror | ClassDeclarationMirror | SlotDeclarationMirror | TypeVariable | Nil>
     s <MessagePatternAST | SlotDefAST | ClassHeaderAST | Nil>
     |
+    m:: type: node name at: surroundingClass.
 
      m isKindOfTypeVariable ifTrue: [^m].
+     m isKindOfTypeParameterType ifTrue: [^m].
      m isKindOfMixinMirror ifTrue: [
        ^ObjectType forMixin: m
      ].
@@ -1296,6 +1344,35 @@ public isKindOfTypeVariable ^ <Boolean> = (
 )
 public subtypeOf: t <Type> ^ <Boolean> = (
 	^bound subtypeOf: t
+)
+) : (
+)
+class TypeParameterType named: n <Symbol> index: i <Integer> = ObjectType forMixin: objectMixin (
+(* A type parameter declared in a class header, e.g., E in class List <[E]>.
+   The index indicates position in the parameter list (1-based). *)
+|
+	public name <Symbol> = n.
+	public index <Integer> = i.
+|) (
+public = o = (
+	o isKindOfTypeParameterType ifFalse: [^false].
+	^name = o name and: [index = o index]
+)
+public apply: v = (
+	^v typeParameterType: self
+)
+public isKindOfTypeParameterType ^ <Boolean> = (
+	^true
+)
+public printOn: s = (
+	s nextPutAll: 'TypeParameter('.
+	s nextPutAll: name.
+	s nextPutAll: ','.
+	s nextPutAll: index printString.
+	s nextPutAll: ')'.
+)
+public subtypeOf: t <Type> ^ <Boolean> = (
+	^(ObjectType forMixin: objectMixin) subtypeOf: t
 )
 ) : (
 )
@@ -1981,9 +2058,30 @@ public variableNode: node <VariableAST> ^ <ObjectType> = (
 	nil ~= localType ifTrue: [^localType].
 	^assert: [false] message: varName, ' should never have been treated as a variable node'.
 )
+typeParameterNamed: name <Symbol> inScopeOf: mixin <MixinMirror> ^ <TypeParameterType | Nil> = (
+	(* Walk the enclosing class chain looking for a class that declares
+	   a type parameter with the given name. Returns a TypeParameterType
+	   with the positional index, or nil if not found. *)
+	| current <MixinMirror> headerAst typeParams |
+	current:: mixin.
+	[current ~= nil] whileTrue: [
+		[headerAst:: parser parseClassHeader: current declaration header source.
+		 typeParams:: headerAst typeParameters.
+		 (nil ~= typeParams and: [typeParams size > 0]) ifTrue: [
+			1 to: typeParams size do: [:i |
+				(typeParams at: i) = name ifTrue: [
+					^TypeParameterType named: name index: i
+				]
+			]
+		 ].
+		] on: Error do: [:e | (* Skip classes whose headers can't be parsed *)].
+		current:: current enclosingMixin.
+	].
+	^nil
+)
 type: selector <Symbol> at: mixin <MixinMirror>
   ^ <MixinMirror | MethodMirror | ClassDeclarationMirror | SlotDeclarationMirror | TypeVariable | Nil> = (
-  | result  <MethodMirror | ClassDeclarationMirror | SlotDeclarationMirror | Nil> namespaceResult classMirror instanceMixin instanceType |
+  | result  <MethodMirror | ClassDeclarationMirror | SlotDeclarationMirror | Nil> namespaceResult classMirror instanceMixin instanceType tpType |
 
   selector = #Self ifTrue: [^typeOfSelf].
   selector = #Instance ifTrue: [
@@ -2013,6 +2111,10 @@ type: selector <Symbol> at: mixin <MixinMirror>
   selector = #DoesNotMatter ifTrue: [^BottomType new].  (* DoesNotMatter is a programmer-friendly alias for BottomType *)
   result:: hereMember: selector in: mixin.
   result ~= nil ifTrue: [^result].
+
+  (* Check type parameters - after members (which shadow), before namespace *)
+  tpType:: typeParameterNamed: selector inScopeOf: mixin.
+  tpType ~= nil ifTrue: [^tpType].
 
   (* Try to find in namespace - first conflict namespace, then main namespace *)
   namespaceResult:: currentConflictNamespace at: selector ifAbsent: [namespace at: selector ifAbsent: [nil]].

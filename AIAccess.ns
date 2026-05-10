@@ -1,0 +1,350 @@
+Newspeak3
+'AI'
+class AIAccess usingPlatform: platform = (
+(*
+ Provides AI model access from Newspeak. Supports multiple providers
+ via the Provider abstraction. Manages multi-turn conversations with
+ tool use (function calling), enabling an AI to query the IDE and vice versa.
+
+ Usage:
+   | ai provider session |
+   ai:: AIAccess usingPlatform: platform.
+   provider:: ai AnthropicProvider apiKey: 'sk-...' model: 'claude-sonnet-4-20250514'.
+   session:: ai Session provider: provider tools: {}.
+   session systemPrompt:: 'You are a Newspeak programming assistant.'.
+   (session sendMessage: 'What is Newspeak?') then: [:reply | transcript show: reply].
+*)
+|
+	private List = platform collections List.
+	private Map = platform collections Map.
+	private global = platform js global.
+	private JSON = global at: #JSON.
+|
+) (
+
+
+
+(* --- Data classes --- *)
+
+(* Defines a tool the AI may invoke. inputSchema is a JSON string
+   conforming to JSON Schema. handler is a block [:input <Alien> | ^String]. *)
+public class Tool name: n description: d inputSchema: s handler: h = (
+|
+	public name <String> = n.
+	public description <String> = d.
+	public inputSchema <String> = s.
+	public handler = h.
+|
+) (
+) : (
+)
+
+(* --- Provider abstraction --- *)
+
+(* Abstract provider. Subclass and implement complete:system:tools:maxTokens:. *)
+public class Provider = (
+) (
+
+(* Send messages to the model. Returns a JS Promise that resolves to
+   a response object with 'content' (array of blocks) and 'stop_reason'. *)
+public complete: messages <Alien[Array]>
+	system: systemPrompt <String>
+	tools: tools <Alien[Array]>
+	maxTokens: maxTokens <Integer>
+	^ <Alien[Promise]> = (
+	subclassResponsibility
+)
+
+) : (
+)
+
+(* Anthropic Claude provider. Calls the Messages API directly from the browser
+   using the dangerous-direct-browser-access header. *)
+public class AnthropicProvider apiKey: key model: mdl = Provider (
+|
+	public apiKey <String> = key.
+	public model <String> = mdl.
+	private apiUrl = 'https://api.anthropic.com/v1/messages'.
+	private apiVersion = '2023-06-01'.
+|
+) (
+
+public complete: messages <Alien[Array]>
+	system: systemPrompt <String>
+	tools: tools <Alien[Array]>
+	maxTokens: maxTokens <Integer>
+	^ <Alien[Promise]> = (
+	| body headers options |
+
+	body:: createJSObject.
+	body at: 'model' put: model.
+	body at: 'max_tokens' put: maxTokens.
+	body at: 'messages' put: messages.
+	systemPrompt isEmpty ifFalse: [
+		body at: 'system' put: systemPrompt.
+	].
+	tools isNil ifFalse: [
+		(tools at: 'length') > 0 ifTrue: [
+			body at: 'tools' put: tools.
+		].
+	].
+
+	headers:: createJSObject.
+	headers at: 'Content-Type' put: 'application/json'.
+	headers at: 'x-api-key' put: apiKey.
+	headers at: 'anthropic-version' put: apiVersion.
+	headers at: 'anthropic-dangerous-direct-browser-access' put: 'true'.
+
+	options:: createJSObject.
+	options at: 'method' put: 'POST'.
+	options at: 'headers' put: headers.
+	options at: 'body' put: (JSON stringify: body).
+
+	^(global fetch: apiUrl with: options) then: [:response |
+		(response at: 'ok')
+			ifFalse: [
+				Error signal: 'Anthropic API error: ', (response at: 'status') printString
+			].
+		response json
+	]
+)
+
+) : (
+)
+
+(* Manages a multi-turn conversation with tool use.
+
+   The session keeps the full API message history including tool_use and
+   tool_result messages. The public displayMessages method extracts
+   user and assistant text for UI display.
+
+   When the model responds with tool_use, the session automatically
+   executes the registered tool handlers and continues the conversation
+   until the model produces a final text response. *)
+public class Session provider: p tools: toolList = (
+|
+	public provider <Provider> = p.
+	private toolDefs = toolList.
+	private toolMap = Map new.
+	(* Full API message history, including tool_use/tool_result messages.
+	   Each element is an Alien (JS message object). *)
+	public apiMessages = List new.
+	public systemPrompt <String> ::= 'You are a helpful Newspeak programming assistant.'.
+	public maxTokens <Integer> ::= 4096.
+	(* Optional callback invoked when conversation state changes. *)
+	public onUpdate ::= nil.
+|
+	toolList do: [:t <Tool> | toolMap at: t name put: t].
+) (
+
+(* --- Building JS structures for the API --- *)
+
+buildToolsJS ^ <Alien> = (
+	| arr |
+	toolDefs isEmpty ifTrue: [^nil].
+	arr:: createJSArray.
+	toolDefs do: [:t |
+		| obj |
+		obj:: createJSObject.
+		obj at: 'name' put: t name.
+		obj at: 'description' put: t description.
+		obj at: 'input_schema' put: (JSON parse: t inputSchema).
+		arr push: obj.
+	].
+	^arr
+)
+
+apiMessagesAsJSArray ^ <Alien> = (
+	| arr |
+	arr:: createJSArray.
+	apiMessages do: [:m | arr push: m].
+	^arr
+)
+
+(* --- Response parsing --- *)
+
+extractTextFrom: response ^ <String> = (
+	| content result |
+	content:: response at: 'content'.
+	result:: ''.
+	0 to: (content at: 'length') - 1 do: [:i |
+		| block |
+		block:: content at: i.
+		(block at: 'type') = 'text' ifTrue: [
+			result:: result, (block at: 'text').
+		].
+	].
+	^result
+)
+
+hasToolUse: response ^ <Boolean> = (
+	^(response at: 'stop_reason') = 'tool_use'
+)
+
+toolUseBlocksFrom: response ^ <List> = (
+	| content blocks |
+	content:: response at: 'content'.
+	blocks:: List new.
+	0 to: (content at: 'length') - 1 do: [:i |
+		| block |
+		block:: content at: i.
+		(block at: 'type') = 'tool_use' ifTrue: [
+			blocks add: block.
+		].
+	].
+	^blocks
+)
+
+(* --- Tool execution --- *)
+
+executeToolCall: toolUseBlock ^ <Alien> = (
+	| toolName input tool result |
+	toolName:: toolUseBlock at: 'name'.
+	input:: toolUseBlock at: 'input'.
+	tool:: toolMap at: toolName ifAbsent: [
+		^makeToolResult: (toolUseBlock at: 'id')
+			content: 'Unknown tool: ', toolName
+			isError: true
+	].
+	[
+		result:: tool handler value: input.
+		^makeToolResult: (toolUseBlock at: 'id')
+			content: result
+			isError: false
+	] on: Exception do: [:e |
+		^makeToolResult: (toolUseBlock at: 'id')
+			content: 'Error: ', e messageText
+			isError: true
+	]
+)
+
+makeToolResult: id content: text isError: err ^ <Alien> = (
+	| block |
+	block:: createJSObject.
+	block at: 'type' put: 'tool_result'.
+	block at: 'tool_use_id' put: id.
+	block at: 'content' put: text.
+	err ifTrue: [block at: 'is_error' put: true].
+	^block
+)
+
+(* --- Conversation loop --- *)
+
+(* Sends the current apiMessages to the model, handles tool use recursively,
+   and resolves to the final assistant text. *)
+completeWithToolLoop ^ <Alien[Promise]> = (
+	^(provider
+		complete: apiMessagesAsJSArray
+		system: systemPrompt
+		tools: buildToolsJS
+		maxTokens: maxTokens
+	) then: [:response |
+		| assistantMsg |
+		(* Add assistant response to history *)
+		assistantMsg:: createJSObject.
+		assistantMsg at: 'role' put: 'assistant'.
+		assistantMsg at: 'content' put: (response at: 'content').
+		apiMessages add: assistantMsg.
+
+		(hasToolUse: response)
+			ifTrue: [
+				| toolBlocks results toolResultMsg |
+				toolBlocks:: toolUseBlocksFrom: response.
+				results:: createJSArray.
+				toolBlocks do: [:tb | results push: (executeToolCall: tb)].
+
+				toolResultMsg:: createJSObject.
+				toolResultMsg at: 'role' put: 'user'.
+				toolResultMsg at: 'content' put: results.
+				apiMessages add: toolResultMsg.
+
+				notifyUpdate.
+				(* Continue conversation *)
+				completeWithToolLoop
+			]
+			ifFalse: [
+				notifyUpdate.
+				extractTextFrom: response
+			]
+	]
+)
+
+notifyUpdate = (
+	onUpdate isNil ifFalse: [onUpdate value].
+)
+
+(* --- Public API --- *)
+
+(* Send a user message. Returns a JS Promise resolving to the
+   assistant's final text response (after any tool use rounds). *)
+public sendMessage: text <String> ^ <Alien[Promise]> = (
+	| userMsg |
+	userMsg:: createJSObject.
+	userMsg at: 'role' put: 'user'.
+	userMsg at: 'content' put: text.
+	apiMessages add: userMsg.
+	notifyUpdate.
+
+	^(completeWithToolLoop) then: [:responseText |
+		notifyUpdate.
+		responseText
+	]
+)
+
+(* Extract display-friendly messages from the full API history.
+   Returns a List of {role <String>. text <String>} pairs,
+   filtering out tool_use and tool_result messages. *)
+public displayMessages ^ <List> = (
+	| result |
+	result:: List new.
+	apiMessages do: [:msg |
+		| role |
+		role:: msg at: 'role'.
+		role = 'user' ifTrue: [
+			| content |
+			content:: msg at: 'content'.
+			(* User messages with string content are user-typed text.
+			   User messages with array content are tool results (skip). *)
+			content isKindOfString ifTrue: [
+				result add: {role. content}.
+			].
+		].
+		role = 'assistant' ifTrue: [
+			| text |
+			text:: ''.
+			0 to: ((msg at: 'content') at: 'length') - 1 do: [:i |
+				| block |
+				block:: (msg at: 'content') at: i.
+				(block at: 'type') = 'text' ifTrue: [
+					text:: text, (block at: 'text').
+				].
+			].
+			text isEmpty ifFalse: [
+				result add: {role. text}.
+			].
+		].
+	].
+	^result
+)
+
+(* Reset the conversation. *)
+public clearHistory = (
+	apiMessages removeAll.
+	notifyUpdate.
+)
+
+): (
+)
+
+(* --- JS interop helpers --- *)
+
+createJSObject ^ <Alien> = (
+	^JSON parse: '{}'
+)
+
+createJSArray ^ <Alien> = (
+	^JSON parse: '[]'
+)
+
+) : (
+)

@@ -1,0 +1,315 @@
+Newspeak3
+'Root'
+class AI_IDE_Support usingPlatform: platform ide: webIde aiAccess: aiAccessModule chatUI: chatUIModule = (
+(*
+ IDE module providing AI integration. Instantiates and exposes the
+ general-purpose AIAccess and AIChatUI modules, and defines
+ IDE-specific tools that allow an AI model to query the IDE via mirrors.
+
+ This module follows the standard IDE module pattern: it is parameterized
+ by the platform and the IDE, and is instantiated by HopscotchWebIDE.
+
+ Other IDE presenters can access AI functionality through this module,
+ e.g., to embed a ChatSubject in a method or class presenter.
+*)
+|
+	(* IDE dependencies *)
+	private Root = webIde namespacing Root.
+	private systemScope = webIde namespacing systemScope.
+	private ClassMirror = platform mirrors ClassMirror.
+	private List = platform collections List.
+	private ide = webIde.
+
+	(* General-purpose AI modules *)
+	public aiAccess = aiAccessModule.
+	public chatUI = chatUIModule.
+
+	(* Re-export commonly needed classes for use by other IDE modules *)
+	public Tool = aiAccess Tool.
+	public Provider = aiAccess Provider.
+	public AnthropicProvider = aiAccess AnthropicProvider.
+	public Session = aiAccess Session.
+	public ChatSubject = chatUI ChatSubject.
+	private AIChatSetupSubject = chatUI AIChatSetupSubject.
+|
+) (
+
+(* --- IDE-specific chat setup --- *)
+
+public class IDEChatSetupSubject onModel: providerClass = AIChatSetupSubject onModel: providerClass (
+(*
+ Overrides session creation to include IDE-specific tools.
+*)
+) (
+
+public createSession: provider = (
+	^Session provider: provider tools: tools
+)
+
+public isKindOfIDEChatSetupSubject = ( ^true )
+isMyKind: other = ( ^other isKindOfIDEChatSetupSubject )
+
+) : (
+)
+
+(* --- Class lookup helpers --- *)
+
+classDeclarationNamed: name <String> ^ <ClassDeclarationMirror> = (
+	| cls |
+	cls:: Root at: name asSymbol ifAbsent: [
+		Error signal: 'Class not found: ', name
+	].
+	cls isKindOfBehavior ifFalse: [
+		Error signal: 'Not a class: ', name
+	].
+	^(ClassMirror reflecting: cls) mixin declaration
+)
+
+resolveClassPath: path <String> ^ <ClassDeclarationMirror> = (
+	| parts cdm |
+	parts:: path findTokens: '.'.
+	cdm:: classDeclarationNamed: (parts at: 1).
+	2 to: parts size do: [:i |
+		| nestedName found |
+		nestedName:: (parts at: i) asSymbol.
+		found:: false.
+		cdm instanceSide nestedClasses do: [:nc |
+			nc simpleName = nestedName ifTrue: [
+				cdm:: nc.
+				found:: true.
+			].
+		].
+		found ifFalse: [
+			Error signal: 'Nested class not found: ', (parts at: i),
+				' in ', cdm simpleName
+		].
+	].
+	^cdm
+)
+
+formatAccess: am ^ <String> = (
+	am = #public ifTrue: [^'public '].
+	am = #private ifTrue: [^'private '].
+	^''
+)
+
+(* --- IDE tool definitions --- *)
+
+public tools ^ <List> = (
+	^{
+		getClassSourceTool.
+		getMethodSourceTool.
+		getClassHeaderTool.
+		listClassMembersTool.
+		sendersTool.
+		implementorsTool.
+		searchClassesTool.
+	}
+)
+
+getClassSourceTool ^ <Tool> = (
+	^Tool
+		name: 'get_class_source'
+		description: 'Get the full source code of a Newspeak class. Use a dotted path for nested classes (e.g. "ShapeLibrary.Circle").'
+		inputSchema: '{"type":"object","properties":{"class_name":{"type":"string","description":"Class name or dotted path (e.g. MyClass or Outer.Inner)"}},"required":["class_name"]}'
+		handler: [:input |
+			(resolveClassPath: (input at: 'class_name')) source
+		]
+)
+
+getMethodSourceTool ^ <Tool> = (
+	^Tool
+		name: 'get_method_source'
+		description: 'Get the source code of a specific method in a class. Specify the selector (method name) including colons for keyword methods (e.g. "at:put:").'
+		inputSchema: '{"type":"object","properties":{"class_name":{"type":"string","description":"Class name or dotted path"},"selector":{"type":"string","description":"Method selector (e.g. foo, at:put:, +)"},"side":{"type":"string","enum":["instance","class"],"description":"Which side of the class (default: instance)"}},"required":["class_name","selector"]}'
+		handler: [:input |
+			| cdm mixin selector found result |
+			cdm:: resolveClassPath: (input at: 'class_name').
+			selector:: (input at: 'selector') asSymbol.
+			mixin:: ((input at: 'side') = 'class')
+				ifTrue: [cdm classSide]
+				ifFalse: [cdm instanceSide].
+			found:: false.
+			result:: ''.
+			mixin methods do: [:mm |
+				mm name = selector ifTrue: [
+					result:: mm source.
+					found:: true.
+				].
+			].
+			found ifFalse: [
+				mixin lazySlots do: [:ls |
+					ls name = selector ifTrue: [
+						result:: ls source.
+						found:: true.
+					].
+				].
+			].
+			found ifFalse: [
+				Error signal: 'Method not found: ', selector,
+					' in ', cdm simpleName
+			].
+			result
+		]
+)
+
+getClassHeaderTool ^ <Tool> = (
+	^Tool
+		name: 'get_class_header'
+		description: 'Get just the class header (factory method signature, superclass clause, slot declarations) without the method bodies.'
+		inputSchema: '{"type":"object","properties":{"class_name":{"type":"string","description":"Class name or dotted path"}},"required":["class_name"]}'
+		handler: [:input |
+			(resolveClassPath: (input at: 'class_name')) header source
+		]
+)
+
+listClassMembersTool ^ <Tool> = (
+	^Tool
+		name: 'list_class_members'
+		description: 'List all members (methods, slots, nested classes, lazy slots) of a class with their access modifiers. Does not include source code - use get_method_source for that.'
+		inputSchema: '{"type":"object","properties":{"class_name":{"type":"string","description":"Class name or dotted path"}},"required":["class_name"]}'
+		handler: [:input |
+			| cdm result |
+			cdm:: resolveClassPath: (input at: 'class_name').
+			result:: 'Class: ', cdm simpleName, '\n'.
+			result:: result, 'Factory: ', cdm primaryFactorySelector, '\n'.
+
+			result:: result, '\nSlots:\n'.
+			cdm instanceSide slots do: [:sm |
+				result:: result, '  ', (formatAccess: sm accessModifier),
+					sm name,
+					(sm isMutable ifTrue: [' (mutable)'] ifFalse: [' (immutable)']),
+					'\n'.
+			].
+
+			result:: result, '\nInstance methods:\n'.
+			cdm instanceSide methods do: [:mm |
+				result:: result, '  ', (formatAccess: mm accessModifier),
+					mm name, '\n'.
+			].
+
+			cdm instanceSide lazySlots do: [:ls |
+				result:: result, '  ',
+					(formatAccess: ls accessModifier),
+					'lazy ', ls name, '\n'.
+			].
+
+			result:: result, '\nClass methods:\n'.
+			cdm classSide methods do: [:mm |
+				result:: result, '  ', (formatAccess: mm accessModifier),
+					mm name, '\n'.
+			].
+
+			result:: result, '\nNested classes:\n'.
+			cdm instanceSide nestedClasses do: [:nc |
+				result:: result, '  ', (formatAccess: nc accessModifier),
+					nc simpleName, '\n'.
+			].
+
+			result
+		]
+)
+
+sendersTool ^ <Tool> = (
+	^Tool
+		name: 'senders_of'
+		description: 'Find all methods that send a given message selector. Returns the defining class and method for each sender.'
+		inputSchema: '{"type":"object","properties":{"selector":{"type":"string","description":"The message selector to search for (e.g. add:, printString, +)"}},"required":["selector"]}'
+		handler: [:input |
+			| selector result count |
+			selector:: (input at: 'selector') asSymbol.
+			result:: 'Senders of #', selector, ':\n'.
+			count:: 0.
+			systemScope sendersOf: selector do: [:mirror |
+				count:: count + 1.
+				mirror isKindOfMethodMirror ifTrue: [
+					result:: result, '  ',
+						mirror definingMixin declaration simpleName, ' >> ',
+						mirror name, '\n'.
+				].
+				mirror isKindOfClassDeclarationMirror ifTrue: [
+					result:: result, '  ',
+						mirror simpleName, ' (class header)\n'.
+				].
+			].
+			count = 0 ifTrue: [
+				result:: result, '  (none found)\n'.
+			].
+			result
+		]
+)
+
+implementorsTool ^ <Tool> = (
+	^Tool
+		name: 'implementors_of'
+		description: 'Find all classes that implement a given message selector. Returns the defining class and access modifier for each implementor.'
+		inputSchema: '{"type":"object","properties":{"selector":{"type":"string","description":"The message selector to search for"}},"required":["selector"]}'
+		handler: [:input |
+			| selector result count |
+			selector:: (input at: 'selector') asSymbol.
+			result:: 'Implementors of #', selector, ':\n'.
+			count:: 0.
+			systemScope implementorsOf: selector do: [:mirror |
+				count:: count + 1.
+				mirror isKindOfMethodMirror ifTrue: [
+					result:: result, '  ',
+						(formatAccess: mirror accessModifier),
+						mirror definingMixin declaration simpleName, ' >> ',
+						mirror name, '\n'.
+				].
+				mirror isKindOfClassDeclarationMirror ifTrue: [
+					result:: result, '  ',
+						mirror simpleName, ' (class/slot)\n'.
+				].
+			].
+			count = 0 ifTrue: [
+				result:: result, '  (none found)\n'.
+			].
+			result
+		]
+)
+
+searchClassesTool ^ <Tool> = (
+	^Tool
+		name: 'search_classes'
+		description: 'Search for classes whose name contains the given substring. Searches both top-level and nested classes.'
+		inputSchema: '{"type":"object","properties":{"query":{"type":"string","description":"Substring to search for in class names (case-sensitive)"}},"required":["query"]}'
+		handler: [:input |
+			| query result count |
+			query:: input at: 'query'.
+			result:: 'Classes matching "', query, '":\n'.
+			count:: 0.
+			systemScope allClassesDo: [:cdm |
+				(cdm simpleName includesSubstring: query) ifTrue: [
+					| path enclosing |
+					count:: count + 1.
+					path:: cdm simpleName.
+					enclosing:: cdm enclosingClass.
+					[enclosing notNil] whileTrue: [
+						path:: enclosing simpleName, '.', path.
+						enclosing:: enclosing enclosingClass.
+					].
+					result:: result, '  ', (formatAccess: cdm accessModifier), path, '\n'.
+				].
+			].
+			count = 0 ifTrue: [
+				result:: result, '  (none found)\n'.
+			].
+			result
+		]
+)
+
+(* --- Convenience API --- *)
+
+(* Create a session with the IDE tools pre-configured. *)
+public createSessionWithProvider: provider <Provider> ^ <Session> = (
+	^Session provider: provider tools: tools
+)
+
+(* Create a ChatSubject backed by a new session with IDE tools. *)
+public createChatWithProvider: provider <Provider> ^ <ChatSubject> = (
+	^ChatSubject onModel: (createSessionWithProvider: provider)
+)
+
+) : (
+)

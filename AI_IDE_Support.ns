@@ -17,6 +17,7 @@ class AI_IDE_Support usingPlatform: platform ide: webIde aiAccess: aiAccessModul
 	private Root = webIde namespacing Root.
 	private systemScope = webIde namespacing systemScope.
 	private ClassMirror = platform mirrors ClassMirror.
+	private ObjectMirror = platform mirrors ObjectMirror.
 	private List = platform collections List.
 	private ide = webIde.
 
@@ -29,8 +30,26 @@ class AI_IDE_Support usingPlatform: platform ide: webIde aiAccess: aiAccessModul
 	public Provider = aiAccess Provider.
 	public AnthropicProvider = aiAccess AnthropicProvider.
 	public Session = aiAccess Session.
-	public ChatSubject = chatUI ChatSubject.
 	private AIChatSetupSubject = chatUI AIChatSetupSubject.
+	private AIChatSetupPresenter = chatUI AIChatSetupPresenter.
+	private BaseChatSubject = chatUI ChatSubject.
+	private BaseChatPresenter = chatUI ChatPresenter.
+
+	(* Current AI focus — a block [ ^String ] producing a fresh description of
+	   what the user is currently asking about, or nil if no focus has been set.
+	   A block (not a snapshot) lets the description reflect live state, e.g.
+	   the current text of an in-progress edit. *)
+	currentFocusBlock ::= nil.
+
+	(* The owner of the current focus — typically the Subject whose brain
+	   button installed the focus. Used to highlight that brain button so the
+	   user can tell which view the chat is currently focused on. *)
+	currentFocusOwner_slot ::= nil.
+
+	(* Single shared chat subject, lazily created on first use (e.g. when the
+	   user clicks any brain button). Once created, all brain buttons reuse it
+	   so the conversation continues as the user navigates. *)
+	sharedChatSubject_slot ::= nil.
 |
 ) (
 
@@ -38,18 +57,131 @@ class AI_IDE_Support usingPlatform: platform ide: webIde aiAccess: aiAccessModul
 
 public class IDEChatSetupSubject onModel: providerClass = AIChatSetupSubject onModel: providerClass (
 (*
- Overrides session creation to include IDE-specific tools.
+ Overrides session creation to include IDE-specific tools, and uses
+ IDE-aware presenter and chat subject subclasses.
 *)
 ) (
 
 public createSession: provider = (
-	^Session provider: provider tools: tools
+	| session |
+	session:: Session provider: provider tools: tools.
+	session systemPrompt: newspeakSystemPrompt.
+	^session
+)
+
+public createPresenter = (
+	^IDEChatSetupPresenter onSubject: self
+)
+
+public newChatSubjectFor: session = (
+	| chat |
+	chat:: IDEChatSubject onModel: session.
+	(* Cache as the shared chat so subsequent brain clicks reuse this session. *)
+	sharedChatSubject_slot:: chat.
+	^chat
 )
 
 public isKindOfIDEChatSetupSubject = ( ^true )
 isMyKind: other = ( ^other isKindOfIDEChatSetupSubject )
 
 ) : (
+)
+
+public class IDEChatSubject onModel: session = BaseChatSubject onModel: session (
+(*
+ IDE-aware chat subject; returns an IDE presenter so Inspect Presenter works.
+*)
+) (
+
+public createPresenter = (
+	^IDEChatPresenter onSubject: self
+)
+
+public isKindOfIDEChatSubject = ( ^true )
+isMyKind: other = ( ^other isKindOfIDEChatSubject )
+
+) : (
+)
+
+public class IDEChatSetupPresenter onSubject: s = AIChatSetupPresenter onSubject: s () (
+
+respondToInspectPresenter = (
+	enterSubject: (ide browsing ObjectSubject onModel: (ObjectMirror reflecting: self))
+)
+
+public isKindOfIDEChatSetupPresenter = ( ^true )
+isMyKind: other = ( ^other isKindOfIDEChatSetupPresenter )
+
+) : (
+)
+
+public class IDEChatPresenter onSubject: s = BaseChatPresenter onSubject: s () (
+
+respondToInspectPresenter = (
+	enterSubject: (ide browsing ObjectSubject onModel: (ObjectMirror reflecting: self))
+)
+
+public isKindOfIDEChatPresenter = ( ^true )
+isMyKind: other = ( ^other isKindOfIDEChatPresenter )
+
+) : (
+)
+
+(* --- Focus management ---
+
+   A presenter signals what the user is asking about by installing a focus
+   block. The chat does NOT push the focus into the conversation; it is pulled
+   on demand via the current_focus tool. The block is re-evaluated on every
+   pull, so live state (e.g. unaccepted edits) flows through automatically.
+   To clear focus, pass nil. *)
+
+public setFocus: aBlock = (
+	currentFocusBlock:: aBlock.
+	currentFocusOwner_slot:: nil.
+)
+
+public setFocus: aBlock owner: anOwner = (
+	currentFocusBlock:: aBlock.
+	currentFocusOwner_slot:: anOwner.
+)
+
+public clearFocus = (
+	currentFocusBlock:: nil.
+	currentFocusOwner_slot:: nil.
+)
+
+public isFocusedOwner: anOwner ^ <Boolean> = (
+	currentFocusOwner_slot isNil ifTrue: [^false].
+	anOwner isNil ifTrue: [^false].
+	^currentFocusOwner_slot = anOwner
+)
+
+public currentFocusDescription ^ <String> = (
+	currentFocusBlock isNil ifTrue: [^'(no focus set)'].
+	^[currentFocusBlock value]
+		on: Error
+		do: [:e | '(focus block raised: ', e messageText, ')']
+)
+
+(* Entry point for the toolbar brain button: if the user has already saved an
+   API key for the Anthropic provider, go straight to a chat; otherwise return
+   the setup subject so the user can enter a key. *)
+public chatLauncher = (
+	^ensureSharedChat
+)
+
+(* Return the cached shared chat subject, or — if no chat has been created yet
+   — a setup subject the caller can navigate to so the user can enter a key.
+   The setup subject's startChat caches the resulting chat in sharedChatSubject_slot. *)
+public ensureSharedChat = (
+	| setup chat |
+	sharedChatSubject_slot isNil ifFalse: [^sharedChatSubject_slot].
+	setup:: IDEChatSetupSubject onModel: AnthropicProvider.
+	setup apiKey isEmpty ifTrue: [^setup].
+	chat:: setup startChat.
+	chat isNil ifTrue: [^setup].
+	(* startChat goes through newChatSubjectFor:, which has already cached. *)
+	^sharedChatSubject_slot
 )
 
 (* --- Class lookup helpers --- *)
@@ -63,6 +195,49 @@ classDeclarationNamed: name <String> ^ <ClassDeclarationMirror> = (
 		Error signal: 'Not a class: ', name
 	].
 	^(ClassMirror reflecting: cls) mixin declaration
+)
+
+resolveNamespacePath: path <String> ^ <Object> = (
+	(* Navigate the namespace tree starting at Root. A leading 'Root.' segment
+	   is optional. Returns the entry (which may be a Namespace, a class, a
+	   Document, an Image, etc.). Signals an error if a segment is not found. *)
+	| parts start current |
+	parts:: path isEmpty ifTrue: [{}] ifFalse: [path findTokens: '.'].
+	current:: Root.
+	start:: (parts isEmpty not and: [(parts at: 1) = 'Root'])
+		ifTrue: [2] ifFalse: [1].
+	start to: parts size do: [:i |
+		| seg = parts at: i. |
+		current:: current at: seg asSymbol ifAbsent: [
+			Error signal: 'Not found in namespace path: ', seg
+		].
+	].
+	^current
+)
+
+kindOf: value <Object> ^ <String> = (
+	value isKindOfNamespace ifTrue: [^'namespace'].
+	value isKindOfBehavior ifTrue: [^'class'].
+	value isKindOfDocument ifTrue: [^'document'].
+	value isKindOfString ifTrue: [^'string'].
+	value isKindOfJSAlien ifTrue: [
+		('IMG' = (value at: 'nodeName')) ifTrue: [^'image'].
+		^'alien'
+	].
+	^'other'
+)
+
+public qualifiedNameOf: cdm <ClassDeclarationMirror> ^ <String> = (
+	(* Walks the enclosing-class chain to produce a dotted path,
+	   e.g. "RuntimeForHopscotchForHTML.Platform.Images". *)
+	| path enclosing |
+	path:: cdm simpleName.
+	enclosing:: cdm enclosingClass.
+	[enclosing isNil] whileFalse: [
+		path:: enclosing simpleName, '.', path.
+		enclosing:: enclosing enclosingClass.
+	].
+	^path
 )
 
 resolveClassPath: path <String> ^ <ClassDeclarationMirror> = (
@@ -98,12 +273,16 @@ formatAccess: am ^ <String> = (
 public tools ^ <List> = (
 	^{
 		getClassSourceTool.
-		getMethodSourceTool.
+		getMemberSourceTool.
 		getClassHeaderTool.
 		listClassMembersTool.
 		sendersTool.
 		implementorsTool.
 		searchClassesTool.
+		listNamespaceTool.
+		getDocumentTool.
+		webFetchTool.
+		currentFocusTool.
 	}
 )
 
@@ -117,11 +296,11 @@ getClassSourceTool ^ <Tool> = (
 		]
 )
 
-getMethodSourceTool ^ <Tool> = (
+getMemberSourceTool ^ <Tool> = (
 	^Tool
-		name: 'get_method_source'
-		description: 'Get the source code of a specific method in a class. Specify the selector (method name) including colons for keyword methods (e.g. "at:put:").'
-		inputSchema: '{"type":"object","properties":{"class_name":{"type":"string","description":"Class name or dotted path"},"selector":{"type":"string","description":"Method selector (e.g. foo, at:put:, +)"},"side":{"type":"string","enum":["instance","class"],"description":"Which side of the class (default: instance)"}},"required":["class_name","selector"]}'
+		name: 'get_member_source'
+		description: 'Get the source of a method or a lazy slot in a class. Specify the selector (the member''s name) including colons for keyword methods (e.g. "at:put:"). Searches the named class side''s methods first, then its lazy slots. For ordinary (non-lazy) slot declarations, use get_class_header.'
+		inputSchema: '{"type":"object","properties":{"class_name":{"type":"string","description":"Class name or dotted path"},"selector":{"type":"string","description":"Method or lazy-slot name (e.g. foo, at:put:, +)"},"side":{"type":"string","enum":["instance","class"],"description":"Which side of the class (default: instance)"}},"required":["class_name","selector"]}'
 		handler: [:input |
 			| cdm mixin selector found result |
 			cdm:: resolveClassPath: (input at: 'class_name').
@@ -146,7 +325,7 @@ getMethodSourceTool ^ <Tool> = (
 				].
 			].
 			found ifFalse: [
-				Error signal: 'Method not found: ', selector,
+				Error signal: 'No method or lazy slot named ', selector,
 					' in ', cdm simpleName
 			].
 			result
@@ -166,7 +345,7 @@ getClassHeaderTool ^ <Tool> = (
 listClassMembersTool ^ <Tool> = (
 	^Tool
 		name: 'list_class_members'
-		description: 'List all members (methods, slots, nested classes, lazy slots) of a class with their access modifiers. Does not include source code - use get_method_source for that.'
+		description: 'List all members (methods, slots, nested classes, lazy slots) of a class with their access modifiers. Does not include source code - use get_member_source for that.'
 		inputSchema: '{"type":"object","properties":{"class_name":{"type":"string","description":"Class name or dotted path"}},"required":["class_name"]}'
 		handler: [:input |
 			| cdm result |
@@ -224,13 +403,20 @@ sendersTool ^ <Tool> = (
 				count:: count + 1.
 				mirror isKindOfMethodMirror ifTrue: [
 					result:: result, '  ',
-						mirror definingMixin declaration simpleName, ' >> ',
+						(qualifiedNameOf: mirror definingMixin declaration), ' >> ',
 						mirror name, '\n'.
-				].
-				mirror isKindOfClassDeclarationMirror ifTrue: [
-					result:: result, '  ',
-						mirror simpleName, ' (class header)\n'.
-				].
+				] ifFalse: [
+					mirror isKindOfLazySlotMirror ifTrue: [
+						result:: result, '  ',
+							(qualifiedNameOf: mirror definingMixin declaration), ' >> ',
+							mirror name, ' (lazy slot)\n'.
+					] ifFalse: [
+						mirror isKindOfClassDeclarationMirror ifTrue: [
+							result:: result, '  ',
+								(qualifiedNameOf: mirror), ' (class header)\n'.
+						]
+					]
+				]
 			].
 			count = 0 ifTrue: [
 				result:: result, '  (none found)\n'.
@@ -251,21 +437,85 @@ implementorsTool ^ <Tool> = (
 			count:: 0.
 			systemScope implementorsOf: selector do: [:mirror |
 				count:: count + 1.
+				mirror isKindOfLazySlotMirror ifTrue: [
+					result:: result, '  ',
+						(formatAccess: mirror accessModifier),
+						(qualifiedNameOf: mirror definingMixin declaration), ' >> ',
+						mirror name, ' (lazy slot)\n'.
+				].
 				mirror isKindOfMethodMirror ifTrue: [
 					result:: result, '  ',
 						(formatAccess: mirror accessModifier),
-						mirror definingMixin declaration simpleName, ' >> ',
+						(qualifiedNameOf: mirror definingMixin declaration), ' >> ',
 						mirror name, '\n'.
 				].
 				mirror isKindOfClassDeclarationMirror ifTrue: [
 					result:: result, '  ',
-						mirror simpleName, ' (class/slot)\n'.
+						(qualifiedNameOf: mirror), ' (class/slot)\n'.
 				].
 			].
 			count = 0 ifTrue: [
 				result:: result, '  (none found)\n'.
 			].
 			result
+		]
+)
+
+listNamespaceTool ^ <Tool> = (
+	^Tool
+		name: 'list_namespace'
+		description: 'List the entries of a Newspeak namespace. With no argument (or an empty path), lists the IDE Root namespace. Use a dotted path to drill into a nested namespace (e.g. "Icons" or "Root.Icons"). Each entry is reported as "name (kind)" where kind is one of: namespace, class, document, string, image, alien, other.'
+		inputSchema: '{"type":"object","properties":{"path":{"type":"string","description":"Optional dotted path to a namespace. Empty or omitted means Root."}}}'
+		handler: [:input |
+			| path ns label result |
+			(* input is a JS Alien — use includesKey: rather than at:ifAbsent:,
+			   which the alien does not understand. *)
+			path:: (input includesKey: 'path')
+				ifTrue: [input at: 'path']
+				ifFalse: [''].
+			ns:: resolveNamespacePath: path.
+			label:: path isEmpty ifTrue: ['Root'] ifFalse: [path].
+			result:: 'Namespace ', label, ':\n'.
+			ns keysAndValuesDo: [:k :v |
+				result:: result, '  ', k, ' (', (kindOf: v), ')\n'.
+			].
+			result
+		]
+)
+
+currentFocusTool ^ <Tool> = (
+	^Tool
+		name: 'current_focus'
+		description: 'Return a description of what the user is currently asking about in the IDE — the class, method, namespace, document or other entity they pointed the chat at, plus any in-progress (unaccepted) edits if relevant. Returns "(no focus set)" if the user has not indicated a focus. Call this first whenever the user refers to "this", "here", or names a member without a class, before guessing.'
+		inputSchema: '{"type":"object","properties":{}}'
+		handler: [:input |
+			currentFocusDescription
+		]
+)
+
+webFetchTool ^ <Tool> = (
+	^Tool
+		name: 'web_fetch'
+		description: 'Fetch a URL and return its response body as text. Useful for consulting the published Newspeak language specification and grammar (https://newspeaklanguage.org/spec/newspeak-spec.tex) or the tutorial (https://newspeaklanguage.org/pubs/newspeak-2025-tutorial.pdf), and for other web lookups. The response is returned as a single string; for binary content (PDFs, images) the text decoding may be lossy.'
+		inputSchema: '{"type":"object","properties":{"url":{"type":"string","description":"Absolute URL to fetch (https:// or http://)."}},"required":["url"]}'
+		handler: [:input |
+			aiAccess webFetch: (input at: 'url')
+		]
+)
+
+getDocumentTool ^ <Tool> = (
+	^Tool
+		name: 'get_document'
+		description: 'Get the textual contents of an IDE document (e.g. a literate/Ampleforth document stored in a namespace). Specify the document name or a dotted path to its location in the namespace tree.'
+		inputSchema: '{"type":"object","properties":{"name":{"type":"string","description":"Document name or dotted path (e.g. \"MyNotes\")."}},"required":["name"]}'
+		handler: [:input |
+			| path entry |
+			path:: input at: 'name'.
+			entry:: resolveNamespacePath: path.
+			entry isKindOfDocument ifFalse: [
+				Error signal: 'Not a document: ', path, ' (it is a ', (kindOf: entry), ')'
+			].
+			entry contents
 		]
 )
 
@@ -281,15 +531,9 @@ searchClassesTool ^ <Tool> = (
 			count:: 0.
 			systemScope allClassesDo: [:cdm |
 				(cdm simpleName includesSubstring: query) ifTrue: [
-					| path enclosing |
 					count:: count + 1.
-					path:: cdm simpleName.
-					enclosing:: cdm enclosingClass.
-					[enclosing notNil] whileTrue: [
-						path:: enclosing simpleName, '.', path.
-						enclosing:: enclosing enclosingClass.
-					].
-					result:: result, '  ', (formatAccess: cdm accessModifier), path, '\n'.
+					result:: result, '  ', (formatAccess: cdm accessModifier),
+						(qualifiedNameOf: cdm), '\n'.
 				].
 			].
 			count = 0 ifTrue: [
@@ -303,12 +547,209 @@ searchClassesTool ^ <Tool> = (
 
 (* Create a session with the IDE tools pre-configured. *)
 public createSessionWithProvider: provider <Provider> ^ <Session> = (
-	^Session provider: provider tools: tools
+	| session |
+	session:: Session provider: provider tools: tools.
+	session systemPrompt: newspeakSystemPrompt.
+	^session
 )
 
 (* Create a ChatSubject backed by a new session with IDE tools. *)
-public createChatWithProvider: provider <Provider> ^ <ChatSubject> = (
-	^ChatSubject onModel: (createSessionWithProvider: provider)
+public createChatWithProvider: provider <Provider> ^ <IDEChatSubject> = (
+	^IDEChatSubject onModel: (createSessionWithProvider: provider)
+)
+
+(* System prompt — Newspeak cheat sheet, cached by AnthropicProvider. *)
+public newspeakSystemPrompt ^ <String> = (
+	^'You are a programming assistant for the Newspeak programming language, embedded in the Newspeak Web IDE. Use the tools listed below to look up actual definitions in the user''s running IDE rather than guessing from training — Newspeak documentation is sparse and recall is unreliable. Prefer concise answers; when the user asks about code, show the source you found via tools.
+
+# Newspeak essentials
+
+Newspeak is a pure message-based, object-capability language in the Smalltalk family.
+
+- No global namespace, no static state, no class variables, no pool variables.
+- Names are always method invocations (auto-generated getters); there are no variable references.
+- No assignment operator; slot writes happen through generated setters.
+- Method invocation is the only operation: e m is always a send. There is no dot between receiver and selector.
+- Classes nest arbitrarily. Inheritance is via mixins; the superclass clause is itself a message send.
+
+# Class declarations
+
+A class header has the form:
+  class Name primaryFactoryHeader = SuperFactory (| slots |) ( instanceMembers ) : ( classSideMembers )
+
+The first parenthesized block after = is the instance initializer (slot declarations plus setup code). The next parenthesized block is the body of instance-side members. The optional ": (...)" declares class-side members.
+
+Examples:
+
+  class Point x: i y: j = (| public x ::= i. public y ::= j. |) (
+    public printString = (^''x='', x printString, '' y='', y printString)
+  ) : ()
+
+  class ShapeLibrary usingPlatform: platform = (
+    | private List = platform collections List. |) (
+    public class Shape = ( ... )( ... ) : ()
+    public class Circle = Shape (...)(...) : ()
+  ) : ()
+
+A top-level module definition is a class whose factory takes a manifest or platform parameter. The manifest/platform supplies the module''s dependencies — modules and library objects it needs.
+
+# Slots vs methods (very easy to confuse — these are distinct syntactic forms)
+
+SLOTS sit inside vertical bars |...| and use a bare expression (NO parentheses around the initializer, NO method body).
+
+  | public x = 0.                   "immutable slot, initialized to 0"
+    public x ::= 0.                 "mutable slot (auto-generated setter x:)"
+    public x.                       "mutable slot, defaults to nil"
+    lazy public x = computeIt.      "lazy immutable slot; computeIt is evaluated on first access"
+    lazy public x ::= computeIt.    "lazy mutable slot"
+    protected y. private z.         "narrower visibility — same forms"
+  |
+
+Mutually recursive (simultaneous) slot declarations use double bars: || a = ... . b = ... . ||
+
+METHODS sit OUTSIDE the slot bars and DO use parentheses around the body:
+
+  public m = ( ^expr )
+  public m: arg = ( body. ^result )
+  public m ^ <ReturnType> = ( body )
+
+The presence or absence of "( ... )" after "=" is the only thing distinguishing a no-arg method from a slot. "lazy slotName = computeIt." is a slot. "lazy slotName = ( computeIt )" is wrong — there is no "lazy" method modifier.
+
+# Setter syntax
+
+- Implicit-receiver setter:  slot:: value.   (short for self slot: value.)
+- Explicit-receiver setter:  obj slot: value.
+- "::" is ONLY for implicit-receiver setter sends. Never use it with an explicit receiver.
+
+# Sends
+
+Five send forms with distinct visibility rules:
+
+- Ordinary             e m       Receiver e; only public members.
+- Self                 self m    Public, protected, private of self''s class.
+- Super                super m   Public, protected of superclasses.
+- Implicit (here)      m         Looks up in enclosing lexical scope (any modifier), then in self''s superclasses (public/protected).
+- Outer                outer C m C names a lexically enclosing class. Reaches members declared in C (any modifier) and public/protected of C''s superclasses.
+
+# Access modifiers
+
+public, protected, private. The default modifier on a declared member is protected.
+
+# Member ordering
+
+Inside a class body, ALL nested-class declarations must precede method declarations. The compiler enforces this.
+
+# Comments and literals
+
+- Comments:  (* ... *)   nestable.
+- Strings:   single-quote delimited; doubled apostrophe for a literal quote.
+- Symbols:   #foo  #at:put:
+- Numbers:   42  3.14
+- Booleans:  true  false
+- Nil:       nil
+- Tuples:    { a. b. c }
+- Blocks:    [:x | body]   invoked via value, value:, value:value:, etc.
+
+# Types (advisory only)
+
+Type annotations are unenforced documentation read by the typechecker (a linter). Placement:
+
+- After slot:              public x <Integer> = 0.
+- After parameter:         m: x <Integer>
+- After method header:     m ^ <Boolean> = ( ... )
+- Class generics:          class Map <[K, V]> new: cap = ... ( ... ) : ()
+- Generic instantiation:   List[Point]  Map[String, Integer]
+
+# Reflection (mirrors)
+
+Get mirrors from "platform mirrors":
+
+- ClassMirror reflecting: aClass       class mirror.
+- ObjectMirror reflecting: anObject    object mirror.
+
+On a ClassMirror:
+- mixin                  the MixinMirror.
+- mixin declaration      ClassDeclarationMirror (source, header, instanceSide, classSide).
+- mixin methods, mixin slots, mixin lazySlots, mixin nestedClasses.
+
+# Platform and IDE namespace
+
+The platform object p exposes capabilities:
+  p kernel  p collections  p mirrors  p actors  p js  p hopscotch  p graphics  p fonts  p text
+
+p js global is the JavaScript global namespace.
+
+The IDE maintains an extra-linguistic namespace at "ide namespacing Root" — a Map keyed by Symbol. Sub-namespaces include Icons (image aliens) and Categories. Top-level classes, documents, and other values live directly in Root.
+
+Namespace protocol: at:, at:put:, at:ifAbsent:, keys, keysAndValuesDo:, includesKey:, predicate isKindOfNamespace.
+
+# Ampleforth documents
+
+An Ampleforth document is a live HTML document that mixes prose with embedded live Hopscotch widgets. Documents are first-class IDE entities, stored in the namespace as instances of Document subclasses (one class per named document, nested in the IDE''s documentHolder).
+
+Document slots:
+- name <String>
+- contents <String>                      the HTML text.
+- mediaRegistry <Map[String, Blob]>      embedded media (images, audio, video).
+
+Document inherits from ProgrammingPresenter, so all Hopscotch fragment builders are available (label:, link:, button:, column:, row:, holder:, image:, textDisplay:, ...). This is so amplet expressions evaluated against a Document can use those builders directly.
+
+The get_document tool returns the document''s contents (HTML).
+
+# Amplets
+
+An amplet is a placeholder inside a document''s HTML:
+
+  <div class="ampleforth" ampletId="..." name="EXPR" contenteditable="false"> ... </div>
+
+The "name" attribute is a Newspeak expression. When the document renders, each amplet''s expression is evaluated as a message send against the host Document instance; the resulting Fragment replaces the placeholder.
+
+Because Document inherits from ProgrammingPresenter, amplet expressions can call fragment builders directly, e.g.:
+
+- label: ''Hello''
+- button: ''Run'' action: [doSomething]
+- inspect: anObject
+- evaluate: ''someExpression''
+- column: { ... }   row: { ... }
+
+Document also offers addMethodFromSource:, addClassFromSource:, addLazySlotFromSource:, so an amplet can extend its host document''s API mid-document. Document''s doesNotUnderstand: looks up unknown names in Root, so amplets can reach top-level entities directly.
+
+Amplet evaluation is incremental: if an amplet''s expression text hasn''t changed since the last render (tracked by ampletId), the existing fragment is reused — important for preserving UI state.
+
+# Style guidelines
+
+- Whitespace between keyword and argument: "at: 1 put: x" (not "at:1 put:x").
+- For a keyword argument that is itself a keyword send, prefer "foo:: x bar: y" over "foo: (x bar: y)".
+- Comments precede the construct they describe.
+- Never use "::" with an explicit receiver — that is invalid syntax.
+- Keep classes before methods inside the class body.
+
+# Navigating nested classes
+
+Classes nest, often several levels deep, and only top-level (module) classes have a unique simple name. Tool output always reports a class by its *dotted path* from the top-level module — e.g. "RuntimeForHopscotchForHTML.Platform.Images" means the class "Images" nested in "Platform" nested in the top-level class "RuntimeForHopscotchForHTML". Treat the leftmost segment as the module that "owns" the definition. Pass the same dotted path back into get_class_source, get_class_header, list_class_members, get_member_source to read or drill into that class.
+
+If you find an inner class by simple name and want to know where it is defined, you can either rely on the dotted path the tools return, or run implementors_of on the class''s own name — the matches will be the enclosing classes'' headers and slots that expose it.
+
+# Using the IDE tools
+
+Prefer tool calls to recalling from training data — many features here are specific to this codebase.
+
+- list_namespace      List entries of a namespace; defaults to Root; dotted paths like Icons or Root.Icons drill in.
+- search_classes      Substring search across all classes (including nested), returns dotted paths.
+- get_class_source    Full source of a class. Use dotted paths for nested classes (e.g. Outer.Inner).
+- get_class_header    Just the header (factory, superclass, slots).
+- list_class_members  Structured listing with access modifiers, both sides.
+- get_member_source   Source of a method or a lazy slot. Set side: "class" for class-side; default is instance.
+- senders_of, implementors_of    Cross-cutting selector lookups across the system.
+- get_document        HTML contents of a Document, by name or dotted path.
+- current_focus       What the user is currently asking about — set when the user opens the chat from a presenter or otherwise signals focus. Call this FIRST when the user says "this", "here", "the current method", refers to a member without naming its class, or otherwise speaks deictically. If the focus is "(no focus set)", ask the user or use other tools.
+- web_fetch           Fetch any URL and return its text body. Use this when you need the authoritative definition of a Newspeak construct. The published reference material is:
+                        - Newspeak Language Specification (grammar in EBNF + prose):
+                          https://newspeaklanguage.org/spec/newspeak-spec.tex
+                        - Newspeak 2025 Tutorial (PDF; text extraction may be lossy):
+                          https://newspeaklanguage.org/pubs/newspeak-2025-tutorial.pdf
+
+When the user asks about an entity in their system, use the IDE tools to look it up before answering. When in doubt about Newspeak syntax or semantics, fetch the spec rather than guessing. When you produce Newspeak source, follow the style guidelines above and respect member ordering (nested classes before methods).'
 )
 
 ) : (

@@ -19,6 +19,7 @@ class AIAccess usingPlatform: platform = (
 	private Map = platform collections Map.
 	private global = platform js global.
 	private JSON = global at: #JSON.
+	private Promise = global at: #Promise.
 |
 ) (
 
@@ -81,7 +82,18 @@ public complete: messages <Alien[Array]>
 	body at: 'max_tokens' put: maxTokens.
 	body at: 'messages' put: messages.
 	systemPrompt isEmpty ifFalse: [
-		body at: 'system' put: systemPrompt.
+		(* Send system as a content-block array with cache_control so Anthropic
+		   caches the (long, static) Newspeak prompt across turns. *)
+		| sysArr textBlock cacheControl |
+		sysArr:: createJSArray.
+		textBlock:: createJSObject.
+		textBlock at: 'type' put: 'text'.
+		textBlock at: 'text' put: systemPrompt.
+		cacheControl:: createJSObject.
+		cacheControl at: 'type' put: 'ephemeral'.
+		textBlock at: 'cache_control' put: cacheControl.
+		sysArr push: textBlock.
+		body at: 'system' put: sysArr.
 	].
 	tools isNil ifFalse: [
 		(tools at: 'length') > 0 ifTrue: [
@@ -197,25 +209,38 @@ toolUseBlocksFrom: response ^ <List> = (
 
 (* --- Tool execution --- *)
 
-executeToolCall: toolUseBlock ^ <Alien> = (
-	| toolName input tool result |
+(* Returns a Promise resolving to a tool_result content block. Handlers may
+   return a String (synchronous result) or a Promise<String> (e.g. a web
+   fetch). Both forms are normalized to a Promise<tool_result_block>. *)
+executeToolCall: toolUseBlock ^ <Alien[Promise]> = (
+	| toolName input tool id resultOrPromise |
+	id:: toolUseBlock at: 'id'.
 	toolName:: toolUseBlock at: 'name'.
 	input:: toolUseBlock at: 'input'.
 	tool:: toolMap at: toolName ifAbsent: [
-		^makeToolResult: (toolUseBlock at: 'id')
+		^Promise resolve: (makeToolResult: id
 			content: 'Unknown tool: ', toolName
-			isError: true
+			isError: true)
 	].
-	[
-		result:: tool handler value: input.
-		^makeToolResult: (toolUseBlock at: 'id')
-			content: result
-			isError: false
-	] on: Exception do: [:e |
-		^makeToolResult: (toolUseBlock at: 'id')
-			content: 'Error: ', e messageText
-			isError: true
-	]
+	resultOrPromise:: [tool handler value: input]
+		on: Exception
+		do: [:e |
+			^Promise resolve: (makeToolResult: id
+				content: 'Error: ', e messageText
+				isError: true)
+		].
+	(* Promise-returning handler: chain. *)
+	(resultOrPromise isKindOfJSAlien and: [resultOrPromise includesKey: 'then']) ifTrue: [
+		^resultOrPromise
+			then: [:text | makeToolResult: id content: text isError: false]
+			onError: [:err |
+				makeToolResult: id
+					content: 'Error: ', err printString
+					isError: true
+			]
+	].
+	(* Synchronous result. *)
+	^Promise resolve: (makeToolResult: id content: resultOrPromise isError: false)
 )
 
 makeToolResult: id content: text isError: err ^ <Alien> = (
@@ -248,19 +273,20 @@ completeWithToolLoop ^ <Alien[Promise]> = (
 
 		(hasToolUse: response)
 			ifTrue: [
-				| toolBlocks results toolResultMsg |
+				| toolBlocks promises |
 				toolBlocks:: toolUseBlocksFrom: response.
-				results:: createJSArray.
-				toolBlocks do: [:tb | results push: (executeToolCall: tb)].
-
-				toolResultMsg:: createJSObject.
-				toolResultMsg at: 'role' put: 'user'.
-				toolResultMsg at: 'content' put: results.
-				apiMessages add: toolResultMsg.
-
-				notifyUpdate.
-				(* Continue conversation *)
-				completeWithToolLoop
+				promises:: createJSArray.
+				toolBlocks do: [:tb | promises push: (executeToolCall: tb)].
+				(* Await all tool results, then continue the conversation. *)
+				(Promise all: promises) then: [:results |
+					| toolResultMsg |
+					toolResultMsg:: createJSObject.
+					toolResultMsg at: 'role' put: 'user'.
+					toolResultMsg at: 'content' put: results.
+					apiMessages add: toolResultMsg.
+					notifyUpdate.
+					completeWithToolLoop
+				]
 			]
 			ifFalse: [
 				notifyUpdate.
@@ -344,6 +370,21 @@ createJSObject ^ <Alien> = (
 
 createJSArray ^ <Alien> = (
 	^JSON parse: '[]'
+)
+
+(* Fetch a URL and resolve to the response body as a String. The returned
+   Promise rejects with an Error on non-2xx HTTP responses. Tools can return
+   this Promise directly. *)
+public webFetch: url <String> ^ <Alien[Promise]> = (
+	| options |
+	options:: createJSObject.
+	options at: 'method' put: 'GET'.
+	^(global fetch: url with: options) then: [:response |
+		(response at: 'ok') ifFalse: [
+			Error signal: 'HTTP ', (response at: 'status') printString, ' fetching ', url
+		].
+		response text
+	]
 )
 
 ) : (

@@ -18,6 +18,7 @@ class AI_IDE_Support usingPlatform: platform ide: webIde aiAccess: aiAccessModul
 	private systemScope = webIde namespacing systemScope.
 	private ClassMirror = platform mirrors ClassMirror.
 	private ObjectMirror = platform mirrors ObjectMirror.
+	private ActivationMirror = platform mirrors ActivationMirror.
 	private List = platform collections List.
 	private ide = webIde.
 
@@ -262,6 +263,23 @@ resolveClassPath: path <String> ^ <ClassDeclarationMirror> = (
 	^cdm
 )
 
+namespaceSubjectForPath: path <String> ^ <Object> = (
+	(* Build a NamespaceSubject for the namespace at the given dotted path,
+	   or for Root if the path is empty or 'Root'. Raises an error if the
+	   path resolves to something that is not a Namespace. *)
+	| parts ns key |
+	(path isEmpty or: [path = 'Root']) ifTrue: [
+		^ide browsing NamespaceSubject new
+	].
+	ns:: resolveNamespacePath: path.
+	ns isKindOfNamespace ifFalse: [
+		Error signal: path, ' is not a namespace (it is a ', (kindOf: ns), ')'
+	].
+	parts:: path findTokens: '.'.
+	key:: (parts at: parts size) asSymbol.
+	^ide browsing NamespaceSubject onModel: ns key: key
+)
+
 formatAccess: am ^ <String> = (
 	am = #public ifTrue: [^'public '].
 	am = #private ifTrue: [^'private '].
@@ -283,6 +301,11 @@ public tools ^ <List> = (
 		getDocumentTool.
 		webFetchTool.
 		currentFocusTool.
+		navigateToClassTool.
+		navigateToNamespaceTool.
+		navigateToDocumentTool.
+		showTestsTool.
+		runTestsTool.
 	}
 )
 
@@ -543,6 +566,91 @@ searchClassesTool ^ <Tool> = (
 		]
 )
 
+navigateToClassTool ^ <Tool> = (
+	^Tool
+		name: 'navigate_to_class'
+		description: 'Navigate the IDE to a class, opening a class presenter on it. Use a dotted path for nested classes (e.g. "ShapeLibrary.Circle"). Side effect: the IDE jumps; use only when the user has expressed intent to navigate.'
+		inputSchema: '{"type":"object","properties":{"class_name":{"type":"string","description":"Class name or dotted path"}},"required":["class_name"]}'
+		handler: [:input |
+			| cdm |
+			cdm:: resolveClassPath: (input at: 'class_name').
+			ide browsing navigateTo: (ide browsing ClassSubject onDeclaration: cdm).
+			'Opened class ', (qualifiedNameOf: cdm)
+		]
+)
+
+navigateToNamespaceTool ^ <Tool> = (
+	^Tool
+		name: 'navigate_to_namespace'
+		description: 'Navigate the IDE to a namespace, opening a namespace presenter. With no argument (or empty path), opens Root. Use a dotted path for nested namespaces (e.g. "Icons" or "Root.Icons"). Side effect: the IDE jumps.'
+		inputSchema: '{"type":"object","properties":{"path":{"type":"string","description":"Optional dotted path. Empty or omitted means Root."}}}'
+		handler: [:input |
+			| path subject |
+			path:: (input includesKey: 'path')
+				ifTrue: [input at: 'path']
+				ifFalse: [''].
+			subject:: namespaceSubjectForPath: path.
+			ide browsing navigateTo: subject.
+			'Opened namespace ', subject title
+		]
+)
+
+navigateToDocumentTool ^ <Tool> = (
+	^Tool
+		name: 'navigate_to_document'
+		description: 'Navigate the IDE to an Ampleforth document by name or dotted path. Side effect: the IDE jumps.'
+		inputSchema: '{"type":"object","properties":{"name":{"type":"string","description":"Document name or dotted path"}},"required":["name"]}'
+		handler: [:input |
+			| path entry |
+			path:: input at: 'name'.
+			entry:: resolveNamespacePath: path.
+			entry isKindOfDocument ifFalse: [
+				Error signal: 'Not a document: ', path, ' (it is a ', (kindOf: entry), ')'
+			].
+			ide browsing navigateTo: (ide documents DocumentSubject onModel: entry).
+			'Opened document ', path
+		]
+)
+
+showTestsTool ^ <Tool> = (
+	^Tool
+		name: 'show_tests'
+		description: 'Open the test-suite view for a test configuration class — equivalent to clicking the [show tests] link on a test configuration''s class entry. Pass the test configuration class''s dotted path. This does not run the suite.'
+		inputSchema: '{"type":"object","properties":{"class_name":{"type":"string","description":"Test configuration class name or dotted path"}},"required":["class_name"]}'
+		handler: [:input |
+			| cdm classSubject |
+			cdm:: resolveClassPath: (input at: 'class_name').
+			classSubject:: ide browsing ClassSubject onDeclaration: cdm.
+			classSubject isTestConfiguration ifFalse: [
+				Error signal: (qualifiedNameOf: cdm), ' is not a test configuration class'
+			].
+			ide browsing navigateTo: classSubject inactiveTestingSubject.
+			'Opened test suite for ', (qualifiedNameOf: cdm)
+		]
+)
+
+runTestsTool ^ <Tool> = (
+	^Tool
+		name: 'run_tests'
+		description: 'Run the test suite for a test configuration class — equivalent to clicking the [run tests] link on a test configuration''s class entry. The IDE jumps to the in-progress test view; if the test runner raises, the IDE navigates to a debugging thread subject instead. Pass the test configuration class''s dotted path.'
+		inputSchema: '{"type":"object","properties":{"class_name":{"type":"string","description":"Test configuration class name or dotted path"}},"required":["class_name"]}'
+		handler: [:input |
+			| cdm classSubject thread |
+			cdm:: resolveClassPath: (input at: 'class_name').
+			classSubject:: ide browsing ClassSubject onDeclaration: cdm.
+			classSubject isTestConfiguration ifFalse: [
+				Error signal: (qualifiedNameOf: cdm), ' is not a test configuration class'
+			].
+			thread:: ActivationMirror invokeSuspended:
+				[ide browsing navigateTo: classSubject testingSubject].
+			thread resume.
+			thread isFulfilled ifFalse: [
+				ide browsing navigateTo: (ide debugging ThreadSubject onModel: thread)
+			].
+			'Running tests for ', (qualifiedNameOf: cdm)
+		]
+)
+
 (* --- Convenience API --- *)
 
 (* Create a session with the IDE tools pre-configured. *)
@@ -748,6 +856,14 @@ Prefer tool calls to recalling from training data — many features here are spe
                           https://newspeaklanguage.org/spec/newspeak-spec.tex
                         - Newspeak 2025 Tutorial (PDF; text extraction may be lossy):
                           https://newspeaklanguage.org/pubs/newspeak-2025-tutorial.pdf
+
+The following tools have SIDE EFFECTS — they move the IDE''s view. Use them only when the user has expressed intent to navigate, not as a way to gather information (the read-only tools above are for that):
+
+- navigate_to_class       Open a class presenter on the named class (dotted path).
+- navigate_to_namespace   Open a namespace presenter; defaults to Root.
+- navigate_to_document    Open an Ampleforth document by name or dotted path.
+- show_tests              Open the test-suite view for a test configuration class (does not run the suite).
+- run_tests               Run the test suite for a test configuration class and open the in-progress view.
 
 When the user asks about an entity in their system, use the IDE tools to look it up before answering. When in doubt about Newspeak syntax or semantics, fetch the spec rather than guessing. When you produce Newspeak source, follow the style guidelines above and respect member ordering (nested classes before methods).'
 )

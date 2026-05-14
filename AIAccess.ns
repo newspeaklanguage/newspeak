@@ -64,11 +64,34 @@ public complete: messages <Alien[Array]>
 public class AnthropicProvider apiKey: key model: mdl = Provider (
 |
 	public apiKey <String> = key.
-	public model <String> = mdl.
+	(* Mutable so the chat UI can switch models mid-session. The session's
+	   history is untouched — the next turn just goes to the new model. *)
+	public model <String> ::= mdl.
 	private apiUrl = 'https://api.anthropic.com/v1/messages'.
 	private apiVersion = '2023-06-01'.
 |
 ) (
+
+(* Models offered by the chat UI's model picker. Curated rather than
+   discovered through the /models endpoint — we want only the few that
+   make sense for IDE work, with friendly display names. Update the list
+   when Anthropic ships a new family. *)
+public availableModels ^ <List[String]> = (
+	^{
+		'claude-opus-4-7'.
+		'claude-sonnet-4-6'.
+		'claude-haiku-4-5'.
+		'claude-sonnet-4-20250514'.  (* legacy default, for back-compat *)
+	}
+)
+
+public displayNameFor: modelId <String> ^ <String> = (
+	modelId = 'claude-opus-4-7' ifTrue: [^'Opus 4.7'].
+	modelId = 'claude-sonnet-4-6' ifTrue: [^'Sonnet 4.6'].
+	modelId = 'claude-haiku-4-5' ifTrue: [^'Haiku 4.5'].
+	modelId = 'claude-sonnet-4-20250514' ifTrue: [^'Sonnet 4 (legacy)'].
+	^modelId
+)
 
 public complete: messages <Alien[Array]>
 	system: systemPrompt <String>
@@ -115,7 +138,9 @@ public complete: messages <Alien[Array]>
 	^(global fetch: apiUrl with: options) then: [:response |
 		(response at: 'ok')
 			ifFalse: [
-				Error signal: 'Anthropic API error: ', (response at: 'status') printString
+				Error signal: 'Anthropic API error: ',
+					(response at: 'status') printString,
+					' ', (response at: 'statusText')
 			].
 		response json
 	]
@@ -264,11 +289,21 @@ completeWithToolLoop ^ <Alien[Promise]> = (
 		tools: buildToolsJS
 		maxTokens: maxTokens
 	) then: [:response |
-		| assistantMsg |
-		(* Add assistant response to history *)
+		| assistantMsg content |
+		(* Defensive: we have observed intermittent 200-OK responses with no
+		   content array (CDN edge case / refusal-with-no-body / transient
+		   server-side glitch). Failing fast here keeps the history clean —
+		   storing an undefined content corrupts apiMessages and breaks every
+		   subsequent send. *)
+		content:: response at: 'content'.
+		content isNil ifTrue: [
+			Error signal: 'API response missing content. stop_reason: ',
+				([(response at: 'stop_reason') printString]
+					on: Error do: [:e | '(absent)'])
+		].
 		assistantMsg:: createJSObject.
 		assistantMsg at: 'role' put: 'assistant'.
-		assistantMsg at: 'content' put: (response at: 'content').
+		assistantMsg at: 'content' put: content.
 		apiMessages add: assistantMsg.
 
 		(hasToolUse: response)
@@ -336,13 +371,19 @@ public displayMessages ^ <List> = (
 			].
 		].
 		role = 'assistant' ifTrue: [
-			| text |
+			| text content |
 			text:: ''.
-			0 to: ((msg at: 'content') at: 'length') - 1 do: [:i |
-				| block |
-				block:: (msg at: 'content') at: i.
-				(block at: 'type') = 'text' ifTrue: [
-					text:: text, (block at: 'text').
+			content:: msg at: 'content'.
+			(* Defensive: prior to the completeWithToolLoop content-validation
+			   fix, an undefined-content response could end up in history.
+			   Don't crash the UI when rendering such a message. *)
+			content isNil ifFalse: [
+				0 to: (content at: 'length') - 1 do: [:i |
+					| block |
+					block:: content at: i.
+					(block at: 'type') = 'text' ifTrue: [
+						text:: text, (block at: 'text').
+					].
 				].
 			].
 			text isEmpty ifFalse: [

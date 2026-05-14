@@ -19,7 +19,9 @@ class AI_IDE_Support usingPlatform: platform ide: webIde aiAccess: aiAccessModul
 	private ClassMirror = platform mirrors ClassMirror.
 	private ObjectMirror = platform mirrors ObjectMirror.
 	private ActivationMirror = platform mirrors ActivationMirror.
+	private ClassDeclarationBuilder = platform mirrors ClassDeclarationBuilder.
 	private List = platform collections List.
+	private Map = platform collections Map.
 	private ide = webIde.
 
 	(* General-purpose AI modules *)
@@ -36,21 +38,53 @@ class AI_IDE_Support usingPlatform: platform ide: webIde aiAccess: aiAccessModul
 	private BaseChatSubject = chatUI ChatSubject.
 	private BaseChatPresenter = chatUI ChatPresenter.
 
-	(* Current AI focus — a block [ ^String ] producing a fresh description of
-	   what the user is currently asking about, or nil if no focus has been set.
-	   A block (not a snapshot) lets the description reflect live state, e.g.
-	   the current text of an in-progress edit. *)
-	currentFocusBlock ::= nil.
+	(* --- AI focus state ---
 
-	(* The owner of the current focus — typically the Subject whose brain
-	   button installed the focus. Used to highlight that brain button so the
-	   user can tell which view the chat is currently focused on. *)
-	currentFocusOwner_slot ::= nil.
+	   Brain buttons in the IDE install a focus describing what the user is
+	   currently asking the chat about. Three orthogonal pieces of state:
+
+	   1. currentFocusBlock — a [ ^String ] block producing a description on
+	      demand. Returned by the current_focus tool. A block (not a snapshot)
+	      lets the description reflect live state — e.g. an in-progress
+	      unaccepted edit, post-replacement updated source.
+
+	   2. currentFocusValidator — a [ ^Boolean ] block that checks whether the
+	      focused entity still exists. Run on every current_focus call. Returns
+	      false (or raises) → focus is cleared. This catches all paths by which
+	      an entity can disappear (explicit delete, add_or_replace_nested_class,
+	      etc.) without each path needing to know about the focus.
+
+	   3. focusKind / focusClassPath / focusSide / focusSelector — structured
+	      identity used by isFocusedOnX:... matchers. Brain-button highlighting
+	      compares against this rather than the Subject that installed the
+	      focus. Reason: atomic install only forwards mixin objects, not
+	      individual methods, so MethodMirror equality fails after a replace,
+	      MirrorGroupSubject>>updateElements creates a fresh MethodSubject,
+	      and any Subject-object-identity check fails. Structural matching
+	      survives that. *)
+
+	currentFocusBlock
+	currentFocusValidator
+	(* focusKind: #class | #classHeader | #method | #lazySlot | nil *)
+	focusKind
+	(* focusClassPath: String, dotted path *)
+	focusClassPath
+	(* focusSide: 'instance' | 'class' | nil *)
+	focusSide
+	(* focusSelector: Symbol — method or lazy-slot name, or nil *)
+	focusSelector
 
 	(* Single shared chat subject, lazily created on first use (e.g. when the
 	   user clicks any brain button). Once created, all brain buttons reuse it
 	   so the conversation continues as the user navigates. *)
-	sharedChatSubject_slot ::= nil.
+	sharedChatSubject_slot
+
+	(* AI-proposed code changes staged for atomic install. Keyed by
+	   changeset id (e.g. "cs1"); the value is a List of change records
+	   (Maps with kind, class_name, side, and either source or selector
+	   plus old_source). Cleared on apply or discard. *)
+	proposedChangesets = Map new.
+	nextChangesetIdNum ::= 0.
 |
 ) (
 
@@ -136,29 +170,157 @@ isMyKind: other = ( ^other isKindOfIDEChatPresenter )
    pull, so live state (e.g. unaccepted edits) flows through automatically.
    To clear focus, pass nil. *)
 
-public setFocus: aBlock = (
+(* Internal: install a description block and an existence validator.
+   Brain buttons should call the kind-specific setXFocusOn: helpers below
+   rather than this one; those also set the structured identity slots
+   required by isFocusedOnX: matchers. *)
+installFocusDescription: aBlock validator: aValidator = (
 	currentFocusBlock:: aBlock.
-	currentFocusOwner_slot:: nil.
+	currentFocusValidator:: aValidator.
 )
 
-public setFocus: aBlock owner: anOwner = (
-	currentFocusBlock:: aBlock.
-	currentFocusOwner_slot:: anOwner.
+(* Kind-specific focus installers. Each sets:
+   - the structured identity (focusKind, focusClassPath, focusSide,
+     focusSelector) used by isFocusedOnX:... matchers for brain-button
+     highlighting,
+   - a description block returned by the current_focus AI tool,
+   - an existence validator that re-checks the entity on every read. *)
+
+public setClassFocusOn: cdm = (
+	| qname |
+	qname:: qualifiedNameOf: cdm.
+	focusKind:: #class.
+	focusClassPath:: qname.
+	focusSide:: nil.
+	focusSelector:: nil.
+	installFocusDescription: ['Class: ', qname]
+		validator: [classStillExists: cdm]
+)
+
+public setClassHeaderFocusOn: cdm = (
+	| qname |
+	qname:: qualifiedNameOf: cdm.
+	focusKind:: #classHeader.
+	focusClassPath:: qname.
+	focusSide:: nil.
+	focusSelector:: nil.
+	installFocusDescription: ['Class header (factory + slots) of class ', qname]
+		validator: [classStillExists: cdm]
+)
+
+public setMethodFocusOn: cdm side: side selector: sel = (
+	| qname selSym |
+	qname:: qualifiedNameOf: cdm.
+	selSym:: sel asSymbol.
+	focusKind:: #method.
+	focusClassPath:: qname.
+	focusSide:: side.
+	focusSelector:: selSym.
+	installFocusDescription: ['Method: ', qname, ' (', side, ' side) >> ', selSym asString]
+		validator: [methodStillExists: cdm side: side selector: selSym]
+)
+
+public setLazySlotFocusOn: cdm side: side name: name = (
+	| qname nameSym |
+	qname:: qualifiedNameOf: cdm.
+	nameSym:: name asSymbol.
+	focusKind:: #lazySlot.
+	focusClassPath:: qname.
+	focusSide:: side.
+	focusSelector:: nameSym.
+	installFocusDescription: ['Lazy slot: ', qname, ' (', side, ' side) >> ', nameSym asString]
+		validator: [lazySlotStillExists: cdm side: side name: nameSym]
+)
+
+(* Structural matchers — brain buttons call these so highlighting tracks
+   the focused entity (class path + side + selector) regardless of whether
+   the Subject object survived atomic install. *)
+
+public isFocusedOnClass: cdm ^ <Boolean> = (
+	focusKind = #class ifFalse: [^false].
+	^focusClassPath = (qualifiedNameOf: cdm)
+)
+
+public isFocusedOnClassHeader: cdm ^ <Boolean> = (
+	focusKind = #classHeader ifFalse: [^false].
+	^focusClassPath = (qualifiedNameOf: cdm)
+)
+
+public isFocusedOnMethod: cdm side: side selector: sel ^ <Boolean> = (
+	focusKind = #method ifFalse: [^false].
+	focusClassPath = (qualifiedNameOf: cdm) ifFalse: [^false].
+	focusSide = side ifFalse: [^false].
+	^focusSelector = sel asSymbol
+)
+
+public isFocusedOnLazySlot: cdm side: side name: name ^ <Boolean> = (
+	focusKind = #lazySlot ifFalse: [^false].
+	focusClassPath = (qualifiedNameOf: cdm) ifFalse: [^false].
+	focusSide = side ifFalse: [^false].
+	^focusSelector = name asSymbol
+)
+
+(* Existence checks used by the structured focus validators. Each resolves
+   the qualified class path freshly through the namespace and compares via
+   ClassDeclarationMirror>>= (which compares the underlying mixins). After
+   atomic-install instance forwarding, a replaced class's old mirror and a
+   freshly-resolved mirror compare equal because both reach the same
+   (forwarded) mixin. Deletions cause resolveClassPath: to raise; the
+   on:Error handler returns false. *)
+
+public classStillExists: cdm ^ <Boolean> = (
+	^[(resolveClassPath: (qualifiedNameOf: cdm)) = cdm]
+		on: Error do: [:e | false]
+)
+
+public methodStillExists: cdm side: side selector: sel ^ <Boolean> = (
+	^[
+		| resolved mixin |
+		resolved:: resolveClassPath: (qualifiedNameOf: cdm).
+		resolved = cdm
+			and: [
+				mixin:: side = 'class'
+					ifTrue: [resolved classSide]
+					ifFalse: [resolved instanceSide].
+				(findMethodMirrorNamed: sel inMixin: mixin) isNil not
+			]
+	] on: Error do: [:e | false]
+)
+
+public lazySlotStillExists: cdm side: side name: name ^ <Boolean> = (
+	^[
+		| resolved mixin |
+		resolved:: resolveClassPath: (qualifiedNameOf: cdm).
+		resolved = cdm
+			and: [
+				mixin:: side = 'class'
+					ifTrue: [resolved classSide]
+					ifFalse: [resolved instanceSide].
+				(findLazySlotMirrorNamed: name inMixin: mixin) isNil not
+			]
+	] on: Error do: [:e | false]
 )
 
 public clearFocus = (
 	currentFocusBlock:: nil.
-	currentFocusOwner_slot:: nil.
-)
-
-public isFocusedOwner: anOwner ^ <Boolean> = (
-	currentFocusOwner_slot isNil ifTrue: [^false].
-	anOwner isNil ifTrue: [^false].
-	^currentFocusOwner_slot = anOwner
+	currentFocusValidator:: nil.
+	focusKind:: nil.
+	focusClassPath:: nil.
+	focusSide:: nil.
+	focusSelector:: nil.
 )
 
 public currentFocusDescription ^ <String> = (
 	currentFocusBlock isNil ifTrue: [^'(no focus set)'].
+	(* Validate first: if the focused entity no longer exists (because a
+	   changeset deleted or replaced its enclosing class etc.), drop the
+	   focus instead of returning stale text. *)
+	currentFocusValidator isNil ifFalse: [
+		([currentFocusValidator value] on: Error do: [:e | false]) ifFalse: [
+			clearFocus.
+			^'(no focus set)'
+		]
+	].
 	^[currentFocusBlock value]
 		on: Error
 		do: [:e | '(focus block raised: ', e messageText, ')']
@@ -286,6 +448,284 @@ formatAccess: am ^ <String> = (
 	^''
 )
 
+(* --- Proposed-changeset helpers --- *)
+
+freshChangesetId ^ <String> = (
+	nextChangesetIdNum:: nextChangesetIdNum + 1.
+	^'cs', nextChangesetIdNum printString
+)
+
+mixinForChange: change ^ <Object> = (
+	| cdm side |
+	cdm:: resolveClassPath: (change at: 'class_name').
+	side:: (change includesKey: 'side')
+		ifTrue: [change at: 'side']
+		ifFalse: ['instance'].
+	^side = 'class' ifTrue: [cdm classSide] ifFalse: [cdm instanceSide]
+)
+
+findMethodMirrorNamed: selector <Symbol> inMixin: mixin ^ <Object> = (
+	mixin methods do: [:mm | mm name = selector ifTrue: [^mm]].
+	^nil
+)
+
+findLazySlotMirrorNamed: selector <Symbol> inMixin: mixin ^ <Object> = (
+	mixin lazySlots do: [:ls | ls name = selector ifTrue: [^ls]].
+	^nil
+)
+
+isMemberKind: kind ^ <Boolean> = (
+	^kind = 'add_or_replace_method'
+		or: [kind = 'delete_method'
+		or: [kind = 'add_or_replace_lazy_slot'
+		or: [kind = 'delete_lazy_slot']]]
+)
+
+validateChange: change ^ <Object> = (
+	(* Returns a Map record of the validated change. Raises if invalid. *)
+	| kind record |
+	kind:: change at: 'kind'.
+	record:: Map new.
+	record at: 'kind' put: kind.
+	record at: 'class_name' put: (change at: 'class_name').
+	(isMemberKind: kind) ifTrue: [
+		| side mixin sel old |
+		side:: (change includesKey: 'side') ifTrue: [change at: 'side'] ifFalse: ['instance'].
+		(side = 'instance' or: [side = 'class']) ifFalse: [
+			Error signal: 'side must be "instance" or "class", got: ', side
+		].
+		record at: 'side' put: side.
+		mixin:: mixinForChange: change.
+		kind = 'add_or_replace_method' ifTrue: [
+			record at: 'source' put: (change at: 'source'). ^record
+		].
+		kind = 'add_or_replace_lazy_slot' ifTrue: [
+			record at: 'source' put: (change at: 'source'). ^record
+		].
+		kind = 'delete_method' ifTrue: [
+			sel:: (change at: 'selector') asSymbol.
+			record at: 'selector' put: sel.
+			old:: findMethodMirrorNamed: sel inMixin: mixin.
+			old isNil ifTrue: [
+				Error signal: 'No method ', sel, ' on the ', side, ' side of ',
+					(record at: 'class_name')
+			].
+			record at: 'old_source' put: old source.
+			^record
+		].
+		kind = 'delete_lazy_slot' ifTrue: [
+			sel:: (change at: 'selector') asSymbol.
+			record at: 'selector' put: sel.
+			old:: findLazySlotMirrorNamed: sel inMixin: mixin.
+			old isNil ifTrue: [
+				Error signal: 'No lazy slot ', sel, ' on the ', side, ' side of ',
+					(record at: 'class_name')
+			].
+			record at: 'old_source' put: old source.
+			^record
+		].
+	].
+	kind = 'set_class_header' ifTrue: [
+		| cdm |
+		record at: 'source' put: (change at: 'source').
+		cdm:: resolveClassPath: (record at: 'class_name').
+		record at: 'old_source' put: cdm header source.
+		^record
+	].
+	kind = 'add_or_replace_nested_class' ifTrue: [
+		(* class_name is the enclosing class (must already exist). *)
+		record at: 'source' put: (change at: 'source').
+		resolveClassPath: (record at: 'class_name').
+		^record
+	].
+	kind = 'delete_nested_class' ifTrue: [
+		| segments cdm |
+		segments:: (record at: 'class_name') findTokens: '.'.
+		segments size < 2 ifTrue: [
+			Error signal: 'delete_nested_class requires a nested class path (got top-level: ',
+				(record at: 'class_name'),
+				'). Top-level deletion is not supported by this tool.'
+		].
+		cdm:: resolveClassPath: (record at: 'class_name').
+		record at: 'old_source' put: cdm source.
+		^record
+	].
+	kind = 'add_top_level_class' ifTrue: [
+		| name existing |
+		record at: 'source' put: (change at: 'source').
+		name:: change at: 'class_name'.
+		existing:: Root at: name asSymbol ifAbsent: [nil].
+		existing isNil ifFalse: [
+			Error signal: 'A top-level entry named ', name, ' already exists in Root'
+		].
+		^record
+	].
+	Error signal: 'Unknown change kind: ', kind
+)
+
+formatChangesetId: id records: records ^ <String> = (
+	| result count |
+	count:: records size.
+	result:: 'Changeset ', id, ' (', count printString,
+		(count = 1 ifTrue: [' change):'] ifFalse: [' changes):']), '\n'.
+	records do: [:r |
+		| kind sideStr |
+		kind:: r at: 'kind'.
+		sideStr:: (r includesKey: 'side')
+			ifTrue: [' (', (r at: 'side'), ' side)']
+			ifFalse: [''].
+		result:: result, '\n[', kind, '] ', (r at: 'class_name'), sideStr.
+		(kind = 'delete_method' or: [kind = 'delete_lazy_slot']) ifTrue: [
+			result:: result, ' >> ', (r at: 'selector') asString, '\n',
+				'--- removing\n', (r at: 'old_source'), '\n'.
+		] ifFalse: [
+			kind = 'set_class_header' ifTrue: [
+				result:: result, '\n--- old header\n', (r at: 'old_source'), '\n',
+					'+++ new header\n', (r at: 'source'), '\n'.
+			] ifFalse: [
+				kind = 'delete_nested_class' ifTrue: [
+					result:: result, '\n--- removing class\n', (r at: 'old_source'), '\n'.
+				] ifFalse: [
+					(* add_or_replace_method, add_or_replace_lazy_slot,
+					   add_or_replace_nested_class, add_top_level_class *)
+					result:: result, '\n+++ new source\n', (r at: 'source'), '\n'.
+				]
+			]
+		].
+	].
+	result:: result, '\nWhen the user approves, call apply_changeset with id "', id, '".'.
+	^result
+)
+
+intermediateOf: builder = (
+	(* Reach into a {Class,Mixin}Builder's private 'intermediate' slot.
+	   AtomicInstallWrapper>>install:into: uses the same trick. *)
+	^((ObjectMirror reflecting: builder) getSlot: #intermediate) reflectee
+)
+
+patchEnclosingOf: childClassBuilder withParent: parentClassBuilder = (
+	(* When we navigate DOWN from a top-level builder into
+	   instanceSide.nestedClasses, the nested IR's enclosingClass is the
+	   parent IntermediateClassDeclaration (set in buildIntermediate:from:within:).
+	   But ClassDeclarationBuilder>>enclosingClass expects an IntermediateMixin
+	   (the parent's instance-side mixin) — see the patch at line 572 of
+	   MirrorsForPrimordialSoup.ns, which only runs on the mirror-up path.
+	   Mirror that patch here so the compiler can walk the scope chain. *)
+	| childIR parentInstanceSideIR |
+	childIR:: intermediateOf: childClassBuilder.
+	parentInstanceSideIR:: intermediateOf: parentClassBuilder instanceSide.
+	childIR enclosingClass: parentInstanceSideIR.
+)
+
+navigateToBuilderForSegments: segments <Array> withBuilderMap: builderByTopLevel ^ <Object> = (
+	(* Resolve a dotted class path (given as segments) to a ClassDeclarationBuilder.
+	   For top-level segments, fetch or create the cached top-level builder.
+	   For nested segments, walk DOWN inside it, patching enclosingClass linkages
+	   as we go (see patchEnclosingOf:withParent: for why). *)
+	| topName targetClassBuilder |
+	topName:: segments at: 1.
+	targetClassBuilder:: builderByTopLevel at: topName ifAbsent: [
+		| topCdm topBuilder |
+		topCdm:: classDeclarationNamed: topName.
+		topBuilder:: topCdm asBuilder.
+		builderByTopLevel at: topName put: topBuilder.
+		topBuilder
+	].
+	2 to: segments size do: [:i |
+		| seg found |
+		seg:: segments at: i.
+		found:: nil.
+		targetClassBuilder instanceSide nestedClasses do: [:ncBuilder |
+			ncBuilder name = seg ifTrue: [found:: ncBuilder]
+		].
+		found isNil ifTrue: [
+			Error signal: 'Nested class not found in builder tree: ', seg,
+				' (under ', topName, ')'
+		].
+		patchEnclosingOf: found withParent: targetClassBuilder.
+		targetClassBuilder:: found
+	].
+	^targetClassBuilder
+)
+
+applyOneRecord: r withBuilderMap: builderByTopLevel = (
+	| kind segments targetClassBuilder side mixinBuilder |
+	kind:: r at: 'kind'.
+	kind = 'add_top_level_class' ifTrue: [
+		| newBuilder name |
+		newBuilder:: ClassDeclarationBuilder fromSource: (r at: 'source').
+		name:: newBuilder name asSymbol.
+		(builderByTopLevel includesKey: name) ifTrue: [
+			Error signal: 'Top-level builder for ', name,
+				' already present in this changeset (duplicate add or conflict)'
+		].
+		builderByTopLevel at: name put: newBuilder.
+		^self
+	].
+	kind = 'delete_nested_class' ifTrue: [
+		| parentBuilder targetName |
+		segments:: (r at: 'class_name') findTokens: '.'.
+		parentBuilder:: navigateToBuilderForSegments: (segments copyFrom: 1 to: segments size - 1)
+			withBuilderMap: builderByTopLevel.
+		targetName:: (segments at: segments size) asSymbol.
+		parentBuilder instanceSide nestedClasses removeMirrorNamed: targetName.
+		^self
+	].
+	(* All remaining kinds operate on a target class identified by class_name. *)
+	segments:: (r at: 'class_name') findTokens: '.'.
+	targetClassBuilder:: navigateToBuilderForSegments: segments
+		withBuilderMap: builderByTopLevel.
+	kind = 'set_class_header' ifTrue: [
+		^targetClassBuilder header source: (r at: 'source')
+	].
+	kind = 'add_or_replace_nested_class' ifTrue: [
+		^targetClassBuilder instanceSide nestedClasses addFromSource: (r at: 'source')
+	].
+	(* Member-level kinds: route through instance or class side. *)
+	side:: r at: 'side'.
+	mixinBuilder:: side = 'class'
+		ifTrue: [targetClassBuilder classSide]
+		ifFalse: [targetClassBuilder instanceSide].
+	kind = 'add_or_replace_method' ifTrue: [
+		^mixinBuilder methods addFromSource: (r at: 'source')
+	].
+	kind = 'delete_method' ifTrue: [
+		^mixinBuilder methods removeMirrorNamed: (r at: 'selector')
+	].
+	kind = 'add_or_replace_lazy_slot' ifTrue: [
+		^mixinBuilder lazySlots addFromSource: (r at: 'source')
+	].
+	kind = 'delete_lazy_slot' ifTrue: [
+		^mixinBuilder lazySlots removeMirrorNamed: (r at: 'selector')
+	].
+	Error signal: 'Unknown change kind in apply: ', kind
+)
+
+applyChangesetRecords: records = (
+	(* Aggregates changes per top-level class and installs them as one
+	   atomic transaction via the platform's atomic installer. *)
+	| builderByTopLevel builders newTopLevelNames mixins |
+	builderByTopLevel:: Map new.
+	newTopLevelNames:: List new.
+	records do: [:r |
+		(r at: 'kind') = 'add_top_level_class' ifTrue: [
+			newTopLevelNames add: (r at: 'class_name')
+		].
+		applyOneRecord: r withBuilderMap: builderByTopLevel
+	].
+	builders:: List new.
+	builderByTopLevel keysAndValuesDo: [:k :v | builders add: v].
+	mixins:: ide installFromBuilders: builders.
+	(* The atomic installer returns mirrors but does NOT add new top-level
+	   classes to the IDE namespace on primordialsoup (the JS mirror builders
+	   do; the wasm ones don't). Mirror the IDE's own post-install step. *)
+	mixins do: [:m |
+		(newTopLevelNames includes: m name) ifTrue: [
+			Root at: m name asSymbol put: m declaration applyToObject reflectee
+		]
+	].
+)
+
 (* --- IDE tool definitions --- *)
 
 public tools ^ <List> = (
@@ -306,6 +746,8 @@ public tools ^ <List> = (
 		navigateToDocumentTool.
 		showTestsTool.
 		runTestsTool.
+		proposeChangesTool.
+		applyChangesetTool.
 	}
 )
 
@@ -651,6 +1093,59 @@ runTestsTool ^ <Tool> = (
 		]
 )
 
+proposeChangesTool ^ <Tool> = (
+	^Tool
+		name: 'propose_changes'
+		description: 'Stage a set of code edits for atomic installation. Does NOT install. Returns a textual diff plus a changeset id. After calling this, present the diff to the user and wait for explicit approval ("apply", "ok", "go ahead") before calling apply_changeset. If the user wants something different, refine the changes and propose again.
+
+Each entry in the changes array is one of:
+- {kind: "add_or_replace_method",       class_name, side?, source}
+- {kind: "delete_method",               class_name, side?, selector}
+- {kind: "add_or_replace_lazy_slot",    class_name, side?, source}
+- {kind: "delete_lazy_slot",            class_name, side?, selector}
+- {kind: "set_class_header",            class_name, source}
+- {kind: "add_or_replace_nested_class", class_name, source}  -- class_name is the ENCLOSING class
+- {kind: "delete_nested_class",         class_name}          -- class_name is the nested class to remove
+- {kind: "add_top_level_class",         class_name, source}  -- class_name must match the simpleName in source
+
+class_name is a dotted path; side defaults to "instance" for member ops. source is full Newspeak source. Multiple changes in one call install atomically — use this for mutually dependent edits.
+
+Top-level class DELETION is not supported by this tool (different mechanism, not part of atomic install). Renaming a class is not supported either; set_class_header preserves the simple name.'
+		inputSchema: '{"type":"object","properties":{"changes":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string","enum":["add_or_replace_method","delete_method","add_or_replace_lazy_slot","delete_lazy_slot","set_class_header","add_or_replace_nested_class","delete_nested_class","add_top_level_class"]},"class_name":{"type":"string"},"side":{"type":"string","enum":["instance","class"]},"selector":{"type":"string"},"source":{"type":"string"}},"required":["kind","class_name"]}}},"required":["changes"]}'
+		handler: [:input |
+			| changes records id |
+			changes:: input at: 'changes'.
+			records:: List new.
+			(* changes is a JS array, not a Newspeak Collection; iterate by index. *)
+			0 to: (changes at: 'length') - 1 do: [:i |
+				records add: (validateChange: (changes at: i))
+			].
+			records isEmpty ifTrue: [
+				Error signal: 'No changes provided'
+			].
+			id:: freshChangesetId.
+			proposedChangesets at: id put: records.
+			formatChangesetId: id records: records
+		]
+)
+
+applyChangesetTool ^ <Tool> = (
+	^Tool
+		name: 'apply_changeset'
+		description: 'Atomically install a previously proposed changeset. Call this only after the user has reviewed the diff returned by propose_changes and explicitly approved. On success returns "Applied changeset <id>". On failure the atomic install rolls back, so no partial state is left in the running system.'
+		inputSchema: '{"type":"object","properties":{"id":{"type":"string","description":"The changeset id returned by propose_changes"}},"required":["id"]}'
+		handler: [:input |
+			| id records |
+			id:: input at: 'id'.
+			records:: proposedChangesets at: id ifAbsent: [
+				Error signal: 'No such changeset: ', id, ' (already applied, discarded, or never proposed)'
+			].
+			applyChangesetRecords: records.
+			proposedChangesets removeKey: id.
+			'Applied changeset ', id
+		]
+)
+
 (* --- Convenience API --- *)
 
 (* Create a session with the IDE tools pre-configured. *)
@@ -864,6 +1359,33 @@ The following tools have SIDE EFFECTS — they move the IDE''s view. Use them on
 - navigate_to_document    Open an Ampleforth document by name or dotted path.
 - show_tests              Open the test-suite view for a test configuration class (does not run the suite).
 - run_tests               Run the test suite for a test configuration class and open the in-progress view.
+
+# Modifying code
+
+To modify code in the running system, ALWAYS use the two-step propose/apply pattern. NEVER call apply_changeset without the user''s explicit go-ahead.
+
+1. Call propose_changes with the full set of mutually dependent edits. A changeset installs atomically — if it has parts that depend on each other (e.g. a new method that calls another new method, or a method rename with all its sender updates), put them in ONE call so they take effect together.
+2. The tool returns a textual diff and a changeset id. Show the diff to the user (you can paraphrase what it does, but include the actual diff text). Ask for confirmation.
+3. Only when the user has clearly approved ("apply", "yes", "go ahead", "looks good"), call apply_changeset with the id. If they want changes, propose a new changeset and discard the prior id.
+
+Supported change kinds (each is one entry in the `changes` array):
+- add_or_replace_method       {class_name, side?, source}     -- member op; side defaults to "instance"
+- delete_method               {class_name, side?, selector}
+- add_or_replace_lazy_slot    {class_name, side?, source}
+- delete_lazy_slot            {class_name, side?, selector}
+- set_class_header            {class_name, source}             -- replace header (slots, factory, superclass); simple name must stay the same
+- add_or_replace_nested_class {class_name, source}             -- class_name is the ENCLOSING class; nested classes always live on the instance side
+- delete_nested_class         {class_name}                     -- class_name is the nested class to remove (rejected for top-level)
+- add_top_level_class         {class_name, source}             -- class_name must match the simpleName in source; class is added to Root
+
+The `source` for a method is the full Newspeak method source (e.g. "foo: x = ( ^x + 1 )"), including the header. The `source` for a lazy slot is the slot declaration (e.g. "lazy myCache = computeIt."). The `source` for a class header is everything from `class` up through the slot bars (no body parens). The `source` for an add_or_replace_nested_class / add_top_level_class is a full Newspeak class declaration including instance side and class side bodies. The `selector` is the name including colons for keyword methods (e.g. "at:put:").
+
+Things this tool does NOT do:
+- Top-level class deletion (uses a different mechanism outside atomic install)
+- Renaming a class (set_class_header preserves the simple name)
+- Class-side nested classes (rare in Newspeak; add_or_replace_nested_class is always instance side)
+
+If you need any of these, tell the user the tool doesn''t support it and stop.
 
 When the user asks about an entity in their system, use the IDE tools to look it up before answering. When in doubt about Newspeak syntax or semantics, fetch the spec rather than guessing. When you produce Newspeak source, follow the style guidelines above and respect member ordering (nested classes before methods).'
 )

@@ -23,6 +23,7 @@ class AI_IDE_Support usingPlatform: platform ide: webIde aiAccess: aiAccessModul
 	private List = platform collections List.
 	private Map = platform collections Map.
 	private ide = webIde.
+	private retainedPlatform = platform.
 
 	(* General-purpose AI modules *)
 	public aiAccess = aiAccessModule.
@@ -101,12 +102,14 @@ class AI_IDE_Support usingPlatform: platform ide: webIde aiAccess: aiAccessModul
 	   can refer to by id. Pre-populated with the AI workspace under id
 	   'workspace' the first time it is reached. Subsequent entries come
 	   from evaluate's non-primitive results, each auto-named (r1, r2, ...)
-	   or AI-named via the name: parameter. Deliberately NOT cleared on
-	   chat-clear: results reachable here may not be reachable from the
-	   workspace's result list (e.g. when the AI navigates and evaluates
-	   transitively through results). *)
+	   or AI-named via the name: parameter. Debugger activations get
+	   their own ids (a1, a2, ...). Deliberately NOT cleared on chat-clear:
+	   results reachable here may not be reachable from the workspace's
+	   result list (e.g. when the AI navigates and evaluates transitively
+	   through results). *)
 	objectRegistry = Map new.
 	nextResultIdNum ::= 0.
+	nextActivationIdNum ::= 0.
 
 	(* Cached AI workspace ObjectSubject. We keep the Subject (not just
 	   the mirror) so workspace evaluations can be routed through the
@@ -308,7 +311,10 @@ public setEvaluatorFocusOnSubject: evaluatorSubject = (
 	   The 'focus' id in the object registry resolves dynamically to the
 	   mirror, and evaluate's default in_id is 'focus' whenever evaluator
 	   focus is active, so the AI's evaluations route through this receiver
-	   without further configuration. *)
+	   without further configuration.
+	   When the underlying mirror is an ActivationMirror (method evaluator,
+	   lazy-slot evaluator, or debugger frame) we also register it as
+	   an 'aN' so debugger tools can refer to it by id. *)
 	| mirror |
 	mirror:: evaluatorSubject model mirror.
 	focusKind:: #evaluator.
@@ -317,6 +323,9 @@ public setEvaluatorFocusOnSubject: evaluatorSubject = (
 	focusSelector:: nil.
 	focusEvaluatorMirror_slot:: mirror.
 	focusEvaluatorSubject_slot:: evaluatorSubject.
+	(mirror isKindOfActivationMirror) ifTrue: [
+		registerActivation: mirror
+	].
 	installFocusDescription: ['Evaluator (', (evaluatorDescription: mirror), ')']
 		validator: [evaluatorMirrorStillValid: mirror]
 )
@@ -915,6 +924,31 @@ registerResult: aMirror <Object> withName: nameOrNil <String | Nil> ^ <String> =
 	^id
 )
 
+registerActivation: anActivationMirror <Object> ^ <String> = (
+	(* Register an ActivationMirror under an 'aN' id, deduping against
+	   already-registered activations (ActivationMirror>>= compares
+	   underlying activation identity, so the same frame stays under one
+	   id no matter how many times it's reached). *)
+	| id |
+	objectRegistry keysAndValuesDo: [:k :v |
+		((k size > 0 and: [(k at: 1) = 'a' first])
+			and: [v = anActivationMirror]) ifTrue: [^k]
+	].
+	nextActivationIdNum:: nextActivationIdNum + 1.
+	id:: 'a', nextActivationIdNum printString.
+	objectRegistry at: id put: anActivationMirror.
+	^id
+)
+
+activationForId: id <String> ^ <Object> = (
+	| m |
+	m:: mirrorForObjectId: id.
+	m isKindOfActivationMirror ifFalse: [
+		Error signal: 'Object [', id, '] is not an activation frame'
+	].
+	^m
+)
+
 isPrimitiveResult: aMirror <Object> ^ <Boolean> = (
 	(* Primitives (Integer, Float, String, Symbol, Boolean, Character, nil)
 	   are NOT registered — the AI can use their printString directly. *)
@@ -972,6 +1006,15 @@ public tools ^ <List> = (
 		searchClassesTool.
 		listNamespaceTool.
 		getDocumentTool.
+		createDocumentTool.
+		setDocumentContentsTool.
+		deleteDocumentTool.
+		listAmpletsTool.
+		addAmpletTool.
+		setAmpletExpressionTool.
+		deleteAmpletTool.
+		listMediaTool.
+		deleteMediaTool.
 		webFetchTool.
 		currentFocusTool.
 		navigateToClassTool.
@@ -991,6 +1034,13 @@ public tools ^ <List> = (
 		inspectObjectTool.
 		listObjectsTool.
 		forgetObjectTool.
+		getCurrentFrameTool.
+		getStackTraceTool.
+		getCurrentExpressionTool.
+		inspectActivationTool.
+		stepTool.
+		returnFromTool.
+		continueThreadTool.
 	}
 )
 
@@ -1208,6 +1258,294 @@ webFetchTool ^ <Tool> = (
 		inputSchema: '{"type":"object","properties":{"url":{"type":"string","description":"Absolute URL to fetch (https:// or http://)."}},"required":["url"]}'
 		handler: [:input |
 			aiAccess webFetch: (input at: 'url')
+		]
+)
+
+(* --- Document management helpers --- *)
+
+parentNamespaceAndLeaf: dottedPath <String> ^ <Object> = (
+	(* Walk the path segments to the parent namespace; return a 2-tuple
+	   {parentNamespace. leafName}. Used by create/delete to locate the
+	   container of the entry being added/removed. Raises if any
+	   intermediate segment isn't found or isn't a namespace. *)
+	| parts current i leaf |
+	parts:: dottedPath findTokens: '.'.
+	parts isEmpty ifTrue: [
+		Error signal: 'Empty path'
+	].
+	leaf:: parts at: parts size.
+	current:: Root.
+	i:: 1.
+	(parts isEmpty not and: [(parts at: 1) = 'Root']) ifTrue: [i:: 2].
+	[i < parts size] whileTrue: [
+		| seg = parts at: i. |
+		current:: current at: seg asSymbol ifAbsent: [
+			Error signal: 'Namespace segment not found: ', seg
+		].
+		current isKindOfNamespace ifFalse: [
+			Error signal: 'Path segment is not a namespace: ', seg
+		].
+		i:: i + 1
+	].
+	^{current. leaf}
+)
+
+documentAt: dottedPath <String> ^ <Object> = (
+	| entry |
+	entry:: resolveNamespacePath: dottedPath.
+	entry isKindOfDocument ifFalse: [
+		Error signal: 'Not a document: ', dottedPath,
+			' (it is a ', (kindOf: entry), ')'
+	].
+	^entry
+)
+
+(* Parse a document's contents HTML into a detached div whose innerHTML
+   holds it. Manipulate the div via DOM methods, then read innerHTML back
+   to produce the updated contents. Same round-trip the IDE uses in
+   Documents.ns freshDocumentFromDOM:. *)
+parseAmpletContainer: html <String> ^ <Object> = (
+	| jsDoc div |
+	jsDoc:: retainedPlatform js global at: 'document'.
+	div:: jsDoc createElement: 'div'.
+	div at: 'innerHTML' put: html.
+	^div
+)
+
+(* Locate the amplet element whose ampletId attribute equals id. Raises
+   if none is found. *)
+findAmpletWithId: id <String> in: container <Object> ^ <Object> = (
+	| amplets count i |
+	amplets:: container getElementsByClassName: 'ampleforth'.
+	count:: amplets at: 'length'.
+	i:: 0.
+	[i < count] whileTrue: [
+		| amplet thisId |
+		amplet:: amplets at: i.
+		thisId:: amplet getAttribute: 'ampletId'.
+		thisId = id ifTrue: [^amplet].
+		i:: i + 1
+	].
+	Error signal: 'No amplet with ampletId="', id, '" in this document'
+)
+
+createDocumentTool ^ <Tool> = (
+	^Tool
+		name: 'create_document'
+		description: 'Create a new Ampleforth document at the given dotted path. The path''s parent must be an existing namespace (e.g. just "MyNotes" puts it in Root; "Foo.Bar.Notes" puts Notes in Root.Foo.Bar). Optional initial_contents is the document''s starting HTML; if omitted, the document is created with the default blank template. Fails if any entry already exists at that path.'
+		inputSchema: '{"type":"object","properties":{"name":{"type":"string","description":"Dotted path for the new document"},"initial_contents":{"type":"string","description":"Optional initial HTML"}},"required":["name"]}'
+		handler: [:input |
+			| name pair parent leaf doc initial |
+			name:: input at: 'name'.
+			pair:: parentNamespaceAndLeaf: name.
+			parent:: pair at: 1.
+			leaf:: pair at: 2.
+			(parent includesKey: leaf asSymbol) ifTrue: [
+				Error signal: 'An entry named ', leaf, ' already exists at this path'
+			].
+			initial:: (input includesKey: 'initial_contents')
+				ifTrue: [input at: 'initial_contents']
+				ifFalse: [nil].
+			doc:: initial isNil
+				ifTrue: [ide documents freshDocumentNamed: leaf asSymbol]
+				ifFalse: [ide documents
+					freshDocumentNamed: leaf asSymbol
+					initialText: initial].
+			parent at: leaf asSymbol put: doc.
+			ide browsing updateCurrentDisplay.
+			'Created document ', name
+		]
+)
+
+setDocumentContentsTool ^ <Tool> = (
+	^Tool
+		name: 'set_document_contents'
+		description: 'Replace the HTML contents of an existing Ampleforth document. The previous contents are lost — describe the change to the user before calling. Use get_document first if you need to know the current state.'
+		inputSchema: '{"type":"object","properties":{"name":{"type":"string","description":"Document name or dotted path"},"contents":{"type":"string","description":"New HTML contents"}},"required":["name","contents"]}'
+		handler: [:input |
+			| name doc |
+			name:: input at: 'name'.
+			doc:: documentAt: name.
+			doc contents: (input at: 'contents').
+			ide browsing updateCurrentDisplay.
+			'Updated contents of ', name
+		]
+)
+
+deleteDocumentTool ^ <Tool> = (
+	^Tool
+		name: 'delete_document'
+		description: 'Remove an Ampleforth document from its namespace. Destructive; describe the action to the user first.'
+		inputSchema: '{"type":"object","properties":{"name":{"type":"string","description":"Document name or dotted path"}},"required":["name"]}'
+		handler: [:input |
+			| name pair parent leaf entry |
+			name:: input at: 'name'.
+			pair:: parentNamespaceAndLeaf: name.
+			parent:: pair at: 1.
+			leaf:: pair at: 2.
+			entry:: parent at: leaf asSymbol ifAbsent: [
+				Error signal: 'No such entry: ', name
+			].
+			entry isKindOfDocument ifFalse: [
+				Error signal: name, ' is a ', (kindOf: entry),
+					', not a document; refusing to delete via this tool.'
+			].
+			parent removeKey: leaf asSymbol.
+			ide browsing updateCurrentDisplay.
+			'Deleted document ', name
+		]
+)
+
+listAmpletsTool ^ <Tool> = (
+	^Tool
+		name: 'list_amplets'
+		description: 'List the amplets in a document. Each amplet is reported as a fenced block: a header line "=== [INDEX] ampletId=ID ===" followed by the amplet''s Newspeak expression. The ampletId is stable within an editing session but gets renumbered when the document is reloaded from disk — do not assume ids persist across sessions.'
+		inputSchema: '{"type":"object","properties":{"name":{"type":"string","description":"Document name or dotted path"}},"required":["name"]}'
+		handler: [:input |
+			| name doc container amplets count i result |
+			name:: input at: 'name'.
+			doc:: documentAt: name.
+			container:: parseAmpletContainer: doc contents.
+			amplets:: container getElementsByClassName: 'ampleforth'.
+			count:: amplets at: 'length'.
+			count = 0
+				ifTrue: ['No amplets in ', name]
+				ifFalse: [
+					result:: 'Amplets in ', name, ' (', count printString, '):\n'.
+					i:: 0.
+					[i < count] whileTrue: [
+						| amplet aid expr |
+						amplet:: amplets at: i.
+						aid:: amplet getAttribute: 'ampletId'.
+						aid isNil ifTrue: [aid:: '?'].
+						expr:: amplet getAttribute: 'name'.
+						expr isNil ifTrue: [expr:: ''].
+						result:: result, '=== [', i printString, '] ampletId=', aid, ' ===\n',
+							expr, '\n'.
+						i:: i + 1
+					].
+					result
+				]
+		]
+)
+
+addAmpletTool ^ <Tool> = (
+	^Tool
+		name: 'add_amplet'
+		description: 'Append a new amplet to a document. The amplet''s expression (the "name" attribute) is the supplied Newspeak expression, evaluated against the host Document when the document renders. A fresh ampletId is allocated automatically. Returns the new ampletId. Destructive — describe the change to the user before calling. v1 always appends at the end; targeted placement will come later.'
+		inputSchema: '{"type":"object","properties":{"name":{"type":"string","description":"Document name or dotted path"},"expression":{"type":"string","description":"Newspeak expression for the amplet (the name attribute)"}},"required":["name","expression"]}'
+		handler: [:input |
+			| name expr doc container newId jsDoc newAmplet body bodies |
+			name:: input at: 'name'.
+			expr:: input at: 'expression'.
+			doc:: documentAt: name.
+			container:: parseAmpletContainer: doc contents.
+			(* The document body lives inside a wrapping <div class="self_ampleforth">
+			   (the editable "blue box"); append the new amplet there so it lands
+			   inside the document boundary, not as a sibling of the wrapper. Fall
+			   back to the container if no such wrapper is present. *)
+			bodies:: container getElementsByClassName: 'self_ampleforth'.
+			body:: (bodies at: 'length') > 0
+				ifTrue: [bodies at: 0]
+				ifFalse: [container].
+			newId:: doc nextAmpletId printString.
+			jsDoc:: retainedPlatform js global at: 'document'.
+			newAmplet:: jsDoc createElement: 'div'.
+			newAmplet setAttribute: 'class' to: 'ampleforth'.
+			newAmplet setAttribute: 'ampletId' to: newId.
+			newAmplet setAttribute: 'name' to: expr.
+			newAmplet setAttribute: 'contenteditable' to: 'false'.
+			body appendChild: newAmplet.
+			doc contents: (container at: 'innerHTML').
+			ide browsing updateCurrentDisplay.
+			'Added amplet to ', name, ' (ampletId=', newId, ')'
+		]
+)
+
+setAmpletExpressionTool ^ <Tool> = (
+	^Tool
+		name: 'set_amplet_expression'
+		description: 'Change the Newspeak expression of an existing amplet, identified by ampletId. Destructive — describe the change to the user before calling.'
+		inputSchema: '{"type":"object","properties":{"name":{"type":"string","description":"Document name or dotted path"},"amplet_id":{"type":"string","description":"The ampletId of the amplet to modify (from list_amplets)"},"expression":{"type":"string","description":"New Newspeak expression for the name attribute"}},"required":["name","amplet_id","expression"]}'
+		handler: [:input |
+			| name aid expr doc container amplet |
+			name:: input at: 'name'.
+			aid:: input at: 'amplet_id'.
+			expr:: input at: 'expression'.
+			doc:: documentAt: name.
+			container:: parseAmpletContainer: doc contents.
+			amplet:: findAmpletWithId: aid in: container.
+			amplet setAttribute: 'name' to: expr.
+			doc contents: (container at: 'innerHTML').
+			ide browsing updateCurrentDisplay.
+			'Updated amplet ', aid, ' in ', name
+		]
+)
+
+deleteAmpletTool ^ <Tool> = (
+	^Tool
+		name: 'delete_amplet'
+		description: 'Remove an amplet from a document, identified by ampletId. Destructive — describe the change to the user before calling.'
+		inputSchema: '{"type":"object","properties":{"name":{"type":"string","description":"Document name or dotted path"},"amplet_id":{"type":"string","description":"The ampletId of the amplet to delete (from list_amplets)"}},"required":["name","amplet_id"]}'
+		handler: [:input |
+			| name aid doc container amplet parent |
+			name:: input at: 'name'.
+			aid:: input at: 'amplet_id'.
+			doc:: documentAt: name.
+			container:: parseAmpletContainer: doc contents.
+			amplet:: findAmpletWithId: aid in: container.
+			parent:: amplet at: 'parentNode'.
+			parent removeChild: amplet.
+			doc contents: (container at: 'innerHTML').
+			ide browsing updateCurrentDisplay.
+			'Deleted amplet ', aid, ' from ', name
+		]
+)
+
+listMediaTool ^ <Tool> = (
+	^Tool
+		name: 'list_media'
+		description: 'List the media entries (images, audio, video blobs) attached to a document. Returns one line per entry with its path, MIME type, and size in bytes.'
+		inputSchema: '{"type":"object","properties":{"name":{"type":"string","description":"Document name or dotted path"}},"required":["name"]}'
+		handler: [:input |
+			| name doc reg result |
+			name:: input at: 'name'.
+			doc:: documentAt: name.
+			reg:: doc mediaRegistry.
+			reg isEmpty
+				ifTrue: ['No media in ', name]
+				ifFalse: [
+					result:: 'Media in ', name, ' (', reg size printString, '):\n'.
+					reg keysAndValuesDo: [:path :blob |
+						| mime |
+						mime:: blob at: 'type'.
+						mime isNil ifTrue: [mime:: '?'].
+						result:: result, '  ', path,
+							'  type=', mime,
+							'  size=', (blob at: 'size') printString, '\n'
+					].
+					result
+				]
+		]
+)
+
+deleteMediaTool ^ <Tool> = (
+	^Tool
+		name: 'delete_media'
+		description: 'Remove a media entry from a document''s media registry, identified by its path. Destructive — describe the change to the user first. If the document''s HTML or any amplet expression references this path, those references will dangle.'
+		inputSchema: '{"type":"object","properties":{"name":{"type":"string","description":"Document name or dotted path"},"path":{"type":"string","description":"The media path (from list_media)"}},"required":["name","path"]}'
+		handler: [:input |
+			| name path doc reg |
+			name:: input at: 'name'.
+			path:: input at: 'path'.
+			doc:: documentAt: name.
+			reg:: doc mediaRegistry.
+			(reg includesKey: path) ifFalse: [
+				Error signal: 'No media entry "', path, '" in ', name
+			].
+			reg removeKey: path.
+			ide browsing updateCurrentDisplay.
+			'Deleted media ', path, ' from ', name
 		]
 )
 
@@ -1629,10 +1967,20 @@ Side-effecting expressions (collection mutations, slot assignments via setters, 
 				]
 			].
 			thread isBroken ifTrue: [
-				| ex |
+				| ex topFrame frameId frameNote |
 				ex:: [thread result reflectee printString]
 					on: Error do: [:e | '(broken; unprintable)'].
-				Error signal: 'Evaluation raised at runtime: ', ex
+				(* Register the top stack frame so the AI can immediately
+				   inspect the failure. *)
+				topFrame:: [thread suspendedActivation] on: Error do: [:e | nil].
+				frameId:: topFrame isNil
+					ifTrue: [nil]
+					ifFalse: [registerActivation: topFrame].
+				frameNote:: frameId isNil
+					ifTrue: ['']
+					ifFalse: [' Top frame registered as ', frameId,
+						'; use get_stack_trace to inspect.'].
+				Error signal: 'Evaluation raised at runtime: ', ex, '.', frameNote
 			].
 			resultMirror:: thread result.
 			(* Use ifTrue:ifFalse: rather than ^early-return: this is a stored
@@ -1690,6 +2038,272 @@ listObjectsTool ^ <Tool> = (
 			objectRegistry keysAndValuesDo: [:id :m |
 				result:: result, '  [', id, '] ', (summaryOf: m), '\n'
 			].
+			result
+		]
+)
+
+(* --- Debugger helpers (Phase 1: observation) --- *)
+
+formatMethodNameOf: anActivationMirror ^ <String> = (
+	(* Best-effort "Class >> selector" for a frame. *)
+	^[
+		| m mixinDecl |
+		m:: anActivationMirror method.
+		mixinDecl:: m definingMixin declaration.
+		(qualifiedNameOf: mixinDecl), ' >> ', m name asString
+	] on: Exception do: [:e | '(unknown method)']
+)
+
+formatActivationLine: anActivationMirror id: id ^ <String> = (
+	^'[', id, '] ', (formatMethodNameOf: anActivationMirror)
+)
+
+formatSourceWithRange: source <String> range: rangeOrNil <Object> ^ <String> = (
+	(* Append a structured marker for the active range rather than splicing
+	   into the source text — easier for the AI to read at a glance. *)
+	| header |
+	header:: rangeOrNil isNil
+		ifTrue: ['active: (no range info)']
+		ifFalse: ['active: source positions ', rangeOrNil start printString,
+			'..', rangeOrNil stop printString].
+	^header, String lf, '---', String lf, source
+)
+
+getCurrentFrameTool ^ <Tool> = (
+	^Tool
+		name: 'get_current_frame'
+		description: 'Return the registered activation id of the currently-focused debugger frame / method evaluator / lazy-slot evaluator. Raises if no activation focus is set. Use this to bootstrap into get_stack_trace, inspect_activation, etc. from a user-driven debug session.'
+		inputSchema: '{"type":"object","properties":{}}'
+		handler: [:input |
+			(focusKind = #evaluator
+				and: [focusEvaluatorMirror_slot isNil not
+					and: [focusEvaluatorMirror_slot isKindOfActivationMirror]])
+				ifTrue: [
+					| id |
+					id:: registerActivation: focusEvaluatorMirror_slot.
+					'Current frame: ', (formatActivationLine: focusEvaluatorMirror_slot id: id)
+				]
+				ifFalse: [
+					Error signal: 'No activation is currently focused. Click a brain on a debugger frame, method evaluator, or lazy-slot evaluator first.'
+				]
+		]
+)
+
+getStackTraceTool ^ <Tool> = (
+	^Tool
+		name: 'get_stack_trace'
+		description: 'Walk the call stack starting at the given activation, going down through callers via sender. Each frame is (re)registered under its aN id so you can evaluate(in_id: "aN"), inspect_activation(id: "aN"), etc. Pass either the activation id from get_current_frame or the id returned in a broken-evaluate error message.'
+		inputSchema: '{"type":"object","properties":{"activation_id":{"type":"string","description":"Registered activation id (e.g. a1)"}},"required":["activation_id"]}'
+		handler: [:input |
+			| startId start result frame depth |
+			startId:: input at: 'activation_id'.
+			start:: activationForId: startId.
+			result:: 'Stack from [', startId, '] downward:', String lf.
+			frame:: start.
+			depth:: 0.
+			[frame isNil] whileFalse: [
+				| id |
+				id:: registerActivation: frame.
+				result:: result, '  ', depth printString, '. ',
+					(formatActivationLine: frame id: id), String lf.
+				frame:: [frame sender] on: Error do: [:e | nil].
+				depth:: depth + 1
+			].
+			result
+		]
+)
+
+getCurrentExpressionTool ^ <Tool> = (
+	^Tool
+		name: 'get_current_expression'
+		description: 'Return the method source for an activation, with a structured marker giving the source positions of the currently-executing (or paused) expression. Format is: a header line ("active: source positions N..M"), a separator, then the method source verbatim. The N..M positions index into the source string (1-based inclusive of start, exclusive of stop).'
+		inputSchema: '{"type":"object","properties":{"activation_id":{"type":"string"}},"required":["activation_id"]}'
+		handler: [:input |
+			| id activation source range |
+			id:: input at: 'activation_id'.
+			activation:: activationForId: id.
+			source:: [activation method source] on: Exception do: [:e | '(source unavailable)'].
+			range:: [activation sourceRange] on: Exception do: [:e | nil].
+			'Frame [', id, '] ', (formatMethodNameOf: activation), String lf,
+				(formatSourceWithRange: source range: range)
+		]
+)
+
+(* --- Debugger helpers (Phase 2: control) --- *)
+
+threadStateName: thread ^ <String> = (
+	[thread isFulfilled  ifTrue: [^'fulfilled']]  on: Exception do: [:e | ].
+	[thread isBroken     ifTrue: [^'broken']]     on: Exception do: [:e | ].
+	[thread isSuspended  ifTrue: [^'suspended']]  on: Exception do: [:e | ].
+	[thread isTerminated ifTrue: [^'terminated']] on: Exception do: [:e | ].
+	^'unknown'
+)
+
+pruneDeadActivations = (
+	(* Remove from the registry any aN that points at an activation that
+	   is no longer continuable (frame has unwound or thread fulfilled). *)
+	| dead |
+	dead:: List new.
+	objectRegistry keysAndValuesDo: [:k :v |
+		(((k size > 0 and: [(k at: 1) = 'a' first])
+			and: [v isKindOfActivationMirror])
+			and: [[v isUncontinuable] on: Exception do: [:e | true]])
+			ifTrue: [dead add: k]
+	].
+	dead do: [:k | objectRegistry removeKey: k]
+)
+
+postOperationReport: thread ^ <String> = (
+	(* Called after any step/return: report the new thread state, register
+	   the result if fulfilled, register the new top frame if still suspended,
+	   prune dead activation ids, and clear focus if it pointed at a frame
+	   that's gone. Returns a human-readable status fragment. *)
+	| status |
+	status:: 'thread state: ', (threadStateName: thread).
+	([thread isFulfilled] on: Exception do: [:e | false]) ifTrue: [
+		| result resultId |
+		result:: [thread result] on: Exception do: [:e | nil].
+		result isNil ifFalse: [
+			resultId:: registerResult: result withName: nil.
+			status:: status, '; result registered as ', resultId
+		]
+	].
+	([thread isSuspended] on: Exception do: [:e | false]) ifTrue: [
+		| topFrame topId |
+		topFrame:: [thread suspendedActivation] on: Exception do: [:e | nil].
+		topFrame isNil ifFalse: [
+			topId:: registerActivation: topFrame.
+			status:: status, '; top frame now [', topId, '] ',
+				(formatMethodNameOf: topFrame)
+		]
+	].
+	pruneDeadActivations.
+	(focusKind = #evaluator
+		and: [focusEvaluatorMirror_slot isNil not
+			and: [focusEvaluatorMirror_slot isKindOfActivationMirror
+				and: [[focusEvaluatorMirror_slot isUncontinuable]
+					on: Exception do: [:e | true]]]])
+		ifTrue: [clearFocus].
+	^status
+)
+
+stepTool ^ <Tool> = (
+	^Tool
+		name: 'step'
+		description: 'Step the thread at a given activation frame. kind is one of: into (step into the next call), over (step over it), out (run until this frame returns), through (step into closure), restart (re-execute this frame from its first statement). After the step, the report names the new top frame if the thread is still suspended; registers the result and reports it if the thread fulfills; cleans up activations that are no longer reachable. The IDE debugger view is refreshed.'
+		inputSchema: '{"type":"object","properties":{"activation_id":{"type":"string"},"kind":{"type":"string","enum":["into","over","out","through","restart"]}},"required":["activation_id","kind"]}'
+		handler: [:input |
+			| id kind activation newThread |
+			id:: input at: 'activation_id'.
+			kind:: input at: 'kind'.
+			activation:: activationForId: id.
+			newThread:: nil.
+			kind = 'into'    ifTrue: [newThread:: activation stepInto].
+			kind = 'over'    ifTrue: [newThread:: activation stepOver].
+			kind = 'out'     ifTrue: [newThread:: activation stepOut].
+			kind = 'through' ifTrue: [newThread:: activation stepThrough].
+			kind = 'restart' ifTrue: [newThread:: activation restart].
+			newThread isNil ifTrue: [
+				Error signal: 'Unknown step kind: ', kind
+			].
+			ide browsing updateCurrentDisplay.
+			'Stepped (', kind, ') from [', id, ']; ',
+				(postOperationReport: newThread)
+		]
+)
+
+continueThreadTool ^ <Tool> = (
+	^Tool
+		name: 'continue_thread'
+		description: 'Resume the thread that the given activation belongs to — equivalent to the debugger''s Continue button. The thread runs until it fulfills, breaks again, or is otherwise suspended. State after is reported the same way as for step / return_from.'
+		inputSchema: '{"type":"object","properties":{"activation_id":{"type":"string"}},"required":["activation_id"]}'
+		handler: [:input |
+			| id activation threadMirror |
+			id:: input at: 'activation_id'.
+			activation:: activationForId: id.
+			threadMirror:: activation threadMirror.
+			threadMirror resume.
+			ide browsing updateCurrentDisplay.
+			'Resumed thread of [', id, ']; ',
+				(postOperationReport: threadMirror)
+		]
+)
+
+returnFromTool ^ <Tool> = (
+	^Tool
+		name: 'return_from'
+		description: 'Force the given activation to return immediately, using the result of evaluating expression in that frame''s scope as the method''s return value. Locals (self, args, temps) are in scope inside expression. The thread resumes; subsequent state is reported the same way as for step. Use with care — this short-circuits whatever the method would otherwise compute.'
+		inputSchema: '{"type":"object","properties":{"activation_id":{"type":"string"},"expression":{"type":"string"}},"required":["activation_id","expression"]}'
+		handler: [:input |
+			| id expr activation evalThread resultMirror newThread valueStr |
+			id:: input at: 'activation_id'.
+			expr:: input at: 'expression'.
+			activation:: activationForId: id.
+			evalThread:: [activation evaluate: expr] on: Exception do: [:e |
+				Error signal: 'Failed to compile return expression: ', e messageText
+			].
+			evalThread isBroken ifTrue: [
+				| ex |
+				ex:: [evalThread result reflectee printString]
+					on: Exception do: [:e | '(unprintable)'].
+				Error signal: 'Return expression raised: ', ex
+			].
+			resultMirror:: evalThread result.
+			newThread:: activation return: resultMirror.
+			ide browsing updateCurrentDisplay.
+			valueStr:: [resultMirror reflectee printString]
+				on: Exception do: [:e | '(unprintable)'].
+			'Returned from [', id, '] with value ', valueStr, '; ',
+				(postOperationReport: newThread)
+		]
+)
+
+inspectActivationTool ^ <Tool> = (
+	^Tool
+		name: 'inspect_activation'
+		description: 'Summarise an activation frame: defining class, method selector, and a listing of locals (self, args, temps) with their printString. To dig further, call evaluate(in_id: "aN", expression: ...) — locals are in scope by name, self is the activation''s receiver.'
+		inputSchema: '{"type":"object","properties":{"activation_id":{"type":"string"}},"required":["activation_id"]}'
+		handler: [:input |
+			| id activation result continuableNote slotsNote |
+			id:: input at: 'activation_id'.
+			activation:: activationForId: id.
+			(* Each section is bracketed independently with on: Exception (not
+			   just Error) so a single misbehaving frame can't fail the whole
+			   tool — failures in one section degrade to a placeholder. *)
+			result:: 'Frame [', id, '] ',
+				([formatMethodNameOf: activation]
+					on: Exception do: [:e | '(method name unavailable)']),
+				String lf.
+			continuableNote:: [
+				activation isUncontinuable
+					ifTrue: ['no (frame is dead)']
+					ifFalse: ['yes']
+			] on: Exception do: [:e | '(unknown)'].
+			result:: result, 'Continuable: ', continuableNote, String lf.
+			slotsNote:: [
+				| slots sb |
+				slots:: activation slots.
+				slots isEmpty ifTrue: [
+					'  (no locals)'
+				] ifFalse: [
+					sb:: ''.
+					slots do: [:s |
+						| nameStr valueStr |
+						nameStr:: [s name asString]
+							on: Exception do: [:e | '(?)'].
+						valueStr:: [s value reflectee printString]
+							on: Exception do: [:e | '(unprintable)'].
+						valueStr size > 120 ifTrue: [
+							valueStr:: (valueStr copyFrom: 1 to: 117), '...'
+						].
+						sb:: sb, '  ', nameStr, ' = ', valueStr, String lf
+					].
+					sb
+				]
+			] on: Exception do: [:e |
+				'  (slot enumeration raised: ', e messageText, ')'
+			].
+			result:: result, 'Locals:', String lf, slotsNote.
 			result
 		]
 )
@@ -1912,6 +2526,15 @@ Prefer tool calls to recalling from training data — many features here are spe
 - get_member_source   Source of a method or a lazy slot. Set side: "class" for class-side; default is instance.
 - senders_of, implementors_of    Cross-cutting selector lookups across the system.
 - get_document        HTML contents of a Document, by name or dotted path.
+- create_document     Create a new Document at the given dotted path (parent must be a namespace), optionally with initial HTML.
+- set_document_contents  Replace an existing Document''s HTML contents. Destructive — describe the change to the user before calling.
+- delete_document     Remove a Document from its namespace. Destructive.
+- list_amplets        List the amplets in a document. Each entry: index, ampletId, and the Newspeak expression. Use this before targeting an amplet by id. ampletIds are session-stable but get renumbered on reload, so don''t cache them across sessions.
+- add_amplet          Append a new amplet to a document with a given expression. Allocates a fresh ampletId. Destructive (changes the document HTML) — describe the change first. v1 only appends at the end; finer placement will come later.
+- set_amplet_expression  Change an existing amplet''s Newspeak expression by ampletId. Destructive — describe first.
+- delete_amplet       Remove an amplet by ampletId. Destructive — describe first.
+- list_media          List media entries (images, audio, video) attached to a document: path, MIME type, size.
+- delete_media        Remove a media entry from a document''s mediaRegistry by path. Destructive — if the document HTML or an amplet references the path, those references will dangle. Check refs first.
 - current_focus       What the user is currently asking about — set when the user opens the chat from a presenter or otherwise signals focus. Call this FIRST when the user says "this", "here", "the current method", refers to a member without naming its class, or otherwise speaks deictically. If the focus is "(no focus set)", ask the user or use other tools.
 - web_fetch           Fetch any URL and return its text body. Use this when you need the authoritative definition of a Newspeak construct. The published reference material is:
                         - Newspeak Language Specification (grammar in EBNF + prose):
@@ -1968,6 +2591,43 @@ Two pre-registered receivers:
   - "focus" — dynamically resolves to whichever evaluator the user has focused on (by clicking a brain button on a workspace, object inspector, method evaluator, lazy-slot evaluator, or debugger activation). Raises if no evaluator focus is set.
 
 `evaluate`''s default `in_id` follows the user''s focus: if an evaluator is focused, the default is "focus"; otherwise it is "workspace". So `evaluate("someExpression")` does the right thing for "evaluate this here" without you specifying. Pass `in_id` explicitly when you want a specific registered object.
+
+**Activation focus is special.** ActivationMirror is the receiver of evaluate in three cases: debugger frames, method evaluators (a method presenter with an exemplar — its evaluator pane runs against a specific invocation of the method), and lazy-slot evaluators (same idea, against a slot initializer activation). The focus description in all three says `activation: ...`.
+
+In an activation focus, the "receiver" of evaluate is the ActivationMirror — but expressions run as though inside that activation''s method body: `self` resolves to whatever object the method was called on, the method''s arguments and temporaries are in scope, and you can inspect any of them by name. Useful expressions during a doesNotUnderstand: break, for instance: `self` (the receiver of the missed message), `self class name`, `message selector`, `message arguments`. For a method evaluator, `self` is the exemplar instance, not the method or its class.
+
+Do NOT confuse "self is X" with "the focus is X" — the focus is still the activation; self is just one local within it.
+
+# Debugging
+
+When an evaluate raises a runtime error, the IDE opens a debugger on the broken thread and the tool result includes the registered activation id of the top frame ("Top frame registered as a1; ..."). For a user-initiated debug session (the user crashed something and is sitting in the debugger), use get_current_frame to obtain the focused frame''s id — assuming the user has clicked a brain on an activation pane.
+
+Once you have an activation id you can:
+
+- get_stack_trace          {activation_id}   Walk the call stack downward from this frame via sender. Each frame is registered as an aN; their ids appear in the result, ready to use.
+- get_current_expression   {activation_id}   Method source plus a "active: source positions N..M" marker for the currently-executing expression in this frame. Read the marker, then locate that substring of the source.
+- inspect_activation       {activation_id}   Method name, continuable status, and a printout of locals (self, args, temps) with their printString.
+- evaluate                 {in_id: "aN", expression: ...}  Runs the expression in the frame''s scope. self / args / temps / instance slots / Root are all accessible by name, just like a method body.
+
+To progress the thread:
+
+- step             {activation_id, kind}        kind is one of "into", "over", "out", "through" (step into closure), "restart" (re-execute this frame from its start).
+- return_from      {activation_id, expression}  Force this frame to return immediately; the expression is evaluated in the frame''s scope and its result is used as the method''s return value.
+- continue_thread  {activation_id}              Resume the thread of the given activation — same as clicking the debugger''s Continue button. The thread runs until it fulfills, breaks again, or is otherwise suspended.
+
+All three operations report the thread''s new state. If the thread fulfills, the result is registered as a fresh rN and named in the report. If it''s still suspended, the new top frame is registered (or re-registered) and named. Activation ids that point at frames the thread has unwound past are pruned from the registry automatically.
+
+# Autonomous change-test-debug loop
+
+When the user asks for a code change, drive the full loop rather than stopping after applying. The propose/apply gate stays in place — every code installation needs the user to approve a diff — but inside that gate you can:
+
+1. Run any tests that exercise the changed code (run_tests with the appropriate test configuration).
+2. Inspect outcomes with get_test_results / get_test_failure_details.
+3. For runtime errors: use the debugger tools (get_stack_trace, inspect_activation, get_current_expression, evaluate(in_id: "aN", ...), step, return_from, continue_thread) to diagnose. The top frame of a broken evaluation is already registered for you in the error message of the offending evaluate call.
+4. If you find a clear fix, propose another changeset (back through propose_changes) and wait for approval. Do NOT call apply_changeset on the SAME id twice; do NOT use raw evaluate to install code.
+5. Stop and report to the user when: all tests pass, you have no clear hypothesis, or you''ve been through more than two or three propose/apply cycles without convergence — they''ll want to redirect rather than watch you spin.
+
+Be concise during the loop — show key findings (failure summary, the active expression at the break, the specific local that''s wrong), not the full output of every tool. The user is reading the chat between rounds.
 
 Five tools form the evaluation surface:
 

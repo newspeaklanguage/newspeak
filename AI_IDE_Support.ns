@@ -115,6 +115,23 @@ class AI_IDE_Support usingPlatform: platform ide: webIde aiAccess: aiAccessModul
 	   workspace presenter renders. Without this, the AI workspace UI
 	   stays blank no matter how many evaluations run. *)
 	aiWorkspaceSubject_slot
+
+	(* Map[String, TestingInProgressSubject] keyed by test configuration
+	   class simpleName. Captured by run_tests so subsequent
+	   get_test_results / run_failing_tests / run_erroring_tests / run_test
+	   tools can read and mutate the same Tester. Selective re-runs
+	   operate on this cached Tester in place; a fresh run_tests
+	   overwrites the entry. *)
+	testersByConfigName = Map new.
+
+	(* The chatHolder currently displaying the shared AI chat, paired
+	   with the page subject it sits on. The brain-click path closes the
+	   previous chat region ONLY when the new click is on the same page;
+	   if the user navigates A → click → B → click → back to A, A's chat
+	   region stays as the user left it. Set together via
+	   activeChatHolder:page:. *)
+	activeChatHolder_slot
+	activeChatHolderPage_slot
 |
 ) (
 
@@ -262,6 +279,26 @@ public setLazySlotFocusOn: cdm side: side name: name = (
 		validator: [lazySlotStillExists: cdm side: side name: nameSym]
 )
 
+public setTestRunFocusOn: configClass = (
+	(* Focus on a test run for the given test configuration class.
+	   The argument is the underlying Class object (not a mirror) — that's
+	   what TestingInProgressSubject and TestingOutcomeSubject carry. *)
+	| cdm qname |
+	cdm:: (ClassMirror reflecting: configClass) mixin declaration.
+	qname:: qualifiedNameOf: cdm.
+	focusKind:: #testRun.
+	focusClassPath:: qname.
+	focusSide:: nil.
+	focusSelector:: nil.
+	installFocusDescription: ['Test results: ', qname]
+		validator: [classStillExists: cdm]
+)
+
+public isFocusedOnTestRunClass: configClass ^ <Boolean> = (
+	focusKind = #testRun ifFalse: [^false].
+	^focusClassPath = (qualifiedNameOf: (ClassMirror reflecting: configClass) mixin declaration)
+)
+
 public setEvaluatorFocusOnSubject: evaluatorSubject = (
 	(* Focus on an evaluator. evaluatorSubject is the EvaluatorSubject the
 	   brain belongs to — it owns the mirror (the receiver of evaluations:
@@ -393,6 +430,33 @@ public clearFocus = (
 	focusSelector:: nil.
 	focusEvaluatorMirror_slot:: nil.
 	focusEvaluatorSubject_slot:: nil.
+)
+
+(* --- Active chat region tracking ---
+
+   Brain buttons drop the shared chat into their presenter's chatHolder.
+   Without coordination, clicking a different brain leaves the previous
+   chatHolder still displaying the chat, so multiple chat regions appear
+   on screen at once. We track the most recently-activated chatHolder so
+   the brain-click path can close it before activating a new one.
+
+   Tracking is intentionally scoped to brain-click actions only — not
+   to updateVisualsFromSameKind:'s re-render restore path, which must
+   not close anything. The actual clearing (which needs Hopscotch's
+   `nothing` fragment) happens in the Browsing-side brain action; we
+   just hold the reference. *)
+
+public activeChatHolder = (
+	^activeChatHolder_slot
+)
+
+public activeChatHolderPage = (
+	^activeChatHolderPage_slot
+)
+
+public activeChatHolder: aChatHolder page: aPageSubject = (
+	activeChatHolder_slot:: aChatHolder.
+	activeChatHolderPage_slot:: aPageSubject.
 )
 
 public currentFocusDescription ^ <String> = (
@@ -915,6 +979,11 @@ public tools ^ <List> = (
 		navigateToDocumentTool.
 		showTestsTool.
 		runTestsTool.
+		getTestResultsTool.
+		getTestFailureDetailsTool.
+		runFailingTestsTool.
+		runErroringTestsTool.
+		runOneTestTool.
 		proposeChangesTool.
 		applyChangesetTool.
 		evaluateTool.
@@ -1248,22 +1317,208 @@ showTestsTool ^ <Tool> = (
 runTestsTool ^ <Tool> = (
 	^Tool
 		name: 'run_tests'
-		description: 'Run the test suite for a test configuration class — equivalent to clicking the [run tests] link on a test configuration''s class entry. The IDE jumps to the in-progress test view; if the test runner raises, the IDE navigates to a debugging thread subject instead. Pass the test configuration class''s dotted path.'
+		description: 'Run the test suite for a test configuration class — equivalent to clicking the [run tests] link on a test configuration''s class entry. The IDE jumps to the in-progress test view; if the test runner raises, the IDE navigates to a debugging thread subject instead. Pass the test configuration class''s dotted path.
+
+The Tester instance is captured for subsequent calls to get_test_results, run_failing_tests, run_erroring_tests, and run_test.'
 		inputSchema: '{"type":"object","properties":{"class_name":{"type":"string","description":"Test configuration class name or dotted path"}},"required":["class_name"]}'
 		handler: [:input |
-			| cdm classSubject thread |
+			| cdm classSubject testSubject thread |
 			cdm:: resolveClassPath: (input at: 'class_name').
 			classSubject:: ide browsing ClassSubject onDeclaration: cdm.
 			classSubject isTestConfiguration ifFalse: [
 				Error signal: (qualifiedNameOf: cdm), ' is not a test configuration class'
 			].
+			testSubject:: classSubject testingSubject.
+			testersByConfigName at: cdm simpleName asString put: testSubject.
 			thread:: ActivationMirror invokeSuspended:
-				[ide browsing navigateTo: classSubject testingSubject].
+				[ide browsing navigateTo: testSubject].
 			thread resume.
 			thread isFulfilled ifFalse: [
 				ide browsing navigateTo: (ide debugging ThreadSubject onModel: thread)
 			].
-			'Running tests for ', (qualifiedNameOf: cdm)
+			'Running tests for ', (qualifiedNameOf: cdm),
+				'. Use get_test_results to retrieve outcomes when complete.'
+		]
+)
+
+(* --- Test result helpers --- *)
+
+testerForConfigPath: configClassPath <String> ^ <Object> = (
+	| cdm testSubject |
+	cdm:: resolveClassPath: configClassPath.
+	testSubject:: testersByConfigName at: cdm simpleName asString ifAbsent: [
+		Error signal: 'No test run cached for ', configClassPath,
+			'. Call run_tests first.'
+	].
+	^testSubject tester
+)
+
+testCaseId: testCase <Object> ^ <String> = (
+	^testCase environment name asString, ' >> ', testCase selector asString
+)
+
+findTestCase: testName <String> inTester: tester <Object> ^ <Object> = (
+	| all match |
+	all:: List new.
+	tester errors    do: [:r  | all add: r testCase].
+	tester failures  do: [:r  | all add: r testCase].
+	tester successes do: [:r  | all add: r testCase].
+	tester inactive  do: [:tc | all add: tc].
+	match:: all detect: [:tc | (testCaseId: tc) = testName] ifNone: [nil].
+	match isNil ifTrue: [
+		Error signal: 'No test named "', testName, '" in this config''s suite.'
+	].
+	^match
+)
+
+summarizeFailure: r <Object> ^ <String> = (
+	^[r description] on: Error do: [:e | '(no description)']
+)
+
+summarizeError: r <Object> ^ <String> = (
+	^[
+		r exception class name asString, ': ', r exception messageText
+	] on: Error do: [:e | '(unprintable exception)']
+)
+
+formatTestSummary: tester <Object> configPath: configPath <String> ^ <String> = (
+	| sb total complete ratio |
+	total:: [tester testCaseList size] on: Error do: [:e | 0].
+	complete:: tester errors size + tester failures size + tester successes size.
+	ratio:: total = 0 ifTrue: [1.0] ifFalse: [complete asFloat / total].
+	sb:: 'Test config: ', configPath, '\n'.
+	sb:: sb, 'Status: ', complete printString, ' of ', total printString,
+		' tests complete (', ((ratio * 100) rounded) printString, '%)\n'.
+	sb:: sb, '  Passed:   ', tester successes size printString, '\n'.
+	sb:: sb, '  Failed:   ', tester failures  size printString, '\n'.
+	sb:: sb, '  Errored:  ', tester errors    size printString, '\n'.
+	sb:: sb, '  Disabled: ', tester disabled  size printString, '\n'.
+	sb:: sb, '  Inactive: ', tester inactive  size printString,
+		' (not yet run or not part of last selection)\n'.
+	tester failures isEmpty ifFalse: [
+		sb:: sb, '\nFailures:\n'.
+		tester failures do: [:r |
+			sb:: sb, '  [', (testCaseId: r testCase), '] ', (summarizeFailure: r), '\n'
+		]
+	].
+	tester errors isEmpty ifFalse: [
+		sb:: sb, '\nErrors:\n'.
+		tester errors do: [:r |
+			sb:: sb, '  [', (testCaseId: r testCase), '] ', (summarizeError: r), '\n'
+		]
+	].
+	complete < total ifTrue: [
+		sb:: sb, '\n(Tests may still be running; call get_test_results again later for an updated snapshot.)\n'
+	].
+	^sb
+)
+
+getTestResultsTool ^ <Tool> = (
+	^Tool
+		name: 'get_test_results'
+		description: 'Retrieve outcomes from the most recent run_tests (or selective re-run) for a test configuration class. Returns counts of passed / failed / errored / disabled / inactive plus one-line summaries of each failure and error. Use get_test_failure_details for full info on a specific test.'
+		inputSchema: '{"type":"object","properties":{"class_name":{"type":"string","description":"Test configuration class name or dotted path"}},"required":["class_name"]}'
+		handler: [:input |
+			| configPath tester |
+			configPath:: input at: 'class_name'.
+			tester:: testerForConfigPath: configPath.
+			formatTestSummary: tester configPath: configPath
+		]
+)
+
+getTestFailureDetailsTool ^ <Tool> = (
+	^Tool
+		name: 'get_test_failure_details'
+		description: 'Get full detail on a single failure or error from the most recent test run. test_name is the id formatted as "ContextName >> test_selector" — exactly as it appears in get_test_results.'
+		inputSchema: '{"type":"object","properties":{"class_name":{"type":"string","description":"Test configuration class name or dotted path"},"test_name":{"type":"string","description":"ContextName >> test_selector form"}},"required":["class_name","test_name"]}'
+		handler: [:input |
+			| configPath testName tester testCase failureResult errorResult successResult result |
+			configPath:: input at: 'class_name'.
+			testName:: input at: 'test_name'.
+			tester:: testerForConfigPath: configPath.
+			testCase:: findTestCase: testName inTester: tester.
+			failureResult:: tester failures detect: [:r | r testCase = testCase] ifNone: [nil].
+			errorResult:: tester errors detect: [:r | r testCase = testCase] ifNone: [nil].
+			successResult:: tester successes detect: [:r | r testCase = testCase] ifNone: [nil].
+			failureResult isNil ifFalse: [
+				^'[', testName, '] FAILURE\nDescription: ', (summarizeFailure: failureResult)
+			].
+			errorResult isNil ifFalse: [
+				^'[', testName, '] ERROR\n',
+					'Exception class: ', ([errorResult exception class name asString]
+						on: Error do: [:e | '(unknown)']), '\n',
+					'Message: ', ([errorResult exception messageText]
+						on: Error do: [:e | '(unprintable)']), '\n',
+					'(For full stack, navigate to the testing view and click the test in the IDE.)'
+			].
+			successResult isNil ifFalse: [
+				^'[', testName, '] PASSED — no failure detail to report.'
+			].
+			'[', testName, '] is inactive — not run in the latest invocation.'
+		]
+)
+
+runTestsForCases: testCases <Object> tester: tester <Object> = (
+	(* Run each test case in turn through tester run:, which mutates the
+	   tester''s errors / failures / successes lists. Iterate over a copy
+	   because run: removes-then-adds. *)
+	(testCases copyFrom: 1 to: testCases size) do: [:tc |
+		[tester run: tc] on: Error do: [:e | ]
+	]
+)
+
+runFailingTestsTool ^ <Tool> = (
+	^Tool
+		name: 'run_failing_tests'
+		description: 'Re-run only the failing tests from the most recent run. Updates the cached Tester in place. The IDE testing view (if currently displayed) refreshes to show the new state.'
+		inputSchema: '{"type":"object","properties":{"class_name":{"type":"string","description":"Test configuration class name or dotted path"}},"required":["class_name"]}'
+		handler: [:input |
+			| configPath tester count |
+			configPath:: input at: 'class_name'.
+			tester:: testerForConfigPath: configPath.
+			count:: tester failures size.
+			runTestsForCases: (tester failures collect: [:r | r testCase]) tester: tester.
+			ide browsing updateCurrentDisplay.
+			'Re-ran ', count printString, ' failing test',
+				(count = 1 ifTrue: [''] ifFalse: ['s']),
+				'. Call get_test_results for the new outcome.'
+		]
+)
+
+runErroringTestsTool ^ <Tool> = (
+	^Tool
+		name: 'run_erroring_tests'
+		description: 'Re-run only the erroring tests from the most recent run. Updates the cached Tester in place. The IDE testing view (if currently displayed) refreshes to show the new state.'
+		inputSchema: '{"type":"object","properties":{"class_name":{"type":"string","description":"Test configuration class name or dotted path"}},"required":["class_name"]}'
+		handler: [:input |
+			| configPath tester count |
+			configPath:: input at: 'class_name'.
+			tester:: testerForConfigPath: configPath.
+			count:: tester errors size.
+			runTestsForCases: (tester errors collect: [:r | r testCase]) tester: tester.
+			ide browsing updateCurrentDisplay.
+			'Re-ran ', count printString, ' erroring test',
+				(count = 1 ifTrue: [''] ifFalse: ['s']),
+				'. Call get_test_results for the new outcome.'
+		]
+)
+
+runOneTestTool ^ <Tool> = (
+	^Tool
+		name: 'run_test'
+		description: 'Re-run a single test by name. test_name is the "ContextName >> test_selector" form as it appears in get_test_results. The cached Tester is updated in place and the IDE testing view refreshes.'
+		inputSchema: '{"type":"object","properties":{"class_name":{"type":"string","description":"Test configuration class name or dotted path"},"test_name":{"type":"string","description":"ContextName >> test_selector form"}},"required":["class_name","test_name"]}'
+		handler: [:input |
+			| configPath testName tester testCase |
+			configPath:: input at: 'class_name'.
+			testName:: input at: 'test_name'.
+			tester:: testerForConfigPath: configPath.
+			testCase:: findTestCase: testName inTester: tester.
+			[tester run: testCase] on: Error do: [:e |
+				Error signal: 'Re-run failed: ', e messageText
+			].
+			ide browsing updateCurrentDisplay.
+			'Re-ran [', testName, ']. Call get_test_results for the new outcome.'
 		]
 )
 
@@ -1670,7 +1925,12 @@ The following tools have SIDE EFFECTS — they move the IDE''s view. Use them on
 - navigate_to_namespace   Open a namespace presenter; defaults to Root.
 - navigate_to_document    Open an Ampleforth document by name or dotted path.
 - show_tests              Open the test-suite view for a test configuration class (does not run the suite).
-- run_tests               Run the test suite for a test configuration class and open the in-progress view.
+- run_tests               Run the test suite for a test configuration class and open the in-progress view. Captures the Tester for subsequent get_test_results / re-run tools.
+- get_test_results        Retrieve outcomes from the latest run_tests for a config: counts plus per-failure/error one-liners.
+- get_test_failure_details Full detail on one failure or error (description for failures, exception class + message for errors).
+- run_failing_tests       Re-run only the current failures for a config; updates the Tester in place.
+- run_erroring_tests      Re-run only the current errors for a config.
+- run_test                Re-run a single named test ("ContextName >> test_selector" form).
 
 # Modifying code
 

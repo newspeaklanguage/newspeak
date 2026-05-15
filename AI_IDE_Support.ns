@@ -65,7 +65,7 @@ class AI_IDE_Support usingPlatform: platform ide: webIde aiAccess: aiAccessModul
 
 	currentFocusBlock
 	currentFocusValidator
-	(* focusKind: #class | #classHeader | #method | #lazySlot | nil *)
+	(* focusKind: #class | #classHeader | #method | #lazySlot | #evaluator | nil *)
 	focusKind
 	(* focusClassPath: String, dotted path *)
 	focusClassPath
@@ -73,6 +73,17 @@ class AI_IDE_Support usingPlatform: platform ide: webIde aiAccess: aiAccessModul
 	focusSide
 	(* focusSelector: Symbol — method or lazy-slot name, or nil *)
 	focusSelector
+	(* focusEvaluatorMirror_slot: ObjectMirror | ActivationMirror — set when
+	   focusKind = #evaluator. Used directly as the identity for matcher
+	   comparison; also exposed via the 'focus' object-registry id so
+	   evaluate(in_id: 'focus') routes to the focused evaluator's receiver. *)
+	focusEvaluatorMirror_slot
+
+	(* focusEvaluatorSubject_slot: the EvaluatorSubject (or subclass) that
+	   installed the focus. We retain it so 'focus' evaluations can append
+	   results to its evaluator's results list, making them visible in the
+	   IDE evaluator pane just like the workspace case. *)
+	focusEvaluatorSubject_slot
 
 	(* Single shared chat subject, lazily created on first use (e.g. when the
 	   user clicks any brain button). Once created, all brain buttons reuse it
@@ -85,6 +96,25 @@ class AI_IDE_Support usingPlatform: platform ide: webIde aiAccess: aiAccessModul
 	   plus old_source). Cleared on apply or discard. *)
 	proposedChangesets = Map new.
 	nextChangesetIdNum ::= 0.
+
+	(* AI object registry — Map[String, ObjectMirror] of objects the AI
+	   can refer to by id. Pre-populated with the AI workspace under id
+	   'workspace' the first time it is reached. Subsequent entries come
+	   from evaluate's non-primitive results, each auto-named (r1, r2, ...)
+	   or AI-named via the name: parameter. Deliberately NOT cleared on
+	   chat-clear: results reachable here may not be reachable from the
+	   workspace's result list (e.g. when the AI navigates and evaluates
+	   transitively through results). *)
+	objectRegistry = Map new.
+	nextResultIdNum ::= 0.
+
+	(* Cached AI workspace ObjectSubject. We keep the Subject (not just
+	   the mirror) so workspace evaluations can be routed through the
+	   subject's EvaluatorSubject — its evaluate: appends the resulting
+	   ThreadMirror to the workspace's results list, which is what the
+	   workspace presenter renders. Without this, the AI workspace UI
+	   stays blank no matter how many evaluations run. *)
+	aiWorkspaceSubject_slot
 |
 ) (
 
@@ -232,6 +262,59 @@ public setLazySlotFocusOn: cdm side: side name: name = (
 		validator: [lazySlotStillExists: cdm side: side name: nameSym]
 )
 
+public setEvaluatorFocusOnSubject: evaluatorSubject = (
+	(* Focus on an evaluator. evaluatorSubject is the EvaluatorSubject the
+	   brain belongs to — it owns the mirror (the receiver of evaluations:
+	   ObjectMirror for workspaces/inspectors, ActivationMirror for method
+	   evaluators and debugger frames) AND the results list shown in the
+	   IDE evaluator pane.
+	   The 'focus' id in the object registry resolves dynamically to the
+	   mirror, and evaluate's default in_id is 'focus' whenever evaluator
+	   focus is active, so the AI's evaluations route through this receiver
+	   without further configuration. *)
+	| mirror |
+	mirror:: evaluatorSubject model mirror.
+	focusKind:: #evaluator.
+	focusClassPath:: nil.
+	focusSide:: nil.
+	focusSelector:: nil.
+	focusEvaluatorMirror_slot:: mirror.
+	focusEvaluatorSubject_slot:: evaluatorSubject.
+	installFocusDescription: ['Evaluator (', (evaluatorDescription: mirror), ')']
+		validator: [evaluatorMirrorStillValid: mirror]
+)
+
+evaluatorMirrorStillValid: mirror ^ <Boolean> = (
+	(* For ActivationMirror, the activation must not have completed; once it
+	   has, evaluating against it is meaningless. For ObjectMirror, the
+	   reflectee stays alive as long as the mirror holds it, so we treat
+	   it as always valid. *)
+	^[
+		(mirror isKindOfActivationMirror)
+			ifTrue: [mirror isUncontinuable not]
+			ifFalse: [true]
+	] on: Error do: [:e | false]
+)
+
+evaluatorDescription: mirror ^ <String> = (
+	^[
+		(mirror isKindOfActivationMirror) ifTrue: [
+			^'activation: ', ([mirror method name asString]
+				on: Error do: [:e | '(unknown method)'])
+		].
+		'object: ', ([mirror getClass mixin name asString]
+			on: Error do: [:e | '(unknown class)'])
+	] on: Error do: [:e | 'unknown']
+)
+
+public isFocusedOnEvaluatorMirror: mirror ^ <Boolean> = (
+	focusKind = #evaluator ifFalse: [^false].
+	(* Use identity-aware mirror equality. ObjectMirror>>= and
+	   ActivationMirror>>= both compare the underlying reflectee, which
+	   is what we want. *)
+	^focusEvaluatorMirror_slot = mirror
+)
+
 (* Structural matchers — brain buttons call these so highlighting tracks
    the focused entity (class path + side + selector) regardless of whether
    the Subject object survived atomic install. *)
@@ -308,6 +391,8 @@ public clearFocus = (
 	focusClassPath:: nil.
 	focusSide:: nil.
 	focusSelector:: nil.
+	focusEvaluatorMirror_slot:: nil.
+	focusEvaluatorSubject_slot:: nil.
 )
 
 public currentFocusDescription ^ <String> = (
@@ -726,6 +811,90 @@ applyChangesetRecords: records = (
 	].
 )
 
+(* --- Object registry / evaluation helpers --- *)
+
+aiWorkspaceSubject ^ <Object> = (
+	(* Get-or-create the AI workspace via the WorkspaceManager's standard
+	   API. The workspace state (the workspaces list, counters) is in the
+	   WorkspaceManager module instance; the methods that manipulate it
+	   (addWorkspace, getWorkspace:, ...) are on the nested
+	   AllWorkspacesSubject class, accessing module state via lexical
+	   scope. Browsing.ns uses the same idiom — create a fresh
+	   AllWorkspacesSubject and call getWorkspace: on it; all subject
+	   instances share the same enclosing workspaces list, so the lookup-
+	   or-create is global to the IDE session.
+	   The resulting workspace is registered in the manager's list and
+	   inherits Workspace's platform/ide/Root bindings. Cached so its
+	   evaluator (which owns the visible-in-UI results list) is the same
+	   one each call. *)
+	aiWorkspaceSubject_slot isNil ifFalse: [^aiWorkspaceSubject_slot].
+	aiWorkspaceSubject_slot::
+		ide theWorkspaceManager AllWorkspacesSubject new
+			getWorkspace: 'AIWorkspace'.
+	objectRegistry at: 'workspace' put: aiWorkspaceSubject_slot objectMirror.
+	^aiWorkspaceSubject_slot
+)
+
+aiWorkspaceMirror ^ <Object> = (
+	^aiWorkspaceSubject objectMirror
+)
+
+registerResult: aMirror <Object> withName: nameOrNil <String | Nil> ^ <String> = (
+	| id |
+	(nameOrNil isNil or: [nameOrNil isEmpty]) ifTrue: [
+		nextResultIdNum:: nextResultIdNum + 1.
+		id:: 'r', nextResultIdNum printString
+	] ifFalse: [
+		id:: nameOrNil
+	].
+	objectRegistry at: id put: aMirror.
+	^id
+)
+
+isPrimitiveResult: aMirror <Object> ^ <Boolean> = (
+	(* Primitives (Integer, Float, String, Symbol, Boolean, Character, nil)
+	   are NOT registered — the AI can use their printString directly. *)
+	| r |
+	r:: aMirror reflectee.
+	r isNil ifTrue: [^true].
+	r isKindOfInteger ifTrue: [^true].
+	r isKindOfFloat ifTrue: [^true].
+	r isKindOfString ifTrue: [^true].
+	r isKindOfSymbol ifTrue: [^true].
+	r isKindOfBoolean ifTrue: [^true].
+	r isKindOfCharacter ifTrue: [^true].
+	^false
+)
+
+summaryOf: aMirror <Object> ^ <String> = (
+	| className printStr |
+	className:: [aMirror getClass mixin name asString]
+		on: Error do: [:e | '(class?)'].
+	printStr:: [aMirror reflectee printString]
+		on: Error do: [:e | '(printString raised: ', e messageText, ')'].
+	printStr size > 200 ifTrue: [printStr:: (printStr copyFrom: 1 to: 197), '...'].
+	^className, ': ', printStr
+)
+
+mirrorForObjectId: id <String> ^ <Object> = (
+	id = 'workspace' ifTrue: [^aiWorkspaceMirror].
+	id = 'focus' ifTrue: [
+		(* Resolves dynamically to whichever evaluator the user has focused
+		   on, so the AI never has to track a stale id between turns. *)
+		focusKind = #evaluator ifFalse: [
+			Error signal:
+				'No evaluator focus is set. Click a brain on a workspace, ' ,
+				'object inspector, method evaluator, or debugger activation, ' ,
+				'or pass in_id: "workspace" to use the AI workspace.'
+		].
+		^focusEvaluatorMirror_slot
+	].
+	^objectRegistry at: id ifAbsent: [
+		Error signal: 'No such object id: ', id,
+			'. Use list_objects to see registered ids.'
+	]
+)
+
 (* --- IDE tool definitions --- *)
 
 public tools ^ <List> = (
@@ -748,6 +917,11 @@ public tools ^ <List> = (
 		runTestsTool.
 		proposeChangesTool.
 		applyChangesetTool.
+		evaluateTool.
+		navigateToObjectTool.
+		inspectObjectTool.
+		listObjectsTool.
+		forgetObjectTool.
 	}
 )
 
@@ -1146,6 +1320,144 @@ applyChangesetTool ^ <Tool> = (
 		]
 )
 
+evaluateTool ^ <Tool> = (
+	^Tool
+		name: 'evaluate'
+		description: 'Evaluate a Newspeak expression. By default the receiver is the AI workspace (id "workspace") — a regular IDE workspace named AIWorkspace, with platform, ide, and Root accessible via the Workspace superclass. Pass in_id to evaluate with a previously registered object as the receiver.
+
+Non-primitive results are registered in the object registry under an auto-generated id (e.g. "r3") or your chosen name (via the name parameter). Primitives (Integer, Float, String, Symbol, Boolean, Character, nil) are NOT registered — their printString is just returned.
+
+Side-effecting expressions (collection mutations, slot assignments via setters, etc.) are allowed — this is the REPL primitive. Use propose_changes / apply_changeset for code installation, not raw evaluate.'
+		inputSchema: '{"type":"object","properties":{"expression":{"type":"string","description":"Newspeak expression to evaluate"},"in_id":{"type":"string","description":"Id of registered receiver (default: workspace)"},"name":{"type":"string","description":"Optional friendly id for the result, instead of auto-generated rN"}},"required":["expression"]}'
+		handler: [:input |
+			| exprSource inId nameOrNil receiver thread resultMirror |
+			exprSource:: input at: 'expression'.
+			inId:: (input includesKey: 'in_id')
+				ifTrue: [input at: 'in_id']
+				ifFalse: [
+					(* Default to whatever evaluator the user has focused on
+					   (workspace, object inspector, method evaluator,
+					   debugger activation). Falls through to the AI
+					   workspace when no evaluator focus is set. *)
+					focusKind = #evaluator
+						ifTrue: ['focus']
+						ifFalse: ['workspace']
+				].
+			nameOrNil:: (input includesKey: 'name')
+				ifTrue: [input at: 'name']
+				ifFalse: [nil].
+			receiver:: mirrorForObjectId: inId.
+			thread:: [receiver evaluate: exprSource] on: Error do: [:e |
+				Error signal: 'Evaluation failed at compile: ', e messageText
+			].
+			(* When evaluating against an in-IDE evaluator (the workspace via
+			   id 'workspace', or whatever the user has focused on via
+			   id 'focus'), append the ThreadMirror to that evaluator's
+			   results list so the result becomes visible in the IDE — both
+			   live (we trigger updateCurrentDisplay) and on later
+			   navigation. For arbitrary objects from the registry, there
+			   is no associated presenter to update; the AI sees the result
+			   via its returned id and tools, which is enough for v1.
+			   All best-effort — never let an exposure failure mask the
+			   actual evaluation result. *)
+			inId = 'workspace' ifTrue: [
+				[aiWorkspaceSubject evaluator results add: thread]
+					on: Error do: [:e | ].
+				ide browsing updateCurrentDisplay
+			] ifFalse: [
+				inId = 'focus' ifTrue: [
+					focusEvaluatorSubject_slot isNil ifFalse: [
+						[focusEvaluatorSubject_slot results add: thread]
+							on: Error do: [:e | ]
+					].
+					ide browsing updateCurrentDisplay
+				]
+			].
+			thread isBroken ifTrue: [
+				| ex |
+				ex:: [thread result reflectee printString]
+					on: Error do: [:e | '(broken; unprintable)'].
+				Error signal: 'Evaluation raised at runtime: ', ex
+			].
+			resultMirror:: thread result.
+			(* Use ifTrue:ifFalse: rather than ^early-return: this is a stored
+			   handler block whose enclosing method (evaluateTool) has already
+			   returned, so ^ would raise CannotReturn. *)
+			(isPrimitiveResult: resultMirror)
+				ifTrue: ['=> ', (summaryOf: resultMirror)]
+				ifFalse: [
+					| id |
+					id:: registerResult: resultMirror withName: nameOrNil.
+					'=> [', id, '] ', (summaryOf: resultMirror)
+				]
+		]
+)
+
+navigateToObjectTool ^ <Tool> = (
+	^Tool
+		name: 'navigate_to_object'
+		description: 'Navigate the IDE to an object presenter on a registered object. Pass the id from evaluate or list_objects. Side effect: the IDE jumps.'
+		inputSchema: '{"type":"object","properties":{"id":{"type":"string","description":"Registered object id (e.g. r1, or workspace)"}},"required":["id"]}'
+		handler: [:input |
+			| id mirror |
+			id:: input at: 'id'.
+			mirror:: mirrorForObjectId: id.
+			ide browsing navigateTo: (ide browsing ObjectSubject onModel: mirror).
+			'Opened object [', id, '] ', (summaryOf: mirror)
+		]
+)
+
+inspectObjectTool ^ <Tool> = (
+	^Tool
+		name: 'inspect_object'
+		description: 'Get a short summary of a registered object — class name and printString. To enumerate the messages it responds to, follow up with list_class_members on the class.'
+		inputSchema: '{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}'
+		handler: [:input |
+			| id mirror |
+			id:: input at: 'id'.
+			mirror:: mirrorForObjectId: id.
+			'Object [', id, ']\nClass: ', (mirror getClass mixin name asString),
+				'\nprintString: ', ([mirror reflectee printString]
+					on: Error do: [:e | '(raised: ', e messageText, ')'])
+		]
+)
+
+listObjectsTool ^ <Tool> = (
+	^Tool
+		name: 'list_objects'
+		description: 'List all objects registered in the AI object registry, with their ids and summaries. Includes the always-present workspace.'
+		inputSchema: '{"type":"object","properties":{}}'
+		handler: [:input |
+			(* Ensure workspace is registered. *)
+			| result |
+			aiWorkspaceMirror.
+			result:: 'Registered objects:\n'.
+			objectRegistry keysAndValuesDo: [:id :m |
+				result:: result, '  [', id, '] ', (summaryOf: m), '\n'
+			].
+			result
+		]
+)
+
+forgetObjectTool ^ <Tool> = (
+	^Tool
+		name: 'forget_object'
+		description: 'Remove an object from the registry. The workspace itself cannot be forgotten.'
+		inputSchema: '{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}'
+		handler: [:input |
+			| id |
+			id:: input at: 'id'.
+			id = 'workspace' ifTrue: [
+				Error signal: 'Cannot forget the workspace.'
+			].
+			objectRegistry at: id ifAbsent: [
+				Error signal: 'No such object id: ', id
+			].
+			objectRegistry removeKey: id.
+			'Forgot [', id, ']'
+		]
+)
+
 (* --- Convenience API --- *)
 
 (* Create a session with the IDE tools pre-configured. *)
@@ -1386,6 +1698,38 @@ Things this tool does NOT do:
 - Class-side nested classes (rare in Newspeak; add_or_replace_nested_class is always instance side)
 
 If you need any of these, tell the user the tool doesn''t support it and stop.
+
+# Evaluating expressions
+
+Newspeak has no globals — every operation is a message send to some receiver. To run code, you need a receiver.
+
+Two pre-registered receivers:
+  - "workspace" — the AI workspace (a real, browsable IDE workspace named AIWorkspace) whose enclosing class is Workspace, so platform, ide, and Root are all in scope, plus Root fallthrough on doesNotUnderstand.
+  - "focus" — dynamically resolves to whichever evaluator the user has focused on (by clicking a brain button on a workspace, object inspector, method evaluator, lazy-slot evaluator, or debugger activation). Raises if no evaluator focus is set.
+
+`evaluate`''s default `in_id` follows the user''s focus: if an evaluator is focused, the default is "focus"; otherwise it is "workspace". So `evaluate("someExpression")` does the right thing for "evaluate this here" without you specifying. Pass `in_id` explicitly when you want a specific registered object.
+
+Five tools form the evaluation surface:
+
+- evaluate              {expression, in_id?, name?}     Sends expression to the registered object at in_id (default "workspace"). Primitive results (Integer, Float, String, Symbol, Boolean, Character, nil) are returned as printString. Non-primitive results are registered in an object registry under an auto-generated id like "r3", or under name if you supply one. Side effects (collection mutations, slot writes) are permitted — this is the REPL.
+- navigate_to_object    {id}                            Opens an IDE object presenter on the registered object. Side effect: the IDE jumps. Use sparingly, with intent.
+- inspect_object        {id}                            Returns class + printString of the registered object. To enumerate messages it responds to, follow up with list_class_members on its class.
+- list_objects          {}                              Lists registered ids and summaries. Always includes "workspace".
+- forget_object         {id}                            Removes from the registry. The workspace cannot be forgotten.
+
+Workflow pattern: evaluate something against the workspace, get back an id, then evaluate further messages against that id. e.g.:
+
+  evaluate("platform mirrors ClassMirror reflecting: List")
+    => [r1] ClassMirror: ...
+  evaluate("mixin methods", in_id: "r1")
+    => [r2] MirrorGroup: ...
+  inspect_object("r2")  /  navigate_to_object("r2")
+
+**Holding values across evaluations.** The workspace does NOT auto-create slots — `foo:: value` in an evaluation will fail at runtime unless a slot named foo already exists on the workspace class. To keep a value addressable across multiple evaluate calls, use the `name:` parameter: `evaluate("someExpression", name: "myThing")` registers the result under id "myThing", so the next call can be `evaluate("something else", in_id: "myThing")`. Use forget_object to discard ones you no longer need.
+
+If you really need a persistent workspace-class slot, you can add one with propose_changes (set_class_header on AIWorkspace) — but for ephemeral values the registry is the right tool.
+
+For code MODIFICATION (adding methods, changing class headers, etc.), use propose_changes / apply_changeset — NOT evaluate. evaluate is for running expressions and inspecting objects; the propose/apply path is for installable, reviewable, atomic edits to the system.
 
 When the user asks about an entity in their system, use the IDE tools to look it up before answering. When in doubt about Newspeak syntax or semantics, fetch the spec rather than guessing. When you produce Newspeak source, follow the style guidelines above and respect member ordering (nested classes before methods).'
 )

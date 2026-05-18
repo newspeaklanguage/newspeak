@@ -24,6 +24,8 @@ class AI_IDE_Support usingPlatform: platform ide: webIde aiAccess: aiAccessModul
 	private Map = platform collections Map.
 	private ide = webIde.
 	private retainedPlatform = platform.
+	private Document = webIde documents Document.
+	private Presenter = platform hopscotch Presenter.
 
 	(* General-purpose AI modules *)
 	public aiAccess = aiAccessModule.
@@ -38,6 +40,8 @@ class AI_IDE_Support usingPlatform: platform ide: webIde aiAccess: aiAccessModul
 	private AIChatSetupPresenter = chatUI AIChatSetupPresenter.
 	private BaseChatSubject = chatUI ChatSubject.
 	private BaseChatPresenter = chatUI ChatPresenter.
+	private ChatStatusPresenter = chatUI ChatStatusPresenter.
+	private ChatInputPresenter = chatUI ChatInputPresenter.
 
 	(* --- AI focus state ---
 
@@ -137,105 +141,408 @@ class AI_IDE_Support usingPlatform: platform ide: webIde aiAccess: aiAccessModul
 	activeChatHolderPage_slot
 |
 ) (
-
-(* --- IDE-specific chat setup --- *)
-
 public class IDEChatSetupSubject onModel: providerClass = AIChatSetupSubject onModel: providerClass (
 (*
- Overrides session creation to include IDE-specific tools, and uses
- IDE-aware presenter and chat subject subclasses.
+ IDE-specific chat setup. Adds a docName field. startChat is overridden:
+ instead of constructing an in-memory ChatSubject, it persists the API key,
+ creates a ChatDocument in Root with the configured provider + model, makes
+ that doc the active chat doc (in localStorage), caches its chat subject
+ as the shared session for ephemeral brain-button chats, and returns a
+ DocumentSubject for navigation so the user lands on the new doc.
 *)
+|
+	public docName <String> ::= 'Chat'.
+|
 ) (
-
 public createSession: provider = (
 	| session |
 	session:: Session provider: provider tools: tools.
 	session systemPrompt: newspeakSystemPrompt.
 	^session
 )
-
 public createPresenter = (
 	^IDEChatSetupPresenter onSubject: self
 )
-
+public startChat = (
+	| doc |
+	apiKey isEmpty ifTrue: [
+		errorMessage:: 'Please enter an API key.'.
+		^nil
+	].
+	docName isEmpty ifTrue: [
+		errorMessage:: 'Please enter a chat name.'.
+		^nil
+	].
+	(Root includesKey: docName asSymbol) ifTrue: [
+		errorMessage:: 'An entry named "', docName, '" already exists in Root.'.
+		^nil
+	].
+	[retainedPlatform js localStorage setItem: storageKey to: apiKey]
+		on: Exception do: [:e | ].
+	[retainedPlatform js localStorage setItem: 'ns_ai_active_chat_doc' to: docName]
+		on: Exception do: [:e | ].
+	doc:: ChatDocument
+		named: docName
+		providerName: 'anthropic'
+		modelName: modelName.
+	Root at: docName asSymbol put: doc.
+	sharedChatSubject_slot:: doc chatSubject.
+	ide browsing updateCurrentDisplay.
+	^ide documents DocumentSubject onModel: doc
+)
 public newChatSubjectFor: session = (
+	(* Legacy path: not used now that startChat creates a ChatDocument and
+	   caches its chatSubject directly. Kept as a defensive fallback if any
+	   caller bypasses startChat. *)
 	| chat |
 	chat:: IDEChatSubject onModel: session.
-	(* Cache as the shared chat so subsequent brain clicks reuse this session. *)
 	sharedChatSubject_slot:: chat.
 	^chat
 )
-
 public isKindOfIDEChatSetupSubject = ( ^true )
 isMyKind: other = ( ^other isKindOfIDEChatSetupSubject )
-
 ) : (
 )
-
 public class IDEChatSubject onModel: session = BaseChatSubject onModel: session (
 (*
  IDE-aware chat subject; returns an IDE presenter so Inspect Presenter works.
 *)
 ) (
-
 public createPresenter = (
 	^IDEChatPresenter onSubject: self
 )
-
 public isKindOfIDEChatSubject = ( ^true )
 isMyKind: other = ( ^other isKindOfIDEChatSubject )
-
 ) : (
 )
-
-public class IDEChatSetupPresenter onSubject: s = AIChatSetupPresenter onSubject: s () (
-
+public class IDEChatSetupPresenter onSubject: s = AIChatSetupPresenter onSubject: s (
+|
+	docNameEditor
+|
+) (
+definition = (
+	^column: {
+		helpSection.
+		row: {
+			(label: 'AI Chat Setup') bold.
+			filler.
+			helpButton.
+			dropDownMenu: [actionsMenu].
+		}.
+		mediumBlank.
+		label: 'Enter your API key and choose a name for your chat document.'.
+		label: 'The key is stored in your browser''s localStorage; the chat document lives in your IDE namespace.'.
+		mediumBlank.
+		row: { (label: 'API Key: ') bold. elastic: apiKeyField. }.
+		mediumBlank.
+		row: { (label: 'Model: ') bold. elastic: modelField. }.
+		mediumBlank.
+		row: { (label: 'Chat name: ') bold. elastic: docNameField. }.
+		mediumBlank.
+		errorArea.
+		row: {
+			filler.
+			button: 'Start Chat' action: [respondToStart].
+		}.
+	}
+)
+docNameField = (
+	docNameEditor:: codeMirror: subject docName.
+	docNameEditor changeResponse: [:frag |
+		subject docName: frag textBeingAccepted.
+	].
+	^docNameEditor
+)
+respondToStart = (
+	subject docName: docNameEditor textBeingAccepted.
+	super respondToStart
+)
 respondToInspectPresenter = (
 	enterSubject: (ide browsing ObjectSubject onModel: (ObjectMirror reflecting: self))
 )
-
 public isKindOfIDEChatSetupPresenter = ( ^true )
 isMyKind: other = ( ^other isKindOfIDEChatSetupPresenter )
-
 ) : (
 )
-
 public class IDEChatPresenter onSubject: s = BaseChatPresenter onSubject: s () (
-
 respondToInspectPresenter = (
 	enterSubject: (ide browsing ObjectSubject onModel: (ObjectMirror reflecting: self))
 )
-
 public isKindOfIDEChatPresenter = ( ^true )
 isMyKind: other = ( ^other isKindOfIDEChatPresenter )
-
 ) : (
 )
-
-(* --- Focus management ---
-
-   A presenter signals what the user is asking about by installing a focus
-   block. The chat does NOT push the focus into the conversation; it is pulled
-   on demand via the current_focus tool. The block is re-evaluated on every
-   pull, so live state (e.g. unaccepted edits) flows through automatically.
-   To clear focus, pass nil. *)
-
-(* Internal: install a description block and an existence validator.
-   Brain buttons should call the kind-specific setXFocusOn: helpers below
-   rather than this one; those also set the structured identity slots
-   required by isFocusedOnX: matchers. *)
+public class ChatDocument named: n <String>
+                          providerName: pn <String>
+                          modelName: mn <String>
+	= Document named: n contents: (initialChatDocumentContents: n) (
+|
+	public providerName <String> = pn.
+	public modelName <String> ::= mn.
+	chatSubject_slot
+	twoViewEditor_slot
+|
+) (
+public isKindOfChatDocument ^ <Boolean> = ( ^true )
+public noteLiveViewRendered: aTwoViewEditor = (
+	(* Capture the TwoViewEditor presenter that is currently rendering this
+	   doc, so the chat subject can call refreshLiveView after mutating
+	   contents (appending turn sections). DocumentPresenter calls this
+	   whenever it builds the editor — including on re-renders, so we always
+	   point at the latest one. *)
+	twoViewEditor_slot:: aTwoViewEditor
+)
+public refreshLiveView = (
+	(* Tell the displayed live view to re-render from the current contents.
+	   No-op if the doc isn't currently displayed (we never saw a
+	   noteLiveViewRendered:). *)
+	twoViewEditor_slot isNil ifFalse: [twoViewEditor_slot refresh]
+)
+public chatSubject = (
+	(* Skip past the structural amplet ids (1..3) so AI-inserted amplets
+	   via add_amplet get fresh ids starting at 4. *)
+	maxAmpletCount < 3 ifTrue: [maxAmpletCount: 3].
+	chatSubject_slot isNil ifTrue: [
+		chatSubject_slot:: IDEChatDocumentSubject onChatDocument: self session: createFreshSession
+	].
+	(* Mark this doc as the active chat doc. The structural amplets call
+	   chatSubject on every render, so this implements "most recently viewed
+	   chat doc wins" for ephemeral brain-button chats (which pull
+	   sharedChatSubject_slot) and for the next-session default. *)
+	sharedChatSubject_slot:: chatSubject_slot.
+	[retainedPlatform js localStorage setItem: 'ns_ai_active_chat_doc' to: name]
+		on: Exception do: [:e | ].
+	^chatSubject_slot
+)
+public session = ( ^chatSubject session )
+createFreshSession = (
+	| provider session key |
+	key:: apiKeyForProvider: providerName.
+	provider:: (providerClassFor: providerName) apiKey: key model: modelName.
+	session:: Session provider: provider tools: tools.
+	session systemPrompt: newspeakSystemPrompt.
+	^session
+)
+public thinkingOrModelPicker = (
+	^ChatStatusPresenter onSubject: chatSubject
+)
+public userInputEditor = (
+	^ChatInputPresenter onSubject: chatSubject
+)
+public chatControls = (
+	^row: {
+		button: 'New Chat' action: [
+			ide browsing navigateTo: (IDEChatSetupSubject onModel: AnthropicProvider)
+		].
+		mediumBlank.
+		chatDocPicker.
+		filler.
+	}
+)
+chatDocPicker = (
+	(* Dropdown listing every ChatDocument in Root. Selecting one navigates
+	   the IDE to it, which makes it the active chat doc (via the chatSubject
+	   side-effect on render). Order: insertion order of Root, which is
+	   roughly creation order — fine for now. *)
+	| docs |
+	docs:: List new.
+	Root keysAndValuesDo: [:k :v |
+		([v isKindOfChatDocument] on: Exception do: [:e | false])
+			ifTrue: [docs add: v]
+	].
+	^row: {
+		label: 'Chats:'.
+		smallBlank.
+		dropDownMenu: [
+			menuWithLabelsAndActions:
+				(docs collect: [:doc |
+					{doc name.
+					 [ide browsing navigateTo:
+						(ide documents DocumentSubject onModel: doc)]}
+				])
+		]
+	}
+)
+public appendUserSection: text <String> = (
+	insertTurnSection: text role: 'user'
+)
+public appendAssistantSection: text <String> = (
+	insertTurnSection: text role: 'assistant'
+)
+public clearConversation = (
+	chatSubject_slot isNil ifFalse: [chatSubject_slot session clearHistory]
+)
+insertTurnSection: text <String> role: role <String> = (
+	| container thinking jsDoc section labelCol textCol parent labelEl textSpan labelText bg border fontStyle |
+	container:: parseAmpletContainer: contents.
+	thinking:: findChatStructuralAmplet: 'thinkingOrModelPicker' in: container.
+	thinking isNil ifTrue: [
+		Error signal: 'ChatDocument is missing its structural amplets; cannot append turn'
+	].
+	jsDoc:: retainedPlatform js global at: 'document'.
+	section:: jsDoc createElement: 'div'.
+	section setAttribute: 'class' to: 'chat-turn'.
+	section setAttribute: 'data-role' to: role.
+	section setAttribute: 'contenteditable' to: 'false'.
+	role = 'user'
+		ifTrue: [
+			labelText:: 'You'.
+			bg:: chatUI userTurnBackground.
+			border:: chatUI userTurnBorder.
+			fontStyle:: 'italic'.
+		]
+		ifFalse: [
+			labelText:: 'Assistant'.
+			bg:: chatUI assistantTurnBackground.
+			border:: chatUI assistantTurnBorder.
+			fontStyle:: 'normal'.
+		].
+	section setAttribute: 'style' to:
+		'display:flex; flex-direction:row; align-items:flex-start; border:1px solid ', border,
+		'; border-radius:6px; padding:8px 12px; margin:12px 0; background-color:', bg, ';'.
+	(* Margin column: speaker label, right-aligned, fixed width *)
+	labelCol:: jsDoc createElement: 'div'.
+	labelCol setAttribute: 'style' to:
+		'min-width:5em; max-width:5em; padding-right:1em; text-align:right; flex-shrink:0;'.
+	labelEl:: jsDoc createElement: 'strong'.
+	labelEl at: 'textContent' put: labelText.
+	labelCol appendChild: labelEl.
+	(* Text column: speech, roman or italic *)
+	textCol:: jsDoc createElement: 'div'.
+	textCol setAttribute: 'style' to: 'flex:1; min-width:0;'.
+	textSpan:: jsDoc createElement: 'span'.
+	textSpan setAttribute: 'style' to: 'white-space:pre-wrap; font-style:', fontStyle, ';'.
+	textSpan at: 'textContent' put: text.
+	textCol appendChild: textSpan.
+	section appendChild: labelCol.
+	section appendChild: textCol.
+	parent:: thinking at: 'parentNode'.
+	parent insertBefore: section before: thinking.
+	contents: (container at: 'innerHTML')
+)
+) : (
+)
+public class IDEChatDocumentSubject onChatDocument: doc session: s = IDEChatSubject onModel: s (
+|
+	public document = doc.
+	lastTurnIndexBeforeSend
+|
+) (
+public isKindOfIDEChatDocumentSubject = ( ^true )
+public sendText: text = (
+	| promise |
+	text isEmpty ifTrue: [^nil].
+	document appendUserSection: text.
+	lastTurnIndexBeforeSend:: session displayMessages size.
+	promise:: super sendText: text.
+	(* Refresh AFTER super so the live view picks up both the new user
+	   section (HTML) and the thinking indicator (chat subject's waiting
+	   flag, which super just set). *)
+	document refreshLiveView.
+	^promise
+)
+public markComplete = (
+	super markComplete.
+	appendNewAssistantTurnsAfter: lastTurnIndexBeforeSend.
+	document refreshLiveView.
+	ide browsing updateCurrentDisplay
+)
+public markError: msg = (
+	super markError: msg.
+	document refreshLiveView.
+	ide browsing updateCurrentDisplay
+)
+appendNewAssistantTurnsAfter: startIdx = (
+	| msgs i |
+	msgs:: session displayMessages.
+	i:: startIdx + 1.
+	[i <= msgs size] whileTrue: [
+		| msg role text |
+		msg:: msgs at: i.
+		role:: msg at: 1.
+		text:: msg at: 2.
+		role = 'assistant' ifTrue: [document appendAssistantSection: text].
+		i:: i + 1
+	]
+)
+) : (
+)
+findChatStructuralAmplet: name <String> in: container <Object> ^ <Object | UndefinedObject> = (
+	| amplets count i |
+	amplets:: container getElementsByClassName: 'ampleforth'.
+	count:: amplets at: 'length'.
+	i:: 0.
+	[i < count] whileTrue: [
+		| amplet n |
+		amplet:: amplets at: i.
+		n:: amplet getAttribute: 'name'.
+		n = name ifTrue: [^amplet].
+		i:: i + 1
+	].
+	^nil
+)
+initialChatDocumentContents: n <String> ^ <String> = (
+	(* Initial HTML for a fresh ChatDocument. Three structural amplets:
+	   chatControls at top (New Chat button, etc.), thinkingOrModelPicker
+	   and userInputEditor anchored at the bottom. Chat turns accumulate
+	   between chatControls and thinkingOrModelPicker. *)
+	^'<div class="self_ampleforth" contenteditable="true" style="border: 2px solid blue; resize: horizontal; overflow: auto; overflow-wrap: break-word; width: 40em;" onkeyup="updateRawHTML()" ondragover="((e) => {e.preventDefault();})(event)"> <!-- self_ampleforth -->
+<h1>', n, '</h1>
+<div class="ampleforth" ampletId="1" name="chatControls" contenteditable="false"> </div>
+<div class="ampleforth" ampletId="2" name="thinkingOrModelPicker" contenteditable="false"> </div>
+<div class="ampleforth" ampletId="3" name="userInputEditor" contenteditable="false" style="display:block; width:100%; min-height:4em; margin-top:0.5em;"> </div>
+</div>'
+)
+providerClassFor: pn <String> = (
+	pn = 'anthropic' ifTrue: [^AnthropicProvider].
+	Error signal: 'Unknown provider: ', pn,
+		' (supported: anthropic)'
+)
+apiKeyStorageKeyFor: pn <String> ^ <String> = (
+	^'ns_ai_apikey_', (providerClassFor: pn) name
+)
+apiKeyForProviderOrNil: pn <String> ^ <String | UndefinedObject> = (
+	| key |
+	[key:: retainedPlatform js localStorage getItem: (apiKeyStorageKeyFor: pn)]
+		on: Exception do: [:e | ^nil].
+	^key
+)
+apiKeyForProvider: pn <String> ^ <String> = (
+	| key |
+	key:: apiKeyForProviderOrNil: pn.
+	key isNil ifTrue: [
+		Error signal: 'No API key stored for provider "', pn,
+			'". Set one via the chat setup screen first.'
+	].
+	^key
+)
+public defaultChatDocumentOrCreate ^ <ChatDocument | UndefinedObject> = (
+	| activeName entry key doc |
+	activeName:: [retainedPlatform js localStorage getItem: 'ns_ai_active_chat_doc']
+		on: Exception do: [:e | nil].
+	activeName isNil ifTrue: [
+		activeName:: 'Chat'.
+		[retainedPlatform js localStorage setItem: 'ns_ai_active_chat_doc' to: 'Chat']
+			on: Exception do: [:e | ]
+	].
+	entry:: Root at: activeName asSymbol ifAbsent: [nil].
+	entry isNil ifFalse: [
+		(entry isKindOfChatDocument) ifTrue: [^entry].
+		^nil
+	].
+	key:: apiKeyForProviderOrNil: 'anthropic'.
+	key isNil ifTrue: [^nil].
+	doc:: ChatDocument
+		named: activeName
+		providerName: 'anthropic'
+		modelName: 'claude-sonnet-4-6'.
+	Root at: activeName asSymbol put: doc.
+	^doc
+)
 installFocusDescription: aBlock validator: aValidator = (
 	currentFocusBlock:: aBlock.
 	currentFocusValidator:: aValidator.
 )
-
-(* Kind-specific focus installers. Each sets:
-   - the structured identity (focusKind, focusClassPath, focusSide,
-     focusSelector) used by isFocusedOnX:... matchers for brain-button
-     highlighting,
-   - a description block returned by the current_focus AI tool,
-   - an existence validator that re-checks the entity on every read. *)
-
 public setClassFocusOn: cdm = (
 	| qname |
 	qname:: qualifiedNameOf: cdm.
@@ -246,7 +553,6 @@ public setClassFocusOn: cdm = (
 	installFocusDescription: ['Class: ', qname]
 		validator: [classStillExists: cdm]
 )
-
 public setClassHeaderFocusOn: cdm = (
 	| qname |
 	qname:: qualifiedNameOf: cdm.
@@ -257,7 +563,6 @@ public setClassHeaderFocusOn: cdm = (
 	installFocusDescription: ['Class header (factory + slots) of class ', qname]
 		validator: [classStillExists: cdm]
 )
-
 public setMethodFocusOn: cdm side: side selector: sel = (
 	| qname selSym |
 	qname:: qualifiedNameOf: cdm.
@@ -269,7 +574,6 @@ public setMethodFocusOn: cdm side: side selector: sel = (
 	installFocusDescription: ['Method: ', qname, ' (', side, ' side) >> ', selSym asString]
 		validator: [methodStillExists: cdm side: side selector: selSym]
 )
-
 public setLazySlotFocusOn: cdm side: side name: name = (
 	| qname nameSym |
 	qname:: qualifiedNameOf: cdm.
@@ -281,7 +585,6 @@ public setLazySlotFocusOn: cdm side: side name: name = (
 	installFocusDescription: ['Lazy slot: ', qname, ' (', side, ' side) >> ', nameSym asString]
 		validator: [lazySlotStillExists: cdm side: side name: nameSym]
 )
-
 public setTestRunFocusOn: configClass = (
 	(* Focus on a test run for the given test configuration class.
 	   The argument is the underlying Class object (not a mirror) — that's
@@ -296,12 +599,27 @@ public setTestRunFocusOn: configClass = (
 	installFocusDescription: ['Test results: ', qname]
 		validator: [classStillExists: cdm]
 )
-
 public isFocusedOnTestRunClass: configClass ^ <Boolean> = (
 	focusKind = #testRun ifFalse: [^false].
 	^focusClassPath = (qualifiedNameOf: (ClassMirror reflecting: configClass) mixin declaration)
 )
-
+public setDocumentFocusOn: doc = (
+	(* Focus on an Ampleforth document (including ChatDocuments). Identity
+	   is the doc's name; the validator confirms a doc with that name still
+	   lives in Root and is the same object. *)
+	| docName |
+	docName:: doc name.
+	focusKind:: #document.
+	focusClassPath:: docName.
+	focusSide:: nil.
+	focusSelector:: nil.
+	installFocusDescription: ['Document: ', docName]
+		validator: [(Root at: docName asSymbol ifAbsent: [nil]) = doc]
+)
+public isFocusedOnDocument: doc ^ <Boolean> = (
+	focusKind = #document ifFalse: [^false].
+	^focusClassPath = doc name
+)
 public setEvaluatorFocusOnSubject: evaluatorSubject = (
 	(* Focus on an evaluator. evaluatorSubject is the EvaluatorSubject the
 	   brain belongs to — it owns the mirror (the receiver of evaluations:
@@ -329,7 +647,6 @@ public setEvaluatorFocusOnSubject: evaluatorSubject = (
 	installFocusDescription: ['Evaluator (', (evaluatorDescription: mirror), ')']
 		validator: [evaluatorMirrorStillValid: mirror]
 )
-
 evaluatorMirrorStillValid: mirror ^ <Boolean> = (
 	(* For ActivationMirror, the activation must not have completed; once it
 	   has, evaluating against it is meaningless. For ObjectMirror, the
@@ -341,7 +658,6 @@ evaluatorMirrorStillValid: mirror ^ <Boolean> = (
 			ifFalse: [true]
 	] on: Error do: [:e | false]
 )
-
 evaluatorDescription: mirror ^ <String> = (
 	^[
 		(mirror isKindOfActivationMirror) ifTrue: [
@@ -352,7 +668,6 @@ evaluatorDescription: mirror ^ <String> = (
 			on: Error do: [:e | '(unknown class)'])
 	] on: Error do: [:e | 'unknown']
 )
-
 public isFocusedOnEvaluatorMirror: mirror ^ <Boolean> = (
 	focusKind = #evaluator ifFalse: [^false].
 	(* Use identity-aware mirror equality. ObjectMirror>>= and
@@ -360,48 +675,30 @@ public isFocusedOnEvaluatorMirror: mirror ^ <Boolean> = (
 	   is what we want. *)
 	^focusEvaluatorMirror_slot = mirror
 )
-
-(* Structural matchers — brain buttons call these so highlighting tracks
-   the focused entity (class path + side + selector) regardless of whether
-   the Subject object survived atomic install. *)
-
 public isFocusedOnClass: cdm ^ <Boolean> = (
 	focusKind = #class ifFalse: [^false].
 	^focusClassPath = (qualifiedNameOf: cdm)
 )
-
 public isFocusedOnClassHeader: cdm ^ <Boolean> = (
 	focusKind = #classHeader ifFalse: [^false].
 	^focusClassPath = (qualifiedNameOf: cdm)
 )
-
 public isFocusedOnMethod: cdm side: side selector: sel ^ <Boolean> = (
 	focusKind = #method ifFalse: [^false].
 	focusClassPath = (qualifiedNameOf: cdm) ifFalse: [^false].
 	focusSide = side ifFalse: [^false].
 	^focusSelector = sel asSymbol
 )
-
 public isFocusedOnLazySlot: cdm side: side name: name ^ <Boolean> = (
 	focusKind = #lazySlot ifFalse: [^false].
 	focusClassPath = (qualifiedNameOf: cdm) ifFalse: [^false].
 	focusSide = side ifFalse: [^false].
 	^focusSelector = name asSymbol
 )
-
-(* Existence checks used by the structured focus validators. Each resolves
-   the qualified class path freshly through the namespace and compares via
-   ClassDeclarationMirror>>= (which compares the underlying mixins). After
-   atomic-install instance forwarding, a replaced class's old mirror and a
-   freshly-resolved mirror compare equal because both reach the same
-   (forwarded) mixin. Deletions cause resolveClassPath: to raise; the
-   on:Error handler returns false. *)
-
 public classStillExists: cdm ^ <Boolean> = (
 	^[(resolveClassPath: (qualifiedNameOf: cdm)) = cdm]
 		on: Error do: [:e | false]
 )
-
 public methodStillExists: cdm side: side selector: sel ^ <Boolean> = (
 	^[
 		| resolved mixin |
@@ -415,7 +712,6 @@ public methodStillExists: cdm side: side selector: sel ^ <Boolean> = (
 			]
 	] on: Error do: [:e | false]
 )
-
 public lazySlotStillExists: cdm side: side name: name ^ <Boolean> = (
 	^[
 		| resolved mixin |
@@ -429,7 +725,6 @@ public lazySlotStillExists: cdm side: side name: name ^ <Boolean> = (
 			]
 	] on: Error do: [:e | false]
 )
-
 public clearFocus = (
 	currentFocusBlock:: nil.
 	currentFocusValidator:: nil.
@@ -440,35 +735,31 @@ public clearFocus = (
 	focusEvaluatorMirror_slot:: nil.
 	focusEvaluatorSubject_slot:: nil.
 )
-
-(* --- Active chat region tracking ---
-
-   Brain buttons drop the shared chat into their presenter's chatHolder.
-   Without coordination, clicking a different brain leaves the previous
-   chatHolder still displaying the chat, so multiple chat regions appear
-   on screen at once. We track the most recently-activated chatHolder so
-   the brain-click path can close it before activating a new one.
-
-   Tracking is intentionally scoped to brain-click actions only — not
-   to updateVisualsFromSameKind:'s re-render restore path, which must
-   not close anything. The actual clearing (which needs Hopscotch's
-   `nothing` fragment) happens in the Browsing-side brain action; we
-   just hold the reference. *)
-
 public activeChatHolder = (
 	^activeChatHolder_slot
 )
-
 public activeChatHolderPage = (
 	^activeChatHolderPage_slot
 )
-
 public activeChatHolder: aChatHolder page: aPageSubject = (
 	activeChatHolder_slot:: aChatHolder.
 	activeChatHolderPage_slot:: aPageSubject.
 )
-
 public currentFocusDescription ^ <String> = (
+	(* Two concatenated pieces of context:
+	   - Which ChatDocument the conversation lives in (if any), so the AI
+	     knows its host independent of brain-button focus.
+	   - The brain-button focus (class, method, document, etc.) if set.
+	   These are orthogonal: the user can be in chat doc Foo but ask about
+	   method Bar by clicking its brain. *)
+	^activeChatDocPrefix, computeFocusOnly
+)
+activeChatDocPrefix ^ <String> = (
+	sharedChatSubject_slot isNil ifTrue: [^''].
+	sharedChatSubject_slot isKindOfIDEChatDocumentSubject ifFalse: [^''].
+	^'Active chat document: ', sharedChatSubject_slot document name, '. '
+)
+computeFocusOnly ^ <String> = (
 	currentFocusBlock isNil ifTrue: [^'(no focus set)'].
 	(* Validate first: if the focused entity no longer exists (because a
 	   changeset deleted or replaced its enclosing class etc.), drop the
@@ -483,17 +774,9 @@ public currentFocusDescription ^ <String> = (
 		on: Error
 		do: [:e | '(focus block raised: ', e messageText, ')']
 )
-
-(* Entry point for the toolbar brain button: if the user has already saved an
-   API key for the Anthropic provider, go straight to a chat; otherwise return
-   the setup subject so the user can enter a key. *)
 public chatLauncher = (
 	^ensureSharedChat
 )
-
-(* Return the cached shared chat subject, or — if no chat has been created yet
-   — a setup subject the caller can navigate to so the user can enter a key.
-   The setup subject's startChat caches the resulting chat in sharedChatSubject_slot. *)
 public ensureSharedChat = (
 	| setup chat |
 	sharedChatSubject_slot isNil ifFalse: [^sharedChatSubject_slot].
@@ -504,9 +787,6 @@ public ensureSharedChat = (
 	(* startChat goes through newChatSubjectFor:, which has already cached. *)
 	^sharedChatSubject_slot
 )
-
-(* --- Class lookup helpers --- *)
-
 classDeclarationNamed: name <String> ^ <ClassDeclarationMirror> = (
 	| cls |
 	cls:: Root at: name asSymbol ifAbsent: [
@@ -517,7 +797,6 @@ classDeclarationNamed: name <String> ^ <ClassDeclarationMirror> = (
 	].
 	^(ClassMirror reflecting: cls) mixin declaration
 )
-
 resolveNamespacePath: path <String> ^ <Object> = (
 	(* Navigate the namespace tree starting at Root. A leading 'Root.' segment
 	   is optional. Returns the entry (which may be a Namespace, a class, a
@@ -535,7 +814,6 @@ resolveNamespacePath: path <String> ^ <Object> = (
 	].
 	^current
 )
-
 kindOf: value <Object> ^ <String> = (
 	value isKindOfNamespace ifTrue: [^'namespace'].
 	value isKindOfBehavior ifTrue: [^'class'].
@@ -547,7 +825,6 @@ kindOf: value <Object> ^ <String> = (
 	].
 	^'other'
 )
-
 public qualifiedNameOf: cdm <ClassDeclarationMirror> ^ <String> = (
 	(* Walks the enclosing-class chain to produce a dotted path,
 	   e.g. "RuntimeForHopscotchForHTML.Platform.Images". *)
@@ -560,7 +837,6 @@ public qualifiedNameOf: cdm <ClassDeclarationMirror> ^ <String> = (
 	].
 	^path
 )
-
 resolveClassPath: path <String> ^ <ClassDeclarationMirror> = (
 	| parts cdm |
 	parts:: path findTokens: '.'.
@@ -582,7 +858,6 @@ resolveClassPath: path <String> ^ <ClassDeclarationMirror> = (
 	].
 	^cdm
 )
-
 namespaceSubjectForPath: path <String> ^ <Object> = (
 	(* Build a NamespaceSubject for the namespace at the given dotted path,
 	   or for Root if the path is empty or 'Root'. Raises an error if the
@@ -599,20 +874,15 @@ namespaceSubjectForPath: path <String> ^ <Object> = (
 	key:: (parts at: parts size) asSymbol.
 	^ide browsing NamespaceSubject onModel: ns key: key
 )
-
 formatAccess: am ^ <String> = (
 	am = #public ifTrue: [^'public '].
 	am = #private ifTrue: [^'private '].
 	^''
 )
-
-(* --- Proposed-changeset helpers --- *)
-
 freshChangesetId ^ <String> = (
 	nextChangesetIdNum:: nextChangesetIdNum + 1.
 	^'cs', nextChangesetIdNum printString
 )
-
 mixinForChange: change ^ <Object> = (
 	| cdm side |
 	cdm:: resolveClassPath: (change at: 'class_name').
@@ -621,24 +891,20 @@ mixinForChange: change ^ <Object> = (
 		ifFalse: ['instance'].
 	^side = 'class' ifTrue: [cdm classSide] ifFalse: [cdm instanceSide]
 )
-
 findMethodMirrorNamed: selector <Symbol> inMixin: mixin ^ <Object> = (
 	mixin methods do: [:mm | mm name = selector ifTrue: [^mm]].
 	^nil
 )
-
 findLazySlotMirrorNamed: selector <Symbol> inMixin: mixin ^ <Object> = (
 	mixin lazySlots do: [:ls | ls name = selector ifTrue: [^ls]].
 	^nil
 )
-
 isMemberKind: kind ^ <Boolean> = (
 	^kind = 'add_or_replace_method'
 		or: [kind = 'delete_method'
 		or: [kind = 'add_or_replace_lazy_slot'
 		or: [kind = 'delete_lazy_slot']]]
 )
-
 validateChange: change ^ <Object> = (
 	(* Returns a Map record of the validated change. Raises if invalid. *)
 	| kind record |
@@ -720,7 +986,6 @@ validateChange: change ^ <Object> = (
 	].
 	Error signal: 'Unknown change kind: ', kind
 )
-
 formatChangesetId: id records: records ^ <String> = (
 	| result count |
 	count:: records size.
@@ -754,13 +1019,11 @@ formatChangesetId: id records: records ^ <String> = (
 	result:: result, '\nWhen the user approves, call apply_changeset with id "', id, '".'.
 	^result
 )
-
 intermediateOf: builder = (
 	(* Reach into a {Class,Mixin}Builder's private 'intermediate' slot.
 	   AtomicInstallWrapper>>install:into: uses the same trick. *)
 	^((ObjectMirror reflecting: builder) getSlot: #intermediate) reflectee
 )
-
 patchEnclosingOf: childClassBuilder withParent: parentClassBuilder = (
 	(* When we navigate DOWN from a top-level builder into
 	   instanceSide.nestedClasses, the nested IR's enclosingClass is the
@@ -774,7 +1037,6 @@ patchEnclosingOf: childClassBuilder withParent: parentClassBuilder = (
 	parentInstanceSideIR:: intermediateOf: parentClassBuilder instanceSide.
 	childIR enclosingClass: parentInstanceSideIR.
 )
-
 navigateToBuilderForSegments: segments <Array> withBuilderMap: builderByTopLevel ^ <Object> = (
 	(* Resolve a dotted class path (given as segments) to a ClassDeclarationBuilder.
 	   For top-level segments, fetch or create the cached top-level builder.
@@ -805,7 +1067,6 @@ navigateToBuilderForSegments: segments <Array> withBuilderMap: builderByTopLevel
 	].
 	^targetClassBuilder
 )
-
 applyOneRecord: r withBuilderMap: builderByTopLevel = (
 	| kind segments targetClassBuilder side mixinBuilder |
 	kind:: r at: 'kind'.
@@ -858,7 +1119,6 @@ applyOneRecord: r withBuilderMap: builderByTopLevel = (
 	].
 	Error signal: 'Unknown change kind in apply: ', kind
 )
-
 applyChangesetRecords: records = (
 	(* Aggregates changes per top-level class and installs them as one
 	   atomic transaction via the platform's atomic installer. *)
@@ -883,9 +1143,6 @@ applyChangesetRecords: records = (
 		]
 	].
 )
-
-(* --- Object registry / evaluation helpers --- *)
-
 aiWorkspaceSubject ^ <Object> = (
 	(* Get-or-create the AI workspace via the WorkspaceManager's standard
 	   API. The workspace state (the workspaces list, counters) is in the
@@ -907,11 +1164,9 @@ aiWorkspaceSubject ^ <Object> = (
 	objectRegistry at: 'workspace' put: aiWorkspaceSubject_slot objectMirror.
 	^aiWorkspaceSubject_slot
 )
-
 aiWorkspaceMirror ^ <Object> = (
 	^aiWorkspaceSubject objectMirror
 )
-
 registerResult: aMirror <Object> withName: nameOrNil <String | Nil> ^ <String> = (
 	| id |
 	(nameOrNil isNil or: [nameOrNil isEmpty]) ifTrue: [
@@ -923,7 +1178,6 @@ registerResult: aMirror <Object> withName: nameOrNil <String | Nil> ^ <String> =
 	objectRegistry at: id put: aMirror.
 	^id
 )
-
 registerActivation: anActivationMirror <Object> ^ <String> = (
 	(* Register an ActivationMirror under an 'aN' id, deduping against
 	   already-registered activations (ActivationMirror>>= compares
@@ -939,7 +1193,6 @@ registerActivation: anActivationMirror <Object> ^ <String> = (
 	objectRegistry at: id put: anActivationMirror.
 	^id
 )
-
 activationForId: id <String> ^ <Object> = (
 	| m |
 	m:: mirrorForObjectId: id.
@@ -948,7 +1201,6 @@ activationForId: id <String> ^ <Object> = (
 	].
 	^m
 )
-
 isPrimitiveResult: aMirror <Object> ^ <Boolean> = (
 	(* Primitives (Integer, Float, String, Symbol, Boolean, Character, nil)
 	   are NOT registered — the AI can use their printString directly. *)
@@ -963,7 +1215,6 @@ isPrimitiveResult: aMirror <Object> ^ <Boolean> = (
 	r isKindOfCharacter ifTrue: [^true].
 	^false
 )
-
 summaryOf: aMirror <Object> ^ <String> = (
 	| className printStr |
 	className:: [aMirror getClass mixin name asString]
@@ -973,7 +1224,6 @@ summaryOf: aMirror <Object> ^ <String> = (
 	printStr size > 200 ifTrue: [printStr:: (printStr copyFrom: 1 to: 197), '...'].
 	^className, ': ', printStr
 )
-
 mirrorForObjectId: id <String> ^ <Object> = (
 	id = 'workspace' ifTrue: [^aiWorkspaceMirror].
 	id = 'focus' ifTrue: [
@@ -992,9 +1242,6 @@ mirrorForObjectId: id <String> ^ <Object> = (
 			'. Use list_objects to see registered ids.'
 	]
 )
-
-(* --- IDE tool definitions --- *)
-
 public tools ^ <List> = (
 	^{
 		getClassSourceTool.
@@ -1007,6 +1254,7 @@ public tools ^ <List> = (
 		listNamespaceTool.
 		getDocumentTool.
 		createDocumentTool.
+		createChatDocumentTool.
 		setDocumentContentsTool.
 		deleteDocumentTool.
 		listAmpletsTool.
@@ -1043,7 +1291,6 @@ public tools ^ <List> = (
 		continueThreadTool.
 	}
 )
-
 getClassSourceTool ^ <Tool> = (
 	^Tool
 		name: 'get_class_source'
@@ -1053,7 +1300,6 @@ getClassSourceTool ^ <Tool> = (
 			(resolveClassPath: (input at: 'class_name')) source
 		]
 )
-
 getMemberSourceTool ^ <Tool> = (
 	^Tool
 		name: 'get_member_source'
@@ -1089,7 +1335,6 @@ getMemberSourceTool ^ <Tool> = (
 			result
 		]
 )
-
 getClassHeaderTool ^ <Tool> = (
 	^Tool
 		name: 'get_class_header'
@@ -1099,7 +1344,6 @@ getClassHeaderTool ^ <Tool> = (
 			(resolveClassPath: (input at: 'class_name')) header source
 		]
 )
-
 listClassMembersTool ^ <Tool> = (
 	^Tool
 		name: 'list_class_members'
@@ -1146,7 +1390,6 @@ listClassMembersTool ^ <Tool> = (
 			result
 		]
 )
-
 sendersTool ^ <Tool> = (
 	^Tool
 		name: 'senders_of'
@@ -1182,7 +1425,6 @@ sendersTool ^ <Tool> = (
 			result
 		]
 )
-
 implementorsTool ^ <Tool> = (
 	^Tool
 		name: 'implementors_of'
@@ -1218,7 +1460,6 @@ implementorsTool ^ <Tool> = (
 			result
 		]
 )
-
 listNamespaceTool ^ <Tool> = (
 	^Tool
 		name: 'list_namespace'
@@ -1240,17 +1481,15 @@ listNamespaceTool ^ <Tool> = (
 			result
 		]
 )
-
 currentFocusTool ^ <Tool> = (
 	^Tool
 		name: 'current_focus'
-		description: 'Return a description of what the user is currently asking about in the IDE — the class, method, namespace, document or other entity they pointed the chat at, plus any in-progress (unaccepted) edits if relevant. Returns "(no focus set)" if the user has not indicated a focus. Call this first whenever the user refers to "this", "here", or names a member without a class, before guessing.'
+		description: 'Return a description of the current IDE context. Two parts, concatenated: (a) "Active chat document: X. " — the ChatDocument hosting this conversation, when one is active (omitted otherwise); (b) the brain-button focus the user has pointed at — class, method, namespace, document, evaluator — or "(no focus set)" if none. The two are orthogonal: the user can be in chat doc Foo while asking about method Bar by clicking its brain. Call this first whenever the user refers to "this", "here", or names a member without a class.'
 		inputSchema: '{"type":"object","properties":{}}'
 		handler: [:input |
 			currentFocusDescription
 		]
 )
-
 webFetchTool ^ <Tool> = (
 	^Tool
 		name: 'web_fetch'
@@ -1260,9 +1499,6 @@ webFetchTool ^ <Tool> = (
 			aiAccess webFetch: (input at: 'url')
 		]
 )
-
-(* --- Document management helpers --- *)
-
 parentNamespaceAndLeaf: dottedPath <String> ^ <Object> = (
 	(* Walk the path segments to the parent namespace; return a 2-tuple
 	   {parentNamespace. leafName}. Used by create/delete to locate the
@@ -1289,7 +1525,6 @@ parentNamespaceAndLeaf: dottedPath <String> ^ <Object> = (
 	].
 	^{current. leaf}
 )
-
 documentAt: dottedPath <String> ^ <Object> = (
 	| entry |
 	entry:: resolveNamespacePath: dottedPath.
@@ -1299,11 +1534,6 @@ documentAt: dottedPath <String> ^ <Object> = (
 	].
 	^entry
 )
-
-(* Parse a document's contents HTML into a detached div whose innerHTML
-   holds it. Manipulate the div via DOM methods, then read innerHTML back
-   to produce the updated contents. Same round-trip the IDE uses in
-   Documents.ns freshDocumentFromDOM:. *)
 parseAmpletContainer: html <String> ^ <Object> = (
 	| jsDoc div |
 	jsDoc:: retainedPlatform js global at: 'document'.
@@ -1311,9 +1541,6 @@ parseAmpletContainer: html <String> ^ <Object> = (
 	div at: 'innerHTML' put: html.
 	^div
 )
-
-(* Locate the amplet element whose ampletId attribute equals id. Raises
-   if none is found. *)
 findAmpletWithId: id <String> in: container <Object> ^ <Object> = (
 	| amplets count i |
 	amplets:: container getElementsByClassName: 'ampleforth'.
@@ -1328,7 +1555,32 @@ findAmpletWithId: id <String> in: container <Object> ^ <Object> = (
 	].
 	Error signal: 'No amplet with ampletId="', id, '" in this document'
 )
-
+createChatDocumentTool ^ <Tool> = (
+	^Tool
+		name: 'create_chat_document'
+		description: 'Create a new ChatDocument at the given dotted path. The path''s parent must be an existing namespace. A ChatDocument hosts one AI conversation; opening it shows a live chat UI bound to its provider + model. The API key is read from localStorage per provider — it is NOT stored on the document. Supported provider values: "anthropic". This is a programmatic entry point; the user-facing path is the chat setup screen.'
+		inputSchema: '{"type":"object","properties":{"name":{"type":"string","description":"Dotted path for the new chat document"},"model_name":{"type":"string","description":"Model name (e.g. \"claude-sonnet-4-6\", \"claude-opus-4-7\")"},"provider":{"type":"string","description":"Provider key. Optional; defaults to \"anthropic\"."}},"required":["name","model_name"]}'
+		handler: [:input |
+			| name pair parent leaf doc provider |
+			name:: input at: 'name'.
+			pair:: parentNamespaceAndLeaf: name.
+			parent:: pair at: 1.
+			leaf:: pair at: 2.
+			(parent includesKey: leaf asSymbol) ifTrue: [
+				Error signal: 'An entry named ', leaf, ' already exists at this path'
+			].
+			provider:: (input includesKey: 'provider')
+				ifTrue: [input at: 'provider']
+				ifFalse: ['anthropic'].
+			doc:: ChatDocument
+				named: leaf
+				providerName: provider
+				modelName: (input at: 'model_name').
+			parent at: leaf asSymbol put: doc.
+			ide browsing updateCurrentDisplay.
+			'Created chat document ', name
+		]
+)
 createDocumentTool ^ <Tool> = (
 	^Tool
 		name: 'create_document'
@@ -1356,7 +1608,6 @@ createDocumentTool ^ <Tool> = (
 			'Created document ', name
 		]
 )
-
 setDocumentContentsTool ^ <Tool> = (
 	^Tool
 		name: 'set_document_contents'
@@ -1371,7 +1622,6 @@ setDocumentContentsTool ^ <Tool> = (
 			'Updated contents of ', name
 		]
 )
-
 deleteDocumentTool ^ <Tool> = (
 	^Tool
 		name: 'delete_document'
@@ -1395,7 +1645,6 @@ deleteDocumentTool ^ <Tool> = (
 			'Deleted document ', name
 		]
 )
-
 listAmpletsTool ^ <Tool> = (
 	^Tool
 		name: 'list_amplets'
@@ -1428,20 +1677,19 @@ listAmpletsTool ^ <Tool> = (
 				]
 		]
 )
-
 addAmpletTool ^ <Tool> = (
 	^Tool
 		name: 'add_amplet'
 		description: 'Append a new amplet to a document. The amplet''s expression (the "name" attribute) is the supplied Newspeak expression, evaluated against the host Document when the document renders. A fresh ampletId is allocated automatically. Returns the new ampletId. Destructive — describe the change to the user before calling. v1 always appends at the end; targeted placement will come later.'
 		inputSchema: '{"type":"object","properties":{"name":{"type":"string","description":"Document name or dotted path"},"expression":{"type":"string","description":"Newspeak expression for the amplet (the name attribute)"}},"required":["name","expression"]}'
 		handler: [:input |
-			| name expr doc container newId jsDoc newAmplet body bodies |
+			| name expr doc container newId jsDoc newAmplet body bodies thinking |
 			name:: input at: 'name'.
 			expr:: input at: 'expression'.
 			doc:: documentAt: name.
 			container:: parseAmpletContainer: doc contents.
 			(* The document body lives inside a wrapping <div class="self_ampleforth">
-			   (the editable "blue box"); append the new amplet there so it lands
+			   (the editable "blue box"); insert new amplets there so they land
 			   inside the document boundary, not as a sibling of the wrapper. Fall
 			   back to the container if no such wrapper is present. *)
 			bodies:: container getElementsByClassName: 'self_ampleforth'.
@@ -1455,13 +1703,20 @@ addAmpletTool ^ <Tool> = (
 			newAmplet setAttribute: 'ampletId' to: newId.
 			newAmplet setAttribute: 'name' to: expr.
 			newAmplet setAttribute: 'contenteditable' to: 'false'.
-			body appendChild: newAmplet.
+			(* For ChatDocuments, place the amplet just before the
+			   thinkingOrModelPicker amplet so chat controls stay anchored at
+			   the bottom. For regular docs, append at the end of the wrapper. *)
+			thinking:: doc isKindOfChatDocument
+				ifTrue: [findChatStructuralAmplet: 'thinkingOrModelPicker' in: container]
+				ifFalse: [nil].
+			thinking isNil
+				ifTrue: [body appendChild: newAmplet]
+				ifFalse: [(thinking at: 'parentNode') insertBefore: newAmplet before: thinking].
 			doc contents: (container at: 'innerHTML').
 			ide browsing updateCurrentDisplay.
 			'Added amplet to ', name, ' (ampletId=', newId, ')'
 		]
 )
-
 setAmpletExpressionTool ^ <Tool> = (
 	^Tool
 		name: 'set_amplet_expression'
@@ -1481,7 +1736,6 @@ setAmpletExpressionTool ^ <Tool> = (
 			'Updated amplet ', aid, ' in ', name
 		]
 )
-
 deleteAmpletTool ^ <Tool> = (
 	^Tool
 		name: 'delete_amplet'
@@ -1501,7 +1755,6 @@ deleteAmpletTool ^ <Tool> = (
 			'Deleted amplet ', aid, ' from ', name
 		]
 )
-
 listMediaTool ^ <Tool> = (
 	^Tool
 		name: 'list_media'
@@ -1528,7 +1781,6 @@ listMediaTool ^ <Tool> = (
 				]
 		]
 )
-
 deleteMediaTool ^ <Tool> = (
 	^Tool
 		name: 'delete_media'
@@ -1548,7 +1800,6 @@ deleteMediaTool ^ <Tool> = (
 			'Deleted media ', path, ' from ', name
 		]
 )
-
 getDocumentTool ^ <Tool> = (
 	^Tool
 		name: 'get_document'
@@ -1564,7 +1815,6 @@ getDocumentTool ^ <Tool> = (
 			entry contents
 		]
 )
-
 searchClassesTool ^ <Tool> = (
 	^Tool
 		name: 'search_classes'
@@ -1588,7 +1838,6 @@ searchClassesTool ^ <Tool> = (
 			result
 		]
 )
-
 navigateToClassTool ^ <Tool> = (
 	^Tool
 		name: 'navigate_to_class'
@@ -1601,7 +1850,6 @@ navigateToClassTool ^ <Tool> = (
 			'Opened class ', (qualifiedNameOf: cdm)
 		]
 )
-
 navigateToNamespaceTool ^ <Tool> = (
 	^Tool
 		name: 'navigate_to_namespace'
@@ -1617,7 +1865,6 @@ navigateToNamespaceTool ^ <Tool> = (
 			'Opened namespace ', subject title
 		]
 )
-
 navigateToDocumentTool ^ <Tool> = (
 	^Tool
 		name: 'navigate_to_document'
@@ -1634,7 +1881,6 @@ navigateToDocumentTool ^ <Tool> = (
 			'Opened document ', path
 		]
 )
-
 showTestsTool ^ <Tool> = (
 	^Tool
 		name: 'show_tests'
@@ -1651,7 +1897,6 @@ showTestsTool ^ <Tool> = (
 			'Opened test suite for ', (qualifiedNameOf: cdm)
 		]
 )
-
 runTestsTool ^ <Tool> = (
 	^Tool
 		name: 'run_tests'
@@ -1678,9 +1923,6 @@ The Tester instance is captured for subsequent calls to get_test_results, run_fa
 				'. Use get_test_results to retrieve outcomes when complete.'
 		]
 )
-
-(* --- Test result helpers --- *)
-
 testerForConfigPath: configClassPath <String> ^ <Object> = (
 	| cdm testSubject |
 	cdm:: resolveClassPath: configClassPath.
@@ -1690,11 +1932,9 @@ testerForConfigPath: configClassPath <String> ^ <Object> = (
 	].
 	^testSubject tester
 )
-
 testCaseId: testCase <Object> ^ <String> = (
 	^testCase environment name asString, ' >> ', testCase selector asString
 )
-
 findTestCase: testName <String> inTester: tester <Object> ^ <Object> = (
 	| all match |
 	all:: List new.
@@ -1708,17 +1948,14 @@ findTestCase: testName <String> inTester: tester <Object> ^ <Object> = (
 	].
 	^match
 )
-
 summarizeFailure: r <Object> ^ <String> = (
 	^[r description] on: Error do: [:e | '(no description)']
 )
-
 summarizeError: r <Object> ^ <String> = (
 	^[
 		r exception class name asString, ': ', r exception messageText
 	] on: Error do: [:e | '(unprintable exception)']
 )
-
 formatTestSummary: tester <Object> configPath: configPath <String> ^ <String> = (
 	| sb total complete ratio |
 	total:: [tester testCaseList size] on: Error do: [:e | 0].
@@ -1750,7 +1987,6 @@ formatTestSummary: tester <Object> configPath: configPath <String> ^ <String> = 
 	].
 	^sb
 )
-
 getTestResultsTool ^ <Tool> = (
 	^Tool
 		name: 'get_test_results'
@@ -1763,7 +1999,6 @@ getTestResultsTool ^ <Tool> = (
 			formatTestSummary: tester configPath: configPath
 		]
 )
-
 getTestFailureDetailsTool ^ <Tool> = (
 	^Tool
 		name: 'get_test_failure_details'
@@ -1795,7 +2030,6 @@ getTestFailureDetailsTool ^ <Tool> = (
 			'[', testName, '] is inactive — not run in the latest invocation.'
 		]
 )
-
 runTestsForCases: testCases <Object> tester: tester <Object> = (
 	(* Run each test case in turn through tester run:, which mutates the
 	   tester''s errors / failures / successes lists. Iterate over a copy
@@ -1804,7 +2038,6 @@ runTestsForCases: testCases <Object> tester: tester <Object> = (
 		[tester run: tc] on: Error do: [:e | ]
 	]
 )
-
 runFailingTestsTool ^ <Tool> = (
 	^Tool
 		name: 'run_failing_tests'
@@ -1822,7 +2055,6 @@ runFailingTestsTool ^ <Tool> = (
 				'. Call get_test_results for the new outcome.'
 		]
 )
-
 runErroringTestsTool ^ <Tool> = (
 	^Tool
 		name: 'run_erroring_tests'
@@ -1840,7 +2072,6 @@ runErroringTestsTool ^ <Tool> = (
 				'. Call get_test_results for the new outcome.'
 		]
 )
-
 runOneTestTool ^ <Tool> = (
 	^Tool
 		name: 'run_test'
@@ -1859,7 +2090,6 @@ runOneTestTool ^ <Tool> = (
 			'Re-ran [', testName, ']. Call get_test_results for the new outcome.'
 		]
 )
-
 proposeChangesTool ^ <Tool> = (
 	^Tool
 		name: 'propose_changes'
@@ -1895,7 +2125,6 @@ Top-level class DELETION is not supported by this tool (different mechanism, not
 			formatChangesetId: id records: records
 		]
 )
-
 applyChangesetTool ^ <Tool> = (
 	^Tool
 		name: 'apply_changeset'
@@ -1912,7 +2141,6 @@ applyChangesetTool ^ <Tool> = (
 			'Applied changeset ', id
 		]
 )
-
 evaluateTool ^ <Tool> = (
 	^Tool
 		name: 'evaluate'
@@ -1995,7 +2223,6 @@ Side-effecting expressions (collection mutations, slot assignments via setters, 
 				]
 		]
 )
-
 navigateToObjectTool ^ <Tool> = (
 	^Tool
 		name: 'navigate_to_object'
@@ -2009,7 +2236,6 @@ navigateToObjectTool ^ <Tool> = (
 			'Opened object [', id, '] ', (summaryOf: mirror)
 		]
 )
-
 inspectObjectTool ^ <Tool> = (
 	^Tool
 		name: 'inspect_object'
@@ -2024,7 +2250,6 @@ inspectObjectTool ^ <Tool> = (
 					on: Error do: [:e | '(raised: ', e messageText, ')'])
 		]
 )
-
 listObjectsTool ^ <Tool> = (
 	^Tool
 		name: 'list_objects'
@@ -2041,9 +2266,6 @@ listObjectsTool ^ <Tool> = (
 			result
 		]
 )
-
-(* --- Debugger helpers (Phase 1: observation) --- *)
-
 formatMethodNameOf: anActivationMirror ^ <String> = (
 	(* Best-effort "Class >> selector" for a frame. *)
 	^[
@@ -2053,11 +2275,9 @@ formatMethodNameOf: anActivationMirror ^ <String> = (
 		(qualifiedNameOf: mixinDecl), ' >> ', m name asString
 	] on: Exception do: [:e | '(unknown method)']
 )
-
 formatActivationLine: anActivationMirror id: id ^ <String> = (
 	^'[', id, '] ', (formatMethodNameOf: anActivationMirror)
 )
-
 formatSourceWithRange: source <String> range: rangeOrNil <Object> ^ <String> = (
 	(* Append a structured marker for the active range rather than splicing
 	   into the source text — easier for the AI to read at a glance. *)
@@ -2068,7 +2288,6 @@ formatSourceWithRange: source <String> range: rangeOrNil <Object> ^ <String> = (
 			'..', rangeOrNil stop printString].
 	^header, String lf, '---', String lf, source
 )
-
 getCurrentFrameTool ^ <Tool> = (
 	^Tool
 		name: 'get_current_frame'
@@ -2088,7 +2307,6 @@ getCurrentFrameTool ^ <Tool> = (
 				]
 		]
 )
-
 getStackTraceTool ^ <Tool> = (
 	^Tool
 		name: 'get_stack_trace'
@@ -2112,7 +2330,6 @@ getStackTraceTool ^ <Tool> = (
 			result
 		]
 )
-
 getCurrentExpressionTool ^ <Tool> = (
 	^Tool
 		name: 'get_current_expression'
@@ -2128,9 +2345,6 @@ getCurrentExpressionTool ^ <Tool> = (
 				(formatSourceWithRange: source range: range)
 		]
 )
-
-(* --- Debugger helpers (Phase 2: control) --- *)
-
 threadStateName: thread ^ <String> = (
 	[thread isFulfilled  ifTrue: [^'fulfilled']]  on: Exception do: [:e | ].
 	[thread isBroken     ifTrue: [^'broken']]     on: Exception do: [:e | ].
@@ -2138,7 +2352,6 @@ threadStateName: thread ^ <String> = (
 	[thread isTerminated ifTrue: [^'terminated']] on: Exception do: [:e | ].
 	^'unknown'
 )
-
 pruneDeadActivations = (
 	(* Remove from the registry any aN that points at an activation that
 	   is no longer continuable (frame has unwound or thread fulfilled). *)
@@ -2152,7 +2365,6 @@ pruneDeadActivations = (
 	].
 	dead do: [:k | objectRegistry removeKey: k]
 )
-
 postOperationReport: thread ^ <String> = (
 	(* Called after any step/return: report the new thread state, register
 	   the result if fulfilled, register the new top frame if still suspended,
@@ -2186,7 +2398,6 @@ postOperationReport: thread ^ <String> = (
 		ifTrue: [clearFocus].
 	^status
 )
-
 stepTool ^ <Tool> = (
 	^Tool
 		name: 'step'
@@ -2211,7 +2422,6 @@ stepTool ^ <Tool> = (
 				(postOperationReport: newThread)
 		]
 )
-
 continueThreadTool ^ <Tool> = (
 	^Tool
 		name: 'continue_thread'
@@ -2228,7 +2438,6 @@ continueThreadTool ^ <Tool> = (
 				(postOperationReport: threadMirror)
 		]
 )
-
 returnFromTool ^ <Tool> = (
 	^Tool
 		name: 'return_from'
@@ -2257,7 +2466,6 @@ returnFromTool ^ <Tool> = (
 				(postOperationReport: newThread)
 		]
 )
-
 inspectActivationTool ^ <Tool> = (
 	^Tool
 		name: 'inspect_activation'
@@ -2307,7 +2515,6 @@ inspectActivationTool ^ <Tool> = (
 			result
 		]
 )
-
 forgetObjectTool ^ <Tool> = (
 	^Tool
 		name: 'forget_object'
@@ -2326,23 +2533,15 @@ forgetObjectTool ^ <Tool> = (
 			'Forgot [', id, ']'
 		]
 )
-
-(* --- Convenience API --- *)
-
-(* Create a session with the IDE tools pre-configured. *)
 public createSessionWithProvider: provider <Provider> ^ <Session> = (
 	| session |
 	session:: Session provider: provider tools: tools.
 	session systemPrompt: newspeakSystemPrompt.
 	^session
 )
-
-(* Create a ChatSubject backed by a new session with IDE tools. *)
 public createChatWithProvider: provider <Provider> ^ <IDEChatSubject> = (
 	^IDEChatSubject onModel: (createSessionWithProvider: provider)
 )
-
-(* System prompt — Newspeak cheat sheet, cached by AnthropicProvider. *)
 public newspeakSystemPrompt ^ <String> = (
 	^'You are a programming assistant for the Newspeak programming language, embedded in the Newspeak Web IDE. Use the tools listed below to look up actual definitions in the user''s running IDE rather than guessing from training — Newspeak documentation is sparse and recall is unreliable. Prefer concise answers; when the user asks about code, show the source you found via tools.
 
@@ -2653,6 +2852,5 @@ For code MODIFICATION (adding methods, changing class headers, etc.), use propos
 
 When the user asks about an entity in their system, use the IDE tools to look it up before answering. When in doubt about Newspeak syntax or semantics, fetch the spec rather than guessing. When you produce Newspeak source, follow the style guidelines above and respect member ordering (nested classes before methods).'
 )
-
 ) : (
 )

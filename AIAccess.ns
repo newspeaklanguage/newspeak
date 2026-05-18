@@ -364,15 +364,50 @@ public class GeminiProvider apiKey: key model: mdl = Provider (
 |
 ) (
 public availableModels ^ <List[String]> = (
+	(* The 1.5 names were deprecated; 2.x is current as of mid-2026. The
+	   set of available models on the Google API drifts faster than this
+	   code can track — if the user gets a 404 from generateContent, the
+	   model name in the chat doc is probably stale; pick a current one
+	   from https://ai.google.dev/gemini-api/docs/models. *)
 	^{
-		'gemini-1.5-pro-latest'.
-		'gemini-1.5-flash-latest'.
+		'gemini-2.5-pro'.
+		'gemini-2.5-flash'.
+		'gemini-2.0-flash'.
 	}
 )
 public displayNameFor: modelId <String> ^ <String> = (
-	modelId = 'gemini-1.5-pro-latest' ifTrue: [^'Gemini 1.5 Pro'].
-	modelId = 'gemini-1.5-flash-latest' ifTrue: [^'Gemini 1.5 Flash'].
+	modelId = 'gemini-2.5-pro' ifTrue: [^'Gemini 2.5 Pro'].
+	modelId = 'gemini-2.5-flash' ifTrue: [^'Gemini 2.5 Flash'].
+	modelId = 'gemini-2.0-flash' ifTrue: [^'Gemini 2.0 Flash'].
 	^modelId
+)
+flattenToTextForGemini: rawContent ^ <String> = (
+	(* User messages stored content as a Newspeak/JS String — return it
+	   as is. Assistant messages stored content as an array of content
+	   blocks (matching the Anthropic shape we use internally); concatenate
+	   any text-typed blocks. Anything else (nil, unrecognised) becomes
+	   ''. Gemini expects parts:[{text: <string>}], never an array. *)
+	rawContent isNil ifTrue: [^''].
+	rawContent isKindOfString ifTrue: [^rawContent].
+	((rawContent at: 'length') isNil) ifTrue: [^''].
+	^[
+		| text i count |
+		text:: ''.
+		i:: 0.
+		count:: rawContent at: 'length'.
+		[i < count] whileTrue: [
+			| block t |
+			block:: rawContent at: i.
+			block isNil ifFalse: [
+				(block at: 'type') = 'text' ifTrue: [
+					t:: block at: 'text'.
+					t isNil ifFalse: [text:: text, t]
+				]
+			].
+			i:: i + 1
+		].
+		text
+	] on: Exception do: [:e | '']
 )
 public complete: messages <Alien[Array]>
 system: systemPrompt <String>
@@ -383,24 +418,34 @@ maxTokens: maxTokens <Integer>
 	
 	body:: createJSObject.
 	
-	(* 1. Translate standard messages array to Gemini 'contents' format *)
+	(* 1. Translate standard messages array to Gemini 'contents' format.
+	   User messages carry a string content (the raw text). Assistant
+	   messages carry a CONTENT-BLOCK ARRAY (our internal Anthropic-shaped
+	   shape: a list of {type, text} or tool blocks). For follow-up turns
+	   the assistant array must be flattened back to a plain text string;
+	   otherwise Gemini sees parts:[{text:<array>}] and rejects the request,
+	   which is what was breaking turn 2. Tool-use blocks are skipped — we
+	   don't yet translate tool calls for Gemini. *)
 	geminiContents:: createJSArray.
 	0 to: (messages at: 'length') - 1 do: [:i |
-		| msg geminiMsg parts textPart role |
+		| msg geminiMsg parts textPart role rawContent textContent |
 		msg:: messages at: i.
 		geminiMsg:: createJSObject.
-		
+
 		(* Map 'assistant' role to 'model' for Gemini *)
 		role:: msg at: 'role'.
-		role = 'assistant' 
+		role = 'assistant'
 			ifTrue: [geminiMsg at: 'role' put: 'model']
 			ifFalse: [geminiMsg at: 'role' put: role].
-			
+
+		rawContent:: msg at: 'content'.
+		textContent:: flattenToTextForGemini: rawContent.
+
 		parts:: createJSArray.
 		textPart:: createJSObject.
-		textPart at: 'text' put: (msg at: 'content').
+		textPart at: 'text' put: textContent.
 		parts push: textPart.
-		
+
 		geminiMsg at: 'parts' put: parts.
 		geminiContents push: geminiMsg.
 	].
@@ -432,44 +477,82 @@ maxTokens: maxTokens <Integer>
 	options at: 'headers' put: headers.
 	options at: 'body' put: (JSON stringify: body).
 
-^(global fetch: apiUrl with: options) then: [:response |
+	^(global fetch: apiUrl with: options) then: [:response |
 		(response at: 'ok')
-			ifFalse: [
-				Error signal: 'Gemini API error: ', 
-					(response at: 'status') printString, ' ', 
-					(response at: 'statusText')
-			].
-		
-		(* Parse the JSON, then translate it to the IDE's expected format *)
-		response json then: [:geminiJson |
-			| mockResponse contentArray candidates firstCandidate parts |
-			
-			mockResponse:: createJSObject.
-			contentArray:: createJSArray.
-			
-			candidates:: geminiJson at: 'candidates'.
-			(candidates isNil not and: [(candidates at: 'length') > 0]) ifTrue: [
-				firstCandidate:: candidates at: 0.
-				parts:: (firstCandidate at: 'content') at: 'parts'.
-				
-				0 to: (parts at: 'length') - 1 do: [:i |
-					| part textBlock |
-					part:: parts at: i.
-					(part at: 'text') isNil ifFalse: [
-						textBlock:: createJSObject.
-						textBlock at: 'type' put: 'text'.
-						textBlock at: 'text' put: (part at: 'text').
-						contentArray push: textBlock.
+			ifTrue: [
+				(* Parse the JSON, then translate it to the IDE's expected format.
+				   Every navigation through the candidates/content/parts tree is
+				   defensive: any field can be missing on safety-blocked responses,
+				   model errors surfaced as 200-OK, or non-text part types. Builds
+				   an empty content array on any deviation rather than raising, so
+				   apiMessages never gets a half-formed entry. The raw response is
+				   stashed under 'raw' for inspection on weird cases. *)
+				response json then: [:geminiJson |
+					| mockResponse contentArray candidates firstCandidate firstContent parts |
+
+					mockResponse:: createJSObject.
+					contentArray:: createJSArray.
+
+					candidates:: geminiJson at: 'candidates'.
+					(candidates isNil not and: [(candidates at: 'length') > 0]) ifTrue: [
+						firstCandidate:: candidates at: 0.
+						firstContent:: firstCandidate isNil ifFalse: [firstCandidate at: 'content'] ifTrue: [nil].
+						parts:: firstContent isNil ifFalse: [firstContent at: 'parts'] ifTrue: [nil].
+
+						parts isNil ifFalse: [
+							0 to: (parts at: 'length') - 1 do: [:i |
+								| part text textBlock |
+								part:: parts at: i.
+								part isNil ifFalse: [
+									text:: part at: 'text'.
+									text isNil ifFalse: [
+										textBlock:: createJSObject.
+										textBlock at: 'type' put: 'text'.
+										textBlock at: 'text' put: text.
+										contentArray push: textBlock.
+									]
+								]
+							]
+						].
 					].
-				].
-			].
-			
-			mockResponse at: 'content' put: contentArray.
-			(* Satisfy the stop_reason check in completeWithToolLoop *)
-			mockResponse at: 'stop_reason' put: 'end_turn'. 
-			
-			mockResponse
-		]
+
+					(* If translation produced no usable text, surface the raw Gemini
+					   body so the user can see why (safety block, request rejection,
+					   model deprecation, etc.) rather than silently storing an empty
+					   assistant message that breaks subsequent turns when fed back. *)
+					(contentArray at: 'length') = 0 ifTrue: [
+						| stringified |
+						stringified:: [
+							(global at: 'JSON') stringify: geminiJson
+						] on: Exception do: [:e | '(unstringifiable response)'].
+						Error signal: 'Gemini returned no usable text content. Raw response: ', stringified
+					].
+
+					mockResponse at: 'content' put: contentArray.
+					mockResponse at: 'stop_reason' put: 'end_turn'.
+					mockResponse at: 'raw' put: geminiJson.
+
+					mockResponse
+				]
+			]
+			ifFalse: [
+				(* Error path. Status+statusText alone is uninformative — statusText
+				   is often empty on HTTP/2, and Google puts the real diagnostic
+				   ("model overloaded", "quota exceeded", "API key invalid", safety
+				   classification details, etc.) in the response BODY as JSON. Read
+				   the body as text and include it in the signalled error so the
+				   user sees what Google actually said. Returning the response.text()
+				   promise from this branch keeps the chain async-correct: Error
+				   signal: inside the inner then: rejects that promise, and the
+				   outer then: flattens it. No non-local return from a stored
+				   closure, which would raise CannotReturn when the outer method
+				   has long since returned its Promise. *)
+				response text then: [:errBody |
+					Error signal: 'Gemini API error: ',
+						(response at: 'status') printString, ' ',
+						(response at: 'statusText'), ' — ', errBody
+				]
+			]
 	]
 )
 ) : (

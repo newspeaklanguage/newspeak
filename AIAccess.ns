@@ -33,6 +33,15 @@ public class Tool name: n description: d inputSchema: s handler: h = (
 ) : (
 )
 public class Provider = (
+(*
+ Abstract base. Each provider owns BOTH the wire protocol (complete:)
+ AND the internal shape of conversation history: addUserText: /
+ appendAssistantResponse: append messages in whatever native shape the
+ provider's API expects, messagesAsRequestPayload: turns that history
+ into the JS array that complete: ships, and displayMessagesFromMessages:
+ / extractTextFromResponse: translate back to neutral text for the UI.
+ Session is a thin coordinator that delegates all shape-y work here.
+*)
 ) (
 public complete: messages <Alien[Array]>
 	system: systemPrompt <String>
@@ -40,6 +49,66 @@ public complete: messages <Alien[Array]>
 	maxTokens: maxTokens <Integer>
 	^ <Alien[Promise]> = (
 	subclassResponsibility
+)
+public addUserText: text <String> toMessages: messages <List> = (
+	(* Append a user-role message carrying the given text, in the provider's
+	   native shape. *)
+	subclassResponsibility
+)
+public appendAssistantResponse: response toMessages: messages <List> = (
+	(* Given the parsed response from complete:, append an assistant-role
+	   entry to the history in the provider's native shape. May raise if
+	   the response has no usable content (preferred to silently storing a
+	   half-formed entry that poisons subsequent turns). *)
+	subclassResponsibility
+)
+public messagesAsRequestPayload: messages <List> ^ <Alien> = (
+	(* Convert the message history into the JS array that complete: will
+	   carry as the request payload. Most providers can just JSArray-ify
+	   their stored messages. *)
+	subclassResponsibility
+)
+public extractTextFromResponse: response ^ <String> = (
+	(* Extract the assistant's text from the response, for the user-facing
+	   send-promise's resolution value. *)
+	subclassResponsibility
+)
+public displayMessagesFromMessages: messages <List> ^ <List> = (
+	(* Walk the history producing {role, text} tuples for UI rendering.
+	   Role is always 'user' or 'assistant' (translate native role names
+	   like Gemini's 'model'). Skip entries with no display text (tool
+	   results, empty turns). *)
+	subclassResponsibility
+)
+public hasToolUse: response ^ <Boolean> = (
+	(* Default: providers without tool support never trigger the tool loop. *)
+	^false
+)
+public toolUseBlocksFrom: response ^ <List> = (
+	(* Only called when hasToolUse: returns true. Providers that support
+	   tool use override to extract the tool-call records. *)
+	subclassResponsibility
+)
+public makeToolResult: id content: text isError: err ^ <Alien> = (
+	(* Build a tool-result message in the provider's native shape, to be
+	   appended to messages and sent on the next turn. Only providers
+	   that support tool use need to implement this. *)
+	subclassResponsibility
+)
+public buildToolsPayload: toolDefs <List[Tool]> ^ <Alien | UndefinedObject> = (
+	(* Translate the IDE's neutral Tool definitions to the provider's
+	   tool-declaration shape, or nil if no tools (or no tool support). *)
+	^nil
+)
+safeAt: receiver field: field = (
+	(* Defensive JS field access. JS `undefined` USUALLY maps to Newspeak
+	   `nil` in primordialsoup's alien bridge, but not in every edge case
+	   (e.g. some object shapes where the at: dispatch raises rather than
+	   returns nil). Wrap every field access on response-tree nodes in
+	   this so a deviant shape produces nil rather than blowing up the
+	   chat session. Returns nil for missing fields. *)
+	receiver isNil ifTrue: [^nil].
+	^[receiver at: field] on: Exception do: [:e | nil]
 )
 ) : (
 )
@@ -111,33 +180,136 @@ public complete: messages <Alien[Array]>
 	options at: 'body' put: (JSON stringify: body).
 
 	^(global fetch: apiUrl with: options) then: [:response |
-		(response at: 'ok')
-			ifFalse: [
-				Error signal: 'Anthropic API error: ',
-					(response at: 'status') printString,
-					' ', (response at: 'statusText')
-			].
-		response json
+		[
+			| status statusText |
+			(* See GeminiProvider doRequest: for the rationale on
+			   status >= 400 and on returning Promise.reject instead of
+			   raising. *)
+			status:: safeAt: response field: 'status'.
+			statusText:: safeAt: response field: 'statusText'.
+			statusText isNil ifTrue: [statusText:: ''].
+			(status isNil or: [status >= 400])
+				ifTrue: [
+					(global at: 'Promise') reject: ('Anthropic API error: ',
+						(status isNil
+							ifTrue: ['(no status)']
+							ifFalse: [status printString]),
+						' ', statusText)
+				]
+				ifFalse: [response json]
+		] on: Exception do: [:e |
+			(global at: 'Promise') reject: ('Anthropic provider error: ', e messageText)
+		]
 	]
 )
-) : (
+public addUserText: text toMessages: messages = (
+	| userMsg |
+	userMsg:: createJSObject.
+	userMsg at: 'role' put: 'user'.
+	userMsg at: 'content' put: text.
+	messages add: userMsg
 )
-public class Session provider: p tools: toolList = (
-|
-	public provider <Provider> = p.
-	private toolDefs = toolList.
-	private toolMap = Map new.
-	(* Full API message history, including tool_use/tool_result messages.
-	   Each element is an Alien (JS message object). *)
-	public apiMessages = List new.
-	public systemPrompt <String> ::= 'You are a helpful Newspeak programming assistant.'.
-	public maxTokens <Integer> ::= 4096.
-	(* Optional callback invoked when conversation state changes. *)
-	public onUpdate
-|
-	toolList do: [:t <Tool> | toolMap at: t name put: t].
-) (
-buildToolsJS ^ <Alien> = (
+public appendAssistantResponse: response toMessages: messages = (
+	| assistantMsg content |
+	content:: safeAt: response field: 'content'.
+	content isNil ifTrue: [
+		Error signal: 'Anthropic response missing content. stop_reason: ',
+			([(safeAt: response field: 'stop_reason') printString]
+				on: Error do: [:e | '(absent)'])
+	].
+	assistantMsg:: createJSObject.
+	assistantMsg at: 'role' put: 'assistant'.
+	assistantMsg at: 'content' put: content.
+	messages add: assistantMsg
+)
+public messagesAsRequestPayload: messages ^ <Alien> = (
+	| arr |
+	arr:: createJSArray.
+	messages do: [:m | arr push: m].
+	^arr
+)
+public extractTextFromResponse: response ^ <String> = (
+	(* Defensive walk. Every JS access goes through safeAt:field: so a
+	   malformed response yields '' rather than raising. *)
+	| content len result text |
+	content:: safeAt: response field: 'content'.
+	len:: safeAt: content field: 'length'.
+	len isNil ifTrue: [^''].
+	result:: ''.
+	0 to: len - 1 do: [:i |
+		| block |
+		block:: safeAt: content field: i.
+		((safeAt: block field: 'type') = 'text') ifTrue: [
+			text:: safeAt: block field: 'text'.
+			text isNil ifFalse: [result:: result, text]
+		]
+	].
+	^result
+)
+public displayMessagesFromMessages: messages ^ <List> = (
+	| result |
+	result:: List new.
+	messages do: [:msg |
+		| role |
+		role:: safeAt: msg field: 'role'.
+		role = 'user' ifTrue: [
+			| content |
+			content:: safeAt: msg field: 'content'.
+			(* String content = user-typed text; array content = tool_result
+			   (skipped, not for display). *)
+			(content isNil not and: [content isKindOfString]) ifTrue: [
+				result add: {role. content}
+			]
+		].
+		role = 'assistant' ifTrue: [
+			| text content len |
+			text:: ''.
+			content:: safeAt: msg field: 'content'.
+			len:: safeAt: content field: 'length'.
+			len isNil ifFalse: [
+				0 to: len - 1 do: [:i |
+					| block |
+					block:: safeAt: content field: i.
+					((safeAt: block field: 'type') = 'text') ifTrue: [
+						| t |
+						t:: safeAt: block field: 'text'.
+						t isNil ifFalse: [text:: text, t]
+					]
+				]
+			].
+			text isEmpty ifFalse: [
+				result add: {role. text}
+			]
+		]
+	].
+	^result
+)
+public hasToolUse: response ^ <Boolean> = (
+	^(safeAt: response field: 'stop_reason') = 'tool_use'
+)
+public toolUseBlocksFrom: response ^ <List> = (
+	| content len blocks |
+	content:: safeAt: response field: 'content'.
+	len:: safeAt: content field: 'length'.
+	blocks:: List new.
+	len isNil ifTrue: [^blocks].
+	0 to: len - 1 do: [:i |
+		| block |
+		block:: safeAt: content field: i.
+		((safeAt: block field: 'type') = 'tool_use') ifTrue: [blocks add: block]
+	].
+	^blocks
+)
+public makeToolResult: id content: text isError: err ^ <Alien> = (
+	| block |
+	block:: createJSObject.
+	block at: 'type' put: 'tool_result'.
+	block at: 'tool_use_id' put: id.
+	block at: 'content' put: text.
+	err ifTrue: [block at: 'is_error' put: true].
+	^block
+)
+public buildToolsPayload: toolDefs ^ <Alien | UndefinedObject> = (
 	| arr |
 	toolDefs isEmpty ifTrue: [^nil].
 	arr:: createJSArray.
@@ -147,62 +319,40 @@ buildToolsJS ^ <Alien> = (
 		obj at: 'name' put: t name.
 		obj at: 'description' put: t description.
 		obj at: 'input_schema' put: (JSON parse: t inputSchema).
-		arr push: obj.
+		arr push: obj
 	].
 	^arr
 )
-apiMessagesAsJSArray ^ <Alien> = (
-	| arr |
-	arr:: createJSArray.
-	apiMessages do: [:m | arr push: m].
-	^arr
+) : (
 )
-extractTextFrom: response ^ <String> = (
-	(* Defensively walk the response's content array, gathering 'text' blocks.
-	   The Anthropic API normally returns content as an array of typed blocks
-	   (text, tool_use, etc.), but malformed/error/streaming-edge responses
-	   may have content == undefined, or a block whose text field is
-	   undefined — in either case we just contribute nothing and let the
-	   conversation continue, rather than raising MNU into the user's chat. *)
-	| content result text |
-	content:: response at: 'content'.
-	content isNil ifTrue: [^''].
-	result:: ''.
-	0 to: (content at: 'length') - 1 do: [:i |
-		| block |
-		block:: content at: i.
-		block isNil ifFalse: [
-			(block at: 'type') = 'text' ifTrue: [
-				text:: block at: 'text'.
-				text isNil ifFalse: [result:: result, text]
-			]
-		]
-	].
-	^result
-)
-hasToolUse: response ^ <Boolean> = (
-	^(response at: 'stop_reason') = 'tool_use'
-)
-toolUseBlocksFrom: response ^ <List> = (
-	| content blocks |
-	content:: response at: 'content'.
-	blocks:: List new.
-	0 to: (content at: 'length') - 1 do: [:i |
-		| block |
-		block:: content at: i.
-		(block at: 'type') = 'tool_use' ifTrue: [
-			blocks add: block.
-		].
-	].
-	^blocks
-)
+public class Session provider: p tools: toolList = (
+|
+	public provider <Provider> = p.
+	private toolDefs = toolList.
+	private toolMap = Map new.
+	(* Conversation history. The shape of each entry is opaque to Session —
+	   only `provider` knows what messages look like in its native API. Use
+	   provider methods (addUserText:toMessages:, displayMessagesFromMessages:,
+	   etc.) to inspect or mutate. *)
+	public apiMessages = List new.
+	public systemPrompt <String> ::= 'You are a helpful Newspeak programming assistant.'.
+	public maxTokens <Integer> ::= 4096.
+	(* Optional callback invoked when conversation state changes. *)
+	public onUpdate
+|
+	toolList do: [:t <Tool> | toolMap at: t name put: t].
+) (
 executeToolCall: toolUseBlock ^ <Alien[Promise]> = (
+	(* Resolve a tool_use block (Anthropic shape — only Anthropic enters this
+	   path) to a tool_result promise. The tool_result is built via the
+	   provider so the shape stays provider-native. *)
 	| toolName input tool id resultOrPromise |
 	id:: toolUseBlock at: 'id'.
 	toolName:: toolUseBlock at: 'name'.
 	input:: toolUseBlock at: 'input'.
 	tool:: toolMap at: toolName ifAbsent: [
-		^Promise resolve: (makeToolResult: id
+		^Promise resolve: (provider
+			makeToolResult: id
 			content: 'Unknown tool: ', toolName
 			isError: true)
 	].
@@ -213,8 +363,7 @@ executeToolCall: toolUseBlock ^ <Alien[Promise]> = (
 			(* Be defensive about extracting the error message: some
 			   exceptions (e.g. CannotReturn from a stale stored block)
 			   raise when sent messageText, which would turn the original
-			   tool failure into a silent chat hang. Fall back to
-			   printString, then a generic placeholder. *)
+			   tool failure into a silent chat hang. *)
 			msg:: [
 				'Error: ', e messageText
 			] on: Exception do: [:e2 |
@@ -224,88 +373,78 @@ executeToolCall: toolUseBlock ^ <Alien[Promise]> = (
 					'Error: <unprintable exception>'
 				]
 			].
-			^Promise resolve: (makeToolResult: id
+			^Promise resolve: (provider
+				makeToolResult: id
 				content: msg
 				isError: true)
 		].
 	(* Promise-returning handler: chain. *)
 	(resultOrPromise isKindOfJSAlien and: [resultOrPromise includesKey: 'then']) ifTrue: [
 		^resultOrPromise
-			then: [:text | makeToolResult: id content: text isError: false]
+			then: [:text | provider makeToolResult: id content: text isError: false]
 			onError: [:err |
-				makeToolResult: id
+				provider
+					makeToolResult: id
 					content: 'Error: ', err printString
 					isError: true
 			]
 	].
 	(* Synchronous result. *)
-	^Promise resolve: (makeToolResult: id content: resultOrPromise isError: false)
-)
-makeToolResult: id content: text isError: err ^ <Alien> = (
-	| block |
-	block:: createJSObject.
-	block at: 'type' put: 'tool_result'.
-	block at: 'tool_use_id' put: id.
-	block at: 'content' put: text.
-	err ifTrue: [block at: 'is_error' put: true].
-	^block
+	^Promise resolve: (provider makeToolResult: id content: resultOrPromise isError: false)
 )
 completeWithToolLoop ^ <Alien[Promise]> = (
 	^(provider
-		complete: apiMessagesAsJSArray
+		complete: (provider messagesAsRequestPayload: apiMessages)
 		system: systemPrompt
-		tools: buildToolsJS
+		tools: (provider buildToolsPayload: toolDefs)
 		maxTokens: maxTokens
 	) then: [:response |
-		| assistantMsg content |
-		(* Defensive: we have observed intermittent 200-OK responses with no
-		   content array (CDN edge case / refusal-with-no-body / transient
-		   server-side glitch). Failing fast here keeps the history clean —
-		   storing an undefined content corrupts apiMessages and breaks every
-		   subsequent send. *)
-		content:: response at: 'content'.
-		content isNil ifTrue: [
-			Error signal: 'API response missing content. stop_reason: ',
-				([(response at: 'stop_reason') printString]
-					on: Error do: [:e | '(absent)'])
-		].
-		assistantMsg:: createJSObject.
-		assistantMsg at: 'role' put: 'assistant'.
-		assistantMsg at: 'content' put: content.
-		apiMessages add: assistantMsg.
+		(* Wrap in on:Exception. Provider methods like appendAssistantResponse:
+		   and missingFieldError:on: raise on malformed responses; if we let
+		   that raise unwind out of this then-closure, primordialsoup's
+		   JS-Promise bridge loses the rejection (the closure's rawPush:
+		   never runs and the next then-callback in the chain fires with
+		   garbage on the alien stack — observed as receiving
+		   document.documentElement on follow-up turns). Returning
+		   Promise.reject keeps the rejection on the JS side, where A+
+		   semantics propagate it to the UI's onError: as expected. *)
+		[
+			provider appendAssistantResponse: response toMessages: apiMessages.
 
-		(hasToolUse: response)
-			ifTrue: [
-				| toolBlocks promises |
-				toolBlocks:: toolUseBlocksFrom: response.
-				promises:: createJSArray.
-				toolBlocks do: [:tb | promises push: (executeToolCall: tb)].
-				(* Await all tool results, then continue the conversation. *)
-				(Promise all: promises) then: [:results |
-					| toolResultMsg |
-					toolResultMsg:: createJSObject.
-					toolResultMsg at: 'role' put: 'user'.
-					toolResultMsg at: 'content' put: results.
-					apiMessages add: toolResultMsg.
-					notifyUpdate.
-					completeWithToolLoop
+			(provider hasToolUse: response)
+				ifTrue: [
+					| toolBlocks promises |
+					toolBlocks:: provider toolUseBlocksFrom: response.
+					promises:: createJSArray.
+					toolBlocks do: [:tb | promises push: (executeToolCall: tb)].
+					(* Await all tool results, then continue the conversation.
+					   The tool_result message itself is still Anthropic-shaped
+					   here — only Anthropic ever takes this branch. *)
+					(Promise all: promises) then: [:results |
+						| toolResultMsg |
+						toolResultMsg:: createJSObject.
+						toolResultMsg at: 'role' put: 'user'.
+						toolResultMsg at: 'content' put: results.
+						apiMessages add: toolResultMsg.
+						notifyUpdate.
+						completeWithToolLoop
+					]
 				]
-			]
-			ifFalse: [
-				notifyUpdate.
-				extractTextFrom: response
-			]
+				ifFalse: [
+					notifyUpdate.
+					provider extractTextFromResponse: response
+				]
+		] on: Exception do: [:e |
+			notifyUpdate.
+			(global at: 'Promise') reject: e messageText
+		]
 	]
 )
 notifyUpdate = (
 	onUpdate isNil ifFalse: [onUpdate value].
 )
 public sendMessage: text <String> ^ <Alien[Promise]> = (
-	| userMsg |
-	userMsg:: createJSObject.
-	userMsg at: 'role' put: 'user'.
-	userMsg at: 'content' put: text.
-	apiMessages add: userMsg.
+	provider addUserText: text toMessages: apiMessages.
 	notifyUpdate.
 
 	^(completeWithToolLoop) then: [:responseText |
@@ -314,42 +453,7 @@ public sendMessage: text <String> ^ <Alien[Promise]> = (
 	]
 )
 public displayMessages ^ <List> = (
-	| result |
-	result:: List new.
-	apiMessages do: [:msg |
-		| role |
-		role:: msg at: 'role'.
-		role = 'user' ifTrue: [
-			| content |
-			content:: msg at: 'content'.
-			(* User messages with string content are user-typed text.
-			   User messages with array content are tool results (skip). *)
-			content isKindOfString ifTrue: [
-				result add: {role. content}.
-			].
-		].
-		role = 'assistant' ifTrue: [
-			| text content |
-			text:: ''.
-			content:: msg at: 'content'.
-			(* Defensive: prior to the completeWithToolLoop content-validation
-			   fix, an undefined-content response could end up in history.
-			   Don't crash the UI when rendering such a message. *)
-			content isNil ifFalse: [
-				0 to: (content at: 'length') - 1 do: [:i |
-					| block |
-					block:: content at: i.
-					(block at: 'type') = 'text' ifTrue: [
-						text:: text, (block at: 'text').
-					].
-				].
-			].
-			text isEmpty ifFalse: [
-				result add: {role. text}.
-			].
-		].
-	].
-	^result
+	^provider displayMessagesFromMessages: apiMessages
 )
 public clearHistory = (
 	apiMessages removeAll.
@@ -358,17 +462,24 @@ public clearHistory = (
 ) : (
 )
 public class GeminiProvider apiKey: key model: mdl = Provider (
+(*
+ Stores messages in Gemini's native shape ({role: 'user'|'model', parts:
+ [{text}]}). complete: just packages them into a Gemini request body —
+ no per-turn translation. Response is returned as Gemini's raw JSON;
+ appendAssistantResponse: and extractTextFromResponse: navigate it
+ directly. Tool calls are not yet supported; hasToolUse: inherits the
+ Provider default of false.
+*)
 |
 	public apiKey <String> ::= key.
 	public model <String> ::= mdl.
 |
 ) (
 public availableModels ^ <List[String]> = (
-	(* The 1.5 names were deprecated; 2.x is current as of mid-2026. The
-	   set of available models on the Google API drifts faster than this
-	   code can track — if the user gets a 404 from generateContent, the
-	   model name in the chat doc is probably stale; pick a current one
-	   from https://ai.google.dev/gemini-api/docs/models. *)
+	(* The set of available models on the Google API drifts faster than
+	   this code can track — if you get a 404 from generateContent, the
+	   model name in your chat doc is stale; pick a current one from
+	   https://ai.google.dev/gemini-api/docs/models. *)
 	^{
 		'gemini-2.5-pro'.
 		'gemini-2.5-flash'.
@@ -381,178 +492,196 @@ public displayNameFor: modelId <String> ^ <String> = (
 	modelId = 'gemini-2.0-flash' ifTrue: [^'Gemini 2.0 Flash'].
 	^modelId
 )
-flattenToTextForGemini: rawContent ^ <String> = (
-	(* User messages stored content as a Newspeak/JS String — return it
-	   as is. Assistant messages stored content as an array of content
-	   blocks (matching the Anthropic shape we use internally); concatenate
-	   any text-typed blocks. Anything else (nil, unrecognised) becomes
-	   ''. Gemini expects parts:[{text: <string>}], never an array. *)
-	rawContent isNil ifTrue: [^''].
-	rawContent isKindOfString ifTrue: [^rawContent].
-	((rawContent at: 'length') isNil) ifTrue: [^''].
-	^[
-		| text i count |
+public addUserText: text toMessages: messages = (
+	| userMsg parts textPart |
+	parts:: createJSArray.
+	textPart:: createJSObject.
+	textPart at: 'text' put: text.
+	parts push: textPart.
+	userMsg:: createJSObject.
+	userMsg at: 'role' put: 'user'.
+	userMsg at: 'parts' put: parts.
+	messages add: userMsg
+)
+public appendAssistantResponse: response toMessages: messages = (
+	| candidates length firstCandidate firstContent assistantMsg parts |
+	candidates:: safeAt: response field: 'candidates'.
+	(* Treat both candidates-absent and candidates-empty as "no usable
+	   response". The HTTP-status check upstream catches 4xx/5xx; this
+	   handles 200-OK with empty/no candidates (safety blocks, the {}
+	   anomaly that we retried, and similar). *)
+	length:: safeAt: candidates field: 'length'.
+	(candidates isNil or: [length isNil or: [length = 0]]) ifTrue: [
+		^missingFieldError: 'candidates' on: response
+	].
+	firstCandidate:: safeAt: candidates field: 0.
+	firstCandidate isNil ifTrue: [
+		^missingFieldError: 'first candidate' on: response
+	].
+	firstContent:: safeAt: firstCandidate field: 'content'.
+	firstContent isNil ifTrue: [
+		^missingFieldError: 'candidate.content' on: response
+	].
+	parts:: safeAt: firstContent field: 'parts'.
+	parts isNil ifTrue: [
+		^missingFieldError: 'content.parts' on: response
+	].
+	assistantMsg:: createJSObject.
+	assistantMsg at: 'role' put: 'model'.
+	assistantMsg at: 'parts' put: parts.
+	messages add: assistantMsg
+)
+missingFieldError: field on: response = (
+	| stringified |
+	stringified:: [(global at: 'JSON') stringify: response]
+		on: Exception do: [:e | '(unstringifiable response)'].
+	Error signal: 'Gemini response missing ', field, '. Raw: ', stringified
+)
+public messagesAsRequestPayload: messages ^ <Alien> = (
+	| arr |
+	arr:: createJSArray.
+	messages do: [:m | arr push: m].
+	^arr
+)
+public extractTextFromResponse: response ^ <String> = (
+	(* Defensive walk of candidates[0].content.parts. Returns '' if any
+	   level is absent or malformed, rather than raising into the user's
+	   chat. (appendAssistantResponse: surfaces shape problems instead;
+	   this method is purely for "what's the text payload?".) *)
+	| candidates length firstCandidate firstContent parts result text plen |
+	result:: ''.
+	candidates:: safeAt: response field: 'candidates'.
+	length:: safeAt: candidates field: 'length'.
+	(length isNil or: [length = 0]) ifTrue: [^result].
+	firstCandidate:: safeAt: candidates field: 0.
+	firstContent:: safeAt: firstCandidate field: 'content'.
+	parts:: safeAt: firstContent field: 'parts'.
+	plen:: safeAt: parts field: 'length'.
+	plen isNil ifTrue: [^result].
+	0 to: plen - 1 do: [:i |
+		| part |
+		part:: safeAt: parts field: i.
+		text:: safeAt: part field: 'text'.
+		text isNil ifFalse: [result:: result, text]
+	].
+	^result
+)
+public displayMessagesFromMessages: messages ^ <List> = (
+	| result |
+	result:: List new.
+	messages do: [:msg |
+		| role displayRole parts text plen |
+		role:: safeAt: msg field: 'role'.
+		displayRole:: role = 'model' ifTrue: ['assistant'] ifFalse: [role].
+		parts:: safeAt: msg field: 'parts'.
+		plen:: safeAt: parts field: 'length'.
 		text:: ''.
-		i:: 0.
-		count:: rawContent at: 'length'.
-		[i < count] whileTrue: [
-			| block t |
-			block:: rawContent at: i.
-			block isNil ifFalse: [
-				(block at: 'type') = 'text' ifTrue: [
-					t:: block at: 'text'.
-					t isNil ifFalse: [text:: text, t]
-				]
-			].
-			i:: i + 1
+		plen isNil ifFalse: [
+			0 to: plen - 1 do: [:i |
+				| part t |
+				part:: safeAt: parts field: i.
+				t:: safeAt: part field: 'text'.
+				t isNil ifFalse: [text:: text, t]
+			]
 		].
-		text
-	] on: Exception do: [:e | '']
+		text isEmpty ifFalse: [
+			result add: {displayRole. text}
+		]
+	].
+	^result
 )
 public complete: messages <Alien[Array]>
 system: systemPrompt <String>
 tools: tools <Alien[Array]>
 maxTokens: maxTokens <Integer>
 ^ <Alien[Promise]> = (
-	| body headers options apiUrl geminiContents sysInst |
-	
+	(* Gemini intermittently returns 200-OK with an empty body ({}) — no
+	   candidates field at all. Retry up to 3 attempts before giving up;
+	   safety-blocked responses (candidates present but empty, with
+	   promptFeedback) are NOT retried, only the no-candidates case is. *)
+	^attemptComplete: messages
+		system: systemPrompt
+		maxTokens: maxTokens
+		triesLeft: 3
+)
+attemptComplete: messages system: systemPrompt maxTokens: maxTokens triesLeft: triesLeft ^ <Alien[Promise]> = (
+	^(doRequest: messages system: systemPrompt maxTokens: maxTokens) then: [:response |
+		| candidates |
+		candidates:: safeAt: response field: 'candidates'.
+		(candidates isNil and: [triesLeft > 1])
+			ifTrue: [
+				(* Retry: candidates field absent. Recursive call via Promise
+				   chaining; A+ flattens so the outer Promise still resolves
+				   to the eventual response (or the last empty one). *)
+				attemptComplete: messages
+					system: systemPrompt
+					maxTokens: maxTokens
+					triesLeft: triesLeft - 1
+			]
+			ifFalse: [response]
+	]
+)
+doRequest: messages system: systemPrompt maxTokens: maxTokens ^ <Alien[Promise]> = (
+	| body headers options apiUrl |
 	body:: createJSObject.
-	
-	(* 1. Translate standard messages array to Gemini 'contents' format.
-	   User messages carry a string content (the raw text). Assistant
-	   messages carry a CONTENT-BLOCK ARRAY (our internal Anthropic-shaped
-	   shape: a list of {type, text} or tool blocks). For follow-up turns
-	   the assistant array must be flattened back to a plain text string;
-	   otherwise Gemini sees parts:[{text:<array>}] and rejects the request,
-	   which is what was breaking turn 2. Tool-use blocks are skipped — we
-	   don't yet translate tool calls for Gemini. *)
-	geminiContents:: createJSArray.
-	0 to: (messages at: 'length') - 1 do: [:i |
-		| msg geminiMsg parts textPart role rawContent textContent |
-		msg:: messages at: i.
-		geminiMsg:: createJSObject.
-
-		(* Map 'assistant' role to 'model' for Gemini *)
-		role:: msg at: 'role'.
-		role = 'assistant'
-			ifTrue: [geminiMsg at: 'role' put: 'model']
-			ifFalse: [geminiMsg at: 'role' put: role].
-
-		rawContent:: msg at: 'content'.
-		textContent:: flattenToTextForGemini: rawContent.
-
-		parts:: createJSArray.
-		textPart:: createJSObject.
-		textPart at: 'text' put: textContent.
-		parts push: textPart.
-
-		geminiMsg at: 'parts' put: parts.
-		geminiContents push: geminiMsg.
-	].
-	body at: 'contents' put: geminiContents.
-
-	(* 2. Handle System Prompt *)
+	(* messages is already Gemini-shaped (built via addUserText: and
+	   appendAssistantResponse:), so it goes straight into the body. *)
+	body at: 'contents' put: messages.
 	systemPrompt isEmpty ifFalse: [
-		| sysParts textPart |
+		| sysInst sysParts textPart |
 		sysInst:: createJSObject.
 		sysParts:: createJSArray.
 		textPart:: createJSObject.
 		textPart at: 'text' put: systemPrompt.
 		sysParts push: textPart.
 		sysInst at: 'parts' put: sysParts.
-		body at: 'systemInstruction' put: sysInst.
+		body at: 'systemInstruction' put: sysInst
 	].
+	(* tools intentionally ignored — Gemini function-calling not yet
+	   translated. buildToolsPayload: returns nil so we never see tools. *)
 
-	(* Note: Tool translation omitted here for brevity, 
-	   but would follow a similar mapping to Gemini's FunctionDeclaration *)
-
-	apiUrl:: 'https://generativelanguage.googleapis.com/v1beta/models/' , model , ':generateContent'.
-
+	apiUrl:: 'https://generativelanguage.googleapis.com/v1beta/models/',
+		model, ':generateContent'.
 	headers:: createJSObject.
 	headers at: 'Content-Type' put: 'application/json'.
 	headers at: 'x-goog-api-key' put: apiKey.
-
 	options:: createJSObject.
 	options at: 'method' put: 'POST'.
 	options at: 'headers' put: headers.
 	options at: 'body' put: (JSON stringify: body).
 
 	^(global fetch: apiUrl with: options) then: [:response |
-		(response at: 'ok')
-			ifTrue: [
-				(* Parse the JSON, then translate it to the IDE's expected format.
-				   Every navigation through the candidates/content/parts tree is
-				   defensive: any field can be missing on safety-blocked responses,
-				   model errors surfaced as 200-OK, or non-text part types. Builds
-				   an empty content array on any deviation rather than raising, so
-				   apiMessages never gets a half-formed entry. The raw response is
-				   stashed under 'raw' for inspection on weird cases. *)
-				response json then: [:geminiJson |
-					| mockResponse contentArray candidates firstCandidate firstContent parts |
-
-					mockResponse:: createJSObject.
-					contentArray:: createJSArray.
-
-					candidates:: geminiJson at: 'candidates'.
-					(candidates isNil not and: [(candidates at: 'length') > 0]) ifTrue: [
-						firstCandidate:: candidates at: 0.
-						firstContent:: firstCandidate isNil ifFalse: [firstCandidate at: 'content'] ifTrue: [nil].
-						parts:: firstContent isNil ifFalse: [firstContent at: 'parts'] ifTrue: [nil].
-
-						parts isNil ifFalse: [
-							0 to: (parts at: 'length') - 1 do: [:i |
-								| part text textBlock |
-								part:: parts at: i.
-								part isNil ifFalse: [
-									text:: part at: 'text'.
-									text isNil ifFalse: [
-										textBlock:: createJSObject.
-										textBlock at: 'type' put: 'text'.
-										textBlock at: 'text' put: text.
-										contentArray push: textBlock.
-									]
-								]
-							]
-						].
-					].
-
-					(* If translation produced no usable text, surface the raw Gemini
-					   body so the user can see why (safety block, request rejection,
-					   model deprecation, etc.) rather than silently storing an empty
-					   assistant message that breaks subsequent turns when fed back. *)
-					(contentArray at: 'length') = 0 ifTrue: [
-						| stringified |
-						stringified:: [
-							(global at: 'JSON') stringify: geminiJson
-						] on: Exception do: [:e | '(unstringifiable response)'].
-						Error signal: 'Gemini returned no usable text content. Raw response: ', stringified
-					].
-
-					mockResponse at: 'content' put: contentArray.
-					mockResponse at: 'stop_reason' put: 'end_turn'.
-					mockResponse at: 'raw' put: geminiJson.
-
-					mockResponse
+		[
+			| status statusText |
+			(* Check status as a number (via at:) rather than response.ok.
+			   ok is a getter; primordialsoup's alien bridge does not
+			   reliably invoke getters via either at: or unary sends. *)
+			status:: safeAt: response field: 'status'.
+			statusText:: safeAt: response field: 'statusText'.
+			statusText isNil ifTrue: [statusText:: ''].
+			(status isNil or: [status >= 400])
+				ifTrue: [
+					(* Return a JS-rejected Promise rather than `Error signal:`.
+					   Raising a Newspeak exception inside a closure passed to
+					   `jsPromise then:` unwinds non-locally through the alien
+					   bridge BEFORE the expat's rawPush: runs, leaving the
+					   alien stack in a state where the next chained then-
+					   callback receives garbage. Returning Promise.reject(...)
+					   keeps the rejection on the JS Promise side, which A+
+					   propagates correctly. *)
+					(global at: 'Promise') reject: ('Gemini API error: ',
+						(status isNil
+							ifTrue: ['(no status)']
+							ifFalse: [status printString]),
+						' ', statusText)
 				]
-			]
-			ifFalse: [
-				(* Error path. Status+statusText alone is uninformative — statusText
-				   is often empty on HTTP/2, and Google puts the real diagnostic
-				   ("model overloaded", "quota exceeded", "API key invalid", safety
-				   classification details, etc.) in the response BODY as JSON. Read
-				   the body as text and include it in the signalled error so the
-				   user sees what Google actually said. Returning the response.text()
-				   promise from this branch keeps the chain async-correct: Error
-				   signal: inside the inner then: rejects that promise, and the
-				   outer then: flattens it. No non-local return from a stored
-				   closure, which would raise CannotReturn when the outer method
-				   has long since returned its Promise. *)
-				response text then: [:errBody |
-					Error signal: 'Gemini API error: ',
-						(response at: 'status') printString, ' ',
-						(response at: 'statusText'), ' — ', errBody
-				]
-			]
+				ifFalse: [response json]
+		] on: Exception do: [:e |
+			(* Backstop: any raise from inside the then-block (e.g. unexpected
+			   MNU) becomes a JS-side rejection, never a non-local unwind
+			   through the bridge. *)
+			(global at: 'Promise') reject: ('Gemini provider error: ', e messageText)
+		]
 	]
 )
 ) : (

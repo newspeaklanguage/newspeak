@@ -96,22 +96,18 @@ Further documentation of subjects and decorators will be added in the future.
     (* re-export *)
     public VoiceController = VCC.
 
-    (* AI integration. aiAccess is owned by the platform (no hopscotch
-       dependency) and re-exported here. AIChatUI requires hopscotch
-       (it reads Subject/Presenter from platform hopscotch), so we keep
-       just the class here and instantiate the module lazily — by the
-       time anything reaches the lazy slot below, Hopscotch is fully
-       constructed and AIChatUI's slot block can resolve platform
-       hopscotch cleanly. Same pattern as voiceController. The platform
-       slot capture below is so the lazy initializer can still reach p
-       after construction. *)
-    private platform = p.
-    private AIChatUI = p aiChatUIClass.
-    (* aiAccess and aiChatUI are lazy module-level declarations defined
-       outside this slot block (alongside voiceController) — Newspeak's
-       lazy-slot syntax is module-level, not slot-block-level. See near
-       the bottom of this file. *)
-	
+    (* AI integration. The chat UI classes (Subject and Presenter
+       subclasses for the chat view, plus AIColors) live as sibling
+       top-level classes in this module so they can read Subject and
+       Presenter at enclosing scope. aiAccess is owned by the platform
+       (no hopscotch dependency) and re-exported here; reading p
+       aiAccess at slot-block time is safe because AIAccess's own
+       slot block was reshaped to do only class-imports — its JS-side
+       lookups are now lazy at AIAccess module body. *)
+    public aiAccess = p aiAccess.
+    private Session = aiAccess Session.
+
+
 (* JS and Web objects. These are initialized lazily because Hopscotch
    is provided by some Newspeak platforms. As such, the module is
    instantiated as part of the serialization process, before load time.
@@ -2850,17 +2846,16 @@ public = anotherPresenter = (
 		 subject = anotherPresenter subject and: [creatingWindowCompatibleWith: anotherPresenter]
 		]
 )
-(* AI chat factory methods. Force the lazy aiChatUI slot, then build the
-   requested presenter. aiChat: returns a ChatPresenter on the given
+(* AI chat factory methods. aiChat: returns a ChatPresenter on the given
    chat subject for embedding. aiChatSetup: returns an
    AIChatSetupPresenter on a fresh setup subject for the given provider
    class, for navigation (enterSubject:) or embedding. *)
 aiChat: aChatSubject = (
-	^aiChatUI ChatPresenter onSubject: aChatSubject
+	^(outer HopscotchForHTML5 ChatPresenter) onSubject: aChatSubject
 )
 aiChatSetup: providerClass = (
-	^aiChatUI AIChatSetupPresenter onSubject:
-		(aiChatUI AIChatSetupSubject onModel: providerClass)
+	^(outer HopscotchForHTML5 AIChatSetupPresenter) onSubject:
+		((outer HopscotchForHTML5 AIChatSetupSubject) onModel: providerClass)
 )
 alert: text = (
 	window alert: text
@@ -4649,12 +4644,439 @@ updateVisualsFromSameKind: oldFragment <TimerFragment> ^ <Alien[Element]> = (
 )
 ) : (
 )
+(* ============================ AI Chat ============================
+   The chat UI classes (formerly in AIChatUI.ns). They live here as
+   top-level siblings so they can read Subject/Presenter/Color/List/
+   Session at enclosing scope, dodging the construction cycle the
+   separate-module form had. AIColors groups the bubble colour
+   palette as a small utility so AI_IDE_Support can pull it in via
+   a single named handle. *)
+
+public class AIColors = (
+(*
+ Shared colour palette for the user/assistant/error turn bubbles —
+ both the inline ChatPresenter and the chat-as-document path in
+ AI_IDE_Support read these so the two views stay visually consistent.
+*)
+) (
+public assistantTurnBackground ^ <String> = ( ^'#edf2ee' )
+public assistantTurnBorder     ^ <String> = ( ^'#b0c8b4' )
+public userTurnBackground      ^ <String> = ( ^'#eef4fb' )
+public userTurnBorder          ^ <String> = ( ^'#b8d4ec' )
+public errorTurnBackground     ^ <String> = ( ^'#fdecea' )
+public errorTurnBorder         ^ <String> = ( ^'#d68682' )
+) : (
+)
+
+public class AIChatSetupSubject onModel: providerClass <Class> = Subject onModel: providerClass (
+(*
+ Subject for the initial chat setup screen where the user enters
+ their API key and chooses a model. The Subject's model is the
+ provider *class* (e.g. AnthropicProvider) — not an instance, since
+ the instance is what startChat will construct from the key+model
+ the user types here. The class name is used to derive a per-provider
+ localStorage key so each provider's key is remembered independently.
+*)
+|
+	public apiKey <String> ::= ''.
+	public modelName <String> ::= 'claude-sonnet-4-6'.
+	public errorMessage <String | UndefinedObject>
+|
+	(* Best-effort restore of the API key. localStorage may be unavailable
+	   (private browsing, embedded contexts); on any failure we just leave
+	   apiKey as ''. *)
+	[apiKey:: js localStorage getItem: storageKey.
+	 apiKey isNil ifTrue: [apiKey:: ''].
+	] on: Error do: [:e | ].
+) (
+storageKey ^ <String> = (
+	(* Per-provider key so switching between Anthropic and Gemini doesn't
+	   clobber the other's stored API key. *)
+	^'ns_ai_apikey_', model name
+)
+public providerClass ^ <Class> = ( ^model )
+public createProvider = (
+	^model apiKey: apiKey model: modelName
+)
+public createSession: provider ^ <Session> = (
+	^Session provider: provider tools: {}
+)
+public startChat ^ <ChatSubject | UndefinedObject> = (
+	(* Validate, persist the key, build a session, and return a ChatSubject
+	   the caller can navigate to. Returns nil (and sets errorMessage) if
+	   the form is incomplete — caller checks for nil before navigating. *)
+	| provider session <Session> |
+	apiKey isEmpty ifTrue: [
+		errorMessage:: 'Please enter an API key.'.
+		^nil
+	].
+	[js localStorage setItem: storageKey to: apiKey] on: Error do: [:e | ].
+	provider:: createProvider.
+	session:: createSession: provider.
+	^newChatSubjectFor: session
+)
+public newChatSubjectFor: session <Session> ^ <ChatSubject> = (
+	^ChatSubject onModel: session
+)
+public title ^ <String> = ( ^'AI Chat Setup' )
+public createPresenter = ( ^AIChatSetupPresenter onSubject: self )
+public isKindOfAIChatSetupSubject ^ <Boolean> = ( ^true )
+isMyKind: other ^ <Boolean> = ( ^other isKindOfAIChatSetupSubject )
+) : (
+)
+
+public class AIChatSetupPresenter onSubject: s = Presenter onSubject: s (
+(*
+ Presenter for the AIChatSetupSubject. Renders the API-key + model entry
+ form, and on submit invokes subject startChat which (if validation
+ passes) returns a ChatSubject we navigate to via enterSubject:.
+*)
+|
+	keyEditor
+	modelEditor
+|
+) (
+definition = (
+	^column: {
+		helpSection.
+		row: {
+			(label: 'AI Chat Setup') bold.
+			filler.
+			helpButton.
+			dropDownMenu: [actionsMenu].
+		}.
+		mediumBlank.
+		label: 'Enter your API key to start a chat session.'.
+		label: 'The key is stored in your browser''s localStorage.'.
+		mediumBlank.
+		row: {
+			(label: 'API Key: ') bold.
+			elastic: apiKeyField.
+		}.
+		mediumBlank.
+		row: {
+			(label: 'Model: ') bold.
+			elastic: modelField.
+		}.
+		mediumBlank.
+		errorArea.
+		row: {
+			filler.
+			button: 'Start Chat' action: [respondToStart].
+		}.
+	}
+)
+actionsMenu = (
+	^menuWithLabelsAndActions: {
+		{'Inspect Presenter'. [respondToInspectPresenter]}.
+	}
+)
+respondToInspectPresenter = (
+)
+public helpText ^ <Fragment> = (
+	^textDisplay:
+		'Use this page to configure access to an AI provider. Enter your API key in the API Key field. The key is stored in your browser''s localStorage, so you only need to enter it once. Enter the model name in the Model field, then press Start Chat.'
+)
+apiKeyField = (
+	(* Keystroke-sync into the subject so the value survives presenter
+	   refreshes — same pattern as ChatInputPresenter's inputEditor. *)
+	keyEditor:: codeMirror: subject apiKey.
+	keyEditor changeResponse: [:frag |
+		subject apiKey: frag textBeingAccepted.
+	].
+	^keyEditor
+)
+modelField = (
+	modelEditor:: codeMirror: subject modelName.
+	modelEditor changeResponse: [:frag |
+		subject modelName: frag textBeingAccepted.
+	].
+	^modelEditor
+)
+errorArea = (
+	subject errorMessage isNil ifTrue: [^blank: 0].
+	^(label: subject errorMessage) color: (Color r: 0.8 g: 0 b: 0).
+)
+respondToStart = (
+	(* Re-read the editors before delegating to the subject (defensive —
+	   change response should already have synced, but a missed
+	   notification would silently send the previous draft). If startChat
+	   succeeds, navigate to the new ChatSubject; on validation failure it
+	   returns nil and writes errorMessage which the next render shows. *)
+	| chatSubject <ChatSubject | UndefinedObject> |
+	subject apiKey: keyEditor textBeingAccepted.
+	subject modelName: modelEditor textBeingAccepted.
+	updateGUI: [
+		chatSubject:: subject startChat.
+	].
+	chatSubject isNil ifFalse: [
+		enterSubject: chatSubject.
+	].
+)
+public isKindOfAIChatSetupPresenter ^ <Boolean> = ( ^true )
+isMyKind: other ^ <Boolean> = ( ^other isKindOfAIChatSetupPresenter )
+) : (
+)
+
+public class ChatSubject onModel: s <Session> = Subject onModel: s (
+(*
+ Subject for a chat conversation. The Subject's model is an AIAccess
+ Session, which owns the actual API messages and tool list. ChatSubject
+ layers per-UI state on top: the in-progress draft, the waiting flag
+ (true while a request is in flight, used to swap the status presenter
+ between "…thinking…" and the model picker), and a transient
+ errorMessage shown after a failed turn.
+*)
+|
+	public draft <String> ::= ''.
+	public waiting <Boolean> ::= false.
+	public errorMessage <String | UndefinedObject>
+|
+) (
+public session ^ <Session> = ( ^model )
+public messages ^ <List> = (
+	^session displayMessages
+)
+public sendDraft ^ <Alien[Promise] | UndefinedObject> = (
+	(* Legacy path: send whatever is currently in draft. The new input
+	   editor uses sendText: instead (see comment there for why). Kept so
+	   external callers (programmatic chats) can still send-by-draft. *)
+	| text <String> |
+	text:: draft.
+	text isEmpty ifTrue: [^nil].
+	draft:: ''.
+	waiting:: true.
+	errorMessage:: nil.
+	^session sendMessage: text
+)
+public sendText: text <String> ^ <Alien[Promise] | UndefinedObject> = (
+	(* Send a literal text — used by the input editor's accept path so the
+	   send does not depend on subject draft, which could be raced to ''
+	   by CodeMirror's change event when the editor is cleared. *)
+	text isEmpty ifTrue: [^nil].
+	draft:: ''.
+	waiting:: true.
+	errorMessage:: nil.
+	^session sendMessage: text
+)
+public markComplete = (
+	waiting:: false.
+)
+public markError: msg <String> = (
+	waiting:: false.
+	errorMessage:: msg.
+)
+public clearHistory = (
+	session clearHistory.
+	draft:: ''.
+	errorMessage:: nil.
+)
+public title ^ <String> = ( ^'Chat' )
+public createPresenter = ( ^ChatPresenter onSubject: self )
+public isKindOfChatSubject ^ <Boolean> = ( ^true )
+isMyKind: other ^ <Boolean> = ( ^other isKindOfChatSubject )
+) : (
+)
+
+public class ChatStatusPresenter onSubject: s = Presenter onSubject: s (
+(*
+ The status block above the input editor. While a request is in flight
+ (subject waiting = true) shows "…thinking…" and the current model;
+ otherwise shows a model picker dropdown so the user can swap models
+ between turns without losing history. The picker is intentionally
+ hidden mid-flight to avoid switching providers/models inside a
+ tool-use loop.
+*)
+) (
+definition = (
+	subject waiting ifTrue: [
+		^column: {
+			(label: '…thinking…') italic.
+			(label: 'Model: ', currentModelName) color: (Color r: 0.5 g: 0.5 b: 0.5).
+		}
+	].
+	^modelPicker
+)
+currentModelName ^ <String> = (
+	| provider |
+	provider:: subject session provider.
+	^provider displayNameFor: provider model
+)
+modelPicker = (
+	| provider |
+	provider:: subject session provider.
+	^row: {
+		label: 'Model: ', currentModelName, ' '.
+		dropDownMenu: [
+			menuWithLabelsAndActions:
+				(provider availableModels collect: [:m <String> |
+					{provider displayNameFor: m.
+					 [updateGUI: [provider model: m]]}
+				])
+		]
+	}
+)
+public isKindOfChatStatusPresenter ^ <Boolean> = ( ^true )
+isMyKind: other ^ <Boolean> = ( ^other isKindOfChatStatusPresenter )
+) : (
+)
+
+public class ChatInputPresenter onSubject: s = Presenter onSubject: s (
+(*
+ The CodeMirror editor below the messages area. On accept (Enter/submit)
+ captures the text, clears the editor, and routes the send through
+ subject sendText: — the Promise resolution updates the waiting flag
+ via markComplete / markError:.
+*)
+|
+	inputEditor
+|
+) (
+definition = (
+	inputEditor:: codeMirror: subject draft.
+	(* Sync draft on each keystroke so it survives presenter refreshes. *)
+	inputEditor changeResponse: [:frag | subject draft: frag textBeingAccepted].
+	inputEditor acceptResponse: [:frag | respondToSend].
+	^column: { inputEditor }
+)
+respondToSend = (
+	(* Capture text locally before clearing/updateGUI so the value isn't
+	   raced to '' by CodeMirror's change event firing on text:''. Clear
+	   and leaveEditState happen BEFORE updateGUI so the re-render replaces
+	   the already-clean editor rather than a fresh one whose JS visual
+	   keeps isInEditState true. *)
+	| promise <Alien[Promise] | UndefinedObject> text <String> |
+	text:: inputEditor textBeingAccepted.
+	text isEmpty ifTrue: [^self].
+	inputEditor text: ''.
+	inputEditor leaveEditState.
+	updateGUI: [
+		promise:: subject sendText: text.
+	].
+	promise isNil ifTrue: [^self].
+	promise
+		then: [:reply | updateGUI: [subject markComplete]]
+		onError: [:err | updateGUI: [subject markError: err printString]].
+)
+public isKindOfChatInputPresenter ^ <Boolean> = ( ^true )
+isMyKind: other ^ <Boolean> = ( ^other isKindOfChatInputPresenter )
+) : (
+)
+
+public class ChatPresenter onSubject: s = Presenter onSubject: s (
+(*
+ Top-level presenter for a chat conversation. Composes three sub-areas:
+
+   messagesArea  scrollable transcript of prior turns (built from
+                 subject messages — a List of {role. text} pairs).
+   statusFragment  the "thinking" indicator / model picker
+                   (delegated to ChatStatusPresenter so it can refresh
+                   independently of the messages area).
+   inputFragment   the CodeMirror input editor + send wiring
+                   (delegated to ChatInputPresenter).
+
+ Splitting the status and input into their own presenters lets the
+ chat-as-document path in AI_IDE_Support reuse them by stacking
+ dedicated thinking/input ampletes around the document body.
+*)
+) (
+definition = (
+	^column: {
+		helpSection.
+		headingBar.
+		mediumBlank.
+		elastic: messagesArea.
+		mediumBlank.
+		statusFragment.
+		inputFragment.
+	}
+)
+headingBar = (
+	^row: {
+		(label: 'Chat') bold.
+		filler.
+		button: 'Clear' action: [updateGUI: [subject clearHistory]].
+		helpButton.
+		dropDownMenu: [actionsMenu].
+	}
+)
+statusFragment = ( ^ChatStatusPresenter onSubject: subject )
+inputFragment = ( ^ChatInputPresenter onSubject: subject )
+actionsMenu = (
+	^menuWithLabelsAndActions: {
+		{'Inspect Presenter'. [respondToInspectPresenter]}.
+	}
+)
+respondToInspectPresenter = (
+)
+public helpText ^ <Fragment> = (
+	^textDisplay:
+		'Chat with the configured AI provider.
+
+Type a message in the input area at the bottom and submit it to send. The conversation history is shown above; press Clear to start a new conversation.
+
+Just above the input there is a status block: while a request is in flight it shows ''…thinking…''; otherwise it shows the current model with a dropdown to switch. Available models (Anthropic):
+  - Opus 4.7 — most capable; best for hard refactors and multi-step tool use; most expensive and highest latency.
+  - Sonnet 4.6 — balanced default; good for most code lookup and editing.
+  - Haiku 4.5 — fastest and cheapest; best for quick navigation and short questions.
+
+Switching models preserves the conversation history — the next turn just goes to the new model with the full prior transcript as context. The first turn after a switch pays a one-time cache miss for the system prompt (Anthropic''s prompt cache is keyed by model); subsequent turns on the new model cache normally.
+
+The picker is hidden while a request is in flight, to avoid switching in the middle of a tool-use loop.'
+)
+messagesArea = (
+	| fragments <List> |
+	fragments:: List new.
+	subject messages do: [:msg <Array> |
+		fragments add: (messageFragment: msg).
+		fragments add: smallBlank.
+	].
+	subject errorMessage isNil ifFalse: [
+		fragments add: ((label: 'Error: ', subject errorMessage)
+			color: (Color r: 0.8 g: 0 b: 0)).
+	].
+	fragments isEmpty ifTrue: [
+		fragments add: (label: 'Send a message to start a conversation.') italic.
+	].
+	^column: fragments
+)
+public isKindOfChatPresenter ^ <Boolean> = ( ^true )
+isMyKind: other ^ <Boolean> = ( ^other isKindOfChatPresenter )
+messageFragment: msg <Array> = (
+	(* msg is a two-element {role <String>. text <String>} pair, as built
+	   by the provider's displayMessagesFromMessages:. The role determines
+	   the colour and label; the text is rendered with white-space:pre-wrap
+	   so newlines and indentation in code-bearing replies survive. *)
+	| role <String> text <String> labelText <String> bg <String> border <String> fontStyle <String> colors |
+	colors:: outer HopscotchForHTML5 aiColors.
+	role:: msg at: 1.
+	text:: msg at: 2.
+	role = 'user'
+		ifTrue: [
+			labelText:: 'You'.
+			bg:: colors userTurnBackground.
+			border:: colors userTurnBorder.
+			fontStyle:: 'italic'.
+		]
+		ifFalse: [
+			labelText:: 'Assistant'.
+			bg:: colors assistantTurnBackground.
+			border:: colors assistantTurnBorder.
+			fontStyle:: 'normal'.
+		].
+	^html: '<div style="display:flex; flex-direction:row; align-items:flex-start; border:1px solid ', border, '; border-radius:6px; padding:8px 12px; margin:4px 0; background-color:', bg, ';">',
+		'<div style="min-width:5em; max-width:5em; padding-right:1em; text-align:right; flex-shrink:0;"><strong>', labelText, '</strong></div>',
+		'<div style="flex:1; min-width:0;"><span style="white-space:pre-wrap; font-style:', fontStyle, ';">',
+		text,
+		'</span></div></div>'
+)
+) : (
+)
 lazy public voiceController = VoiceController recognizer: (window at: #webkitSpeechRecognition) transcript: transcript editor: currentHopscotchWindow.
-(* Lazy at module level so the expressions defer to first access — at
-   snapshot-creation time the platform's aiAccess isn't yet usable
-   (JS aliens unavailable). *)
-lazy public aiAccess = platform aiAccess.
-lazy public aiChatUI = AIChatUI usingPlatform: platform aiAccess: aiAccess.
+(* aiColors is lazy at module body (lazy syntax isn't allowed in slot
+   blocks). AIColors has no state, so this is just consistency with the
+   other module-body lazy slots — there's no construction-time hazard. *)
+lazy public aiColors = AIColors new.
 public CodeMirror = (
   ^window at: 'CodeMirror'.
 )
@@ -4887,15 +5309,6 @@ addMenuClickListener: menuItem < MenuItem | Symbol> to: entry <Alien[HTMLElement
 )
 public mikeImage = (^images mikeImage)
 
-(* Re-exports of AIChatUI's presenter and subject classes. Going through
-   the lazy aiChatUI slot ensures the AIChatUI module isn't constructed
-   until a caller actually needs one of these classes; the first access
-   forces the lazy slot and resolves to AIChatUI's nested class. *)
-public ChatPresenter         ^ <Class> = ( ^aiChatUI ChatPresenter )
-public ChatInputPresenter    ^ <Class> = ( ^aiChatUI ChatInputPresenter )
-public ChatStatusPresenter   ^ <Class> = ( ^aiChatUI ChatStatusPresenter )
-public ChatSubject           ^ <Class> = ( ^aiChatUI ChatSubject )
-public AIChatSetupPresenter  ^ <Class> = ( ^aiChatUI AIChatSetupPresenter )
-public AIChatSetupSubject    ^ <Class> = ( ^aiChatUI AIChatSetupSubject )
+
 ) : (
 )

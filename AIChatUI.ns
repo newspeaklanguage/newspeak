@@ -21,55 +21,68 @@ class AIChatUI usingPlatform: platform aiAccess: ai = (
 	private Session = ai Session.
 |
 ) (
-public class AIChatSetupSubject onModel: providerClass = Subject onModel: providerClass (
+public class AIChatSetupSubject onModel: providerClass <Class> = Subject onModel: providerClass (
 (*
  Subject for the initial chat setup screen where the user enters
- their API key. The model is a provider class (e.g. AnthropicProvider).
- The class name is used to derive the localStorage key for persisting
- the API key.
+ their API key and chooses a model. The Subject's model is the
+ provider *class* (e.g. AnthropicProvider) — not an instance, since
+ the instance is what startChat will construct from the key+model
+ the user types here. The class name is used to derive a per-provider
+ localStorage key so each provider's key is remembered independently.
 *)
 |
 	public apiKey <String> ::= ''.
 	public modelName <String> ::= 'claude-sonnet-4-6'.
-	public errorMessage <String>
+	public errorMessage <String | UndefinedObject>
 |
-	(* Try to restore API key from localStorage *)
+	(* Best-effort restore of the API key. localStorage may be unavailable
+	   (private browsing, embedded contexts); on any failure we just leave
+	   apiKey as ''. *)
 	[apiKey:: localStorage getItem: storageKey.
 	 apiKey isNil ifTrue: [apiKey:: ''].
 	] on: Error do: [:e | ].
 ) (
 storageKey ^ <String> = (
+	(* Per-provider key so switching between Anthropic and Gemini doesn't
+	   clobber the other's stored API key. *)
 	^'ns_ai_apikey_', model name
 )
-public providerClass = ( ^model )
-public createProvider = (
+public providerClass ^ <Class> = ( ^model )
+public createProvider ^ <Provider> = (
 	^model apiKey: apiKey model: modelName
 )
-public createSession: provider = (
+public createSession: provider <Provider> ^ <Session> = (
 	^Session provider: provider tools: {}
 )
-public startChat ^ <ChatSubject> = (
-	| provider session |
+public startChat ^ <ChatSubject | UndefinedObject> = (
+	(* Validate, persist the key, build a session, and return a ChatSubject
+	   the caller can navigate to. Returns nil (and sets errorMessage) if
+	   the form is incomplete — caller checks for nil before navigating. *)
+	| provider <Provider> session <Session> |
 	apiKey isEmpty ifTrue: [
 		errorMessage:: 'Please enter an API key.'.
 		^nil
 	].
-	(* Persist key for convenience *)
 	[localStorage setItem: storageKey to: apiKey] on: Error do: [:e | ].
 	provider:: createProvider.
 	session:: createSession: provider.
 	^newChatSubjectFor: session
 )
-public newChatSubjectFor: session = (
+public newChatSubjectFor: session <Session> ^ <ChatSubject> = (
 	^ChatSubject onModel: session
 )
 public title ^ <String> = ( ^'AI Chat Setup' )
 public createPresenter = ( ^AIChatSetupPresenter onSubject: self )
-public isKindOfAIChatSetupSubject = ( ^true )
-isMyKind: other = ( ^other isKindOfAIChatSetupSubject )
+public isKindOfAIChatSetupSubject ^ <Boolean> = ( ^true )
+isMyKind: other ^ <Boolean> = ( ^other isKindOfAIChatSetupSubject )
 ) : (
 )
 public class AIChatSetupPresenter onSubject: s = Presenter onSubject: s (
+(*
+ Presenter for the AIChatSetupSubject. Renders the API-key + model entry
+ form, and on submit invokes subject startChat which (if validation
+ passes) returns a ChatSubject we navigate to via enterSubject:.
+*)
 |
 	keyEditor
 	modelEditor
@@ -117,6 +130,8 @@ public helpText ^ <Fragment> = (
 		'Use this page to configure access to an AI provider. Enter your API key in the API Key field. The key is stored in your browser''s localStorage, so you only need to enter it once. Enter the model name in the Model field, then press Start Chat.'
 )
 apiKeyField = (
+	(* Keystroke-sync into the subject so the value survives presenter
+	   refreshes — same pattern as ChatInputPresenter's inputEditor. *)
 	keyEditor:: codeMirror: subject apiKey.
 	keyEditor changeResponse: [:frag |
 		subject apiKey: frag textBeingAccepted.
@@ -135,7 +150,12 @@ errorArea = (
 	^(label: subject errorMessage) color: (Color r: 0.8 g: 0 b: 0).
 )
 respondToStart = (
-	| chatSubject |
+	(* Re-read the editors before delegating to the subject (defensive —
+	   change response should already have synced, but a missed
+	   notification would silently send the previous draft). If startChat
+	   succeeds, navigate to the new ChatSubject; on validation failure it
+	   returns nil and writes errorMessage which the next render shows. *)
+	| chatSubject <ChatSubject | UndefinedObject> |
 	subject apiKey: keyEditor textBeingAccepted.
 	subject modelName: modelEditor textBeingAccepted.
 	updateGUI: [
@@ -145,27 +165,34 @@ respondToStart = (
 		enterSubject: chatSubject.
 	].
 )
-public isKindOfAIChatSetupPresenter = ( ^true )
-isMyKind: other = ( ^other isKindOfAIChatSetupPresenter )
+public isKindOfAIChatSetupPresenter ^ <Boolean> = ( ^true )
+isMyKind: other ^ <Boolean> = ( ^other isKindOfAIChatSetupPresenter )
 ) : (
 )
-public class ChatSubject onModel: s = Subject onModel: s (
+public class ChatSubject onModel: s <Session> = Subject onModel: s (
 (*
- Subject for a chat conversation. The model is an AIAccess Session.
- Exposes the conversation state and handles sending messages.
+ Subject for a chat conversation. The Subject's model is an AIAccess
+ Session, which owns the actual API messages and tool list. ChatSubject
+ layers per-UI state on top: the in-progress draft, the waiting flag
+ (true while a request is in flight, used to swap the status presenter
+ between "…thinking…" and the model picker), and a transient
+ errorMessage shown after a failed turn.
 *)
 |
 	public draft <String> ::= ''.
 	public waiting <Boolean> ::= false.
-	public errorMessage <String>
+	public errorMessage <String | UndefinedObject>
 |
 ) (
-public session = ( ^model )
+public session ^ <Session> = ( ^model )
 public messages ^ <List> = (
 	^session displayMessages
 )
-public sendDraft ^ <Alien[Promise]> = (
-	| text |
+public sendDraft ^ <Alien[Promise] | UndefinedObject> = (
+	(* Legacy path: send whatever is currently in draft. The new input
+	   editor uses sendText: instead (see comment there for why). Kept so
+	   external callers (programmatic chats) can still send-by-draft. *)
+	| text <String> |
 	text:: draft.
 	text isEmpty ifTrue: [^nil].
 	draft:: ''.
@@ -173,7 +200,7 @@ public sendDraft ^ <Alien[Promise]> = (
 	errorMessage:: nil.
 	^session sendMessage: text
 )
-public sendText: text <String> ^ <Alien[Promise]> = (
+public sendText: text <String> ^ <Alien[Promise] | UndefinedObject> = (
 	(* Send a literal text — used by the input editor's accept path so the
 	   send does not depend on subject draft, which could be raced to ''
 	   by CodeMirror's change event when the editor is cleared. *)
@@ -197,11 +224,20 @@ public clearHistory = (
 )
 public title ^ <String> = ( ^'Chat' )
 public createPresenter = ( ^ChatPresenter onSubject: self )
-public isKindOfChatSubject = ( ^true )
-isMyKind: other = ( ^other isKindOfChatSubject )
+public isKindOfChatSubject ^ <Boolean> = ( ^true )
+isMyKind: other ^ <Boolean> = ( ^other isKindOfChatSubject )
 ) : (
 )
-public class ChatStatusPresenter onSubject: s = Presenter onSubject: s () (
+public class ChatStatusPresenter onSubject: s = Presenter onSubject: s (
+(*
+ The status block above the input editor. While a request is in flight
+ (subject waiting = true) shows "…thinking…" and the current model;
+ otherwise shows a model picker dropdown so the user can swap models
+ between turns without losing history. The picker is intentionally
+ hidden mid-flight to avoid switching providers/models inside a
+ tool-use loop.
+*)
+) (
 definition = (
 	subject waiting ifTrue: [
 		^column: {
@@ -211,30 +247,36 @@ definition = (
 	].
 	^modelPicker
 )
-currentModelName = (
-	| provider |
+currentModelName ^ <String> = (
+	| provider <Provider> |
 	provider:: subject session provider.
 	^provider displayNameFor: provider model
 )
 modelPicker = (
-	| provider |
+	| provider <Provider> |
 	provider:: subject session provider.
 	^row: {
 		label: 'Model: ', currentModelName, ' '.
 		dropDownMenu: [
 			menuWithLabelsAndActions:
-				(provider availableModels collect: [:m |
+				(provider availableModels collect: [:m <String> |
 					{provider displayNameFor: m.
 					 [updateGUI: [provider model: m]]}
 				])
 		]
 	}
 )
-public isKindOfChatStatusPresenter = ( ^true )
-isMyKind: other = ( ^other isKindOfChatStatusPresenter )
+public isKindOfChatStatusPresenter ^ <Boolean> = ( ^true )
+isMyKind: other ^ <Boolean> = ( ^other isKindOfChatStatusPresenter )
 ) : (
 )
 public class ChatInputPresenter onSubject: s = Presenter onSubject: s (
+(*
+ The CodeMirror editor below the messages area. On accept (Enter/submit)
+ captures the text, clears the editor, and routes the send through
+ subject sendText: — the Promise resolution updates the waiting flag
+ via markComplete / markError:.
+*)
 |
 	inputEditor
 |
@@ -247,12 +289,12 @@ definition = (
 	^column: { inputEditor }
 )
 respondToSend = (
-	| promise text |
 	(* Capture text locally before clearing/updateGUI so the value isn't
 	   raced to '' by CodeMirror's change event firing on text:''. Clear
 	   and leaveEditState happen BEFORE updateGUI so the re-render replaces
 	   the already-clean editor rather than a fresh one whose JS visual
 	   keeps isInEditState true. *)
+	| promise <Alien[Promise] | UndefinedObject> text <String> |
 	text:: inputEditor textBeingAccepted.
 	text isEmpty ifTrue: [^self].
 	inputEditor text: ''.
@@ -265,11 +307,27 @@ respondToSend = (
 		then: [:reply | updateGUI: [subject markComplete]]
 		onError: [:err | updateGUI: [subject markError: err printString]].
 )
-public isKindOfChatInputPresenter = ( ^true )
-isMyKind: other = ( ^other isKindOfChatInputPresenter )
+public isKindOfChatInputPresenter ^ <Boolean> = ( ^true )
+isMyKind: other ^ <Boolean> = ( ^other isKindOfChatInputPresenter )
 ) : (
 )
-public class ChatPresenter onSubject: s = Presenter onSubject: s () (
+public class ChatPresenter onSubject: s = Presenter onSubject: s (
+(*
+ Top-level presenter for a chat conversation. Composes three sub-areas:
+
+   messagesArea  scrollable transcript of prior turns (built from
+                 subject messages — a List of {role. text} pairs).
+   statusFragment  the "thinking" indicator / model picker
+                   (delegated to ChatStatusPresenter so it can refresh
+                   independently of the messages area).
+   inputFragment   the CodeMirror input editor + send wiring
+                   (delegated to ChatInputPresenter).
+
+ Splitting the status and input into their own presenters lets the
+ chat-as-document path in AI_IDE_Support reuse them by stacking
+ dedicated thinking/input ampletes around the document body.
+*)
+) (
 definition = (
 	^column: {
 		helpSection.
@@ -315,9 +373,9 @@ Switching models preserves the conversation history — the next turn just goes 
 The picker is hidden while a request is in flight, to avoid switching in the middle of a tool-use loop.'
 )
 messagesArea = (
-	| fragments |
+	| fragments <List> |
 	fragments:: List new.
-	subject messages do: [:msg |
+	subject messages do: [:msg <Array> |
 		fragments add: (messageFragment: msg).
 		fragments add: smallBlank.
 	].
@@ -330,10 +388,14 @@ messagesArea = (
 	].
 	^column: fragments
 )
-public isKindOfChatPresenter = ( ^true )
-isMyKind: other = ( ^other isKindOfChatPresenter )
-messageFragment: msg = (
-	| role text labelText bg border fontStyle |
+public isKindOfChatPresenter ^ <Boolean> = ( ^true )
+isMyKind: other ^ <Boolean> = ( ^other isKindOfChatPresenter )
+messageFragment: msg <Array> = (
+	(* msg is a two-element {role <String>. text <String>} pair, as built
+	   by the provider's displayMessagesFromMessages:. The role determines
+	   the colour and label; the text is rendered with white-space:pre-wrap
+	   so newlines and indentation in code-bearing replies survive. *)
+	| role <String> text <String> labelText <String> bg <String> border <String> fontStyle <String> |
 	role:: msg at: 1.
 	text:: msg at: 2.
 	role = 'user'
@@ -357,11 +419,14 @@ messageFragment: msg = (
 )
 ) : (
 )
-public assistantTurnBackground = ( ^'#edf2ee' )
-public userTurnBorder = ( ^'#b8d4ec' )
-public userTurnBackground = ( ^'#eef4fb' )
-public assistantTurnBorder = ( ^'#b0c8b4' )
-public errorTurnBackground = ( ^'#fdecea' )
-public errorTurnBorder = ( ^'#d68682' )
+(* Shared colour palette for the user/assistant/error turn bubbles —
+   both the inline ChatPresenter and the chat-as-document path in
+   AI_IDE_Support read these so the two views stay visually consistent. *)
+public assistantTurnBackground ^ <String> = ( ^'#edf2ee' )
+public userTurnBorder ^ <String> = ( ^'#b8d4ec' )
+public userTurnBackground ^ <String> = ( ^'#eef4fb' )
+public assistantTurnBorder ^ <String> = ( ^'#b0c8b4' )
+public errorTurnBackground ^ <String> = ( ^'#fdecea' )
+public errorTurnBorder ^ <String> = ( ^'#d68682' )
 ) : (
 )

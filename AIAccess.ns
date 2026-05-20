@@ -79,7 +79,9 @@ public class Provider = (
  Tool-use support is optional. Providers that don't translate tools
  inherit hasToolUse: ^false and the tool-loop is skipped. Providers
  that do support tools also implement toolUseBlocksFrom:,
- makeToolResult:content:isError:, and buildToolsPayload:.
+ makeToolResult:content:isError:, buildToolsPayload:, and
+ addToolResults:toMessages: (which wraps a list of tool-result
+ blocks/parts into a user-role message in the provider's native shape).
 *)
 ) (
 public complete: messages <Alien[Array]>
@@ -160,16 +162,50 @@ public buildToolsPayload: toolDefs <List[Tool]> ^ <Alien | UndefinedObject> = (
 	   Default: nil. *)
 	^nil
 )
+public addToolResults: results <Alien[Array]> toMessages: messages <List> = (
+	(* Wrap a list of tool-result blocks/parts (each produced by
+	   makeToolResult:content:isError:) into a single user-role message in
+	   the provider's native shape, and append to messages. Called once
+	   per tool-loop round, after every executeToolCall: promise has
+	   resolved. Providers that support tool use must implement;
+	   tool-less providers never reach this path (hasToolUse: defaults to
+	   false). *)
+	subclassResponsibility
+)
 safeAt: receiver <Object> field: field <String | Integer> = (
-	(* Defensive JS field access. JS `undefined` USUALLY maps to Newspeak
-	   `nil` in primordialsoup's alien bridge, but not in every edge case
-	   (e.g. some object shapes where the at: dispatch raises rather than
-	   returns nil). Wrap every field access on response-tree nodes in
-	   this so a deviant shape produces nil rather than blowing up the
-	   chat session. Returns nil for missing fields or non-respondent
-	   receivers; otherwise returns the field value. *)
+	(* Defensive JS field access for *structural navigation*. JS
+	   `undefined` USUALLY maps to Newspeak `nil` in primordialsoup's
+	   alien bridge, but not in every edge case (e.g. some object
+	   shapes where the at: dispatch raises rather than returns nil).
+	   Wrap every field access on response-tree nodes in this so a
+	   deviant shape produces nil rather than blowing up the chat
+	   session. Returns nil for missing fields or non-respondent
+	   receivers; otherwise returns the field value AS-IS — which may
+	   still be JS undefined for callers that read scalar leaves
+	   directly. For those, use safeStringAt:field: instead. *)
 	receiver isNil ifTrue: [^nil].
 	^[receiver at: field] on: Exception do: [:e | nil]
+)
+safeStringAt: receiver <Object> field: field <String | Integer> ^ <String | UndefinedObject> = (
+	(* Defensive String-field access. Like safeAt: but additionally
+	   filters out JS undefined / null / non-String values that the
+	   alien bridge sometimes passes through as values which fail
+	   isNil. Returns nil if the field is missing or not a String,
+	   otherwise the String value.
+
+	   Mechanism: a real String concatenated with the empty String
+	   returns itself. Anything else (JS undefined, JS null, numbers,
+	   objects) raises on `,` and is normalised to nil. Cheap, single
+	   alien round-trip, no type-class guessing.
+
+	   Use this at every leaf where you read a string field from an
+	   alien (response.parts[i].text, tool name, etc.) and intend to
+	   use it in a String context. *)
+	| v |
+	receiver isNil ifTrue: [^nil].
+	v:: [receiver at: field] on: Exception do: [:e | nil].
+	v isNil ifTrue: [^nil].
+	^[v , ''] on: Exception do: [:e | nil]
 )
 ) : (
 )
@@ -274,7 +310,7 @@ public complete: messages <Alien[Array]>
 				]
 				ifFalse: [response json]
 		] on: Exception do: [:e |
-			(global at: 'Promise') reject: ('Anthropic provider error: ', e messageText)
+			(global at: 'Promise') reject: ('Anthropic provider error: ', (errorDescription: e))
 		]
 	]
 )
@@ -311,8 +347,9 @@ public messagesAsRequestPayload: messages <List> ^ <Alien[Array]> = (
 )
 public extractTextFromResponse: response <Alien> ^ <String> = (
 	(* Concatenate text from all 'text' blocks in the content array.
-	   Every JS access goes through safeAt:field: so a malformed
-	   response yields '' rather than raising into the user's chat. *)
+	   Every JS access goes through safeAt:/safeStringAt: so a
+	   malformed response — including one with JS undefined leaves —
+	   yields '' rather than raising into the user's chat. *)
 	| content len result <String> text |
 	content:: safeAt: response field: 'content'.
 	len:: safeAt: content field: 'length'.
@@ -321,8 +358,8 @@ public extractTextFromResponse: response <Alien> ^ <String> = (
 	0 to: len - 1 do: [:i <Integer> |
 		| block |
 		block:: safeAt: content field: i.
-		((safeAt: block field: 'type') = 'text') ifTrue: [
-			text:: safeAt: block field: 'text'.
+		((safeStringAt: block field: 'type') = 'text') ifTrue: [
+			text:: safeStringAt: block field: 'text'.
 			text isNil ifFalse: [result:: result, text]
 		]
 	].
@@ -330,12 +367,15 @@ public extractTextFromResponse: response <Alien> ^ <String> = (
 )
 public displayMessagesFromMessages: messages <List> ^ <List> = (
 	(* Walks apiMessages — entries we constructed ourselves via
-	   addUserText: / appendAssistantResponse: / the tool loop, so plain
-	   at: is safe; no safeAt: defence needed here.
+	   addUserText: / appendAssistantResponse: / the tool loop. We still
+	   use safeStringAt: at scalar leaves because the assistant message's
+	   content array carries blocks we got from the API, which can
+	   include non-text blocks (tool_use, future block types) whose
+	   'text' is JS undefined; isNil doesn't catch undefined.
 
 	   For user entries with array content (tool_result messages), skip:
 	   they're not for the human reader. For assistant entries, gather
-	   only 'text' blocks — tool_use blocks aren't displayable text. *)
+	   only 'text' blocks. *)
 	| result <List> |
 	result:: List new.
 	messages do: [:msg <Alien> |
@@ -348,13 +388,17 @@ public displayMessagesFromMessages: messages <List> ^ <List> = (
 			]
 		].
 		role = 'assistant' ifTrue: [
-			| text <String> |
+			| text <String> len |
 			text:: ''.
-			0 to: (content at: 'length') - 1 do: [:i <Integer> |
-				| block <Alien> |
-				block:: content at: i.
-				(block at: 'type') = 'text' ifTrue: [
-					text:: text, (block at: 'text')
+			len:: safeAt: content field: 'length'.
+			len isNil ifFalse: [
+				0 to: len - 1 do: [:i <Integer> |
+					| block t |
+					block:: safeAt: content field: i.
+					(safeStringAt: block field: 'type') = 'text' ifTrue: [
+						t:: safeStringAt: block field: 'text'.
+						t isNil ifFalse: [text:: text, t]
+					]
 				]
 			].
 			text isEmpty ifFalse: [
@@ -379,7 +423,7 @@ public toolUseBlocksFrom: response <Alien> ^ <List> = (
 	0 to: len - 1 do: [:i <Integer> |
 		| block |
 		block:: safeAt: content field: i.
-		((safeAt: block field: 'type') = 'tool_use') ifTrue: [blocks add: block]
+		((safeStringAt: block field: 'type') = 'tool_use') ifTrue: [blocks add: block]
 	].
 	^blocks
 )
@@ -412,6 +456,15 @@ public buildToolsPayload: toolDefs <List[Tool]> ^ <Alien[Array] | UndefinedObjec
 		arr push: obj
 	].
 	^arr
+)
+public addToolResults: results <Alien[Array]> toMessages: messages <List> = (
+	(* Anthropic carries the round's tool_result blocks inside a single
+	   user-role message whose content is the array of blocks. *)
+	| msg <Alien> |
+	msg:: createJSObject.
+	msg at: 'role' put: 'user'.
+	msg at: 'content' put: results.
+	messages add: msg
 )
 ) : (
 )
@@ -446,24 +499,43 @@ public class Session provider: p <Provider> tools: toolList <List[Tool]> = (
 	toolList do: [:t <Tool> | toolMap at: t name put: t].
 ) (
 executeToolCall: toolUseBlock <Alien> ^ <Alien[Promise]> = (
-	(* Resolve a tool_use block to a tool_result promise. The toolUseBlock
-	   here is the Anthropic-shaped block from toolUseBlocksFrom:; only
-	   Anthropic enters this path today (GeminiProvider's hasToolUse: is
-	   false). The tool_result is constructed via the provider so its
-	   wire shape stays provider-native.
+	(* Resolve a tool-use block to a tool-result promise. The toolUseBlock
+	   is whatever toolUseBlocksFrom: returned for this provider — by
+	   contract it has 'id', 'name', 'input' top-level fields (Anthropic's
+	   native tool_use block shape; GeminiProvider builds shim objects
+	   with the same surface). The tool_result is constructed via the
+	   provider so its wire shape stays provider-native.
 
 	   Tool handlers may return either a synchronous value or an
 	   Alien[Promise]; both are normalized to a Promise here. Errors at
 	   any point (unknown tool, handler raise, handler-returned promise
 	   rejection) produce an is_error tool_result that the AI sees on
 	   the next turn — rather than a silent chat hang. *)
-	| toolName <String> input <Alien> tool <Tool | UndefinedObject> id <String> resultOrPromise |
-	id:: toolUseBlock at: 'id'.
-	toolName:: toolUseBlock at: 'name'.
-	input:: toolUseBlock at: 'input'.
+	| toolName <String | UndefinedObject> input <Alien> tool <Tool | UndefinedObject>
+	  id <String | UndefinedObject> resultOrPromise stage <String> safeId <String> |
+	stage:: 'read id'.
+	[
+		id:: toolUseBlock at: 'id'.
+		stage:: 'read name'.
+		toolName:: toolUseBlock at: 'name'.
+		stage:: 'read input'.
+		input:: toolUseBlock at: 'input'.
+	] on: Exception do: [:e |
+		| dump |
+		dump:: [JSON stringify: toolUseBlock] on: Exception do: [:e2 | '(unstringifiable)'].
+		^(global at: 'Promise') reject:
+			'[executeToolCall stage: ', stage, '] ', (errorDescription: e), ' | block: ', dump
+	].
+	safeId:: id isNil ifTrue: ['(no id)'] ifFalse: [id].
+	toolName isNil ifTrue: [
+		| dump |
+		dump:: [JSON stringify: toolUseBlock] on: Exception do: [:e2 | '(unstringifiable)'].
+		^(global at: 'Promise') reject:
+			'Tool call missing name field | block: ', dump
+	].
 	tool:: toolMap at: toolName ifAbsent: [
 		^Promise resolve: (provider
-			makeToolResult: id
+			makeToolResult: safeId
 			content: 'Unknown tool: ', toolName
 			isError: true)
 	].
@@ -528,39 +600,60 @@ completeWithToolLoop ^ <Alien[Promise]> = (
 		tools: (provider buildToolsPayload: toolDefs)
 		maxTokens: maxTokens
 	) then: [:response |
+		| stage <String> |
+		stage:: 'start of then'.
 		[
+			stage:: 'appendAssistantResponse:'.
 			provider appendAssistantResponse: response toMessages: apiMessages.
 
+			stage:: 'hasToolUse:'.
 			(provider hasToolUse: response)
 				ifTrue: [
 					| toolBlocks <List> promises <Alien[Array]> |
+					stage:: 'toolUseBlocksFrom:'.
 					toolBlocks:: provider toolUseBlocksFrom: response.
 					promises:: createJSArray.
+					stage:: 'executeToolCall: dispatch'.
 					toolBlocks do: [:tb <Alien> | promises push: (executeToolCall: tb)].
-					(* Await all tool results, then recurse to send them
-					   back. The tool_result message itself is still
-					   Anthropic-shaped (role: 'user', content: array of
-					   tool_result blocks) — only Anthropic ever takes
-					   this branch, so the shape is OK here. When Gemini
-					   tool support arrives, this assembly should move
-					   behind a provider method. *)
+					(* Await all tool results, then hand them to the
+					   provider to wrap into a user-role message in its
+					   native shape (Anthropic: content array of
+					   tool_result blocks; Gemini: parts array of
+					   functionResponse parts), then recurse to send
+					   them back to the model. *)
+					stage:: 'Promise.all then'.
 					(Promise all: promises) then: [:results <Alien[Array]> |
-						| toolResultMsg <Alien> |
-						toolResultMsg:: createJSObject.
-						toolResultMsg at: 'role' put: 'user'.
-						toolResultMsg at: 'content' put: results.
-						apiMessages add: toolResultMsg.
-						notifyUpdate.
-						completeWithToolLoop
+						| innerStage <String> |
+						innerStage:: 'addToolResults:toMessages:'.
+						[
+							provider addToolResults: results toMessages: apiMessages.
+							notifyUpdate.
+							innerStage:: 'recursive completeWithToolLoop'.
+							completeWithToolLoop
+						] on: Exception do: [:e |
+							notifyUpdate.
+							(global at: 'Promise') reject: ('[stage: ', innerStage, '] ', (errorDescription: e))
+						]
 					]
 				]
 				ifFalse: [
+					stage:: 'notifyUpdate (no tool use)'.
 					notifyUpdate.
+					stage:: 'extractTextFromResponse:'.
 					provider extractTextFromResponse: response
 				]
 		] on: Exception do: [:e |
+			| dump |
 			notifyUpdate.
-			(global at: 'Promise') reject: e messageText
+			(* Include the raw provider response in the rejection. This is
+			   the single most useful piece of context when something goes
+			   wrong — protocol drift, vendor returning a new part shape,
+			   or a freshly added provider following the recipe — and it
+			   lets the user paste the chat error verbatim into a bug
+			   report instead of us having to instrument fresh diagnostic
+			   code each time the AI says something unexpected. *)
+			dump:: [JSON stringify: response] on: Exception do: [:e2 | '(unstringifiable response)'].
+			(global at: 'Promise') reject: ('[stage: ', stage, '] ', (errorDescription: e), ' | response: ', dump)
 		]
 	]
 )
@@ -610,9 +703,23 @@ public class GeminiProvider apiKey: key <String> model: mdl <String> = Provider 
  appendAssistantResponse: and extractTextFromResponse: navigate it
  directly via safeAt:.
 
- Tool calls (Gemini function-calling) are not yet translated;
- hasToolUse: inherits the Provider default of false, so the Session's
- tool loop is bypassed for Gemini sessions.
+ Tool calls (Gemini function-calling) are translated to and from
+ Anthropic's tool-block surface so Session.completeWithToolLoop works
+ uniformly across providers:
+
+   - Outgoing: buildToolsPayload: wraps the IDE's Tool list as
+     [{functionDeclarations: [...]}]. Gemini's declaration shape uses
+     'parameters' rather than Anthropic's 'input_schema'.
+   - Incoming functionCall parts: toolUseBlocksFrom: builds shim JS
+     objects with 'id', 'name', 'input' top-level fields so the
+     Session can dispatch them with no Gemini-specific path. Gemini
+     does not issue tool-call ids of its own, so we synthesise one
+     ('gem-N') per call and stash the call's name in pendingCallNames
+     so makeToolResult: can recover it. The map is replaced (not
+     accumulated) at the start of each tool-loop round.
+   - Outgoing tool results: makeToolResult: builds a functionResponse
+     part; addToolResults:toMessages: wraps the round's parts into a
+     user-role message ({role: 'user', parts: [...]}).
 
  Quirks:
    - Free-tier accounts hit aggressive rate limiting (429s).
@@ -622,6 +729,8 @@ public class GeminiProvider apiKey: key <String> model: mdl <String> = Provider 
 |
 	public apiKey <String> ::= key.
 	public model <String> ::= mdl.
+	private toolCallCounter <Integer> ::= 0.
+	private pendingCallNames <Map[String, String]> ::= Map new.
 |
 ) (
 public availableModels ^ <List[String]> = (
@@ -707,34 +816,165 @@ public extractTextFromResponse: response <Alien> ^ <String> = (
 	0 to: plen - 1 do: [:i <Integer> |
 		| part |
 		part:: safeAt: parts field: i.
-		text:: safeAt: part field: 'text'.
+		text:: safeStringAt: part field: 'text'.
 		text isNil ifFalse: [result:: result, text]
 	].
 	^result
 )
 public displayMessagesFromMessages: messages <List> ^ <List> = (
 	(* Walks apiMessages — entries we constructed ourselves via
-	   addUserText: / appendAssistantResponse:, so plain at: is safe.
-	   Individual parts may still have no text (future thinking parts,
-	   function calls), so we guard the t-isNil case below. *)
+	   addUserText: / appendAssistantResponse: / addToolResults:.
+	   functionCall parts (assistant side, after tool use) and
+	   functionResponse parts (user side, tool-result messages) carry no
+	   text. safeStringAt: guarantees we get nil-or-real-String, never
+	   JS undefined (which sneaks past isNil and crashes String concat). *)
 	| result <List> |
 	result:: List new.
 	messages do: [:msg <Alien> |
-		| role <String> displayRole <String> parts <Alien[Array]> text <String> |
+		| role <String> displayRole <String> parts <Alien[Array]> text <String> plen |
 		role:: msg at: 'role'.
 		displayRole:: role = 'model' ifTrue: ['assistant'] ifFalse: [role].
 		parts:: msg at: 'parts'.
 		text:: ''.
-		0 to: (parts at: 'length') - 1 do: [:i <Integer> |
-			| t |
-			t:: (parts at: i) at: 'text'.
-			t isNil ifFalse: [text:: text, t]
+		plen:: safeAt: parts field: 'length'.
+		plen isNil ifFalse: [
+			0 to: plen - 1 do: [:i <Integer> |
+				| t |
+				t:: safeStringAt: (safeAt: parts field: i) field: 'text'.
+				t isNil ifFalse: [text:: text, t]
+			]
 		].
 		text isEmpty ifFalse: [
 			result add: {displayRole. text}
 		]
 	].
 	^result
+)
+responsePartsOf: response <Alien> ^ <Alien | UndefinedObject> = (
+	(* Pull candidates[0].content.parts defensively. Used by hasToolUse:
+	   and toolUseBlocksFrom: to find functionCall parts. Returns nil if
+	   any level is missing or malformed. *)
+	| candidates firstCandidate firstContent |
+	candidates:: safeAt: response field: 'candidates'.
+	firstCandidate:: safeAt: candidates field: 0.
+	firstContent:: safeAt: firstCandidate field: 'content'.
+	^safeAt: firstContent field: 'parts'
+)
+public hasToolUse: response <Alien> ^ <Boolean> = (
+	(* True if any part in the assistant's response is a functionCall.
+	   Gemini does not set a tool-use-specific stop_reason; the only
+	   reliable signal is a functionCall part with a non-nil name.
+
+	   Gate on functionCall.name rather than on functionCall itself.
+	   Reason: on text-only parts, safeAt: of the missing 'functionCall'
+	   field may yield JS undefined rather than Newspeak nil (the alien
+	   bridge isn't uniform here — see safeAt:'s docstring), and
+	   `undefined isNil` is false, so a functionCall isNil ifFalse:
+	   guard incorrectly admits text parts. The two-step safeAt: chain
+	   ending in 'name' is reliable because safeAt: short-circuits on
+	   nil receivers, and only a real functionCall has a name. *)
+	| parts plen result |
+	parts:: responsePartsOf: response.
+	plen:: safeAt: parts field: 'length'.
+	plen isNil ifTrue: [^false].
+	result:: false.
+	0 to: plen - 1 do: [:i <Integer> |
+		| name |
+		name:: safeStringAt: (safeAt: (safeAt: parts field: i) field: 'functionCall') field: 'name'.
+		name isNil ifFalse: [result:: true]
+	].
+	^result
+)
+public toolUseBlocksFrom: response <Alien> ^ <List> = (
+	(* Collect every functionCall part as a shim JS object that exposes
+	   'id', 'name', 'input' at the top level — matching Anthropic's
+	   tool_use block surface so Session.executeToolCall: needs no
+	   provider-specific path. Synthesise an opaque id per call and
+	   remember it under pendingCallNames so makeToolResult: can recover
+	   the function name (Gemini matches function responses to calls by
+	   name, not id; the id is purely a Session-side handle). The map
+	   is reset here so previous-round entries don't accumulate. *)
+	| parts plen blocks |
+	pendingCallNames:: Map new.
+	blocks:: List new.
+	parts:: responsePartsOf: response.
+	plen:: safeAt: parts field: 'length'.
+	plen isNil ifTrue: [^blocks].
+	0 to: plen - 1 do: [:i <Integer> |
+		| part fc name args id shim |
+		part:: safeAt: parts field: i.
+		fc:: safeAt: part field: 'functionCall'.
+		name:: safeStringAt: fc field: 'name'.
+		(* Gate on a non-nil name, not on fc — see hasToolUse: rationale.
+		   On text parts the missing functionCall surfaces as JS
+		   undefined that fails isNil, so a `fc isNil ifFalse:` guard
+		   would let text parts through and produce malformed shims. *)
+		name isNil ifFalse: [
+			args:: safeAt: fc field: 'args'.
+			args isNil ifTrue: [args:: createJSObject].
+			toolCallCounter:: toolCallCounter + 1.
+			id:: 'gem-', toolCallCounter printString.
+			pendingCallNames at: id put: name.
+			shim:: createJSObject.
+			shim at: 'id' put: id.
+			shim at: 'name' put: name.
+			shim at: 'input' put: args.
+			blocks add: shim
+		]
+	].
+	^blocks
+)
+public makeToolResult: id <String> content: text isError: err <Boolean> ^ <Alien> = (
+	(* Build a Gemini functionResponse part. Gemini has no standard
+	   is_error flag; convention is to put the failure text under
+	   'error' instead of 'result' in the response payload so the model
+	   sees the distinction. The function name is recovered from
+	   pendingCallNames; if the id is missing (shouldn't happen in
+	   normal flow) we fall back to 'unknown' so the response still
+	   carries useful diagnostics. *)
+	| name part funcResp respBody |
+	name:: pendingCallNames at: id ifAbsent: ['unknown'].
+	respBody:: createJSObject.
+	err
+		ifTrue: [respBody at: 'error' put: text]
+		ifFalse: [respBody at: 'result' put: text].
+	funcResp:: createJSObject.
+	funcResp at: 'name' put: name.
+	funcResp at: 'response' put: respBody.
+	part:: createJSObject.
+	part at: 'functionResponse' put: funcResp.
+	^part
+)
+public buildToolsPayload: toolDefs <List[Tool]> ^ <Alien[Array] | UndefinedObject> = (
+	(* Gemini's tools field shape: [{functionDeclarations: [...]}].
+	   Each declaration uses 'parameters' for its JSON Schema rather
+	   than Anthropic's 'input_schema'. Returns nil if no tools, so the
+	   request body's 'tools' field is omitted. *)
+	| arr declarations toolEntry |
+	toolDefs isEmpty ifTrue: [^nil].
+	declarations:: createJSArray.
+	toolDefs do: [:t <Tool> |
+		| decl |
+		decl:: createJSObject.
+		decl at: 'name' put: t name.
+		decl at: 'description' put: t description.
+		decl at: 'parameters' put: (JSON parse: t inputSchema).
+		declarations push: decl
+	].
+	toolEntry:: createJSObject.
+	toolEntry at: 'functionDeclarations' put: declarations.
+	arr:: createJSArray.
+	arr push: toolEntry.
+	^arr
+)
+public addToolResults: results <Alien[Array]> toMessages: messages <List> = (
+	(* Gemini carries the round's functionResponse parts inside a single
+	   user-role message whose 'parts' is the array of parts. *)
+	| msg <Alien> |
+	msg:: createJSObject.
+	msg at: 'role' put: 'user'.
+	msg at: 'parts' put: results.
+	messages add: msg
 )
 public complete: messages <Alien[Array]>
 system: systemPrompt <String>
@@ -748,11 +988,13 @@ maxTokens: maxTokens <Integer>
 	   since a safety block is a real model decision, not a transient. *)
 	^attemptComplete: messages
 		system: systemPrompt
+		tools: tools
 		maxTokens: maxTokens
 		triesLeft: 3
 )
 attemptComplete: messages <Alien[Array]>
 system: systemPrompt <String>
+tools: tools <Alien[Array] | UndefinedObject>
 maxTokens: maxTokens <Integer>
 triesLeft: triesLeft <Integer>
 ^ <Alien[Promise]> = (
@@ -761,13 +1003,14 @@ triesLeft: triesLeft <Integer>
 	   so the outer Promise still resolves to the eventual response (or
 	   the last empty one, when retries are exhausted — at which point
 	   appendAssistantResponse: will raise via missingFieldError:). *)
-	^(doRequest: messages system: systemPrompt maxTokens: maxTokens) then: [:response <Alien> |
+	^(doRequest: messages system: systemPrompt tools: tools maxTokens: maxTokens) then: [:response <Alien> |
 		| candidates |
 		candidates:: safeAt: response field: 'candidates'.
 		(candidates isNil and: [triesLeft > 1])
 			ifTrue: [
 				attemptComplete: messages
 					system: systemPrompt
+					tools: tools
 					maxTokens: maxTokens
 					triesLeft: triesLeft - 1
 			]
@@ -776,6 +1019,7 @@ triesLeft: triesLeft <Integer>
 )
 doRequest: messages <Alien[Array]>
 system: systemPrompt <String>
+tools: tools <Alien[Array] | UndefinedObject>
 maxTokens: maxTokens <Integer>
 ^ <Alien[Promise]> = (
 	(* Build the request body, POST to Gemini, return a Promise that
@@ -796,8 +1040,11 @@ maxTokens: maxTokens <Integer>
 		sysInst at: 'parts' put: sysParts.
 		body at: 'systemInstruction' put: sysInst
 	].
-	(* tools intentionally ignored — Gemini function-calling not yet
-	   translated. buildToolsPayload: returns nil so we never see tools. *)
+	tools isNil ifFalse: [
+		(tools at: 'length') > 0 ifTrue: [
+			body at: 'tools' put: tools
+		]
+	].
 
 	apiUrl:: 'https://generativelanguage.googleapis.com/v1beta/models/',
 		model, ':generateContent'.
@@ -839,7 +1086,7 @@ maxTokens: maxTokens <Integer>
 			(* Backstop: any raise from inside the then-block (e.g. unexpected
 			   MNU) becomes a JS-side rejection, never a non-local unwind
 			   through the bridge. *)
-			(global at: 'Promise') reject: ('Gemini provider error: ', e messageText)
+			(global at: 'Promise') reject: ('Gemini provider error: ', (errorDescription: e))
 		]
 	]
 )
@@ -869,6 +1116,29 @@ createJSArray ^ <Alien> = (
 	   arrays in provider request bodies. *)
 	^JSON parse: '[]'
 )
+errorDescription: e <Exception> ^ <String> = (
+	(* Defensive non-nil String description of an exception for
+	   error reporting that crosses a String boundary — Promise.reject:
+	   and markError: both blow up or surface as 'nil' if the
+	   exception's messageText is nil.
+
+	   Order:
+	     1. e messageText if non-nil (the author's intent).
+	     2. e class name printString — at least the kind of error.
+	     3. e printString — last-ditch.
+	     4. '<unprintable exception>' if even printString raises.
+
+	   Each step is wrapped so an alien-bridge or method-lookup hiccup
+	   at any layer doesn't sink the whole error path. *)
+	^[
+		| mt |
+		mt:: [e messageText] on: Exception do: [:e2 | nil].
+		mt isNil
+			ifTrue: [[e class name printString] on: Exception do: [:e2 |
+				[e printString] on: Exception do: [:e3 | '<unprintable exception>']]]
+			ifFalse: [mt]
+	] on: Exception do: [:e4 | '<unprintable exception>']
+)
 public webFetch: url <String> ^ <Alien[Promise]> = (
 	(* Generic GET helper exposed to tools (web_fetch). Returns a Promise
 	   that resolves to the response body as a String, or rejects with a
@@ -896,7 +1166,7 @@ public webFetch: url <String> ^ <Alien[Promise]> = (
 				]
 				ifFalse: [response text]
 		] on: Exception do: [:e |
-			(global at: 'Promise') reject: ('webFetch error: ', e messageText)
+			(global at: 'Promise') reject: ('webFetch error: ', (errorDescription: e))
 		]
 	]
 )

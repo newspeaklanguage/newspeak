@@ -2,35 +2,28 @@ Newspeak3
 'MemoryHole'
 class VCSNewspeakSourceMirrors usingPlatform: p vcs: vcs ide: ide = (
 (*
-Web port — phase 1.
+Web port.
 
-p mirrors grammar TypedNS3Grammar may or may not be exposed in the
-web mirrors API — the original comment ("This import is cheating")
-flagged it as fragile in 2011. Left as-is for now; if the web
-mirrors module doesn't expose it the slot will fail at module-load,
-and we'll need to either expose it or use a different parser.
+TypedNS3Grammar comes from the IDE's grammar accessor, mirroring
+how Root is fetched via ide namespacing. The original Squeak code
+reached through p mirrors grammar; the primordialsoup mirrors
+module doesn't expose the grammar, but the IDE module already
+constructs a NewspeakGrammar instance for its own use.
 
-imageMirrorCache nilled out (Squeak perf cache, see VCSSourceMirrors
-notes).
+imageMirrorCache is replaced by InMemoryMirrorCache (defined below),
+a minimal substitute for the Squeak-image-backed perf cache.
 *)
 |
-	(* This import is cheating. The mature mirrors API won't make it available. *)
-	(* Web port — confirmed: `p mirrors grammar` MNUs against the
-	   primordialsoup MirrorsForPrimordialSoup module. Stubbed nil.
-	   SourceMirrorParser (which inherits from this) is only ever
-	   instantiated via MirrorCache, and MirrorCache is itself a
-	   lazy slot (see below), so the nil here is harmless for module
-	   load. Phase 2 will either expose the grammar from the web
-	   mirrors module or use a different parser. *)
-	private TypedNS3Grammar = nil.
+	private TypedNS3Grammar = ide grammar TypedNS3Grammar.
 
 	private mirrors = p mirrors.
 	private ClassMirror = p mirrors ClassMirror.
 	private ClassDeclarationBuilder = p mirrors ClassDeclarationBuilder.
 	private List = p collections List.
+	private Map = p collections Map.
 	private Root = ide namespacing Root.
 
-	private imageMirrorCache = nil.
+	private imageMirrorCache = InMemoryMirrorCache new.
 
 	(* vcs captured for the lazy cross-module bindings below — see
 	   VCSLib / VCSCore / VCSSourceMirrors for rationale. The original
@@ -176,23 +169,32 @@ public streamTo: stream = (
 )
 ) : (
 )
-class MirrorCache onSelector: selector = (
-(* Keeps a map of string -> mirror *)
+class MirrorCache cacheKey: selector productionFromParser: parserBlock = (
+(* Keeps a map of string -> mirror.
+
+   The original Squeak code did `parser perform: selector` to fetch
+   the production accessor by symbol. primordialsoup doesn't put
+   perform: on ordinary objects — only on mirrors — so callers now
+   pass a block that resolves the production given the parser. The
+   selector is still kept as a cache key. *)
 |
-(* Keep the actual dictionaries in VCS(ImageMirror)Caching, so it can be reused over multiple instances *)
 cachedMirrors = imageMirrorCache stringToMirrorCacheForProduction: selector.
 parser = SourceMirrorParser new.
-production = parser perform: selector.
+production = parserBlock value: parser.
 |) (
 public clear = (
 	cachedMirrors keysAndValuesRemove: [:k :v | true].
 )
 public mirrorForStream: stream = (
-	^mirrorForStream: stream ifError: [:pos :msg | Error signal]
+	^mirrorForString: stream contents
 )
 public mirrorForStream: stream ifError: errorBlock = (
-	| string |
-	string:: stream contents.
+	^mirrorForString: stream contents ifError: errorBlock
+)
+public mirrorForString: string = (
+	^mirrorForString: string ifError: [:pos :msg | Error signal: msg]
+)
+public mirrorForString: string ifError: errorBlock = (
 	^cachedMirrors at: string ifAbsentPut:
 		[parser input: string.
 		 production parseString: string ifError: errorBlock]
@@ -286,7 +288,9 @@ classDecl = ( (* WIP *)
 	              inheritanceListAndOrBody). *)
 	#BOGUS yourself.
 	^super classDecl wrapper:
-		[:am <Token> :classKwd <Token> :ident <Token> :msgOrEmpty <AnnotatedSourceReference> :eq <Token> :iListAndOrBody |
+		[:am <Token> :classKwd <Token> :ident <Token> :typeParams :msgOrEmpty <AnnotatedSourceReference> :eq <Token> :iListAndOrBody |
+		(* typeParams is the result of typeParameterDecl opt, present in
+		   the current grammar. Not yet used by source mirrors. *)
 		|
 		bodyOrDot
 		body <{Token. String. AnnotatedSourceReference.  List. Token. AnnotatedSourceReference. AnnotatedSourceReference}>
@@ -300,7 +304,7 @@ classDecl = ( (* WIP *)
 
 		klassName:: ident value asSymbol.
 
-		iListAndOrBody isCollection
+		iListAndOrBody isKindOfCollection
 				ifFalse: [
 					bodyOrDot:: iListAndOrBody children at: 2.
 				]
@@ -471,17 +475,10 @@ Copyright 2008 Cadence Design Systems, Inc.
 	input <PositionableStream> = i.
 |) (
 public contents ^ <String> = (
-	input isStream ifTrue:
-		[(* This convolution deals with UTF-8.  The problem is that stream
-		   positions are byte positions, /not/ character positions. *)
-		| cs c p |
-		cs:: WriteStream on: (input originalContents species new: end - start + 1).
-		p:: input position.
-		[input position: start - 1.
-		 [input position < end] whileTrue:
-			[cs nextPut: input next]]
-			ensure: [input position: p].
-		^cs contents].
+	(* input is always a String in the web port; mirrorForString: is the
+	   only entry point that constructs SourceReferences. The Squeak
+	   stream-handling branch (UTF-8 byte-position aware) was dropped
+	   along with the rest of the stream-dependent paths. *)
 	^input copyFrom: start to: end
 )
 public printOn: aStream <Stream> = (
@@ -490,7 +487,7 @@ public printOn: aStream <Stream> = (
 )
 ) : (
 public firstNode: node = (
-	node isCollection
+	node isKindOfCollection
 		ifTrue: [
 			node do: [:each | (firstNode: each)
 								ifNotNil: [:it | ^it]].
@@ -498,7 +495,7 @@ public firstNode: node = (
 		ifFalse: [^ node]
 )
 public lastNode: node = (
-	node isCollection
+	node isKindOfCollection
 		ifTrue: [
 			node reverse do: [:each | (lastNode: each)
 								ifNotNil: [:it | ^it]].
@@ -527,20 +524,28 @@ public wrap: node input: input children: children = (
 		children: children
 )
 )
-(* Cross-module bindings deferred via lazy slots — see VCSLib /
-   VCSCore for rationale. SourceMirror and StringMirror originally
-   came from vcs.sourceMirrors in the slot block, but with
-   VCSSourceMirrors holding a reciprocal reference back to this
-   module the slot-block-time cycle deadlocked without futures.
-
-   compilationUnitCache / methodDeclCache also deferred — they
-   instantiate MirrorCache which needs SourceMirrorParser (built
-   on the "cheating" TypedNS3Grammar import that the web mirrors
-   API doesn't expose) and imageMirrorCache (nil in phase 1). *)
+class InMemoryMirrorCache = (
+(* Web-runtime substitute for the Squeak imageMirrorCache. Holds a
+   per-production string→mirror map; MirrorCache asks for the map
+   keyed by its grammar production selector and memoizes parsed
+   mirrors into it. No image-backed persistence — the cache lives
+   for the lifetime of the VCSNewspeakSourceMirrors module. *)
+|
+	caches = Map new.
+|
+) (
+public stringToMirrorCacheForProduction: selector = (
+	^caches at: selector ifAbsentPut: [Map new]
+)
+) : (
+)
+(* SourceMirror and StringMirror are deferred via lazy slots to
+   avoid the slot-block-time cycle with VCSSourceMirrors. See
+   VCSLib / VCSCore for the wider rationale. *)
 lazy public SourceMirror = vcsHolder sourceMirrors SourceMirror.
 lazy public StringMirror = vcsHolder sourceMirrors StringMirror.
-lazy public compilationUnitCache = MirrorCache onSelector: #compilationUnit.
-lazy public methodDeclCache = MirrorCache onSelector: #methodDecl.
+lazy public compilationUnitCache = MirrorCache cacheKey: #compilationUnit productionFromParser: [:p | p compilationUnit].
+lazy public methodDeclCache = MirrorCache cacheKey: #methodDecl productionFromParser: [:p | p methodDecl].
 public clearCaches = (
 	compilationUnitCache clear.
 	methodDeclCache clear.
@@ -586,6 +591,9 @@ mirrorForMethod: method <MethodMirror> ^<MethodSourceMirror> = (
 )
 public mirrorForStream: stream <ReadStream> ^<ClassSourceMirror> = (
 	^compilationUnitCache mirrorForStream: stream
+)
+public mirrorForString: source <String> ^<ClassSourceMirror> = (
+	^compilationUnitCache mirrorForString: source
 )
 ) : (
 )

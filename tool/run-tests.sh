@@ -49,7 +49,12 @@ else
     IMPL_FILE=""
 fi
 
-# Build list of additional files to load (in dependency order)
+# Build list of additional files to load (in dependency order).
+# Any extra .ns files passed after the test-config name are appended
+# (lets callers thread in test deps the auto-discovery doesn't know
+# about — e.g. multi-file packages like MemoryHole, which has
+# VCSCore, VCSDiffing, VCSSourceMirrors, etc., none of which match
+# the TEST_BASE name).
 ADDITIONAL_FILES=""
 if [ -n "$IMPL_FILE" ] && [ -f "$IMPL_FILE" ]; then
     ADDITIONAL_FILES="$IMPL_FILE"
@@ -60,6 +65,16 @@ fi
 if [ -f "$CONFIG_FILE" ]; then
     ADDITIONAL_FILES="$ADDITIONAL_FILES $CONFIG_FILE"
 fi
+shift  # drop $1 (TEST_CONFIG); remaining args are extra dep files
+for extra in "$@"; do
+    if [ -f "$extra" ]; then
+        ADDITIONAL_FILES="$ADDITIONAL_FILES $extra"
+    elif [ -f "${NEWSPEAK}/$extra" ]; then
+        ADDITIONAL_FILES="$ADDITIONAL_FILES ${NEWSPEAK}/$extra"
+    else
+        printf "WARNING: extra dep file not found: %s\n" "$extra"
+    fi
+done
 
 # 5. Run the tests using NewspeakTestRunner
 printf "\nRunning tests: %s\n\n" "$TEST_CONFIG"

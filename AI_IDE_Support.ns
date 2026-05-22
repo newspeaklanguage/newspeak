@@ -1766,39 +1766,55 @@ pickFile ^ <Alien[Promise]> = (
 	   to the chosen Alien[File] on selection; rejects with a string if the
 	   user dismisses the dialog. The fragment is constructed fresh per call;
 	   a hidden <input> is built lazily on its first input access, so we
-	   don't need to insert anything into the DOM. *)
-	^aiAccess Promise new: [:resolve :reject |
-		FileChooserFragment new
-			chooseSingleFile: [:file <Alien> | resolve value: file. nil]
-			ifCanceled: [reject value: 'File selection canceled'. nil].
-		nil
-	]
+	   don't need to insert anything into the DOM.
+
+	   Implementation note: built on Promise.withResolvers() rather than
+	   `new Promise(executor)`. Primordialsoup's alien bridge does NOT pass
+	   arguments to a Newspeak closure invoked synchronously by the
+	   Promise constructor — both `resolve` and `reject` arrive as nil —
+	   so the executor pattern is unusable. withResolvers exposes the
+	   resolve/reject as ordinary JS function aliens, which we invoke
+	   later (asynchronously, from event handlers) via Function.call. *)
+	| deferred <Alien> resolveFn <Alien> rejectFn <Alien> |
+	deferred:: aiAccess Promise withResolvers.
+	resolveFn:: deferred at: 'resolve'.
+	rejectFn:: deferred at: 'reject'.
+	FileChooserFragment new
+		chooseSingleFile: [:file <Alien> |
+			resolveFn call: js undefined with: file. nil]
+		ifCanceled: [
+			rejectFn call: js undefined with: 'File selection canceled'. nil].
+	^deferred at: 'promise'
 )
 readFileAsBase64: file <Alien> ^ <Alien[Promise]> = (
 	(* Read the file's bytes via FileReader.readAsDataURL and resolve to the
 	   base64 payload (the part after 'data:<mime>;base64,'). Used for
 	   binary uploads — images and PDFs — that must be transported as
-	   base64 inside Anthropic content blocks. *)
-	| FileReader <Alien> reader <Alien> |
+	   base64 inside Anthropic content blocks. Uses Promise.withResolvers()
+	   for the same reason pickFile does — see its comment. *)
+	| FileReader <Alien> reader <Alien>
+	  deferred <Alien> resolveFn <Alien> rejectFn <Alien> |
 	FileReader:: aiAccess global at: 'FileReader'.
 	reader:: FileReader new.
-	^aiAccess Promise new: [:resolve :reject |
-		reader addEventListener: 'load' action: [:event |
-			| dataUrl <String> commaIdx <Integer> |
-			dataUrl:: reader at: 'result'.
-			commaIdx:: dataUrl indexOf: ','.
-			commaIdx = 0
-				ifTrue: [reject value: 'FileReader returned no data: URL prefix']
-				ifFalse: [resolve value: (dataUrl copyFrom: commaIdx + 1 to: dataUrl size)].
-			nil
-		].
-		reader addEventListener: 'error' action: [:event |
-			reject value: 'FileReader error'.
-			nil
-		].
-		reader readAsDataURL: file.
+	deferred:: aiAccess Promise withResolvers.
+	resolveFn:: deferred at: 'resolve'.
+	rejectFn:: deferred at: 'reject'.
+	reader addEventListener: 'load' action: [:event |
+		| dataUrl <String> commaIdx <Integer> |
+		dataUrl:: reader at: 'result'.
+		commaIdx:: dataUrl indexOf: ','.
+		commaIdx = 0
+			ifTrue: [rejectFn call: js undefined with: 'FileReader returned no data: URL prefix']
+			ifFalse: [resolveFn call: js undefined with:
+				(dataUrl copyFrom: commaIdx + 1 to: dataUrl size)].
 		nil
-	]
+	].
+	reader addEventListener: 'error' action: [:event |
+		rejectFn call: js undefined with: 'FileReader error'.
+		nil
+	].
+	reader readAsDataURL: file.
+	^deferred at: 'promise'
 )
 fileToContentBlock: file <Alien> ^ <Alien[Promise]> = (
 	(* Dispatch on the file's MIME type to build the right Anthropic content

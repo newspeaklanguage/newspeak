@@ -1,0 +1,178 @@
+Newspeak3
+'MemoryHole'
+class VCSIsomorphicGitBackendProvider usingPlatform: platform = (
+(*
+ Browser-side git backend for MemoryHole, built on isomorphic-git and
+ lightning-fs (IndexedDB-backed filesystem). Replacement for the
+ archived VCSGitBackendProvider, whose Launcher pattern shells out to
+ a git CLI that doesn't exist in the browser.
+
+ MVP scope (this commit): proves the JS bridge works end-to-end - a
+ Backend can mkdir a working directory, init a repo, write a file,
+ add, commit, and read the log. The AbstractBackend / AbstractRepository
+ / AbstractHistorian lift is deferred to a follow-up commit; that work
+ has to reshape the abstract interface from synchronous (Squeak shell-
+ outs) to Promise-based (isomorphic-git is fundamentally async), and
+ it's a meaningful refactor of VCSCore.
+
+ JS globals required (loaded via <script> tags in primordialsoup.html):
+   window.git         - isomorphic-git facade
+   window.LightningFS - FS constructor
+   window.GitHttp     - isomorphic-git/http/web (only needed for clone/
+                        fetch/push to remotes)
+
+ If those globals are missing the slot initializers below return aliens
+ that MNU on first use - check the <script> tags landed in the deployed
+ primordialsoup.html.
+
+ Smoke-test invocations from an IDE workspace:
+
+   "Local-only chain (no network):"
+   (VCSIsomorphicGitBackendProvider smokeTestUsingPlatform: platform)
+       then: [:summary | summary out]
+
+   "Clone a tiny public GitHub repo. Requires a CORS proxy in front
+    of the browser (GitHub's git endpoints don't send CORS headers).
+    Run `npx @isomorphic-git/cors-proxy` in another terminal first;
+    that listens on port 9999 by default, which is what the corsProxy
+    slot defaults to."
+   (VCSIsomorphicGitBackendProvider
+       cloneSmokeTestUsingPlatform: platform
+       url: 'https://github.com/octocat/Hello-World')
+           then: [:summary | summary out].
+
+   "Same, but with an explicit proxy URL:"
+   (VCSIsomorphicGitBackendProvider
+       cloneSmokeTestUsingPlatform: platform
+       url: 'https://github.com/octocat/Hello-World'
+       corsProxy: 'http://localhost:9999')
+           then: [:summary | summary out]
+*)
+|
+	private js = platform js.
+	private global = js global.
+	private JSON = global at: #JSON.
+	private LightningFSClass = global at: #LightningFS.
+	private gitFacade = global at: #git.
+	private gitHttpFacade = global at: #GitHttp.
+|
+) (
+public class Backend = (
+(* Pairs the isomorphic-git facade with one lightning-fs instance.
+   The fs is scoped to a named IndexedDB store; backends sharing a
+   store name share storage. *)
+|
+	public fs = LightningFSClass new: 'newspeak-memhole'.
+	public git = gitFacade.
+	public http = gitHttpFacade.
+	public dir = '/smoke'.
+	public cloneDir = '/clone-test'.
+	(* GitHub's git protocol endpoints don't send CORS headers, so a
+	   proxy in front of the browser is required for any clone/fetch/push.
+	   The previous public proxy at cors.isomorphic-git.org is dead;
+	   spin up a local one with `npx @isomorphic-git/cors-proxy` (default
+	   port 9999) and override the slot if you're using a different port. *)
+	public corsProxy ::= 'http://localhost:9999'.
+|
+) (
+createJSObject = (
+	(* JSON.parse('{}') round-trip yields an alien that accepts dynamic
+	   at:put: writes - see AIAccess for the rationale. *)
+	^JSON parse: '{}'
+)
+mkdirIgnoringExisting: path ^ <Alien[Promise]> = (
+	(* fs.promises.mkdir(path).then(ignoreOk, ignoreEEXIST). Both branches
+	   resolve to nil so the chain can continue regardless of whether the
+	   directory already exists. *)
+	| fsPromises mkdirPromise |
+	fsPromises:: fs at: #promises.
+	mkdirPromise:: fsPromises mkdir: path.
+	^mkdirPromise then: [:ok | nil] onRejected: [:err | nil]
+)
+initRepo: dirPath ^ <Alien[Promise]> = (
+	| opts |
+	opts:: createJSObject.
+	opts at: 'fs' put: fs.
+	opts at: 'dir' put: dirPath.
+	^git init: opts
+)
+writeFile: fullPath withContents: content ^ <Alien[Promise]> = (
+	^(fs at: #promises) writeFile: fullPath with: content
+)
+addPath: filepath in: dirPath ^ <Alien[Promise]> = (
+	| opts |
+	opts:: createJSObject.
+	opts at: 'fs' put: fs.
+	opts at: 'dir' put: dirPath.
+	opts at: 'filepath' put: filepath.
+	^git add: opts
+)
+commitIn: dirPath message: message ^ <Alien[Promise]> = (
+	| opts author |
+	author:: createJSObject.
+	author at: 'name' put: 'Smoke Test'.
+	author at: 'email' put: 'smoke@example.com'.
+	opts:: createJSObject.
+	opts at: 'fs' put: fs.
+	opts at: 'dir' put: dirPath.
+	opts at: 'message' put: message.
+	opts at: 'author' put: author.
+	^git commit: opts
+)
+logIn: dirPath ^ <Alien[Promise]> = (
+	| opts |
+	opts:: createJSObject.
+	opts at: 'fs' put: fs.
+	opts at: 'dir' put: dirPath.
+	^git log: opts
+)
+public smokeTest ^ <Alien[Promise]> = (
+	(* Async chain: mkdir(dir) -> git.init -> writeFile README -> git.add
+	   -> git.commit -> git.log -> string summary. Resolves to a String
+	   like 'committed abc1234; log has 1 entries'. *)
+	^(mkdirIgnoringExisting: dir) then: [:r1 |
+		(initRepo: dir) then: [:r2 |
+			(writeFile: dir, '/README.md' withContents: 'Hello, MemoryHole!') then: [:r3 |
+				(addPath: 'README.md' in: dir) then: [:r4 |
+					(commitIn: dir message: 'Initial commit') then: [:sha |
+						(logIn: dir) then: [:entries |
+							'committed ', sha,
+								'; log has ', (entries at: 'length') printString,
+								' entries']]]]]]
+)
+public cloneFrom: url ^ <Alien[Promise]> = (
+	(* Shallow-clone url into cloneDir over HTTPS via a CORS proxy.
+	   single-branch + depth 1 keeps the transfer small. Resolves to a
+	   String like 'cloned <url> into <dir>; log has N entries'. *)
+	| opts |
+	opts:: createJSObject.
+	opts at: 'fs' put: fs.
+	opts at: 'http' put: http.
+	opts at: 'dir' put: cloneDir.
+	opts at: 'url' put: url.
+	opts at: 'corsProxy' put: corsProxy.
+	opts at: 'singleBranch' put: true.
+	opts at: 'depth' put: 1.
+	^(mkdirIgnoringExisting: cloneDir) then: [:r1 |
+		(git clone: opts) then: [:r2 |
+			(logIn: cloneDir) then: [:entries |
+				'cloned ', url,
+					' into ', cloneDir,
+					'; log has ', (entries at: 'length') printString,
+					' entries']]]
+)
+) : (
+)
+) : (
+public smokeTestUsingPlatform: p ^ <Alien[Promise]> = (
+	^(self usingPlatform: p) Backend new smokeTest
+)
+public cloneSmokeTestUsingPlatform: p url: url ^ <Alien[Promise]> = (
+	^((self usingPlatform: p) Backend new) cloneFrom: url
+)
+public cloneSmokeTestUsingPlatform: p url: url corsProxy: proxy ^ <Alien[Promise]> = (
+	| backend = (self usingPlatform: p) Backend new. |
+	backend corsProxy: proxy.
+	^backend cloneFrom: url
+)
+)

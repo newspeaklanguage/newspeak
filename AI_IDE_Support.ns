@@ -24,9 +24,10 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = (
 	private List = platform collections List.
 	private Map = platform collections Map.
 	private ide = webIde.
-	private retainedPlatform = platform.
+	private js = platform js.
 	private Document = webIde documents Document.
 	private Presenter = platform hopscotch Presenter.
+	private FileChooserFragment = platform hopscotch FileChooserFragment.
 
 	(* AI capability comes from the platform: aiAccess is the non-UI
 	   service module, aiColors is the chat-bubble palette grouped on
@@ -174,14 +175,14 @@ storageKey ^ <String> = (
 )
 public reloadApiKey = (
 	| key <String | UndefinedObject> |
-	key:: [retainedPlatform js localStorage getItem: storageKey]
+	key:: [js localStorage getItem: storageKey]
 		on: Exception do: [:e | nil].
 	key isNil ifTrue: [key:: ''].
 	apiKey:: key
 )
 public createSession: provider <Provider> ^ <Session> = (
 	| session <Session> |
-	session:: Session provider: provider tools: tools.
+	session:: Session provider: provider tools: (toolsForProvider: provider).
 	session systemPrompt: newspeakSystemPrompt.
 	^session
 )
@@ -206,9 +207,9 @@ public startChat = (
 		errorMessage:: 'An entry named "', docName, '" already exists in Root.'.
 		^nil
 	].
-	[retainedPlatform js localStorage setItem: storageKey to: apiKey]
+	[js localStorage setItem: storageKey to: apiKey]
 		on: Exception do: [:e | ].
-	[retainedPlatform js localStorage setItem: 'ns_ai_active_chat_doc' to: docName]
+	[js localStorage setItem: 'ns_ai_active_chat_doc' to: docName]
 		on: Exception do: [:e | ].
 	doc:: ChatDocument
 		named: docName
@@ -458,7 +459,7 @@ public chatSubject ^ <IDEChatDocumentSubject> = (
 	   chat doc wins" for ephemeral brain-button chats (which pull
 	   sharedChatSubject_slot) and for the next-session default. *)
 	sharedChatSubject_slot:: chatSubject_slot.
-	[retainedPlatform js localStorage setItem: 'ns_ai_active_chat_doc' to: name]
+	[js localStorage setItem: 'ns_ai_active_chat_doc' to: name]
 		on: Exception do: [:e | ].
 	^chatSubject_slot
 )
@@ -471,7 +472,7 @@ createFreshSession ^ <Session> = (
 	| provider <Provider> session <Session> key <String> |
 	key:: apiKeyForProvider: providerName.
 	provider:: (providerClassFor: providerName) apiKey: key model: modelName.
-	session:: Session provider: provider tools: tools.
+	session:: Session provider: provider tools: (toolsForProvider: provider).
 	session systemPrompt: newspeakSystemPrompt.
 	^session
 )
@@ -543,7 +544,7 @@ insertTurnSection: text <String> role: role <String> = (
 	thinking isNil ifTrue: [
 		Error signal: 'ChatDocument is missing its structural amplets; cannot append turn'
 	].
-	jsDoc:: retainedPlatform js global at: 'document'.
+	jsDoc:: js global at: 'document'.
 	section:: jsDoc createElement: 'div'.
 	section setAttribute: 'class' to: 'chat-turn'.
 	section setAttribute: 'data-role' to: role.
@@ -653,6 +654,21 @@ appendNewAssistantTurnsAfter: startIdx <Integer> = (
 		i:: i + 1
 	]
 )
+public sendText: text <String> attachments: docs <List> ^ <Alien[Promise] | UndefinedObject> = (
+	(* Like sendText: but forwards document attachments down the chain.
+	   docs is a List of { filename <String>. content <String> } tuples.
+	   Mirrors the structure of sendText: exactly. *)
+	| promise <Alien[Promise] | UndefinedObject> |
+	text isEmpty ifTrue: [^nil].
+	document appendUserSection: text.
+	lastTurnIndexBeforeSend:: session displayMessages size.
+	promise:: super sendText: text attachments: docs.
+	(* Refresh AFTER super so the live view picks up both the new user
+	   section (HTML) and the thinking indicator (chat subject's waiting
+	   flag, which super just set). *)
+	document refreshLiveView.
+	^promise
+)
 ) : (
 )
 findChatStructuralAmplet: name <String> in: container <Object> ^ <Object | UndefinedObject> = (
@@ -692,7 +708,7 @@ apiKeyStorageKeyFor: pn <String> ^ <String> = (
 )
 apiKeyForProviderOrNil: pn <String> ^ <String | UndefinedObject> = (
 	| key |
-	[key:: retainedPlatform js localStorage getItem: (apiKeyStorageKeyFor: pn)]
+	[key:: js localStorage getItem: (apiKeyStorageKeyFor: pn)]
 		on: Exception do: [:e | ^nil].
 	^key
 )
@@ -707,11 +723,11 @@ apiKeyForProvider: pn <String> ^ <String> = (
 )
 public defaultChatDocumentOrCreate ^ <ChatDocument | UndefinedObject> = (
 	| activeName entry key doc |
-	activeName:: [retainedPlatform js localStorage getItem: 'ns_ai_active_chat_doc']
+	activeName:: [js localStorage getItem: 'ns_ai_active_chat_doc']
 		on: Exception do: [:e | nil].
 	activeName isNil ifTrue: [
 		activeName:: 'Chat'.
-		[retainedPlatform js localStorage setItem: 'ns_ai_active_chat_doc' to: 'Chat']
+		[js localStorage setItem: 'ns_ai_active_chat_doc' to: 'Chat']
 			on: Exception do: [:e | ]
 	].
 	entry:: Root at: activeName asSymbol ifAbsent: [nil].
@@ -1526,6 +1542,17 @@ public tools ^ <List> = (
 		continueThreadTool.
 	}
 )
+public toolsForProvider: provider <Provider> ^ <List[Tool]> = (
+	(* tools plus any capability-gated extras the given provider can drive.
+	   uploadFileTool delivers content as an array of text/image/document
+	   blocks in tool_result.content; only providers whose
+	   supportsFileUploads is true get it offered. *)
+	| result <List[Tool]> |
+	result:: List new.
+	tools do: [:t <Tool> | result add: t].
+	provider supportsFileUploads ifTrue: [result add: uploadFileTool].
+	^result
+)
 getClassSourceTool ^ <Tool> = (
 	^Tool
 		name: 'get_class_source'
@@ -1734,6 +1761,114 @@ webFetchTool ^ <Tool> = (
 			aiAccess webFetch: (input at: 'url')
 		]
 )
+pickFile ^ <Alien[Promise]> = (
+	(* Open the OS file picker via Hopscotch's FileChooserFragment. Resolves
+	   to the chosen Alien[File] on selection; rejects with a string if the
+	   user dismisses the dialog. The fragment is constructed fresh per call;
+	   a hidden <input> is built lazily on its first input access, so we
+	   don't need to insert anything into the DOM. *)
+	^aiAccess Promise new: [:resolve :reject |
+		FileChooserFragment new
+			chooseSingleFile: [:file <Alien> | resolve value: file. nil]
+			ifCanceled: [reject value: 'File selection canceled'. nil].
+		nil
+	]
+)
+readFileAsBase64: file <Alien> ^ <Alien[Promise]> = (
+	(* Read the file's bytes via FileReader.readAsDataURL and resolve to the
+	   base64 payload (the part after 'data:<mime>;base64,'). Used for
+	   binary uploads — images and PDFs — that must be transported as
+	   base64 inside Anthropic content blocks. *)
+	| FileReader <Alien> reader <Alien> |
+	FileReader:: aiAccess global at: 'FileReader'.
+	reader:: FileReader new.
+	^aiAccess Promise new: [:resolve :reject |
+		reader addEventListener: 'load' action: [:event |
+			| dataUrl <String> commaIdx <Integer> |
+			dataUrl:: reader at: 'result'.
+			commaIdx:: dataUrl indexOf: ','.
+			commaIdx = 0
+				ifTrue: [reject value: 'FileReader returned no data: URL prefix']
+				ifFalse: [resolve value: (dataUrl copyFrom: commaIdx + 1 to: dataUrl size)].
+			nil
+		].
+		reader addEventListener: 'error' action: [:event |
+			reject value: 'FileReader error'.
+			nil
+		].
+		reader readAsDataURL: file.
+		nil
+	]
+)
+fileToContentBlock: file <Alien> ^ <Alien[Promise]> = (
+	(* Dispatch on the file's MIME type to build the right Anthropic content
+	   block. Resolves to a single JS content-block object suitable for
+	   inclusion in tool_result.content (which accepts text, image,
+	   document, search_result, and tool_reference blocks). PDFs become
+	   document blocks; images become image blocks; everything else is
+	   read as text and returned as a text block. *)
+	| mime <String> name <String> |
+	(* JS undefined doesn't satisfy isNil; the ", ''" pattern coerces a real
+	   String through and raises on anything else (undefined, null, numbers). *)
+	mime:: [(file at: 'type'), ''] on: Exception do: [:e | ''].
+	name:: [(file at: 'name'), ''] on: Exception do: [:e | ''].
+	mime = 'application/pdf' ifTrue: [
+		^(readFileAsBase64: file) then: [:b64 <String> |
+			| block <Alien> source <Alien> |
+			source:: aiAccess JSON parse: '{}'.
+			source at: 'type' put: 'base64'.
+			source at: 'media_type' put: 'application/pdf'.
+			source at: 'data' put: b64.
+			block:: aiAccess JSON parse: '{}'.
+			block at: 'type' put: 'document'.
+			block at: 'source' put: source.
+			name isEmpty ifFalse: [block at: 'title' put: name].
+			block
+		]
+	].
+	(mime startsWith: 'image/') ifTrue: [
+		^(readFileAsBase64: file) then: [:b64 <String> |
+			| block <Alien> source <Alien> |
+			source:: aiAccess JSON parse: '{}'.
+			source at: 'type' put: 'base64'.
+			source at: 'media_type' put: mime.
+			source at: 'data' put: b64.
+			block:: aiAccess JSON parse: '{}'.
+			block at: 'type' put: 'image'.
+			block at: 'source' put: source.
+			block
+		]
+	].
+	(* Default: treat as text. Prefixes the filename so the model knows what
+	   it just received; for unknown binary types this will be garbled but
+	   the AI can detect and recover. *)
+	^(file text) then: [:text <String> |
+		| block <Alien> body <String> |
+		body:: name isEmpty
+			ifTrue: [text]
+			ifFalse: [name, String lf, String lf, text].
+		block:: aiAccess JSON parse: '{}'.
+		block at: 'type' put: 'text'.
+		block at: 'text' put: body.
+		block
+	]
+)
+uploadFileTool ^ <Tool> = (
+	^Tool
+		name: 'upload_file'
+		description: 'Ask the user to upload a file from their local filesystem. Opens an OS file picker; the user selects one file and the tool returns its contents in the tool_result. Text files (text/*, json, xml, source, etc.) are returned as a text block; images (image/jpeg, image/png, image/gif, image/webp) as an image block; PDFs (application/pdf) as a document block. Use this when you need the user to share a file you cannot otherwise read (e.g., a local source file outside the IDE namespace, a configuration file, a log, a screenshot, a PDF). The tool errors with "File selection canceled" if the user dismisses the picker.'
+		inputSchema: '{"type":"object","properties":{},"required":[]}'
+		handler: [:input |
+			pickFile then: [:file <Alien> |
+				(fileToContentBlock: file) then: [:block <Alien> |
+					| arr <Alien> |
+					arr:: aiAccess JSON parse: '[]'.
+					arr push: block.
+					arr
+				]
+			]
+		]
+)
 parentNamespaceAndLeaf: dottedPath <String> ^ <Object> = (
 	(* Walk the path segments to the parent namespace; return a 2-tuple
 	   {parentNamespace. leafName}. Used by create/delete to locate the
@@ -1771,7 +1906,7 @@ documentAt: dottedPath <String> ^ <Object> = (
 )
 parseAmpletContainer: html <String> ^ <Object> = (
 	| jsDoc div |
-	jsDoc:: retainedPlatform js global at: 'document'.
+	jsDoc:: js global at: 'document'.
 	div:: jsDoc createElement: 'div'.
 	div at: 'innerHTML' put: html.
 	^div
@@ -1932,7 +2067,7 @@ addAmpletTool ^ <Tool> = (
 				ifTrue: [bodies at: 0]
 				ifFalse: [container].
 			newId:: doc nextAmpletId printString.
-			jsDoc:: retainedPlatform js global at: 'document'.
+			jsDoc:: js global at: 'document'.
 			newAmplet:: jsDoc createElement: 'div'.
 			newAmplet setAttribute: 'class' to: 'ampleforth'.
 			newAmplet setAttribute: 'ampletId' to: newId.
@@ -2770,7 +2905,7 @@ forgetObjectTool ^ <Tool> = (
 )
 public createSessionWithProvider: provider <Provider> ^ <Session> = (
 	| session |
-	session:: Session provider: provider tools: tools.
+	session:: Session provider: provider tools: (toolsForProvider: provider).
 	session systemPrompt: newspeakSystemPrompt.
 	^session
 )

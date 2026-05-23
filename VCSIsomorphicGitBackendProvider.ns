@@ -46,7 +46,15 @@ class VCSIsomorphicGitBackendProvider usingPlatform: platform = (
        cloneSmokeTestUsingPlatform: platform
        url: 'https://github.com/octocat/Hello-World'
        corsProxy: 'http://localhost:9999')
-           then: [:summary | summary out]
+           then: [:summary | summary out].
+
+   "Drafts repo end-to-end (no network needed). Records two snapshots,
+    reads the log, reconstructs the first snapshot; resolves to a
+    summary string. Repeat runs stack commits in the
+    'newspeak-drafts-smoketest' IndexedDB store - clear that store to
+    reset between runs."
+   (VCSIsomorphicGitBackendProvider draftsSmokeTestUsingPlatform: platform)
+       then: [:summary | summary out]
 *)
 |
 	private js = platform js.
@@ -55,6 +63,8 @@ class VCSIsomorphicGitBackendProvider usingPlatform: platform = (
 	private LightningFSClass = global at: #LightningFS.
 	private gitFacade = global at: #git.
 	private gitHttpFacade = global at: #GitHttp.
+	private Promise = global at: #Promise.
+	private TextDecoder = global at: #TextDecoder.
 |
 ) (
 public class Backend = (
@@ -163,6 +173,143 @@ public cloneFrom: url ^ <Alien[Promise]> = (
 )
 ) : (
 )
+public class DraftsRepo storeNamed: storeName <String> dir: workDir <String> = (
+(*
+ A git repository dedicated to recording IDE Accepts as commits. The
+ backend for "git-as-infinite-undo": each Accept writes a snapshot of
+ the touched files and commits with a descriptive message; history
+ surfaces as the git log, and a past state is reconstructed by reading
+ blobs at a given commit.
+
+ Carries its own lightning-fs instance scoped to a named IndexedDB
+ store so its packfile / refs don't intermingle with other Backends.
+ Pass a distinct storeName per logical repository.
+
+ Files are opaque: this class doesn't know that the contents are
+ Newspeak class sources. The IDE side decides the path scheme and
+ serializes mirrors into the (filename -> content) Map handed to
+ recordSnapshot:.
+*)
+|
+	fs = LightningFSClass new: storeName.
+	git = gitFacade.
+	dir = workDir.
+	author = makeDefaultAuthor.
+	initialized ::= false.
+|
+) (
+makeDefaultAuthor = (
+	| a |
+	a:: JSON parse: '{}'.
+	a at: 'name' put: 'IDE Drafts'.
+	a at: 'email' put: 'drafts@newspeak.local'.
+	^a
+)
+createJSObject = (
+	^JSON parse: '{}'
+)
+createJSArray = (
+	^JSON parse: '[]'
+)
+mkdirIgnoringExisting: path ^ <Alien[Promise]> = (
+	| mkdirPromise |
+	mkdirPromise:: (fs at: #promises) mkdir: path.
+	^mkdirPromise then: [:ok | nil] onRejected: [:err | nil]
+)
+ensureInitialized ^ <Alien[Promise]> = (
+	(* Idempotent. After the first successful pass through mkdir + init,
+	   subsequent calls short-circuit via Promise.resolve so the snapshot
+	   chain doesn't repeat work. *)
+	initialized ifTrue: [^Promise resolve: nil].
+	^(mkdirIgnoringExisting: dir) then: [:r1 |
+		| initOpts |
+		initOpts:: createJSObject.
+		initOpts at: 'fs' put: fs.
+		initOpts at: 'dir' put: dir.
+		(git init: initOpts) then: [:r2 |
+			initialized:: true.
+			nil]]
+)
+public recordSnapshot: files <Map[String, String]> message: message <String> ^ <Alien[Promise]> = (
+	(* files maps filenames (relative to dir) to their contents. Each is
+	   written to disk, then all are git-added in one call, then committed.
+	   Resolves to the new commit SHA (a String). *)
+	^(ensureInitialized) then: [:r1 |
+		| writePromises addFilenames |
+		writePromises:: createJSArray.
+		addFilenames:: createJSArray.
+		files keysAndValuesDo: [:filename :content |
+			writePromises push: ((fs at: #promises) writeFile: dir, '/', filename with: content).
+			addFilenames push: filename].
+		(Promise all: writePromises) then: [:r2 |
+			| addOpts |
+			addOpts:: createJSObject.
+			addOpts at: 'fs' put: fs.
+			addOpts at: 'dir' put: dir.
+			addOpts at: 'filepath' put: addFilenames.
+			(git add: addOpts) then: [:r3 |
+				| commitOpts |
+				commitOpts:: createJSObject.
+				commitOpts at: 'fs' put: fs.
+				commitOpts at: 'dir' put: dir.
+				commitOpts at: 'message' put: message.
+				commitOpts at: 'author' put: author.
+				git commit: commitOpts]]]
+)
+public history ^ <Alien[Promise]> = (
+	(* Resolves to the JS array returned by git.log: each entry has
+	   .oid, .commit.message, .commit.author.timestamp, .commit.parent, ...
+	   Newest-first. Empty array (length 0) for a fresh repo with no
+	   commits yet, but the chain still requires init so we don't get a
+	   reference-not-found error. *)
+	^(ensureInitialized) then: [:r |
+		| opts |
+		opts:: createJSObject.
+		opts at: 'fs' put: fs.
+		opts at: 'dir' put: dir.
+		git log: opts]
+)
+readBlobPairAt: sha <String> path: filepath <String> ^ <Alien[Promise]> = (
+	(* Promise resolving to a two-element JS array [filepath, content]
+	   where content is the file's text at the given commit. Used by
+	   snapshotAt: to gather one pair per file before joining via
+	   Promise.all. *)
+	| opts |
+	opts:: createJSObject.
+	opts at: 'fs' put: fs.
+	opts at: 'dir' put: dir.
+	opts at: 'oid' put: sha.
+	opts at: 'filepath' put: filepath.
+	^(git readBlob: opts) then: [:blobResult |
+		| content pair |
+		content:: TextDecoder new decode: (blobResult at: 'blob').
+		pair:: createJSArray.
+		pair push: filepath.
+		pair push: content.
+		pair]
+)
+public snapshotAt: sha <String> ^ <Alien[Promise]> = (
+	(* Resolves to a JS array of two-element JS arrays [filename, content]
+	   (one per blob in the tree at sha). Caller decides whether to build
+	   a Newspeak Map / Dictionary from this. We deliberately don't build
+	   a Newspeak Map inside the then: closure: the alien bridge can't
+	   round-trip a Newspeak Map as the resolution value of a JS Promise
+	   (the bridge expects JS-native shapes when promise values cross
+	   back to JS-side machinery). *)
+	| listOpts |
+	listOpts:: createJSObject.
+	listOpts at: 'fs' put: fs.
+	listOpts at: 'dir' put: dir.
+	listOpts at: 'ref' put: sha.
+	^(git listFiles: listOpts) then: [:filesArr |
+		| readPromises |
+		readPromises:: createJSArray.
+		0 to: (filesArr at: 'length') - 1 do: [:i |
+			readPromises push: (readBlobPairAt: sha path: (filesArr at: i))].
+		Promise all: readPromises]
+)
+) : (
+)
 ) : (
 public smokeTestUsingPlatform: p ^ <Alien[Promise]> = (
 	^(self usingPlatform: p) Backend new smokeTest
@@ -174,5 +321,33 @@ public cloneSmokeTestUsingPlatform: p url: url corsProxy: proxy ^ <Alien[Promise
 	| backend = (self usingPlatform: p) Backend new. |
 	backend corsProxy: proxy.
 	^backend cloneFrom: url
+)
+public draftsSmokeTestUsingPlatform: p ^ <Alien[Promise]> = (
+	(* Round-trip a DraftsRepo: record two snapshots, read the log,
+	   reconstruct the first snapshot, return a summary string. Uses a
+	   dedicated IndexedDB store so it doesn't intermingle with the
+	   plain Backend smoke test. Repeat invocations stack new commits
+	   (the dir is reused) - clear the 'newspeak-drafts-smoketest'
+	   IndexedDB to reset. *)
+	| Map repo files1 files2 firstSha |
+	Map:: p collections Map.
+	repo:: (self usingPlatform: p) DraftsRepo
+		storeNamed: 'newspeak-drafts-smoketest'
+		dir: '/drafts'.
+	files1:: Map new.
+	files1 at: 'Foo.ns' put: 'class Foo = ( ) ( ) : ( )'.
+	files1 at: 'Bar.ns' put: 'class Bar = ( ) ( ) : ( )'.
+	files2:: Map new.
+	files2 at: 'Foo.ns' put: 'class Foo = ( ) ( m = ( ^42 ) ) : ( )'.
+	files2 at: 'Bar.ns' put: 'class Bar = ( ) ( ) : ( )'.
+	files2 at: 'Baz.ns' put: 'class Baz = ( ) ( ) : ( )'.
+	^(repo recordSnapshot: files1 message: 'first batch') then: [:sha1 |
+		firstSha:: sha1.
+		(repo recordSnapshot: files2 message: 'second batch') then: [:sha2 |
+			repo history then: [:log |
+				(repo snapshotAt: firstSha) then: [:pairs |
+					'first sha=', firstSha,
+					'; log has ', (log at: 'length') printString, ' commits',
+					'; first snapshot reconstructs ', (pairs at: 'length') printString, ' files']]]]
 )
 )

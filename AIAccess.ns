@@ -79,9 +79,9 @@ public class Provider = (
  Tool-use support is optional. Providers that don't translate tools
  inherit hasToolUse: ^false and the tool-loop is skipped. Providers
  that do support tools also implement toolUseBlocksFrom:,
- makeToolResult:content:isError:, buildToolsPayload:, and
- addToolResults:toMessages: (which wraps a list of tool-result
- blocks/parts into a user-role message in the provider's native shape).
+ makeToolResult:textResult:media:isError:, buildToolsPayload:, and
+ addToolResults:toMessages: (which folds the per-call tool-result
+ outcomes into one or more messages in the provider's native shape).
 *)
 ) (
 public complete: messages <Alien[Array]>
@@ -149,10 +149,28 @@ public toolUseBlocksFrom: response <Alien> ^ <List> = (
 	   call. *)
 	subclassResponsibility
 )
-public makeToolResult: id <String> content: text isError: err <Boolean> ^ <Alien> = (
-	(* Build a tool-result message in the provider's native shape, to be
-	   appended to messages and sent on the next turn. content (text) is
-	   either a String (textual result) or an array of content blocks.
+public makeToolResult: id <String>
+	textResult: text <String>
+	media: mediaParts <Alien[Array]>
+	isError: err <Boolean>
+	^ <Object> = (
+	(* Build a tool-result outcome in the provider's native shape. The
+	   return value is opaque to Session — only this provider's
+	   addToolResults:toMessages: knows how to fold it into the message
+	   stream. Returning a structured object (rather than a single block
+	   or part) lets providers that need to split media across multiple
+	   parts or messages (Gemini, OpenAI-compatible) do so without
+	   leaking through Session.
+
+	   text is the textual tool result (never empty by the time this is
+	   called — Session substitutes 'See attached' when the handler
+	   produces only media). mediaParts is a JS array of canonical media
+	   objects: each has {mimeType <String>, dataBase64 <String>, name
+	   <String> (optional)}. Providers translate to their native
+	   image/document/audio/video shape; items with a MIME type the
+	   provider can't carry are dropped and noted in the textual result
+	   so the model sees the omission rather than receiving silence.
+
 	   Only providers that support tool use need to implement this. *)
 	subclassResponsibility
 )
@@ -163,13 +181,21 @@ public buildToolsPayload: toolDefs <List[Tool]> ^ <Alien | UndefinedObject> = (
 	^nil
 )
 public addToolResults: results <Alien[Array]> toMessages: messages <List> = (
-	(* Wrap a list of tool-result blocks/parts (each produced by
-	   makeToolResult:content:isError:) into a single user-role message in
-	   the provider's native shape, and append to messages. Called once
-	   per tool-loop round, after every executeToolCall: promise has
-	   resolved. Providers that support tool use must implement;
-	   tool-less providers never reach this path (hasToolUse: defaults to
-	   false). *)
+	(* Fold per-call tool-result outcomes (each produced by
+	   makeToolResult:textResult:media:isError:) into one or more
+	   messages in the provider's native shape, and append to messages.
+	   Called once per tool-loop round, after every executeToolCall:
+	   promise has resolved.
+
+	   Providers may emit ≥1 messages: Anthropic and Gemini wrap all
+	   outcomes into one user-role message; a future OpenAI-compatible
+	   provider may need to emit N tool messages plus a follow-up
+	   user-role message carrying media that the OpenAI spec won't
+	   accept inside a tool message. The contract is "consume the
+	   results array; append whatever messages are needed."
+
+	   Providers that support tool use must implement; tool-less
+	   providers never reach this path (hasToolUse: defaults to false). *)
 	subclassResponsibility
 )
 safeAt: receiver <Object> field: field <String | Integer> = (
@@ -440,16 +466,76 @@ public toolUseBlocksFrom: response <Alien> ^ <List> = (
 	].
 	^blocks
 )
-public makeToolResult: id <String> content: text isError: err <Boolean> ^ <Alien> = (
-	(* Build a tool_result content block referencing the original tool_use
-	   by id. Anthropic carries these inside a user-role message's content
-	   array — the Session.completeWithToolLoop tool-loop branch assembles
-	   that wrapper. *)
-	| block <Alien> |
+public makeToolResult: id <String>
+	textResult: text <String>
+	media: mediaParts <Alien[Array]>
+	isError: err <Boolean>
+	^ <Alien> = (
+	(* Build a tool_result block for Anthropic, referencing the original
+	   tool_use by id. The content array starts with a text block, then
+	   one image/document block per supported media item. Anthropic
+	   accepts image/* and application/pdf inside tool_result.content;
+	   audio/video are not supported there and get dropped with a notice
+	   appended to the text so the model sees the omission rather than
+	   silent data loss. *)
+	| block contentArr finalText skippedNotes mediaBlocks mlen textBlock |
+	finalText:: text.
+	skippedNotes:: ''.
+	mediaBlocks:: List new.
+	mlen:: safeAt: mediaParts field: 'length'.
+	mlen isNil ifTrue: [mlen:: 0].
+	0 to: mlen - 1 do: [:i <Integer> |
+		| m mime b64 name mb source label |
+		m:: mediaParts at: i.
+		mime:: safeStringAt: m field: 'mimeType'.
+		mime isNil ifTrue: [mime:: ''].
+		b64:: safeStringAt: m field: 'dataBase64'.
+		b64 isNil ifTrue: [b64:: ''].
+		name:: safeStringAt: m field: 'name'.
+		name isNil ifTrue: [name:: ''].
+		mime = 'application/pdf' ifTrue: [
+			source:: createJSObject.
+			source at: 'type' put: 'base64'.
+			source at: 'media_type' put: 'application/pdf'.
+			source at: 'data' put: b64.
+			mb:: createJSObject.
+			mb at: 'type' put: 'document'.
+			mb at: 'source' put: source.
+			name isEmpty ifFalse: [mb at: 'title' put: name].
+			mediaBlocks add: mb
+		] ifFalse: [(mime startsWith: 'image/') ifTrue: [
+			source:: createJSObject.
+			source at: 'type' put: 'base64'.
+			source at: 'media_type' put: mime.
+			source at: 'data' put: b64.
+			mb:: createJSObject.
+			mb at: 'type' put: 'image'.
+			mb at: 'source' put: source.
+			mediaBlocks add: mb
+		] ifFalse: [
+			label:: name isEmpty ifTrue: [mime] ifFalse: [name, ' (', mime, ')'].
+			skippedNotes:: skippedNotes isEmpty
+				ifTrue: [label]
+				ifFalse: [skippedNotes, ', ', label]
+		]]
+	].
+	skippedNotes isEmpty ifFalse: [
+		finalText:: finalText, String lf,
+			'[note: skipped attachments with media type not supported in Anthropic tool_result: ',
+			skippedNotes, ']'
+	].
+	contentArr:: createJSArray.
+	finalText isEmpty ifFalse: [
+		textBlock:: createJSObject.
+		textBlock at: 'type' put: 'text'.
+		textBlock at: 'text' put: finalText.
+		contentArr push: textBlock
+	].
+	mediaBlocks do: [:mb | contentArr push: mb].
 	block:: createJSObject.
 	block at: 'type' put: 'tool_result'.
 	block at: 'tool_use_id' put: id.
-	block at: 'content' put: text.
+	block at: 'content' put: contentArr.
 	err ifTrue: [block at: 'is_error' put: true].
 	^block
 )
@@ -584,9 +670,8 @@ executeToolCall: toolUseBlock <Alien> ^ <Alien[Promise]> = (
 			'Tool call missing name field | block: ', dump
 	].
 	tool:: toolMap at: toolName ifAbsent: [
-		^Promise resolve: (provider
-			makeToolResult: safeId
-			content: 'Unknown tool: ', toolName
+		^Promise resolve: (toolResultFor: safeId
+			handlerValue: 'Unknown tool: ', toolName
 			isError: true)
 	].
 	resultOrPromise:: [tool handler value: input]
@@ -606,24 +691,60 @@ executeToolCall: toolUseBlock <Alien> ^ <Alien[Promise]> = (
 					'Error: <unprintable exception>'
 				]
 			].
-			^Promise resolve: (provider
-				makeToolResult: id
-				content: msg
+			^Promise resolve: (toolResultFor: id
+				handlerValue: msg
 				isError: true)
 		].
 	(* Promise-returning handler: chain. *)
 	(resultOrPromise isKindOfJSAlien and: [resultOrPromise includesKey: 'then']) ifTrue: [
 		^resultOrPromise
-			then: [:text | provider makeToolResult: id content: text isError: false]
+			then: [:result | toolResultFor: id handlerValue: result isError: false]
 			onError: [:err |
-				provider
-					makeToolResult: id
-					content: 'Error: ', err printString
+				toolResultFor: id
+					handlerValue: 'Error: ', err printString
 					isError: true
 			]
 	].
 	(* Synchronous result. *)
-	^Promise resolve: (provider makeToolResult: id content: resultOrPromise isError: false)
+	^Promise resolve: (toolResultFor: id handlerValue: resultOrPromise isError: false)
+)
+toolResultFor: id <String> handlerValue: v isError: isError <Boolean> ^ <Object> = (
+	(* Normalize a tool handler's resolved value to the canonical
+	   {text, media} form, apply the 'See attached' default when text is
+	   empty but media is present, then ask the provider to build its
+	   native tool-result outcome. The returned object is opaque to
+	   Session — only this provider's addToolResults:toMessages: knows
+	   how to fold it into the message stream.
+
+	   Accepted handler shapes:
+	     - String          → {text: v, media: []}
+	     - {text, media}   → as-is (media defaults to empty array if
+	                         absent)
+	     - other           → {text: v printString, media: []} fallback.
+
+	   Defensive against alien-bridge quirks at every leaf: the
+	   safeStringAt:-style pattern at v's text/media fields, try/catch
+	   around `media at: 'length'` for the substitution decision. A
+	   handler that returns garbage produces an empty-or-printString
+	   result rather than crashing the chat session. *)
+	| text media mlen |
+	v isKindOfString ifTrue: [
+		text:: v.
+		media:: createJSArray
+	] ifFalse: [
+		(v isKindOfJSAlien and: [v includesKey: 'text']) ifTrue: [
+			text:: [(v at: 'text'), ''] on: Exception do: [:e | ''].
+			media:: [v at: 'media'] on: Exception do: [:e | createJSArray].
+			media isNil ifTrue: [media:: createJSArray]
+		] ifFalse: [
+			text:: [v printString] on: Exception do: [:e | '<unprintable result>'].
+			media:: createJSArray
+		]
+	].
+	mlen:: [media at: 'length'] on: Exception do: [:e | 0].
+	mlen isNil ifTrue: [mlen:: 0].
+	(text isEmpty and: [mlen > 0]) ifTrue: [text:: 'See attached'].
+	^provider makeToolResult: id textResult: text media: media isError: isError
 )
 completeWithToolLoop ^ <Alien[Promise]> = (
 	(* One turn of the conversation, with recursion to handle tool-use
@@ -922,6 +1043,14 @@ responsePartsOf: response <Alien> ^ <Alien | UndefinedObject> = (
 	firstContent:: safeAt: firstCandidate field: 'content'.
 	^safeAt: firstContent field: 'parts'
 )
+public supportsFileUploads ^ <Boolean> = (
+	(* Gemini delivers media as inlineData parts that ride alongside the
+	   functionResponse part in the same user-role message. Image/PDF/
+	   audio/video are all supported; makeToolResult:textResult:media:
+	   isError: handles the split between the functionResponse text and
+	   the sibling inlineData parts. *)
+	^true
+)
 public hasToolUse: response <Alien> ^ <Boolean> = (
 	(* True if any part in the assistant's response is a functionCall.
 	   Gemini does not set a tool-use-specific stop_reason; the only
@@ -986,26 +1115,90 @@ public toolUseBlocksFrom: response <Alien> ^ <List> = (
 	].
 	^blocks
 )
-public makeToolResult: id <String> content: text isError: err <Boolean> ^ <Alien> = (
-	(* Build a Gemini functionResponse part. Gemini has no standard
-	   is_error flag; convention is to put the failure text under
-	   'error' instead of 'result' in the response payload so the model
-	   sees the distinction. The function name is recovered from
-	   pendingCallNames; if the id is missing (shouldn't happen in
-	   normal flow) we fall back to 'unknown' so the response still
-	   carries useful diagnostics. *)
-	| name part funcResp respBody |
+public makeToolResult: id <String>
+	textResult: text <String>
+	media: mediaParts <Alien[Array]>
+	isError: err <Boolean>
+	^ <Alien[Array]> = (
+	(* Build the Gemini parts for one tool call: a functionResponse part
+	   carrying the text, followed by an inlineData part per supported
+	   media item. Returned as an array because Gemini delivers media as
+	   sibling parts in the same user-role message (not inside the
+	   functionResponse, whose response field is JSON-only). The whole
+	   array is later flattened by addToolResults:toMessages: into the
+	   round's parts list.
+
+	   Gemini accepts image/*, audio/*, video/*, and application/pdf as
+	   inlineData. Other MIME types are dropped with a notice appended
+	   to the functionResponse text. Filenames have no native slot in
+	   inlineData, so they're surfaced via an 'Attached files: ...' line
+	   added to the text so the model can refer to them by name.
+
+	   Gemini has no standard is_error flag; convention is to put the
+	   failure text under 'error' instead of 'result'. The function name
+	   is recovered from pendingCallNames; missing id falls back to
+	   'unknown' so the response still carries useful diagnostics. *)
+	| parts name funcResp funcRespPart respBody finalText skippedNotes namedList
+	  inlineParts mlen |
 	name:: pendingCallNames at: id ifAbsent: ['unknown'].
+	finalText:: text.
+	skippedNotes:: ''.
+	namedList:: ''.
+	inlineParts:: List new.
+	mlen:: safeAt: mediaParts field: 'length'.
+	mlen isNil ifTrue: [mlen:: 0].
+	0 to: mlen - 1 do: [:i <Integer> |
+		| m mime b64 mname inlinePart inlineData label |
+		m:: mediaParts at: i.
+		mime:: safeStringAt: m field: 'mimeType'.
+		mime isNil ifTrue: [mime:: ''].
+		b64:: safeStringAt: m field: 'dataBase64'.
+		b64 isNil ifTrue: [b64:: ''].
+		mname:: safeStringAt: m field: 'name'.
+		mname isNil ifTrue: [mname:: ''].
+		((mime startsWith: 'image/') or: [
+		 (mime startsWith: 'audio/') or: [
+		 (mime startsWith: 'video/') or: [
+		  mime = 'application/pdf']]]) ifTrue: [
+			inlineData:: createJSObject.
+			inlineData at: 'mimeType' put: mime.
+			inlineData at: 'data' put: b64.
+			inlinePart:: createJSObject.
+			inlinePart at: 'inlineData' put: inlineData.
+			inlineParts add: inlinePart.
+			mname isEmpty ifFalse: [
+				namedList:: namedList isEmpty
+					ifTrue: [mname]
+					ifFalse: [namedList, ', ', mname]
+			]
+		] ifFalse: [
+			label:: mname isEmpty ifTrue: [mime] ifFalse: [mname, ' (', mime, ')'].
+			skippedNotes:: skippedNotes isEmpty
+				ifTrue: [label]
+				ifFalse: [skippedNotes, ', ', label]
+		]
+	].
+	namedList isEmpty ifFalse: [
+		finalText:: finalText, String lf, 'Attached files: ', namedList
+	].
+	skippedNotes isEmpty ifFalse: [
+		finalText:: finalText, String lf,
+			'[note: skipped attachments with media type not supported by Gemini: ',
+			skippedNotes, ']'
+	].
 	respBody:: createJSObject.
 	err
-		ifTrue: [respBody at: 'error' put: text]
-		ifFalse: [respBody at: 'result' put: text].
+		ifTrue: [respBody at: 'error' put: finalText]
+		ifFalse: [respBody at: 'result' put: finalText].
 	funcResp:: createJSObject.
 	funcResp at: 'name' put: name.
 	funcResp at: 'response' put: respBody.
-	part:: createJSObject.
-	part at: 'functionResponse' put: funcResp.
-	^part
+	funcRespPart:: createJSObject.
+	funcRespPart at: 'functionResponse' put: funcResp.
+	parts:: createJSArray.
+	parts push: funcRespPart.
+	inlineParts do: [:p | parts push: p].
+	^parts
 )
 public buildToolsPayload: toolDefs <List[Tool]> ^ <Alien[Array] | UndefinedObject> = (
 	(* Gemini's tools field shape: [{functionDeclarations: [...]}].
@@ -1030,12 +1223,30 @@ public buildToolsPayload: toolDefs <List[Tool]> ^ <Alien[Array] | UndefinedObjec
 	^arr
 )
 public addToolResults: results <Alien[Array]> toMessages: messages <List> = (
-	(* Gemini carries the round's functionResponse parts inside a single
-	   user-role message whose 'parts' is the array of parts. *)
-	| msg <Alien> |
+	(* Flatten the per-call parts arrays into one user-role message's
+	   parts list. Each entry in results is the JS array produced by
+	   makeToolResult:textResult:media:isError:: a functionResponse part
+	   followed by zero or more inlineData parts (the media siblings
+	   that Gemini delivers alongside the functionResponse in the same
+	   wrapping user message). Flattening collapses N arrays-of-parts
+	   into one flat parts array, which is the shape Gemini's API
+	   expects. *)
+	| msg parts rlen |
+	parts:: createJSArray.
+	rlen:: safeAt: results field: 'length'.
+	rlen isNil ifTrue: [rlen:: 0].
+	0 to: rlen - 1 do: [:i <Integer> |
+		| entry elen |
+		entry:: results at: i.
+		elen:: safeAt: entry field: 'length'.
+		elen isNil ifTrue: [elen:: 0].
+		0 to: elen - 1 do: [:j <Integer> |
+			parts push: (entry at: j)
+		]
+	].
 	msg:: createJSObject.
 	msg at: 'role' put: 'user'.
-	msg at: 'parts' put: results.
+	msg at: 'parts' put: parts.
 	messages add: msg
 )
 public complete: messages <Alien[Array]>

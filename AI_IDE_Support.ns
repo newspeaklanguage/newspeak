@@ -1816,73 +1816,80 @@ readFileAsBase64: file <Alien> ^ <Alien[Promise]> = (
 	reader readAsDataURL: file.
 	^deferred at: 'promise'
 )
-fileToContentBlock: file <Alien> ^ <Alien[Promise]> = (
-	(* Dispatch on the file's MIME type to build the right Anthropic content
-	   block. Resolves to a single JS content-block object suitable for
-	   inclusion in tool_result.content (which accepts text, image,
-	   document, search_result, and tool_reference blocks). PDFs become
-	   document blocks; images become image blocks; everything else is
-	   read as text and returned as a text block. *)
-	| mime <String> name <String> |
+isBinaryMime: mime <String> ^ <Boolean> = (
+	(* Known binary MIME categories we deliver as media attachments. Everything
+	   else (text/*, application/json/xml/javascript, application/octet-stream,
+	   empty/unknown) falls through to the text-decoding path. SVG (image/
+	   svg+xml) is text-shaped but still goes through the image media path
+	   because providers that accept image/* take SVG verbatim. *)
+	mime = 'application/pdf' ifTrue: [^true].
+	(mime startsWith: 'image/') ifTrue: [^true].
+	(mime startsWith: 'audio/') ifTrue: [^true].
+	(mime startsWith: 'video/') ifTrue: [^true].
+	^false
+)
+toolResultText: text <String> ^ <Alien> = (
+	(* Canonical {text, media: []} JS object for a text-only result. *)
+	| result emptyMedia |
+	emptyMedia:: aiAccess JSON parse: '[]'.
+	result:: aiAccess JSON parse: '{}'.
+	result at: 'text' put: text.
+	result at: 'media' put: emptyMedia.
+	^result
+)
+toolResultMediaB64: b64 <String> mime: mime <String> name: name <String> ^ <Alien> = (
+	(* Canonical {text, media: [{mimeType, dataBase64, name}]} JS object for
+	   a single media attachment. The text field announces the attachment so
+	   the model has a textual reference; the provider's makeToolResult:
+	   may further augment it (e.g. Gemini appends 'Attached files: …'). *)
+	| result media part text |
+	text:: name isEmpty
+		ifTrue: ['Attached file (', mime, ')']
+		ifFalse: ['Attached: ', name].
+	part:: aiAccess JSON parse: '{}'.
+	part at: 'mimeType' put: mime.
+	part at: 'dataBase64' put: b64.
+	name isEmpty ifFalse: [part at: 'name' put: name].
+	media:: aiAccess JSON parse: '[]'.
+	media push: part.
+	result:: aiAccess JSON parse: '{}'.
+	result at: 'text' put: text.
+	result at: 'media' put: media.
+	^result
+)
+fileToToolResult: file <Alien> ^ <Alien[Promise]> = (
+	(* Resolves to the canonical {text, media} JS object the upload_file tool
+	   hands back to Session. Binary files — image/*, application/pdf,
+	   audio/*, video/* — are read as base64 and packaged as a single media
+	   attachment; everything else is decoded as text and returned as the
+	   text field with a filename prefix. The provider's makeToolResult:
+	   then translates this canonical form into its native shape — and
+	   drops any media MIME it can't carry, with a note in the text. *)
+	| mime name |
 	(* JS undefined doesn't satisfy isNil; the ", ''" pattern coerces a real
 	   String through and raises on anything else (undefined, null, numbers). *)
 	mime:: [(file at: 'type'), ''] on: Exception do: [:e | ''].
 	name:: [(file at: 'name'), ''] on: Exception do: [:e | ''].
-	mime = 'application/pdf' ifTrue: [
+	(isBinaryMime: mime) ifTrue: [
 		^(readFileAsBase64: file) then: [:b64 <String> |
-			| block <Alien> source <Alien> |
-			source:: aiAccess JSON parse: '{}'.
-			source at: 'type' put: 'base64'.
-			source at: 'media_type' put: 'application/pdf'.
-			source at: 'data' put: b64.
-			block:: aiAccess JSON parse: '{}'.
-			block at: 'type' put: 'document'.
-			block at: 'source' put: source.
-			name isEmpty ifFalse: [block at: 'title' put: name].
-			block
+			toolResultMediaB64: b64 mime: mime name: name
 		]
 	].
-	(mime startsWith: 'image/') ifTrue: [
-		^(readFileAsBase64: file) then: [:b64 <String> |
-			| block <Alien> source <Alien> |
-			source:: aiAccess JSON parse: '{}'.
-			source at: 'type' put: 'base64'.
-			source at: 'media_type' put: mime.
-			source at: 'data' put: b64.
-			block:: aiAccess JSON parse: '{}'.
-			block at: 'type' put: 'image'.
-			block at: 'source' put: source.
-			block
-		]
-	].
-	(* Default: treat as text. Prefixes the filename so the model knows what
-	   it just received; for unknown binary types this will be garbled but
-	   the AI can detect and recover. *)
 	^(file text) then: [:text <String> |
-		| block <Alien> body <String> |
+		| body |
 		body:: name isEmpty
 			ifTrue: [text]
 			ifFalse: [name, String lf, String lf, text].
-		block:: aiAccess JSON parse: '{}'.
-		block at: 'type' put: 'text'.
-		block at: 'text' put: body.
-		block
+		toolResultText: body
 	]
 )
 uploadFileTool ^ <Tool> = (
 	^Tool
 		name: 'upload_file'
-		description: 'Ask the user to upload a file from their local filesystem. Opens an OS file picker; the user selects one file and the tool returns its contents in the tool_result. Text files (text/*, json, xml, source, etc.) are returned as a text block; images (image/jpeg, image/png, image/gif, image/webp) as an image block; PDFs (application/pdf) as a document block. Use this when you need the user to share a file you cannot otherwise read (e.g., a local source file outside the IDE namespace, a configuration file, a log, a screenshot, a PDF). The tool errors with "File selection canceled" if the user dismisses the picker.'
+		description: 'Ask the user to upload a file from their local filesystem. Opens an OS file picker; the user selects one file and the tool returns its contents. Text files (text/*, JSON, XML, source code, etc.) are decoded and returned as text. Binary files — images, PDFs, audio, and video — are returned as media attachments; provider support for each media type varies, and the tool result will note any attachment your model cannot see. Use this when you need the user to share a file you cannot otherwise read (e.g., a local source file outside the IDE namespace, a configuration file, a log, a screenshot, a PDF). The tool errors with "File selection canceled" if the user dismisses the picker.'
 		inputSchema: '{"type":"object","properties":{},"required":[]}'
 		handler: [:input |
-			pickFile then: [:file <Alien> |
-				(fileToContentBlock: file) then: [:block <Alien> |
-					| arr <Alien> |
-					arr:: aiAccess JSON parse: '[]'.
-					arr push: block.
-					arr
-				]
-			]
+			pickFile then: [:file <Alien> | fileToToolResult: file]
 		]
 )
 parentNamespaceAndLeaf: dottedPath <String> ^ <Object> = (

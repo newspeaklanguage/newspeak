@@ -407,62 +407,22 @@ public class ChatDocument named: n <String>
 	public providerName <String> = pn.
 	public modelName <String> ::= mn.
 	chatSubject_slot
-	twoViewEditor_slot
 |
 ) (
 public isKindOfChatDocument ^ <Boolean> = ( ^true )
-public noteLiveViewRendered: aTwoViewEditor = (
-	(* Capture the TwoViewEditor presenter that is currently rendering this
-	   doc, so the chat subject can call refreshLiveView after mutating
-	   contents (appending turn sections). DocumentPresenter calls this
-	   whenever it builds the editor — including on re-renders, so we always
-	   point at the latest one. *)
-	twoViewEditor_slot:: aTwoViewEditor
-)
-public refreshLiveView = (
-	(* Tell the displayed live view to re-render from the current contents.
-	   No-op if the doc isn't currently displayed (we never saw a
-	   noteLiveViewRendered:, or the editor we did see is no longer in
-	   the live hierarchy because the user navigated away).
-
-	   The liveness check is important: twoViewEditor_slot is updated
-	   on every DocumentPresenter render of this doc via
-	   noteLiveViewRendered:, but is NOT cleared when the user
-	   navigates away. So between navigation-away and any later
-	   navigation back, the slot points at a detached TwoViewEditor.
-	   If a chat-subject side effect (sendText:, markComplete,
-	   markError:) fires in that window — e.g. a tool-loop response
-	   resolving on a chat we just switched away from — calling
-	   refresh on the detached editor walks into shell on a
-	   parent-less DocumentPresenter and raises. Probing via shell
-	   (the same call that would raise) lets us detect the staleness
-	   cheaply and drop the slot; the next render of this doc will
-	   install a fresh one.
-
-	   Also clear the amplet fragmentMapping/expressionMapping caches before
-	   refreshing. The TwoViewEditor caches each amplet's evaluated fragment
-	   by ampletId — without invalidation, the cached ChatStatusPresenter
-	   sticks around with its previous waiting=true state even after the
-	   chat subject moved on. Clearing forces structural amplets to
-	   re-evaluate against the current subject state. The AmpleforthTarget-
-	   Document entry is preserved because it carries the doc identity, not
-	   an amplet result. *)
-	| ed |
-	ed:: twoViewEditor_slot.
-	ed isNil ifTrue: [^self].
-	(twoViewEditorIsLive: ed) ifFalse: [
-		twoViewEditor_slot:: nil.
-		^self
-	].
-	invalidateAmpletCachesOn: ed.
-	ed refresh
-)
-twoViewEditorIsLive: ed <TwoViewEditor> ^ <Boolean> = (
-	(* True iff ed's parent chain still reaches a HopscotchShell —
-	   i.e. ed is in the currently-displayed hierarchy. Probe by
-	   asking for shell; a parent-less ancestor raises the same
-	   'hierarchy not installed' error we're guarding against. *)
-	^[ed shell. true] on: Exception do: [:e | false]
+public prepareForLiveViewRefresh: editor = (
+	(* Clear the editor's amplet fragmentMapping/expressionMapping caches
+	   before the live view refreshes. The TwoViewEditor caches each
+	   amplet's evaluated fragment by ampletId; for chat docs the
+	   structural amplets (chatControls, thinkingOrModelPicker,
+	   userInputEditor) evaluate to fragments whose state depends on the
+	   chat subject (e.g. ChatStatusPresenter's waiting flag), so reusing
+	   a cached fragment would freeze that state. The AmpleforthTarget-
+	   Document entry is preserved because it carries the doc identity,
+	   not an amplet result. The chat input's typed-but-unsent draft
+	   survives because it's bound to the chat subject's `draft` slot,
+	   not held in the recreated CodeMirror's UI state. *)
+	invalidateAmpletCachesOn: editor
 )
 invalidateAmpletCachesOn: editor = (
 	| keysToRemove <List> |
@@ -621,7 +581,7 @@ insertTurnSection: text <String> role: role <String> = (
 	section appendChild: textCol.
 	parent:: thinking at: 'parentNode'.
 	parent insertBefore: section before: thinking.
-	contents: (container at: 'innerHTML')
+	mutateContentsTo: (container at: 'innerHTML')
 )
 ) : (
 )
@@ -647,23 +607,25 @@ public sendText: text <String> ^ <Alien[Promise] | UndefinedObject> = (
 	text isEmpty ifTrue: [^nil].
 	document appendUserSection: text.
 	lastTurnIndexBeforeSend:: session displayMessages size.
+	(* super sendText: flips the chat subject's waiting flag, but it does
+	   so AFTER our appendUserSection: above has already published. So we
+	   re-publish here via a no-op mutation so the live view picks up the
+	   thinking indicator alongside the user section. *)
 	promise:: super sendText: text.
-	(* Refresh AFTER super so the live view picks up both the new user
-	   section (HTML) and the thinking indicator (chat subject's waiting
-	   flag, which super just set). *)
-	document refreshLiveView.
+	document mutateContentsTo: document contents.
 	^promise
 )
 public markComplete = (
 	super markComplete.
 	appendNewAssistantTurnsAfter: lastTurnIndexBeforeSend.
-	document refreshLiveView.
+	(* super flipped waiting back to false. Re-publish so the thinking
+	   indicator is replaced with the model picker. *)
+	document mutateContentsTo: document contents.
 	ide browsing updateCurrentDisplay
 )
 public markError: msg <String> = (
 	super markError: msg.
 	document appendErrorSection: msg.
-	document refreshLiveView.
 	ide browsing updateCurrentDisplay
 )
 appendNewAssistantTurnsAfter: startIdx <Integer> = (
@@ -691,10 +653,9 @@ public sendText: text <String> attachments: docs <List> ^ <Alien[Promise] | Unde
 	document appendUserSection: text.
 	lastTurnIndexBeforeSend:: session displayMessages size.
 	promise:: super sendText: text attachments: docs.
-	(* Refresh AFTER super so the live view picks up both the new user
-	   section (HTML) and the thinking indicator (chat subject's waiting
-	   flag, which super just set). *)
-	document refreshLiveView.
+	(* Re-publish via a no-op mutation so the live view picks up the
+	   thinking indicator from the waiting flag super just set. *)
+	document mutateContentsTo: document contents.
 	^promise
 )
 ) : (
@@ -2038,7 +1999,7 @@ setDocumentContentsTool ^ <Tool> = (
 			| name doc |
 			name:: input at: 'name'.
 			doc:: documentAt: name.
-			doc contents: (input at: 'contents').
+			doc mutateContentsTo: (input at: 'contents').
 			ide browsing updateCurrentDisplay.
 			'Updated contents of ', name
 		]
@@ -2133,7 +2094,7 @@ addAmpletTool ^ <Tool> = (
 			thinking isNil
 				ifTrue: [body appendChild: newAmplet]
 				ifFalse: [(thinking at: 'parentNode') insertBefore: newAmplet before: thinking].
-			doc contents: (container at: 'innerHTML').
+			doc mutateContentsTo: (container at: 'innerHTML').
 			ide browsing updateCurrentDisplay.
 			'Added amplet to ', name, ' (ampletId=', newId, ')'
 		]
@@ -2152,7 +2113,7 @@ setAmpletExpressionTool ^ <Tool> = (
 			container:: parseAmpletContainer: doc contents.
 			amplet:: findAmpletWithId: aid in: container.
 			amplet setAttribute: 'name' to: expr.
-			doc contents: (container at: 'innerHTML').
+			doc mutateContentsTo: (container at: 'innerHTML').
 			ide browsing updateCurrentDisplay.
 			'Updated amplet ', aid, ' in ', name
 		]
@@ -2171,7 +2132,7 @@ deleteAmpletTool ^ <Tool> = (
 			amplet:: findAmpletWithId: aid in: container.
 			parent:: amplet at: 'parentNode'.
 			parent removeChild: amplet.
-			doc contents: (container at: 'innerHTML').
+			doc mutateContentsTo: (container at: 'innerHTML').
 			ide browsing updateCurrentDisplay.
 			'Deleted amplet ', aid, ' from ', name
 		]

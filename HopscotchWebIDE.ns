@@ -174,6 +174,9 @@ definition = (
 class HopscotchWebIDE usingPlatform: p = (
 	|
 	public Map = p collections Map.
+	private List = p collections List.
+	private StringBuilder = p kernel StringBuilder.
+	private Promise = p js global at: 'Promise'.
         public images = p hopscotch images(*HopscotchImages usingPlatform: p*). 
 	public browsing = Browsing usingPlatform: p ide: self.
     public debugging = Debugging usingPlatform: p ide: self.
@@ -241,11 +244,18 @@ public installFromBuilders: bs <Array[ClassDeclarationBuilder]> ^ <List[MixinMir
   ^installFromBuilders: bs into: namespacing Root.
 )
 public installFromBuilders: bs <Array[ClassDeclarationBuilder]> into: namespace <Map[Symbol, Object]> ^ <List[MixinMirror]> = (
-(* A centralized method for installing new code from the IDE *)
+(* A centralized method for installing new code from the IDE. Captures
+   per-class baselines from the LIVE pre-install state BEFORE the install
+   so the drafts hook can record them; the live mirrors will reflect the
+   new state once atomicInstaller runs. *)
   |
   lastBackup <Map[Symbol, String]> = backup.
   (* Make sure all builders are top level *)
   builders <Array[ClassDeclarationBuilder]> = bs collect: [:b <ClassDeclartionBuilder> | topMostBuilderOf: b].
+  (* Snapshot the live per-class state BEFORE installing so the drafts
+     hook can compare against drafts' latest commit and emit a Baseline
+     or Resync commit when needed. Synchronous walk; cheap. *)
+  baselines = computeBaselinesFor: builders inNamespace: namespace.
   (* Install the code *)
   mixins = atomicInstaller install: builders into: namespace.
   |
@@ -258,29 +268,296 @@ public installFromBuilders: bs <Array[ClassDeclarationBuilder]> into: namespace 
   localStorage setItem: #backup to: (json encode: lastBackup).
   (* Timestamp latest backup *)
   localStorage setItem: #lastBackupTime to: incrementedVersion.
-  (* Drafts hook (git-as-infinite-undo): record the touched classes as
-     a commit in the hidden drafts repo. Fire-and-forget; failures are
-     logged to the console but don't fail the install. *)
-  recordAcceptForBuilders: builders.
+  (* Drafts hook (git-as-infinite-undo): record per-member commits in the
+     hidden drafts repo. Fire-and-forget; failures are logged to the console
+     but don't fail the install. *)
+  recordAcceptForBuilders: builders baselines: baselines.
   ^mixins
 )
-recordAcceptForBuilders: builders <Array[ClassDeclarationBuilder]> = (
-(* Build a filename -> source Map for the touched classes and commit
-   it to the drafts repo. The Promise returned by recordSnapshot:
-   is intentionally not awaited - Accepts complete synchronously and
-   the commit lands in the background. *)
-  | files msg |
-  files:: Map new.
-  msg:: ''.
+(* === Per-member drafts: filename scheme + walk ============================
+   Each touched top-level class C becomes a subtree:
+     C/header.ns                          class header (covers all regular
+                                          slots, factory, slot block,
+                                          superclass clause)
+     C/method.<selector>.ns               instance method
+     C/lazy-slot.<name>.ns                instance lazy slot
+     C/class-method.<selector>.ns         class-side method
+     C/D/...                              nested class recurses
+
+   Class-side slots and lazy slots don't exist in Newspeak so they're
+   absent from the scheme. Regular instance slots live entirely in
+   header.ns; no separate slot.*.ns files.
+
+   Selector / lazy-slot names are percent-encoded for filesystem use:
+     '%' -> '%25' (escape char itself; encoded first to avoid double-encode)
+     '/' -> '%2F' (path separator -- mandatory; binary selectors can
+                    contain '/' per the Newspeak grammar)
+   All other binary chars (+ * - = < > ~ & | ? ! , @) and ':' (keyword
+   selectors) stay raw -- lightning-fs / git's pathname handling on the
+   browser side accept them fine. *)
+encodeForFilename: s <String> ^ <String> = (
+  ^replaceIn: (replaceIn: s all: '%' with: '%25') all: '/' with: '%2F'
+)
+decodeFromFilename: s <String> ^ <String> = (
+  (* Inverse of encodeForFilename:. Decode '/' first so that an encoded
+     '%2F' doesn't get partially undone by the '%25' -> '%' pass. *)
+  ^replaceIn: (replaceIn: s all: '%2F' with: '/') all: '%25' with: '%'
+)
+replaceIn: s <String> all: oldSub <String> with: newSub <String> ^ <String> = (
+  (* String replace helper. Primordialsoup's kernel String doesn't carry
+     replaceAll:with: (that one lives on KernelForJS), so we build the
+     result by scanning oldSub via indexOf:startingAt: and accumulating
+     into a StringBuilder. *)
+  | result idx start |
+  oldSub isEmpty ifTrue: [^s].
+  result:: StringBuilder new.
+  start:: 1.
+  idx:: s indexOf: oldSub startingAt: start.
+  [idx > 0] whileTrue: [
+    result add: (s copyFrom: start to: idx - 1).
+    result add: newSub.
+    start:: idx + oldSub size.
+    idx:: s indexOf: oldSub startingAt: start].
+  result add: (s copyFrom: start to: s size).
+  ^result asString
+)
+walkClassDecl: cd intoPath: prefix <String> files: outMap <Map[String, String]> = (
+(* Polymorphic over ClassDeclarationBuilder and ClassDeclarationMirror --
+   both expose name, header source, instanceSide/classSide each with
+   methods/lazySlots/nestedClasses iterable via do:, yielding mirrors or
+   builders with name + source. Writes every member of cd's subtree into
+   outMap at <prefix><name>/<kind>.<id>.ns. *)
+  | className thisDir |
+  className:: cd name asString.
+  thisDir:: prefix, className, '/'.
+  outMap at: thisDir, 'header.ns' put: cd header source.
+  cd instanceSide methods do: [:m |
+    outMap at: thisDir, 'method.', (encodeForFilename: m name asString), '.ns'
+      put: m source].
+  cd instanceSide lazySlots do: [:ls |
+    outMap at: thisDir, 'lazy-slot.', (encodeForFilename: ls name asString), '.ns'
+      put: ls source].
+  cd classSide methods do: [:m |
+    outMap at: thisDir, 'class-method.', (encodeForFilename: m name asString), '.ns'
+      put: m source].
+  cd instanceSide nestedClasses do: [:nc |
+    walkClassDecl: nc intoPath: thisDir files: outMap].
+  cd classSide nestedClasses do: [:nc |
+    (* Class-side nested classes are rare but grammatically legal. *)
+    walkClassDecl: nc intoPath: thisDir files: outMap]
+)
+computeBaselinesFor: builders <Array[ClassDeclarationBuilder]> inNamespace: namespace
+  ^ <Map[String, Map[String, String]]> = (
+(* For each top-level builder, look up the LIVE class in namespace.
+   If present, walk the live ClassDeclarationMirror into a per-class
+   {path -> source} Map and store it under the class's simple name in
+   the result. Brand-new classes (not in namespace) get no entry; the
+   Accept commit will record them as additions without a Baseline.
+
+   The walk is wrapped in on:Error do: -- some live classes have partial
+   mirror state (e.g. nested classes with nil _classMixin) that crash the
+   walker on classSide methods/nestedClasses iteration. When that happens
+   we skip the baseline for that class and let the Accept record the new
+   state without a Baseline commit. *)
+  | result |
+  result:: Map new.
   builders do: [:b <ClassDeclarationBuilder> |
-    files at: b name, '.ns' put: b source.
-    msg:: msg isEmpty
-      ifTrue: [b name]
-      ifFalse: [msg, ', ', b name]].
-  msg:: 'Accept: ', msg.
-  (drafts recordSnapshot: files message: msg)
+    | className liveClass perClass |
+    className:: b name asString.
+    liveClass:: namespace at: b name ifAbsent: [
+      namespace at: className ifAbsent: [nil]].
+    nil = liveClass ifFalse: [
+      [perClass:: Map new.
+       walkClassDecl: ((platformHolder mirrors ClassMirror reflecting: liveClass) mixin declaration)
+         intoPath: ''
+         files: perClass.
+       result at: className put: perClass]
+         on: Exception
+         do: [:ex |
+           (* Catch Exception, not Error: MessageNotUnderstood extends
+              Exception directly, not Error, so on:Error do: lets DNU
+              propagate. The walk hits DNU when nested-class mirrors have
+              nil _classMixin or similar partial state. *)
+           ('Drafts baseline walk failed for ', className, ': ', ex printString) out]]].
+  ^result
+)
+recordAcceptForBuilders: builders <Array[ClassDeclarationBuilder]> baselines: baselineMap <Map[String, Map[String, String]]> = (
+(* Per-member drafts hook. Builds the Accept files map by walking every
+   touched top-level builder, then chains:
+     1. For each touched class with a baseline: check whether drafts'
+        latest tree under '<C>/' differs from the live baseline. If yes
+        (or drafts has no '<C>/' yet), emit a 'Baseline: C' / 'Resync from
+        vfuel: C' commit recording the baseline.
+     2. Then emit a single 'Accept: <names>' commit with per-member
+        change list built from the diff returned by stageSubtreeReplacements.
+   Fire-and-forget at the top level; failures log to console. *)
+  | acceptFiles touchedPrefixes touchedNames classNamesInOrder chain |
+  acceptFiles:: Map new.
+  touchedPrefixes:: List new.
+  touchedNames:: List new.
+  classNamesInOrder:: List new.
+  builders do: [:b <ClassDeclarationBuilder> |
+    | name |
+    name:: b name asString.
+    walkClassDecl: b intoPath: '' files: acceptFiles.
+    touchedPrefixes add: name, '/'.
+    touchedNames add: name.
+    classNamesInOrder add: name].
+
+  (* Start the chain with a resolved Promise rather than calling
+     drafts ensureInitialized directly: that's a protected method
+     (default access) so an external send DNUs. The public DraftsRepo
+     methods we ultimately call (hasSubtree:, divergesFromHEAD:newFiles:,
+     stageSubtreeReplacements:newFiles:) each invoke ensureInitialized
+     internally, so the init runs exactly once anyway. *)
+  chain:: Promise resolve: nil.
+  classNamesInOrder do: [:cn |
+    | baselineFiles |
+    baselineFiles:: baselineMap at: cn ifAbsent: [nil].
+    (nil = baselineFiles or: [baselineFiles isEmpty]) ifFalse: [
+      chain:: chain then: [:r |
+        maybeCommitBaselineFor: cn files: baselineFiles]]].
+
+  chain:: chain then: [:r |
+    | prefixesArr |
+    prefixesArr:: List new.
+    touchedPrefixes do: [:pp | prefixesArr add: pp].
+    (drafts stageSubtreeReplacements: prefixesArr asArray newFiles: acceptFiles)
+      then: [:diff |
+        | msg |
+        msg:: acceptMessageFromDiff: diff classNames: touchedNames.
+        drafts commit: msg]].
+
+  chain
     then: [:sha | nil]
-    onRejected: [:err | ('Drafts commit failed: ', err printString) out. nil].
+    onRejected: [:err | ('Drafts commit failed: ', err printString) out. nil]
+)
+maybeCommitBaselineFor: className <String> files: baselineFiles <Map[String, String]> ^ <Alien[Promise]> = (
+(* Inspect drafts: if its latest tree under '<className>/' matches the
+   live baseline, do nothing. Otherwise stage the baseline and commit it
+   with either 'Baseline: ' (drafts had no prior <className>/) or
+   'Resync from vfuel: ' (drafts had it but contents diverged). *)
+  | prefix |
+  prefix:: className, '/'.
+  ^(drafts divergesFromHEAD: prefix newFiles: baselineFiles) then: [:diverged |
+    diverged
+      ifFalse: [Promise resolve: nil]
+      ifTrue: [
+        (drafts hasSubtree: className) then: [:hasExisting |
+          | label prefixesArr |
+          label:: hasExisting
+            ifTrue: ['Resync from vfuel: ']
+            ifFalse: ['Baseline: '].
+          prefixesArr:: List new.
+          prefixesArr add: prefix.
+          (drafts stageSubtreeReplacements: prefixesArr asArray newFiles: baselineFiles)
+            then: [:diff | drafts commit: label, className]]]]
+)
+acceptMessageFromDiff: diff classNames: classNames <List[String]> ^ <String> = (
+(* Build a multi-line commit message:
+     Subject:  'Accept: <class names joined by comma>'
+     Body:     per-class blocks listing + (added), ~ (modified), - (removed)
+               members, with members labeled by their kind. *)
+  | added modified removed sb subject pathsByClass |
+  added:: diff at: 'added'.
+  modified:: diff at: 'modified'.
+  removed:: diff at: 'removed'.
+  subject:: ''.
+  classNames do: [:n |
+    subject:: subject isEmpty ifTrue: [n] ifFalse: [subject, ', ', n]].
+  pathsByClass:: Map new.
+  classNames do: [:n |
+    | classBlock |
+    classBlock:: Map new.
+    classBlock at: 'added' put: List new.
+    classBlock at: 'modified' put: List new.
+    classBlock at: 'removed' put: List new.
+    pathsByClass at: n put: classBlock].
+  partitionDiffPaths: added marker: 'added' into: pathsByClass.
+  partitionDiffPaths: modified marker: 'modified' into: pathsByClass.
+  partitionDiffPaths: removed marker: 'removed' into: pathsByClass.
+  sb:: StringBuilder new.
+  (* Subject line + LF *)
+  sb writeln: 'Accept: ', subject.
+  classNames do: [:n |
+    | block hasAny |
+    block:: pathsByClass at: n.
+    hasAny:: (block at: 'added') isEmpty not
+       or: [(block at: 'modified') isEmpty not
+       or: [(block at: 'removed') isEmpty not]].
+    hasAny ifTrue: [
+      (* Blank line between subject/prev block and this block, then the
+         class header. *)
+      sb writeln: ''.
+      sb writeln: n.
+      (block at: 'added') do: [:p |
+        sb writeln: '  + ', (pathToMemberLabel: p forClass: n)].
+      (block at: 'modified') do: [:p |
+        sb writeln: '  ~ ', (pathToMemberLabel: p forClass: n)].
+      (block at: 'removed') do: [:p |
+        sb writeln: '  - ', (pathToMemberLabel: p forClass: n)]]].
+  ^sb asString
+)
+partitionDiffPaths: jsArray marker: key into: pathsByClass <Map[String, Map[String, List[String]]]> = (
+(* jsArray is a JS array of paths like 'Foo/method.bar.ns' or
+   'Foo/D/method.qux.ns'. Drop each path into pathsByClass[<topLevel>][key]. *)
+  0 to: (jsArray at: 'length') - 1 do: [:i |
+    | p slashIdx topLevel block bucket |
+    p:: jsArray at: i.
+    slashIdx:: p indexOf: '/' startingAt: 1.
+    slashIdx = 0 ifFalse: [
+      topLevel:: p copyFrom: 1 to: slashIdx - 1.
+      block:: pathsByClass at: topLevel ifAbsent: [nil].
+      nil = block ifFalse: [
+        bucket:: block at: key.
+        bucket add: p]]]
+)
+pathToMemberLabel: path <String> forClass: className <String> ^ <String> = (
+(* Turn a path like 'Foo/method.bar.ns' / 'Foo/D/method.qux.ns' into a
+   human-readable member label like 'method bar' / 'D method qux'.
+   className is the top-level class -- we strip the leading '<className>/'
+   then split the rest on '/' to surface nested-class qualifiers. *)
+  | remainder segments leafKind leafName i prefixLen qualifier |
+  prefixLen:: className size + 2.   (* '<className>/' *)
+  remainder:: path copyFrom: prefixLen to: path size.
+  (* Strip trailing '.ns'. *)
+  (remainder endsWith: '.ns') ifTrue: [
+    remainder:: remainder copyFrom: 1 to: remainder size - 3].
+  (* Split remainder on '/' -- everything but the last segment is a
+     nested-class qualifier; the last segment is '<kind>.<id>' or 'header'. *)
+  segments:: List new.
+  i:: 1.
+  [i <= remainder size] whileTrue: [
+    | nextSlash |
+    nextSlash:: remainder indexOf: '/' startingAt: i.
+    nextSlash = 0
+      ifTrue: [
+        segments add: (remainder copyFrom: i to: remainder size).
+        i:: remainder size + 1]
+      ifFalse: [
+        segments add: (remainder copyFrom: i to: nextSlash - 1).
+        i:: nextSlash + 1]].
+  qualifier:: ''.
+  1 to: segments size - 1 do: [:k |
+    qualifier:: qualifier isEmpty
+      ifTrue: [segments at: k]
+      ifFalse: [qualifier, '.', (segments at: k)]].
+  ^qualifier isEmpty
+    ifTrue: [memberKindOf: segments last]
+    ifFalse: [qualifier, ' ', (memberKindOf: segments last)]
+)
+memberKindOf: leaf <String> ^ <String> = (
+(* leaf is one of 'header', 'method.<encoded sel>', 'lazy-slot.<name>',
+   or 'class-method.<encoded sel>'. Recognize the prefix, decode the
+   remainder, return a human label. *)
+  leaf = 'header' ifTrue: [^'header'].
+  (leaf startsWith: 'method.') ifTrue: [
+    ^'method ', (decodeFromFilename: (leaf copyFrom: 8 to: leaf size))].
+  (leaf startsWith: 'lazy-slot.') ifTrue: [
+    ^'lazy slot ', (decodeFromFilename: (leaf copyFrom: 11 to: leaf size))].
+  (leaf startsWith: 'class-method.') ifTrue: [
+    ^'class-side method ', (decodeFromFilename: (leaf copyFrom: 14 to: leaf size))].
+  ^leaf
 )
 lastBackupTime ^ <Integer> = (
   | backupString <String> = [localStorage getItem:  #lastBackupTime] on: Error do: [:e | '0']. |

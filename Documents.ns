@@ -54,7 +54,8 @@ Copyright Gilad Bracha 2022-2025
     private Subject = p hopscotch Subject.
     private Presenter = p hopscotch Presenter.
     private DOMParser = p hopscotch DOMParser.
-    private ClassMirror = p mirrors ClassMirror.    
+    private Duct = p hopscotch ducts Duct.
+    private ClassMirror = p mirrors ClassMirror.
     private ObjectMirror = p mirrors ObjectMirror.
     private Color = p graphics Color.
     private ProgrammingPresenter = webIDE browsing ProgrammingPresenter.
@@ -743,11 +744,12 @@ Common usages (like embedding a workspace or an object presenter) are supported 
     public mirror = ObjectMirror reflecting: self.
     (* A counter for amplets, so each amplet gets a unique id *)
     public maxAmpletCount <Integer> ::= 0.
-    (* All external media used by the document are stored in a map keyed by the media's path *) 
+    (* All external media used by the document are stored in a map keyed by the media's path *)
     public mediaRegistry <Map[String, Blob]> ::= Map new.
     public lastMediaAmplet <MediaCreatorFragment>
 	|
 ) (
+lazy public contentsChanged = Duct new.
 public isKindOfDocument ^ <Boolean> = (
   ^true
 )
@@ -895,11 +897,15 @@ transcludeClass: className <String> = (
 public addContentsUsingFolder: folder = (
   (* Docu-apps that have specific data representations they need to be able to save should do this here. By default, do nothing *)
 )
-public noteLiveViewRendered: aTwoViewEditor = (
-  (* Hook: subclasses (e.g. ChatDocument) override to capture the
-     TwoViewEditor presenter rendering this document, so they can trigger
-     a live-view refresh when they mutate contents programmatically.
-     Default: no-op. *)
+public mutateContentsTo: s <String> = (
+  (* Programmatic mutation entry point: set `contents` and publish a
+     change event through `contentsChanged`. Tools, chat sessions, and
+     any out-of-band write that needs the live view to reflect the new
+     bytes should use this. The auto-generated `contents:` setter
+     remains the quiet path used by the live view's own keystroke
+     handler. *)
+  contents:: s.
+  contentsChanged send: self
 )
 jsDocument = (
   ^platform js global at: #document
@@ -1092,6 +1098,33 @@ public standaloneMediaVersion = (
 (* Copy DOM *)
 (* Find all media nodes, and for each one, replace with a standard node *)
 )
+public prepareForLiveViewRefresh: editor <TwoViewEditorPresenter> = (
+  (* Invalidate the editor's cached fragment for any amplet whose
+     value depends on state outside its own expression text. The
+     fragment cache is keyed by expression text (see
+     AmpleforthFragment>>processChildren): same expression =>
+     reuse the prior fragment. That optimization is wrong for
+     transclusions, because `transclude: 'B'` keeps the same
+     expression text even when document B's contents change, so
+     edits to B never appear in a document that transcludes it.
+     Drop those entries from both fragmentMapping and
+     expressionMapping so the next refresh re-evaluates them. *)
+  | keysToDrop <List[String]> = List new. |
+  editor expressionMapping keysAndValuesDo: [:k <String> :expr <String> |
+    (dependsOnExternalState: expr) ifTrue: [keysToDrop add: k]
+    ].
+  keysToDrop do: [:k <String> |
+    editor fragmentMapping removeKey: k ifAbsent: [].
+    editor expressionMapping removeKey: k ifAbsent: []
+    ]
+)
+dependsOnExternalState: expression <String> ^ <Boolean> = (
+  (* True if the amplet expression's result can change without the
+     expression text changing — currently the transclusion forms,
+     which dereference another document or class by name. *)
+  ^(expression startsWith: 'transclude:')
+    or: [expression startsWith: 'transcludeClass:']
+)
 ) : (
 )
 class DocumentPresenter onDocumentSubject: s = ProgrammingPresenter onSubject: s (
@@ -1159,7 +1192,19 @@ helpText ^ <AmpleforthFragment> = (
 )
 definition ^ <Fragment> = (
   twoViewEditor::  (TwoViewEditorSubject onModel:  subject document) presenter.
-  subject document noteLiveViewRendered: twoViewEditor.
+  (* Subscribe this presenter's live view to programmatic mutations of
+     the document. The doc gets a `prepareForLiveViewRefresh:` callback
+     before the refresh so subclasses can invalidate caches whose
+     state-dependent fragments would survive incorrectly (chat docs use
+     this). The response block is exception-guarded so a stale outlet
+     that fires after this presenter is torn down can't break the chat
+     session — a detached editor raises on `refresh` and we swallow. *)
+  subject document contentsChanged => [:doc |
+      twoViewEditor isNil ifFalse: [
+          [doc prepareForLiveViewRefresh: twoViewEditor.
+           twoViewEditor refresh] on: Exception do: [:e | nil]
+      ]
+  ].
   ^column: {
        helpSection.
        toolbarToggle.

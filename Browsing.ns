@@ -3148,8 +3148,24 @@ loadFailed_slot <String>
    presenter instance. Lets expandAll / collapseAll iterate the toggles
    via childrenDo:. *)
 contentListSlot
+(* Holds the sha-keyed MemberHistoryEntrySubjects so that their
+   CodeMirror editors persist across presenter rebuilds and row
+   collapse/expand. Transferred between presenter instances via
+   updateVisualsFromSameKind:, mirroring DefinitionListPresenter
+   (Browsing.ns:1198). *)
+stateSlot <MemberHistoryPresenterState>
 |
 ) (
+public state ^ <MemberHistoryPresenterState> = (
+  stateSlot isNil ifTrue: [stateSlot:: MemberHistoryPresenterState new].
+  ^stateSlot
+)
+updateVisualsFromSameKind: oldPresenter <Self> ^ <Alien[Element]> = (
+  (* Transfer the EntrySubjects (and thus their persistent editors)
+     from the old presenter so user edits survive parent rebuilds. *)
+  stateSlot:: oldPresenter state.
+  ^super updateVisualsFromSameKind: oldPresenter
+)
 public isKindOfMemberHistoryPresenter ^ <Boolean> = (^true)
 isMyKind: f <Fragment> ^ <Boolean> = (
   ^f isKindOfMemberHistoryPresenter
@@ -3262,7 +3278,8 @@ toggleFor: entry = (
   | toggle |
   toggle:: collapsed: [collapsedFor: entry toggle: toggle]
     expanded: [expandedFor: entry toggle: toggle]
-    initiallyExpanded: false.
+    initiallyExpanded: false
+    tag: (entry at: 'oid').
   ^toggle
 )
 collapsedFor: entry toggle: toggle = (
@@ -3285,7 +3302,7 @@ collapsedFor: entry toggle: toggle = (
   }
 )
 expandedFor: entry toggle: toggle = (
-  | sha shortSha message firstLine inlineBody timestamp dateStr path source |
+  | sha shortSha message firstLine inlineBody timestamp dateStr path entrySubject |
   sha:: entry at: 'oid'.
   shortSha:: sha copyFrom: 1 to: 7.
   message:: (entry at: 'commit') at: 'message'.
@@ -3294,8 +3311,8 @@ expandedFor: entry toggle: toggle = (
   timestamp:: ((entry at: 'commit') at: 'author') at: 'timestamp'.
   dateStr:: formatTimestamp: timestamp.
   path:: subject draftPath.
-  source:: subject repo cachedBlobAt: path in: sha.
-  source isNil ifTrue: [kickOffSourceFetchFor: path sha: sha].
+  entrySubject:: state subjectFor: entry path: path parent: subject.
+  ensureVersionSourceFor: entrySubject path: path sha: sha.
   ^column: {
     row: {
       (link: shortSha action: [toggle collapse]) color: actionLinkColor.
@@ -3307,38 +3324,23 @@ expandedFor: entry toggle: toggle = (
       label: inlineBody
     }.
     mediumBlank.
-    source isNil
-      ifTrue: [label: 'Loading source...']
-      ifFalse: [historicalEditorFor: source toggle: toggle]
+    entrySubject createPresenter
   }
 )
-historicalEditorFor: historicalSource <String> toggle: toggle ^ <CodeMirrorFragment> = (
-  (* Build a CodeMirror initialized with the LIVE member source, then
-     push the historical source in. The editor enters its pending-edit
-     state (yellow background + accept/cancel) because the displayed
-     text differs from the init source. Accept routes through subject
-     installHistoricalSource: -- the revert lands as a new append-only
-     Accept commit. Cancel resets to live source and collapses. *)
-  | liveSrc cm |
-  liveSrc:: crToLf: subject liveSource.
-  cm:: codeMirror: liveSrc.
-  cm text: (crToLf: historicalSource).
-  cm acceptResponse: [:ed :event |
-    updateGUI: [
-      [subject installHistoricalSource: ed textBeingAccepted.
-       ed leaveEditState.
-       toggle collapse]
-        on: Error do: [:ex <Exception> | ed showMessage: ex printString]].
-    ed editor focus].
-  cm cancelResponse: [:ed |
-    ed text: liveSrc.
-    ed leaveEditState.
-    toggle collapse].
-  ^cm
-)
-kickOffSourceFetchFor: path <String> sha: sha <String> = (
+ensureVersionSourceFor: entrySubject path: path sha: sha = (
+  (* If the entry subject doesn't yet have its versionSource set,
+     check DraftsRepo's blob cache (sync) first; on miss kick off the
+     async fetch which on resolve sets the source and triggers
+     updateGUI: so a fresh definition pass renders the EntryPresenter
+     with source available. *)
+  | cached |
+  entrySubject versionSource isNil ifFalse: [^self].
+  cached:: subject repo cachedBlobAt: path in: sha.
+  cached isNil ifFalse: [^entrySubject versionSource: cached].
   (subject repo readBlobAt: path in: sha)
-    then: [:src | updateGUI: []. nil]
+    then: [:src |
+      entrySubject versionSource: src.
+      updateGUI: []. nil]
     onRejected: [:err |
       ('MemberHistoryPresenter: blob fetch failed for ', path,
         ' @ ', sha, ': ', err printString) out.
@@ -3413,6 +3415,175 @@ startFetch = (
     onRejected: [:err |
       updateGUI: [loadFailed_slot:: err printString]. nil]
 )
+) : (
+)
+public class MemberHistoryEntrySubject onModel: m <MemberHistoryEntryModel>
+  = ProgrammingSubject onModel: m (
+(* Subject for a single historical version of a member. Lives in
+   MemberHistoryPresenterState (keyed by sha), so it persists across
+   row collapse/expand and across parent presenter rebuilds. Holds the
+   editor CodeMirrorFragment lazily; the fragment is created once by
+   the EntryPresenter and stashed here, then reused on every render
+   for cursor / selection / undo persistence. *)
+|
+editor_slot
+versionSource_slot
+|
+) (
+public createPresenter ^ <Presenter> = (
+  ^MemberHistoryEntryPresenter onSubject: self
+)
+public parentSubject = (^model parentSubject)
+public entry = (^model entry)
+public path = (^model path)
+public sha = (^entry at: 'oid')
+public shortSha ^ <String> = (^sha copyFrom: 1 to: 7)
+public commitMessage ^ <String> = (
+  ^(entry at: 'commit') at: 'message'
+)
+public commitTimestamp = (
+  ^((entry at: 'commit') at: 'author') at: 'timestamp'
+)
+public versionSource ^ <String | Nil> = (^versionSource_slot)
+public versionSource: src <String> = (versionSource_slot:: src)
+public editor = (^editor_slot)
+public editor: cm = (editor_slot:: cm)
+public installEdits: text <String> = (
+  parentSubject installHistoricalSource: text
+)
+public isKindOfMemberHistoryEntrySubject ^ <Boolean> = (^true)
+isMyKind: f <Subject> ^ <Boolean> = (
+  ^f isKindOfMemberHistoryEntrySubject
+)
+) : (
+)
+public class MemberHistoryEntryPresenter onSubject: s <MemberHistoryEntrySubject>
+  = ProgrammingPresenter onSubject: s (
+(* Renders ONE historical version. Drops live-only affordances
+   (exemplar / debug / AI / references). Editor is the subject's
+   persistent CodeMirrorFragment, created lazily on first render and
+   reused thereafter -- this is the load-bearing piece for edit
+   persistence across collapse and refresh.
+
+   Make Live button is always visible: it installs whatever's in the
+   editor (edited or original) through the parent subject's
+   installHistoricalSource:. CodeMirror's standard accept does the
+   same when edits are pending. Cancel (CodeMirror's red button) is
+   only visible with edits and resets the editor to the version's
+   original source.
+
+   Colorization dispatches on the parent subject's isKindOf*. *)
+) (
+public isKindOfMemberHistoryEntryPresenter ^ <Boolean> = (^true)
+isMyKind: f <Fragment> ^ <Boolean> = (
+  ^f isKindOfMemberHistoryEntryPresenter
+)
+definition = (
+  subject versionSource isNil ifTrue: [
+    ^label: 'Loading source...'].
+  ^column: {
+    ensureEditor.
+    mediumBlank.
+    row: {
+      mediumBlank.
+      button: 'Make Live' action: [installCurrentEditorText].
+      filler
+    }
+  }
+)
+ensureEditor ^ <CodeMirrorFragment> = (
+  (* Lazy-init the CodeMirror once; subsequent renders return the same
+     Fragment instance, preserving text, cursor, undo. *)
+  subject editor isNil ifTrue: [
+    | src cm |
+    src:: crToLf: subject versionSource.
+    cm:: codeMirror: src.
+    cm
+      changeResponse: [:ed :ev |
+        colorizeSource: (crToLf: ed textBeingAccepted) withEditor: ed];
+      cancelResponse: [:ed |
+        ed text: src.
+        colorizeSource: src withEditor: ed.
+        ed leaveEditState];
+      acceptResponse: [:ed :ev | installAndResetEditor: ed].
+    colorizeSource: src withEditor: cm.
+    subject editor: cm].
+  ^subject editor
+)
+colorizeSource: src <String> withEditor: cm <CodeMirrorFragment> = (
+  (* Colorization is presentation; kind-dispatch on the parent
+     subject. *)
+  | parent |
+  parent:: subject parentSubject.
+  parent isKindOfMethodHistorySubject ifTrue: [
+    ^ide colorizer
+      colorizeMethod: src
+      fromClass: parent methodMirror definingMixin declaration
+      via: (colorizingBlockFor: cm)].
+  parent isKindOfLazySlotHistorySubject ifTrue: [
+    ^ide colorizer
+      colorizeLazySlot: src
+      fromClass: parent slotMirror definingMixin declaration
+      via: (colorizingBlockFor: cm)].
+  parent isKindOfClassHeaderHistorySubject ifTrue: [
+    ^ide colorizer
+      colorizeHeader: src
+      fromClass: parent classMirror
+      via: (colorizingBlockFor: cm)]
+)
+installAndResetEditor: ed <CodeMirrorFragment> = (
+  (* CodeMirror's accept path: install edited text, reset editor to
+     the version's original. *)
+  updateGUI: [
+    [subject installEdits: ed textBeingAccepted.
+     resetEditor: ed]
+       on: Error do: [:ex <Exception> | ed showMessage: ex printString]].
+  ed editor focus
+)
+installCurrentEditorText = (
+  (* Make Live button: always available. Installs whatever's currently
+     in the editor (edited or not), then resets to the version's
+     original. *)
+  | cm |
+  cm:: subject editor.
+  cm isNil ifTrue: [^self].
+  updateGUI: [
+    [subject installEdits: cm textBeingAccepted.
+     resetEditor: cm]
+       on: Error do: [:ex <Exception> | cm showMessage: ex printString]]
+)
+resetEditor: cm <CodeMirrorFragment> = (
+  | src |
+  src:: crToLf: subject versionSource.
+  cm text: src.
+  colorizeSource: src withEditor: cm.
+  cm leaveEditState
+)
+) : (
+)
+public class MemberHistoryPresenterState = (
+(* Per-MemberHistoryPresenter-instance state. Holds the
+   sha-keyed EntrySubjects so they survive parent rebuilds and row
+   collapse/expand. Transferred between presenter instances via
+   MemberHistoryPresenter>>updateVisualsFromSameKind:, exactly the
+   way DefinitionListPresenterState (Browsing.ns:1274) is transferred. *)
+|
+entries_slot
+|
+) (
+entries = (
+  entries_slot isNil ifTrue: [entries_slot:: Map new].
+  ^entries_slot
+)
+public subjectFor: entry path: path <String> parent: parentSubject
+  ^ <MemberHistoryEntrySubject> = (
+  | sha |
+  sha:: entry at: 'oid'.
+  ^entries at: sha ifAbsentPut: [
+    MemberHistoryEntrySubject onModel:
+      (MemberHistoryEntryModel entry: entry parent: parentSubject path: path)]
+)
+public isKindOfMemberHistoryPresenterState ^ <Boolean> = (^true)
 ) : (
 )
 class MirrorGroupSubject onModel: m <MirrorGroupModel> = ProgrammingSubject onModel: m (
@@ -6547,6 +6718,19 @@ public repo = r.
 |
 ) (
 public isKindOfClassHeaderHistoryModel ^ <Boolean> = (^true)
+) : (
+)
+public class MemberHistoryEntryModel entry: e parent: p path: pa = (
+(* Triple held by a MemberHistoryEntrySubject: the git log entry, the
+   parent MemberHistorySubject (for protocol delegation and isKindOf*
+   dispatch), and the draft file path. *)
+|
+public entry = e.
+public parentSubject = p.
+public path <String> = pa.
+|
+) (
+public isKindOfMemberHistoryEntryModel ^ <Boolean> = (^true)
 ) : (
 )
 public class LazySlotModel slot: m <LazySlotMirror> exemplar: e <Object | Nil>

@@ -213,12 +213,6 @@ class HopscotchWebIDE usingPlatform: p = (
   populateNamespaceUsingPlatform: p.
   deployment:: DeploymentManager usingPlatform: p ide: self.
 ) (
-(* Hidden drafts repo for "git-as-infinite-undo": every successful
-   Accept on installFromBuilders:into: writes the touched class sources
-   to this repo and commits. Lazy so sessions that never edit pay
-   nothing, and so the <script src="LightningFS">/git tags are
-   guaranteed to have loaded by first access. Survives across reloads
-   via IndexedDB. *)
 lazy public drafts = (VCSIsomorphicGitBackendProvider usingPlatform: platformHolder)
 	DraftsRepo storeNamed: 'newspeak-ide-drafts' dir: '/drafts'.
 public launch: s <Subject> inWindow: w <HopscotchShell class> = (
@@ -274,34 +268,54 @@ public installFromBuilders: bs <Array[ClassDeclarationBuilder]> into: namespace 
   recordAcceptForBuilders: builders baselines: baselines.
   ^mixins
 )
-(* === Per-member drafts: filename scheme + walk ============================
-   Each touched top-level class C becomes a subtree:
-     C/header.ns                          class header (covers all regular
-                                          slots, factory, slot block,
-                                          superclass clause)
-     C/method.<selector>.ns               instance method
-     C/lazy-slot.<name>.ns                instance lazy slot
-     C/class-method.<selector>.ns         class-side method
-     C/D/...                              nested class recurses
-
-   Class-side slots and lazy slots don't exist in Newspeak so they're
-   absent from the scheme. Regular instance slots live entirely in
-   header.ns; no separate slot.*.ns files.
-
-   Selector / lazy-slot names are percent-encoded for filesystem use:
-     '%' -> '%25' (escape char itself; encoded first to avoid double-encode)
-     '/' -> '%2F' (path separator -- mandatory; binary selectors can
-                    contain '/' per the Newspeak grammar)
-   All other binary chars (+ * - = < > ~ & | ? ! , @) and ':' (keyword
-   selectors) stay raw -- lightning-fs / git's pathname handling on the
-   browser side accept them fine. *)
-encodeForFilename: s <String> ^ <String> = (
+public encodeForFilename: s <String> ^ <String> = (
   ^replaceIn: (replaceIn: s all: '%' with: '%25') all: '/' with: '%2F'
 )
-decodeFromFilename: s <String> ^ <String> = (
+public decodeFromFilename: s <String> ^ <String> = (
   (* Inverse of encodeForFilename:. Decode '/' first so that an encoded
      '%2F' doesn't get partially undone by the '%25' -> '%' pass. *)
   ^replaceIn: (replaceIn: s all: '%2F' with: '/') all: '%25' with: '%'
+)
+draftPathPrefixForClassDeclaration: cdm ^ <String> = (
+  (* Outermost-to-innermost slash-terminated class chain. For top-level Foo
+     returns 'Foo/'; for D nested in Foo returns 'Foo/D/'. Shared by all
+     draftPathFor*: helpers. *)
+  | classes path c |
+  classes:: List new.
+  c:: cdm.
+  [c isNil] whileFalse: [
+    classes add: c.
+    c:: c enclosingClass].
+  path:: ''.
+  classes size to: 1 by: -1 do: [:i |
+    path:: path, (classes at: i) simpleName asString, '/'].
+  ^path
+)
+public draftPathForMethodMirror: aMirror <MethodMirror> ^ <String> = (
+  (* <TopLevel>/.../<Enclosing>/method.<encoded selector>.ns       (instance side)
+     <TopLevel>/.../<Enclosing>/class-method.<encoded selector>.ns (class side) *)
+  | sideKind |
+  sideKind:: aMirror definingMixin isMeta
+    ifTrue: ['class-method.']
+    ifFalse: ['method.'].
+  ^(draftPathPrefixForClassDeclaration: aMirror definingMixin declaration),
+    sideKind,
+    (encodeForFilename: aMirror name asString),
+    '.ns'
+)
+public draftPathForLazySlotMirror: aMirror ^ <String> = (
+  (* <TopLevel>/.../<Enclosing>/lazy-slot.<encoded name>.ns -- class side
+     never has lazy slots in Newspeak so there's no class-side variant. *)
+  ^(draftPathPrefixForClassDeclaration: aMirror definingMixin declaration),
+    'lazy-slot.',
+    (encodeForFilename: aMirror name asString),
+    '.ns'
+)
+public draftPathForClassDeclaration: cdm ^ <String> = (
+  (* <TopLevel>/.../<This class>/header.ns -- the class header covers the
+     factory params, slot block, superclass clause, and all regular
+     (non-lazy) slots. *)
+  ^(draftPathPrefixForClassDeclaration: cdm), 'header.ns'
 )
 replaceIn: s <String> all: oldSub <String> with: newSub <String> ^ <String> = (
   (* String replace helper. Primordialsoup's kernel String doesn't carry
@@ -725,7 +739,8 @@ setupIDEWith: mixins using: platform = (
     augmentNamespace: namespace withPlatform: platform local.
     ide setupNames.
     mixins do: [:m <MixinMirror> | namespace at: m name put: m declaration applyToObject reflectee].
-    ide launch: (ide browsing HomeSubject new)
+    ide launch: (ide browsing HomeSubject new).
+    refreshProviderModelsInBackgroundFor: ide platform: platform
 )
 loadOrRestoreUsingPlatform: p  = (
   |
@@ -811,6 +826,39 @@ namespaceGivenPlatform: p ^ <Map[Symbol, Object]> = (
   testModules do: [:testModule | ns at: testModule name put: testModule].
   augmentNamespace: ns withPlatform: p.
   ^ns
+)
+refreshProviderModelsInBackgroundFor: ide platform: platform = (
+    (* For each known AI provider class, check localStorage for a stored
+       API key; if present, construct a transient provider instance and
+       kick off a refresh of its model list cache. Fire-and-forget: on
+       success, force an IDE-wide re-render so any model picker
+       currently on screen picks up the new list. Failures go to console
+       and the static fallback list remains in effect.
+
+       Done after `ide launch:` so the IDE is fully constructed (and
+       any cached list is already visible). Done in the background so
+       it never blocks startup — the user sees the IDE immediately
+       even on a slow network.
+
+       NB: the then-block must NOT return the model list out of the
+       Promise — a Newspeak List cannot be marshalled to JS and crashes
+       the alien bridge. We return nil. *)
+    | ai providers |
+    ai:: platform aiAccess.
+    providers:: { ai AnthropicProvider. ai GeminiProvider }.
+    providers do: [:cls |
+        | key keyName |
+        keyName:: 'ns_ai_apikey_', cls name.
+        key:: [platform js localStorage getItem: keyName]
+            on: Exception do: [:e | nil].
+        (key isNil or: [key isEmpty]) ifFalse: [
+            ((cls apiKey: key model: 'discovery') refreshAvailableModels)
+                then: [:ignored | ide browsing updateCurrentDisplay. nil]
+                onError: [:err |
+                    ('Model discovery failed for ', cls name, ': ', err printString) out
+                ]
+        ]
+    ]
 )
 ) : (
 )

@@ -66,6 +66,7 @@ class VCSIsomorphicGitBackendProvider usingPlatform: platform = (
 	private Promise = global at: #Promise.
 	private TextDecoder = global at: #TextDecoder.
 	private JSSet = global at: #Set.
+	private Map = platform collections Map.
 |
 ) (
 public class Backend = (
@@ -197,6 +198,18 @@ public class DraftsRepo storeNamed: storeName <String> dir: workDir <String> = (
 	dir = workDir.
 	author = makeDefaultAuthor.
 	initialized ::= false.
+	(* Per-path cache of the git.log result for historyOf:. Populated on
+	   each successful fetch; cleared by invalidateHistoryCache (called
+	   from commit: on success). Lets the per-member history UI render
+	   synchronously after the first fetch even across the parent
+	   presenter's updateGUI: rebuilds. *)
+	historyCache_slot ::= nil.
+	(* Per-(path, sha) cache of decoded blob text from readBlobAt:in:.
+	   Same purpose as historyCache_slot: lets the expanded-entry view
+	   render the historical source synchronously after the first fetch
+	   even across rebuilds. (path, sha) keys are immutable so this
+	   cache never needs invalidation. *)
+	blobCache_slot ::= nil.
 |
 ) (
 makeDefaultAuthor = (
@@ -269,6 +282,78 @@ public history ^ <Alien[Promise]> = (
 		opts at: 'fs' put: fs.
 		opts at: 'dir' put: dir.
 		git log: opts]
+)
+public historyOf: filepath <String> ^ <Alien[Promise]> = (
+	(* Like history, but filtered to commits that touched filepath
+	   specifically. Same entry shape (.oid, .commit.message, ...,
+	   newest-first). Used by the per-member history UI to enumerate
+	   prior versions of a single file (e.g. Foo/method.bar.ns).
+	   Populates the per-path cache on resolve so subsequent fresh
+	   MethodHistoryPresenters (created after a parent updateGUI:)
+	   can hit cachedHistoryOf: synchronously. *)
+	^ensureInitialized then: [:r |
+		| opts |
+		opts:: createJSObject.
+		opts at: 'fs' put: fs.
+		opts at: 'dir' put: dir.
+		opts at: 'filepath' put: filepath.
+		(git log: opts) then: [:log |
+			historyCache at: filepath put: log.
+			log]]
+)
+historyCache = (
+	historyCache_slot isNil ifTrue: [historyCache_slot:: Map new].
+	^historyCache_slot
+)
+public cachedHistoryOf: filepath <String> = (
+	(* Synchronous cache lookup. Returns the JS array of commit entries
+	   if a prior historyOf: has populated the cache for filepath, else
+	   nil. The UI uses this for the fast path; nil means "fall back to
+	   the async historyOf: fetch". *)
+	historyCache_slot isNil ifTrue: [^nil].
+	^historyCache_slot at: filepath ifAbsent: [nil]
+)
+invalidateHistoryCache = (
+	(* Drop the entire per-path cache. Called from commit: on success
+	   since any new commit could touch arbitrary paths and we don't
+	   track which here. Cheap; the UI just re-fetches on next render. *)
+	historyCache_slot:: nil
+)
+public readBlobAt: filepath <String> in: sha <String> ^ <Alien[Promise]> = (
+	(* Resolves to the decoded text of filepath at commit sha. Rejects
+	   if filepath doesn't exist at that commit (e.g. the commit removed
+	   the file). Populates the per-(path, sha) cache on resolve so the
+	   sync cachedBlobAt:in: lookup can hit on subsequent renders. *)
+	| cached |
+	cached:: cachedBlobAt: filepath in: sha.
+	cached isNil ifFalse: [^Promise resolve: cached].
+	^ensureInitialized then: [:r |
+		| opts |
+		opts:: createJSObject.
+		opts at: 'fs' put: fs.
+		opts at: 'dir' put: dir.
+		opts at: 'oid' put: sha.
+		opts at: 'filepath' put: filepath.
+		(git readBlob: opts) then: [:result |
+			| content |
+			content:: TextDecoder new decode: (result at: 'blob').
+			blobCache at: (blobCacheKey: filepath sha: sha) put: content.
+			content]]
+)
+blobCache = (
+	blobCache_slot isNil ifTrue: [blobCache_slot:: Map new].
+	^blobCache_slot
+)
+blobCacheKey: filepath <String> sha: sha <String> = (
+	^filepath, '@', sha
+)
+public cachedBlobAt: filepath <String> in: sha <String> = (
+	(* Synchronous cache lookup. Returns the decoded text if a prior
+	   readBlobAt:in: has populated the cache for (filepath, sha), else
+	   nil. UI uses this for the sync fast path; nil means "fall back
+	   to the async readBlobAt:in: fetch". *)
+	blobCache_slot isNil ifTrue: [^nil].
+	^blobCache_slot at: (blobCacheKey: filepath sha: sha) ifAbsent: [nil]
 )
 readBlobPairAt: sha <String> path: filepath <String> ^ <Alien[Promise]> = (
 	(* Promise resolving to a two-element JS array [filepath, content]
@@ -584,7 +669,9 @@ public commit: message <String> ^ <Alien[Promise]> = (
 commitWithParent: parentArr <JS Array | nil> message: msg <String> ^ <Alien[Promise]> = (
 	(* Helper for commit:. parentArr nil leaves isomorphic-git to infer
 	   the parent from HEAD (default behavior). Pass an explicit JS array
-	   (typically empty) to suppress that lookup for the initial commit. *)
+	   (typically empty) to suppress that lookup for the initial commit.
+	   On successful commit, invalidate the history cache since this new
+	   commit could touch arbitrary paths; UI re-fetches on next render. *)
 	| commitOpts |
 	commitOpts:: createJSObject.
 	commitOpts at: 'fs' put: fs.
@@ -592,7 +679,9 @@ commitWithParent: parentArr <JS Array | nil> message: msg <String> ^ <Alien[Prom
 	commitOpts at: 'message' put: msg.
 	commitOpts at: 'author' put: author.
 	nil = parentArr ifFalse: [commitOpts at: 'parent' put: parentArr].
-	^git commit: commitOpts
+	^(git commit: commitOpts) then: [:sha |
+		invalidateHistoryCache.
+		sha]
 )
 ) : (
 )

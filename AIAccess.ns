@@ -240,6 +240,148 @@ public supportsFileUploads ^ <Boolean> = (
 	   true here. Default false; override per provider. *)
 	^false
 )
+public availableModels ^ <List[String]> = (
+	(* Cache-first list of model ids the picker should offer. Reads
+	   cachedModels from localStorage; falls back to staticFallbackModels
+	   when no cache is present (no API key stored, boot refresh hasn't
+	   resolved yet, or the network call failed). Subclasses override
+	   staticFallbackModels, not this method. *)
+	| cached ids |
+	cached:: cachedModels.
+	cached isNil ifTrue: [^staticFallbackModels].
+	ids:: List new.
+	cached do: [:entry | ids add: (entry at: 1)].
+	ids isEmpty ifTrue: [^staticFallbackModels].
+	^ids
+)
+public displayNameFor: modelId <String> ^ <String> = (
+	(* Cache-first display name. Each cache entry is a {id. displayName}
+	   tuple; if a matching id is found and its displayName is non-empty,
+	   return it. Otherwise delegate to staticDisplayNameFor: which
+	   subclasses implement as a hardcoded switch. *)
+	| cached |
+	cached:: cachedModels.
+	cached isNil ifFalse: [
+		cached do: [:entry |
+			(entry at: 1) = modelId ifTrue: [
+				| dn |
+				dn:: entry at: 2.
+				(dn isNil or: [dn isEmpty]) ifFalse: [^dn]
+			]
+		]
+	].
+	^staticDisplayNameFor: modelId
+)
+public staticFallbackModels ^ <List[String]> = (
+	(* Hardcoded list shipped in this build. Used when localStorage has no
+	   cached list yet — keeps the picker usable on first run or when no
+	   API key is stored. *)
+	subclassResponsibility
+)
+public staticDisplayNameFor: modelId <String> ^ <String> = (
+	(* Hardcoded label lookup, used when the cache doesn't carry a display
+	   name for the given id. Default: return the id verbatim. *)
+	^modelId
+)
+public listModelsEndpoint ^ <String> = (
+	(* URL of the provider's list-models endpoint. *)
+	subclassResponsibility
+)
+public fetchAvailableModelsFromAPI ^ <Alien[Promise]> = (
+	(* Hit listModelsEndpoint with provider-appropriate auth headers and
+	   resolve with the *raw* parsed JSON body (provider-specific shape).
+	   Rejects with a String reason on HTTP / network failure.
+
+	   This mirrors complete:'s pattern: a single then-block that returns
+	   `response json` straight through. Parsing the body into {id.
+	   displayName} tuples is done by refreshAvailableModels in a flat
+	   second then-stage, NOT nested inside this one — primordialsoup's
+	   JS-Promise bridge handles flat chains cleanly but a raise inside a
+	   nested `response json then: [...]` can corrupt the alien stack and
+	   surface as the next callback receiving document.documentElement. *)
+	subclassResponsibility
+)
+public parseListModelsResponse: body <Alien> ^ <List> = (
+	(* Walk the provider-native response body and return a Newspeak List
+	   of {id <String>. displayName <String>} 2-tuples. Implementations
+	   should be defensive (safeAt:, safeStringAt:) — any raise here
+	   surfaces as the chain rejecting via refreshAvailableModels's
+	   on:Exception backstop. *)
+	subclassResponsibility
+)
+public localStorageModelsKey ^ <String> = (
+	(* Per-provider cache key. `class name` returns the simple class
+	   name (e.g. 'AnthropicProvider'). *)
+	^'ns_ai_models_', class name
+)
+public cachedModels ^ <List | UndefinedObject> = (
+	(* Read parsed cache from localStorage. Returns nil if absent,
+	   localStorage is unavailable, or the stored value isn't a JSON
+	   array of objects with at least an `id` field. Returns a List of
+	   {id. displayName} 2-tuples on success. *)
+	| raw parsed list len |
+	raw:: [js localStorage getItem: localStorageModelsKey]
+		on: Exception do: [:e | nil].
+	raw isNil ifTrue: [^nil].
+	(raw isKindOfString and: [raw isEmpty]) ifTrue: [^nil].
+	parsed:: [JSON parse: raw] on: Exception do: [:e | nil].
+	parsed isNil ifTrue: [^nil].
+	len:: safeAt: parsed field: 'length'.
+	len isNil ifTrue: [^nil].
+	list:: List new.
+	0 to: len - 1 do: [:i <Integer> |
+		| entry id dn |
+		entry:: safeAt: parsed field: i.
+		id:: safeStringAt: entry field: 'id'.
+		dn:: safeStringAt: entry field: 'displayName'.
+		dn isNil ifTrue: [dn:: ''].
+		id isNil ifFalse: [list add: {id. dn}]
+	].
+	list isEmpty ifTrue: [^nil].
+	^list
+)
+public storeCachedModels: tuples <List> = (
+	(* Persist the list of {id. displayName} tuples as a JSON array.
+	   Silently no-ops on any storage failure. *)
+	| arr str |
+	arr:: createJSArray.
+	tuples do: [:entry |
+		| obj |
+		obj:: createJSObject.
+		obj at: 'id' put: (entry at: 1).
+		obj at: 'displayName' put: (entry at: 2).
+		arr push: obj
+	].
+	str:: [JSON stringify: arr] on: Exception do: [:e | nil].
+	str isNil ifTrue: [^self].
+	[js localStorage setItem: localStorageModelsKey to: str]
+		on: Exception do: [:e | ]
+)
+public refreshAvailableModels ^ <Alien[Promise]> = (
+	(* Fetch the raw body, parse into tuples, persist, and resolve. Cache
+	   mutates only on success. The parse + store happen in a single flat
+	   then-stage with an on:Exception backstop so any raise turns into a
+	   clean Promise.reject — keeps the alien bridge from corrupting
+	   downstream callbacks.
+
+	   NB: a Newspeak List is NOT a JS-marshallable value, so we must NOT
+	   resolve the Promise with `tuples` — doing so makes the alien bridge
+	   try to push the List into JS (List >> index doesNotUnderstand) and
+	   crash. The parsed list lives in the cache (storeCachedModels:);
+	   callers read it from there, not from the Promise value. We resolve
+	   with nil. *)
+	^fetchAvailableModelsFromAPI then: [:body |
+		[
+			| tuples |
+			tuples:: parseListModelsResponse: body.
+			storeCachedModels: tuples.
+			nil
+		] on: Exception do: [:e |
+			(global at: 'Promise') reject:
+				('list-models parse error: ', (errorDescription: e))
+		]
+	]
+)
 ) : (
 )
 public class AnthropicProvider apiKey: key <String> model: mdl <String> = Provider (
@@ -267,7 +409,11 @@ public class AnthropicProvider apiKey: key <String> model: mdl <String> = Provid
 	private apiVersion <String> = '2023-06-01'.
 |
 ) (
-public availableModels ^ <List[String]> = (
+public staticFallbackModels ^ <List[String]> = (
+	(* Hardcoded list shipped in this build. Used when no localStorage
+	   cache is available — e.g. first run, no API key stored, or the
+	   boot-time refresh has not yet resolved. The cache (when present)
+	   takes priority via the inherited availableModels. *)
 	^{
 		'claude-opus-4-7'.
 		'claude-sonnet-4-6'.
@@ -275,12 +421,69 @@ public availableModels ^ <List[String]> = (
 		'claude-sonnet-4-20250514'.  (* legacy default, for back-compat *)
 	}
 )
-public displayNameFor: modelId <String> ^ <String> = (
+public staticDisplayNameFor: modelId <String> ^ <String> = (
 	modelId = 'claude-opus-4-7' ifTrue: [^'Opus 4.7'].
 	modelId = 'claude-sonnet-4-6' ifTrue: [^'Sonnet 4.6'].
 	modelId = 'claude-haiku-4-5' ifTrue: [^'Haiku 4.5'].
 	modelId = 'claude-sonnet-4-20250514' ifTrue: [^'Sonnet 4 (legacy)'].
 	^modelId
+)
+public listModelsEndpoint ^ <String> = (
+	^'https://api.anthropic.com/v1/models'
+)
+public fetchAvailableModelsFromAPI ^ <Alien[Promise]> = (
+	(* GET /v1/models with the standard Anthropic auth headers. Returns
+	   the raw parsed body Promise (shape {data: [{id, display_name,
+	   ...}, ...]}). Same flat then-shape as complete:: status check
+	   inside the outer then-block, return `response json` straight
+	   through on success. Parsing into tuples is done one level up by
+	   refreshAvailableModels, NOT nested here. *)
+	| headers options |
+	headers:: createJSObject.
+	headers at: 'x-api-key' put: apiKey.
+	headers at: 'anthropic-version' put: apiVersion.
+	headers at: 'anthropic-dangerous-direct-browser-access' put: 'true'.
+	options:: createJSObject.
+	options at: 'method' put: 'GET'.
+	options at: 'headers' put: headers.
+	^(global fetch: listModelsEndpoint with: options) then: [:response |
+		[
+			| status statusText |
+			status:: safeAt: response field: 'status'.
+			statusText:: safeAt: response field: 'statusText'.
+			statusText isNil ifTrue: [statusText:: ''].
+			(status isNil or: [status >= 400])
+				ifTrue: [
+					(global at: 'Promise') reject: ('Anthropic list-models error: ',
+						(status isNil
+							ifTrue: ['(no status)']
+							ifFalse: [status printString]),
+						' ', statusText)
+				]
+				ifFalse: [response json]
+		] on: Exception do: [:e |
+			(global at: 'Promise') reject: ('Anthropic list-models error: ', (errorDescription: e))
+		]
+	]
+)
+public parseListModelsResponse: body <Alien> ^ <List> = (
+	(* Walk the data array and build {id, displayName} 2-tuples. *)
+	| data dlen tuples |
+	data:: safeAt: body field: 'data'.
+	dlen:: safeAt: data field: 'length'.
+	dlen isNil ifTrue: [
+		Error signal: 'Anthropic list-models response missing data array'
+	].
+	tuples:: List new.
+	0 to: dlen - 1 do: [:i <Integer> |
+		| entry id dn |
+		entry:: safeAt: data field: i.
+		id:: safeStringAt: entry field: 'id'.
+		dn:: safeStringAt: entry field: 'display_name'.
+		dn isNil ifTrue: [dn:: ''].
+		id isNil ifFalse: [tuples add: {id. dn}]
+	].
+	^tuples
 )
 public complete: messages <Alien[Array]>
 	system: systemPrompt <String>
@@ -916,11 +1119,11 @@ public class GeminiProvider apiKey: key <String> model: mdl <String> = Provider 
 	private pendingCallNames <Map[String, String]> ::= Map new.
 |
 ) (
-public availableModels ^ <List[String]> = (
-	(* The set of available models on the Google API drifts faster than
-	   this code can track — if you get a 404 from generateContent, the
-	   model name in your chat doc is stale; pick a current one from
-	   https://ai.google.dev/gemini-api/docs/models. *)
+public staticFallbackModels ^ <List[String]> = (
+	(* Hardcoded list shipped in this build, used when no localStorage
+	   cache is available. The Gemini model set drifts faster than this
+	   code can track — when refreshAvailableModels resolves, the cache
+	   supersedes this. *)
 	^{
 		'gemini-3.1-pro-preview'.
 		'gemini-3.5-flash'.
@@ -929,13 +1132,92 @@ public availableModels ^ <List[String]> = (
 		'gemini-2.5-pro'.
 	}
 )
-public displayNameFor: modelId <String> ^ <String> = (
+public staticDisplayNameFor: modelId <String> ^ <String> = (
 	modelId = 'gemini-3.1-pro-preview' ifTrue: [^'Gemini 3.1 Pro (preview)'].
 	modelId = 'gemini-3.5-flash' ifTrue: [^'Gemini 3.5 Flash'].
 	modelId = 'gemini-3-flash-preview' ifTrue: [^'Gemini 3 Flash (preview)'].
 	modelId = 'gemini-3.1-flash-lite' ifTrue: [^'Gemini 3.1 Flash Lite'].
 	modelId = 'gemini-2.5-pro' ifTrue: [^'Gemini 2.5 Pro'].
 	^modelId
+)
+public listModelsEndpoint ^ <String> = (
+	^'https://generativelanguage.googleapis.com/v1beta/models'
+)
+public fetchAvailableModelsFromAPI ^ <Alien[Promise]> = (
+	(* GET /v1beta/models with the x-goog-api-key header. Returns the raw
+	   parsed body Promise. Filtering + 'models/' prefix stripping happens
+	   in parseListModelsResponse: one level up, NOT nested here. *)
+	| headers options |
+	headers:: createJSObject.
+	headers at: 'x-goog-api-key' put: apiKey.
+	options:: createJSObject.
+	options at: 'method' put: 'GET'.
+	options at: 'headers' put: headers.
+	^(global fetch: listModelsEndpoint with: options) then: [:response |
+		[
+			| status statusText |
+			status:: safeAt: response field: 'status'.
+			statusText:: safeAt: response field: 'statusText'.
+			statusText isNil ifTrue: [statusText:: ''].
+			(status isNil or: [status >= 400])
+				ifTrue: [
+					(global at: 'Promise') reject: ('Gemini list-models error: ',
+						(status isNil
+							ifTrue: ['(no status)']
+							ifFalse: [status printString]),
+						' ', statusText)
+				]
+				ifFalse: [response json]
+		] on: Exception do: [:e |
+			(global at: 'Promise') reject: ('Gemini list-models error: ', (errorDescription: e))
+		]
+	]
+)
+public parseListModelsResponse: body <Alien> ^ <List> = (
+	(* Walk the models array, filter to entries that support
+	   generateContent, strip the 'models/' prefix from name. *)
+	| models mlen tuples |
+	models:: safeAt: body field: 'models'.
+	mlen:: safeAt: models field: 'length'.
+	mlen isNil ifTrue: [
+		Error signal: 'Gemini list-models response missing models array'
+	].
+	tuples:: List new.
+	0 to: mlen - 1 do: [:i <Integer> |
+		| entry rawName supported supportsGen id dn |
+		entry:: safeAt: models field: i.
+		supported:: safeAt: entry field: 'supportedGenerationMethods'.
+		supportsGen:: supportsGenerateContent: supported.
+		supportsGen ifTrue: [
+			rawName:: safeStringAt: entry field: 'name'.
+			dn:: safeStringAt: entry field: 'displayName'.
+			dn isNil ifTrue: [dn:: ''].
+			id:: stripModelsPrefix: rawName.
+			id isNil ifFalse: [tuples add: {id. dn}]
+		]
+	].
+	^tuples
+)
+supportsGenerateContent: methods <Alien[Array] | UndefinedObject> ^ <Boolean> = (
+	(* True iff the array contains the string 'generateContent'. Defensive
+	   against missing/short arrays. *)
+	| len |
+	len:: safeAt: methods field: 'length'.
+	len isNil ifTrue: [^false].
+	0 to: len - 1 do: [:i <Integer> |
+		(safeStringAt: methods field: i) = 'generateContent' ifTrue: [^true]
+	].
+	^false
+)
+stripModelsPrefix: rawName <String | UndefinedObject> ^ <String | UndefinedObject> = (
+	(* Gemini's 'name' field is 'models/gemini-...'; the generateContent
+	   URL uses just the suffix. Return nil if rawName is nil or doesn't
+	   start with the expected prefix. *)
+	| prefix |
+	rawName isNil ifTrue: [^nil].
+	prefix:: 'models/'.
+	(rawName startsWith: prefix) ifFalse: [^rawName].
+	^rawName copyFrom: prefix size + 1 to: rawName size
 )
 public addUserText: text <String> toMessages: messages <List> = (
 	| userMsg <Alien> parts <Alien[Array]> textPart <Alien> |

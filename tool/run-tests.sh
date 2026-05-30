@@ -65,6 +65,15 @@ fi
 if [ -f "$CONFIG_FILE" ]; then
     ADDITIONAL_FILES="$ADDITIONAL_FILES $CONFIG_FILE"
 fi
+# Configs whose deps the auto-discovery doesn't know about. Keep this
+# list minimal — entries here let single-arg `./run-tests.sh CONFIG`
+# work for suites whose modules don't live in the test-runner snapshot.
+case "$TEST_CONFIG" in
+    NewspeakParsingTestingConfiguration)
+        ADDITIONAL_FILES="$ADDITIONAL_FILES ${NEWSPEAK}/CombinatorialParsing.ns ${NEWSPEAK}/NewspeakGrammar.ns"
+        ;;
+esac
+
 shift  # drop $1 (TEST_CONFIG); remaining args are extra dep files
 for extra in "$@"; do
     if [ -f "$extra" ]; then

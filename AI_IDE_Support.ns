@@ -40,6 +40,7 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = (
 	public Provider = aiAccess Provider.
 	public AnthropicProvider = aiAccess AnthropicProvider.
 	public GeminiProvider = aiAccess GeminiProvider.
+	public OpenAICompatibleProvider = aiAccess OpenAICompatibleProvider.
 	public Session = aiAccess Session.
 	private AIChatSetupSubject = platform hopscotch AIChatSetupSubject.
 	private AIChatSetupPresenter = platform hopscotch AIChatSetupPresenter.
@@ -163,16 +164,38 @@ public class IDEChatSetupSubject onModel: providerClass <Class> = AIChatSetupSub
 |
 	public docName <String>
 	public providerName <String> ::= 'anthropic'.
+	public baseUrl <String> ::= ''.
 |
 	(* The parent's initializer already tried to load apiKey via storageKey,
 	   but our overridden storageKey reads providerName which wasn't yet
 	   initialized — the parent's on:Error swallowed and left apiKey empty.
 	   Reload now that providerName is set. *)
 	reloadApiKey.
+	reloadBaseUrl.
 	docName:: defaultDocNameForProvider: providerName
 ) (
 storageKey ^ <String> = (
 	^'ns_ai_apikey_', (providerClassFor: providerName) name
+)
+public reloadBaseUrl = (
+	(* Refresh baseUrl from localStorage (or fall back to the provider's
+	   default). Called from the initializer and on every provider
+	   switch so the form reflects the current provider's URL config. *)
+	baseUrl:: baseUrlForProvider: providerName
+)
+public createProvider = (
+	(* Override the base AIChatSetupSubject>>createProvider to dispatch
+	   on providerName: openai-compat needs the 3-arg factory carrying
+	   baseUrl; others use the inherited 2-arg shape. The base impl
+	   reads `model` which is the original onModel: providerClass and
+	   never updates on dropdown switch, so we explicitly resolve via
+	   providerClass (which itself routes through providerClassFor:). *)
+	| klass |
+	klass:: providerClass.
+	providerName = 'openai-compat' ifTrue: [
+		^klass apiKey: apiKey model: modelName baseUrl: baseUrl
+	].
+	^klass apiKey: apiKey model: modelName
 )
 public providerClass = (
 	(* Override the base AIChatSetupSubject's `model`-based providerClass
@@ -223,6 +246,7 @@ providerDisplayLabelFor: pname <String> ^ <String> = (
 	   back to the key itself. *)
 	pname = 'anthropic' ifTrue: [^'Anthropic'].
 	pname = 'gemini' ifTrue: [^'Gemini'].
+	pname = 'openai-compat' ifTrue: [^'Local'].
 	^pname
 )
 public startChat = (
@@ -245,6 +269,10 @@ public startChat = (
 	].
 	[js localStorage setItem: storageKey to: apiKey]
 		on: Exception do: [:e | ].
+	providerName = 'openai-compat' ifTrue: [
+		[js localStorage setItem: (baseUrlStorageKeyFor: providerName) to: baseUrl]
+			on: Exception do: [:e | ]
+	].
 	[js localStorage setItem: 'ns_ai_active_chat_doc' to: docName]
 		on: Exception do: [:e | ].
 	doc:: ChatDocument
@@ -289,34 +317,50 @@ public class IDEChatSetupPresenter onSubject: s <IDEChatSetupSubject> = AIChatSe
 *)
 |
 	docNameEditor
+	baseUrlEditor
 |
 ) (
 definition = (
-	^column: {
-		helpSection.
-		row: {
-			(label: 'AI Chat Setup') bold.
-			filler.
-			helpButton.
-			dropDownMenu: [actionsMenu].
-		}.
-		mediumBlank.
-		label: 'Configure your AI provider and chat document. API keys are stored per provider in your browser''s localStorage; the chat document lives in your IDE namespace.'.
-		mediumBlank.
-		row: { (label: 'Provider: ') bold. smallBlank. providerPicker. }.
-		mediumBlank.
-		row: { (label: 'API Key: ') bold. elastic: apiKeyField. }.
-		mediumBlank.
-		row: { (label: 'Model: ') bold. elastic: modelField. }.
-		mediumBlank.
-		row: { (label: 'Chat name: ') bold. elastic: docNameField. }.
-		mediumBlank.
-		errorArea.
-		row: {
-			filler.
-			button: 'Start Chat' action: [respondToStart].
-		}.
-	}
+	| rows |
+	rows:: List new.
+	rows add: helpSection.
+	rows add: (row: {
+		(label: 'AI Chat Setup') bold.
+		filler.
+		helpButton.
+		dropDownMenu: [actionsMenu].
+	}).
+	rows add: mediumBlank.
+	rows add: (label: 'Configure your AI provider and chat document. API keys are stored per provider in your browser''s localStorage; the chat document lives in your IDE namespace.').
+	rows add: mediumBlank.
+	rows add: (row: { (label: 'Provider: ') bold. smallBlank. providerPicker. }).
+	rows add: mediumBlank.
+	subject providerName = 'openai-compat' ifTrue: [
+		rows add: (row: { (label: 'Base URL: ') bold. elastic: baseUrlField. }).
+		rows add: ((label: 'Local servers must allow CORS for this origin — e.g. for Ollama set OLLAMA_ORIGINS=* before launching.') italic).
+		rows add: mediumBlank
+	].
+	rows add: (row: { (label: 'API Key: ') bold. elastic: apiKeyField. }).
+	rows add: mediumBlank.
+	rows add: (row: { (label: 'Model: ') bold. elastic: modelField. }).
+	rows add: mediumBlank.
+	rows add: (row: { (label: 'Chat name: ') bold. elastic: docNameField. }).
+	rows add: mediumBlank.
+	rows add: errorArea.
+	rows add: (row: {
+		filler.
+		button: 'Start Chat' action: [respondToStart].
+	}).
+	^column: rows
+)
+baseUrlField = (
+	(* CodeMirror text editor bound to subject baseUrl. Only rendered
+	   when providerName = 'openai-compat'. *)
+	baseUrlEditor:: codeMirror: subject baseUrl.
+	baseUrlEditor changeResponse: [:frag |
+		subject baseUrl: frag textBeingAccepted.
+	].
+	^baseUrlEditor
 )
 providerPicker = (
 	(* Provider selector. Picking a provider swaps in its default model
@@ -328,8 +372,9 @@ providerPicker = (
 		smallBlank.
 		dropDownMenu: [
 			menuWithLabelsAndActions: {
-				{'Anthropic'. [respondToProviderSwitch: 'anthropic' defaultModel: 'claude-sonnet-4-6']}.
-				{'Gemini'.    [respondToProviderSwitch: 'gemini'    defaultModel: 'gemini-3.5-flash']}.
+				{'Anthropic'.                  [respondToProviderSwitch: 'anthropic'     defaultModel: 'claude-sonnet-4-6']}.
+				{'Gemini'.                     [respondToProviderSwitch: 'gemini'        defaultModel: 'gemini-3.5-flash']}.
+				{'Local (OpenAI-compatible)'.  [respondToProviderSwitch: 'openai-compat' defaultModel: '']}.
 			}
 		]
 	}
@@ -350,6 +395,7 @@ respondToProviderSwitch: providerName <String> defaultModel: defaultModel <Strin
 		subject modelName: defaultModel.
 		subject docName: (subject defaultDocNameForProvider: providerName).
 		subject reloadApiKey.
+		subject reloadBaseUrl.
 		keyRevealed:: subject apiKey isEmpty.
 		keyToggle isNil ifFalse: [
 			keyRevealed
@@ -359,6 +405,7 @@ respondToProviderSwitch: providerName <String> defaultModel: defaultModel <Strin
 		keyEditor isNil ifFalse: [keyEditor text: subject apiKey].
 		modelEditor isNil ifFalse: [modelEditor text: subject modelName].
 		docNameEditor isNil ifFalse: [docNameEditor text: subject docName].
+		baseUrlEditor isNil ifFalse: [baseUrlEditor text: subject baseUrl].
 	]
 )
 docNameField = (
@@ -466,10 +513,20 @@ createFreshSession ^ <Session> = (
 	(* Build a brand-new Session bound to a fresh Provider — used on first
 	   chatSubject access and on Clear. API key is read from localStorage
 	   under the per-provider key; missing key raises (which surfaces as a
-	   chat error rather than a silent empty conversation). *)
-	| provider <Provider> session <Session> key <String> |
-	key:: apiKeyForProvider: providerName.
-	provider:: (providerClassFor: providerName) apiKey: key model: modelName.
+	   chat error rather than a silent empty conversation). For the
+	   OpenAI-compatible provider we additionally read the base URL from
+	   localStorage and use the 3-arg factory; other providers use the
+	   2-arg form. *)
+	| provider <Provider> session <Session> key <String> cls |
+	key:: providerName = 'openai-compat'
+		ifTrue: [(apiKeyForProviderOrNil: providerName) isNil
+					ifTrue: ['']
+					ifFalse: [apiKeyForProvider: providerName]]
+		ifFalse: [apiKeyForProvider: providerName].
+	cls:: providerClassFor: providerName.
+	provider:: providerName = 'openai-compat'
+		ifTrue: [cls apiKey: key model: modelName baseUrl: (baseUrlForProvider: providerName)]
+		ifFalse: [cls apiKey: key model: modelName].
 	session:: Session provider: provider tools: (toolsForProvider: provider).
 	session systemPrompt: newspeakSystemPrompt.
 	^session
@@ -699,8 +756,9 @@ initialChatDocumentContents: n <String> ^ <String> = (
 providerClassFor: pn <String> = (
 	pn = 'anthropic' ifTrue: [^AnthropicProvider].
 	pn = 'gemini' ifTrue: [^GeminiProvider].
+	pn = 'openai-compat' ifTrue: [^OpenAICompatibleProvider].
 	Error signal: 'Unknown provider: ', pn,
-		' (supported: anthropic, gemini)'
+		' (supported: anthropic, gemini, openai-compat)'
 )
 apiKeyStorageKeyFor: pn <String> ^ <String> = (
 	^'ns_ai_apikey_', (providerClassFor: pn) name
@@ -719,6 +777,31 @@ apiKeyForProvider: pn <String> ^ <String> = (
 			'". Set one via the chat setup screen first.'
 	].
 	^key
+)
+baseUrlStorageKeyFor: pn <String> ^ <String> = (
+	(* localStorage key for an OpenAI-compatible provider's base URL.
+	   Only meaningful when pn = 'openai-compat'; harmless to compute
+	   for other provider names but unused there. *)
+	^'ns_ai_baseurl_', (providerClassFor: pn) name
+)
+defaultBaseUrlForProvider: pn <String> ^ <String> = (
+	(* Sensible default base URL for first-time setup. Currently only
+	   OpenAI-compatible has a non-empty default; other providers don't
+	   have a URL concept (they hardcode their endpoints). *)
+	pn = 'openai-compat' ifTrue: [^'http://localhost:11434/v1'].
+	^''
+)
+baseUrlForProvider: pn <String> ^ <String> = (
+	(* Read the configured base URL for pn; if nothing is stored, fall
+	   back to defaultBaseUrlForProvider:. Returns '' for providers that
+	   don't use a base URL. *)
+	| stored |
+	stored:: [js localStorage getItem: (baseUrlStorageKeyFor: pn)]
+		on: Exception do: [:e | nil].
+	(stored isNil or: [stored isEmpty]) ifTrue: [
+		^defaultBaseUrlForProvider: pn
+	].
+	^stored
 )
 public defaultChatDocumentOrCreate ^ <ChatDocument | UndefinedObject> = (
 	| activeName entry key doc |

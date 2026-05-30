@@ -229,7 +229,12 @@ emitCommentsBefore: node = (
 	node start <= cursor ifTrue: [^self].
 	chunk:: source copyFrom: cursor to: node start - 1.
 	parser:: metadataModule MetadataParser onSource: chunk.
-	parser gatherMetadataBackwards.
+	(* Tolerate MetadataParser failures: it has no notion of string
+	   literals, so a chunk containing an open-comment marker inside
+	   a quoted string makes its scanner walk off the end and call
+	   its own missing scanError:. Emit whatever comments were
+	   recovered before that failure. *)
+	[parser gatherMetadataBackwards] on: Error do: [:e | ].
 	emitGatheredComments: parser.
 	cursor:: node start.
 )
@@ -402,15 +407,22 @@ emitClassHeaderBody: header = (
 	].
 	(hasSlots or: [hasInit]) ifTrue: [
 		indented: [
-			newline.
-			emit: '|'.
+			(* Emit the slot bar only when there ARE slots. Without
+			   slots, emitting '|' '|' produces '||' — which the parser
+			   reads as a simultaneous slot bar opener and then expects
+			   identifiers. For slot-less class headers the init exprs
+			   sit directly in the body with no bar. *)
 			hasSlots ifTrue: [
+				| bar |
+				bar:: header isSeq ifTrue: ['|'] ifFalse: ['||'].
+				newline.
+				emit: bar.
 				indented: [
 					header slots do: [:slot | newline. visitSlotInBar: slot].
 				].
 				newline.
+				emit: bar.
 			].
-			emit: '|'.
 			hasInit ifTrue: [
 				header initExprs do: [:expr |
 					newline.
@@ -442,9 +454,14 @@ visitSlotDef: slot = (
 		ifFalse: [visitSlotInBar: slot].
 )
 visitLazySlot: slot = (
-	(* [modifier] lazy name [<Type>] [(= | ::=) expr.] *)
-	emitAccessModifier: slot accessModifier.
+	(* lazy [modifier] name [<Type>] [(= | ::=) expr.]
+
+	The 'lazy' keyword MUST come before the access modifier — only
+	'lazy public' is accepted by the grammar (parseLazySlotDeclaration
+	looks for the lazy keyword first). 'public lazy' raises
+	'expected ='. *)
 	emit: 'lazy '.
+	emitAccessModifier: slot accessModifier.
 	emit: slot name.
 	slot type isNil ifFalse: [
 		emit: ' <'. visitType: slot type. emit: '>'.
@@ -541,7 +558,7 @@ emitInPatternMetadata: methodNode savedCursor: savedCursor = (
 	equalsPos <= savedCursor ifTrue: [^self].
 	chunk:: source copyFrom: savedCursor to: equalsPos - 1.
 	parser:: metadataModule MetadataParser onSource: chunk.
-	parser gatherMetadataBackwards.
+	[parser gatherMetadataBackwards] on: Error do: [:e | ].
 	emitGatheredComments: parser.
 )
 visitMessagePattern: pattern = (
@@ -671,7 +688,7 @@ emitLeadingCommentsUpTo: pos = (
 	pos <= cursor ifTrue: [^self].
 	chunk:: source copyFrom: cursor to: pos - 1.
 	parser:: metadataModule MetadataParser onSource: chunk.
-	parser gatherMetadata.
+	[parser gatherMetadata] on: Error do: [:e | ].
 	emitGatheredCommentsInSourceOrder: parser.
 	cursor:: pos.
 )
@@ -711,7 +728,10 @@ visitBlock: node = (
 			emit: ':'. emit: p name.
 			p type isNil ifFalse: [emit: ' <'. visitType: p type. emit: '>'].
 		].
-		(hasTemps or: [hasStmts]) ifTrue: [emit: ' |'].
+		(* Always emit ' |' after params, even when there are no
+		   temps and no stmts. The grammar requires it: '[:x]' fails
+		   to parse, '[:x |]' is valid. *)
+		emit: ' |'.
 	].
 	(hasTemps or: [hasStmts])
 		ifTrue: [emitBlockBody: body hasParams: hasParams]
@@ -961,15 +981,87 @@ visitSymbol: node = (
 	].
 )
 symbolNeedsQuotes: v = (
+	(* A symbol can be emitted unquoted only if its bytes form a
+	   syntactically valid selector — either a unary/keyword
+	   selector or a pure binary selector. Mixed forms ('@here',
+	   '::=', etc.) must be wrapped in single quotes. *)
 	v isNil ifTrue: [^true].
 	v size = 0 ifTrue: [^true].
-	(v indexOf: ' ') > 0 ifTrue: [^true].
+	(isIdentifierStartByte: (v at: 1)) ifTrue: [
+		^(isValidIdentifierOrKeywordSelector: v) not].
+	(isBinaryByte: (v at: 1)) ifTrue: [
+		^(isAllBinaryBytes: v) not].
+	^true.
+)
+isIdentifierStartByte: byte = (
+	(byte >= 65 and: [byte <= 90]) ifTrue: [^true].
+	(byte >= 97 and: [byte <= 122]) ifTrue: [^true].
+	byte = 95 (* _ *) ifTrue: [^true].
 	^false.
 )
+isIdentifierByte: byte = (
+	(isIdentifierStartByte: byte) ifTrue: [^true].
+	(byte >= 48 and: [byte <= 57]) ifTrue: [^true].
+	^false.
+)
+isBinaryByte: byte = (
+	(* Matches NewspeakPredictiveParsing isSpecialCharacter at line
+	   1389-1407. Notably: ';' (59) and ':' (58) are NOT binary —
+	   they're statement separators and keyword markers, so a symbol
+	   like '#;' or '#:' must be quoted, not emitted bare. *)
+	byte = 33 ifTrue: [^true].   (* ! *)
+	byte = 37 ifTrue: [^true].   (* % *)
+	byte = 38 ifTrue: [^true].   (* & *)
+	byte = 42 ifTrue: [^true].   (* * *)
+	byte = 43 ifTrue: [^true].   (* + *)
+	byte = 44 ifTrue: [^true].   (* , *)
+	byte = 45 ifTrue: [^true].   (* - *)
+	byte = 47 ifTrue: [^true].   (* / *)
+	byte = 60 ifTrue: [^true].   (* < *)
+	byte = 61 ifTrue: [^true].   (* = *)
+	byte = 62 ifTrue: [^true].   (* > *)
+	byte = 63 ifTrue: [^true].   (* ? *)
+	byte = 64 ifTrue: [^true].   (* @ *)
+	byte = 92 ifTrue: [^true].   (* \ *)
+	byte = 124 ifTrue: [^true]. (* | *)
+	byte = 126 ifTrue: [^true]. (* ~ *)
+	^false.
+)
+isAllBinaryBytes: v = (
+	1 to: v size do: [:i |
+		(isBinaryByte: (v at: i)) ifFalse: [^false].
+	].
+	^true.
+)
+isValidIdentifierOrKeywordSelector: v = (
+	(* Validates: id (':' id)* (':')? where id matches
+	   [_A-Za-z][_A-Za-z0-9]*. Allows a trailing colon (keyword
+	   selector with one keyword) and additional ':id' segments. *)
+	| i |
+	i:: 1.
+	(isIdentifierStartByte: (v at: i)) ifFalse: [^false].
+	i:: i + 1.
+	[i <= v size] whileTrue: [
+		(isIdentifierByte: (v at: i)) ifTrue: [i:: i + 1] ifFalse: [
+			(v at: i) = 58 ifFalse: [^false].
+			i:: i + 1.
+			i > v size ifTrue: [^true].
+			(isIdentifierStartByte: (v at: i)) ifFalse: [^false].
+			i:: i + 1.
+		].
+	].
+	^true.
+)
 visitCharacter: node = (
-	(* Newspeak-on-psoup uses 1-character Strings in place of Characters.
-	   Emit as a string literal. *)
-	emit: ''''. emit: node value. emit: ''''.
+	(* Use the "x" character-literal syntax (per
+	   NewspeakPredictiveParsing scanCharacter at line 1442). Newspeak-
+	   on-psoup uses 1-char Strings instead of Characters at runtime,
+	   but the source-level literal must still be a *character literal*
+	   — emitting it as a string literal '...' changes the AST kind
+	   (StringAST vs CharacterAST) and breaks code that pattern-matches
+	   on the literal. Even for the character "double-quote", '"""'
+	   parses correctly (open " + " + close "). *)
+	emit: '"'. emit: node value. emit: '"'.
 )
 visitTuple: node = (
 	emit: '{'.
@@ -1031,13 +1123,29 @@ emitBlockType: t = (
 	(t formals isNil not and: [t formals isEmpty not]) ifTrue: [
 		t formals keysAndValuesDo: [:i :f |
 			i = 1 ifFalse: [space].
-			emit: ':'. visitType: f.
+			emit: ':'.
+			emitBlockArgType: f.
 		].
 		t return isNil ifFalse: [space. emit: '|'. space. visitType: t return].
 	] ifFalse: [
 		t return isNil ifFalse: [visitType: t return].
 	].
 	emit: ']'.
+)
+emitBlockArgType: f = (
+	(* If the block-arg type is a binary type-op (most commonly a
+	   '|' union), parenthesise it. Otherwise the inner '|' fuses
+	   with the outer block-type grammar's '|' return-type separator
+	   and the type re-parses with the wrong shape — e.g. block type
+	   '[:(E | X) :E | X def]' degenerates to '[:E | X :E | X def]'
+	   which the parser reads as one arg, one return, then garbage.
+
+	   Detection: isKindOfBinaryTypeOpAST is defined on
+	   BinaryTypeOpAST returning true; on other AST nodes it
+	   doesNotUnderstand-defaults to false. *)
+	f isKindOfBinaryTypeOpAST
+		ifTrue: [emit: '('. visitType: f. emit: ')']
+		ifFalse: [visitType: f].
 )
 (* --- Mixin / class-prefix ---------------------------------------------- *)
 visitMixinApplication: node = ( visitClassPrefix: node classPrefix )

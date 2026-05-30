@@ -16,6 +16,7 @@ class  HopscotchWebIDE packageUsing: manifest = (
 	private NewspeakASTs = manifest NewspeakASTs.	
     private NewspeakParsing = manifest NewspeakParsing.
 	private NewspeakTypechecker = manifest NewspeakTypechecker.
+	private NewspeakPrettyPrinter = manifest NewspeakPrettyPrinter.
     private Documents = manifest Documents.
     private DocumentHolder = manifest DocumentHolder.
 	private WorkspaceHolder = manifest WorkspaceHolder.	
@@ -73,6 +74,8 @@ manifest MirrorBuilderTesting.
 		manifest JSTestingConfiguration.
 		manifest NewspeakTypecheckerTesting.
 		manifest NewspeakTypecheckerTestingConfiguration.
+		manifest NewspeakPrettyPrinterTesting.
+		manifest NewspeakPrettyPrinterTestingConfiguration.
 		manifest MemoryHoleTesting.
 		manifest MemoryHoleTestingConfiguration.
 	}.
@@ -215,6 +218,23 @@ class HopscotchWebIDE usingPlatform: p = (
 ) (
 lazy public drafts = (VCSIsomorphicGitBackendProvider usingPlatform: platformHolder)
 	DraftsRepo storeNamed: 'newspeak-ide-drafts' dir: '/drafts'.
+lazy public prettyPrinter = makePrettyPrinter.
+makePrettyPrinter = (
+	(* Build the shared NewspeakPrettyPrinter instance used by the
+	   IDE's 'Pretty Print' / 'Pretty Print Selection' menu options.
+	   Reuses the IDE's existing grammar and constructs fresh AST,
+	   parsing, and metadata-parsing instances. *)
+	| asts parsing md cp |
+	asts:: NewspeakASTs usingPlatform: platformHolder.
+	parsing:: NewspeakParsing usingPlatform: platformHolder grammar: grammar asts: asts.
+	cp:: parsing CommonParser new.
+	md:: MetadataParsing usingPlatform: platformHolder.
+	^NewspeakPrettyPrinter
+		usingPlatform: platformHolder
+		ast: asts
+		parser: cp
+		metadata: md.
+)
 public launch: s <Subject> inWindow: w <HopscotchShell class> = (
   browsing launch: s inWindow: w
 )
@@ -616,10 +636,11 @@ populateNamespaceUsingPlatform: p <Platform> ^ <Namespace> = (
 		at: 'NewspeakASTs' put: NewspeakASTs;
 		at: 'NewspeakParsing' put: NewspeakParsing;
 		at: 'NewspeakTypechecker' put: NewspeakTypechecker;
+		at: 'NewspeakPrettyPrinter' put: NewspeakPrettyPrinter;
         at: 'MetadataParsing' put: MetadataParsing;
         at: 'Debugging' put: Debugging;
         at: 'Documents' put: Documents;
-        at: 'DocumentHolder' put: DocumentHolder;        
+        at: 'DocumentHolder' put: DocumentHolder;
 		at: 'WorkspaceManager' put: WorkspaceManager;
 		at: 'WorkspaceHolder' put: WorkspaceHolder;		
 		at: 'DeploymentManager' put: DeploymentManager;		
@@ -790,10 +811,11 @@ namespaceGivenPlatform: p ^ <Map[Symbol, Object]> = (
 		at: 'NewspeakASTs' put: NewspeakASTs;
 		at: 'NewspeakParsing' put: NewspeakParsing;
 		at: 'NewspeakTypechecker' put: NewspeakTypechecker;
+		at: 'NewspeakPrettyPrinter' put: NewspeakPrettyPrinter;
         at: 'MetadataParsing' put: MetadataParsing;
 		at: 'Debugging' put: Debugging;
         at: 'Documents' put: Documents;
-        at: 'DocumentHolder' put: DocumentHolder;    
+        at: 'DocumentHolder' put: DocumentHolder;
 		at: 'WorkspaceManager' put: WorkspaceManager;
         at: 'WorkspaceHolder' put: WorkspaceHolder;		
 		at: 'DeploymentManager' put: DeploymentManager;		
@@ -843,22 +865,43 @@ refreshProviderModelsInBackgroundFor: ide platform: platform = (
        NB: the then-block must NOT return the model list out of the
        Promise — a Newspeak List cannot be marshalled to JS and crashes
        the alien bridge. We return nil. *)
-    | ai providers |
+    | ai |
     ai:: platform aiAccess.
-    providers:: { ai AnthropicProvider. ai GeminiProvider }.
-    providers do: [:cls |
-        | key keyName |
-        keyName:: 'ns_ai_apikey_', cls name.
-        key:: [platform js localStorage getItem: keyName]
-            on: Exception do: [:e | nil].
-        (key isNil or: [key isEmpty]) ifFalse: [
-            ((cls apiKey: key model: 'discovery') refreshAvailableModels)
-                then: [:ignored | ide browsing updateCurrentDisplay. nil]
-                onError: [:err |
-                    ('Model discovery failed for ', cls name, ': ', err printString) out
-                ]
+    refreshProviderModelsFor: ai AnthropicProvider ide: ide platform: platform.
+    refreshProviderModelsFor: ai GeminiProvider    ide: ide platform: platform.
+    refreshOpenAICompatModelsFor: ai OpenAICompatibleProvider ide: ide platform: platform
+)
+refreshProviderModelsFor: cls ide: ide platform: platform = (
+    (* Two-arg-factory providers (Anthropic, Gemini). Skip if no API key
+       is stored. Fire-and-forget; on success force a re-render so any
+       picker on screen picks up the new cache. *)
+    | key |
+    key:: [platform js localStorage getItem: ('ns_ai_apikey_', cls name)]
+        on: Exception do: [:e | nil].
+    (key isNil or: [key isEmpty]) ifTrue: [^self].
+    ((cls apiKey: key model: 'discovery') refreshAvailableModels)
+        then: [:ignored | ide browsing updateCurrentDisplay. nil]
+        onError: [:err |
+            ('Model discovery failed for ', cls name, ': ', err printString) out
         ]
-    ]
+)
+refreshOpenAICompatModelsFor: cls ide: ide platform: platform = (
+    (* OpenAI-compatible providers use a three-arg factory (apiKey, model,
+       baseUrl). Many local servers (Ollama, mlx-omni-server, etc.) do
+       not require an API key, so an empty key is fine; we attempt the
+       refresh whenever a base URL is configured (or defaultable). *)
+    | key url |
+    key:: [platform js localStorage getItem: ('ns_ai_apikey_', cls name)]
+        on: Exception do: [:e | nil].
+    key isNil ifTrue: [key:: ''].
+    url:: [platform js localStorage getItem: ('ns_ai_baseurl_', cls name)]
+        on: Exception do: [:e | nil].
+    (url isNil or: [url isEmpty]) ifTrue: [^self].
+    ((cls apiKey: key model: 'discovery' baseUrl: url) refreshAvailableModels)
+        then: [:ignored | ide browsing updateCurrentDisplay. nil]
+        onError: [:err |
+            ('Model discovery failed for ', cls name, ' at ', url, ': ', err printString) out
+        ]
 )
 ) : (
 )

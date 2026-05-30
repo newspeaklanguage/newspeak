@@ -42,6 +42,15 @@ cd ${PRIMORDIALSOUP} || exit 1
   ${NEWSPEAK}/NewspeakTestRunner.ns \
   RuntimeWithMirrorsForPrimordialSoup NewspeakTestRunner ./out/snapshots/NewspeakTestRunner.vfuel
 
+# 4c. Build NewspeakPrettyPrintApp.vfuel for tool/pretty-print.sh script
+./out/ReleaseX64/primordialsoup \
+  ./out/snapshots/WebCompiler.vfuel \
+  ./newspeak/*.ns \
+  ${NEWSPEAK}/NewspeakASTs.ns \
+  ${NEWSPEAK}/NewspeakPrettyPrinter.ns \
+  ${NEWSPEAK}/NewspeakPrettyPrintApp.ns \
+  RuntimeWithMirrorsForPrimordialSoup NewspeakPrettyPrintApp ./out/snapshots/NewspeakPrettyPrintApp.vfuel
+
 # Back to 'newspeak'.
 cd ${NEWSPEAK} || exit 1
 

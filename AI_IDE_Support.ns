@@ -25,6 +25,8 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = (
 	private Map = platform collections Map.
 	private ide = webIde.
 	private js = platform js.
+	private JSDocument = js global at: 'document'.
+	private JSDate = js global at: 'Date'.
 	private Document = webIde documents Document.
 	private Presenter = platform hopscotch Presenter.
 	private FileChooserFragment = platform hopscotch FileChooserFragment.
@@ -40,6 +42,7 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = (
 	public Provider = aiAccess Provider.
 	public AnthropicProvider = aiAccess AnthropicProvider.
 	public GeminiProvider = aiAccess GeminiProvider.
+	public OpenAICompatibleProvider = aiAccess OpenAICompatibleProvider.
 	public Session = aiAccess Session.
 	private AIChatSetupSubject = platform hopscotch AIChatSetupSubject.
 	private AIChatSetupPresenter = platform hopscotch AIChatSetupPresenter.
@@ -83,6 +86,16 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = (
 	focusSide
 	(* focusSelector: Symbol — method or lazy-slot name, or nil *)
 	focusSelector
+	(* focusSha_slot: String (full git oid) — present only when the focus is
+	   on a historical version of a member (i.e. installed via
+	   setHistoryFocusOnEntry:). Nil otherwise. The isFocusedOnHistory:
+	   predicate and the read-tool fan-out branch on this. *)
+	focusSha_slot
+	(* focusHistoricalSource_slot: String — the version's source, captured
+	   at focus install time. Returned by get_member_source /
+	   get_class_header when the request matches the historical focus. Set
+	   together with focusSha_slot. *)
+	focusHistoricalSource_slot
 	(* focusEvaluatorMirror_slot: ObjectMirror | ActivationMirror — set when
 	   focusKind = #evaluator. Used directly as the identity for matcher
 	   comparison; also exposed via the 'focus' object-registry id so
@@ -163,16 +176,38 @@ public class IDEChatSetupSubject onModel: providerClass <Class> = AIChatSetupSub
 |
 	public docName <String>
 	public providerName <String> ::= 'anthropic'.
+	public baseUrl <String> ::= ''.
 |
 	(* The parent's initializer already tried to load apiKey via storageKey,
 	   but our overridden storageKey reads providerName which wasn't yet
 	   initialized — the parent's on:Error swallowed and left apiKey empty.
 	   Reload now that providerName is set. *)
 	reloadApiKey.
+	reloadBaseUrl.
 	docName:: defaultDocNameForProvider: providerName
 ) (
 storageKey ^ <String> = (
 	^'ns_ai_apikey_', (providerClassFor: providerName) name
+)
+public reloadBaseUrl = (
+	(* Refresh baseUrl from localStorage (or fall back to the provider's
+	   default). Called from the initializer and on every provider
+	   switch so the form reflects the current provider's URL config. *)
+	baseUrl:: baseUrlForProvider: providerName
+)
+public createProvider = (
+	(* Override the base AIChatSetupSubject>>createProvider to dispatch
+	   on providerName: openai-compat needs the 3-arg factory carrying
+	   baseUrl; others use the inherited 2-arg shape. The base impl
+	   reads `model` which is the original onModel: providerClass and
+	   never updates on dropdown switch, so we explicitly resolve via
+	   providerClass (which itself routes through providerClassFor:). *)
+	| klass |
+	klass:: providerClass.
+	providerName = 'openai-compat' ifTrue: [
+		^klass apiKey: apiKey model: modelName baseUrl: baseUrl
+	].
+	^klass apiKey: apiKey model: modelName
 )
 public providerClass = (
 	(* Override the base AIChatSetupSubject's `model`-based providerClass
@@ -223,6 +258,7 @@ providerDisplayLabelFor: pname <String> ^ <String> = (
 	   back to the key itself. *)
 	pname = 'anthropic' ifTrue: [^'Anthropic'].
 	pname = 'gemini' ifTrue: [^'Gemini'].
+	pname = 'openai-compat' ifTrue: [^'Local'].
 	^pname
 )
 public startChat = (
@@ -245,6 +281,10 @@ public startChat = (
 	].
 	[js localStorage setItem: storageKey to: apiKey]
 		on: Exception do: [:e | ].
+	providerName = 'openai-compat' ifTrue: [
+		[js localStorage setItem: (baseUrlStorageKeyFor: providerName) to: baseUrl]
+			on: Exception do: [:e | ]
+	].
 	[js localStorage setItem: 'ns_ai_active_chat_doc' to: docName]
 		on: Exception do: [:e | ].
 	doc:: ChatDocument
@@ -289,34 +329,50 @@ public class IDEChatSetupPresenter onSubject: s <IDEChatSetupSubject> = AIChatSe
 *)
 |
 	docNameEditor
+	baseUrlEditor
 |
 ) (
 definition = (
-	^column: {
-		helpSection.
-		row: {
-			(label: 'AI Chat Setup') bold.
-			filler.
-			helpButton.
-			dropDownMenu: [actionsMenu].
-		}.
-		mediumBlank.
-		label: 'Configure your AI provider and chat document. API keys are stored per provider in your browser''s localStorage; the chat document lives in your IDE namespace.'.
-		mediumBlank.
-		row: { (label: 'Provider: ') bold. smallBlank. providerPicker. }.
-		mediumBlank.
-		row: { (label: 'API Key: ') bold. elastic: apiKeyField. }.
-		mediumBlank.
-		row: { (label: 'Model: ') bold. elastic: modelField. }.
-		mediumBlank.
-		row: { (label: 'Chat name: ') bold. elastic: docNameField. }.
-		mediumBlank.
-		errorArea.
-		row: {
-			filler.
-			button: 'Start Chat' action: [respondToStart].
-		}.
-	}
+	| rows |
+	rows:: List new.
+	rows add: helpSection.
+	rows add: (row: {
+		(label: 'AI Chat Setup') bold.
+		filler.
+		helpButton.
+		dropDownMenu: [actionsMenu].
+	}).
+	rows add: mediumBlank.
+	rows add: (label: 'Configure your AI provider and chat document. API keys are stored per provider in your browser''s localStorage; the chat document lives in your IDE namespace.').
+	rows add: mediumBlank.
+	rows add: (row: { (label: 'Provider: ') bold. smallBlank. providerPicker. }).
+	rows add: mediumBlank.
+	subject providerName = 'openai-compat' ifTrue: [
+		rows add: (row: { (label: 'Base URL: ') bold. elastic: baseUrlField. }).
+		rows add: ((label: 'Local servers must allow CORS for this origin — e.g. for Ollama set OLLAMA_ORIGINS=* before launching.') italic).
+		rows add: mediumBlank
+	].
+	rows add: (row: { (label: 'API Key: ') bold. elastic: apiKeyField. }).
+	rows add: mediumBlank.
+	rows add: (row: { (label: 'Model: ') bold. elastic: modelField. }).
+	rows add: mediumBlank.
+	rows add: (row: { (label: 'Chat name: ') bold. elastic: docNameField. }).
+	rows add: mediumBlank.
+	rows add: errorArea.
+	rows add: (row: {
+		filler.
+		button: 'Start Chat' action: [respondToStart].
+	}).
+	^column: rows
+)
+baseUrlField = (
+	(* CodeMirror text editor bound to subject baseUrl. Only rendered
+	   when providerName = 'openai-compat'. *)
+	baseUrlEditor:: codeMirror: subject baseUrl.
+	baseUrlEditor changeResponse: [:frag |
+		subject baseUrl: frag textBeingAccepted.
+	].
+	^baseUrlEditor
 )
 providerPicker = (
 	(* Provider selector. Picking a provider swaps in its default model
@@ -328,8 +384,9 @@ providerPicker = (
 		smallBlank.
 		dropDownMenu: [
 			menuWithLabelsAndActions: {
-				{'Anthropic'. [respondToProviderSwitch: 'anthropic' defaultModel: 'claude-sonnet-4-6']}.
-				{'Gemini'.    [respondToProviderSwitch: 'gemini'    defaultModel: 'gemini-3.5-flash']}.
+				{'Anthropic'.                  [respondToProviderSwitch: 'anthropic'     defaultModel: 'claude-sonnet-4-6']}.
+				{'Gemini'.                     [respondToProviderSwitch: 'gemini'        defaultModel: 'gemini-3.5-flash']}.
+				{'Local (OpenAI-compatible)'.  [respondToProviderSwitch: 'openai-compat' defaultModel: '']}.
 			}
 		]
 	}
@@ -350,6 +407,7 @@ respondToProviderSwitch: providerName <String> defaultModel: defaultModel <Strin
 		subject modelName: defaultModel.
 		subject docName: (subject defaultDocNameForProvider: providerName).
 		subject reloadApiKey.
+		subject reloadBaseUrl.
 		keyRevealed:: subject apiKey isEmpty.
 		keyToggle isNil ifFalse: [
 			keyRevealed
@@ -359,6 +417,7 @@ respondToProviderSwitch: providerName <String> defaultModel: defaultModel <Strin
 		keyEditor isNil ifFalse: [keyEditor text: subject apiKey].
 		modelEditor isNil ifFalse: [modelEditor text: subject modelName].
 		docNameEditor isNil ifFalse: [docNameEditor text: subject docName].
+		baseUrlEditor isNil ifFalse: [baseUrlEditor text: subject baseUrl].
 	]
 )
 docNameField = (
@@ -466,10 +525,20 @@ createFreshSession ^ <Session> = (
 	(* Build a brand-new Session bound to a fresh Provider — used on first
 	   chatSubject access and on Clear. API key is read from localStorage
 	   under the per-provider key; missing key raises (which surfaces as a
-	   chat error rather than a silent empty conversation). *)
-	| provider <Provider> session <Session> key <String> |
-	key:: apiKeyForProvider: providerName.
-	provider:: (providerClassFor: providerName) apiKey: key model: modelName.
+	   chat error rather than a silent empty conversation). For the
+	   OpenAI-compatible provider we additionally read the base URL from
+	   localStorage and use the 3-arg factory; other providers use the
+	   2-arg form. *)
+	| provider <Provider> session <Session> key <String> cls |
+	key:: providerName = 'openai-compat'
+		ifTrue: [(apiKeyForProviderOrNil: providerName) isNil
+					ifTrue: ['']
+					ifFalse: [apiKeyForProvider: providerName]]
+		ifFalse: [apiKeyForProvider: providerName].
+	cls:: providerClassFor: providerName.
+	provider:: providerName = 'openai-compat'
+		ifTrue: [cls apiKey: key model: modelName baseUrl: (baseUrlForProvider: providerName)]
+		ifFalse: [cls apiKey: key model: modelName].
 	session:: Session provider: provider tools: (toolsForProvider: provider).
 	session systemPrompt: newspeakSystemPrompt.
 	^session
@@ -542,7 +611,7 @@ insertTurnSection: text <String> role: role <String> = (
 	thinking isNil ifTrue: [
 		Error signal: 'ChatDocument is missing its structural amplets; cannot append turn'
 	].
-	jsDoc:: js global at: 'document'.
+	jsDoc:: JSDocument.
 	section:: jsDoc createElement: 'div'.
 	section setAttribute: 'class' to: 'chat-turn'.
 	section setAttribute: 'data-role' to: role.
@@ -699,8 +768,9 @@ initialChatDocumentContents: n <String> ^ <String> = (
 providerClassFor: pn <String> = (
 	pn = 'anthropic' ifTrue: [^AnthropicProvider].
 	pn = 'gemini' ifTrue: [^GeminiProvider].
+	pn = 'openai-compat' ifTrue: [^OpenAICompatibleProvider].
 	Error signal: 'Unknown provider: ', pn,
-		' (supported: anthropic, gemini)'
+		' (supported: anthropic, gemini, openai-compat)'
 )
 apiKeyStorageKeyFor: pn <String> ^ <String> = (
 	^'ns_ai_apikey_', (providerClassFor: pn) name
@@ -719,6 +789,31 @@ apiKeyForProvider: pn <String> ^ <String> = (
 			'". Set one via the chat setup screen first.'
 	].
 	^key
+)
+baseUrlStorageKeyFor: pn <String> ^ <String> = (
+	(* localStorage key for an OpenAI-compatible provider's base URL.
+	   Only meaningful when pn = 'openai-compat'; harmless to compute
+	   for other provider names but unused there. *)
+	^'ns_ai_baseurl_', (providerClassFor: pn) name
+)
+defaultBaseUrlForProvider: pn <String> ^ <String> = (
+	(* Sensible default base URL for first-time setup. Currently only
+	   OpenAI-compatible has a non-empty default; other providers don't
+	   have a URL concept (they hardcode their endpoints). *)
+	pn = 'openai-compat' ifTrue: [^'http://localhost:11434/v1'].
+	^''
+)
+baseUrlForProvider: pn <String> ^ <String> = (
+	(* Read the configured base URL for pn; if nothing is stored, fall
+	   back to defaultBaseUrlForProvider:. Returns '' for providers that
+	   don't use a base URL. *)
+	| stored |
+	stored:: [js localStorage getItem: (baseUrlStorageKeyFor: pn)]
+		on: Exception do: [:e | nil].
+	(stored isNil or: [stored isEmpty]) ifTrue: [
+		^defaultBaseUrlForProvider: pn
+	].
+	^stored
 )
 public defaultChatDocumentOrCreate ^ <ChatDocument | UndefinedObject> = (
 	| activeName entry key doc |
@@ -754,6 +849,7 @@ public setClassFocusOn: cdm = (
 	focusClassPath:: qname.
 	focusSide:: nil.
 	focusSelector:: nil.
+	clearHistoricalFocusFields.
 	installFocusDescription: ['Class: ', qname]
 		validator: [classStillExists: cdm]
 )
@@ -764,6 +860,7 @@ public setClassHeaderFocusOn: cdm = (
 	focusClassPath:: qname.
 	focusSide:: nil.
 	focusSelector:: nil.
+	clearHistoricalFocusFields.
 	installFocusDescription: ['Class header (factory + slots) of class ', qname]
 		validator: [classStillExists: cdm]
 )
@@ -775,6 +872,7 @@ public setMethodFocusOn: cdm side: side selector: sel = (
 	focusClassPath:: qname.
 	focusSide:: side.
 	focusSelector:: selSym.
+	clearHistoricalFocusFields.
 	installFocusDescription: ['Method: ', qname, ' (', side, ' side) >> ', selSym asString]
 		validator: [methodStillExists: cdm side: side selector: selSym]
 )
@@ -786,8 +884,130 @@ public setLazySlotFocusOn: cdm side: side name: name = (
 	focusClassPath:: qname.
 	focusSide:: side.
 	focusSelector:: nameSym.
+	clearHistoricalFocusFields.
 	installFocusDescription: ['Lazy slot: ', qname, ' (', side, ' side) >> ', nameSym asString]
 		validator: [lazySlotStillExists: cdm side: side name: nameSym]
+)
+clearHistoricalFocusFields = (
+	focusSha_slot:: nil.
+	focusHistoricalSource_slot:: nil.
+)
+public setHistoryFocusOnEntry: entrySubject = (
+	(* Focus on a historical version of a method / lazy slot / class
+	   header. Dispatches on the entry subject's parent kind so the
+	   focusKind / focusClassPath / focusSide / focusSelector match the
+	   corresponding live focus, then layers on the sha and a snapshot of
+	   the version's source. The structured focus carries enough for the
+	   brain-button highlight to compare across rebuilds and for the read
+	   tools to fan out to the historical source. *)
+	| parent shortSha header source |
+	parent:: entrySubject parentSubject.
+	source:: entrySubject versionSource.
+	focusSha_slot:: entrySubject sha.
+	focusHistoricalSource_slot:: source.
+	shortSha:: entrySubject shortSha.
+	parent isKindOfMethodHistorySubject ifTrue: [
+		| cdm side selSym qname |
+		cdm:: parent methodMirror definingMixin declaration.
+		side:: parent methodMirror definingMixin isMeta
+			ifTrue: ['class'] ifFalse: ['instance'].
+		selSym:: parent methodMirror name.
+		qname:: qualifiedNameOf: cdm.
+		focusKind:: #method.
+		focusClassPath:: qname.
+		focusSide:: side.
+		focusSelector:: selSym.
+		header:: 'Method (historical version @', shortSha, '): ',
+			qname, ' (', side, ' side) >> ', selSym asString.
+		^installHistoricalFocusDescription: header
+			source: source
+			entry: entrySubject].
+	parent isKindOfLazySlotHistorySubject ifTrue: [
+		| cdm side nameSym qname |
+		cdm:: parent slotMirror definingMixin declaration.
+		side:: parent slotMirror definingMixin isMeta
+			ifTrue: ['class'] ifFalse: ['instance'].
+		nameSym:: parent slotMirror name.
+		qname:: qualifiedNameOf: cdm.
+		focusKind:: #lazySlot.
+		focusClassPath:: qname.
+		focusSide:: side.
+		focusSelector:: nameSym.
+		header:: 'Lazy slot (historical version @', shortSha, '): ',
+			qname, ' (', side, ' side) >> ', nameSym asString.
+		^installHistoricalFocusDescription: header
+			source: source
+			entry: entrySubject].
+	parent isKindOfClassHeaderHistorySubject ifTrue: [
+		| cdm qname |
+		cdm:: parent classMirror.
+		qname:: qualifiedNameOf: cdm.
+		focusKind:: #classHeader.
+		focusClassPath:: qname.
+		focusSide:: nil.
+		focusSelector:: nil.
+		header:: 'Class header (historical version @', shortSha, ') of class ', qname.
+		^installHistoricalFocusDescription: header
+			source: source
+			entry: entrySubject].
+)
+installHistoricalFocusDescription: header source: source entry: entrySubject = (
+	(* The description handed to current_focus combines an identity line,
+	   the version's source, and an explicit note that source-writing
+	   tools install changes as the new live version (the existing
+	   Make Live semantic). The validator is a no-op true: git blobs are
+	   immutable and we hold the snapshot, so the focus never goes
+	   stale. *)
+	| commitMsg dateStr description body |
+	commitMsg:: firstLineOf: entrySubject commitMessage.
+	dateStr:: formatHistoryTimestamp: entrySubject commitTimestamp.
+	body:: header, '\n',
+		'Committed ', dateStr, ': ', commitMsg, '\n\n',
+		source, '\n\n',
+		'Note: this is a read-only historical version. Tools that write source ',
+		'(e.g. set_member_source, propose_changes) install changes as the new ',
+		'live version, similar to clicking Make Live.'.
+	description:: body.
+	installFocusDescription: [description]
+		validator: [true]
+)
+firstLineOf: msg = (
+	| lf idx |
+	lf:: String fromRunes: { 10 }.
+	idx:: msg indexOf: lf.
+	^idx = 0
+		ifTrue: [msg]
+		ifFalse: [msg copyFrom: 1 to: idx - 1]
+)
+formatHistoryTimestamp: tsSeconds = (
+	(* The alien bridge truncates Newspeak Integer to 32 bits when
+	   handing it to JS, so force Float arithmetic via asFloat. *)
+	^(JSDate new: tsSeconds asFloat * 1000) toLocaleString
+)
+public isFocusedOnHistory: parent sha: sha ^ <Boolean> = (
+	(* Brain-button highlight predicate for a historical entry. Matches
+	   when (a) the sha matches, AND (b) the live identity (kind +
+	   class path + side + selector) matches the entry's parent's
+	   corresponding live identity. The live mirror is the authority on
+	   the parent's qualified name, so we recompute it here rather than
+	   storing redundant fields. *)
+	focusSha_slot isNil ifTrue: [^false].
+	focusSha_slot = sha ifFalse: [^false].
+	parent isKindOfMethodHistorySubject ifTrue: [
+		| cdm side |
+		cdm:: parent methodMirror definingMixin declaration.
+		side:: parent methodMirror definingMixin isMeta
+			ifTrue: ['class'] ifFalse: ['instance'].
+		^isFocusedOnMethod: cdm side: side selector: parent methodMirror name].
+	parent isKindOfLazySlotHistorySubject ifTrue: [
+		| cdm side |
+		cdm:: parent slotMirror definingMixin declaration.
+		side:: parent slotMirror definingMixin isMeta
+			ifTrue: ['class'] ifFalse: ['instance'].
+		^isFocusedOnLazySlot: cdm side: side name: parent slotMirror name].
+	parent isKindOfClassHeaderHistorySubject ifTrue: [
+		^isFocusedOnClassHeader: parent classMirror].
+	^false
 )
 public setTestRunFocusOn: configClass = (
 	(* Focus on a test run for the given test configuration class.
@@ -800,6 +1020,7 @@ public setTestRunFocusOn: configClass = (
 	focusClassPath:: qname.
 	focusSide:: nil.
 	focusSelector:: nil.
+	clearHistoricalFocusFields.
 	installFocusDescription: ['Test results: ', qname]
 		validator: [classStillExists: cdm]
 )
@@ -817,6 +1038,7 @@ public setDocumentFocusOn: doc = (
 	focusClassPath:: docName.
 	focusSide:: nil.
 	focusSelector:: nil.
+	clearHistoricalFocusFields.
 	installFocusDescription: ['Document: ', docName]
 		validator: [(Root at: docName asSymbol ifAbsent: [nil]) = doc]
 )
@@ -845,6 +1067,7 @@ public setEvaluatorFocusOnSubject: evaluatorSubject = (
 	focusSelector:: nil.
 	focusEvaluatorMirror_slot:: mirror.
 	focusEvaluatorSubject_slot:: evaluatorSubject.
+	clearHistoricalFocusFields.
 	(mirror isKindOfActivationMirror) ifTrue: [
 		registerActivation: mirror
 	].
@@ -938,6 +1161,8 @@ public clearFocus = (
 	focusSelector:: nil.
 	focusEvaluatorMirror_slot:: nil.
 	focusEvaluatorSubject_slot:: nil.
+	focusSha_slot:: nil.
+	focusHistoricalSource_slot:: nil.
 )
 public activeChatHolder = (
 	^activeChatHolder_slot
@@ -1567,33 +1792,44 @@ getMemberSourceTool ^ <Tool> = (
 		description: 'Get the source of a method or a lazy slot in a class. Specify the selector (the member''s name) including colons for keyword methods (e.g. "at:put:"). Searches the named class side''s methods first, then its lazy slots. For ordinary (non-lazy) slot declarations, use get_class_header.'
 		inputSchema: '{"type":"object","properties":{"class_name":{"type":"string","description":"Class name or dotted path"},"selector":{"type":"string","description":"Method or lazy-slot name (e.g. foo, at:put:, +)"},"side":{"type":"string","enum":["instance","class"],"description":"Which side of the class (default: instance)"}},"required":["class_name","selector"]}'
 		handler: [:input |
-			| cdm mixin selector found result |
+			| cdm mixin selector found result side qname historicalMatch |
 			cdm:: resolveClassPath: (input at: 'class_name').
 			selector:: (input at: 'selector') asSymbol.
-			mixin:: ((input at: 'side') = 'class')
-				ifTrue: [cdm classSide]
-				ifFalse: [cdm instanceSide].
-			found:: false.
-			result:: ''.
-			mixin methods do: [:mm |
-				mm name = selector ifTrue: [
-					result:: mm source.
-					found:: true.
-				].
-			].
-			found ifFalse: [
-				mixin lazySlots do: [:ls |
-					ls name = selector ifTrue: [
-						result:: ls source.
-						found:: true.
+			side:: (input at: 'side' ifAbsent: ['instance']).
+			qname:: qualifiedNameOf: cdm.
+			historicalMatch::
+				focusSha_slot isNil not
+				and: [(focusKind = #method or: [focusKind = #lazySlot])
+				and: [focusClassPath = qname
+				and: [focusSide = side
+				and: [focusSelector = selector]]]].
+			historicalMatch
+				ifTrue: [focusHistoricalSource_slot]
+				ifFalse: [
+					mixin:: (side = 'class')
+						ifTrue: [cdm classSide]
+						ifFalse: [cdm instanceSide].
+					found:: false.
+					result:: ''.
+					mixin methods do: [:mm |
+						mm name = selector ifTrue: [
+							result:: mm source.
+							found:: true.
+						].
 					].
-				].
-			].
-			found ifFalse: [
-				Error signal: 'No method or lazy slot named ', selector,
-					' in ', cdm simpleName
-			].
-			result
+					found ifFalse: [
+						mixin lazySlots do: [:ls |
+							ls name = selector ifTrue: [
+								result:: ls source.
+								found:: true.
+							].
+						].
+					].
+					found ifFalse: [
+						Error signal: 'No method or lazy slot named ', selector,
+							' in ', cdm simpleName
+					].
+					result]
 		]
 )
 getClassHeaderTool ^ <Tool> = (
@@ -1602,7 +1838,15 @@ getClassHeaderTool ^ <Tool> = (
 		description: 'Get just the class header (factory method signature, superclass clause, slot declarations) without the method bodies.'
 		inputSchema: '{"type":"object","properties":{"class_name":{"type":"string","description":"Class name or dotted path"}},"required":["class_name"]}'
 		handler: [:input |
-			(resolveClassPath: (input at: 'class_name')) header source
+			| cdm historicalMatch |
+			cdm:: resolveClassPath: (input at: 'class_name').
+			historicalMatch::
+				focusSha_slot isNil not
+				and: [focusKind = #classHeader
+				and: [focusClassPath = (qualifiedNameOf: cdm)]].
+			historicalMatch
+				ifTrue: [focusHistoricalSource_slot]
+				ifFalse: [cdm header source]
 		]
 )
 listClassMembersTool ^ <Tool> = (
@@ -1775,7 +2019,7 @@ pickFile ^ <Alien[Promise]> = (
 	   resolve/reject as ordinary JS function aliens, which we invoke
 	   later (asynchronously, from event handlers) via Function.call. *)
 	| deferred <Alien> resolveFn <Alien> rejectFn <Alien> |
-	deferred:: aiAccess Promise withResolvers.
+	deferred:: aiAccess JSPromise withResolvers.
 	resolveFn:: deferred at: 'resolve'.
 	rejectFn:: deferred at: 'reject'.
 	FileChooserFragment new
@@ -1795,7 +2039,7 @@ readFileAsBase64: file <Alien> ^ <Alien[Promise]> = (
 	  deferred <Alien> resolveFn <Alien> rejectFn <Alien> |
 	FileReader:: aiAccess global at: 'FileReader'.
 	reader:: FileReader new.
-	deferred:: aiAccess Promise withResolvers.
+	deferred:: aiAccess JSPromise withResolvers.
 	resolveFn:: deferred at: 'resolve'.
 	rejectFn:: deferred at: 'reject'.
 	reader addEventListener: 'load' action: [:event |
@@ -1928,7 +2172,7 @@ documentAt: dottedPath <String> ^ <Object> = (
 )
 parseAmpletContainer: html <String> ^ <Object> = (
 	| jsDoc div |
-	jsDoc:: js global at: 'document'.
+	jsDoc:: JSDocument.
 	div:: jsDoc createElement: 'div'.
 	div at: 'innerHTML' put: html.
 	^div
@@ -2089,7 +2333,7 @@ addAmpletTool ^ <Tool> = (
 				ifTrue: [bodies at: 0]
 				ifFalse: [container].
 			newId:: doc nextAmpletId printString.
-			jsDoc:: js global at: 'document'.
+			jsDoc:: JSDocument.
 			newAmplet:: jsDoc createElement: 'div'.
 			newAmplet setAttribute: 'class' to: 'ampleforth'.
 			newAmplet setAttribute: 'ampletId' to: newId.

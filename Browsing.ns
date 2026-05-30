@@ -3428,6 +3428,8 @@ public class MemberHistoryEntrySubject onModel: m <MemberHistoryEntryModel>
 |
 editor_slot
 versionSource_slot
+messages_slot
+messagesComputed_slot ::= false.
 |
 ) (
 public createPresenter ^ <Presenter> = (
@@ -3450,6 +3452,106 @@ public editor = (^editor_slot)
 public editor: cm = (editor_slot:: cm)
 public installEdits: text <String> = (
   parentSubject installHistoricalSource: text
+)
+public messages ^ <List[Symbol] | Nil> = (
+  (* Lazily compiles versionSource against the live defining mixin and
+     walks the resulting bytecode for sent selectors. Returns nil when
+     compilation fails (e.g. the source predates a syntax change) or
+     when there's no source yet. nil is the "menu shows a disabled
+     entry" signal; an empty list is "compiled fine but no sends". *)
+  messagesComputed_slot ifTrue: [^messages_slot].
+  versionSource_slot isNil ifTrue: [^nil].
+  messagesComputed_slot:: true.
+  messages_slot:: [computeMessages] on: Error do: [:e | nil].
+  ^messages_slot
+)
+computeMessages ^ <List[Symbol] | Nil> = (
+  | parent |
+  parent:: parentSubject.
+  parent isKindOfMethodHistorySubject ifTrue: [
+    | imeth |
+    imeth:: compiler
+      compileMethodSource: versionSource_slot
+      within: parent methodMirror definingMixin.
+    ^selectorsInBytes: imeth bytes literals: imeth literals].
+  parent isKindOfLazySlotHistorySubject ifTrue: [
+    | islot init |
+    islot:: compiler
+      compileLazySlotSource: versionSource_slot
+      within: parent slotMirror definingMixin.
+    init:: islot intermediateInitMethod.
+    ^selectorsInBytes: init bytes literals: init literals].
+  parent isKindOfClassHeaderHistorySubject ifTrue: [
+    ^computeHeaderMessages].
+  ^nil
+)
+computeHeaderMessages ^ <List[Symbol]> = (
+  (* Mirrors the live ClassFactoryPresenter>>messages at
+     Browsing.ns:685: explicit slot names (and setters for mutable
+     slots) plus the bytecode-walked selectors of the synthetic class-
+     declaration initializer, with backtick-mangled internal selectors
+     dropped. We deliberately do NOT walk the factory -- the live menu
+     doesn't either, so basicNew etc. would just be noise. `within:`
+     is nil; Newspeak's late binding means selector extraction does
+     not need an enclosing-scope lookup. *)
+  | icd accum initSelectors |
+  icd:: compiler compileClassHeader2: versionSource_slot within: nil.
+  accum:: List new.
+  icd instanceSide slots do: [:slot |
+    accum add: slot name.
+    slot isMutable ifTrue: [accum add: slot name, ':']].
+  icd initializers isNil ifFalse: [
+    icd initializers do: [:imeth |
+      initSelectors::
+        (selectorsInBytes: imeth bytes literals: imeth literals)
+          removeAllSuchThat: [:s | (s indexOf: '`') > 0].
+      initSelectors do: [:s |
+        (accum indexOf: s) = 0 ifTrue: [accum add: s]]]].
+  ^accum
+)
+selectorsInBytes: bytes literals: literals ^ <List[Symbol]> = (
+  (* Bytecode walker. Mirrors MethodMirror>>selectors in
+     out/MirrorsForPrimordialSoup.ns:1090 -- common sends, ordinary
+     sends, and the extension-byte forms for implicit-receiver / super
+     / self / outer sends. Selectors are accumulated from the literal
+     pool. *)
+  | pc extA result |
+  pc:: 1.
+  extA:: 0.
+  result:: Set new.
+  [pc > bytes size] whileFalse: [
+    | instruction |
+    instruction:: bytes at: pc.
+    (instruction > 79 and: [instruction <= 111]) ifTrue: [
+      result add: (commonSendSelector: instruction - 79)].
+    (instruction > 112 and: [instruction <= 175]) ifTrue: [
+      | index |
+      index:: 1 + (instruction bitAnd: 15).
+      result add: (literals at: index)].
+    instruction = 224 ifTrue: [
+      | byte2 |
+      byte2:: bytes at: pc + 1.
+      extA:: (extA << 8) + byte2].
+    ({227. 228. 253} indexOf: instruction) > 0 ifTrue: [extA:: 0].
+    ({238. 240. 241. 245. 254} indexOf: instruction) > 0 ifTrue: [
+      | byte2 index |
+      byte2:: bytes at: pc + 1.
+      index:: 1 + (extA << 5) + (byte2 >> 3).
+      extA:: 0.
+      result add: (literals at: index)].
+    pc:: pc + (bytecodeSize: instruction)].
+  ^List withAll: result asArray
+)
+bytecodeSize: instruction = (
+  instruction <= 223 ifTrue: [^1].
+  instruction <= 248 ifTrue: [^2].
+  ^3
+)
+commonSendSelector: offset = (
+  ^{#+. #-. #<. #>. #<=. #>=. #=. #~=. #*. #/. #\\. #@. #bitShift:. #//.
+    #bitAnd:. #bitOr:. #at:. #at:put:. #size. #next. #nextPut:. #atEnd.
+    #==. #class. #blockCopy:. #value. #value:. #do:. #new. #new:. #x.
+    #y.} at: offset
 )
 public isKindOfMemberHistoryEntrySubject ^ <Boolean> = (^true)
 isMyKind: f <Subject> ^ <Boolean> = (
@@ -3487,9 +3589,53 @@ definition = (
     row: {
       mediumBlank.
       button: 'Make Live' action: [installCurrentEditorText].
+      smallBlank.
+      dropDownMenu: [messagesMenu] image: ide images itemReferencesImage.
       filler
     }
   }
+)
+messagesMenu = (
+  (* If compilation fell over (syntax change since the commit), show a
+     single disabled placeholder. Otherwise build the same item set the
+     live MethodPresenter uses, dropping selectors that contain spaces
+     (the existing string-heuristic for "not a real selector") and
+     skipping the entry's own selector when it matches one. *)
+  | msgs items |
+  msgs:: subject messages.
+  msgs isNil ifTrue: [
+    ^menuWithLabelsAndActions: {
+      {'(source predates a syntax change)'. []}}].
+  items:: referencesMenuMessageItems: msgs.
+  items isEmpty ifTrue: [
+    ^menuWithLabelsAndActions: {
+      {'(no references in this version)'. []}}].
+  ^menuWithLabelsAndActions: items
+)
+referencesMenuMessageItems: msgs <List[Symbol]> ^ <List> = (
+  (* Same shape as the live MethodPresenter's referencesMenuMessageItems
+     at Browsing.ns:2744 -- filter, sort lexically, emit
+     {label. [browseSelector: selector]}. *)
+  | items likely sorted name |
+  items:: List new.
+  name:: parentMemberName.
+  likely:: msgs select: [:s <String> | 0 = (s indexOf: ' ')].
+  sorted:: likely sort: [:m1 :m2 | lexicallyLessOrEqual: m1 than: m2].
+  sorted do: [:selector |
+    selector == name ifFalse: [
+      items add:
+        {selector copyFrom: 1 to: (64 min: selector size).
+         [browseSelector: selector]}]].
+  ^items
+)
+parentMemberName = (
+  (* Skip the entry's own name when listing its sends, so we don't
+     suggest "find senders of foo" from inside foo. *)
+  | parent |
+  parent:: subject parentSubject.
+  parent isKindOfMethodHistorySubject ifTrue: [^parent methodMirror name].
+  parent isKindOfLazySlotHistorySubject ifTrue: [^parent slotMirror name].
+  ^nil
 )
 ensureEditor ^ <CodeMirrorFragment> = (
   (* Lazy-init the CodeMirror once; subsequent renders return the same

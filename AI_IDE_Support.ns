@@ -84,6 +84,16 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = (
 	focusSide
 	(* focusSelector: Symbol — method or lazy-slot name, or nil *)
 	focusSelector
+	(* focusSha_slot: String (full git oid) — present only when the focus is
+	   on a historical version of a member (i.e. installed via
+	   setHistoryFocusOnEntry:). Nil otherwise. The isFocusedOnHistory:sha:
+	   predicate and the read-tool fan-out branch on this. *)
+	focusSha_slot
+	(* focusHistoricalSource_slot: String — the version's source, captured
+	   at focus install time. Returned by get_member_source /
+	   get_class_header when the request matches the historical focus. Set
+	   together with focusSha_slot. *)
+	focusHistoricalSource_slot
 	(* focusEvaluatorMirror_slot: ObjectMirror | ActivationMirror — set when
 	   focusKind = #evaluator. Used directly as the identity for matcher
 	   comparison; also exposed via the 'focus' object-registry id so
@@ -850,6 +860,7 @@ public setClassFocusOn: cdm = (
 	focusClassPath:: qname.
 	focusSide:: nil.
 	focusSelector:: nil.
+	clearHistoricalFocusFields.
 	installFocusDescription: ['Class: ', qname]
 		validator: [classStillExists: cdm]
 )
@@ -860,6 +871,7 @@ public setClassHeaderFocusOn: cdm = (
 	focusClassPath:: qname.
 	focusSide:: nil.
 	focusSelector:: nil.
+	clearHistoricalFocusFields.
 	installFocusDescription: ['Class header (factory + slots) of class ', qname]
 		validator: [classStillExists: cdm]
 )
@@ -871,6 +883,7 @@ public setMethodFocusOn: cdm side: side selector: sel = (
 	focusClassPath:: qname.
 	focusSide:: side.
 	focusSelector:: selSym.
+	clearHistoricalFocusFields.
 	installFocusDescription: ['Method: ', qname, ' (', side, ' side) >> ', selSym asString]
 		validator: [methodStillExists: cdm side: side selector: selSym]
 )
@@ -882,8 +895,133 @@ public setLazySlotFocusOn: cdm side: side name: name = (
 	focusClassPath:: qname.
 	focusSide:: side.
 	focusSelector:: nameSym.
+	clearHistoricalFocusFields.
 	installFocusDescription: ['Lazy slot: ', qname, ' (', side, ' side) >> ', nameSym asString]
 		validator: [lazySlotStillExists: cdm side: side name: nameSym]
+)
+clearHistoricalFocusFields = (
+	focusSha_slot:: nil.
+	focusHistoricalSource_slot:: nil.
+)
+public setHistoryFocusOnEntry: entrySubject = (
+	(* Focus on a historical version of a method / lazy slot / class
+	   header. Dispatches on the entry subject's parent kind so the
+	   focusKind / focusClassPath / focusSide / focusSelector match the
+	   corresponding live focus, then layers on the sha and a snapshot of
+	   the version's source. The structured focus carries enough for the
+	   brain-button highlight to compare across rebuilds and for the read
+	   tools to fan out to the historical source. *)
+	| parent shortSha header source |
+	parent:: entrySubject parentSubject.
+	source:: entrySubject versionSource.
+	focusSha_slot:: entrySubject sha.
+	focusHistoricalSource_slot:: source.
+	shortSha:: entrySubject shortSha.
+	parent isKindOfMethodHistorySubject ifTrue: [
+		| cdm side selSym qname |
+		cdm:: parent methodMirror definingMixin declaration.
+		side:: parent methodMirror definingMixin isMeta
+			ifTrue: ['class'] ifFalse: ['instance'].
+		selSym:: parent methodMirror name.
+		qname:: qualifiedNameOf: cdm.
+		focusKind:: #method.
+		focusClassPath:: qname.
+		focusSide:: side.
+		focusSelector:: selSym.
+		header:: 'Method (historical version @', shortSha, '): ',
+			qname, ' (', side, ' side) >> ', selSym asString.
+		^installHistoricalFocusDescription: header
+			source: source
+			entry: entrySubject].
+	parent isKindOfLazySlotHistorySubject ifTrue: [
+		| cdm side nameSym qname |
+		cdm:: parent slotMirror definingMixin declaration.
+		side:: parent slotMirror definingMixin isMeta
+			ifTrue: ['class'] ifFalse: ['instance'].
+		nameSym:: parent slotMirror name.
+		qname:: qualifiedNameOf: cdm.
+		focusKind:: #lazySlot.
+		focusClassPath:: qname.
+		focusSide:: side.
+		focusSelector:: nameSym.
+		header:: 'Lazy slot (historical version @', shortSha, '): ',
+			qname, ' (', side, ' side) >> ', nameSym asString.
+		^installHistoricalFocusDescription: header
+			source: source
+			entry: entrySubject].
+	parent isKindOfClassHeaderHistorySubject ifTrue: [
+		| cdm qname |
+		cdm:: parent classMirror.
+		qname:: qualifiedNameOf: cdm.
+		focusKind:: #classHeader.
+		focusClassPath:: qname.
+		focusSide:: nil.
+		focusSelector:: nil.
+		header:: 'Class header (historical version @', shortSha, ') of class ', qname.
+		^installHistoricalFocusDescription: header
+			source: source
+			entry: entrySubject].
+)
+installHistoricalFocusDescription: header source: source entry: entrySubject = (
+	(* The description handed to current_focus combines an identity line,
+	   the version's source, and an explicit note that source-writing
+	   tools install changes as the new live version (the existing
+	   Make Live semantic). The validator is a no-op true: git blobs are
+	   immutable and we hold the snapshot, so the focus never goes
+	   stale. *)
+	| commitMsg dateStr description body lf |
+	lf:: String fromRunes: { 10 }.
+	commitMsg:: firstLineOfMessage: entrySubject commitMessage.
+	dateStr:: formatHistoryTimestamp: entrySubject commitTimestamp.
+	body:: header, lf,
+		'Committed ', dateStr, ': ', commitMsg, lf, lf,
+		source, lf, lf,
+		'Note: this is a read-only historical version. Tools that write source ',
+		'(e.g. set_member_source, propose_changes) install changes as the new ',
+		'live version, similar to clicking Make Live.'.
+	description:: body.
+	installFocusDescription: [description]
+		validator: [true]
+)
+firstLineOfMessage: msg = (
+	| lf idx |
+	lf:: String fromRunes: { 10 }.
+	idx:: msg indexOf: lf.
+	^idx = 0
+		ifTrue: [msg]
+		ifFalse: [msg copyFrom: 1 to: idx - 1]
+)
+formatHistoryTimestamp: tsSeconds = (
+	(* The alien bridge truncates Newspeak Integer to 32 bits when
+	   handing it to JS, so force Float arithmetic via asFloat. *)
+	| Date |
+	Date:: js global at: 'Date'.
+	^(Date new: tsSeconds asFloat * 1000) toLocaleString
+)
+public isFocusedOnHistory: parent sha: sha ^ <Boolean> = (
+	(* Brain-button highlight predicate for a historical entry. Matches
+	   when (a) the sha matches, AND (b) the live identity (kind +
+	   class path + side + selector) matches the entry's parent's
+	   corresponding live identity. The live mirror is the authority on
+	   the parent's qualified name, so we recompute it here rather than
+	   storing redundant fields. *)
+	focusSha_slot isNil ifTrue: [^false].
+	focusSha_slot = sha ifFalse: [^false].
+	parent isKindOfMethodHistorySubject ifTrue: [
+		| cdm side |
+		cdm:: parent methodMirror definingMixin declaration.
+		side:: parent methodMirror definingMixin isMeta
+			ifTrue: ['class'] ifFalse: ['instance'].
+		^isFocusedOnMethod: cdm side: side selector: parent methodMirror name].
+	parent isKindOfLazySlotHistorySubject ifTrue: [
+		| cdm side |
+		cdm:: parent slotMirror definingMixin declaration.
+		side:: parent slotMirror definingMixin isMeta
+			ifTrue: ['class'] ifFalse: ['instance'].
+		^isFocusedOnLazySlot: cdm side: side name: parent slotMirror name].
+	parent isKindOfClassHeaderHistorySubject ifTrue: [
+		^isFocusedOnClassHeader: parent classMirror].
+	^false
 )
 public setTestRunFocusOn: configClass = (
 	(* Focus on a test run for the given test configuration class.
@@ -896,6 +1034,7 @@ public setTestRunFocusOn: configClass = (
 	focusClassPath:: qname.
 	focusSide:: nil.
 	focusSelector:: nil.
+	clearHistoricalFocusFields.
 	installFocusDescription: ['Test results: ', qname]
 		validator: [classStillExists: cdm]
 )
@@ -913,6 +1052,7 @@ public setDocumentFocusOn: doc = (
 	focusClassPath:: docName.
 	focusSide:: nil.
 	focusSelector:: nil.
+	clearHistoricalFocusFields.
 	installFocusDescription: ['Document: ', docName]
 		validator: [(Root at: docName asSymbol ifAbsent: [nil]) = doc]
 )
@@ -941,6 +1081,7 @@ public setEvaluatorFocusOnSubject: evaluatorSubject = (
 	focusSelector:: nil.
 	focusEvaluatorMirror_slot:: mirror.
 	focusEvaluatorSubject_slot:: evaluatorSubject.
+	clearHistoricalFocusFields.
 	(mirror isKindOfActivationMirror) ifTrue: [
 		registerActivation: mirror
 	].
@@ -1034,6 +1175,8 @@ public clearFocus = (
 	focusSelector:: nil.
 	focusEvaluatorMirror_slot:: nil.
 	focusEvaluatorSubject_slot:: nil.
+	focusSha_slot:: nil.
+	focusHistoricalSource_slot:: nil.
 )
 public activeChatHolder = (
 	^activeChatHolder_slot
@@ -1663,33 +1806,44 @@ getMemberSourceTool ^ <Tool> = (
 		description: 'Get the source of a method or a lazy slot in a class. Specify the selector (the member''s name) including colons for keyword methods (e.g. "at:put:"). Searches the named class side''s methods first, then its lazy slots. For ordinary (non-lazy) slot declarations, use get_class_header.'
 		inputSchema: '{"type":"object","properties":{"class_name":{"type":"string","description":"Class name or dotted path"},"selector":{"type":"string","description":"Method or lazy-slot name (e.g. foo, at:put:, +)"},"side":{"type":"string","enum":["instance","class"],"description":"Which side of the class (default: instance)"}},"required":["class_name","selector"]}'
 		handler: [:input |
-			| cdm mixin selector found result |
+			| cdm mixin selector found result side qname historicalMatch |
 			cdm:: resolveClassPath: (input at: 'class_name').
 			selector:: (input at: 'selector') asSymbol.
-			mixin:: ((input at: 'side') = 'class')
-				ifTrue: [cdm classSide]
-				ifFalse: [cdm instanceSide].
-			found:: false.
-			result:: ''.
-			mixin methods do: [:mm |
-				mm name = selector ifTrue: [
-					result:: mm source.
-					found:: true.
-				].
-			].
-			found ifFalse: [
-				mixin lazySlots do: [:ls |
-					ls name = selector ifTrue: [
-						result:: ls source.
-						found:: true.
+			side:: (input at: 'side' ifAbsent: ['instance']).
+			qname:: qualifiedNameOf: cdm.
+			historicalMatch::
+				focusSha_slot isNil not
+				and: [(focusKind = #method or: [focusKind = #lazySlot])
+				and: [focusClassPath = qname
+				and: [focusSide = side
+				and: [focusSelector = selector]]]].
+			historicalMatch
+				ifTrue: [focusHistoricalSource_slot]
+				ifFalse: [
+					mixin:: (side = 'class')
+						ifTrue: [cdm classSide]
+						ifFalse: [cdm instanceSide].
+					found:: false.
+					result:: ''.
+					mixin methods do: [:mm |
+						mm name = selector ifTrue: [
+							result:: mm source.
+							found:: true.
+						].
 					].
-				].
-			].
-			found ifFalse: [
-				Error signal: 'No method or lazy slot named ', selector,
-					' in ', cdm simpleName
-			].
-			result
+					found ifFalse: [
+						mixin lazySlots do: [:ls |
+							ls name = selector ifTrue: [
+								result:: ls source.
+								found:: true.
+							].
+						].
+					].
+					found ifFalse: [
+						Error signal: 'No method or lazy slot named ', selector,
+							' in ', cdm simpleName
+					].
+					result]
 		]
 )
 getClassHeaderTool ^ <Tool> = (
@@ -1698,7 +1852,15 @@ getClassHeaderTool ^ <Tool> = (
 		description: 'Get just the class header (factory method signature, superclass clause, slot declarations) without the method bodies.'
 		inputSchema: '{"type":"object","properties":{"class_name":{"type":"string","description":"Class name or dotted path"}},"required":["class_name"]}'
 		handler: [:input |
-			(resolveClassPath: (input at: 'class_name')) header source
+			| cdm historicalMatch |
+			cdm:: resolveClassPath: (input at: 'class_name').
+			historicalMatch::
+				focusSha_slot isNil not
+				and: [focusKind = #classHeader
+				and: [focusClassPath = (qualifiedNameOf: cdm)]].
+			historicalMatch
+				ifTrue: [focusHistoricalSource_slot]
+				ifFalse: [cdm header source]
 		]
 )
 listClassMembersTool ^ <Tool> = (
@@ -1871,7 +2033,7 @@ pickFile ^ <Alien[Promise]> = (
 	   resolve/reject as ordinary JS function aliens, which we invoke
 	   later (asynchronously, from event handlers) via Function.call. *)
 	| deferred <Alien> resolveFn <Alien> rejectFn <Alien> |
-	deferred:: aiAccess Promise withResolvers.
+	deferred:: aiAccess JSPromise withResolvers.
 	resolveFn:: deferred at: 'resolve'.
 	rejectFn:: deferred at: 'reject'.
 	FileChooserFragment new
@@ -1891,7 +2053,7 @@ readFileAsBase64: file <Alien> ^ <Alien[Promise]> = (
 	  deferred <Alien> resolveFn <Alien> rejectFn <Alien> |
 	FileReader:: aiAccess global at: 'FileReader'.
 	reader:: FileReader new.
-	deferred:: aiAccess Promise withResolvers.
+	deferred:: aiAccess JSPromise withResolvers.
 	resolveFn:: deferred at: 'resolve'.
 	rejectFn:: deferred at: 'reject'.
 	reader addEventListener: 'load' action: [:event |

@@ -1,0 +1,1275 @@
+Newspeak3
+'Root'
+class Repositories usingPlatform: platform ide: webIde = (
+(*
+ User-visible git repositories scoped by Namespace. Companion to
+ DraftsRepo (which is hidden and single-purpose, powering the per-
+ member history UI); this module exposes named user-managed
+ repositories the user explicitly registers, clones, browses, and
+ (eventually) commits to / pushes / pulls.
+
+ Each Repository's tracked content is the entries of a Namespace
+ (a Map[Symbol, Object]); multi-repo membership emerges from the
+ language's existing multi-namespace membership. There is no
+ separate "extra classes" list.
+
+ Phase 1 scope (this commit): Repository model + setup form +
+ list page + log-view RepositoryPresenter. Clone-on-create works
+ against public read-only repos via the CORS proxy.
+
+ JS globals required (loaded via <script> tags in primordialsoup.html):
+   window.git         - isomorphic-git facade
+   window.LightningFS - FS constructor
+   window.GitHttp     - isomorphic-git/http/web
+*)
+|
+	private Root = webIde namespacing Root.
+	private ide = webIde.
+	private js = platform js.
+	private global = js global.
+	(* Built-in JS globals — always present, eager capture is safe. *)
+	private JSPromise = global at: #Promise.
+	private TextDecoder = global at: #TextDecoder.
+	private JSON = global at: #JSON.
+	private JSDate = global at: #Date.
+	(* CDN-loaded JS classes (window.LightningFS / window.git /
+	   window.GitHttp) are NOT captured here. The Newspeak snapshot is
+	   loaded via <script async>, so module construction can run before
+	   the regular <script> tags that define these globals have finished
+	   executing. Eager `global at: #LightningFS` at construction would
+	   bind to `undefined` and stay that way. They're surfaced as `lazy
+	   public` slots in the class body below, which read the live window
+	   at first access. *)
+	private Map = platform collections Map.
+	private List = platform collections List.
+	private Set = platform collections Set.
+	private Subject = platform hopscotch Subject.
+	private Presenter = platform hopscotch Presenter.
+	private ProgrammingSubject = webIde browsing ProgrammingSubject.
+	private ProgrammingPresenter = webIde browsing ProgrammingPresenter.
+	private Color = platform graphics Color.
+	private localStorage = platform js localStorage.
+	styleButtonSize <Float> = 30.
+	(* localStorage key holding the JSON-encoded list of Repository
+	   configs. Restored on module construction; updated on
+	   create / delete. *)
+	repoConfigsKey = 'ns_vcs_repos'.
+|
+	(* Register RepositoryPresenter as an inspector view for any object
+	   answering isKindOfRepository. Effect: when the user clicks a
+	   Repository entry in a NamespacePresenter (e.g. Root), the live
+	   repository UI replaces the generic object inspector. Mirrors how
+	   Documents.ns:81 registers DocumentPresenter for isKindOfDocument. *)
+	webIde browsing addObjectViews: {RepositoryPresenter} forKind: 'isKindOfRepository'.
+	(* Pull saved repo configs from localStorage and reconstruct
+	   Repository instances + register them in Root, so the user's
+	   repos survive a browser reload. Done at module construction
+	   (which runs during IDE startup) so the registry is hot before
+	   any UI is shown. *)
+	restorePersistedRepositories.
+) (
+public class Repository
+	named: n <Symbol>
+	namespaceKey: nk <String>
+	namespace: ns <Map[Symbol, Object]>
+	remoteUrl: u <String | Nil>
+	storeNamed: storeName <String>
+	defaultBranch: branch <String>
+	corsProxyUrl: cp <String | Nil> = (
+(* A user-visible git repository. Scope: the entries of `namespace`.
+   Backing store: lightning-fs IndexedDB scope `storeName`. Remote:
+   `remoteUrl` (nil for local-only). All git ops are Promise-based.
+
+   `namespaceKey` is the Root key the namespace was registered under
+   (or 'Root' for Root itself). Stored separately because the in-
+   memory `namespace` reference can't be persisted directly; on
+   restore from localStorage we look it back up by key. *)
+|
+	(* Identity-shaped slots — immutable. Changing these would break
+	   the Root registration / IndexedDB store binding. *)
+	public name <Symbol> = n.
+	public namespaceKey <String> = nk.
+	public namespace <Map[Symbol, Object]> = ns.
+	public localStoreName <String> = storeName.
+	(* Settings — mutable so the user can fix them (e.g. wrong branch).
+	   Setters are auto-generated; persist with
+	   ide repositories persistRepository: aRepo after mutating. *)
+	public remoteUrl <String | Nil> ::= u.
+	public defaultBranch <String> ::= branch.
+	public corsProxyUrl <String | Nil> ::= cp.
+	(* fs / git / http are lazy slots in the class body — see comment
+	   on the module-level lazy LightningFSClass / gitFacade /
+	   gitHttpFacade slots for why we can't capture them eagerly. *)
+	historyCache_slot
+	blobCache_slot
+	(* cloneStatus_slot: nil | #cloning | #cloned | #failed | #localOnly.
+	   Tracks the lifecycle of the repository's working dir so the
+	   presenter can render an honest state instead of hanging on
+	   "Loading history..." when clone hasn't finished or has failed. *)
+	cloneStatus_slot
+	cloneError_slot
+|
+) (
+lazy public fs = LightningFSClass new: localStoreName.
+lazy public git = gitFacade.
+lazy public http = gitHttpFacade.
+public isKindOfRepository ^ <Boolean> = (^true)
+public dir ^ <String> = (^'/work')
+public cloneStatus ^ <Symbol | Nil> = (^cloneStatus_slot)
+public cloneError ^ <String | Nil> = (^cloneError_slot)
+public isClonedOrLocalOnly ^ <Boolean> = (
+	^cloneStatus_slot = #cloned or: [cloneStatus_slot = #localOnly]
+)
+createJSObject = (^JSON parse: '{}')
+createJSArray = (^JSON parse: '[]')
+mkdirIgnoringExisting: path ^ <Alien> = (
+	| p |
+	p:: (fs at: #promises) mkdir: path.
+	^p then: [:ok | nil] onRejected: [:err | nil]
+)
+public cloneFromRemote ^ <Alien> = (
+	(* Shallow clone (depth 50) of remoteUrl into dir via the CORS proxy.
+	   Honors defaultBranch as the ref to fetch; an empty defaultBranch
+	   makes isomorphic-git use the remote's HEAD. Updates
+	   cloneStatus_slot / cloneError_slot so the UI can render the state
+	   without polling. Races against a hard 60s timeout so a hung clone
+	   (CORS proxy down, bad branch in some edge cases, network stall)
+	   doesn't keep the UI stuck on "Cloning..." indefinitely. *)
+	| opts clonePromise timeoutPromise deferred timerId |
+	remoteUrl isNil ifTrue: [
+		cloneStatus_slot:: #localOnly.
+		cloneError_slot:: nil.
+		^JSPromise resolve: nil].
+	cloneStatus_slot:: #cloning.
+	cloneError_slot:: nil.
+	opts:: createJSObject.
+	opts at: 'fs' put: fs.
+	opts at: 'http' put: http.
+	opts at: 'dir' put: dir.
+	opts at: 'url' put: remoteUrl.
+	corsProxyUrl isNil ifFalse: [opts at: 'corsProxy' put: corsProxyUrl].
+	(defaultBranch isNil or: [defaultBranch isEmpty]) ifFalse: [
+		opts at: 'ref' put: defaultBranch].
+	opts at: 'singleBranch' put: true.
+	opts at: 'depth' put: 50.
+	clonePromise:: (mkdirIgnoringExisting: dir) then: [:r1 |
+		git clone: opts].
+	deferred:: JSPromise withResolvers.
+	timerId:: js global setTimeout: [
+		(deferred at: 'reject') call: js undefined with: 'Clone timed out after 60s (is the CORS proxy running on ', (corsProxyUrl ifNil: ['<unset>']), '?)'.
+		nil] with: 60000.
+	timeoutPromise:: deferred at: 'promise'.
+	^(JSPromise race: (raceArrayOf: clonePromise and: timeoutPromise))
+		then: [:r |
+			js global clearTimeout: timerId.
+			cloneStatus_slot:: #cloned.
+			cloneError_slot:: nil.
+			nil]
+		onRejected: [:err |
+			js global clearTimeout: timerId.
+			cloneStatus_slot:: #failed.
+			cloneError_slot:: safeErrorString: err.
+			JSPromise reject: err]
+)
+raceArrayOf: p1 and: p2 ^ <Alien> = (
+	(* JS-side Array containing two Promises. Promise.race takes an
+	   iterable; passing a Newspeak Array literal `{p1. p2}` would ship
+	   a non-bilingual Newspeak object across the alien bridge and fail
+	   rawPush:. *)
+	| arr |
+	arr:: createJSArray.
+	arr push: p1.
+	arr push: p2.
+	^arr
+)
+safeErrorString: err = (
+	(* Defensive printString — if the JS Error's toString throws (custom
+	   getters, etc.) we mustn't propagate that out of the rejection
+	   handler since raising inside a Promise then/onRejected closure
+	   corrupts the alien bridge (see CLAUDE memory). *)
+	^[err printString] on: Exception do: [:e | '<unprintable error>']
+)
+public wipeLocalStore ^ <Alien> = (
+	(* Recursively delete the working dir from the lightning-fs store.
+	   lightning-fs only exposes POSIX rmdir (empty dir) and unlink
+	   (file); there's no recursive rm, so we walk the tree in
+	   post-order. Resolves on any outcome — success, missing dir, or
+	   partial failure — so callers can chain a navigation without
+	   worrying about edge cases. *)
+	^(removePathRecursively: dir)
+		then: [:r | nil]
+		onRejected: [:err | nil]
+)
+removePathRecursively: path <String> ^ <Alien> = (
+	(* Stat the path. If a directory, recursively remove + rmdir; else
+	   unlink. lightning-fs Stats exposes a string `type` property
+	   ('file', 'dir', or 'symlink'). *)
+	| fsPromises |
+	fsPromises:: fs at: #promises.
+	^(fsPromises stat: path)
+		then: [:stats |
+			(stats at: 'type') = 'dir'
+				ifTrue: [removeDir: path withPromises: fsPromises]
+				ifFalse: [fsPromises unlink: path]]
+		onRejected: [:err | nil]
+)
+removeDir: path <String> withPromises: fsPromises <Alien> ^ <Alien> = (
+	(* readdir + recursively remove every entry + rmdir the now-empty
+	   directory. Uses JSPromise.all over a JS array of child-removal
+	   promises (Newspeak Array {...} would fail the alien bridge). *)
+	^(fsPromises readdir: path) then: [:entries |
+		| childPromises childCount jsArr |
+		childCount:: entries at: 'length'.
+		jsArr:: createJSArray.
+		0 to: childCount - 1 do: [:i |
+			jsArr push:
+				(removePathRecursively: path, '/', (entries at: i))].
+		(JSPromise all: jsArr) then: [:r |
+			fsPromises rmdir: path]]
+)
+public resetCloneState = (
+	(* Drop the cached clone status / history / blobs so the next clone
+	   attempt starts fresh. Does NOT touch the underlying lightning-fs
+	   store; isomorphic-git's clone is tolerant of an existing dir with
+	   prior .git content, so the next attempt typically Just Works. *)
+	cloneStatus_slot:: nil.
+	cloneError_slot:: nil.
+	historyCache_slot:: nil.
+)
+public restoreCloneStateAsClonedOrLocalOnly = (
+	(* Used by Repositories>>restorePersistedRepositories on reload. The
+	   IDB-backed working dir survived; mark the repo as cloned (or
+	   local-only) so the presenter's startFetch gating lets git.log
+	   run. A bad on-disk state surfaces as a Failed-history error
+	   with a Retry button — better than hanging on "Loading...". *)
+	cloneStatus_slot:: remoteUrl isNil ifTrue: [#localOnly] ifFalse: [#cloned].
+	cloneError_slot:: nil
+)
+public history ^ <Alien> = (
+	(* git.log on the work directory. Caches the result on
+	   historyCache_slot so cachedHistory can render synchronously after
+	   the first fetch. *)
+	| opts |
+	opts:: createJSObject.
+	opts at: 'fs' put: fs.
+	opts at: 'dir' put: dir.
+	^(git log: opts) then: [:entries |
+		historyCache_slot:: entries.
+		entries]
+)
+public cachedHistory = (^historyCache_slot)
+public invalidateHistoryCache = (historyCache_slot:: nil)
+public listFilesAt: sha <String> ^ <Alien> = (
+	(* git.listFiles {fs, dir, ref: sha}. Resolves to a JS array of
+	   filepaths in the tree at that commit. *)
+	| opts |
+	opts:: createJSObject.
+	opts at: 'fs' put: fs.
+	opts at: 'dir' put: dir.
+	opts at: 'ref' put: sha.
+	^git listFiles: opts
+)
+blobCacheKey: filepath <String> sha: sha <String> = (^filepath, '@', sha)
+blobCache = (
+	blobCache_slot isNil ifTrue: [blobCache_slot:: Map new].
+	^blobCache_slot
+)
+public cachedBlobAt: filepath <String> in: sha <String> = (
+	blobCache_slot isNil ifTrue: [^nil].
+	^blobCache_slot at: (blobCacheKey: filepath sha: sha) ifAbsent: [nil]
+)
+public readBlobAt: filepath <String> in: sha <String> ^ <Alien> = (
+	(* Resolves to the decoded text of filepath at commit sha. Caches
+	   the result on first read. *)
+	| opts cached |
+	cached:: cachedBlobAt: filepath in: sha.
+	cached isNil ifFalse: [^JSPromise resolve: cached].
+	opts:: createJSObject.
+	opts at: 'fs' put: fs.
+	opts at: 'dir' put: dir.
+	opts at: 'oid' put: sha.
+	opts at: 'filepath' put: filepath.
+	^(git readBlob: opts) then: [:result |
+		| content |
+		content:: TextDecoder new decode: (result at: 'blob').
+		blobCache at: (blobCacheKey: filepath sha: sha) put: content.
+		content]
+)
+) : (
+)
+public class RepositorySubject onModel: r <Repository>
+	= ProgrammingSubject onModel: r (
+(* Subject wrapping a Repository for display. *)
+) (
+public createPresenter ^ <Presenter> = (
+	^RepositoryPresenter onRepositorySubject: self
+)
+public repository ^ <Repository> = (^model)
+public title ^ <String> = (^'Repository: ', model name asString)
+public isKindOfRepositorySubject ^ <Boolean> = (^true)
+isMyKind: s <Subject> ^ <Boolean> = (
+	^s isKindOfRepositorySubject
+)
+) : (
+)
+public class RepositoryPresenter onRepositorySubject: s <RepositorySubject>
+	= ProgrammingPresenter onSubject: s (
+(* Read-only view of a Repository: header (name + remote + HEAD short
+   sha when known), log, and (later) action buttons. Phase 1 only
+   loads the log.
+
+   The primary constructor is `onRepositorySubject:`; class-side
+   `onSubject:` is a secondary constructor used by `addObjectViews:
+   forKind:` so an arbitrary ObjectSubject (e.g. a Root entry the
+   user is inspecting) gets wrapped in a RepositorySubject for us. *)
+|
+loadStarted_slot ::= false.
+loadFailed_slot
+contentListSlot
+|
+) (
+public isKindOfRepositoryPresenter ^ <Boolean> = (^true)
+isMyKind: f <Fragment> ^ <Boolean> = (
+	^f isKindOfRepositoryPresenter
+)
+public refreshFromAsync = (
+	(* Public hook for external code (a Promise then/onRejected handler
+	   on the wrapping subject's async clone/refresh path) to trigger a
+	   real UI refresh — meaning one that bumps `uiGeneration` so the
+	   cached presenter substance is invalidated and a fresh
+	   `definition` runs against the latest subject state. Has to live
+	   on the presenter as a public method because `updateGUI:` is
+	   protected and only accessible via implicit-receiver sends from
+	   the surrounding lexical scope. *)
+	updateGUI: []
+)
+updateVisualsFromSameKind: oldPresenter <Self> ^ <Alien[Element]> = (
+	(* Clear the cached substance so `definition` re-runs and picks up
+	   the latest cachedHistory / cloneStatus from the underlying
+	   Repository. Without this, an async clone-then-history flow that
+	   ends with ide browsing updateCurrentDisplay refreshes the
+	   wrapping window but the presenter keeps showing the old
+	   "Cloning..." / "Loading history..." substance until the user
+	   navigates away and back. Same pattern as
+	   ClassPresenter>>updateVisualsFromSameKind: (Browsing.ns:4508). *)
+	subject = oldPresenter subject ifFalse: [
+		ensureSubstance.
+		^replaceVisual: oldPresenter visual with: substance visual].
+	substanceSlot:: nil.
+	ensureSubstance.
+	^super updateVisualsFromSameKind: oldPresenter
+)
+definition = (
+	| cached |
+	cached:: subject repository cachedHistory.
+	(* Only fire the log fetch when the working dir is in a known-good
+	   state. Firing while clone is in flight or after a failed clone
+	   would call git.log on a partial repo, which can itself hang on
+	   lightning-fs locks and pile up async work — exactly the failure
+	   mode that wedged the IDE last time. *)
+	(cached isNil
+		and: [subject repository isClonedOrLocalOnly
+		and: [loadStarted_slot not]]) ifTrue: [
+		loadStarted_slot:: true.
+		startFetch].
+	^column: {
+		helpSection.
+		majorHeadingBlock: (
+			row: {
+				(label: subject title) bold.
+				filler.
+				expandButtonWithAction: [expandAll].
+				smallBlank.
+				collapseButtonWithAction: [collapseAll].
+				smallBlank.
+				refreshHistoryButton.
+				smallBlank.
+				helpButton.
+				smallBlank.
+				dropDownMenu: [repositoryMenu]}).
+		mediumBlank.
+		row: {
+			(label: 'Remote: ') bold.
+			label: (subject repository remoteUrl isNil
+				ifTrue: ['(local only)']
+				ifFalse: [subject repository remoteUrl]).
+			filler}.
+		row: {
+			(label: 'Branch: ') bold.
+			label: subject repository defaultBranch.
+			filler}.
+		mediumBlank.
+		bodyFor: cached
+	}
+)
+refreshHistoryButton = (
+	(* Invalidate the repository's history cache, reset the presenter's
+	   load-state, and ask the IDE to redraw — which kicks off a fresh
+	   git.log on the next render. *)
+	^(imageButton: ide images refreshImage
+		action: [updateGUI: [
+			subject repository invalidateHistoryCache.
+			loadStarted_slot:: false.
+			loadFailed_slot:: nil]])
+		height: styleButtonSize;
+		toolTip: 'Refresh the commit log'
+)
+bodyFor: cached = (
+	(* Render whichever state is true:
+	   - Clone failed       → error message + Retry button.
+	   - Clone in flight    → "Cloning..." placeholder.
+	   - Status nil         → explicit "Load history" button.
+	     (Restored persisted repos start here. We don't auto-fire
+	     git.log because a corrupt IDB state can put isomorphic-git
+	     into a sync CPU loop that wedges the browser. The user opts
+	     in; recovery from a bad load is via the per-row Delete on
+	     the list page.)
+	   - Status cloned/local, cached nil → loading or failed.
+	   - Already loaded     → the actual commit list, or
+	     "No commits yet." *)
+	subject repository cloneStatus = #failed ifTrue: [
+		^column: {
+			(label: 'Clone failed: ', subject repository cloneError)
+				color: (Color r: 0.8 g: 0.1 b: 0.1).
+			smallBlank.
+			row: {
+				button: 'Retry clone' action: [respondToRetryClone].
+				filler}}].
+	subject repository cloneStatus = #cloning ifTrue: [
+		^label: 'Cloning...'].
+	subject repository cloneStatus isNil ifTrue: [
+		^column: {
+			label: 'History not loaded. Click below to fetch — the call may hang the browser if the local store is corrupt; recover via the per-row Delete on the repository list.'.
+			smallBlank.
+			row: {
+				button: 'Load history' action: [respondToLoadHistory].
+				filler}}].
+	cached isNil ifTrue: [
+		loadFailed_slot isNil
+			ifTrue: [^label: 'Loading history...']
+			ifFalse: [^label: 'Failed to load history: ', loadFailed_slot]].
+	(cached at: 'length') = 0 ifTrue: [
+		^label: 'No commits yet.'].
+	^logColumnFor: cached
+)
+respondToLoadHistory = (
+	(* Explicit user-triggered load for restored repos. Promotes
+	   cloneStatus to #cloned (or #localOnly), which unblocks the
+	   presenter's startFetch gating on next render. *)
+	updateGUI: [
+		subject repository restoreCloneStateAsClonedOrLocalOnly.
+		loadStarted_slot:: false.
+		loadFailed_slot:: nil]
+)
+respondToRetryClone = (
+	(* Reset the repository's clone state and re-run the clone-then-
+	   populate-history dance, refreshing the UI when the inner Promise
+	   settles so the user sees the result. cloneFromRemote already
+	   stores its own error string via safeErrorString:; we just refresh
+	   the display. *)
+	| repo |
+	repo:: subject repository.
+	updateGUI: [
+		repo resetCloneState.
+		loadStarted_slot:: false.
+		loadFailed_slot:: nil].
+	repo cloneFromRemote
+		then: [:r |
+			repo invalidateHistoryCache.
+			repo history then: [:log |
+				updateGUI: []. nil]]
+		onRejected: [:err |
+			updateGUI: [].
+			nil]
+)
+logColumnFor: entries = (
+	| toggles |
+	toggles:: List new.
+	0 to: (entries at: 'length') - 1 do: [:i |
+		toggles add: (logToggleFor: (entries at: i))].
+	contentListSlot:: zebra: (taggedColumn: toggles).
+	^contentListSlot
+)
+public expandAll = (
+	contentListSlot isNil ifFalse: [
+		contentListSlot childrenDo: [:each | each expand]]
+)
+public collapseAll = (
+	contentListSlot isNil ifFalse: [
+		contentListSlot childrenDo: [:each | each collapse]]
+)
+logToggleFor: entry = (
+	| toggle sha |
+	sha:: entry at: 'oid'.
+	toggle:: collapsed: [collapsedLogRowFor: entry toggle: toggle]
+		expanded: [expandedLogRowFor: entry toggle: toggle]
+		initiallyExpanded: false
+		tag: sha.
+	^toggle
+)
+collapsedLogRowFor: entry toggle: toggle = (
+	| sha shortSha message firstLine timestamp dateStr |
+	sha:: entry at: 'oid'.
+	shortSha:: sha copyFrom: 1 to: 7.
+	message:: (entry at: 'commit') at: 'message'.
+	firstLine:: firstLineOf: message.
+	timestamp:: ((entry at: 'commit') at: 'author') at: 'timestamp'.
+	dateStr:: formatTimestamp: timestamp.
+	^row: {
+		(link: shortSha action: [toggle expand]) color: actionLinkColor.
+		smallBlank.
+		label: dateStr.
+		smallBlank.
+		label: firstLine.
+		filler}
+)
+expandedLogRowFor: entry toggle: toggle = (
+	| sha shortSha message timestamp dateStr authorName |
+	sha:: entry at: 'oid'.
+	shortSha:: sha copyFrom: 1 to: 7.
+	message:: (entry at: 'commit') at: 'message'.
+	timestamp:: ((entry at: 'commit') at: 'author') at: 'timestamp'.
+	dateStr:: formatTimestamp: timestamp.
+	authorName:: ((entry at: 'commit') at: 'author') at: 'name'.
+	^column: {
+		row: {
+			(link: shortSha action: [toggle collapse]) color: actionLinkColor.
+			smallBlank.
+			label: dateStr.
+			smallBlank.
+			label: authorName.
+			filler}.
+		smallBlank.
+		(label: sha) smallFont.
+		smallBlank.
+		multilineLabelOf: message}
+)
+multilineLabelOf: text = (
+	(* Render a multi-line commit body as a column of single-line
+	   labels. Strips the trailing newline if any. *)
+	| labels lines start lf size |
+	labels:: List new.
+	lines:: List new.
+	lf:: String fromRunes: { 10 }.
+	start:: 1.
+	size:: text size.
+	[start <= size] whileTrue: [
+		| idx |
+		idx:: text indexOf: lf startingAt: start.
+		idx = 0
+			ifTrue: [lines add: (text copyFrom: start to: size). start:: size + 1]
+			ifFalse: [
+				lines add: (text copyFrom: start to: idx - 1).
+				start:: idx + 1]].
+	lines do: [:line | labels add: (label: line)].
+	^column: labels
+)
+repositoryMenu = (
+	^menuWithLabelsAndActions: {
+		{'Edit Settings'. [respondToEditSettings]}.
+		{'Delete Repository'. [respondToDelete]}.
+		{'Delete and Wipe Local Store'. [respondToDeleteAndWipe]}.
+		{'Inspect Presenter'. [respondToInspectPresenter]}}
+)
+respondToEditSettings = (
+	(* Open the settings form for this repository. *)
+	enterSubject:: RepositorySettingsSubject onRepository: subject repository
+)
+respondToDelete = (
+	(* Remove the Repository from Root, drop its persisted config, and
+	   navigate back to the list. Does not garbage-collect the
+	   underlying IndexedDB store. *)
+	| repo |
+	repo:: subject repository.
+	updateGUI: [
+		Root removeKey: repo name asSymbol ifAbsent: [].
+		ide repositories unpersistRepositoryNamed: repo name.
+		enterSubject:: RepositoryListSubject new]
+)
+respondToDeleteAndWipe = (
+	(* Same as Delete Repository, plus wipes the working dir from
+	   lightning-fs. Use this to recover from a wedged clone state. *)
+	| repo |
+	repo:: subject repository.
+	repo wipeLocalStore then: [:r |
+		updateGUI: [
+			Root removeKey: repo name asSymbol ifAbsent: [].
+			ide repositories unpersistRepositoryNamed: repo name.
+			enterSubject:: RepositoryListSubject new].
+		nil]
+)
+firstLineOf: msg = (
+	| lf idx |
+	lf:: String fromRunes: { 10 }.
+	idx:: msg indexOf: lf.
+	^idx = 0
+		ifTrue: [msg]
+		ifFalse: [msg copyFrom: 1 to: idx - 1]
+)
+formatTimestamp: tsSeconds = (
+	(* Force Float arithmetic via asFloat so the JS Date constructor
+	   sees a real millisecond value (alien bridge truncates Newspeak
+	   Integer to 32 bits). *)
+	^(JSDate new: tsSeconds asFloat * 1000) toLocaleString
+)
+startFetch = (
+	(* Kick off the async history fetch. On resolve, updateGUI refreshes
+	   the presenter so cachedHistory is non-nil on the next render. *)
+	subject repository history
+		then: [:log | updateGUI: []. nil]
+		onRejected: [:err |
+			updateGUI: [loadFailed_slot:: err printString]. nil]
+)
+helpText = (
+	| mapping = Map new. |
+	mapping
+		at: #hopscotchExpandAllButton put: (expandButtonWithAction: [expandAll]);
+		at: #hopscotchCollapseAllButton put: (collapseButtonWithAction: [collapseAll]);
+		at: #hopscotchRefreshButton put: refreshHistoryButton;
+		at: #hopscotchHelpButton put: helpButton;
+		at: #repositoryMenuButton put: (dropDownMenu: [repositoryMenu]).
+	^ampleforth: 'This is a repository presenter. It lists the commits in this
+repository (newest first). Each row shows the short commit SHA (click to
+expand), the commit date, and the first line of the commit message. Expanding
+a row reveals the author, the full SHA, and the full commit message body.
+The header provides the following buttons:
+<ul>
+<li> <div class="hopscotchExpandAllButton"> </div> Expands all commits in the list.</li>
+<li> <div class="hopscotchCollapseAllButton"> </div> Collapses all commits in the list.</li>
+<li> <div class="hopscotchRefreshButton"> </div> Re-fetches the log from the backing store (just in case of UI bugs).</li>
+<li> <div class="hopscotchHelpButton"> </div> Shows this help message.</li>
+<li> <div class="repositoryMenuButton"> </div> Opens a menu of additional operations, such as inspecting this presenter.</li>
+</ul>' mapping: mapping
+)
+) : (
+public onSubject: os <ObjectSubject> ^ <Instance> = (
+	(* Inspector-side factory: wrap the underlying Repository in a
+	   RepositorySubject so the user sees the live RepositoryPresenter
+	   instead of the generic object inspector. Used by
+	   `addObjectViews: forKind:`. *)
+	^onRepositorySubject: (RepositorySubject onModel: os objectMirror reflectee)
+)
+)
+public class RepositoryListSubject = ProgrammingSubject onModel: nil (
+(* The "all my repositories" page. Enumerates Root for entries that
+   answer isKindOfRepository. *)
+) (
+public createPresenter ^ <Presenter> = (
+	^RepositoryListPresenter onSubject: self
+)
+public title ^ <String> = (^'Repositories')
+public repositories ^ <List[Repository]> = (
+	| repos |
+	repos:: List new.
+	Root keysAndValuesDo: [:k :v |
+		([v isKindOfRepository] on: Exception do: [:e | false])
+			ifTrue: [repos add: v]].
+	^repos
+)
+public isKindOfRepositoryListSubject ^ <Boolean> = (^true)
+isMyKind: s <Subject> ^ <Boolean> = (
+	^s isKindOfRepositoryListSubject
+)
+) : (
+)
+public class RepositoryListPresenter onSubject: s <RepositoryListSubject>
+	= ProgrammingPresenter onSubject: s (
+) (
+public isKindOfRepositoryListPresenter ^ <Boolean> = (^true)
+isMyKind: f <Fragment> ^ <Boolean> = (
+	^f isKindOfRepositoryListPresenter
+)
+definition = (
+	| repos rows |
+	repos:: subject repositories.
+	rows:: List new.
+	rows add: helpSection.
+	rows add: (majorHeadingBlock: (
+		row: {
+			(label: subject title) bold.
+			filler.
+			newRepositoryButton.
+			smallBlank.
+			refreshListButton.
+			smallBlank.
+			helpButton.
+			smallBlank.
+			dropDownMenu: [listMenu]})).
+	rows add: mediumBlank.
+	repos isEmpty
+		ifTrue: [rows add: (label: 'No repositories registered yet.')]
+		ifFalse: [
+			rows add: (zebra: (column:
+				(repos collect: [:r | rowForRepository: r]))).
+			rows add: smallBlank].
+	^column: rows
+)
+rowForRepository: r <Repository> = (
+	^row: {
+		(link: r name asString action: [
+			enterSubject:: RepositorySubject onModel: r]) color: actionLinkColor.
+		smallBlank.
+		label: (r remoteUrl isNil ifTrue: ['(local only)'] ifFalse: [r remoteUrl]).
+		filler.
+		dropDownMenu: [menuForRepository: r]}
+)
+menuForRepository: r <Repository> = (
+	^menuWithLabelsAndActions: {
+		{'Delete'. [respondToDeleteRow: r]}.
+		{'Delete and Wipe Local Store'. [respondToDeleteAndWipeRow: r]}}
+)
+respondToDeleteRow: r <Repository> = (
+	(* Remove the repository from Root + localStorage WITHOUT opening
+	   it. Critical for recovering from a corrupt repo whose presenter
+	   would hang the IDE if entered. *)
+	updateGUI: [
+		Root removeKey: r name asSymbol ifAbsent: [].
+		ide repositories unpersistRepositoryNamed: r name]
+)
+respondToDeleteAndWipeRow: r <Repository> = (
+	(* Same as delete, plus wipes the lightning-fs working dir so the
+	   IDB store doesn't accumulate orphaned data. *)
+	r wipeLocalStore then: [:x |
+		updateGUI: [
+			Root removeKey: r name asSymbol ifAbsent: [].
+			ide repositories unpersistRepositoryNamed: r name].
+		nil]
+)
+newRepositoryButton = (
+	^button: 'New Repository' action: [respondToNew]
+)
+refreshListButton = (
+	^(imageButton: ide images refreshImage
+		action: [updateGUI: []])
+		height: styleButtonSize;
+		toolTip: 'Refresh the repository list'
+)
+respondToNew = (
+	enterSubject:: RepositorySetupSubject new
+)
+listMenu = (
+	^menuWithLabelsAndActions: {
+		{'Inspect Presenter'. [respondToInspectPresenter]}}
+)
+helpText = (
+	| mapping = Map new. |
+	mapping
+		at: #newRepositoryButton put: newRepositoryButton;
+		at: #hopscotchRefreshButton put: refreshListButton;
+		at: #hopscotchHelpButton put: helpButton;
+		at: #listMenuButton put: (dropDownMenu: [listMenu]).
+	^ampleforth: 'This is the repository list. It enumerates every git
+repository registered in Root. Click a repository name to open its
+presenter. The header provides the following buttons:
+<ul>
+<li> <div class="newRepositoryButton"> </div> Opens a form to register a new repository (clone an existing remote or initialize a local-only repo).</li>
+<li> <div class="hopscotchRefreshButton"> </div> Refreshes the list (just in case of UI bugs).</li>
+<li> <div class="hopscotchHelpButton"> </div> Shows this help message.</li>
+<li> <div class="listMenuButton"> </div> Opens a menu of additional operations, such as inspecting this presenter.</li>
+</ul>' mapping: mapping
+)
+) : (
+)
+public class RepositorySetupSubject = ProgrammingSubject onModel: nil (
+(* Form-style subject for creating a new Repository. Captures user
+   input (name, namespace key, remote URL, default branch, CORS proxy)
+   and creates the Repository on confirm. *)
+|
+public repoName <String> ::= ''.
+public namespaceKey <String> ::= 'Root'.
+public createNewNamespace <Boolean> ::= false.
+public remoteUrl <String> ::= ''.
+public defaultBranch <String> ::= 'main'.
+public corsProxyUrl <String> ::= 'http://localhost:9999'.
+public errorMessage <String> ::= ''.
+|
+) (
+public createPresenter ^ <Presenter> = (
+	^RepositorySetupPresenter onSubject: self
+)
+public title ^ <String> = (^'New Repository')
+public isKindOfRepositorySetupSubject ^ <Boolean> = (^true)
+isMyKind: s <Subject> ^ <Boolean> = (
+	^s isKindOfRepositorySetupSubject
+)
+public availableNamespaces ^ <List[String]> = (
+	(* Every entry in Root that answers isKindOfNamespace, plus Root
+	   itself as a default option. Names are returned as Strings (the
+	   key under which the namespace is registered). *)
+	| names |
+	names:: List new.
+	names add: 'Root'.
+	Root keysAndValuesDo: [:k :v |
+		([v isKindOfNamespace] on: Exception do: [:e | false])
+			ifTrue: [names add: k asString]].
+	^names
+)
+public resolveNamespace ^ <Map[Symbol, Object] | Nil> = (
+	(* Look up the namespaceKey in Root; for the special key 'Root',
+	   return Root itself. Returns nil if no match found and no
+	   create-new flag set. *)
+	namespaceKey = 'Root' ifTrue: [^Root].
+	^Root at: namespaceKey asSymbol ifAbsent: [nil]
+)
+public submit = (
+	(* Validate, build the Repository, register in Root, kick off the
+	   clone if a remote was given, and return a RepositorySubject for
+	   navigation. On validation failure returns nil with errorMessage
+	   set; the presenter renders the error. *)
+	| ns target storeName repo subjectInstance |
+	repoName isEmpty ifTrue: [
+		errorMessage:: 'Please enter a repository name.'.
+		^nil].
+	(Root includesKey: repoName asSymbol) ifTrue: [
+		errorMessage:: 'An entry named "', repoName, '" already exists in Root.'.
+		^nil].
+	createNewNamespace
+		ifTrue: [
+			(Root includesKey: namespaceKey asSymbol) ifTrue: [
+				errorMessage:: 'A namespace named "', namespaceKey, '" already exists in Root.'.
+				^nil].
+			ns:: ide namespacing freshNamespace.
+			Root at: namespaceKey asSymbol put: ns]
+		ifFalse: [
+			ns:: resolveNamespace.
+			ns isNil ifTrue: [
+				errorMessage:: 'No namespace named "', namespaceKey, '" in Root. Tick "Create new namespace" to create one.'.
+				^nil]].
+	storeName:: 'newspeak-repo-', repoName.
+	target:: remoteUrl isEmpty ifTrue: [nil] ifFalse: [remoteUrl].
+	repo:: Repository
+		named: repoName asSymbol
+		namespaceKey: namespaceKey
+		namespace: ns
+		remoteUrl: target
+		storeNamed: storeName
+		defaultBranch: defaultBranch
+		corsProxyUrl: corsProxyUrl.
+	Root at: repoName asSymbol put: repo.
+	persistRepository: repo.
+	subjectInstance:: RepositorySubject onModel: repo.
+	target isNil ifFalse: [
+		(* Fire-and-forget clone. cloneFromRemote updates cloneStatus_slot
+		   / cloneError_slot on the Repository (with safeErrorString:);
+		   the presenter checks both and renders the right state. We use
+		   `subjectInstance presenter updateGUI: []` (not
+		   updateCurrentDisplay) because updateGUI: bumps uiGeneration,
+		   which is what invalidates the cached presenter substance
+		   downstream — updateCurrentDisplay alone just redraws the
+		   cached substance and nothing changes. *)
+		repo cloneFromRemote
+			then: [:r |
+				repo invalidateHistoryCache.
+				repo history then: [:log |
+					subjectInstance presenter refreshFromAsync. nil]]
+			onRejected: [:err |
+				subjectInstance presenter refreshFromAsync.
+				nil]].
+	^subjectInstance
+)
+) : (
+)
+public class RepositorySetupPresenter onSubject: s <RepositorySetupSubject>
+	= ProgrammingPresenter onSubject: s (
+|
+nameEditor
+namespaceEditor
+remoteUrlEditor
+defaultBranchEditor
+corsProxyEditor
+|
+) (
+public isKindOfRepositorySetupPresenter ^ <Boolean> = (^true)
+isMyKind: f <Fragment> ^ <Boolean> = (
+	^f isKindOfRepositorySetupPresenter
+)
+definition = (
+	| rows |
+	rows:: List new.
+	rows add: helpSection.
+	rows add: (majorHeadingBlock: (
+		row: {
+			(label: subject title) bold.
+			filler.
+			helpButton}));
+		add: mediumBlank;
+		add: (label: 'Register a new git repository. The repository is scoped by a Newspeak namespace: only the classes in that namespace are committed when you commit, and any commit you load will be installed into it. Multi-repo membership is achieved by having a class appear in multiple namespaces.');
+		add: mediumBlank;
+		add: (row: { (label: 'Name: ') bold. smallBlank. elastic: nameField. });
+		add: mediumBlank;
+		add: (row: { (label: 'Namespace: ') bold. smallBlank. elastic: namespaceField. });
+		add: (row: {
+			smallBlank.
+			checkBoxFor: subject createNewNamespace.
+			smallBlank.
+			label: 'Create new namespace with this name'.
+			filler});
+		add: mediumBlank;
+		add: (row: { (label: 'Remote URL: ') bold. smallBlank. elastic: remoteUrlField. });
+		add: ((label: 'Leave blank for a local-only repository. HTTPS URLs require a CORS proxy.') italic);
+		add: mediumBlank;
+		add: (row: { (label: 'Default branch: ') bold. smallBlank. elastic: defaultBranchField. });
+		add: mediumBlank;
+		add: (row: { (label: 'CORS proxy: ') bold. smallBlank. elastic: corsProxyField. });
+		add: ((label: 'Run python3 tool/cors-proxy.py to start the local CORS proxy on port 9999.') italic);
+		add: mediumBlank;
+		add: errorArea;
+		add: (row: {
+			filler.
+			button: 'Create' action: [respondToCreate]}).
+	^column: rows
+)
+nameField = (
+	nameEditor:: codeMirror: subject repoName.
+	nameEditor changeResponse: [:frag |
+		subject repoName: frag textBeingAccepted].
+	^nameEditor
+)
+namespaceField = (
+	namespaceEditor:: codeMirror: subject namespaceKey.
+	namespaceEditor changeResponse: [:frag |
+		subject namespaceKey: frag textBeingAccepted].
+	^namespaceEditor
+)
+remoteUrlField = (
+	remoteUrlEditor:: codeMirror: subject remoteUrl.
+	remoteUrlEditor changeResponse: [:frag |
+		subject remoteUrl: frag textBeingAccepted].
+	^remoteUrlEditor
+)
+defaultBranchField = (
+	defaultBranchEditor:: codeMirror: subject defaultBranch.
+	defaultBranchEditor changeResponse: [:frag |
+		subject defaultBranch: frag textBeingAccepted].
+	^defaultBranchEditor
+)
+corsProxyField = (
+	corsProxyEditor:: codeMirror: subject corsProxyUrl.
+	corsProxyEditor changeResponse: [:frag |
+		subject corsProxyUrl: frag textBeingAccepted].
+	^corsProxyEditor
+)
+checkBoxFor: flag <Boolean> = (
+	(* Inline checkbox. Hopscotch doesn't expose a styled checkbox
+	   composer, so we use a labeled button that flips the subject's
+	   createNewNamespace flag and re-renders. *)
+	^button: (subject createNewNamespace ifTrue: ['[x]'] ifFalse: ['[ ]'])
+		action: [updateGUI: [
+			subject createNewNamespace: subject createNewNamespace not]]
+)
+errorArea = (
+	^subject errorMessage isEmpty
+		ifTrue: [nothing]
+		ifFalse: [(label: subject errorMessage) color: (Color r: 0.8 g: 0.1 b: 0.1)]
+)
+respondToCreate = (
+	| newSubject |
+	updateGUI: [
+		(* Snap edited values back from the editors in case the user
+		   didn't blur the field before clicking Create. *)
+		nameEditor isNil ifFalse: [subject repoName: nameEditor textBeingAccepted].
+		namespaceEditor isNil ifFalse: [subject namespaceKey: namespaceEditor textBeingAccepted].
+		remoteUrlEditor isNil ifFalse: [subject remoteUrl: remoteUrlEditor textBeingAccepted].
+		defaultBranchEditor isNil ifFalse: [subject defaultBranch: defaultBranchEditor textBeingAccepted].
+		corsProxyEditor isNil ifFalse: [subject corsProxyUrl: corsProxyEditor textBeingAccepted].
+		subject errorMessage: ''.
+		newSubject:: subject submit.
+		newSubject isNil ifFalse: [enterSubject:: newSubject]]
+)
+helpText = (
+	^ampleforth: 'Repository setup form. The repository is keyed by Name (which will appear as an entry in Root). Namespace picks an existing namespace in Root to use as the repo''s scope; tick Create new namespace to create one with that name. Remote URL is optional (leave blank for a local-only repo).'
+		mapping: Map new
+)
+) : (
+)
+public class RepositorySettingsSubject onRepository: r <Repository>
+	= ProgrammingSubject onModel: r (
+(* Edit form for the mutable settings of an existing Repository.
+   Identity-shaped fields (name, namespace, store name) are not
+   editable; only remote URL, default branch, and CORS proxy are.
+   Saves update the repo in place and persist the change. *)
+|
+public remoteUrl <String> ::= ''.
+public defaultBranch <String> ::= ''.
+public corsProxyUrl <String> ::= ''.
+public errorMessage <String> ::= ''.
+|
+	(* Pre-fill from the live repository. *)
+	remoteUrl:: r remoteUrl ifNil: [''].
+	defaultBranch:: r defaultBranch.
+	corsProxyUrl:: r corsProxyUrl ifNil: [''].
+) (
+public createPresenter ^ <Presenter> = (
+	^RepositorySettingsPresenter onSubject: self
+)
+public repository ^ <Repository> = (^model)
+public title ^ <String> = (^'Settings: ', model name asString)
+public isKindOfRepositorySettingsSubject ^ <Boolean> = (^true)
+isMyKind: s <Subject> ^ <Boolean> = (
+	^s isKindOfRepositorySettingsSubject
+)
+public save ^ <RepositorySubject | Nil> = (
+	(* Push the edited fields back onto the repository, persist, and
+	   return a RepositorySubject for navigation back to the repo
+	   presenter. On validation failure returns nil with errorMessage
+	   set. *)
+	defaultBranch isEmpty ifTrue: [
+		errorMessage:: 'Default branch cannot be empty.'.
+		^nil].
+	model remoteUrl: (remoteUrl isEmpty ifTrue: [nil] ifFalse: [remoteUrl]).
+	model defaultBranch: defaultBranch.
+	model corsProxyUrl: (corsProxyUrl isEmpty ifTrue: [nil] ifFalse: [corsProxyUrl]).
+	ide repositories persistRepository: model.
+	^RepositorySubject onModel: model
+)
+) : (
+)
+public class RepositorySettingsPresenter onSubject: s <RepositorySettingsSubject>
+	= ProgrammingPresenter onSubject: s (
+|
+remoteUrlEditor
+defaultBranchEditor
+corsProxyEditor
+|
+) (
+public isKindOfRepositorySettingsPresenter ^ <Boolean> = (^true)
+isMyKind: f <Fragment> ^ <Boolean> = (
+	^f isKindOfRepositorySettingsPresenter
+)
+definition = (
+	| rows |
+	rows:: List new.
+	rows add: helpSection;
+		add: (majorHeadingBlock: (
+			row: {
+				(label: subject title) bold.
+				filler.
+				helpButton.
+				smallBlank.
+				dropDownMenu: [settingsMenu]}));
+		add: mediumBlank;
+		add: (row: {
+			(label: 'Name: ') bold.
+			label: subject repository name asString.
+			filler});
+		add: (row: {
+			(label: 'Namespace: ') bold.
+			label: subject repository namespaceKey.
+			filler});
+		add: ((label: 'Name and namespace cannot be edited — delete and recreate the repository to change them.') italic);
+		add: mediumBlank;
+		add: (row: { (label: 'Remote URL: ') bold. smallBlank. elastic: remoteUrlField. });
+		add: ((label: 'Leave blank for a local-only repository.') italic);
+		add: mediumBlank;
+		add: (row: { (label: 'Default branch: ') bold. smallBlank. elastic: defaultBranchField. });
+		add: mediumBlank;
+		add: (row: { (label: 'CORS proxy: ') bold. smallBlank. elastic: corsProxyField. });
+		add: mediumBlank;
+		add: errorArea;
+		add: (row: {
+			filler.
+			button: 'Cancel' action: [respondToCancel].
+			smallBlank.
+			button: 'Save' action: [respondToSave]}).
+	^column: rows
+)
+settingsMenu = (
+	^menuWithLabelsAndActions: {
+		{'Inspect Presenter'. [respondToInspectPresenter]}}
+)
+remoteUrlField = (
+	remoteUrlEditor:: codeMirror: subject remoteUrl.
+	remoteUrlEditor changeResponse: [:frag |
+		subject remoteUrl: frag textBeingAccepted].
+	^remoteUrlEditor
+)
+defaultBranchField = (
+	defaultBranchEditor:: codeMirror: subject defaultBranch.
+	defaultBranchEditor changeResponse: [:frag |
+		subject defaultBranch: frag textBeingAccepted].
+	^defaultBranchEditor
+)
+corsProxyField = (
+	corsProxyEditor:: codeMirror: subject corsProxyUrl.
+	corsProxyEditor changeResponse: [:frag |
+		subject corsProxyUrl: frag textBeingAccepted].
+	^corsProxyEditor
+)
+errorArea = (
+	^subject errorMessage isEmpty
+		ifTrue: [nothing]
+		ifFalse: [(label: subject errorMessage) color: (Color r: 0.8 g: 0.1 b: 0.1)]
+)
+respondToSave = (
+	| newSubject |
+	updateGUI: [
+		(* Snap edited values back from the editors in case the user
+		   didn't blur a field before clicking Save. *)
+		remoteUrlEditor isNil ifFalse: [subject remoteUrl: remoteUrlEditor textBeingAccepted].
+		defaultBranchEditor isNil ifFalse: [subject defaultBranch: defaultBranchEditor textBeingAccepted].
+		corsProxyEditor isNil ifFalse: [subject corsProxyUrl: corsProxyEditor textBeingAccepted].
+		subject errorMessage: ''.
+		newSubject:: subject save.
+		newSubject isNil ifFalse: [enterSubject:: newSubject]]
+)
+respondToCancel = (
+	enterSubject:: RepositorySubject onModel: subject repository
+)
+helpText = (
+	| mapping = Map new. |
+	mapping
+		at: #hopscotchHelpButton put: helpButton;
+		at: #settingsMenuButton put: (dropDownMenu: [settingsMenu]).
+	^ampleforth: 'Edit the mutable settings of this repository: remote
+URL, default branch, CORS proxy. Saves update the repository in place
+and persist the change to localStorage. Name and namespace are
+identity fields and cannot be changed (delete and recreate the
+repository to change them).
+<br><br>
+The header provides the following buttons:
+<ul>
+<li> <div class="hopscotchHelpButton"> </div> Shows this help message.</li>
+<li> <div class="settingsMenuButton"> </div> Opens a menu of additional operations, such as inspecting this presenter.</li>
+</ul>' mapping: mapping
+)
+) : (
+)
+(* Lazy slots for the three CDN-loaded JS globals. Evaluated on first
+   access — by which time the regular <script> tags in
+   primordialsoup.html have executed and the classes are on the
+   window. Repository's `fs` / `git` / `http` lazy slots reach these
+   via implicit-receiver sends up the lexical scope. *)
+lazy public LightningFSClass = global at: #LightningFS.
+lazy public gitFacade = global at: #git.
+lazy public gitHttpFacade = global at: #GitHttp.
+public list ^ <RepositoryListSubject> = (
+	(* Convenience entry point: ide repositories list returns a Subject
+	   you can hand to ide browsing navigateTo:. Equivalent to
+	   `RepositoryListSubject new`. *)
+	^RepositoryListSubject new
+)
+public setup ^ <RepositorySetupSubject> = (
+	(* Convenience entry point for `ide repositories setup`: opens the
+	   New Repository form. Equivalent to `RepositorySetupSubject new`. *)
+	^RepositorySetupSubject new
+)
+loadPersistedConfigs ^ <Alien | Nil> = (
+	(* Returns a JS array of {name, namespaceKey, storeName, remoteUrl,
+	   defaultBranch, corsProxyUrl} objects parsed from localStorage, or
+	   nil if no entry exists / parsing failed. *)
+	| raw |
+	raw:: [localStorage getItem: repoConfigsKey]
+		on: Exception do: [:e | nil].
+	(raw isNil or: [raw isKindOfString not]) ifTrue: [^nil].
+	^[JSON parse: raw] on: Exception do: [:e | nil]
+)
+savePersistedConfigs: jsArr <Alien> = (
+	(* Stringify and write a JS array of configs back to localStorage. *)
+	| str |
+	str:: JSON stringify: jsArr.
+	[localStorage setItem: repoConfigsKey to: str]
+		on: Exception do: [:e | ]
+)
+configFromRepository: repo <Repository> ^ <Alien> = (
+	(* Build a JS object of the repo's persisted fields. *)
+	| cfg |
+	cfg:: JSON parse: '{}'.
+	cfg at: 'name' put: repo name asString.
+	cfg at: 'namespaceKey' put: repo namespaceKey.
+	cfg at: 'storeName' put: repo localStoreName.
+	cfg at: 'remoteUrl' put: (repo remoteUrl ifNil: ['']).
+	cfg at: 'defaultBranch' put: repo defaultBranch.
+	cfg at: 'corsProxyUrl' put: (repo corsProxyUrl ifNil: ['']).
+	^cfg
+)
+public persistRepository: repo <Repository> = (
+	(* Append or replace the repo's config in the persisted list, keyed
+	   by name. *)
+	| existing newArr len i cfg keptOne replaced |
+	existing:: loadPersistedConfigs.
+	newArr:: JSON parse: '[]'.
+	replaced:: false.
+	existing isNil ifFalse: [
+		len:: existing at: 'length'.
+		i:: 0.
+		[i < len] whileTrue: [
+			keptOne:: existing at: i.
+			(keptOne at: 'name') = repo name asString
+				ifTrue: [
+					newArr push: (configFromRepository: repo).
+					replaced:: true]
+				ifFalse: [newArr push: keptOne].
+			i:: i + 1]].
+	replaced ifFalse: [newArr push: (configFromRepository: repo)].
+	savePersistedConfigs: newArr
+)
+public unpersistRepositoryNamed: name <Symbol | String> = (
+	(* Drop the named repo's config from the persisted list. No-op if
+	   absent. *)
+	| existing newArr len i keptOne nameStr |
+	existing:: loadPersistedConfigs.
+	existing isNil ifTrue: [^self].
+	nameStr:: name asString.
+	newArr:: JSON parse: '[]'.
+	len:: existing at: 'length'.
+	i:: 0.
+	[i < len] whileTrue: [
+		keptOne:: existing at: i.
+		(keptOne at: 'name') = nameStr ifFalse: [newArr push: keptOne].
+		i:: i + 1].
+	savePersistedConfigs: newArr
+)
+restorePersistedRepositories = (
+	(* On module construction: pull saved configs out of localStorage
+	   and reconstruct Repository instances, registering each in Root.
+	   If the repo's namespace doesn't exist in Root yet, create a
+	   fresh empty one with the saved key. Errors are swallowed: one
+	   bad entry shouldn't prevent the rest from restoring. *)
+	| configs len i cfg name namespaceKey ns repo |
+	configs:: loadPersistedConfigs.
+	configs isNil ifTrue: [^self].
+	len:: configs at: 'length'.
+	i:: 0.
+	[i < len] whileTrue: [
+		cfg:: configs at: i.
+		[
+			name:: cfg at: 'name'.
+			namespaceKey:: cfg at: 'namespaceKey'.
+			(Root includesKey: name asSymbol)
+				ifTrue: [(* Already restored or shadowed — skip. *)]
+				ifFalse: [
+					ns:: namespaceKey = 'Root'
+						ifTrue: [Root]
+						ifFalse: [Root at: namespaceKey asSymbol
+							ifAbsent: [
+								| fresh |
+								fresh:: webIde namespacing freshNamespace.
+								Root at: namespaceKey asSymbol put: fresh.
+								fresh]].
+					repo:: Repository
+						named: name asSymbol
+						namespaceKey: namespaceKey
+						namespace: ns
+						remoteUrl: ((cfg at: 'remoteUrl') isEmpty
+							ifTrue: [nil] ifFalse: [cfg at: 'remoteUrl'])
+						storeNamed: (cfg at: 'storeName')
+						defaultBranch: (cfg at: 'defaultBranch')
+						corsProxyUrl: ((cfg at: 'corsProxyUrl') isEmpty
+							ifTrue: [nil] ifFalse: [cfg at: 'corsProxyUrl']).
+					(* Deliberately leave cloneStatus_slot nil on restored
+					   repos. The presenter shows an explicit "Load
+					   history" button instead of auto-firing git.log,
+					   because a corrupt IDB state can put isomorphic-git
+					   into a sync CPU loop that the browser cannot
+					   recover from (no setTimeout fires while the main
+					   thread is hung). The user opts in to loading; if
+					   the repo is bad they can recover via the per-row
+					   Delete on the list page. *)
+					Root at: name asSymbol put: repo]
+		] on: Exception do: [:e |
+			('Repositories: failed to restore config #', i printString,
+				': ', e messageText) out].
+		i:: i + 1]
+)
+) : (
+)

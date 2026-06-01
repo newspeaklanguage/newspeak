@@ -49,6 +49,8 @@ class Repositories usingPlatform: platform ide: webIde = (
 	private ProgrammingSubject = webIde browsing ProgrammingSubject.
 	private ProgrammingPresenter = webIde browsing ProgrammingPresenter.
 	private ClassMirror = platform mirrors ClassMirror.
+	private ClassDeclarationBuilder = platform mirrors ClassDeclarationBuilder.
+	private platformHolder = platform.
 	private Color = platform graphics Color.
 	private localStorage = platform js localStorage.
 	styleButtonSize <Float> = 30.
@@ -602,9 +604,68 @@ repositoryMenu = (
 	^menuWithLabelsAndActions: {
 		{'Edit Settings'. [respondToEditSettings]}.
 		{'Show Snapshot'. [respondToShowSnapshot]}.
+		{'Show Diff (round-trip)'. [respondToShowRoundTripDiff]}.
 		{'Delete Repository'. [respondToDelete]}.
 		{'Delete and Wipe Local Store'. [respondToDeleteAndWipe]}.
 		{'Inspect Presenter'. [respondToInspectPresenter]}}
+)
+respondToShowRoundTripDiff = (
+	(* Self-consistency smoke test: for every class in the repo's
+	   namespace, snapshot it to .ns text, parse the text back, extract
+	   the per-member map, and diff against the live mirror's per-member
+	   map. If everything is wired up correctly the diff is empty
+	   (modulo whitespace artifacts) for every class. Non-empty diffs
+	   reveal bugs in snapshot / extractor / mirror-reader / parser
+	   positions. *)
+	| repo snap files anyDiffs |
+	repo:: subject repository.
+	snap:: repo snapshotFiles.
+	files:: snap at: #files.
+	anyDiffs:: 0.
+	console log: '--- Round-trip diff for ', repo name asString, ' ---'.
+	repo namespace keysAndValuesDo: [:key :value |
+		value isKindOfBehavior ifTrue: [
+			| src parsedSnap liveSnap diff |
+			src:: files at: key asString, '.ns' ifAbsent: [nil].
+			src isNil ifFalse: [
+				[parsedSnap:: ide repositories extractedSnapshotFromSource: src.
+				 liveSnap:: ide repositories liveSnapshotOf: value.
+				 diff:: ide repositories diffSnapshot: parsedSnap to: liveSnap.
+				 (diffIsEmpty: diff) ifFalse: [
+					anyDiffs:: anyDiffs + 1.
+					console log: 'DIFF: ', key asString.
+					console log: diff printString]]
+					on: Exception do: [:e |
+						| msg |
+						msg:: [e messageText] on: Exception do: [:e2 | nil].
+						msg isNil ifTrue: [msg:: e printString].
+						anyDiffs:: anyDiffs + 1.
+						console log: 'ERROR: ', key asString, ' -- ', msg.
+						console log: 'src size: ', src size printString.
+						console log: '--- full snapshot source for ', key asString, ' ---'.
+						console log: src]]]].
+	js global alert: 'Round-trip: ', anyDiffs printString,
+		' class(es) with diffs or errors. See console.'
+)
+diffIsEmpty: diff <Map> ^ <Boolean> = (
+	(* True iff the diff has no added/removed/changed members at any
+	   level (header unchanged, all member maps empty, all nested
+	   diffs themselves empty). *)
+	(diff at: #headerChanged) ifTrue: [^false].
+	((memberDiffIsEmpty: (diff at: #methods))
+		and: [memberDiffIsEmpty: (diff at: #lazySlots)])
+		ifFalse: [^false].
+	(memberDiffIsEmpty: (diff at: #classMethods)) ifFalse: [^false].
+	(diff at: #nestedClasses) keysAndValuesDo: [:k :nested |
+		(nested at: #status ifAbsent: [nil]) isNil
+			ifTrue: [(diffIsEmpty: nested) ifFalse: [^false]]
+			ifFalse: [^false]].
+	^true
+)
+memberDiffIsEmpty: mDiff <Map> ^ <Boolean> = (
+	^(mDiff at: #added) isEmpty
+		and: [(mDiff at: #removed) isEmpty
+		and: [(mDiff at: #changed) isEmpty]]
 )
 respondToShowSnapshot = (
 	(* Smoke test: dump what snapshotFiles would commit. Summary to
@@ -1195,65 +1256,44 @@ The header provides the following buttons:
 )
 ) : (
 )
-class PerMemberExtractor onSource: src <String> ast: a <ClassDeclarationAST> = (
-(* Walks a parsed conventional .ns ClassDeclarationAST and returns a
-   per-member source map keyed by selector (methods) / name (lazy
-   slots, nested classes). Used by the commit dialog to diff a live
-   class's per-member state (free from the mirror) against the parsed
-   HEAD version of its <Class>.ns file. Source substrings are copied
-   verbatim from the original input using node start/end positions —
-   no reformatting. *)
+class PerMemberMirrorReader onMirror: m <ClassDeclarationMirror> = (
+(* Walks a live ClassDeclarationMirror and returns the same per-member
+   source map shape as PerMemberExtractor. The "live" half of any diff
+   over a Newspeak class. *)
 |
-	source <String> = src.
-	ast <ClassDeclarationAST> = a.
+	mirror <ClassDeclarationMirror> = m.
 |
 ) (
 public extract ^ <Map[Symbol, Object]> = (
-	(* Returns a Map with keys:
-	     #name           -> Symbol
-	     #header         -> String (header source)
-	     #methods        -> Map[Symbol, String]   (instance methods)
-	     #classMethods   -> Map[Symbol, String]
-	     #lazySlots      -> Map[Symbol, String]
-	     #nestedClasses  -> Map[Symbol, Map] (recursive) *)
-	^extractClass: ast
+	^extractMirror: mirror
 )
-extractClass: classAST <ClassDeclarationAST> ^ <Map[Symbol, Object]> = (
-	| result instanceMethods classSideMethods lazies nested iSide cSide |
+extractMirror: cdm <ClassDeclarationMirror> ^ <Map[Symbol, Object]> = (
+	| result methods classMethods lazies nested |
 	result:: Map new.
-	result at: #name put: classAST name.
-	result at: #header put: (sourceFrom: classAST header).
+	result at: #name put: cdm name.
+	result at: #header put: cdm header source.
 
-	instanceMethods:: Map new.
+	methods:: Map new.
+	cdm instanceSide methods do: [:m |
+		methods at: m name put: m source].
+	result at: #methods put: methods.
+
 	lazies:: Map new.
-	nested:: Map new.
-	iSide:: classAST instanceSide.
-	iSide isNil ifFalse: [
-		iSide methods isNil ifFalse: [
-			iSide methods do: [:m |
-				instanceMethods at: m selector put: (sourceFrom: m)]].
-		iSide lazySlots isNil ifFalse: [
-			iSide lazySlots do: [:s |
-				lazies at: s name put: (sourceFrom: s)]].
-		iSide nestedClasses isNil ifFalse: [
-			iSide nestedClasses do: [:nc |
-				nested at: nc name put: (extractClass: nc)]]].
-	result at: #methods put: instanceMethods.
+	cdm instanceSide lazySlots do: [:ls |
+		lazies at: ls name put: ls source].
 	result at: #lazySlots put: lazies.
+
+	classMethods:: Map new.
+	cdm classSide methods do: [:m |
+		classMethods at: m name put: m source].
+	result at: #classMethods put: classMethods.
+
+	nested:: Map new.
+	cdm instanceSide nestedClasses do: [:nc |
+		nested at: nc name put: (extractMirror: nc)].
 	result at: #nestedClasses put: nested.
 
-	classSideMethods:: Map new.
-	cSide:: classAST classSide.
-	cSide isNil ifFalse: [
-		cSide methods isNil ifFalse: [
-			cSide methods do: [:m |
-				classSideMethods at: m selector put: (sourceFrom: m)]]].
-	result at: #classMethods put: classSideMethods.
-
 	^result
-)
-sourceFrom: node <AST> ^ <String> = (
-	^source copyFrom: node start to: node end
 )
 ) : (
 )
@@ -1265,6 +1305,116 @@ sourceFrom: node <AST> ^ <String> = (
 lazy public LightningFSClass = global at: #LightningFS.
 lazy public gitFacade = global at: #git.
 lazy public gitHttpFacade = global at: #GitHttp.
+public liveSnapshotOf: aClass <Behavior> ^ <Map[Symbol, Object]> = (
+	(* Per-member map for a live class, same shape as
+	   PerMemberExtractor produces from a parsed .ns source. *)
+	^(PerMemberMirrorReader onMirror:
+		(ClassMirror reflecting: aClass) mixin declaration) extract
+)
+public extractedSnapshotFromSource: src <String> ^ <Map[Symbol, Object]> = (
+	(* Parse a conventional .ns source string and return the per-member
+	   map. Routes through ClassDeclarationBuilder fromUnitSource: --
+	   the same path Browsing's Compile File menu uses -- which calls
+	   the platform compiler's predictive parser internally (not the
+	   combinatorial NewspeakParsing parser, which has divergent grammar
+	   behavior on some forms; see VCSIsomorphicGitBackendProvider /
+	   nested DraftsRepo round-trip failure). The resulting builder is
+	   API-compatible with ClassDeclarationMirror per HopscotchWebIDE
+	   walkClassDecl:intoPath:files: comment at line 360, so
+	   PerMemberMirrorReader walks either kind interchangeably. *)
+	| builder |
+	builder:: ClassDeclarationBuilder fromUnitSource: src.
+	^(PerMemberMirrorReader onMirror: builder) extract
+)
+public diffSnapshot: oldSnap <Map> to: newSnap <Map> ^ <Map[Symbol, Object]> = (
+	(* Pure: produce a per-member diff between two snapshots.
+	   Result map keys:
+	     #name           -> Symbol
+	     #headerChanged  -> Boolean
+	     #oldHeader      -> String (preserved both ways for the diff view)
+	     #newHeader      -> String
+	     #methods        -> {#added, #removed, #changed}
+	     #classMethods   -> same
+	     #lazySlots      -> same
+	     #nestedClasses  -> Map[Symbol, {#status: #added | #removed | (recursive diff)}]
+	   #added / #removed entries:  {#name, #source}
+	   #changed entries:           {#name, #oldSource, #newSource} *)
+	| result |
+	result:: Map new.
+	result at: #name put: (newSnap at: #name).
+	result at: #headerChanged put: ((oldSnap at: #header) = (newSnap at: #header)) not.
+	result at: #oldHeader put: (oldSnap at: #header).
+	result at: #newHeader put: (newSnap at: #header).
+	result at: #methods put:
+		(diffMembers: (oldSnap at: #methods) to: (newSnap at: #methods)).
+	result at: #lazySlots put:
+		(diffMembers: (oldSnap at: #lazySlots) to: (newSnap at: #lazySlots)).
+	result at: #classMethods put:
+		(diffMembers: (oldSnap at: #classMethods) to: (newSnap at: #classMethods)).
+	result at: #nestedClasses put:
+		(diffNested: (oldSnap at: #nestedClasses) to: (newSnap at: #nestedClasses)).
+	^result
+)
+diffMembers: oldMap <Map> to: newMap <Map> ^ <Map[Symbol, Object]> = (
+	| added removed changed allNames |
+	added:: List new.
+	removed:: List new.
+	changed:: List new.
+	allNames:: Set new.
+	oldMap keysAndValuesDo: [:k :v | allNames add: k].
+	newMap keysAndValuesDo: [:k :v | allNames add: k].
+	allNames do: [:name |
+		(oldMap includesKey: name) ifTrue: [
+			(newMap includesKey: name) ifTrue: [
+				| o n |
+				o:: oldMap at: name.
+				n:: newMap at: name.
+				o = n ifFalse: [
+					changed add: (Map new
+						at: #name put: name;
+						at: #oldSource put: o;
+						at: #newSource put: n;
+						yourself)]]
+			ifFalse: [
+				removed add: (Map new
+					at: #name put: name;
+					at: #source put: (oldMap at: name);
+					yourself)]]
+		ifFalse: [
+			added add: (Map new
+				at: #name put: name;
+				at: #source put: (newMap at: name);
+				yourself)]].
+	^Map new
+		at: #added put: added;
+		at: #removed put: removed;
+		at: #changed put: changed;
+		yourself
+)
+diffNested: oldNested <Map> to: newNested <Map> ^ <Map[Symbol, Object]> = (
+	| result allNames |
+	result:: Map new.
+	allNames:: Set new.
+	oldNested keysAndValuesDo: [:k :v | allNames add: k].
+	newNested keysAndValuesDo: [:k :v | allNames add: k].
+	allNames do: [:name |
+		(oldNested includesKey: name) ifTrue: [
+			(newNested includesKey: name) ifTrue: [
+				result at: name put:
+					(diffSnapshot: (oldNested at: name)
+					 to: (newNested at: name))]
+			ifFalse: [
+				result at: name put: (Map new
+					at: #status put: #removed;
+					at: #snapshot put: (oldNested at: name);
+					yourself)]]
+		ifFalse: [
+			result at: name put: (Map new
+				at: #status put: #added;
+				at: #snapshot put: (newNested at: name);
+				yourself)]].
+	^result
+)
 public list ^ <RepositoryListSubject> = (
 	(* Convenience entry point: ide repositories list returns a Subject
 	   you can hand to ide browsing navigateTo:. Equivalent to

@@ -74,9 +74,18 @@ Slots:
 	private lf <String> = String lf.
 	(* Comment table. Built lazily on first emitCommentsUpTo: call
 	   from a single forward scan of source. Each entry is a List
-	   of three: { interiorStart. interiorEnd. body }, sorted by
-	   interiorStart. commentIdx is the index of the next unconsumed
-	   entry; consumedFlags tracks which entries have been emitted. *)
+	   of three values: openerPos -- source position of the open
+	   marker; closerEnd -- source position one past the matching
+	   close marker; trimmedBody -- the comment text between them.
+	   Entries are sorted by openerPos.
+
+	   commentIdx is the index of the next entry the unified emitter
+	   should consider; consumedFlags is a parallel boolean list
+	   marking which entries have actually been emitted. The two
+	   indices serve different purposes: commentIdx is the cursor
+	   into the table -- advances monotonically except across a
+	   trySingleLine: rollback -- while consumedFlags decides whether
+	   a given entry's payload should be re-emitted on revisit. *)
 	private commentTable <List | Nil>
 	private commentIdx <Integer> ::= 1.
 	private consumedFlags <List[Boolean] | Nil>
@@ -254,12 +263,23 @@ trySingleLine: tryBlock orMultiLine: altBlock = (
    Coverage: any commentTable entry left unconsumed at end-of-print
    indicates the printer skipped past its source position without
    asking. Reported via unconsumedComments. *)
-scanComments = (
+scanComments ^ <List> = (
 	(* One forward pass over source. Recognises Newspeak nested
-	   comments, quoted-string literals (with the doubled single-quote
-	   as an escape), and character literals. Returns a List of
-	   3-element list entries (openerPos, closerEnd, trimmedBody) in
-	   source order. *)
+	   comments, quoted-string literals -- where two consecutive
+	   single-quotes escape one -- and character literals, which in
+	   psoup are exactly three chars: open-quote, the char, close-
+	   quote.
+
+	   Returns a List of 3-element list entries: openerPos,
+	   closerEnd, trimmedBody, in source order.
+
+	   The byte-code constants below are: 39 = single-quote, 34 =
+	   double-quote, 40 = open-paren, 42 = star.
+
+	   String and character literals are skipped because they can
+	   contain bytes that look like comment delimiters; without this,
+	   an open-marker sitting inside a string would falsely register
+	   as a comment open. *)
 	| comments pos size |
 	comments:: List new.
 	source isNil ifTrue: [^comments].
@@ -275,10 +295,11 @@ scanComments = (
 				ifFalse: [pos:: pos + 1]]]].
 	^comments
 )
-skipStringLiteralFrom: startPos size: size ^ <Integer> = (
+skipStringLiteralFrom: startPos <Integer> size: size <Integer> ^ <Integer> = (
 	(* startPos is the first char inside the opening single-quote.
-	   Returns the position just after the closing quote. '' is an
-	   escaped single-quote, not a terminator. *)
+	   Returns the position just after the closing quote. Two
+	   consecutive single-quotes form an escaped quote inside the
+	   string, not a terminator. *)
 	| pos |
 	pos:: startPos.
 	[pos <= size] whileTrue: [
@@ -290,10 +311,15 @@ skipStringLiteralFrom: startPos size: size ^ <Integer> = (
 			ifFalse: [pos:: pos + 1]].
 	^pos
 )
-extractCommentAt: openerPos size: size into: comments ^ <Integer> = (
+extractCommentAt: openerPos <Integer> size: size <Integer> into: comments <List> ^ <Integer> = (
 	(* openerPos is the position of the opening parenthesis. Walks
 	   to the matching close-marker tracking nesting, records the
-	   entry, returns the position just past the close. *)
+	   entry, returns the position just past the close. Note: Newspeak
+	   comments DO support nesting at the grammar level; the predictive
+	   parser's lexer doesn't (see the memory note 'Comment terminator
+	   hazard') but this scanner does. The mismatch only matters when
+	   the parser is involved -- we're the scanner for the printer's
+	   commentTable, not the parser's lexer. *)
 	| pos depth interiorStart body |
 	interiorStart:: openerPos + 2.
 	pos:: interiorStart.
@@ -318,21 +344,25 @@ extractCommentAt: openerPos size: size into: comments ^ <Integer> = (
 	^pos
 )
 ensureCommentTable = (
-	(* Build the comment table on first emit. *)
+	(* Build the comment table on first emit. Idempotent: subsequent
+	   calls observe a non-nil commentTable and short-circuit. *)
 	commentTable isNil ifTrue: [
 		commentTable:: scanComments.
 		consumedFlags:: List new.
 		1 to: commentTable size do: [:i | consumedFlags add: false]].
 )
-emitCommentsUpTo: pos = (
+emitCommentsUpTo: pos <Integer> = (
 	(* Block layout: each emitted comment on its own line. *)
 	^emitCommentsUpTo: pos inline: false
 )
-emitCommentsUpTo: pos inline: isInline = (
+emitCommentsUpTo: pos <Integer> inline: isInline <Boolean> = (
 	(* Emit every unconsumed comment whose opener position is in
 	   [cursor, pos). isInline = true uses spaces and no newlines;
 	   isInline = false starts each comment on a new line and emits a
-	   trailing newline. *)
+	   trailing newline. Always advances cursor to pos so the next
+	   call's iteration starts from the right place; safe early
+	   returns for the standard guards (no source, no position, pos
+	   not ahead of cursor). *)
 	source isNil ifTrue: [^self].
 	pos isNil ifTrue: [^self].
 	pos <= 0 ifTrue: [^self].
@@ -348,7 +378,10 @@ emitCommentsUpTo: pos inline: isInline = (
 		commentIdx:: commentIdx + 1].
 	cursor:: pos.
 )
-emitCommentRecord: rec inline: isInline = (
+emitCommentRecord: rec <List> inline: isInline <Boolean> = (
+	(* Block layout guards the leading newline with column = 0
+	   ifFalse: -- without it, calls that follow an already-broken
+	   line would emit a stray blank line. *)
 	isInline
 		ifTrue: [emit: '(* '. emit: (rec at: 3). emit: ' *) ']
 		ifFalse: [
@@ -362,7 +395,7 @@ emitCommentsBefore: node = (
 	(node start isNil or: [node start <= 0]) ifTrue: [^self].
 	emitCommentsUpTo: node start.
 )
-consumeCommentsThrough: pos = (
+consumeCommentsThrough: pos <Integer> = (
 	(* Mark every commentTable entry with openerPos in [cursor, pos)
 	   as consumed without emitting it, and advance cursor. Used by
 	   emit paths that splice source verbatim (visitNumber) so that
@@ -379,12 +412,12 @@ consumeCommentsThrough: pos = (
 		commentIdx:: commentIdx + 1].
 	cursor:: pos.
 )
-emitLeadingCommentsUpTo: pos = (
+emitLeadingCommentsUpTo: pos <Integer> = (
 	(* Wrapper kept so existing call sites compile. Same semantics
-	   as emitCommentsUpTo: (block layout). *)
+	   as emitCommentsUpTo: -- block layout. *)
 	^emitCommentsUpTo: pos
 )
-emitTrailingCommentsUpTo: pos = (
+emitTrailingCommentsUpTo: pos <Integer> = (
 	(* Same. The unified scanner handles the cases the old
 	   emitTrailingCommentsUpTo: was working around manually. *)
 	^emitCommentsUpTo: pos
@@ -405,7 +438,9 @@ public unconsumedComments ^ <List> = (
 flushTrailingComments = (
 	(* Emit any unconsumed comments that sit at or past the cursor.
 	   Used at end-of-print to drain trailing comments past the last
-	   AST node. *)
+	   AST node. The 'size + 1' is one past the last byte; that
+	   guarantees any comment opener with start <= source size is
+	   strictly less than the bound. *)
 	source isNil ifTrue: [^self].
 	emitCommentsUpTo: source size + 1.
 )
@@ -1410,7 +1445,7 @@ public class PrettyPrintFacade onSource: src = (
    callers can inspect its post-print state -- in particular,
    unconsumedComments for round-trip coverage assertions. *)
 |
-	private source = src.
+	private source <String | Nil> = src.
 	private lastPrinter <PrettyPrinter | Nil>
 |) (
 public printClass: ast ^ <String> = (

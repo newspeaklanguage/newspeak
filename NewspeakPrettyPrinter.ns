@@ -72,11 +72,21 @@ Slots:
 	public width <Integer> ::= 80.
 	private tab <String> = String with: 9.
 	private lf <String> = String lf.
+	(* Comment table. Built lazily on first emitCommentsUpTo: call
+	   from a single forward scan of source. Each entry is a List
+	   of three: { interiorStart. interiorEnd. body }, sorted by
+	   interiorStart. commentIdx is the index of the next unconsumed
+	   entry; consumedFlags tracks which entries have been emitted. *)
+	private commentTable <List | Nil>
+	private commentIdx <Integer> ::= 1.
+	private consumedFlags <List[Boolean] | Nil>
+
 |) (
 (* --- Public API ---------------------------------------------------------- *)
 public printClass: node = (
 	emitCommentsBefore: node.
 	visitClassDeclaration: node.
+	flushTrailingComments.
 )
 public printClassHeader: node = (
 	emitCommentsBefore: node.
@@ -181,14 +191,23 @@ indented: block = (
 )
 trySingleLine: tryBlock orMultiLine: altBlock = (
 	(* Run tryBlock optimistically. If it produced a newline or pushed
-	   past the width, roll the output back and run altBlock instead. *)
+	   past the width, roll the output back and run altBlock instead.
+	   commentIdx and consumedFlags must also be saved: comments
+	   emitted during a failed attempt would otherwise stay marked
+	   consumed after the output is reverted, silently dropping them. *)
 	|
 	startSize savedColumn savedCursor savedIndent broke
+	savedCommentIdx savedConsumed
 	|
 	startSize:: output size.
 	savedColumn:: column.
 	savedCursor:: cursor.
 	savedIndent:: indentLevel.
+	savedCommentIdx:: commentIdx.
+	savedConsumed:: consumedFlags isNil
+		ifTrue: [nil]
+		ifFalse: [ | snap | snap:: List new.
+		           consumedFlags do: [:b | snap add: b]. snap].
 	tryBlock value.
 	broke:: column > width.
 	broke ifFalse: [
@@ -201,42 +220,177 @@ trySingleLine: tryBlock orMultiLine: altBlock = (
 		column:: savedColumn.
 		cursor:: savedCursor.
 		indentLevel:: savedIndent.
+		commentIdx:: savedCommentIdx.
+		savedConsumed isNil ifFalse: [
+			1 to: savedConsumed size do: [:i |
+				consumedFlags at: i put: (savedConsumed at: i)]].
 		altBlock value.
 	].
 )
 (* --- Comment threading -------------------------------------------------- *)
-emitCommentsBefore: node = (
-	(* If source is non-nil, has a usable position, and lies past the
-	   current cursor, scan source[cursor..node.start - 1] for metadata
-	   and comments and emit them before the node.
+(* Redesigned 2026-06-01.
 
-	   Cursor is advanced to node.start (not past node.end), so that
-	   sub-traversals of the node can scan its internal source for
-	   nested comments. Sibling traversals advance the cursor past the
-	   node's end via advanceCursorPast:.
+   The previous design scanned source piecemeal at every emit site that
+   knew about a potential comment position, with MetadataParser as the
+   inner scanner. It was fragile: every visitor that wanted to preserve
+   comments needed its own scan, every scan had to manually skip
+   leading '.', '=', etc. so MetadataParser wouldn't choke, and there
+   was no global accounting that detected dropped comments.
 
-	   Uses gatherMetadataBackwards: comments attach to the AST node
-	   that *follows* them (the convention used by the runtime mirrors),
-	   which is captured by walking backwards from the next node's
-	   start. gatherMetadata (forward) has the additional problem that
-	   skipWhitespace in MetadataParser doesn't bounds-check, so a chunk
-	   ending in whitespace raises ArgumentError. *)
-	| chunk parser |
+   The new design pre-scans the entire source once, building a
+   commentTable sorted by opener position. Each entry is
+       { openerPos. closerEnd. trimmedBody }
+   (a 3-element list). consumedFlags is a parallel List[Boolean] that
+   tracks which entries have been emitted.
+
+   emitCommentsUpTo: pos is the only primitive for emit. It walks
+   commentTable from commentIdx, emits every entry whose openerPos is
+   in [cursor, pos), marks each consumed, and advances cursor.
+
+   For visitors that want inline placement (between modifier and slot
+   name, inside an empty block, etc.), emitCommentsUpTo: pos inline:
+   true uses spaces instead of newlines.
+
+   Coverage: any commentTable entry left unconsumed at end-of-print
+   indicates the printer skipped past its source position without
+   asking. Reported via unconsumedComments. *)
+scanComments = (
+	(* One forward pass over source. Recognises Newspeak nested
+	   comments, quoted-string literals (with the doubled single-quote
+	   as an escape), and character literals. Returns a List of
+	   3-element list entries (openerPos, closerEnd, trimmedBody) in
+	   source order. *)
+	| comments pos size |
+	comments:: List new.
+	source isNil ifTrue: [^comments].
+	pos:: 1.
+	size:: source size.
+	[pos <= size] whileTrue: [| ch |
+		ch:: source at: pos.
+		ch = 39 (* ' *) ifTrue: [pos:: skipStringLiteralFrom: pos + 1 size: size]
+		ifFalse: [ch = 34 (* " *) ifTrue: [pos:: pos + 3] (* character literal "X" is exactly 3 chars *)
+		ifFalse: [
+			(ch = 40 (* ( *) and: [pos + 1 <= size and: [(source at: pos + 1) = 42 (* * *)]])
+				ifTrue: [pos:: extractCommentAt: pos size: size into: comments]
+				ifFalse: [pos:: pos + 1]]]].
+	^comments
+)
+skipStringLiteralFrom: startPos size: size ^ <Integer> = (
+	(* startPos is the first char inside the opening single-quote.
+	   Returns the position just after the closing quote. '' is an
+	   escaped single-quote, not a terminator. *)
+	| pos |
+	pos:: startPos.
+	[pos <= size] whileTrue: [
+		(source at: pos) = 39
+			ifTrue: [
+				(pos + 1 <= size and: [(source at: pos + 1) = 39])
+					ifTrue: [pos:: pos + 2]
+					ifFalse: [^pos + 1]]
+			ifFalse: [pos:: pos + 1]].
+	^pos
+)
+extractCommentAt: openerPos size: size into: comments ^ <Integer> = (
+	(* openerPos is the position of the opening parenthesis. Walks
+	   to the matching close-marker tracking nesting, records the
+	   entry, returns the position just past the close. *)
+	| pos depth interiorStart body |
+	interiorStart:: openerPos + 2.
+	pos:: interiorStart.
+	depth:: 1.
+	[depth > 0 and: [pos <= size]] whileTrue: [| ch |
+		ch:: source at: pos.
+		(ch = 40 and: [pos + 1 <= size and: [(source at: pos + 1) = 42]])
+			ifTrue: [depth:: depth + 1. pos:: pos + 2]
+		ifFalse: [
+			(ch = 42 and: [pos + 1 <= size and: [(source at: pos + 1) = 41]])
+				ifTrue: [
+					depth:: depth - 1.
+					depth = 0 ifTrue: [
+						| rec |
+						body:: (source copyFrom: interiorStart to: pos - 1) withBlanksTrimmed.
+						rec:: List new.
+						rec add: openerPos. rec add: pos + 2. rec add: body.
+						comments add: rec.
+						^pos + 2].
+					pos:: pos + 2]
+				ifFalse: [pos:: pos + 1]]].
+	^pos
+)
+ensureCommentTable = (
+	(* Build the comment table on first emit. *)
+	commentTable isNil ifTrue: [
+		commentTable:: scanComments.
+		consumedFlags:: List new.
+		1 to: commentTable size do: [:i | consumedFlags add: false]].
+)
+emitCommentsUpTo: pos = (
+	(* Block layout: each emitted comment on its own line. *)
+	^emitCommentsUpTo: pos inline: false
+)
+emitCommentsUpTo: pos inline: isInline = (
+	(* Emit every unconsumed comment whose opener position is in
+	   [cursor, pos). isInline = true uses spaces and no newlines;
+	   isInline = false starts each comment on a new line and emits a
+	   trailing newline. *)
 	source isNil ifTrue: [^self].
-	metadataModule isNil ifTrue: [^self].
+	pos isNil ifTrue: [^self].
+	pos <= 0 ifTrue: [^self].
+	pos <= cursor ifTrue: [^self].
+	ensureCommentTable.
+	[commentIdx <= commentTable size and: [
+		((commentTable at: commentIdx) at: 1) < pos]] whileTrue: [
+		| rec |
+		rec:: commentTable at: commentIdx.
+		(consumedFlags at: commentIdx) ifFalse: [
+			emitCommentRecord: rec inline: isInline.
+			consumedFlags at: commentIdx put: true].
+		commentIdx:: commentIdx + 1].
+	cursor:: pos.
+)
+emitCommentRecord: rec inline: isInline = (
+	isInline
+		ifTrue: [emit: '(* '. emit: (rec at: 3). emit: ' *) ']
+		ifFalse: [
+			column = 0 ifFalse: [newline].
+			emit: '(* '. emit: (rec at: 3). emit: ' *)'.
+			newline].
+)
+emitCommentsBefore: node = (
+	(* Thin wrapper for callers that have an AST node in hand. *)
 	node isNil ifTrue: [^self].
 	(node start isNil or: [node start <= 0]) ifTrue: [^self].
-	node start <= cursor ifTrue: [^self].
-	chunk:: source copyFrom: cursor to: node start - 1.
-	parser:: metadataModule MetadataParser onSource: chunk.
-	(* Tolerate MetadataParser failures: it has no notion of string
-	   literals, so a chunk containing an open-comment marker inside
-	   a quoted string makes its scanner walk off the end and call
-	   its own missing scanError:. Emit whatever comments were
-	   recovered before that failure. *)
-	[parser gatherMetadataBackwards] on: Error do: [:e | ].
-	emitGatheredComments: parser.
-	cursor:: node start.
+	emitCommentsUpTo: node start.
+)
+emitLeadingCommentsUpTo: pos = (
+	(* Wrapper kept so existing call sites compile. Same semantics
+	   as emitCommentsUpTo: (block layout). *)
+	^emitCommentsUpTo: pos
+)
+emitTrailingCommentsUpTo: pos = (
+	(* Same. The unified scanner handles the cases the old
+	   emitTrailingCommentsUpTo: was working around manually. *)
+	^emitCommentsUpTo: pos
+)
+public unconsumedComments ^ <List> = (
+	(* Diagnostic: list every commentTable entry that was never
+	   emitted by emitCommentsUpTo:. Each is the { openerPos.
+	   closerEnd. body } triple. Empty when round-trip coverage
+	   is complete. *)
+	| result |
+	source isNil ifTrue: [^List new].
+	ensureCommentTable.
+	result:: List new.
+	1 to: commentTable size do: [:i |
+		(consumedFlags at: i) ifFalse: [result add: (commentTable at: i)]].
+	^result
+)
+flushTrailingComments = (
+	(* Emit any unconsumed comments that sit at or past the cursor.
+	   Used at end-of-print to drain trailing comments past the last
+	   AST node. *)
+	source isNil ifTrue: [^self].
+	emitCommentsUpTo: source size + 1.
 )
 emitAccessModifier: am = (
 	(* Emit the access modifier with a trailing space, but only if it's
@@ -257,27 +411,8 @@ advanceCursorPast: node = (
 	(node end isNil or: [node end <= 0]) ifTrue: [^self].
 	node end >= cursor ifTrue: [cursor:: node end + 1].
 )
-emitGatheredComments: parser = (
-	(* Emit recovered metadata (each as '(* :tag: payload *)') followed
-	   by plain comments (each as '(* text *)'). Order within each group
-	   is parser-defined; metadata-then-comment ordering is stable. *)
-	| md plain |
-	md:: parser metadata.
-	plain:: parser comments.
-	(md isEmpty and: [plain isEmpty]) ifTrue: [^self].
-	md keys do: [:tag |
-		column = 0 ifFalse: [newline].
-		emit: '(* :', tag, ': ', (md at: tag), ' *)'.
-		newline.
-	].
-	(* gatherMetadataBackwards appends to `comments` in backward source
-	   order; reverse so emit order matches source order. *)
-	plain reverse do: [:c |
-		column = 0 ifFalse: [newline].
-		emit: '(* ', c withBlanksTrimmed, ' *)'.
-		newline.
-	].
-)
+(* Old emitGatheredComments: removed — replaced by the unified
+   emitCommentsUpTo: family above. *)
 (* --- Precedence handling ----------------------------------------------- *)
 (* Higher = tighter binding: primary > unary > binary > keyword > cascade *)
 levelPrimary = ( ^4 )
@@ -404,17 +539,29 @@ emitSuperclassClause: header = (
 		ifTrue: [space. visitMessage: header superConstructorCall].
 )
 emitClassHeaderBody: header = (
-	| hasComment hasSlots hasInit ccText |
-	ccText:: classCommentTextOf: header.
-	hasComment:: ccText isNil not and: [ccText isEmpty not].
+	| hasSlots hasInit firstContentPos ccText hasComment |
 	hasSlots:: header slots isNil not and: [header slots isEmpty not].
 	hasInit:: header initExprs isNil not and: [header initExprs isEmpty not].
-	hasComment ifTrue: [
-		indented: [
-			newline.
-			emit: '(* '. emit: ccText. emit: ' *)'.
-		].
-	].
+	(* Drain any comments between the body's opening '(' and the first
+	   body content (slot, init expr, or — if none — the closing ')').
+	   The pre-scanned commentTable already holds these; the unified
+	   emitter places them in source order. Falls back to the AST's
+	   classComment field when no source is attached (commentTable
+	   empty). *)
+	firstContentPos:: hasSlots
+		ifTrue: [header slots first start]
+		ifFalse: [hasInit
+			ifTrue: [header initExprs first start]
+			ifFalse: [header end]].
+	(source isNil not and: [firstContentPos isNil not and: [firstContentPos > 0]])
+		ifTrue: [indented: [emitCommentsUpTo: firstContentPos]].
+	source isNil ifTrue: [
+		ccText:: classCommentTextOf: header.
+		hasComment:: ccText isNil not and: [ccText isEmpty not].
+		hasComment ifTrue: [
+			indented: [
+				newline.
+				emit: '(* '. emit: ccText. emit: ' *)']]].
 	(hasSlots or: [hasInit]) ifTrue: [
 		indented: [
 			(* Emit the slot bar only when there ARE slots. Without
@@ -458,7 +605,8 @@ visitSlotInBar: slot = (
 	   from the source span between slot.start (modifier position) and
 	   slot.slotDecl.start (slot-name position) and emit them inline. *)
 	emitAccessModifier: slot accessModifier.
-	emitInlineCommentsInSlot: slot.
+	(slot slotDecl isNil not and: [slot slotDecl start isNil not and: [slot slotDecl start > 0]])
+		ifTrue: [emitCommentsUpTo: slot slotDecl start inline: true].
 	emit: slot name.
 	slot type isNil ifFalse: [
 		emit: ' <'. visitType: slot type. emit: '>'.
@@ -483,7 +631,8 @@ visitLazySlot: slot = (
 	'expected ='. *)
 	emit: 'lazy '.
 	emitAccessModifier: slot accessModifier.
-	emitInlineCommentsInSlot: slot.
+	(slot slotDecl isNil not and: [slot slotDecl start isNil not and: [slot slotDecl start > 0]])
+		ifTrue: [emitCommentsUpTo: slot slotDecl start inline: true].
 	emit: slot name.
 	slot type isNil ifFalse: [
 		emit: ' <'. visitType: slot type. emit: '>'.
@@ -494,54 +643,11 @@ visitLazySlot: slot = (
 		emit: '.'.
 	].
 )
-emitInlineCommentsInSlot: slot = (
-	(* Scan source between the slot's modifier-keyword end and the
-	   slot-name start for embedded comments like
-	   '(* bogus *)' in 'public (* bogus *) uiActor = ...'. Emit
-	   each one inline, with a trailing space, so it sits between
-	   the modifier and the name. The caller has just emitted the
-	   modifier (which already includes its own trailing space). *)
-	| modStart modLen scanFrom scanTo chunk parser |
-	source isNil ifTrue: [^self].
-	metadataModule isNil ifTrue: [^self].
-	slot start isNil ifTrue: [^self].
-	slot start <= 0 ifTrue: [^self].
-	slot slotDecl isNil ifTrue: [^self].
-	slot slotDecl start isNil ifTrue: [^self].
-	slot slotDecl start <= 0 ifTrue: [^self].
-	modStart:: slot start.
-	modLen:: lengthOfModifierKeywordAt: modStart.
-	scanFrom:: modStart + modLen.
-	scanTo:: slot slotDecl start - 1.
-	scanFrom > scanTo ifTrue: [^self].
-	scanTo > source size ifTrue: [^self].
-	chunk:: source copyFrom: scanFrom to: scanTo.
-	parser:: metadataModule MetadataParser onSource: chunk.
-	[parser gatherMetadata] on: Error do: [:e | ].
-	parser comments do: [:c |
-		emit: '(* ', c withBlanksTrimmed, ' *) '].
-)
-lengthOfModifierKeywordAt: pos = (
-	(* Return the source length of an access-modifier keyword
-	   starting at pos: 6 for 'public', 7 for 'private', 9 for
-	   'protected', or 0 if no modifier keyword is there. Used to
-	   advance past the modifier text when scanning for trailing
-	   inline comments inside a slot declaration. *)
-	source isNil ifTrue: [^0].
-	(pos isNil or: [pos <= 0]) ifTrue: [^0].
-	pos > source size ifTrue: [^0].
-	(matchesAt: pos word: 'public') ifTrue: [^6].
-	(matchesAt: pos word: 'private') ifTrue: [^7].
-	(matchesAt: pos word: 'protected') ifTrue: [^9].
-	^0
-)
-matchesAt: pos word: word = (
-	(* True iff source[pos..pos+word.size-1] equals word. *)
-	| n |
-	n:: word size.
-	pos + n - 1 > source size ifTrue: [^false].
-	^(source copyFrom: pos to: pos + n - 1) = word
-)
+(* Old emitInlineCommentsInSlot:, lengthOfModifierKeywordAt: and
+   matchesAt:word: have been retired. The unified emitCommentsUpTo:
+   inline: true now handles inline-between-modifier-and-name
+   comments by anchoring directly on slot.slotDecl.start, without
+   needing to peek at source bytes for the modifier keyword. *)
 (* --- Side (instance / class members) ----------------------------------- *)
 visitSide: side = (
 	side isNil ifTrue: [^self].
@@ -612,24 +718,18 @@ findBodyOpenPosFrom: pos = (
 	equalsPos = 0 ifTrue: [^0].
 	^source indexOf: '(' startingAt: equalsPos.
 )
-emitInPatternMetadata: methodNode savedCursor: savedCursor = (
-	(* Scan source[savedCursor..equalsPos - 1] for metadata. Mirrors
-	   the convention used by the runtime (MirrorsForPrimordialSoup
-	   parseMetadata, line 1074-1080): method metadata lives in the
-	   source prefix that precedes '='. Uses gatherMetadataBackwards
-	   because the comments appear AFTER the selector tokens — a
-	   forward scan from the start of the chunk would stop at the
-	   first non-comment token. *)
-	| chunk parser equalsPos |
+emitInPatternMetadata: headerNode savedCursor: savedCursor = (
+	(* Comments and tagged metadata between savedCursor and the '='
+	   that opens the body. Used by both method declarations and
+	   class headers: the convention is the same in either case.
+	   Looks up the first '=' after savedCursor in source and asks
+	   the unified comment-emitter to drain the gap. *)
+	| equalsPos |
 	source isNil ifTrue: [^self].
-	metadataModule isNil ifTrue: [^self].
 	equalsPos:: source indexOf: '=' startingAt: savedCursor.
 	equalsPos = 0 ifTrue: [^self].
 	equalsPos <= savedCursor ifTrue: [^self].
-	chunk:: source copyFrom: savedCursor to: equalsPos - 1.
-	parser:: metadataModule MetadataParser onSource: chunk.
-	[parser gatherMetadataBackwards] on: Error do: [:e | ].
-	emitGatheredComments: parser.
+	emitCommentsUpTo: equalsPos.
 )
 visitMessagePattern: pattern = (
 	emitSelectorPattern: pattern.
@@ -755,78 +855,10 @@ emitCodeBodyContents: body inMethod: inMethod bodyEnd: bodyEnd = (
 		emitTrailingCommentsUpTo: bodyEnd.
 	].
 )
-emitTrailingCommentsUpTo: pos = (
-	(* Forward-scan from cursor up to pos - 1 for comments. Each
-	   comment is emitted on its own line, then cursor is advanced
-	   to pos. Used at the END of a body region (between the last
-	   statement and the body's closing delimiter).
-
-	   gatherMetadata stops on any non-whitespace non-comment byte,
-	   so step past a leading '.' (the statement terminator the
-	   parser ate) before scanning. *)
-	| scanFrom chunk parser comments |
-	source isNil ifTrue: [^self].
-	metadataModule isNil ifTrue: [^self].
-	pos isNil ifTrue: [^self].
-	pos <= 0 ifTrue: [^self].
-	pos <= cursor ifTrue: [^self].
-	scanFrom:: cursor.
-	[scanFrom <= source size and: [
-		| ch |
-		ch:: source at: scanFrom.
-		ch = 46 (* . *) or: [
-			ch = 32 or: [ch = 9 or: [ch = 10 or: [ch = 13]]]]]]
-		whileTrue: [scanFrom:: scanFrom + 1].
-	scanFrom > (pos - 1) ifTrue: [^self].
-	chunk:: source copyFrom: scanFrom to: pos - 1.
-	parser:: metadataModule MetadataParser onSource: chunk.
-	[parser gatherMetadata] on: Error do: [:e | ].
-	comments:: parser comments.
-	comments isEmpty ifTrue: [^self].
-	comments do: [:c |
-		newline.
-		emit: '(* ', c withBlanksTrimmed, ' *)'].
-	cursor:: pos.
-)
-emitLeadingCommentsUpTo: pos = (
-	(* Forward-scan from cursor up to pos - 1, gathering leading
-	   comments via gatherMetadata, and advance cursor to pos. Used at
-	   the start of a body region (between an opening delimiter and
-	   the first AST content). Forward gather is the right primitive
-	   here because we're looking for comments at the BEGINNING of the
-	   scanned region; backward gather would find comments adjacent to
-	   the first AST content instead. *)
-	| chunk parser |
-	source isNil ifTrue: [^self].
-	metadataModule isNil ifTrue: [^self].
-	pos isNil ifTrue: [^self].
-	pos <= 0 ifTrue: [^self].
-	pos <= cursor ifTrue: [^self].
-	chunk:: source copyFrom: cursor to: pos - 1.
-	parser:: metadataModule MetadataParser onSource: chunk.
-	[parser gatherMetadata] on: Error do: [:e | ].
-	emitGatheredCommentsInSourceOrder: parser.
-	cursor:: pos.
-)
-emitGatheredCommentsInSourceOrder: parser = (
-	(* As emitGatheredComments, but without reversing the comments
-	   list — used by callers that drove a FORWARD gather, which
-	   appends comments in source order already. *)
-	| md plain |
-	md:: parser metadata.
-	plain:: parser comments.
-	(md isEmpty and: [plain isEmpty]) ifTrue: [^self].
-	md keys do: [:tag |
-		column = 0 ifFalse: [newline].
-		emit: '(* :', tag, ': ', (md at: tag), ' *)'.
-		newline.
-	].
-	plain do: [:c |
-		column = 0 ifFalse: [newline].
-		emit: '(* ', c withBlanksTrimmed, ' *)'.
-		newline.
-	].
-)
+(* Old comment-emit helpers (emitTrailingCommentsUpTo:, emitLeadingCommentsUpTo:,
+   emitGatheredCommentsInSourceOrder:) have been retired. Their behaviour is
+   absorbed into the unified emitCommentsUpTo: family above, which uses the
+   pre-scanned commentTable. *)
 (* --- Block -------------------------------------------------------------- *)
 visitBlock: node = (
 	| body params hasParams hasTemps hasStmts |
@@ -851,36 +883,13 @@ visitBlock: node = (
 	].
 	(hasTemps or: [hasStmts])
 		ifTrue: [emitBlockBody: body hasParams: hasParams]
-		ifFalse: [emitEmptyBlockInteriorComments: node].
+		ifFalse: [
+			(* No temps, no stmts. Drain any interior comments
+			   between '[' and ']' inline. *)
+			(node end isNil not and: [node end > 0]) ifTrue: [
+				space.
+				emitCommentsUpTo: node end inline: true]].
 	emit: ']'.
-)
-emitEmptyBlockInteriorComments: blockNode = (
-	(* For blocks with no temps and no statements (e.g. an
-	   'ifFalse: [ (* noop *) ]' shell), the regular code-body
-	   scan never runs and any interior comments would be dropped.
-	   Scan the block's interior source span between '[' and ']'
-	   and emit each comment inline with surrounding spaces, so
-	   '[ (* noop *) ]' round-trips. *)
-	| scanFrom scanTo chunk parser comments |
-	source isNil ifTrue: [^self].
-	metadataModule isNil ifTrue: [^self].
-	blockNode start isNil ifTrue: [^self].
-	blockNode end isNil ifTrue: [^self].
-	blockNode start <= 0 ifTrue: [^self].
-	blockNode end <= 0 ifTrue: [^self].
-	scanFrom:: blockNode start + 1.
-	scanTo:: blockNode end - 1.
-	scanFrom > scanTo ifTrue: [^self].
-	scanTo > source size ifTrue: [^self].
-	chunk:: source copyFrom: scanFrom to: scanTo.
-	parser:: metadataModule MetadataParser onSource: chunk.
-	[parser gatherMetadata] on: Error do: [:e | ].
-	comments:: parser comments.
-	comments isEmpty ifTrue: [^self].
-	comments do: [:c |
-		space.
-		emit: '(* ', c withBlanksTrimmed, ' *)'].
-	space.
 )
 emitBlockBody: body hasParams: hasParams = (
 	(* If the block has more than one statement, force each onto its
@@ -1208,7 +1217,7 @@ visitCharacter: node = (
 	emit: '"'. emit: node value. emit: '"'.
 )
 visitTuple: node = (
-	| els scanFrom scanTo chunk parser comments |
+	| els |
 	emit: '{'.
 	els:: node elements.
 	(els isNil not and: [els isEmpty not]) ifTrue: [
@@ -1221,38 +1230,15 @@ visitTuple: node = (
 	   and the closing '}', e.g.
 	     ^{
 	         realImpl.
-	         (* commentedOutAlternative. *)
+	         (* commentedOutAlternative *)
 	     } collect: ...
-	   The parser drops these comments (the lexer skips them between
-	   tokens), so the AST has no knowledge of them. Recover by
-	   scanning the source between the last element's end and the
-	   tuple's end-marker. *)
-	(source isNil
-		or: [els isNil
-		or: [els isEmpty
-		or: [node end isNil
-		or: [node end <= 0]]]]) ifTrue: [emit: '}'. ^self].
-	scanFrom:: els last end + 1.
-	(* The tuple separator '.' (consumed by the parser) sits between
-	   the last element and the comment. gatherMetadata doesn't skip
-	   non-whitespace non-comment chars, so advance past any leading
-	   '.' or whitespace before scanning. *)
-	[scanFrom <= source size and: [
-		| ch |
-		ch:: source at: scanFrom.
-		ch = 46 (* . *) or: [
-			ch = 32 or: [ch = 9 or: [ch = 10 or: [ch = 13]]]]]]
-		whileTrue: [scanFrom:: scanFrom + 1].
-	scanTo:: node end - 1.
-	(scanFrom > scanTo or: [metadataModule isNil])
-		ifTrue: [emit: '}'. ^self].
-	chunk:: source copyFrom: scanFrom to: scanTo.
-	parser:: metadataModule MetadataParser onSource: chunk.
-	[parser gatherMetadata] on: Error do: [:e | ].
-	comments:: parser comments.
-	comments do: [:c |
-		emit: '. '.
-		emit: '(* ', c withBlanksTrimmed, ' *)'].
+	   are recovered from the pre-scanned commentTable via the
+	   unified emitter; emitting through it also marks the entry
+	   consumed so a later flush won't re-emit. Prefix a '. ' if
+	   we're in fact about to emit any comment inline. *)
+	(node end isNil not and: [node end > 0]) ifTrue: [
+		(els isNil not and: [els isEmpty not]) ifTrue: [emit: '. '].
+		emitCommentsUpTo: node end inline: true].
 	emit: '}'.
 )
 visitVarDecl: node = (
@@ -1275,7 +1261,12 @@ emitParameterizedType: t = (
 	   re-parses as a non-parameterized TypeIdAST, losing the tuple
 	   wrapping). The empty-args case is the load-bearing one;
 	   keeping non-empty cases in tuple syntax is just consistency. *)
-	t generic name = #Tuple ifTrue: [
+	(* The Tuple-syntax check only applies when the generic is a bare
+	   TypeIdAST — for the parser's '{X. Y. Z}' path, generic is
+	   always TypeIdAST(name: #Tuple). For 'NS Array[String]' the
+	   generic is a UnaryTypeOpAST (no name field), so guard the
+	   send. *)
+	(t generic isKindOfTypeIdAST and: [t generic name = #Tuple]) ifTrue: [
 		emit: '{'.
 		t arguments isNil ifFalse: [
 			printSeparatedList: t arguments with: '. ' do: [:a | visitType: a]].

@@ -436,8 +436,16 @@ emitClassHeaderBody: header = (
 visitSlotInBar: slot = (
 	(* Slot inside the slot bar: optional modifier, name, optional type
 	   annotation, optional initializer with =/::=, trailing period iff
-	   initialized. *)
+	   initialized.
+
+	   Inline comments such as 'public (* bogus *) uiActor = ...' live
+	   in source between the modifier keyword and the slot name; the
+	   parser strips them (the lexer skips whitespace/comments to find
+	   the next real token) so they're not on the AST. Recover them
+	   from the source span between slot.start (modifier position) and
+	   slot.slotDecl.start (slot-name position) and emit them inline. *)
 	emitAccessModifier: slot accessModifier.
+	emitInlineCommentsInSlot: slot.
 	emit: slot name.
 	slot type isNil ifFalse: [
 		emit: ' <'. visitType: slot type. emit: '>'.
@@ -462,6 +470,7 @@ visitLazySlot: slot = (
 	'expected ='. *)
 	emit: 'lazy '.
 	emitAccessModifier: slot accessModifier.
+	emitInlineCommentsInSlot: slot.
 	emit: slot name.
 	slot type isNil ifFalse: [
 		emit: ' <'. visitType: slot type. emit: '>'.
@@ -471,6 +480,54 @@ visitLazySlot: slot = (
 		printAtLevel: slot initializer minLevel: levelCascade.
 		emit: '.'.
 	].
+)
+emitInlineCommentsInSlot: slot = (
+	(* Scan source between the slot's modifier-keyword end and the
+	   slot-name start for embedded comments like
+	   '(* bogus *)' in 'public (* bogus *) uiActor = ...'. Emit
+	   each one inline, with a trailing space, so it sits between
+	   the modifier and the name. The caller has just emitted the
+	   modifier (which already includes its own trailing space). *)
+	| modStart modLen scanFrom scanTo chunk parser |
+	source isNil ifTrue: [^self].
+	metadataModule isNil ifTrue: [^self].
+	slot start isNil ifTrue: [^self].
+	slot start <= 0 ifTrue: [^self].
+	slot slotDecl isNil ifTrue: [^self].
+	slot slotDecl start isNil ifTrue: [^self].
+	slot slotDecl start <= 0 ifTrue: [^self].
+	modStart:: slot start.
+	modLen:: lengthOfModifierKeywordAt: modStart.
+	scanFrom:: modStart + modLen.
+	scanTo:: slot slotDecl start - 1.
+	scanFrom > scanTo ifTrue: [^self].
+	scanTo > source size ifTrue: [^self].
+	chunk:: source copyFrom: scanFrom to: scanTo.
+	parser:: metadataModule MetadataParser onSource: chunk.
+	[parser gatherMetadata] on: Error do: [:e | ].
+	parser comments do: [:c |
+		emit: '(* ', c withBlanksTrimmed, ' *) '].
+)
+lengthOfModifierKeywordAt: pos = (
+	(* Return the source length of an access-modifier keyword
+	   starting at pos: 6 for 'public', 7 for 'private', 9 for
+	   'protected', or 0 if no modifier keyword is there. Used to
+	   advance past the modifier text when scanning for trailing
+	   inline comments inside a slot declaration. *)
+	source isNil ifTrue: [^0].
+	(pos isNil or: [pos <= 0]) ifTrue: [^0].
+	pos > source size ifTrue: [^0].
+	(matchesAt: pos word: 'public') ifTrue: [^6].
+	(matchesAt: pos word: 'private') ifTrue: [^7].
+	(matchesAt: pos word: 'protected') ifTrue: [^9].
+	^0
+)
+matchesAt: pos word: word = (
+	(* True iff source[pos..pos+word.size-1] equals word. *)
+	| n |
+	n:: word size.
+	pos + n - 1 > source size ifTrue: [^false].
+	^(source copyFrom: pos to: pos + n - 1) = word
 )
 (* --- Side (instance / class members) ----------------------------------- *)
 visitSide: side = (
@@ -676,7 +733,47 @@ emitCodeBodyContents: body inMethod: inMethod bodyEnd: bodyEnd = (
 			i = stmts size ifFalse: [emit: '.'].
 			advanceCursorPast: stmt.
 		].
+		(* After the last statement, scan for trailing comments
+		   between the cursor and the body's closing delimiter.
+		   Catches "lone trailing" comments such as
+		     stmt. (* explanatory note *)
+		   at the end of a method body, where there's no subsequent
+		   AST node to attach the comment to via gatherMetadataBackwards. *)
+		emitTrailingCommentsUpTo: bodyEnd.
 	].
+)
+emitTrailingCommentsUpTo: pos = (
+	(* Forward-scan from cursor up to pos - 1 for comments. Each
+	   comment is emitted on its own line, then cursor is advanced
+	   to pos. Used at the END of a body region (between the last
+	   statement and the body's closing delimiter).
+
+	   gatherMetadata stops on any non-whitespace non-comment byte,
+	   so step past a leading '.' (the statement terminator the
+	   parser ate) before scanning. *)
+	| scanFrom chunk parser comments |
+	source isNil ifTrue: [^self].
+	metadataModule isNil ifTrue: [^self].
+	pos isNil ifTrue: [^self].
+	pos <= 0 ifTrue: [^self].
+	pos <= cursor ifTrue: [^self].
+	scanFrom:: cursor.
+	[scanFrom <= source size and: [
+		| ch |
+		ch:: source at: scanFrom.
+		ch = 46 (* . *) or: [
+			ch = 32 or: [ch = 9 or: [ch = 10 or: [ch = 13]]]]]]
+		whileTrue: [scanFrom:: scanFrom + 1].
+	scanFrom > (pos - 1) ifTrue: [^self].
+	chunk:: source copyFrom: scanFrom to: pos - 1.
+	parser:: metadataModule MetadataParser onSource: chunk.
+	[parser gatherMetadata] on: Error do: [:e | ].
+	comments:: parser comments.
+	comments isEmpty ifTrue: [^self].
+	comments do: [:c |
+		newline.
+		emit: '(* ', c withBlanksTrimmed, ' *)'].
+	cursor:: pos.
 )
 emitLeadingCommentsUpTo: pos = (
 	(* Forward-scan from cursor up to pos - 1, gathering leading
@@ -741,8 +838,36 @@ visitBlock: node = (
 	].
 	(hasTemps or: [hasStmts])
 		ifTrue: [emitBlockBody: body hasParams: hasParams]
-		ifFalse: [].
+		ifFalse: [emitEmptyBlockInteriorComments: node].
 	emit: ']'.
+)
+emitEmptyBlockInteriorComments: blockNode = (
+	(* For blocks with no temps and no statements (e.g. an
+	   'ifFalse: [ (* noop *) ]' shell), the regular code-body
+	   scan never runs and any interior comments would be dropped.
+	   Scan the block's interior source span between '[' and ']'
+	   and emit each comment inline with surrounding spaces, so
+	   '[ (* noop *) ]' round-trips. *)
+	| scanFrom scanTo chunk parser comments |
+	source isNil ifTrue: [^self].
+	metadataModule isNil ifTrue: [^self].
+	blockNode start isNil ifTrue: [^self].
+	blockNode end isNil ifTrue: [^self].
+	blockNode start <= 0 ifTrue: [^self].
+	blockNode end <= 0 ifTrue: [^self].
+	scanFrom:: blockNode start + 1.
+	scanTo:: blockNode end - 1.
+	scanFrom > scanTo ifTrue: [^self].
+	scanTo > source size ifTrue: [^self].
+	chunk:: source copyFrom: scanFrom to: scanTo.
+	parser:: metadataModule MetadataParser onSource: chunk.
+	[parser gatherMetadata] on: Error do: [:e | ].
+	comments:: parser comments.
+	comments isEmpty ifTrue: [^self].
+	comments do: [:c |
+		space.
+		emit: '(* ', c withBlanksTrimmed, ' *)'].
+	space.
 )
 emitBlockBody: body hasParams: hasParams = (
 	(* If the block has more than one statement, force each onto its
@@ -1070,13 +1195,51 @@ visitCharacter: node = (
 	emit: '"'. emit: node value. emit: '"'.
 )
 visitTuple: node = (
+	| els scanFrom scanTo chunk parser comments |
 	emit: '{'.
-	(node elements isNil not and: [node elements isEmpty not]) ifTrue: [
-		node elements keysAndValuesDo: [:i :e |
+	els:: node elements.
+	(els isNil not and: [els isEmpty not]) ifTrue: [
+		els keysAndValuesDo: [:i :e |
 			i = 1 ifFalse: [emit: '. '].
 			printAtLevel: e minLevel: levelCascade.
 		].
 	].
+	(* Trailing comments inside the tuple between the last element
+	   and the closing '}', e.g.
+	     ^{
+	         realImpl.
+	         (* commentedOutAlternative. *)
+	     } collect: ...
+	   The parser drops these comments (the lexer skips them between
+	   tokens), so the AST has no knowledge of them. Recover by
+	   scanning the source between the last element's end and the
+	   tuple's end-marker. *)
+	(source isNil
+		or: [els isNil
+		or: [els isEmpty
+		or: [node end isNil
+		or: [node end <= 0]]]]) ifTrue: [emit: '}'. ^self].
+	scanFrom:: els last end + 1.
+	(* The tuple separator '.' (consumed by the parser) sits between
+	   the last element and the comment. gatherMetadata doesn't skip
+	   non-whitespace non-comment chars, so advance past any leading
+	   '.' or whitespace before scanning. *)
+	[scanFrom <= source size and: [
+		| ch |
+		ch:: source at: scanFrom.
+		ch = 46 (* . *) or: [
+			ch = 32 or: [ch = 9 or: [ch = 10 or: [ch = 13]]]]]]
+		whileTrue: [scanFrom:: scanFrom + 1].
+	scanTo:: node end - 1.
+	(scanFrom > scanTo or: [metadataModule isNil])
+		ifTrue: [emit: '}'. ^self].
+	chunk:: source copyFrom: scanFrom to: scanTo.
+	parser:: metadataModule MetadataParser onSource: chunk.
+	[parser gatherMetadata] on: Error do: [:e | ].
+	comments:: parser comments.
+	comments do: [:c |
+		emit: '. '.
+		emit: '(* ', c withBlanksTrimmed, ' *)'].
 	emit: '}'.
 )
 visitVarDecl: node = (

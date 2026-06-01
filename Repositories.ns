@@ -32,6 +32,7 @@ class Repositories usingPlatform: platform ide: webIde = (
 	private TextDecoder = global at: #TextDecoder.
 	private JSON = global at: #JSON.
 	private JSDate = global at: #Date.
+	private console = global at: #console.
 	(* CDN-loaded JS classes (window.LightningFS / window.git /
 	   window.GitHttp) are NOT captured here. The Newspeak snapshot is
 	   loaded via <script async>, so module construction can run before
@@ -47,6 +48,7 @@ class Repositories usingPlatform: platform ide: webIde = (
 	private Presenter = platform hopscotch Presenter.
 	private ProgrammingSubject = webIde browsing ProgrammingSubject.
 	private ProgrammingPresenter = webIde browsing ProgrammingPresenter.
+	private ClassMirror = platform mirrors ClassMirror.
 	private Color = platform graphics Color.
 	private localStorage = platform js localStorage.
 	styleButtonSize <Float> = 30.
@@ -294,6 +296,38 @@ public readBlobAt: filepath <String> in: sha <String> ^ <Alien> = (
 		content:: TextDecoder new decode: (result at: 'blob').
 		blobCache at: (blobCacheKey: filepath sha: sha) put: content.
 		content]
+)
+public snapshotFiles ^ <Map[Symbol, Object]> = (
+	(* Walk this repo's namespace and emit a conventional-layout
+	   snapshot. Returns a Map with two keys:
+	     #files    -> Map[String, String]  ('<ClassName>.ns' -> source)
+	     #skipped  -> List[String]         human-readable lines describing
+	                                       every non-class entry that didn't
+	                                       make it into the snapshot.
+	   File source format: 'Newspeak3\n<namespaceKey>\n' + class
+	   declaration source from the live mirror (nested classes inlined,
+	   lazy slots preserved -- see MirrorsForPrimordialSoup.ns:627). *)
+	| files skipped |
+	files:: Map new.
+	skipped:: List new.
+	namespace keysAndValuesDo: [:key :value |
+		value isKindOfBehavior
+			ifTrue: [
+				| cdm body |
+				cdm:: (ClassMirror reflecting: value) mixin declaration.
+				body:: 'Newspeak3', String newline,
+					namespaceKey printString, String newline,
+					cdm source.
+				files at: key asString, '.ns' put: body]
+			ifFalse: [
+				| desc |
+				desc:: [value class name asString]
+					on: Exception do: [:e | '<unknown class>'].
+				skipped add: key asString, ' (', desc, ')']].
+	^Map new
+		at: #files put: files;
+		at: #skipped put: skipped;
+		yourself
 )
 ) : (
 )
@@ -567,9 +601,36 @@ multilineLabelOf: text = (
 repositoryMenu = (
 	^menuWithLabelsAndActions: {
 		{'Edit Settings'. [respondToEditSettings]}.
+		{'Show Snapshot'. [respondToShowSnapshot]}.
 		{'Delete Repository'. [respondToDelete]}.
 		{'Delete and Wipe Local Store'. [respondToDeleteAndWipe]}.
 		{'Inspect Presenter'. [respondToInspectPresenter]}}
+)
+respondToShowSnapshot = (
+	(* Smoke test: dump what snapshotFiles would commit. Summary to
+	   alert, full file list + per-file char count + first-file source
+	   + skipped entries to console.log. *)
+	| repo snap files skipped summary firstKey |
+	repo:: subject repository.
+	snap:: repo snapshotFiles.
+	files:: snap at: #files.
+	skipped:: snap at: #skipped.
+	summary:: repo name asString, ': ', files size printString,
+		' file(s), ', skipped size printString,
+		' skipped. See console for detail.'.
+	console log: summary.
+	console log: '--- Files ---'.
+	files keysAndValuesDo: [:k :v |
+		console log: '  ', k, ' (', v size printString, ' chars)'].
+	files isEmpty ifFalse: [
+		firstKey:: nil.
+		files keysAndValuesDo: [:k :v | firstKey isNil ifTrue: [firstKey:: k]].
+		console log: '--- Sample (', firstKey, ') ---'.
+		console log: (files at: firstKey)].
+	skipped isEmpty ifFalse: [
+		console log: '--- Skipped ---'.
+		skipped do: [:line | console log: '  ', line]].
+	js global alert: summary
 )
 respondToEditSettings = (
 	(* Open the settings form for this repository. *)
@@ -1131,6 +1192,68 @@ The header provides the following buttons:
 <li> <div class="hopscotchHelpButton"> </div> Shows this help message.</li>
 <li> <div class="settingsMenuButton"> </div> Opens a menu of additional operations, such as inspecting this presenter.</li>
 </ul>' mapping: mapping
+)
+) : (
+)
+class PerMemberExtractor onSource: src <String> ast: a <ClassDeclarationAST> = (
+(* Walks a parsed conventional .ns ClassDeclarationAST and returns a
+   per-member source map keyed by selector (methods) / name (lazy
+   slots, nested classes). Used by the commit dialog to diff a live
+   class's per-member state (free from the mirror) against the parsed
+   HEAD version of its <Class>.ns file. Source substrings are copied
+   verbatim from the original input using node start/end positions —
+   no reformatting. *)
+|
+	source <String> = src.
+	ast <ClassDeclarationAST> = a.
+|
+) (
+public extract ^ <Map[Symbol, Object]> = (
+	(* Returns a Map with keys:
+	     #name           -> Symbol
+	     #header         -> String (header source)
+	     #methods        -> Map[Symbol, String]   (instance methods)
+	     #classMethods   -> Map[Symbol, String]
+	     #lazySlots      -> Map[Symbol, String]
+	     #nestedClasses  -> Map[Symbol, Map] (recursive) *)
+	^extractClass: ast
+)
+extractClass: classAST <ClassDeclarationAST> ^ <Map[Symbol, Object]> = (
+	| result instanceMethods classSideMethods lazies nested iSide cSide |
+	result:: Map new.
+	result at: #name put: classAST name.
+	result at: #header put: (sourceFrom: classAST header).
+
+	instanceMethods:: Map new.
+	lazies:: Map new.
+	nested:: Map new.
+	iSide:: classAST instanceSide.
+	iSide isNil ifFalse: [
+		iSide methods isNil ifFalse: [
+			iSide methods do: [:m |
+				instanceMethods at: m selector put: (sourceFrom: m)]].
+		iSide lazySlots isNil ifFalse: [
+			iSide lazySlots do: [:s |
+				lazies at: s name put: (sourceFrom: s)]].
+		iSide nestedClasses isNil ifFalse: [
+			iSide nestedClasses do: [:nc |
+				nested at: nc name put: (extractClass: nc)]]].
+	result at: #methods put: instanceMethods.
+	result at: #lazySlots put: lazies.
+	result at: #nestedClasses put: nested.
+
+	classSideMethods:: Map new.
+	cSide:: classAST classSide.
+	cSide isNil ifFalse: [
+		cSide methods isNil ifFalse: [
+			cSide methods do: [:m |
+				classSideMethods at: m selector put: (sourceFrom: m)]]].
+	result at: #classMethods put: classSideMethods.
+
+	^result
+)
+sourceFrom: node <AST> ^ <String> = (
+	^source copyFrom: node start to: node end
 )
 ) : (
 )

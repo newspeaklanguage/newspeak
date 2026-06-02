@@ -401,12 +401,13 @@ ensureInitialized ^ <Alien> = (
 			initialized_slot:: true.
 			nil]]
 )
-listHEADFiles ^ <Alien> = (
+listHEADFiles ^ <Alien> = (^listFilesAtRef: 'HEAD')
+listFilesAtRef: ref <String> ^ <Alien> = (
 	| listOpts |
 	listOpts:: createJSObject.
 	listOpts at: 'fs' put: fs.
 	listOpts at: 'dir' put: dir.
-	listOpts at: 'ref' put: 'HEAD'.
+	listOpts at: 'ref' put: ref.
 	^(git listFiles: listOpts)
 		then: [:arr | arr]
 		onRejected: [:err | createJSArray]
@@ -659,18 +660,23 @@ readHEADTextFilesInner ^ <Alien> = (
 	refOpts at: 'dir' put: dir.
 	refOpts at: 'ref' put: 'HEAD'.
 	^(git resolveRef: refOpts)
-		then: [:headSha | readHEADTextFilesAtSha: headSha]
-		onRejected: [:err |
-			console log: 'readHEADTextFiles: HEAD ref unresolved, treating as empty: ', err printString.
-			createJSObject]
+		then: [:headSha | readTextFilesAtSha: headSha]
+		onRejected: [:err | createJSObject]
 )
-readHEADTextFilesAtSha: headSha <String> ^ <Alien> = (
-	^listHEADFiles
+public readTextFilesAt: sha <String> ^ <Alien> = (
+	(* Public entry point: resolves to a JS object {path -> content}
+	   of every file in the repo at commit sha. Used by installFilesAt:
+	   to round-trip a past commit back into the live namespace. *)
+	^ensureInitialized
+		then: [:r | readTextFilesAtSha: sha]
+		onRejected: [:err | createJSObject]
+)
+readTextFilesAtSha: sha <String> ^ <Alien> = (
+	^(listFilesAtRef: sha)
 		then: [:paths |
 			| promises result count |
 			count:: paths at: 'length'.
 			result:: createJSObject.
-			console log: 'readHEADTextFiles: HEAD=', headSha, ', listFiles returned ', count printString, ' paths'.
 			count = 0
 				ifTrue: [JSPromise resolve: result]
 				ifFalse: [
@@ -678,25 +684,82 @@ readHEADTextFilesAtSha: headSha <String> ^ <Alien> = (
 					0 to: count - 1 do: [:i |
 						| path |
 						path:: paths at: i.
-						promises push: ((readBlobAt: path in: headSha)
+						promises push: ((readBlobAt: path in: sha)
 							then: [:content |
 								result at: path put: content.
 								nil]
-							onRejected: [:err |
-								console log: 'readBlob failed for ', path, ': ', err printString.
-								nil])].
-					(JSPromise all: promises) then: [:done |
-						console log: 'readHEADTextFiles: collected ', (jsObjectKeyCount: result) printString, ' entries'.
-						result]]]
-		onRejected: [:err |
-			console log: 'listHEADFiles rejected: ', err printString.
-			createJSObject]
+							onRejected: [:err | nil])].
+					(JSPromise all: promises) then: [:done | result]]]
+		onRejected: [:err | createJSObject]
 )
 jsObjectKeyCount: jsObj <Alien> ^ <Integer> = (
 	| Object keys |
 	Object:: global at: #Object.
 	keys:: Object keys: jsObj.
 	^keys at: 'length'
+)
+public installFilesAt: sha <String>
+	onComplete: doneBlock <[:Integer :Integer]>
+	onError: errBlock <[:String]> = (
+	(* Round-trip the repo's state at sha back into Root, then re-bind
+	   into this Repository's namespace ONLY those classes that were
+	   already there. Rationale: the commit's top-level <Class>.ns set
+	   may include files committed by other namespaces against the
+	   same repo (we lack a per-repo ownership manifest to
+	   disambiguate). Installing every file blindly into THIS
+	   namespace pollutes it with unrelated classes. The classes still
+	   exist in Root post-install -- the user can pull individual ones
+	   into the namespace later via Add to namespace.
+	   doneBlock fires with (installedCount, reboundIntoNamespaceCount).
+	   errBlock fires with a message on parse or install failure. *)
+	(readTextFilesAt: sha)
+		then: [:filesObj |
+			| files builders mixins ok preInstallNames reboundCount |
+			files:: filterTopLevelNsFiles: (jsObjectToMap: filesObj).
+			files isEmpty ifTrue: [
+				errBlock value: 'No top-level .ns files at ', (sha copyFrom: 1 to: 7).
+				^nil].
+			(* Snapshot which class names were in this namespace BEFORE
+			   installing, so we can re-bind exactly those after
+			   install (and not flood the namespace with new commit
+			   contents). *)
+			preInstallNames:: Set new.
+			namespace keysAndValuesDo: [:k :v |
+				v isKindOfBehavior ifTrue: [preInstallNames add: k asString]].
+			reboundCount:: 0.
+			ok:: [
+				builders:: List new.
+				files keysAndValuesDo: [:path :src |
+					builders add: (ClassDeclarationBuilder fromUnitSource: src)].
+				(* Install into Root -- the IDE convention is that every
+				   top-level class lives there. *)
+				mixins:: ide installFromBuilders: builders asArray.
+				mixins do: [:m |
+					| live |
+					live:: m declaration applyToObject reflectee.
+					(* installFromBuilders: produces installed bytecode
+					   but does NOT bind the resulting classes into the
+					   target namespace -- the Compile File flow does that
+					   step explicitly. Without this, installed classes
+					   exist but are unreachable. Bind unconditionally so
+					   every class is at least in Root. *)
+					Root at: m name put: live.
+					(* Re-bind into THIS namespace only if it was present
+					   pre-install (avoids the "every commit file flooding
+					   the namespace" trap). *)
+					(preInstallNames includes: m name asString) ifTrue: [
+						namespace at: m name put: live.
+						reboundCount:: reboundCount + 1]].
+				true]
+					on: Exception
+					do: [:e |
+						errBlock value: 'Install failed: ', e messageText.
+						false].
+			ok ifTrue: [doneBlock value: builders size value: reboundCount].
+			nil]
+		onRejected: [:e |
+			errBlock value: 'Read failed: ', e printString.
+			nil]
 )
 ) : (
 )
@@ -956,7 +1019,43 @@ expandedLogRowFor: entry toggle: toggle = (
 		smallBlank.
 		(label: sha) smallFont.
 		smallBlank.
-		multilineLabelOf: message}
+		multilineLabelOf: message.
+		smallBlank.
+		row: {
+			(link: 'Install this version' action: [respondToInstallVersion: sha])
+				color: actionLinkColor.
+			filler}}
+)
+respondToInstallVersion: sha <String> = (
+	(* Re-install the top-level <Class>.ns set at sha. New classes
+	   land in Root; classes that were already in this namespace get
+	   their binding refreshed to the installed version. Other classes
+	   (not previously in the namespace) are NOT silently added --
+	   pull them in via Add to namespace if desired. Destructive
+	   (live classes at the commit are replaced); prompts first. *)
+	| confirmed |
+	confirmed:: js global confirm:
+		'Install commit ', (sha copyFrom: 1 to: 7), '?',
+		String newline,
+		'Classes will be installed into Root.', String newline,
+		'Classes already in ', subject repository namespaceKey,
+		' will have their bindings refreshed.', String newline,
+		'New classes go to Root only -- pull them into ',
+		subject repository namespaceKey, ' via Add to namespace if needed.',
+		String newline, 'Continue?'.
+	confirmed ifFalse: [^nil].
+	subject repository
+		installFilesAt: sha
+		onComplete: [:installed :reboundIntoNs |
+			updateGUI: [].
+			js global alert: 'Installed ', installed printString,
+				' class(es) from ', (sha copyFrom: 1 to: 7),
+				'. ', reboundIntoNs printString,
+				' re-bound into ', subject repository namespaceKey, '.'.
+			nil]
+		onError: [:msg |
+			js global alert: msg.
+			nil]
 )
 multilineLabelOf: text = (
 	(* Render a multi-line commit body as a column of single-line

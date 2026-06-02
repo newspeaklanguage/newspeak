@@ -127,6 +127,12 @@ public class Repository
 	   "Loading history..." when clone hasn't finished or has failed. *)
 	cloneStatus_slot
 	cloneError_slot
+	(* Cached {ahead, behind, localSha, remoteSha, localMissing,
+	   remoteMissing} result of comparing local refs/heads/<branch>
+	   to refs/remotes/origin/<branch>. Invalidated by any operation
+	   that moves either ref: commit, push, fetch. UI re-fetches on
+	   next render. *)
+	aheadBehindCache_slot
 	(* Tracks whether `git init` has been run on `dir`. Cloned repos are
 	   initialized as a side effect of cloneFromRemote; local-only repos
 	   need explicit init on first commit. ensureInitialized is idempotent. *)
@@ -575,6 +581,7 @@ commitWithParent: parentArr <Alien | Nil> message: msg <String> ^ <Alien> = (
 	nil = parentArr ifFalse: [commitOpts at: 'parent' put: parentArr].
 	^(git commit: commitOpts) then: [:sha |
 		invalidateHistoryCache.
+		invalidateAheadBehindCache.
 		sha]
 )
 public commitSnapshot: files <Map[String, String]> message: msg <String> ^ <Alien> = (
@@ -590,6 +597,120 @@ public commitSnapshot: files <Map[String, String]> message: msg <String> ^ <Alie
 		total = 0
 			ifTrue: [JSPromise resolve: nil]
 			ifFalse: [commit: msg]]
+)
+public cachedAheadBehind ^ <Alien | Nil> = (^aheadBehindCache_slot)
+public invalidateAheadBehindCache = (aheadBehindCache_slot:: nil)
+public aheadBehind ^ <Alien> = (
+	(* Resolves to a JS object {ahead, behind, localSha, remoteSha,
+	   localMissing, remoteMissing}. Cached; invalidated by commit /
+	   push / fetch. ahead = local commits not on remote tracking.
+	   behind = remote tracking commits not on local. -1 in either
+	   field means the merge base lies outside the log depth used
+	   (200 by default). *)
+	aheadBehindCache_slot isNil ifFalse: [
+		^JSPromise resolve: aheadBehindCache_slot].
+	^computeAheadBehind then: [:r |
+		aheadBehindCache_slot:: r.
+		r]
+)
+computeAheadBehind ^ <Alien> = (
+	| localOpts remoteOpts |
+	localOpts:: createJSObject.
+	localOpts at: 'fs' put: fs.
+	localOpts at: 'dir' put: dir.
+	localOpts at: 'ref' put: 'refs/heads/', defaultBranch.
+	remoteOpts:: createJSObject.
+	remoteOpts at: 'fs' put: fs.
+	remoteOpts at: 'dir' put: dir.
+	remoteOpts at: 'ref' put: 'refs/remotes/origin/', defaultBranch.
+	^(git resolveRef: localOpts)
+		then: [:localSha |
+			(git resolveRef: remoteOpts)
+				then: [:remoteSha |
+					aheadBehindBetweenLocal: localSha andRemote: remoteSha]
+				onRejected: [:e | aheadBehindRemoteMissing: localSha]]
+		onRejected: [:e | aheadBehindLocalMissing]
+)
+aheadBehindRemoteMissing: localSha ^ <Alien> = (
+	| r |
+	r:: createJSObject.
+	r at: 'ahead' put: 0.
+	r at: 'behind' put: 0.
+	r at: 'localMissing' put: false.
+	r at: 'remoteMissing' put: true.
+	r at: 'localSha' put: localSha.
+	r at: 'remoteSha' put: nil.
+	^JSPromise resolve: r
+)
+aheadBehindLocalMissing ^ <Alien> = (
+	| r |
+	r:: createJSObject.
+	r at: 'ahead' put: 0.
+	r at: 'behind' put: 0.
+	r at: 'localMissing' put: true.
+	r at: 'remoteMissing' put: false.
+	r at: 'localSha' put: nil.
+	r at: 'remoteSha' put: nil.
+	^JSPromise resolve: r
+)
+aheadBehindBetweenLocal: localSha <String> andRemote: remoteSha <String> ^ <Alien> = (
+	localSha = remoteSha ifTrue: [
+		| r |
+		r:: createJSObject.
+		r at: 'ahead' put: 0.
+		r at: 'behind' put: 0.
+		r at: 'localMissing' put: false.
+		r at: 'remoteMissing' put: false.
+		r at: 'localSha' put: localSha.
+		r at: 'remoteSha' put: remoteSha.
+		^JSPromise resolve: r].
+	^(logShasFromRef: localSha)
+		then: [:localShas |
+			(logShasFromRef: remoteSha)
+				then: [:remoteShas |
+					| r ahead behind |
+					ahead:: countUntilCommon: localShas in: remoteShas.
+					behind:: countUntilCommon: remoteShas in: localShas.
+					r:: createJSObject.
+					r at: 'ahead' put: ahead.
+					r at: 'behind' put: behind.
+					r at: 'localMissing' put: false.
+					r at: 'remoteMissing' put: false.
+					r at: 'localSha' put: localSha.
+					r at: 'remoteSha' put: remoteSha.
+					r]]
+)
+logShasFromRef: ref <String> ^ <Alien> = (
+	| opts |
+	opts:: createJSObject.
+	opts at: 'fs' put: fs.
+	opts at: 'dir' put: dir.
+	opts at: 'ref' put: ref.
+	opts at: 'depth' put: 200.
+	^(git log: opts) then: [:entries |
+		| shas |
+		shas:: createJSArray.
+		0 to: (entries at: 'length') - 1 do: [:i |
+			shas push: ((entries at: i) at: 'oid')].
+		shas]
+)
+countUntilCommon: shas <Alien> in: otherShas <Alien> ^ <Integer> = (
+	(* Walk shas in order. Count how many appear before reaching a
+	   sha that also appears in otherShas. Returns -1 if no common
+	   sha is found within the log depth. *)
+	| Set otherSet count len |
+	Set:: global at: #Set.
+	otherSet:: Set new.
+	0 to: (otherShas at: 'length') - 1 do: [:i |
+		otherSet add: (otherShas at: i)].
+	count:: 0.
+	len:: shas at: 'length'.
+	0 to: len - 1 do: [:i |
+		| sha |
+		sha:: shas at: i.
+		(otherSet has: sha) ifTrue: [^count].
+		count:: count + 1].
+	^-1
 )
 public push ^ <Alien> = (^pushForce: false)
 public pushForce: force <Boolean> ^ <Alien> = (
@@ -629,7 +750,9 @@ public pushForce: force <Boolean> ^ <Alien> = (
 		obj at: 'username' put: 'x-access-token'.
 		obj at: 'password' put: pat.
 		obj].
-	^git push: pushOpts
+	^(git push: pushOpts) then: [:result |
+		invalidateAheadBehindCache.
+		result]
 )
 public fetchAndResetHEADToRemote ^ <Alien> = (
 	(* Re-baseline the local repo against the remote: git fetch the
@@ -673,6 +796,7 @@ public fetchAndResetHEADToRemote ^ <Alien> = (
 				checkoutOpts at: 'force' put: true.
 				(git checkout: checkoutOpts) then: [:cr |
 					invalidateHistoryCache.
+					invalidateAheadBehindCache.
 					blobCache_slot:: nil.
 					remoteSha]]]]
 )
@@ -832,6 +956,8 @@ public class RepositoryPresenter onRepositorySubject: s <RepositorySubject>
 loadStarted_slot ::= false.
 loadFailed_slot
 contentListSlot
+aheadBehindStarted_slot ::= false.
+aheadBehindError_slot
 |
 ) (
 public isKindOfRepositoryPresenter ^ <Boolean> = (^true)
@@ -915,9 +1041,64 @@ definition = (
 						onModel: nsValue key: nsKey)]])
 				color: actionLinkColor.
 			filler}.
+		aheadBehindRow.
 		mediumBlank.
 		bodyFor: cached
 	}
+)
+aheadBehindRow = (
+	(* Local-vs-remote-tracking comparison. Computed asynchronously
+	   on first render; cached on the Repository (invalidated by
+	   commit / push / fetch). Stale otherwise until a sync op. *)
+	| cached |
+	cached:: subject repository cachedAheadBehind.
+	cached isNil ifTrue: [
+		aheadBehindStarted_slot ifFalse: [
+			aheadBehindStarted_slot:: true.
+			startFetchAheadBehind].
+		aheadBehindError_slot isNil ifFalse: [
+			^row: {
+				(label: 'Local: ') bold.
+				(label: 'compare failed: ', aheadBehindError_slot) italic.
+				filler}].
+		^row: {
+			(label: 'Local: ') bold.
+			(label: 'comparing to remote...') italic.
+			filler}].
+	^row: {
+		(label: 'Local: ') bold.
+		label: (describeAheadBehind: cached).
+		filler}
+)
+describeAheadBehind: r <Alien> ^ <String> = (
+	| ahead behind |
+	(r at: 'localMissing') = true ifTrue: [
+		^'no local commits yet on ', subject repository defaultBranch].
+	(r at: 'remoteMissing') = true ifTrue: [
+		^'remote tracking ref not found (Fetch first to populate)'].
+	ahead:: r at: 'ahead'.
+	behind:: r at: 'behind'.
+	(ahead = 0 and: [behind = 0]) ifTrue: [^'in sync with origin'].
+	(ahead < 0 or: [behind < 0]) ifTrue: [
+		^'diverged beyond log depth'].
+	ahead = 0 ifTrue: [
+		^behind printString, ' behind (Pull would fast-forward)'].
+	behind = 0 ifTrue: [
+		^ahead printString, ' ahead (Push would fast-forward)'].
+	^ahead printString, ' ahead, ',
+		behind printString, ' behind (diverged -- Force Push or Fetch to reconcile)'
+)
+startFetchAheadBehind = (
+	subject repository aheadBehind
+		then: [:r |
+			updateGUI: [].
+			nil]
+		onRejected: [:e |
+			| msg |
+			msg:: [e messageText] on: Exception do: [:e2 | nil].
+			msg isNil ifTrue: [msg:: e printString].
+			updateGUI: [aheadBehindError_slot:: msg].
+			nil]
 )
 refreshHistoryButton = (
 	(* Invalidate the repository's history cache, reset the presenter's

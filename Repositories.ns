@@ -591,6 +591,46 @@ public commitSnapshot: files <Map[String, String]> message: msg <String> ^ <Alie
 			ifTrue: [JSPromise resolve: nil]
 			ifFalse: [commit: msg]]
 )
+public push ^ <Alien> = (^pushForce: false)
+public pushForce: force <Boolean> ^ <Alien> = (
+	(* git push origin <defaultBranch>. Uses the host-keyed PAT from
+	   localStorage for HTTPS basic auth via the onAuth callback.
+	   Set force=true to overwrite the remote ref unconditionally
+	   (destroys remote history -- the menu's "Force Push" affordance
+	   prompts before passing this). Returns the JS push result on
+	   success (the {ok, refs, errors} structure isomorphic-git uses).
+	   Rejects if no remote / no PAT / git.push itself fails (network,
+	   auth, non-FF). *)
+	| pushOpts host pat |
+	remoteUrl isNil ifTrue: [
+		^JSPromise reject: 'Local-only repo has no remote'].
+	host:: ide repositories hostFromUrl: remoteUrl.
+	pat:: ide repositories storedPATForHost: host.
+	pat isNil ifTrue: [
+		^JSPromise reject: 'No PAT stored for ', host, '. Set one via the Push menu item.'].
+	pushOpts:: createJSObject.
+	pushOpts at: 'fs' put: fs.
+	pushOpts at: 'http' put: http.
+	pushOpts at: 'dir' put: dir.
+	pushOpts at: 'url' put: remoteUrl.
+	pushOpts at: 'ref' put: defaultBranch.
+	force ifTrue: [pushOpts at: 'force' put: true].
+	corsProxyUrl isNil ifFalse: [
+		pushOpts at: 'corsProxy' put: corsProxyUrl].
+	(* onAuth is invoked by isomorphic-git when the remote requires
+	   credentials. The block is passed through the alien bridge as
+	   an expat and called synchronously. For GitHub PATs, any non-
+	   empty username works; we send 'x-access-token' as a convention.
+	   For other providers (GitLab, Bitbucket, Gitea) the same shape
+	   typically works with token auth. *)
+	pushOpts at: 'onAuth' put: [:authUrl :authPrevious |
+		| obj |
+		obj:: JSON parse: '{}'.
+		obj at: 'username' put: 'x-access-token'.
+		obj at: 'password' put: pat.
+		obj].
+	^git push: pushOpts
+)
 public fetchAndResetHEADToRemote ^ <Alien> = (
 	(* Re-baseline the local repo against the remote: git fetch the
 	   configured branch, then advance refs/heads/<branch> to the
@@ -1080,6 +1120,8 @@ multilineLabelOf: text = (
 repositoryMenu = (
 	^menuWithLabelsAndActions: {
 		{'Commit…'. [respondToCommit]}.
+		{'Push to Remote'. [respondToPush]}.
+		{'Force Push to Remote'. [respondToForcePush]}.
 		{'Fetch from Remote'. [respondToFetch]}.
 		{'Edit Settings'. [respondToEditSettings]}.
 		{'Show Snapshot'. [respondToShowSnapshot]}.
@@ -1087,6 +1129,92 @@ repositoryMenu = (
 		{'Delete Repository'. [respondToDelete]}.
 		{'Delete and Wipe Local Store'. [respondToDeleteAndWipe]}.
 		{'Inspect Presenter'. [respondToInspectPresenter]}}
+)
+respondToPush = (
+	(* Push local commits to the remote. First-time use for a host
+	   prompts for a Personal Access Token and stores it under
+	   ns_vcs_pat_<host>. Subsequent pushes reuse it silently. *)
+	| repo host pat |
+	repo:: subject repository.
+	repo remoteUrl isNil ifTrue: [
+		^js global alert: 'This repository has no remote configured.'].
+	host:: ide repositories hostFromUrl: repo remoteUrl.
+	(ide repositories hasStoredPATForHost: host) ifFalse: [
+		pat:: js global prompt:
+			'Personal Access Token for ', host, ':',
+			String newline,
+			'(stored locally under ns_vcs_pat_', host, ')'.
+		(pat isNil or: [pat isEmpty]) ifTrue: [^nil].
+		ide repositories saveStoredPATForHost: host value: pat].
+	repo push
+		then: [:result |
+			updateGUI: [
+				loadStarted_slot:: false.
+				loadFailed_slot:: nil].
+			js global alert: 'Push to ', host, ' succeeded.'.
+			nil]
+		onRejected: [:e |
+			| msg confirmed nonFF |
+			msg:: [e messageText] on: Exception do: [:e2 | nil].
+			msg isNil ifTrue: [msg:: e printString].
+			(* Non-FF reject is the most common recoverable failure;
+			   offer Force Push inline rather than make the user
+			   navigate back to the menu. Can't use a non-local
+			   return here -- we're inside a stored Promise callback,
+			   and ^ would CannotReturn after respondToPush has long
+			   since exited. Use ifTrue:ifFalse: to gate. *)
+			nonFF:: msg includesSubstring: 'not a simple fast-forward'.
+			nonFF
+				ifTrue: [
+					confirmed:: js global confirm:
+						'Push rejected: remote has commits not in your local repo.',
+						String newline,
+						'Force push (overwrites remote history)?'.
+					confirmed
+						ifTrue: [doPushForce]
+						ifFalse: [js global alert: 'Push failed: ', msg]]
+				ifFalse: [js global alert: 'Push failed: ', msg].
+			nil]
+)
+respondToForcePush = (
+	(* Explicit force push -- prompts up front. *)
+	| repo host confirmed |
+	repo:: subject repository.
+	repo remoteUrl isNil ifTrue: [
+		^js global alert: 'This repository has no remote configured.'].
+	host:: ide repositories hostFromUrl: repo remoteUrl.
+	(ide repositories hasStoredPATForHost: host) ifFalse: [
+		^js global alert: 'No PAT stored for ', host,
+			'. Use Push to Remote first to set one.'].
+	confirmed:: js global confirm:
+		'Force push to ', host, '.', String newline,
+		'This OVERWRITES the remote history with your local commits.',
+		String newline,
+		'Any commits on the remote that you don''t have locally will be LOST.',
+		String newline, 'Continue?'.
+	confirmed ifFalse: [^nil].
+	^doPushForce
+)
+doPushForce = (
+	(* Shared push-force path used by both the explicit Force Push
+	   menu item and the inline "remote diverged" follow-up. PAT is
+	   assumed to be stored by this point. *)
+	| repo host |
+	repo:: subject repository.
+	host:: ide repositories hostFromUrl: repo remoteUrl.
+	(repo pushForce: true)
+		then: [:result |
+			updateGUI: [
+				loadStarted_slot:: false.
+				loadFailed_slot:: nil].
+			js global alert: 'Force push to ', host, ' succeeded.'.
+			nil]
+		onRejected: [:e |
+			| msg |
+			msg:: [e messageText] on: Exception do: [:e2 | nil].
+			msg isNil ifTrue: [msg:: e printString].
+			js global alert: 'Force push failed: ', msg.
+			nil]
 )
 respondToFetch = (
 	(* Re-baseline this repo's HEAD against the remote. Any local
@@ -2712,6 +2840,41 @@ public saveAuthorName: name <String> email: email <String> = (
 	obj at: 'email' put: email.
 	[localStorage setItem: authorStorageKey to: (JSON stringify: obj)]
 		on: Exception do: [:e | ]
+)
+patStorageKeyFor: host <String> ^ <String> = (
+	^'ns_vcs_pat_', host
+)
+public storedPATForHost: host <String> ^ <String | Nil> = (
+	(* Returns the stored Personal Access Token for `host` (e.g.
+	   'github.com'), or nil if none. Localstorage is JS-readable so
+	   tokens stored here are NOT secure against script injection;
+	   acceptable for an IDE-local development convenience. *)
+	| raw |
+	raw:: [localStorage getItem: (patStorageKeyFor: host)]
+		on: Exception do: [:e | nil].
+	(raw isNil or: [raw isKindOfString not]) ifTrue: [^nil].
+	raw isEmpty ifTrue: [^nil].
+	^raw
+)
+public hasStoredPATForHost: host <String> ^ <Boolean> = (
+	^(storedPATForHost: host) isNil not
+)
+public saveStoredPATForHost: host <String> value: pat <String> = (
+	[localStorage setItem: (patStorageKeyFor: host) to: pat]
+		on: Exception do: [:e | ]
+)
+public hostFromUrl: url <String> ^ <String> = (
+	(* Extract the host part from an https / http URL. Returns the
+	   substring between '://' and the next '/' (or end of string).
+	   Used for per-host PAT storage. *)
+	| schemeIdx afterScheme slashIdx |
+	schemeIdx:: url indexOf: '://'.
+	schemeIdx = 0 ifTrue: [^url].
+	afterScheme:: url copyFrom: schemeIdx + 3 to: url size.
+	slashIdx:: afterScheme indexOf: '/'.
+	^slashIdx = 0
+		ifTrue: [afterScheme]
+		ifFalse: [afterScheme copyFrom: 1 to: slashIdx - 1]
 )
 public list ^ <RepositoryListSubject> = (
 	(* Convenience entry point: ide repositories list returns a Subject

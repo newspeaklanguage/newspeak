@@ -1,5 +1,5 @@
 Newspeak3
-'Root'
+'Newspeak'
 class Repositories usingPlatform: platform ide: webIde = (
 (*
  User-visible git repositories scoped by Namespace. Companion to
@@ -58,6 +58,10 @@ class Repositories usingPlatform: platform ide: webIde = (
 	   configs. Restored on module construction; updated on
 	   create / delete. *)
 	repoConfigsKey = 'ns_vcs_repos'.
+	(* localStorage key for the shared author identity (JSON {name,email})
+	   used by every Repository's commits. Editable from the commit
+	   dialog; mirrors the per-host PAT storage pattern in spirit. *)
+	authorStorageKey = 'ns_vcs_author'.
 |
 	(* Register RepositoryPresenter as an inspector view for any object
 	   answering isKindOfRepository. Effect: when the user clicks a
@@ -65,12 +69,19 @@ class Repositories usingPlatform: platform ide: webIde = (
 	   repository UI replaces the generic object inspector. Mirrors how
 	   Documents.ns:81 registers DocumentPresenter for isKindOfDocument. *)
 	webIde browsing addObjectViews: {RepositoryPresenter} forKind: 'isKindOfRepository'.
-	(* Pull saved repo configs from localStorage and reconstruct
-	   Repository instances + register them in Root, so the user's
-	   repos survive a browser reload. Done at module construction
-	   (which runs during IDE startup) so the registry is hot before
-	   any UI is shown. *)
-	restorePersistedRepositories.
+	(* Restoration of persisted repos is NOT called here. The
+	   Repositories module is constructed inside HopscotchWebIDE's
+	   slot init, which runs BEFORE the constructor body that calls
+	   populateNamespaceUsingPlatform: + seedBootstrapNamespacesInto:.
+	   Restoring at construction time would race that seeding: any
+	   repo whose namespaceKey is a bootstrap namespace (e.g. Newspeak,
+	   PrimordialSoup) would find that namespace absent, create an
+	   empty placeholder, and seeding would then SKIP populating it
+	   (it only seeds keys that aren't already in Root). Result: the
+	   bootstrap namespace appears empty.
+	   Instead, HopscotchWebIDE calls
+	   `repositories restorePersistedRepositories` from its constructor
+	   body after seeding finishes. *)
 ) (
 public class Repository
 	named: n <Symbol>
@@ -92,9 +103,13 @@ public class Repository
 	(* Identity-shaped slots — immutable. Changing these would break
 	   the Root registration / IndexedDB store binding. *)
 	public name <Symbol> = n.
-	public namespaceKey <String> = nk.
-	public namespace <Map[Symbol, Object]> = ns.
 	public localStoreName <String> = storeName.
+	(* Target namespace — mutable. Rebinding is safe (doesn't touch
+	   the IndexedDB store), but should go through rebindToNamespaceKey:
+	   so namespaceKey and namespace stay in sync and the change is
+	   persisted. *)
+	public namespaceKey <String> ::= nk.
+	public namespace <Map[Symbol, Object]> ::= ns.
 	(* Settings — mutable so the user can fix them (e.g. wrong branch).
 	   Setters are auto-generated; persist with
 	   ide repositories persistRepository: aRepo after mutating. *)
@@ -112,6 +127,14 @@ public class Repository
 	   "Loading history..." when clone hasn't finished or has failed. *)
 	cloneStatus_slot
 	cloneError_slot
+	(* Tracks whether `git init` has been run on `dir`. Cloned repos are
+	   initialized as a side effect of cloneFromRemote; local-only repos
+	   need explicit init on first commit. ensureInitialized is idempotent. *)
+	initialized_slot
+	(* author is a JS object {name, email} used by every commit. Defaults
+	   to a placeholder; the commit dialog (52d) reads / writes
+	   ns_vcs_author in localStorage and updates this slot per repo. *)
+	author_slot
 |
 ) (
 lazy public fs = LightningFSClass new: localStoreName.
@@ -240,6 +263,21 @@ public resetCloneState = (
 	cloneError_slot:: nil.
 	historyCache_slot:: nil.
 )
+public rebindToNamespaceKey: newKey <String> = (
+	(* Repoint this repository at a different namespace, looked up in
+	   Root. Atomic update of namespaceKey + namespace + persistence.
+	   Raises if the key doesn't resolve to an existing namespace.
+	   Doesn't touch the IndexedDB working tree -- the same on-disk
+	   .ns files now scope to a different namespace. The first commit
+	   after a rebind re-syncs the file preambles (Newspeak3\n
+	   '<namespaceKey>'\n) to the new key. *)
+	| newNs |
+	newNs:: Root at: newKey asSymbol ifAbsent: [
+		^Error signal: 'No namespace named ', newKey, ' in Root'].
+	namespaceKey:: newKey.
+	namespace:: newNs.
+	ide repositories persistRepository: self
+)
 public restoreCloneStateAsClonedOrLocalOnly = (
 	(* Used by Repositories>>restorePersistedRepositories on reload. The
 	   IDB-backed working dir survived; mark the repo as cloned (or
@@ -247,7 +285,8 @@ public restoreCloneStateAsClonedOrLocalOnly = (
 	   run. A bad on-disk state surfaces as a Failed-history error
 	   with a Retry button — better than hanging on "Loading...". *)
 	cloneStatus_slot:: remoteUrl isNil ifTrue: [#localOnly] ifFalse: [#cloned].
-	cloneError_slot:: nil
+	cloneError_slot:: nil.
+	initialized_slot:: true
 )
 public history ^ <Alien> = (
 	(* git.log on the work directory. Caches the result on
@@ -330,6 +369,334 @@ public snapshotFiles ^ <Map[Symbol, Object]> = (
 		at: #files put: files;
 		at: #skipped put: skipped;
 		yourself
+)
+public author ^ <Alien> = (
+	(* Per-commit identity. Per-Repository override (author_slot) wins;
+	   else fall back to the module-level stored author from
+	   localStorage; else a clearly-fake placeholder so first-time
+	   commits are visibly bogus (and the dialog prompts before
+	   commit anyway when hasStoredAuthor is false). *)
+	author_slot isNil ifFalse: [^author_slot].
+	storedAuthor isNil ifFalse: [^storedAuthor].
+	^makeDefaultAuthor
+)
+public author: a <Alien> = (author_slot:: a)
+makeDefaultAuthor ^ <Alien> = (
+	| a |
+	a:: createJSObject.
+	a at: 'name' put: 'IDE User (unconfigured)'.
+	a at: 'email' put: 'unconfigured@newspeak.local'.
+	^a
+)
+ensureInitialized ^ <Alien> = (
+	(* Idempotent. After first init, subsequent calls short-circuit
+	   via Promise.resolve. *)
+	(initialized_slot = true) ifTrue: [^JSPromise resolve: nil].
+	^(mkdirIgnoringExisting: dir) then: [:r1 |
+		| initOpts |
+		initOpts:: createJSObject.
+		initOpts at: 'fs' put: fs.
+		initOpts at: 'dir' put: dir.
+		(git init: initOpts) then: [:r2 |
+			initialized_slot:: true.
+			nil]]
+)
+listHEADFiles ^ <Alien> = (
+	| listOpts |
+	listOpts:: createJSObject.
+	listOpts at: 'fs' put: fs.
+	listOpts at: 'dir' put: dir.
+	listOpts at: 'ref' put: 'HEAD'.
+	^(git listFiles: listOpts)
+		then: [:arr | arr]
+		onRejected: [:err | createJSArray]
+)
+writeFileEnsuringDirs: relpath <String> with: content <String> ^ <Alien> = (
+	^mkdirChainFrom: (parentDirsOf: relpath) index: 0 then:
+		[(fs at: #promises) writeFile: dir, '/', relpath with: content]
+)
+parentDirsOf: relpath <String> ^ <Alien> = (
+	| result idx |
+	result:: createJSArray.
+	idx:: relpath indexOf: '/' startingAt: 1.
+	[idx > 0] whileTrue: [
+		result push: dir, '/', (relpath copyFrom: 1 to: idx - 1).
+		idx:: relpath indexOf: '/' startingAt: idx + 1].
+	^result
+)
+mkdirChainFrom: dirs <Alien> index: i <Integer> then: thenBlock <[]> ^ <Alien> = (
+	i >= (dirs at: 'length')
+		ifTrue: [^thenBlock value]
+		ifFalse: [^(mkdirIgnoringExisting: (dirs at: i)) then: [:r |
+			mkdirChainFrom: dirs index: i + 1 then: thenBlock]]
+)
+public stageWholeNamespace: files <Map[String, String]> ^ <Alien> = (
+	(* Stage `files` as the complete working-tree contents. Files in
+	   HEAD that aren't in `files` are unlinked + git-removed. Resolves
+	   to a JS {added, modified, removed} diff against HEAD.
+	   WARNING: this scope replaces EVERY file in the working tree --
+	   not what a namespace-scoped commit wants. Use
+	   stageTopLevelNsReplacements: for that. *)
+	^stageSubtreeReplacements: { '' } newFiles: files
+)
+public stageTopLevelNsReplacements: files <Map[String, String]> ^ <Alien> = (
+	(* Stage `files` (top-level <Class>.ns map) as additions / updates.
+	   Does NOT remove any HEAD file -- a class disappearing from a
+	   user's namespace is not the same as the corresponding repo file
+	   needing deletion, because a repo's top-level .ns set is the
+	   union of every namespace that touches it (and we don't have a
+	   per-namespace ownership manifest yet). Explicit removal lives
+	   in a separate workflow. Resolves to a JS
+	   {added, modified, removed} diff against HEAD; removed is
+	   always empty. *)
+	^ensureInitialized then: [:r |
+		| writePromises noRemovals |
+		noRemovals:: createJSArray.
+		writePromises:: createJSArray.
+		files keysAndValuesDo: [:fn :content |
+			writePromises push: (writeFileEnsuringDirs: fn with: content)].
+		(JSPromise all: writePromises) then: [:r2 |
+			stageAndDiff: files removals: noRemovals]]
+)
+stageSubtreeReplacements: prefixes <Array[String]> newFiles: files <Map[String, String]> ^ <Alien> = (
+	^ensureInitialized then: [:r |
+		listHEADFiles then: [:headFiles |
+			| priorUnderPrefixes removalPaths writePromises |
+			priorUnderPrefixes:: createJSArray.
+			0 to: (headFiles at: 'length') - 1 do: [:i |
+				| p anyMatch |
+				p:: headFiles at: i.
+				anyMatch:: false.
+				prefixes do: [:pref |
+					(p startsWith: pref) ifTrue: [anyMatch:: true]].
+				anyMatch ifTrue: [priorUnderPrefixes push: p]].
+			removalPaths:: createJSArray.
+			0 to: (priorUnderPrefixes at: 'length') - 1 do: [:i |
+				| p = priorUnderPrefixes at: i. |
+				(files includesKey: p) ifFalse: [removalPaths push: p]].
+			writePromises:: createJSArray.
+			files keysAndValuesDo: [:fn :content |
+				writePromises push: (writeFileEnsuringDirs: fn with: content)].
+			0 to: (removalPaths at: 'length') - 1 do: [:i |
+				writePromises push:
+					((fs at: #promises) unlink: dir, '/', (removalPaths at: i))].
+			(JSPromise all: writePromises) then: [:r2 |
+				stageAndDiff: files removals: removalPaths]]]
+)
+stageAndDiff: files <Map[String, String]> removals: removalPaths <Alien> ^ <Alien> = (
+	| stagePromises filepathsForMatrix |
+	stagePromises:: createJSArray.
+	filepathsForMatrix:: createJSArray.
+	files keysAndValuesDo: [:fn :content |
+		| addOpts |
+		addOpts:: createJSObject.
+		addOpts at: 'fs' put: fs.
+		addOpts at: 'dir' put: dir.
+		addOpts at: 'filepath' put: fn.
+		stagePromises push: (git add: addOpts).
+		filepathsForMatrix push: fn].
+	0 to: (removalPaths at: 'length') - 1 do: [:i |
+		| p remOpts |
+		p:: removalPaths at: i.
+		remOpts:: createJSObject.
+		remOpts at: 'fs' put: fs.
+		remOpts at: 'dir' put: dir.
+		remOpts at: 'filepath' put: p.
+		stagePromises push: (git remove: remOpts).
+		filepathsForMatrix push: p].
+	(filepathsForMatrix at: 'length') = 0 ifTrue: [
+		| empty |
+		empty:: createJSObject.
+		empty at: 'added' put: createJSArray.
+		empty at: 'modified' put: createJSArray.
+		empty at: 'removed' put: createJSArray.
+		^JSPromise resolve: empty].
+	^(JSPromise all: stagePromises) then: [:r |
+		| matrixOpts |
+		matrixOpts:: createJSObject.
+		matrixOpts at: 'fs' put: fs.
+		matrixOpts at: 'dir' put: dir.
+		matrixOpts at: 'filepaths' put: filepathsForMatrix.
+		(git statusMatrix: matrixOpts)
+			then: [:matrix | classifyMatrix: matrix]
+			onRejected: [:err | classifyAsAllAdded: files]]
+)
+classifyAsAllAdded: files <Map[String, String]> ^ <Alien> = (
+	| added result |
+	added:: createJSArray.
+	files keysAndValuesDo: [:fn :content | added push: fn].
+	result:: createJSObject.
+	result at: 'added' put: added.
+	result at: 'modified' put: createJSArray.
+	result at: 'removed' put: createJSArray.
+	^result
+)
+classifyMatrix: matrix <Alien> ^ <Alien> = (
+	| added modified removed result |
+	added:: createJSArray.
+	modified:: createJSArray.
+	removed:: createJSArray.
+	0 to: (matrix at: 'length') - 1 do: [:i |
+		| row path h w |
+		row:: matrix at: i.
+		path:: row at: 0.
+		h:: row at: 1.
+		w:: row at: 2.
+		(h = 0 and: [w > 0]) ifTrue: [added push: path].
+		(h = 1 and: [w = 2]) ifTrue: [modified push: path].
+		(h = 1 and: [w = 0]) ifTrue: [removed push: path]].
+	result:: createJSObject.
+	result at: 'added' put: added.
+	result at: 'modified' put: modified.
+	result at: 'removed' put: removed.
+	^result
+)
+public commit: message <String> ^ <Alien> = (
+	(* Bare commit -- caller must have staged via stageWholeNamespace:
+	   (or stageSubtreeReplacements:newFiles:) first. Resolves to the
+	   new commit SHA. *)
+	| refOpts |
+	refOpts:: createJSObject.
+	refOpts at: 'fs' put: fs.
+	refOpts at: 'dir' put: dir.
+	refOpts at: 'ref' put: 'HEAD'.
+	^(git resolveRef: refOpts)
+		then: [:headSha | commitWithParent: nil message: message]
+		onRejected: [:err | commitWithParent: createJSArray message: message]
+)
+commitWithParent: parentArr <Alien | Nil> message: msg <String> ^ <Alien> = (
+	| commitOpts |
+	commitOpts:: createJSObject.
+	commitOpts at: 'fs' put: fs.
+	commitOpts at: 'dir' put: dir.
+	commitOpts at: 'message' put: msg.
+	commitOpts at: 'author' put: author.
+	nil = parentArr ifFalse: [commitOpts at: 'parent' put: parentArr].
+	^(git commit: commitOpts) then: [:sha |
+		invalidateHistoryCache.
+		sha]
+)
+public commitSnapshot: files <Map[String, String]> message: msg <String> ^ <Alien> = (
+	(* End-to-end commit: stage `files` as the top-level <Class>.ns set
+	   (subdirectory + non-.ns HEAD content untouched), then commit
+	   with `msg` if anything actually changed. Resolves to the new
+	   SHA on commit, or nil if there was nothing to commit. *)
+	^(stageTopLevelNsReplacements: files) then: [:diff |
+		| total |
+		total:: (diff at: 'added') at: 'length'.
+		total:: total + ((diff at: 'modified') at: 'length').
+		total:: total + ((diff at: 'removed') at: 'length').
+		total = 0
+			ifTrue: [JSPromise resolve: nil]
+			ifFalse: [commit: msg]]
+)
+public fetchAndResetHEADToRemote ^ <Alien> = (
+	(* Re-baseline the local repo against the remote: git fetch the
+	   configured branch, then advance refs/heads/<branch> to the
+	   fetched commit and check it out. Any local commits not yet
+	   pushed are lost. Used by the "Fetch from Remote" menu item to
+	   refresh the IDE's local clone after pushes from elsewhere.
+	   Resolves to the new HEAD SHA. *)
+	| fetchOpts |
+	remoteUrl isNil
+		ifTrue: [^JSPromise reject: 'Local-only repo has no remote'].
+	fetchOpts:: createJSObject.
+	fetchOpts at: 'fs' put: fs.
+	fetchOpts at: 'http' put: http.
+	fetchOpts at: 'dir' put: dir.
+	fetchOpts at: 'url' put: remoteUrl.
+	fetchOpts at: 'ref' put: defaultBranch.
+	fetchOpts at: 'singleBranch' put: true.
+	corsProxyUrl isNil ifFalse: [
+		fetchOpts at: 'corsProxy' put: corsProxyUrl].
+	^(git fetch: fetchOpts) then: [:fetchResult |
+		| refOpts |
+		refOpts:: createJSObject.
+		refOpts at: 'fs' put: fs.
+		refOpts at: 'dir' put: dir.
+		refOpts at: 'ref' put: 'refs/remotes/origin/', defaultBranch.
+		(git resolveRef: refOpts) then: [:remoteSha |
+			| writeRefOpts |
+			writeRefOpts:: createJSObject.
+			writeRefOpts at: 'fs' put: fs.
+			writeRefOpts at: 'dir' put: dir.
+			writeRefOpts at: 'ref' put: 'refs/heads/', defaultBranch.
+			writeRefOpts at: 'value' put: remoteSha.
+			writeRefOpts at: 'force' put: true.
+			(git writeRef: writeRefOpts) then: [:r |
+				| checkoutOpts |
+				checkoutOpts:: createJSObject.
+				checkoutOpts at: 'fs' put: fs.
+				checkoutOpts at: 'dir' put: dir.
+				checkoutOpts at: 'ref' put: defaultBranch.
+				checkoutOpts at: 'force' put: true.
+				(git checkout: checkoutOpts) then: [:cr |
+					invalidateHistoryCache.
+					blobCache_slot:: nil.
+					remoteSha]]]]
+)
+public readHEADTextFiles ^ <Alien> = (
+	(* Resolves to a JS object {path -> content} of every file at HEAD
+	   in this repo. Empty object if HEAD doesn't exist yet (fresh init,
+	   no commits) or any read error occurs. Returns JS object (not
+	   Newspeak Map) because Newspeak Maps don't survive crossing the
+	   JS Promise resolution boundary intact; callers convert via
+	   jsObjectToMap: in their then: callback. *)
+	^ensureInitialized
+		then: [:r | readHEADTextFilesInner]
+		onRejected: [:err | createJSObject]
+)
+readHEADTextFilesInner ^ <Alien> = (
+	(* Resolve HEAD to a concrete SHA first, then read each path's
+	   blob at that SHA. isomorphic-git's git.readBlob takes oid which
+	   nominally accepts symbolic refs like 'HEAD', but in practice
+	   resolving up front is more reliable across versions and gives
+	   us a clean "HEAD doesn't exist" path via the resolveRef
+	   rejection. *)
+	| refOpts |
+	refOpts:: createJSObject.
+	refOpts at: 'fs' put: fs.
+	refOpts at: 'dir' put: dir.
+	refOpts at: 'ref' put: 'HEAD'.
+	^(git resolveRef: refOpts)
+		then: [:headSha | readHEADTextFilesAtSha: headSha]
+		onRejected: [:err |
+			console log: 'readHEADTextFiles: HEAD ref unresolved, treating as empty: ', err printString.
+			createJSObject]
+)
+readHEADTextFilesAtSha: headSha <String> ^ <Alien> = (
+	^listHEADFiles
+		then: [:paths |
+			| promises result count |
+			count:: paths at: 'length'.
+			result:: createJSObject.
+			console log: 'readHEADTextFiles: HEAD=', headSha, ', listFiles returned ', count printString, ' paths'.
+			count = 0
+				ifTrue: [JSPromise resolve: result]
+				ifFalse: [
+					promises:: createJSArray.
+					0 to: count - 1 do: [:i |
+						| path |
+						path:: paths at: i.
+						promises push: ((readBlobAt: path in: headSha)
+							then: [:content |
+								result at: path put: content.
+								nil]
+							onRejected: [:err |
+								console log: 'readBlob failed for ', path, ': ', err printString.
+								nil])].
+					(JSPromise all: promises) then: [:done |
+						console log: 'readHEADTextFiles: collected ', (jsObjectKeyCount: result) printString, ' entries'.
+						result]]]
+		onRejected: [:err |
+			console log: 'listHEADFiles rejected: ', err printString.
+			createJSObject]
+)
+jsObjectKeyCount: jsObj <Alien> ^ <Integer> = (
+	| Object keys |
+	Object:: global at: #Object.
+	keys:: Object keys: jsObj.
+	^keys at: 'length'
 )
 ) : (
 )
@@ -433,6 +800,17 @@ definition = (
 		row: {
 			(label: 'Branch: ') bold.
 			label: subject repository defaultBranch.
+			filler}.
+		row: {
+			(label: 'Namespace: ') bold.
+			(link: subject repository namespaceKey action: [
+				| nsKey nsValue |
+				nsKey:: subject repository namespaceKey asSymbol.
+				nsValue:: Root at: nsKey ifAbsent: [nil].
+				nsValue isNil ifFalse: [
+					enterSubject:: (ide browsing NamespaceSubject
+						onModel: nsValue key: nsKey)]])
+				color: actionLinkColor.
 			filler}.
 		mediumBlank.
 		bodyFor: cached
@@ -602,12 +980,43 @@ multilineLabelOf: text = (
 )
 repositoryMenu = (
 	^menuWithLabelsAndActions: {
+		{'Commit…'. [respondToCommit]}.
+		{'Fetch from Remote'. [respondToFetch]}.
 		{'Edit Settings'. [respondToEditSettings]}.
 		{'Show Snapshot'. [respondToShowSnapshot]}.
 		{'Show Diff (round-trip)'. [respondToShowRoundTripDiff]}.
 		{'Delete Repository'. [respondToDelete]}.
 		{'Delete and Wipe Local Store'. [respondToDeleteAndWipe]}.
 		{'Inspect Presenter'. [respondToInspectPresenter]}}
+)
+respondToFetch = (
+	(* Re-baseline this repo's HEAD against the remote. Any local
+	   commits not yet pushed will be lost. Shows a progress notice
+	   while the fetch is in flight; resets the history cache + UI
+	   on success. *)
+	| repo |
+	repo:: subject repository.
+	repo remoteUrl isNil ifTrue: [
+		^js global alert: 'This repository has no remote configured.'].
+	repo fetchAndResetHEADToRemote
+		then: [:sha |
+			updateGUI: [
+				loadStarted_slot:: false.
+				loadFailed_slot:: nil].
+			js global alert: 'Fetched. New HEAD: ', (sha copyFrom: 1 to: 7).
+			nil]
+		onRejected: [:e |
+			| msg |
+			msg:: [e messageText] on: Exception do: [:e2 | nil].
+			msg isNil ifTrue: [msg:: e printString].
+			js global alert: 'Fetch failed: ', msg.
+			nil]
+)
+respondToCommit = (
+	| repo strategy |
+	repo:: subject repository.
+	strategy:: RepoCommitStrategy onRepository: repo.
+	enterSubject:: ChangesetSubject onRepository: repo strategy: strategy
 )
 respondToShowRoundTripDiff = (
 	(* Self-consistency smoke test: for every class in the repo's
@@ -631,7 +1040,7 @@ respondToShowRoundTripDiff = (
 				[parsedSnap:: ide repositories extractedSnapshotFromSource: src.
 				 liveSnap:: ide repositories liveSnapshotOf: value.
 				 diff:: ide repositories diffSnapshot: parsedSnap to: liveSnap.
-				 (diffIsEmpty: diff) ifFalse: [
+				 (ide repositories diffIsEmpty: diff) ifFalse: [
 					anyDiffs:: anyDiffs + 1.
 					console log: 'DIFF: ', key asString.
 					console log: diff printString]]
@@ -646,26 +1055,6 @@ respondToShowRoundTripDiff = (
 						console log: src]]]].
 	js global alert: 'Round-trip: ', anyDiffs printString,
 		' class(es) with diffs or errors. See console.'
-)
-diffIsEmpty: diff <Map> ^ <Boolean> = (
-	(* True iff the diff has no added/removed/changed members at any
-	   level (header unchanged, all member maps empty, all nested
-	   diffs themselves empty). *)
-	(diff at: #headerChanged) ifTrue: [^false].
-	((memberDiffIsEmpty: (diff at: #methods))
-		and: [memberDiffIsEmpty: (diff at: #lazySlots)])
-		ifFalse: [^false].
-	(memberDiffIsEmpty: (diff at: #classMethods)) ifFalse: [^false].
-	(diff at: #nestedClasses) keysAndValuesDo: [:k :nested |
-		(nested at: #status ifAbsent: [nil]) isNil
-			ifTrue: [(diffIsEmpty: nested) ifFalse: [^false]]
-			ifFalse: [^false]].
-	^true
-)
-memberDiffIsEmpty: mDiff <Map> ^ <Boolean> = (
-	^(mDiff at: #added) isEmpty
-		and: [(mDiff at: #removed) isEmpty
-		and: [(mDiff at: #changed) isEmpty]]
 )
 respondToShowSnapshot = (
 	(* Smoke test: dump what snapshotFiles would commit. Summary to
@@ -1107,16 +1496,18 @@ helpText = (
 public class RepositorySettingsSubject onRepository: r <Repository>
 	= ProgrammingSubject onModel: r (
 (* Edit form for the mutable settings of an existing Repository.
-   Identity-shaped fields (name, namespace, store name) are not
-   editable; only remote URL, default branch, and CORS proxy are.
+   Identity-shaped fields (name, store name) are not editable; only
+   namespace, remote URL, default branch, and CORS proxy are.
    Saves update the repo in place and persist the change. *)
 |
+public namespaceKey <String> ::= ''.
 public remoteUrl <String> ::= ''.
 public defaultBranch <String> ::= ''.
 public corsProxyUrl <String> ::= ''.
 public errorMessage <String> ::= ''.
 |
 	(* Pre-fill from the live repository. *)
+	namespaceKey:: r namespaceKey.
 	remoteUrl:: r remoteUrl ifNil: [''].
 	defaultBranch:: r defaultBranch.
 	corsProxyUrl:: r corsProxyUrl ifNil: [''].
@@ -1138,6 +1529,18 @@ public save ^ <RepositorySubject | Nil> = (
 	defaultBranch isEmpty ifTrue: [
 		errorMessage:: 'Default branch cannot be empty.'.
 		^nil].
+	namespaceKey isEmpty ifTrue: [
+		errorMessage:: 'Namespace key cannot be empty.'.
+		^nil].
+	(namespaceKey = model namespaceKey) ifFalse: [
+		((ide namespacing Root) includesKey: namespaceKey asSymbol) ifFalse: [
+			errorMessage:: 'No namespace named ', namespaceKey, ' in Root.'.
+			^nil].
+		[model rebindToNamespaceKey: namespaceKey]
+			on: Error
+			do: [:e |
+				errorMessage:: e messageText.
+				^nil]].
 	model remoteUrl: (remoteUrl isEmpty ifTrue: [nil] ifFalse: [remoteUrl]).
 	model defaultBranch: defaultBranch.
 	model corsProxyUrl: (corsProxyUrl isEmpty ifTrue: [nil] ifFalse: [corsProxyUrl]).
@@ -1149,6 +1552,7 @@ public save ^ <RepositorySubject | Nil> = (
 public class RepositorySettingsPresenter onSubject: s <RepositorySettingsSubject>
 	= ProgrammingPresenter onSubject: s (
 |
+namespaceEditor
 remoteUrlEditor
 defaultBranchEditor
 corsProxyEditor
@@ -1174,11 +1578,10 @@ definition = (
 			(label: 'Name: ') bold.
 			label: subject repository name asString.
 			filler});
-		add: (row: {
-			(label: 'Namespace: ') bold.
-			label: subject repository namespaceKey.
-			filler});
-		add: ((label: 'Name and namespace cannot be edited — delete and recreate the repository to change them.') italic);
+		add: ((label: 'Name cannot be edited — delete and recreate the repository to change it.') italic);
+		add: mediumBlank;
+		add: (row: { (label: 'Namespace: ') bold. smallBlank. elastic: namespaceField. });
+		add: ((label: 'Existing Root key. First commit after a rebind re-syncs file preambles.') italic);
 		add: mediumBlank;
 		add: (row: { (label: 'Remote URL: ') bold. smallBlank. elastic: remoteUrlField. });
 		add: ((label: 'Leave blank for a local-only repository.') italic);
@@ -1198,6 +1601,12 @@ definition = (
 settingsMenu = (
 	^menuWithLabelsAndActions: {
 		{'Inspect Presenter'. [respondToInspectPresenter]}}
+)
+namespaceField = (
+	namespaceEditor:: codeMirror: subject namespaceKey.
+	namespaceEditor changeResponse: [:frag |
+		subject namespaceKey: frag textBeingAccepted].
+	^namespaceEditor
 )
 remoteUrlField = (
 	remoteUrlEditor:: codeMirror: subject remoteUrl.
@@ -1227,6 +1636,7 @@ respondToSave = (
 	updateGUI: [
 		(* Snap edited values back from the editors in case the user
 		   didn't blur a field before clicking Save. *)
+		namespaceEditor isNil ifFalse: [subject namespaceKey: namespaceEditor textBeingAccepted].
 		remoteUrlEditor isNil ifFalse: [subject remoteUrl: remoteUrlEditor textBeingAccepted].
 		defaultBranchEditor isNil ifFalse: [subject defaultBranch: defaultBranchEditor textBeingAccepted].
 		corsProxyEditor isNil ifFalse: [subject corsProxyUrl: corsProxyEditor textBeingAccepted].
@@ -1242,17 +1652,497 @@ helpText = (
 	mapping
 		at: #hopscotchHelpButton put: helpButton;
 		at: #settingsMenuButton put: (dropDownMenu: [settingsMenu]).
-	^ampleforth: 'Edit the mutable settings of this repository: remote
-URL, default branch, CORS proxy. Saves update the repository in place
-and persist the change to localStorage. Name and namespace are
-identity fields and cannot be changed (delete and recreate the
-repository to change them).
+	^ampleforth: 'Edit the mutable settings of this repository:
+namespace, remote URL, default branch, CORS proxy. Saves update the
+repository in place and persist the change to localStorage. Name and
+storeName are identity fields and cannot be changed (delete and
+recreate the repository to change them).
 <br><br>
 The header provides the following buttons:
 <ul>
 <li> <div class="hopscotchHelpButton"> </div> Shows this help message.</li>
 <li> <div class="settingsMenuButton"> </div> Opens a menu of additional operations, such as inspecting this presenter.</li>
 </ul>' mapping: mapping
+)
+) : (
+)
+public class ChangesetSubject onRepository: r <Repository> strategy: s <ApplyStrategy>
+	= ProgrammingSubject onModel: nil (
+(* Holds the state of a Changeset review session: the computed changeset,
+   the user's draft commit message + author identity, expansion state for
+   the diff tree, and submission-in-flight / error state. The strategy
+   parameter is what drives Accept (currently always a RepoCommitStrategy
+   pointing at the same repo; later it may be an install strategy, etc.). *)
+|
+	public repository = r.
+	public strategy = s.
+	changeset_slot.
+	computeError_slot.
+	public messageDraft <String> ::= ''.
+	public authorNameDraft <String> ::= ''.
+	public authorEmailDraft <String> ::= ''.
+	public rememberAuthor <Boolean> ::= true.
+	public submissionInFlight <Boolean> ::= false.
+	submissionError_slot.
+	expansion_slot.
+	public editingAuthor <Boolean> ::= false.
+|
+	(* Prefill author drafts from the stored identity. If nothing stored,
+	   start in editing-author mode so the user is prompted before
+	   commit. *)
+	authorNameDraft:: storedAuthorName ifNil: [''].
+	authorEmailDraft:: storedAuthorEmail ifNil: [''].
+	editingAuthor:: hasStoredAuthor not.
+	expansion_slot:: Map new.
+) (
+public createPresenter ^ <Presenter> = (
+	^ChangesetPresenter onSubject: self
+)
+public title ^ <String> = (
+	^strategy actionLabel, ' to ', repository name asString
+)
+public isKindOfChangesetSubject ^ <Boolean> = (^true)
+isMyKind: s <Subject> ^ <Boolean> = (^s isKindOfChangesetSubject)
+public changeset = (^changeset_slot)
+public computeError = (^computeError_slot)
+public submissionError = (^submissionError_slot)
+public toggleExpansion: key <String> = (
+	expansion_slot at: key put: (expansion_slot at: key ifAbsent: [false]) not
+)
+public isExpanded: key <String> ^ <Boolean> = (
+	^expansion_slot at: key ifAbsent: [false]
+)
+public computeAsync: refreshBlock <[]> = (
+	(* Idempotent. First call kicks off computeChangesetFor:; subsequent
+	   calls short-circuit. refreshBlock is the presenter's
+	   refreshFromAsync hook, invoked when the changeset arrives (or
+	   errors). Uses callback delivery to keep the resulting Newspeak
+	   Map out of the JS Promise resolution boundary. *)
+	changeset_slot isNil ifFalse: [^nil].
+	computeError_slot isNil ifFalse: [^nil].
+	computeChangesetFor: repository
+		onComplete: [:cs |
+			changeset_slot:: cs.
+			refreshBlock value]
+		onError: [:msg |
+			computeError_slot:: msg.
+			refreshBlock value]
+)
+public submit: refreshBlock <[]> = (
+	(* Validate, then run the strategy's apply hook. refreshBlock bumps
+	   the presenter on each state transition. On success the apply
+	   hook returns a Promise that resolves to a SHA (or nil for
+	   no-op); the dialog navigates back to the repo presenter. *)
+	| input valid |
+	submissionInFlight ifTrue: [^nil].
+	submissionError_slot:: nil.
+	input:: Map new
+		at: #message put: messageDraft;
+		at: #authorName put: authorNameDraft;
+		at: #authorEmail put: authorEmailDraft;
+		at: #rememberAuthor put: rememberAuthor;
+		yourself.
+	valid:: strategy validate: input onError: [:m |
+		submissionError_slot:: m.
+		refreshBlock value].
+	valid ifFalse: [^nil].
+	submissionInFlight:: true.
+	refreshBlock value.
+	(strategy apply: changeset_slot withInput: input)
+		then: [:result |
+			submissionInFlight:: false.
+			refreshBlock value.
+			nil]
+		onRejected: [:e |
+			| msg |
+			msg:: [e messageText] on: Exception do: [:e2 | nil].
+			msg isNil ifTrue: [msg:: e printString].
+			submissionInFlight:: false.
+			submissionError_slot:: 'Apply failed: ', msg.
+			refreshBlock value.
+			nil]
+)
+) : (
+)
+public class ChangesetPresenter onSubject: s <ChangesetSubject>
+	= ProgrammingPresenter onSubject: s (
+(* Renders a Changeset review session: header, summary, expandable
+   diff tree, skipped list, commit message field, author area,
+   Accept/Cancel. Strategy-driven action label. *)
+|
+	loadStarted_slot ::= false.
+	messageEditor
+	authorNameEditor
+	authorEmailEditor
+|
+) (
+public isKindOfChangesetPresenter ^ <Boolean> = (^true)
+isMyKind: f <Fragment> ^ <Boolean> = (^f isKindOfChangesetPresenter)
+public refreshFromAsync = (
+	(* Bump uiGeneration so cached substance is invalidated and a fresh
+	   definition runs against the latest subject state. *)
+	updateGUI: []
+)
+updateVisualsFromSameKind: oldPresenter <Self> ^ <Alien> = (
+	subject = oldPresenter subject ifFalse: [
+		ensureSubstance.
+		^replaceVisual: oldPresenter visual with: substance visual].
+	substanceSlot:: nil.
+	ensureSubstance.
+	^super updateVisualsFromSameKind: oldPresenter
+)
+definition = (
+	((subject changeset isNil)
+		and: [(subject computeError isNil)
+		and: [loadStarted_slot not]]) ifTrue: [
+		loadStarted_slot:: true.
+		subject computeAsync: [refreshFromAsync]].
+	^column: {
+		majorHeadingBlock: (
+			row: {
+				(label: subject title) bold.
+				filler}).
+		mediumBlank.
+		bodyArea.
+		mediumBlank.
+		skippedArea.
+		mediumBlank.
+		outOfScopeArea.
+		mediumBlank.
+		messageArea.
+		mediumBlank.
+		authorArea.
+		mediumBlank.
+		errorArea.
+		mediumBlank.
+		buttonRow}
+)
+bodyArea = (
+	subject computeError isNil ifFalse: [
+		^(label: 'Failed to compute changeset: ', subject computeError)
+			color: (Color r: 0.8 g: 0.1 b: 0.1)].
+	subject changeset isNil ifTrue: [
+		^label: 'Computing changeset...'].
+	(subject changeset at: #classDiffs) isEmpty ifTrue: [
+		^label: 'No changes to commit.'].
+	^column: {
+		(label: summaryLine) bold.
+		smallBlank.
+		classDiffsList}
+)
+summaryLine = (
+	| diffs added changed skipped outOfScope |
+	diffs:: subject changeset at: #classDiffs.
+	skipped:: (subject changeset at: #skipped) size.
+	outOfScope:: (subject changeset at: #outOfScope ifAbsent: [List new]) size.
+	added:: 0. changed:: 0.
+	diffs keysAndValuesDo: [:k :cd |
+		(cd at: #status) = #new ifTrue: [added:: added + 1].
+		(cd at: #status) = #changed ifTrue: [changed:: changed + 1]].
+	^changed printString, ' changed | ',
+		added printString, ' new | ',
+		skipped printString, ' skipped | ',
+		outOfScope printString, ' in HEAD but not in namespace'
+)
+classDiffsList = (
+	| diffs toggles names |
+	diffs:: subject changeset at: #classDiffs.
+	names:: List new.
+	diffs keysAndValuesDo: [:k :v | names add: k].
+	(* Sort by class name for stable presentation. String `<` isn't
+	   defined in this runtime; use Browsing Utilities' lexical
+	   comparator. *)
+	names:: names asArray sort: [:a :b |
+		ide browsing Utilities
+			lexicallyLessOrEqual: a asString
+			than: b asString].
+	toggles:: List new.
+	names do: [:name |
+		toggles add: (classToggleFor: name diff: (diffs at: name))].
+	^zebra: (taggedColumn: toggles)
+)
+classToggleFor: name <Symbol> diff: cd <Map> = (
+	| toggle status statusLabel |
+	status:: cd at: #status.
+	statusLabel:: status asString.
+	toggle:: collapsed: [
+			row: {
+				(link: name asString action: [toggle expand])
+					color: actionLinkColor.
+				smallBlank.
+				(label: '(', statusLabel, ')') italic.
+				filler}]
+		expanded: [
+			column: {
+				row: {
+					(link: name asString action: [toggle collapse])
+						color: actionLinkColor.
+					smallBlank.
+					(label: '(', statusLabel, ')') italic.
+					filler}.
+				smallBlank.
+				classDiffDetailFor: cd classPath: name asString}]
+		initiallyExpanded: false
+		tag: name asString.
+	^toggle
+)
+classDiffDetailFor: cd <Map> classPath: cpath <String> = (
+	| status |
+	status:: cd at: #status.
+	status = #new ifTrue: [
+		^(label: 'New class. Source will be committed.') italic].
+	status = #removed ifTrue: [
+		^(label: 'Removed from namespace. File will be deleted.') italic].
+	status = #changed ifTrue: [
+		^changedClassDetailFor: (cd at: #diff) classPath: cpath].
+	^label: 'unknown status: ', status asString
+)
+changedClassDetailFor: diff <Map> classPath: cpath <String> = (
+	(* Section order per Newspeak class-presenter convention: header,
+	   lazy slots, nested classes, methods, class methods. *)
+	| sections |
+	sections:: List new.
+	sections add: (headerSectionFor: diff classPath: cpath).
+	sections add: (memberSectionToggleFor: 'lazy slots'
+		kind: #lazySlots
+		diff: (diff at: #lazySlots)
+		classPath: cpath).
+	sections add: (nestedSectionToggleFor: (diff at: #nestedClasses)
+		classPath: cpath).
+	sections add: (memberSectionToggleFor: 'methods'
+		kind: #methods
+		diff: (diff at: #methods)
+		classPath: cpath).
+	sections add: (memberSectionToggleFor: 'class methods'
+		kind: #classMethods
+		diff: (diff at: #classMethods)
+		classPath: cpath).
+	^column: sections
+)
+headerSectionFor: diff <Map> classPath: cpath <String> = (
+	(diff at: #headerChanged) ifFalse: [
+		^row: { (label: '  header: unchanged') italic. filler}].
+	^expandableSection: 'header: changed'
+		tag: cpath, '/header'
+		bodyBlock: [
+			sideBySideOld: (diff at: #oldHeader) new: (diff at: #newHeader)]
+)
+memberSectionToggleFor: sectionLabel <String> kind: kind <Symbol>
+	diff: mDiff <Map> classPath: cpath <String> = (
+	| added removed changed total summary sectionTag |
+	added:: (mDiff at: #added) size.
+	removed:: (mDiff at: #removed) size.
+	changed:: (mDiff at: #changed) size.
+	total:: added + removed + changed.
+	total = 0 ifTrue: [
+		^row: { (label: '  ', sectionLabel, ': unchanged') italic. filler}].
+	summary:: sectionLabel, ': ', changed printString, ' changed, ',
+		added printString, ' added, ', removed printString, ' removed'.
+	sectionTag:: cpath, '/', kind asString.
+	^expandableSection: summary
+		tag: sectionTag
+		bodyBlock: [memberRowsFor: mDiff classPath: sectionTag]
+)
+nestedSectionToggleFor: nDiff <Map> classPath: cpath <String> = (
+	| sectionTag |
+	nDiff isEmpty ifTrue: [
+		^row: { (label: '  nested classes: unchanged') italic. filler}].
+	sectionTag:: cpath, '/nestedClasses'.
+	^expandableSection: 'nested classes: ', nDiff size printString, ' affected'
+		tag: sectionTag
+		bodyBlock: [nestedRowsFor: nDiff classPath: sectionTag]
+)
+expandableSection: summary <String> tag: tag <String> bodyBlock: bodyBlock <[]> = (
+	| toggle |
+	toggle:: collapsed: [
+			row: {
+				(link: '  ', summary action: [toggle expand]) color: actionLinkColor.
+				filler}]
+		expanded: [
+			column: {
+				row: {
+					(link: '  ', summary action: [toggle collapse]) color: actionLinkColor.
+					filler}.
+				bodyBlock value}]
+		initiallyExpanded: false
+		tag: tag.
+	^toggle
+)
+memberRowsFor: mDiff <Map> classPath: cpath <String> = (
+	| toggles |
+	toggles:: List new.
+	(mDiff at: #added) do: [:m |
+		toggles add: (memberToggle: m sign: '+'
+			label: 'New source' isChange: false classPath: cpath)].
+	(mDiff at: #removed) do: [:m |
+		toggles add: (memberToggle: m sign: '-'
+			label: 'Removed source' isChange: false classPath: cpath)].
+	(mDiff at: #changed) do: [:m |
+		toggles add: (memberToggle: m sign: '~'
+			label: nil isChange: true classPath: cpath)].
+	^taggedColumn: toggles
+)
+memberToggle: m <Map> sign: sign <String> label: lbl <String | Nil>
+	isChange: isChange <Boolean> classPath: cpath <String> = (
+	| toggle name tag display |
+	name:: m at: #name.
+	tag:: cpath, '/', sign, name asString.
+	display:: '    ', sign, ' ', name asString.
+	toggle:: collapsed: [
+			row: {
+				(link: display action: [toggle expand]) color: actionLinkColor.
+				filler}]
+		expanded: [
+			column: {
+				row: {
+					(link: display action: [toggle collapse]) color: actionLinkColor.
+					filler}.
+				isChange
+					ifTrue: [sideBySideOld: (m at: #oldSource) new: (m at: #newSource)]
+					ifFalse: [singlePaneSource: (m at: #source) label: lbl]}]
+		initiallyExpanded: false
+		tag: tag.
+	^toggle
+)
+nestedRowsFor: nDiff <Map> classPath: cpath <String> = (
+	| toggles |
+	toggles:: List new.
+	nDiff keysAndValuesDo: [:name :entry |
+		toggles add: (nestedToggleFor: name entry: entry classPath: cpath)].
+	^taggedColumn: toggles
+)
+nestedToggleFor: name <Symbol> entry: cd <Map> classPath: cpath <String> = (
+	| toggle tag status display |
+	tag:: cpath, '/', name asString.
+	status:: cd at: #status ifAbsent: [#changed].
+	status = #added ifTrue: [
+		display:: '    + ', name asString, ' (new nested class)'.
+		^row: { (label: display) italic. filler}].
+	status = #removed ifTrue: [
+		display:: '    - ', name asString, ' (removed nested class)'.
+		^row: { (label: display) italic. filler}].
+	display:: '    ~ ', name asString.
+	toggle:: collapsed: [
+			row: {
+				(link: display action: [toggle expand]) color: actionLinkColor.
+				filler}]
+		expanded: [
+			column: {
+				row: {
+					(link: display action: [toggle collapse]) color: actionLinkColor.
+					filler}.
+				changedClassDetailFor: cd classPath: tag}]
+		initiallyExpanded: false
+		tag: tag.
+	^toggle
+)
+singlePaneSource: src <String> label: lbl <String> = (
+	| cm |
+	cm:: codeMirror: src.
+	cm readOnly: true.
+	^column: { (label: lbl) italic. cm}
+)
+sideBySideOld: oldSrc <String> new: newSrc <String> = (
+	| oldCm newCm |
+	oldCm:: codeMirror: oldSrc.
+	oldCm readOnly: true.
+	newCm:: codeMirror: newSrc.
+	newCm readOnly: true.
+	^row: {
+		column: { (label: 'Old (HEAD)') italic. oldCm}.
+		smallBlank.
+		column: { (label: 'New (live)') italic. newCm}}
+)
+skippedArea = (
+	| skipped rows |
+	subject changeset isNil ifTrue: [^nothing].
+	skipped:: subject changeset at: #skipped.
+	skipped isEmpty ifTrue: [^nothing].
+	rows:: List new.
+	rows add: ((label: 'Skipped non-class entries (', skipped size printString, '):') bold).
+	skipped do: [:s |
+		rows add: (row: { label: '  - ', s. filler})].
+	^column: rows
+)
+outOfScopeArea = (
+	| oos rows |
+	subject changeset isNil ifTrue: [^nothing].
+	oos:: subject changeset at: #outOfScope ifAbsent: [List new].
+	oos isEmpty ifTrue: [^nothing].
+	rows:: List new.
+	rows add: ((label: 'In HEAD but not in this namespace (', oos size printString, '): left untouched by this commit') bold).
+	oos do: [:name |
+		rows add: (row: { label: '  - ', name. filler})].
+	^column: rows
+)
+messageArea = (
+	subject strategy requiresMessage ifFalse: [^nothing].
+	messageEditor:: codeMirror: subject messageDraft.
+	messageEditor changeResponse: [:frag |
+		subject messageDraft: frag textBeingAccepted].
+	^column: {
+		(label: subject strategy messagePrompt, ' *') bold.
+		messageEditor}
+)
+authorArea = (
+	subject strategy requiresAuthor ifFalse: [^nothing].
+	subject editingAuthor ifTrue: [^authorEditForm].
+	^row: {
+		(label: 'Author: ') bold.
+		label: subject authorNameDraft, ' <', subject authorEmailDraft, '>'.
+		smallBlank.
+		button: 'Edit' action: [updateGUI: [subject editingAuthor: true]].
+		filler}
+)
+authorEditForm = (
+	authorNameEditor:: codeMirror: subject authorNameDraft.
+	authorNameEditor changeResponse: [:frag |
+		subject authorNameDraft: frag textBeingAccepted].
+	authorEmailEditor:: codeMirror: subject authorEmailDraft.
+	authorEmailEditor changeResponse: [:frag |
+		subject authorEmailDraft: frag textBeingAccepted].
+	^column: {
+		(label: 'Author identity') bold.
+		row: { (label: '  Name: ') bold. smallBlank. elastic: authorNameEditor }.
+		row: { (label: '  Email: ') bold. smallBlank. elastic: authorEmailEditor }.
+		row: {
+			button: (subject rememberAuthor ifTrue: ['[x]'] ifFalse: ['[ ]'])
+				action: [updateGUI: [
+					subject rememberAuthor: subject rememberAuthor not]].
+			smallBlank.
+			label: 'Remember for future commits'.
+			filler}}
+)
+errorArea = (
+	subject submissionError isNil ifTrue: [^nothing].
+	^(label: subject submissionError) color: (Color r: 0.8 g: 0.1 b: 0.1)
+)
+buttonRow = (
+	| canSubmit |
+	canSubmit:: subject submissionInFlight not
+		and: [subject changeset isNil not
+		and: [(subject changeset at: #classDiffs) isEmpty not]].
+	^row: {
+		filler.
+		button: 'Cancel' action: [respondToCancel].
+		smallBlank.
+		canSubmit
+			ifTrue: [button: subject strategy actionLabel action: [respondToAccept]]
+			ifFalse: [(label: subject strategy actionLabel) italic]}
+)
+respondToCancel = (
+	enterSubject:: RepositorySubject onModel: subject repository
+)
+respondToAccept = (
+	(* Snap form values back from editors in case the user didn't blur. *)
+	updateGUI: [
+		messageEditor isNil ifFalse: [
+			subject messageDraft: messageEditor textBeingAccepted].
+		authorNameEditor isNil ifFalse: [
+			subject authorNameDraft: authorNameEditor textBeingAccepted].
+		authorEmailEditor isNil ifFalse: [
+			subject authorEmailDraft: authorEmailEditor textBeingAccepted].
+		subject submit: [refreshFromAsync]]
 )
 ) : (
 )
@@ -1297,11 +2187,67 @@ extractMirror: cdm <ClassDeclarationMirror> ^ <Map[Symbol, Object]> = (
 )
 ) : (
 )
-(* Lazy slots for the three CDN-loaded JS globals. Evaluated on first
-   access — by which time the regular <script> tags in
-   primordialsoup.html have executed and the classes are on the
-   window. Repository's `fs` / `git` / `http` lazy slots reach these
-   via implicit-receiver sends up the lexical scope. *)
+public class ApplyStrategy = (
+(* Abstract base for "what happens when the user accepts a Changeset."
+   Concretes: RepoCommitStrategy for repository commits. Future:
+   InstallToNamespaceStrategy for AI-proposal review,
+   StagedEditorsApplyStrategy for atomic install of unaccepted
+   editors. The dialog (ChangesetPresenter) renders the same way
+   regardless of strategy; the strategy supplies the action label,
+   message-field config, validation, and apply hook. *)
+) (
+public actionLabel ^ <String> = (subclassResponsibility)
+public requiresMessage ^ <Boolean> = (subclassResponsibility)
+public messagePrompt ^ <String> = (^'Message')
+public requiresAuthor ^ <Boolean> = (^false)
+public validate: input <Map[Symbol, Object]> onError: errBlock <[:String]> ^ <Boolean> = (
+	(* Default: no validation. Subclasses override; on first error,
+	   call errBlock with the message string and return false. *)
+	^true
+)
+public apply: changeset <Map[Symbol, Object]> withInput: input <Map[Symbol, Object]> ^ <Alien> = (
+	subclassResponsibility
+)
+) : (
+)
+public class RepoCommitStrategy onRepository: r <Repository> = ApplyStrategy (
+(* Repository-commit apply strategy. Validates message + author, then
+   on apply: writes author to the repo, stages every snapshot file,
+   commits with the message. Resolves to the new commit SHA, or nil
+   if there was nothing to commit. *)
+|
+	public repository = r.
+|
+) (
+public actionLabel = (^'Commit')
+public requiresMessage = (^true)
+public messagePrompt = (^'Commit message')
+public requiresAuthor = (^true)
+public validate: input onError: errBlock = (
+	| msg name email |
+	msg:: input at: #message ifAbsent: [''].
+	msg isEmpty ifTrue: [errBlock value: 'Commit message is required'. ^false].
+	name:: input at: #authorName ifAbsent: [''].
+	name isEmpty ifTrue: [errBlock value: 'Author name is required'. ^false].
+	email:: input at: #authorEmail ifAbsent: [''].
+	email isEmpty ifTrue: [errBlock value: 'Author email is required'. ^false].
+	^true
+)
+public apply: changeset withInput: input = (
+	| message name email authorObj |
+	message:: input at: #message.
+	name:: input at: #authorName.
+	email:: input at: #authorEmail.
+	(input at: #rememberAuthor ifAbsent: [false]) ifTrue: [
+		saveAuthorName: name email: email].
+	authorObj:: JSON parse: '{}'.
+	authorObj at: 'name' put: name.
+	authorObj at: 'email' put: email.
+	repository author: authorObj.
+	^repository commitSnapshot: (changeset at: #files) message: message
+)
+) : (
+)
 lazy public LightningFSClass = global at: #LightningFS.
 lazy public gitFacade = global at: #git.
 lazy public gitHttpFacade = global at: #GitHttp.
@@ -1400,9 +2346,13 @@ diffNested: oldNested <Map> to: newNested <Map> ^ <Map[Symbol, Object]> = (
 	allNames do: [:name |
 		(oldNested includesKey: name) ifTrue: [
 			(newNested includesKey: name) ifTrue: [
-				result at: name put:
-					(diffSnapshot: (oldNested at: name)
-					 to: (newNested at: name))]
+				| sub |
+				sub:: diffSnapshot: (oldNested at: name)
+					to: (newNested at: name).
+				(* Only include nested-class entries with actual
+				   differences. *)
+				(diffIsEmpty: sub) ifFalse: [
+					result at: name put: sub]]
 			ifFalse: [
 				result at: name put: (Map new
 					at: #status put: #removed;
@@ -1414,6 +2364,204 @@ diffNested: oldNested <Map> to: newNested <Map> ^ <Map[Symbol, Object]> = (
 				at: #snapshot put: (newNested at: name);
 				yourself)]].
 	^result
+)
+public computeChangesetFor: repo <Repository>
+	onComplete: doneBlock <[:Map[Symbol, Object]]>
+	onError: errBlock <[:String]> = (
+	(* Asynchronously compute a Changeset map and invoke doneBlock with
+	   it. Callback-style on purpose: a Newspeak Map can't survive
+	   resolving a JS Promise with it (rawPush fails on the eventual
+	   Symbol key lookup `at: #classDiffs`), so we deliver the result
+	   via a continuation block called from inside the .then: handler
+	   while still in Newspeak land.
+
+	   Changeset map keys:
+	     #classDiffs -> Map[Symbol, ClassDiff]
+	     #skipped    -> List[String]
+	     #files      -> Map[String, String]  (snapshot, ready to stage)
+	   ClassDiff variants:
+	     {#status: #new,      #liveSnapshot: ...}
+	     {#status: #removed,  #headSnapshot: ...}
+	     {#status: #changed,  #diff: PerMemberDiff,
+	                          #headSnapshot: ..., #liveSnapshot: ...}
+	   Classes whose live source matches HEAD verbatim are omitted from
+	   classDiffs entirely. *)
+	| snap files skipped |
+	snap:: repo snapshotFiles.
+	files:: snap at: #files.
+	skipped:: snap at: #skipped.
+	(repo readHEADTextFiles)
+		then: [:headFilesJS |
+			| headFiles classDiffs result outOfScope |
+			(* Scope HEAD to top-level <Class>.ns files only -- subdirectory
+			   files (e.g. out, tool) and non-.ns files (README, LICENSE,
+			   .gitignore) are not part of the namespace-scoped commit
+			   surface. *)
+			headFiles:: filterTopLevelNsFiles: (jsObjectToMap: headFilesJS).
+			classDiffs:: Map new.
+		(* Walk every live class. *)
+		files keysAndValuesDo: [:path :liveSrc |
+			| className headSrc |
+			className:: classNameFromFilename: path.
+			headSrc:: headFiles at: path ifAbsent: [nil].
+			headSrc isNil
+				ifTrue: [
+					(* New class: not in HEAD. *)
+					classDiffs at: className put: (Map new
+						at: #status put: #new;
+						at: #liveSnapshot put:
+							(liveSnapshotOf: (repo namespace at: className));
+						yourself)]
+				ifFalse: [
+					(* Both sides have it. Diff iff content differs at
+					   the source-string level; THEN also iff the parsed
+					   per-member structure actually has differences --
+					   format-only changes (whitespace, trailing blanks,
+					   comment positions) collapse to an empty per-member
+					   diff and would be misleading noise in the dialog. *)
+					headSrc = liveSrc ifFalse: [
+						| headSnap liveSnap diff |
+						headSnap:: extractedSnapshotFromSource: headSrc.
+						liveSnap:: liveSnapshotOf: (repo namespace at: className).
+						diff:: diffSnapshot: headSnap to: liveSnap.
+						(diffIsEmpty: diff) ifFalse: [
+							classDiffs at: className put: (Map new
+								at: #status put: #changed;
+								at: #diff put: diff;
+								at: #headSnapshot put: headSnap;
+								at: #liveSnapshot put: liveSnap;
+								yourself)]]]].
+		(* Walk HEAD for "out of scope" classes: top-level <X>.ns files
+		   that AREN'T in this namespace's snapshot. These are not
+		   "removed" from the commit's perspective -- the repo holds
+		   the union of every namespace that touches it, and we don't
+		   yet have a per-namespace ownership manifest to disambiguate.
+		   We surface them as an informational list so the user can
+		   see what else lives in the repo at HEAD; the commit step
+		   leaves them untouched. *)
+		outOfScope:: List new.
+		headFiles keysAndValuesDo: [:path :headSrc |
+			(files includesKey: path) ifFalse: [
+				outOfScope add: (classNameFromFilename: path) asString]].
+		result:: Map new
+			at: #classDiffs put: classDiffs;
+			at: #skipped put: skipped;
+			at: #outOfScope put: outOfScope;
+			at: #files put: files;
+			yourself.
+		(* Hand the Newspeak Map directly to the continuation block;
+		   do NOT resolve the Promise with it (would force the Map
+		   across the JS bridge and corrupt subsequent at:/isEmpty
+		   calls on it). *)
+		doneBlock value: result.
+		nil]
+	onRejected: [:e |
+		| msg |
+		msg:: [e messageText] on: Exception do: [:e2 | nil].
+		msg isNil ifTrue: [msg:: e printString].
+		errBlock value: msg.
+		nil]
+)
+isTopLevelNsFile: path <String> ^ <Boolean> = (
+	(* True iff path looks like a top-level Newspeak class file:
+	   ends in '.ns' and contains no path separator. The user-visible
+	   commit scope is exactly the namespace's top-level <Class>.ns
+	   files; subdirectory .ns files (out/, tool/, tests/...) and
+	   non-.ns files (README, LICENSE, .gitignore, ...) are out of
+	   scope and must not be touched by stage/commit. *)
+	^(path endsWith: '.ns') and: [(path indexOf: '/') = 0]
+)
+filterTopLevelNsFiles: hf <Map[String, String]> ^ <Map[String, String]> = (
+	| result |
+	result:: Map new.
+	hf keysAndValuesDo: [:path :content |
+		(isTopLevelNsFile: path) ifTrue: [
+			result at: path put: content]].
+	^result
+)
+jsObjectToMap: jsObj <Alien> ^ <Map[String, Object]> = (
+	(* Convert a plain JS object (alien) to a Newspeak Map by iterating
+	   its own enumerable keys via Object.keys. Used to bring Promise-
+	   chained JS state back into Newspeak Map land. *)
+	| Object keys result |
+	Object:: global at: #Object.
+	keys:: Object keys: jsObj.
+	result:: Map new.
+	0 to: (keys at: 'length') - 1 do: [:i |
+		| k |
+		k:: keys at: i.
+		result at: k put: (jsObj at: k)].
+	^result
+)
+public diffIsEmpty: diff <Map> ^ <Boolean> = (
+	(* True iff a PerMemberDiff has no actual member-level changes.
+	   Used to suppress classes (and nested classes) whose snapshot
+	   source string differs from HEAD only by reformatting -- the
+	   per-member extraction collapses those down to identical-source
+	   member maps, so the diff is empty. We don't want the dialog to
+	   list a class as "changed" if there's nothing to show on
+	   drill-down. *)
+	(diff at: #headerChanged) ifTrue: [^false].
+	(memberDiffIsEmpty: (diff at: #methods)) ifFalse: [^false].
+	(memberDiffIsEmpty: (diff at: #lazySlots)) ifFalse: [^false].
+	(memberDiffIsEmpty: (diff at: #classMethods)) ifFalse: [^false].
+	(diff at: #nestedClasses) keysAndValuesDo: [:k :nested |
+		(nested at: #status ifAbsent: [nil]) isNil
+			ifTrue: [(diffIsEmpty: nested) ifFalse: [^false]]
+			ifFalse: [^false]].
+	^true
+)
+public memberDiffIsEmpty: mDiff <Map> ^ <Boolean> = (
+	^(mDiff at: #added) isEmpty
+		and: [(mDiff at: #removed) isEmpty
+		and: [(mDiff at: #changed) isEmpty]]
+)
+classNameFromFilename: path <String> ^ <Symbol> = (
+	(* 'Browsing.ns' -> #Browsing. The snapshot only emits top-level
+	   '<ClassName>.ns'; nested classes are inline in the parent file
+	   so no path-segment splitting needed here. *)
+	((path endsWith: '.ns'))
+		ifTrue: [^(path copyFrom: 1 to: path size - 3) asSymbol]
+		ifFalse: [^path asSymbol]
+)
+public storedAuthor ^ <Alien | Nil> = (
+	(* Pull the user's commit identity from localStorage. Returns a JS
+	   {name, email} object on success, nil if not configured or
+	   parse-failed. Shared across every Repository. *)
+	| raw |
+	raw:: [localStorage getItem: authorStorageKey]
+		on: Exception do: [:e | nil].
+	(raw isNil or: [raw isKindOfString not]) ifTrue: [^nil].
+	^[JSON parse: raw] on: Exception do: [:e | nil]
+)
+public storedAuthorName ^ <String | Nil> = (
+	| a |
+	a:: storedAuthor.
+	a isNil ifTrue: [^nil].
+	^a at: 'name'
+)
+public storedAuthorEmail ^ <String | Nil> = (
+	| a |
+	a:: storedAuthor.
+	a isNil ifTrue: [^nil].
+	^a at: 'email'
+)
+public hasStoredAuthor ^ <Boolean> = (
+	| a |
+	a:: storedAuthor.
+	a isNil ifTrue: [^false].
+	((a at: 'name') isNil or: [(a at: 'email') isNil]) ifTrue: [^false].
+	^((a at: 'name') isEmpty) not and: [((a at: 'email') isEmpty) not]
+)
+public saveAuthorName: name <String> email: email <String> = (
+	(* Persist a {name, email} JS object under ns_vcs_author so every
+	   Repository's commits use the same identity. *)
+	| obj |
+	obj:: JSON parse: '{}'.
+	obj at: 'name' put: name.
+	obj at: 'email' put: email.
+	[localStorage setItem: authorStorageKey to: (JSON stringify: obj)]
+		on: Exception do: [:e | ]
 )
 public list ^ <RepositoryListSubject> = (
 	(* Convenience entry point: ide repositories list returns a Subject
@@ -1492,44 +2640,66 @@ public unpersistRepositoryNamed: name <Symbol | String> = (
 		i:: i + 1].
 	savePersistedConfigs: newArr
 )
-restorePersistedRepositories = (
-	(* On module construction: pull saved configs out of localStorage
-	   and reconstruct Repository instances, registering each in Root.
-	   If the repo's namespace doesn't exist in Root yet, create a
-	   fresh empty one with the saved key. Errors are swallowed: one
-	   bad entry shouldn't prevent the rest from restoring. *)
+public repositoriesForNamespaceKey: key <String> ^ <List[Repository]> = (
+	(* Reverse lookup: every Repository registered in Root whose
+	   namespaceKey matches `key`. Used by Browsing's NamespacePresenter
+	   to render "Repository:" link rows so the namespace ↔ repo
+	   relationship is discoverable from both sides. Multiple
+	   repositories may target the same namespace (e.g. one user-
+	   visible mirror + a backup clone with a different remote);
+	   the list may be empty if nothing targets this key. *)
+	| result |
+	result:: List new.
+	Root keysAndValuesDo: [:k :v |
+		v isKindOfRepository
+			ifTrue: [v namespaceKey = key ifTrue: [result add: v]]].
+	^result
+)
+public restorePersistedRepositories = (
+	(* Called from HopscotchWebIDE's constructor body after seeding so
+	   bootstrap namespaces (Newspeak, PrimordialSoup) are fully
+	   populated by the time we look them up. Pulls saved configs out
+	   of localStorage and reconstructs Repository instances,
+	   registering each in Root. If the repo's namespaceKey points at
+	   an absent key, a fresh empty namespace is created with that key
+	   (a legitimate case: the user previously bound a repo to a
+	   namespace they've since removed -- this restores the binding).
+	   Errors are swallowed per-entry: one bad config shouldn't
+	   prevent the rest from restoring. *)
+	
 	| configs len i cfg name namespaceKey ns repo |
 	configs:: loadPersistedConfigs.
-	configs isNil ifTrue: [^self].
+	configs isNil ifTrue: [ ^self ].
 	len:: configs at: 'length'.
 	i:: 0.
-	[i < len] whileTrue: [
-		cfg:: configs at: i.
-		[
-			name:: cfg at: 'name'.
-			namespaceKey:: cfg at: 'namespaceKey'.
-			(Root includesKey: name asSymbol)
-				ifTrue: [(* Already restored or shadowed — skip. *)]
-				ifFalse: [
-					ns:: namespaceKey = 'Root'
-						ifTrue: [Root]
-						ifFalse: [Root at: namespaceKey asSymbol
-							ifAbsent: [
-								| fresh |
-								fresh:: webIde namespacing freshNamespace.
-								Root at: namespaceKey asSymbol put: fresh.
-								fresh]].
-					repo:: Repository
-						named: name asSymbol
-						namespaceKey: namespaceKey
-						namespace: ns
-						remoteUrl: ((cfg at: 'remoteUrl') isEmpty
-							ifTrue: [nil] ifFalse: [cfg at: 'remoteUrl'])
-						storeNamed: (cfg at: 'storeName')
-						defaultBranch: (cfg at: 'defaultBranch')
-						corsProxyUrl: ((cfg at: 'corsProxyUrl') isEmpty
-							ifTrue: [nil] ifFalse: [cfg at: 'corsProxyUrl']).
-					(* Deliberately leave cloneStatus_slot nil on restored
+	[ i < len ] whileTrue: [
+			cfg:: configs at: i.
+			[
+				name:: cfg at: 'name'.
+				namespaceKey:: cfg at: 'namespaceKey'.
+				(Root includesKey: name asSymbol) ifTrue: [ (* Already restored or shadowed — skip. *) ]
+					ifFalse: [
+						ns:: namespaceKey = 'Root' ifTrue: [ Root ]
+							ifFalse: [
+								Root at: namespaceKey asSymbol
+									ifAbsent: [
+										| fresh |
+										fresh:: ide namespacing freshNamespace.
+										Root at: namespaceKey asSymbol put: fresh.
+										fresh
+									]
+							].
+						repo:: Repository named: name asSymbol
+							namespaceKey: namespaceKey
+							namespace: ns
+							remoteUrl: ((cfg at: 'remoteUrl') isEmpty ifTrue: [ nil ]
+								ifFalse: [ cfg at: 'remoteUrl' ])
+							storeNamed: (cfg at: 'storeName')
+							defaultBranch: (cfg at: 'defaultBranch')
+							corsProxyUrl: ((cfg at: 'corsProxyUrl') isEmpty ifTrue: [ nil ]
+								ifFalse: [ cfg at: 'corsProxyUrl' ]).
+						
+						(* Deliberately leave cloneStatus_slot nil on restored
 					   repos. The presenter shows an explicit "Load
 					   history" button instead of auto-firing git.log,
 					   because a corrupt IDB state can put isomorphic-git
@@ -1538,11 +2708,14 @@ restorePersistedRepositories = (
 					   thread is hung). The user opts in to loading; if
 					   the repo is bad they can recover via the per-row
 					   Delete on the list page. *)
-					Root at: name asSymbol put: repo]
-		] on: Exception do: [:e |
-			('Repositories: failed to restore config #', i printString,
-				': ', e messageText) out].
-		i:: i + 1]
+						Root at: name asSymbol put: repo
+					]
+			] on: Exception
+				do: [:e |
+					('Repositories: failed to restore config #' , i printString , ': ' , e messageText) out
+				].
+			i:: i + 1
+		]
 )
 ) : (
 )

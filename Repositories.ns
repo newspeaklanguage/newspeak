@@ -754,6 +754,113 @@ public pushForce: force <Boolean> ^ <Alien> = (
 		invalidateAheadBehindCache.
 		result]
 )
+public pull ^ <Alien> = (
+	(* Fetch + FF-only merge. Resolves to a JS object describing the
+	   outcome:
+	     {status: 'up-to-date',     sha}                 nothing to do
+	     {status: 'fast-forwarded', sha}                 advanced local
+	     {status: 'diverged', localSha, remoteSha}       local has commits
+	                                                      not on remote;
+	                                                      not advanced
+	   Network / auth failures reject; diverged is a SUCCESSFUL resolve
+	   because it's a valid outcome the user can act on (Force Push,
+	   Fetch+reset, or external merge). *)
+	| fetchOpts host pat |
+	remoteUrl isNil ifTrue: [
+		^JSPromise reject: 'Local-only repo has no remote'].
+	fetchOpts:: createJSObject.
+	fetchOpts at: 'fs' put: fs.
+	fetchOpts at: 'http' put: http.
+	fetchOpts at: 'dir' put: dir.
+	fetchOpts at: 'url' put: remoteUrl.
+	fetchOpts at: 'ref' put: defaultBranch.
+	fetchOpts at: 'singleBranch' put: true.
+	corsProxyUrl isNil ifFalse: [
+		fetchOpts at: 'corsProxy' put: corsProxyUrl].
+	(* Authenticated fetch when a PAT is stored. Public repos work
+	   without; private repos need it. *)
+	host:: ide repositories hostFromUrl: remoteUrl.
+	pat:: ide repositories storedPATForHost: host.
+	pat isNil ifFalse: [
+		fetchOpts at: 'onAuth' put: [:authUrl :authPrevious |
+			| obj |
+			obj:: JSON parse: '{}'.
+			obj at: 'username' put: 'x-access-token'.
+			obj at: 'password' put: pat.
+			obj]].
+	^(git fetch: fetchOpts) then: [:fr |
+		invalidateAheadBehindCache.
+		pullCheckAndAdvance]
+)
+pullCheckAndAdvance ^ <Alien> = (
+	| remoteOpts |
+	remoteOpts:: createJSObject.
+	remoteOpts at: 'fs' put: fs.
+	remoteOpts at: 'dir' put: dir.
+	remoteOpts at: 'ref' put: 'refs/remotes/origin/', defaultBranch.
+	^(git resolveRef: remoteOpts) then: [:remoteSha |
+		| localOpts |
+		localOpts:: createJSObject.
+		localOpts at: 'fs' put: fs.
+		localOpts at: 'dir' put: dir.
+		localOpts at: 'ref' put: 'refs/heads/', defaultBranch.
+		(git resolveRef: localOpts)
+			then: [:localSha |
+				pullCompareLocal: localSha remote: remoteSha]
+			onRejected: [:e |
+				(* No local branch ref yet -- treat as FF from nothing. *)
+				pullAdvanceTo: remoteSha]]
+)
+pullCompareLocal: localSha <String> remote: remoteSha <String> ^ <Alien> = (
+	localSha = remoteSha ifTrue: [
+		| r |
+		r:: createJSObject.
+		r at: 'status' put: 'up-to-date'.
+		r at: 'sha' put: localSha.
+		^JSPromise resolve: r].
+	(* FF iff local is an ancestor of remote -- i.e. localSha appears
+	   somewhere in remote's history within the log depth. *)
+	^(logShasFromRef: remoteSha) then: [:remoteShas |
+		| Set s |
+		Set:: global at: #Set.
+		s:: Set new.
+		0 to: (remoteShas at: 'length') - 1 do: [:i |
+			s add: (remoteShas at: i)].
+		(s has: localSha)
+			ifTrue: [pullAdvanceTo: remoteSha]
+			ifFalse: [
+				| r |
+				r:: createJSObject.
+				r at: 'status' put: 'diverged'.
+				r at: 'localSha' put: localSha.
+				r at: 'remoteSha' put: remoteSha.
+				JSPromise resolve: r]]
+)
+pullAdvanceTo: remoteSha <String> ^ <Alien> = (
+	| writeRefOpts |
+	writeRefOpts:: createJSObject.
+	writeRefOpts at: 'fs' put: fs.
+	writeRefOpts at: 'dir' put: dir.
+	writeRefOpts at: 'ref' put: 'refs/heads/', defaultBranch.
+	writeRefOpts at: 'value' put: remoteSha.
+	writeRefOpts at: 'force' put: true.
+	^(git writeRef: writeRefOpts) then: [:wr |
+		| checkoutOpts |
+		checkoutOpts:: createJSObject.
+		checkoutOpts at: 'fs' put: fs.
+		checkoutOpts at: 'dir' put: dir.
+		checkoutOpts at: 'ref' put: defaultBranch.
+		checkoutOpts at: 'force' put: true.
+		(git checkout: checkoutOpts) then: [:cr |
+			| r |
+			invalidateHistoryCache.
+			invalidateAheadBehindCache.
+			blobCache_slot:: nil.
+			r:: createJSObject.
+			r at: 'status' put: 'fast-forwarded'.
+			r at: 'sha' put: remoteSha.
+			r]]
+)
 public fetchAndResetHEADToRemote ^ <Alien> = (
 	(* Re-baseline the local repo against the remote: git fetch the
 	   configured branch, then advance refs/heads/<branch> to the
@@ -1303,6 +1410,7 @@ repositoryMenu = (
 		{'Commit…'. [respondToCommit]}.
 		{'Push to Remote'. [respondToPush]}.
 		{'Force Push to Remote'. [respondToForcePush]}.
+		{'Pull from Remote'. [respondToPull]}.
 		{'Fetch from Remote'. [respondToFetch]}.
 		{'Edit Settings'. [respondToEditSettings]}.
 		{'Show Snapshot'. [respondToShowSnapshot]}.
@@ -1355,6 +1463,37 @@ respondToPush = (
 						ifTrue: [doPushForce]
 						ifFalse: [js global alert: 'Push failed: ', msg]]
 				ifFalse: [js global alert: 'Push failed: ', msg].
+			nil]
+)
+respondToPull = (
+	(* FF-only pull. Non-destructive: rejects on divergence rather
+	   than overwriting either side. *)
+	| repo |
+	repo:: subject repository.
+	repo remoteUrl isNil ifTrue: [
+		^js global alert: 'This repository has no remote configured.'].
+	repo pull
+		then: [:r |
+			| status |
+			status:: r at: 'status'.
+			updateGUI: [
+				loadStarted_slot:: false.
+				loadFailed_slot:: nil].
+			status = 'up-to-date' ifTrue: [
+				js global alert: 'Already up to date.'].
+			status = 'fast-forwarded' ifTrue: [
+				js global alert: 'Fast-forwarded to ', ((r at: 'sha') copyFrom: 1 to: 7), '.'].
+			status = 'diverged' ifTrue: [
+				js global alert:
+					'Cannot fast-forward: your local branch has commits not on the remote.',
+					String newline,
+					'Use Force Push (your state wins) or Fetch (remote state wins, local commits lost) to reconcile.'].
+			nil]
+		onRejected: [:e |
+			| msg |
+			msg:: [e messageText] on: Exception do: [:e2 | nil].
+			msg isNil ifTrue: [msg:: e printString].
+			js global alert: 'Pull failed: ', msg.
 			nil]
 )
 respondToForcePush = (

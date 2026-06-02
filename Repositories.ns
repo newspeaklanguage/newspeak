@@ -991,13 +991,21 @@ repositoryMenu = (
 )
 respondToFetch = (
 	(* Re-baseline this repo's HEAD against the remote. Any local
-	   commits not yet pushed will be lost. Shows a progress notice
-	   while the fetch is in flight; resets the history cache + UI
-	   on success. *)
-	| repo |
+	   commits not yet pushed will be lost -- prompt first since this
+	   is destructive and there's no Push affordance yet. Shows a
+	   progress notice while the fetch is in flight; resets the
+	   history cache + UI on success. *)
+	| repo confirmed |
 	repo:: subject repository.
 	repo remoteUrl isNil ifTrue: [
 		^js global alert: 'This repository has no remote configured.'].
+	confirmed:: js global confirm:
+		'Fetch from remote and reset local HEAD to origin/',
+		repo defaultBranch,
+		'.', String newline,
+		'Any local commits not yet pushed will be lost.', String newline,
+		'Continue?'.
+	confirmed ifFalse: [^nil].
 	repo fetchAndResetHEADToRemote
 		then: [:sha |
 			updateGUI: [
@@ -1684,6 +1692,7 @@ public class ChangesetSubject onRepository: r <Repository> strategy: s <ApplyStr
 	public rememberAuthor <Boolean> ::= true.
 	public submissionInFlight <Boolean> ::= false.
 	submissionError_slot.
+	submittedSha_slot.
 	expansion_slot.
 	public editingAuthor <Boolean> ::= false.
 |
@@ -1706,6 +1715,8 @@ isMyKind: s <Subject> ^ <Boolean> = (^s isKindOfChangesetSubject)
 public changeset = (^changeset_slot)
 public computeError = (^computeError_slot)
 public submissionError = (^submissionError_slot)
+public submittedSha ^ <String | Nil> = (^submittedSha_slot)
+public hasBeenSubmitted ^ <Boolean> = (^submittedSha_slot isNil not)
 public toggleExpansion: key <String> = (
 	expansion_slot at: key put: (expansion_slot at: key ifAbsent: [false]) not
 )
@@ -1728,11 +1739,18 @@ public computeAsync: refreshBlock <[]> = (
 			computeError_slot:: msg.
 			refreshBlock value]
 )
-public submit: refreshBlock <[]> = (
-	(* Validate, then run the strategy's apply hook. refreshBlock bumps
-	   the presenter on each state transition. On success the apply
-	   hook returns a Promise that resolves to a SHA (or nil for
-	   no-op); the dialog navigates back to the repo presenter. *)
+public submit: refreshBlock <[]>
+	onSuccess: successBlock <[:Object]>
+	onFailure: failureBlock <[]> = (
+	(* Validate, then run the strategy's apply hook.
+	   * refreshBlock fires on each state transition (start of
+	     submission and end of submission) so the dialog re-renders
+	     button states / error text.
+	   * successBlock fires once with the strategy's result (typically
+	     a SHA String, or nil for an empty commit). Presenter uses
+	     this to navigate away.
+	   * failureBlock fires once after the failure state is set; the
+	     refreshBlock has already been called to update the dialog. *)
 	| input valid |
 	submissionInFlight ifTrue: [^nil].
 	submissionError_slot:: nil.
@@ -1751,7 +1769,9 @@ public submit: refreshBlock <[]> = (
 	(strategy apply: changeset_slot withInput: input)
 		then: [:result |
 			submissionInFlight:: false.
+			submittedSha_slot:: result.
 			refreshBlock value.
+			successBlock value: result.
 			nil]
 		onRejected: [:e |
 			| msg |
@@ -1760,6 +1780,7 @@ public submit: refreshBlock <[]> = (
 			submissionInFlight:: false.
 			submissionError_slot:: 'Apply failed: ', msg.
 			refreshBlock value.
+			failureBlock value.
 			nil]
 )
 ) : (
@@ -1818,6 +1839,20 @@ definition = (
 		buttonRow}
 )
 bodyArea = (
+	(* If the user has already submitted this changeset, render a
+	   stable post-submit banner. The cached classDiffs would be
+	   stale (live = HEAD post-commit), and submitting again would
+	   either no-op or re-commit identical work; either way it's
+	   user-confusing. *)
+	subject hasBeenSubmitted ifTrue: [
+		| sha |
+		sha:: subject submittedSha.
+		^column: {
+			(label: 'Committed locally as ',
+				(sha isNil ifTrue: ['(no-op; nothing to commit)']
+					ifFalse: [sha copyFrom: 1 to: 7])) bold.
+			smallBlank.
+			(label: 'This changeset has been submitted. Reload the dialog from the Repository to start a fresh review.') italic}].
 	subject computeError isNil ifFalse: [
 		^(label: 'Failed to compute changeset: ', subject computeError)
 			color: (Color r: 0.8 g: 0.1 b: 0.1)].
@@ -2119,6 +2154,10 @@ errorArea = (
 )
 buttonRow = (
 	| canSubmit |
+	subject hasBeenSubmitted ifTrue: [
+		^row: {
+			filler.
+			button: 'Done' action: [respondToCancel]}].
 	canSubmit:: subject submissionInFlight not
 		and: [subject changeset isNil not
 		and: [(subject changeset at: #classDiffs) isEmpty not]].
@@ -2134,7 +2173,12 @@ respondToCancel = (
 	enterSubject:: RepositorySubject onModel: subject repository
 )
 respondToAccept = (
-	(* Snap form values back from editors in case the user didn't blur. *)
+	(* Snap form values back from editors in case the user didn't blur,
+	   then run the strategy. On success, navigate back to the
+	   Repository page -- both because that's the natural destination
+	   (the new commit shows at the top of the log) and because
+	   staying on the dialog would let the user re-submit the same
+	   cached changeset over and over. *)
 	updateGUI: [
 		messageEditor isNil ifFalse: [
 			subject messageDraft: messageEditor textBeingAccepted].
@@ -2142,7 +2186,14 @@ respondToAccept = (
 			subject authorNameDraft: authorNameEditor textBeingAccepted].
 		authorEmailEditor isNil ifFalse: [
 			subject authorEmailDraft: authorEmailEditor textBeingAccepted].
-		subject submit: [refreshFromAsync]]
+		subject
+			submit: [refreshFromAsync]
+			onSuccess: [:result |
+				updateGUI: [
+					subject repository invalidateHistoryCache.
+					enterSubject:: RepositorySubject onModel: subject repository].
+				nil]
+			onFailure: []]
 )
 ) : (
 )

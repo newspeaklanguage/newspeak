@@ -401,12 +401,13 @@ ensureInitialized ^ <Alien> = (
 			initialized_slot:: true.
 			nil]]
 )
-listHEADFiles ^ <Alien> = (
+listHEADFiles ^ <Alien> = (^listFilesAtRef: 'HEAD')
+listFilesAtRef: ref <String> ^ <Alien> = (
 	| listOpts |
 	listOpts:: createJSObject.
 	listOpts at: 'fs' put: fs.
 	listOpts at: 'dir' put: dir.
-	listOpts at: 'ref' put: 'HEAD'.
+	listOpts at: 'ref' put: ref.
 	^(git listFiles: listOpts)
 		then: [:arr | arr]
 		onRejected: [:err | createJSArray]
@@ -590,6 +591,42 @@ public commitSnapshot: files <Map[String, String]> message: msg <String> ^ <Alie
 			ifTrue: [JSPromise resolve: nil]
 			ifFalse: [commit: msg]]
 )
+public push ^ <Alien> = (
+	(* git push origin <defaultBranch>. Uses the host-keyed PAT from
+	   localStorage for HTTPS basic auth via the onAuth callback.
+	   Returns the JS push result on success (includes the {ok, refs,
+	   errors} structure isomorphic-git uses). Rejects if no remote
+	   is configured, no PAT is stored for the host, or git.push
+	   itself fails (network / auth / non-FF reject). *)
+	| pushOpts host pat |
+	remoteUrl isNil ifTrue: [
+		^JSPromise reject: 'Local-only repo has no remote'].
+	host:: ide repositories hostFromUrl: remoteUrl.
+	pat:: ide repositories storedPATForHost: host.
+	pat isNil ifTrue: [
+		^JSPromise reject: 'No PAT stored for ', host, '. Set one via the Push menu item.'].
+	pushOpts:: createJSObject.
+	pushOpts at: 'fs' put: fs.
+	pushOpts at: 'http' put: http.
+	pushOpts at: 'dir' put: dir.
+	pushOpts at: 'url' put: remoteUrl.
+	pushOpts at: 'ref' put: defaultBranch.
+	corsProxyUrl isNil ifFalse: [
+		pushOpts at: 'corsProxy' put: corsProxyUrl].
+	(* onAuth is invoked by isomorphic-git when the remote requires
+	   credentials. The block is passed through the alien bridge as
+	   an expat and called synchronously. For GitHub PATs, any non-
+	   empty username works; we send 'x-access-token' as a convention.
+	   For other providers (GitLab, Bitbucket, Gitea) the same shape
+	   typically works with token auth. *)
+	pushOpts at: 'onAuth' put: [:authUrl :authPrevious |
+		| obj |
+		obj:: JSON parse: '{}'.
+		obj at: 'username' put: 'x-access-token'.
+		obj at: 'password' put: pat.
+		obj].
+	^git push: pushOpts
+)
 public fetchAndResetHEADToRemote ^ <Alien> = (
 	(* Re-baseline the local repo against the remote: git fetch the
 	   configured branch, then advance refs/heads/<branch> to the
@@ -659,18 +696,23 @@ readHEADTextFilesInner ^ <Alien> = (
 	refOpts at: 'dir' put: dir.
 	refOpts at: 'ref' put: 'HEAD'.
 	^(git resolveRef: refOpts)
-		then: [:headSha | readHEADTextFilesAtSha: headSha]
-		onRejected: [:err |
-			console log: 'readHEADTextFiles: HEAD ref unresolved, treating as empty: ', err printString.
-			createJSObject]
+		then: [:headSha | readTextFilesAtSha: headSha]
+		onRejected: [:err | createJSObject]
 )
-readHEADTextFilesAtSha: headSha <String> ^ <Alien> = (
-	^listHEADFiles
+public readTextFilesAt: sha <String> ^ <Alien> = (
+	(* Public entry point: resolves to a JS object {path -> content}
+	   of every file in the repo at commit sha. Used by installFilesAt:
+	   to round-trip a past commit back into the live namespace. *)
+	^ensureInitialized
+		then: [:r | readTextFilesAtSha: sha]
+		onRejected: [:err | createJSObject]
+)
+readTextFilesAtSha: sha <String> ^ <Alien> = (
+	^(listFilesAtRef: sha)
 		then: [:paths |
 			| promises result count |
 			count:: paths at: 'length'.
 			result:: createJSObject.
-			console log: 'readHEADTextFiles: HEAD=', headSha, ', listFiles returned ', count printString, ' paths'.
 			count = 0
 				ifTrue: [JSPromise resolve: result]
 				ifFalse: [
@@ -678,25 +720,82 @@ readHEADTextFilesAtSha: headSha <String> ^ <Alien> = (
 					0 to: count - 1 do: [:i |
 						| path |
 						path:: paths at: i.
-						promises push: ((readBlobAt: path in: headSha)
+						promises push: ((readBlobAt: path in: sha)
 							then: [:content |
 								result at: path put: content.
 								nil]
-							onRejected: [:err |
-								console log: 'readBlob failed for ', path, ': ', err printString.
-								nil])].
-					(JSPromise all: promises) then: [:done |
-						console log: 'readHEADTextFiles: collected ', (jsObjectKeyCount: result) printString, ' entries'.
-						result]]]
-		onRejected: [:err |
-			console log: 'listHEADFiles rejected: ', err printString.
-			createJSObject]
+							onRejected: [:err | nil])].
+					(JSPromise all: promises) then: [:done | result]]]
+		onRejected: [:err | createJSObject]
 )
 jsObjectKeyCount: jsObj <Alien> ^ <Integer> = (
 	| Object keys |
 	Object:: global at: #Object.
 	keys:: Object keys: jsObj.
 	^keys at: 'length'
+)
+public installFilesAt: sha <String>
+	onComplete: doneBlock <[:Integer :Integer]>
+	onError: errBlock <[:String]> = (
+	(* Round-trip the repo's state at sha back into Root, then re-bind
+	   into this Repository's namespace ONLY those classes that were
+	   already there. Rationale: the commit's top-level <Class>.ns set
+	   may include files committed by other namespaces against the
+	   same repo (we lack a per-repo ownership manifest to
+	   disambiguate). Installing every file blindly into THIS
+	   namespace pollutes it with unrelated classes. The classes still
+	   exist in Root post-install -- the user can pull individual ones
+	   into the namespace later via Add to namespace.
+	   doneBlock fires with (installedCount, reboundIntoNamespaceCount).
+	   errBlock fires with a message on parse or install failure. *)
+	(readTextFilesAt: sha)
+		then: [:filesObj |
+			| files builders mixins ok preInstallNames reboundCount |
+			files:: filterTopLevelNsFiles: (jsObjectToMap: filesObj).
+			files isEmpty ifTrue: [
+				errBlock value: 'No top-level .ns files at ', (sha copyFrom: 1 to: 7).
+				^nil].
+			(* Snapshot which class names were in this namespace BEFORE
+			   installing, so we can re-bind exactly those after
+			   install (and not flood the namespace with new commit
+			   contents). *)
+			preInstallNames:: Set new.
+			namespace keysAndValuesDo: [:k :v |
+				v isKindOfBehavior ifTrue: [preInstallNames add: k asString]].
+			reboundCount:: 0.
+			ok:: [
+				builders:: List new.
+				files keysAndValuesDo: [:path :src |
+					builders add: (ClassDeclarationBuilder fromUnitSource: src)].
+				(* Install into Root -- the IDE convention is that every
+				   top-level class lives there. *)
+				mixins:: ide installFromBuilders: builders asArray.
+				mixins do: [:m |
+					| live |
+					live:: m declaration applyToObject reflectee.
+					(* installFromBuilders: produces installed bytecode
+					   but does NOT bind the resulting classes into the
+					   target namespace -- the Compile File flow does that
+					   step explicitly. Without this, installed classes
+					   exist but are unreachable. Bind unconditionally so
+					   every class is at least in Root. *)
+					Root at: m name put: live.
+					(* Re-bind into THIS namespace only if it was present
+					   pre-install (avoids the "every commit file flooding
+					   the namespace" trap). *)
+					(preInstallNames includes: m name asString) ifTrue: [
+						namespace at: m name put: live.
+						reboundCount:: reboundCount + 1]].
+				true]
+					on: Exception
+					do: [:e |
+						errBlock value: 'Install failed: ', e messageText.
+						false].
+			ok ifTrue: [doneBlock value: builders size value: reboundCount].
+			nil]
+		onRejected: [:e |
+			errBlock value: 'Read failed: ', e printString.
+			nil]
 )
 ) : (
 )
@@ -956,7 +1055,43 @@ expandedLogRowFor: entry toggle: toggle = (
 		smallBlank.
 		(label: sha) smallFont.
 		smallBlank.
-		multilineLabelOf: message}
+		multilineLabelOf: message.
+		smallBlank.
+		row: {
+			(link: 'Install this version' action: [respondToInstallVersion: sha])
+				color: actionLinkColor.
+			filler}}
+)
+respondToInstallVersion: sha <String> = (
+	(* Re-install the top-level <Class>.ns set at sha. New classes
+	   land in Root; classes that were already in this namespace get
+	   their binding refreshed to the installed version. Other classes
+	   (not previously in the namespace) are NOT silently added --
+	   pull them in via Add to namespace if desired. Destructive
+	   (live classes at the commit are replaced); prompts first. *)
+	| confirmed |
+	confirmed:: js global confirm:
+		'Install commit ', (sha copyFrom: 1 to: 7), '?',
+		String newline,
+		'Classes will be installed into Root.', String newline,
+		'Classes already in ', subject repository namespaceKey,
+		' will have their bindings refreshed.', String newline,
+		'New classes go to Root only -- pull them into ',
+		subject repository namespaceKey, ' via Add to namespace if needed.',
+		String newline, 'Continue?'.
+	confirmed ifFalse: [^nil].
+	subject repository
+		installFilesAt: sha
+		onComplete: [:installed :reboundIntoNs |
+			updateGUI: [].
+			js global alert: 'Installed ', installed printString,
+				' class(es) from ', (sha copyFrom: 1 to: 7),
+				'. ', reboundIntoNs printString,
+				' re-bound into ', subject repository namespaceKey, '.'.
+			nil]
+		onError: [:msg |
+			js global alert: msg.
+			nil]
 )
 multilineLabelOf: text = (
 	(* Render a multi-line commit body as a column of single-line
@@ -981,6 +1116,7 @@ multilineLabelOf: text = (
 repositoryMenu = (
 	^menuWithLabelsAndActions: {
 		{'Commit…'. [respondToCommit]}.
+		{'Push to Remote'. [respondToPush]}.
 		{'Fetch from Remote'. [respondToFetch]}.
 		{'Edit Settings'. [respondToEditSettings]}.
 		{'Show Snapshot'. [respondToShowSnapshot]}.
@@ -988,6 +1124,36 @@ repositoryMenu = (
 		{'Delete Repository'. [respondToDelete]}.
 		{'Delete and Wipe Local Store'. [respondToDeleteAndWipe]}.
 		{'Inspect Presenter'. [respondToInspectPresenter]}}
+)
+respondToPush = (
+	(* Push local commits to the remote. First-time use for a host
+	   prompts for a Personal Access Token and stores it under
+	   ns_vcs_pat_<host>. Subsequent pushes reuse it silently. *)
+	| repo host pat |
+	repo:: subject repository.
+	repo remoteUrl isNil ifTrue: [
+		^js global alert: 'This repository has no remote configured.'].
+	host:: ide repositories hostFromUrl: repo remoteUrl.
+	(ide repositories hasStoredPATForHost: host) ifFalse: [
+		pat:: js global prompt:
+			'Personal Access Token for ', host, ':',
+			String newline,
+			'(stored locally under ns_vcs_pat_', host, ')'.
+		(pat isNil or: [pat isEmpty]) ifTrue: [^nil].
+		ide repositories saveStoredPATForHost: host value: pat].
+	repo push
+		then: [:result |
+			updateGUI: [
+				loadStarted_slot:: false.
+				loadFailed_slot:: nil].
+			js global alert: 'Push to ', host, ' succeeded.'.
+			nil]
+		onRejected: [:e |
+			| msg |
+			msg:: [e messageText] on: Exception do: [:e2 | nil].
+			msg isNil ifTrue: [msg:: e printString].
+			js global alert: 'Push failed: ', msg.
+			nil]
 )
 respondToFetch = (
 	(* Re-baseline this repo's HEAD against the remote. Any local
@@ -2613,6 +2779,41 @@ public saveAuthorName: name <String> email: email <String> = (
 	obj at: 'email' put: email.
 	[localStorage setItem: authorStorageKey to: (JSON stringify: obj)]
 		on: Exception do: [:e | ]
+)
+patStorageKeyFor: host <String> ^ <String> = (
+	^'ns_vcs_pat_', host
+)
+public storedPATForHost: host <String> ^ <String | Nil> = (
+	(* Returns the stored Personal Access Token for `host` (e.g.
+	   'github.com'), or nil if none. Localstorage is JS-readable so
+	   tokens stored here are NOT secure against script injection;
+	   acceptable for an IDE-local development convenience. *)
+	| raw |
+	raw:: [localStorage getItem: (patStorageKeyFor: host)]
+		on: Exception do: [:e | nil].
+	(raw isNil or: [raw isKindOfString not]) ifTrue: [^nil].
+	raw isEmpty ifTrue: [^nil].
+	^raw
+)
+public hasStoredPATForHost: host <String> ^ <Boolean> = (
+	^(storedPATForHost: host) isNil not
+)
+public saveStoredPATForHost: host <String> value: pat <String> = (
+	[localStorage setItem: (patStorageKeyFor: host) to: pat]
+		on: Exception do: [:e | ]
+)
+public hostFromUrl: url <String> ^ <String> = (
+	(* Extract the host part from an https / http URL. Returns the
+	   substring between '://' and the next '/' (or end of string).
+	   Used for per-host PAT storage. *)
+	| schemeIdx afterScheme slashIdx |
+	schemeIdx:: url indexOf: '://'.
+	schemeIdx = 0 ifTrue: [^url].
+	afterScheme:: url copyFrom: schemeIdx + 3 to: url size.
+	slashIdx:: afterScheme indexOf: '/'.
+	^slashIdx = 0
+		ifTrue: [afterScheme]
+		ifFalse: [afterScheme copyFrom: 1 to: slashIdx - 1]
 )
 public list ^ <RepositoryListSubject> = (
 	(* Convenience entry point: ide repositories list returns a Subject

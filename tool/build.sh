@@ -77,6 +77,12 @@ cp ${PRIMORDIALSOUP}/newspeak/*.ns out
 cp ./*.ns ./*.png out
 # cp -R CodeMirror out # CodeMirror is copied during deploy
 
+# 7a. Stage self-hosted third-party JS (isomorphic-git, lightning-fs).
+# Vendored under vendor/ at the repo root and consumed by the deploy
+# scripts. Mirror the whole dir so additions land automatically.
+mkdir -p out/vendor
+cp ./vendor/*.js out/vendor/
+
 cd ${NEWSPEAK}/out || exit 1
 
 # ${PRIMORDIALSOUP}/out/ReleaseX64/primordialsoup \

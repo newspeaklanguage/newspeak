@@ -1,5 +1,5 @@
 Newspeak3
-'Root'
+'Newspeak'
 class Repositories usingPlatform: platform ide: webIde = (
 (*
  User-visible git repositories scoped by Namespace. Companion to
@@ -133,6 +133,14 @@ public class Repository
 	   that moves either ref: commit, push, fetch. UI re-fetches on
 	   next render. *)
 	aheadBehindCache_slot
+	(* Last-operation status banner state. Drives a non-modal banner
+	   on RepositoryPresenter so async operations (Push, Pull, Fetch,
+	   Force Push, Install Version, Commit) report progress and
+	   outcome without modal alerts. Kind is one of #pending,
+	   #success, #failure, nil. The banner shows a Close affordance
+	   when kind is not #pending. *)
+	lastOperationMessage_slot
+	lastOperationKind_slot
 	(* Tracks whether `git init` has been run on `dir`. Cloned repos are
 	   initialized as a side effect of cloneFromRemote; local-only repos
 	   need explicit init on first commit. ensureInitialized is idempotent. *)
@@ -147,6 +155,17 @@ lazy public fs = LightningFSClass new: localStoreName.
 lazy public git = gitFacade.
 lazy public http = gitHttpFacade.
 public isKindOfRepository ^ <Boolean> = (^true)
+public lastOperationMessage ^ <String | Nil> = (^lastOperationMessage_slot)
+public lastOperationKind ^ <Symbol | Nil> = (^lastOperationKind_slot)
+public lastOperationIsPending ^ <Boolean> = (^lastOperationKind_slot = #pending)
+public setLastOperation: msg <String> kind: k <Symbol> = (
+	lastOperationMessage_slot:: msg.
+	lastOperationKind_slot:: k
+)
+public clearLastOperation = (
+	lastOperationMessage_slot:: nil.
+	lastOperationKind_slot:: nil
+)
 public dir ^ <String> = (^'/work')
 public cloneStatus ^ <Symbol | Nil> = (^cloneStatus_slot)
 public cloneError ^ <String | Nil> = (^cloneError_slot)
@@ -751,8 +770,16 @@ public pushForce: force <Boolean> ^ <Alien> = (
 		obj at: 'password' put: pat.
 		obj].
 	^(git push: pushOpts) then: [:result |
-		invalidateAheadBehindCache.
-		result]
+		| ok dump |
+		ok:: [result at: 'ok'] on: Exception do: [:e | nil].
+		ok = true
+			ifTrue: [
+				invalidateAheadBehindCache.
+				result]
+			ifFalse: [
+				dump:: [JSON stringify: result]
+					on: Exception do: [:e | '<not serializable>'].
+				JSPromise reject: 'Push refused (', dump, ')']]
 )
 public pull ^ <Alien> = (
 	(* Fetch + FF-only merge. Resolves to a JS object describing the
@@ -1149,9 +1176,32 @@ definition = (
 				color: actionLinkColor.
 			filler}.
 		aheadBehindRow.
+		lastOperationBanner.
 		mediumBlank.
 		bodyFor: cached
 	}
+)
+lastOperationBanner = (
+	(* Non-modal status banner driven by Repository's lastOperation
+	   slots. Color codes by kind. Shows a neutral dismiss button
+	   unless the operation is still pending. *)
+	| msg kind c |
+	msg:: subject repository lastOperationMessage.
+	msg isNil ifTrue: [^nothing].
+	kind:: subject repository lastOperationKind.
+	c:: Color r: 0.35 g: 0.35 b: 0.35.
+	(kind asString = 'failure') ifTrue: [c:: Color r: 0.8 g: 0.1 b: 0.1].
+	(kind asString = 'success') ifTrue: [c:: Color r: 0.0 g: 0.55 b: 0.0].
+	^row: {
+		(label: msg) color: c.
+		smallBlank.
+		subject repository lastOperationIsPending
+			ifTrue: [nothing]
+			ifFalse: [
+				(imageButton: ide images clearImage action: [
+					updateGUI: [subject repository clearLastOperation]])
+					height: styleButtonSize].
+		filler}
 )
 aheadBehindRow = (
 	(* Local-vs-remote-tracking comparison. Computed asynchronously
@@ -1473,48 +1523,56 @@ forcePushMenuLabel: ab <Alien | Nil> ^ <String> = (
 )
 respondToPush = (
 	(* Push local commits to the remote. First-time use for a host
-	   prompts for a Personal Access Token and stores it under
-	   ns_vcs_pat_<host>. Subsequent pushes reuse it silently. *)
-	| repo host pat |
+	   navigates to a prompt InteractionSubject for the PAT; subsequent
+	   pushes reuse it silently. Async result is reported via the
+	   non-modal status banner on RepositoryPresenter. *)
+	| repo host |
 	repo:: subject repository.
 	repo remoteUrl isNil ifTrue: [
-		^js global alert: 'This repository has no remote configured.'].
+		^repo setLastOperation: 'No remote configured for this repository.'
+			kind: #failure].
 	host:: ide repositories hostFromUrl: repo remoteUrl.
-	(ide repositories hasStoredPATForHost: host) ifFalse: [
-		pat:: js global prompt:
-			'Personal Access Token for ', host, ':',
-			String newline,
-			'(stored locally under ns_vcs_pat_', host, ')'.
-		(pat isNil or: [pat isEmpty]) ifTrue: [^nil].
-		ide repositories saveStoredPATForHost: host value: pat].
+	(ide repositories hasStoredPATForHost: host)
+		ifTrue: [doPushAndReportStatus]
+		ifFalse: [enterSubject:: (ide browsing InteractionSubject
+			prompt: 'Personal Access Token for ', host, String newline,
+				'(stored locally under ns_vcs_pat_', host, ')'
+			default: ''
+			onAccept: [:enteredPat |
+				enteredPat isEmpty ifFalse: [
+					ide repositories saveStoredPATForHost: host value: enteredPat.
+					doPushAndReportStatus]]
+			returnTo: subject)]
+)
+doPushAndReportStatus = (
+	(* Shared push path used by both the immediate Push and the
+	   post-PAT-prompt Push. Sets banner status and updates it on
+	   resolve / reject. *)
+	| repo host |
+	repo:: subject repository.
+	host:: ide repositories hostFromUrl: repo remoteUrl.
+	repo setLastOperation: 'Pushing to ', host, '...' kind: #pending.
+	updateGUI: [].
 	repo push
 		then: [:result |
-			updateGUI: [
-				loadStarted_slot:: false.
-				loadFailed_slot:: nil].
-			js global alert: 'Push to ', host, ' succeeded.'.
+			repo setLastOperation: 'Push to ', host, ' succeeded.'
+				kind: #success.
+			refreshFromAsync.
 			nil]
 		onRejected: [:e |
-			| msg confirmed nonFF |
+			| msg nonFF |
 			msg:: [e messageText] on: Exception do: [:e2 | nil].
 			msg isNil ifTrue: [msg:: e printString].
-			(* Non-FF reject is the most common recoverable failure;
-			   offer Force Push inline rather than make the user
-			   navigate back to the menu. Can't use a non-local
-			   return here -- we're inside a stored Promise callback,
-			   and ^ would CannotReturn after respondToPush has long
-			   since exited. Use ifTrue:ifFalse: to gate. *)
 			nonFF:: msg includesSubstring: 'not a simple fast-forward'.
 			nonFF
 				ifTrue: [
-					confirmed:: js global confirm:
-						'Push rejected: remote has commits not in your local repo.',
-						String newline,
-						'Force push (overwrites remote history)?'.
-					confirmed
-						ifTrue: [doPushForce]
-						ifFalse: [js global alert: 'Push failed: ', msg]]
-				ifFalse: [js global alert: 'Push failed: ', msg].
+					repo setLastOperation:
+						'Push rejected: remote has commits you don''t have locally. Use Force Push or Pull to reconcile.'
+						kind: #failure]
+				ifFalse: [
+					repo setLastOperation: 'Push failed: ', msg
+						kind: #failure].
+			refreshFromAsync.
 			nil]
 )
 respondToPull = (
@@ -2646,15 +2704,29 @@ nestedRowsFor: nDiff <Map> classPath: cpath <String> = (
 	^taggedColumn: toggles
 )
 nestedToggleFor: name <Symbol> entry: cd <Map> classPath: cpath <String> = (
+	(* Every return MUST be a toggle -- the caller (nestedRowsFor:)
+	   wraps results in taggedColumn:, which requires children to
+	   respond to tag. For #added / #removed entries there's nothing
+	   to drill into, so the toggle's collapsed and expanded views
+	   are identical -- a non-expanding placeholder that still
+	   satisfies the tagged-child protocol. *)
 	| toggle tag status display |
 	tag:: cpath, '/', name asString.
 	status:: cd at: #status ifAbsent: [#changed].
 	status = #added ifTrue: [
 		display:: '    + ', name asString, ' (new nested class)'.
-		^row: { (label: display) italic. filler}].
+		toggle:: collapsed: [row: { (label: display) italic. filler}]
+			expanded: [row: { (label: display) italic. filler}]
+			initiallyExpanded: false
+			tag: tag.
+		^toggle].
 	status = #removed ifTrue: [
 		display:: '    - ', name asString, ' (removed nested class)'.
-		^row: { (label: display) italic. filler}].
+		toggle:: collapsed: [row: { (label: display) italic. filler}]
+			expanded: [row: { (label: display) italic. filler}]
+			initiallyExpanded: false
+			tag: tag.
+		^toggle].
 	display:: '    ~ ', name asString.
 	toggle:: collapsed: [
 			row: {

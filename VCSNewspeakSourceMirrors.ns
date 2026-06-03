@@ -51,22 +51,50 @@ public children = c.
 public class ClassSourceMirror = SourceMirror (|
 	public category
 	public name <Symbol>
-	public header <String>
+	(* `header` is a ClassHeaderSourceMirror (not a raw String), so
+	   `classSourceMirror header source` matches the live
+	   ClassDeclarationMirror>>header>>source protocol. The parser /
+	   live-mirror factories wrap a header String in
+	   ClassHeaderSourceMirror at construction time. *)
+	public header <ClassHeaderSourceMirror>
 	public classes
 	public instanceMethods
 	public classMethods
+	(* Instance-side lazy slots. Class-side lazy slots aren't a thing
+	   in Newspeak so there's no classSideLazySlots. *)
+	public lazySlots
 |) (
 public children = (
 	^Array streamContents: [:stream |
-		{#name. #category. #header} do: [:each |
+		{#name. #category} do: [:each |
 			(self perform: each) ifNotNil: [:it | | stringMirror |
 				stringMirror:: StringMirror new
 					string: it;
 					yourself.
 				stream nextPut: each -> stringMirror]].
-		{#classes. #instanceMethods. #classMethods} do: [:each |
+		header isNil ifFalse: [stream nextPut: #header -> header].
+		{#classes. #lazySlots. #instanceMethods. #classMethods} do: [:each |
 			(self perform: each) ifNotNil: [:it |
 				stream nextPutAll: (it collect: [:el | each -> el])]]]
+)
+public instanceSide ^ <SideSourceMirror> = (
+	(* Synthetic side mirror grouping the instance-side members --
+	   nested classes, lazy slots, and methods -- behind the same
+	   accessors live SideMirror exposes. *)
+	^SideSourceMirror new
+		methods: (instanceMethods ifNil: [{}]);
+		lazySlots: (lazySlots ifNil: [{}]);
+		nestedClasses: (classes ifNil: [{}]);
+		yourself
+)
+public classSide ^ <SideSourceMirror> = (
+	(* Class side has methods only -- class-side nested classes are
+	   rare but legal; not modeled here yet. Add when needed. *)
+	^SideSourceMirror new
+		methods: (classMethods ifNil: [{}]);
+		lazySlots: {};
+		nestedClasses: {};
+		yourself
 )
 public filename = (
 	^name, '.ns'
@@ -107,7 +135,7 @@ streamClassBodyTo: stream = (
 	stream nextPut: ")"; cr.
 )
 streamClassHeaderTo: stream = (
-	stream nextPutAll: header
+	stream nextPutAll: header source
 )
 streamFileHeaderTo: stream = (
 	isToplevel ifFalse: [
@@ -126,11 +154,47 @@ public streamTo: stream = (
 )
 ) : (
 )
+class ClassHeaderSourceMirror = SourceMirror (|
+	(* Wraps a class header source string so that
+	   `classSourceMirror header source` matches the
+	   `liveClassMirror header source` protocol used by
+	   ClassHeaderHistorySubject. *)
+	public source
+|) (
+public children = (^{})
+public name = (^'header')
+public isKindOfClassHeaderMirror = (^true)
+public streamTo: stream = (
+	stream nextPutAll: source
+)
+) : (
+)
+class SideSourceMirror = (
+(* Lightweight stand-in for the live SideMirror. Holds collections of
+   members (methods, lazy slots, nested classes) for one side of a
+   class. Returned by ClassSourceMirror>>instanceSide / classSide. *)
+|
+	public methods
+	public lazySlots
+	public nestedClasses
+|) (
+public isKindOfSideMirror = (^true)
+) : (
+)
 class MethodSourceMirror = SourceMirror (|
 	public methodSource
 	public category
 	public accessModifier
 	public selector
+	(* Optional reference to the live MixinMirror that owns (or
+	   should own) this method. When set, the mirror is a drop-in
+	   for the live MethodMirror's read-side protocol:
+	     definingMixin asBuilder + methods addFromSource: source
+	   installs the member into that class. Used by the changeset /
+	   history machinery so #added, #removed, and #changed members
+	   can all be displayed as MemberHistoryEntryPresenters whose
+	   "Make Live" path goes through the same install pipeline. *)
+	public definingMixin <MixinMirror | Nil>
 |) (
 public children = (
 	^{}
@@ -147,6 +211,7 @@ public copy = (
 		category: category;
 		accessModifier: accessModifier;
 		selector: selector;
+		definingMixin: definingMixin;
 		yourself
 )
 public correspondsHash = (
@@ -207,6 +272,11 @@ class SlotSourceMirror = SourceMirror (|
 	public type
 	public initializer
 	public immutable
+	(* Optional reference to the live MixinMirror that owns (or
+	   should own) this slot. Same role as MethodSourceMirror's
+	   definingMixin -- when set, install routes through the live
+	   class's builder. *)
+	public definingMixin <MixinMirror | Nil>
 |) (
 public children = (
 	^{}
@@ -326,7 +396,7 @@ classDecl = ( (* WIP *)
 		classMethods:: classSide ifNotNil: [:it | it children].
 		ClassSourceMirror new
 			name: klassName;
-			header: header contents;
+			header: (ClassHeaderSourceMirror new source: header contents; yourself);
 			classes: classes;
 			instanceMethods: instanceMethods;
 			classMethods: classMethods]
@@ -349,7 +419,7 @@ classDeclaration = (
 
 		ClassSourceMirror new
 			name: klassName;
-			header: header contents;
+			header: (ClassHeaderSourceMirror new source: header contents; yourself);
 			classes: classes;
 			instanceMethods: instanceMethods;
 			classMethods: classMethods]
@@ -570,13 +640,38 @@ public mirrorForClass: klass <Class> ^<ClassSourceMirror> = (
 	^mirrorForClassDeclaration: (ClassMirror reflecting: klass) mixin declaration
 )
 mirrorForClassDeclaration: decl <ClassDeclarationMirror> ^<ClassSourceMirror> = (
-	| result = ClassSourceMirror new. |
+	(* Each child method / lazy slot is constructed without a
+	   definingMixin; setting that is the caller's responsibility
+	   (typically when wiring up SourceMirrors against a known live
+	   target class for install). The convenience factory
+	   `mirrorForLiveClass:` does set it. *)
+	| result |
+	result:: ClassSourceMirror new.
 	result category: decl header category.
 	result name: decl name.
-	result header: decl header source.
-	result classes: (decl instanceSide nestedClasses collect: [:nested | mirrorForClassDeclaration: nested]).
-	result instanceMethods: (decl instanceSide methods collect: [:method | mirrorForMethod: method]).
-	result classMethods: (decl classSide methods collect: [:method | mirrorForMethod: method]).
+	result header: (ClassHeaderSourceMirror new source: decl header source; yourself).
+	result classes: (decl instanceSide nestedClasses collect: [:nested |
+		mirrorForClassDeclaration: nested]).
+	result instanceMethods: (decl instanceSide methods collect: [:method |
+		mirrorForMethod: method]).
+	result lazySlots: (decl instanceSide lazySlots collect: [:slot |
+		mirrorForLazySlot: slot]).
+	result classMethods: (decl classSide methods collect: [:method |
+		mirrorForMethod: method]).
+	^result
+)
+public mirrorForLiveClass: klass <Class> ^<ClassSourceMirror> = (
+	(* Like mirrorForClass: but also wires each MethodSourceMirror's
+	   and SlotSourceMirror's definingMixin to the live MixinMirror
+	   so the install chain through definingMixin asBuilder works. *)
+	| classMirror mixin classSideMixin result |
+	classMirror:: ClassMirror reflecting: klass.
+	mixin:: classMirror mixin.
+	classSideMixin:: classMirror mixin classSide.
+	result:: mirrorForClassDeclaration: mixin declaration.
+	result instanceMethods do: [:m | m definingMixin: mixin].
+	result lazySlots do: [:s | s definingMixin: mixin].
+	result classMethods do: [:m | m definingMixin: classSideMixin].
 	^result
 )
 mirrorForMethod: method <MethodMirror> ^<MethodSourceMirror> = (
@@ -584,6 +679,14 @@ mirrorForMethod: method <MethodMirror> ^<MethodSourceMirror> = (
 	result methodSource: method source.
 	result accessModifier: method accessModifier.
 	result selector: method name.
+	^result
+)
+mirrorForLazySlot: slot ^<SlotSourceMirror> = (
+	| result = SlotSourceMirror new. |
+	result name: slot name.
+	result accessModifier: slot accessModifier.
+	result initializer: slot source.
+	result immutable: false.
 	^result
 )
 public mirrorForStream: stream <ReadStream> ^<ClassSourceMirror> = (

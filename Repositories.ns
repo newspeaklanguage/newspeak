@@ -1407,32 +1407,41 @@ expandedLogRowFor: entry toggle: toggle = (
 respondToInstallVersion: sha <String> = (
 	(* Re-install the top-level <Class>.ns set at sha. New classes
 	   land in Root; classes that were already in this namespace get
-	   their binding refreshed to the installed version. Other classes
-	   (not previously in the namespace) are NOT silently added --
-	   pull them in via Add to namespace if desired. Destructive
-	   (live classes at the commit are replaced); prompts first. *)
-	| confirmed |
-	confirmed:: js global confirm:
-		'Install commit ', (sha copyFrom: 1 to: 7), '?',
-		String newline,
-		'Classes will be installed into Root.', String newline,
-		'Classes already in ', subject repository namespaceKey,
-		' will have their bindings refreshed.', String newline,
-		'New classes go to Root only -- pull them into ',
-		subject repository namespaceKey, ' via Add to namespace if needed.',
-		String newline, 'Continue?'.
-	confirmed ifFalse: [^nil].
-	subject repository
+	   their binding refreshed. Destructive (live classes at the
+	   commit are replaced); routes through a confirmation. *)
+	enterSubject:: ide browsing InteractionSubject
+		confirm: 'Install commit ', (sha copyFrom: 1 to: 7), '?',
+			String newline,
+			'Classes will be installed into Root.', String newline,
+			'Classes already in ', subject repository namespaceKey,
+			' will have their bindings refreshed.', String newline,
+			'New classes go to Root only -- pull them into ',
+			subject repository namespaceKey, ' via Add to namespace if needed.',
+			String newline, 'Continue?'
+		yesLabel: 'Install'
+		onYes: [doInstallVersion: sha]
+		returnTo: subject
+)
+doInstallVersion: sha <String> = (
+	| repo |
+	repo:: subject repository.
+	repo setLastOperation:
+		'Installing commit ', (sha copyFrom: 1 to: 7), '...'
+		kind: #pending.
+	updateGUI: [].
+	repo
 		installFilesAt: sha
 		onComplete: [:installed :reboundIntoNs |
-			updateGUI: [].
-			js global alert: 'Installed ', installed printString,
+			repo setLastOperation: 'Installed ', installed printString,
 				' class(es) from ', (sha copyFrom: 1 to: 7),
 				'. ', reboundIntoNs printString,
-				' re-bound into ', subject repository namespaceKey, '.'.
+				' re-bound into ', repo namespaceKey, '.'
+				kind: #success.
+			refreshFromAsync.
 			nil]
 		onError: [:msg |
-			js global alert: msg.
+			repo setLastOperation: msg kind: #failure.
+			refreshFromAsync.
 			nil]
 )
 multilineLabelOf: text = (
@@ -1524,8 +1533,7 @@ forcePushMenuLabel: ab <Alien | Nil> ^ <String> = (
 respondToPush = (
 	(* Push local commits to the remote. First-time use for a host
 	   navigates to a prompt InteractionSubject for the PAT; subsequent
-	   pushes reuse it silently. Async result is reported via the
-	   non-modal status banner on RepositoryPresenter. *)
+	   pushes reuse it silently. Async result via the status banner. *)
 	| repo host |
 	repo:: subject repository.
 	repo remoteUrl isNil ifTrue: [
@@ -1577,11 +1585,15 @@ doPushAndReportStatus = (
 )
 respondToPull = (
 	(* FF-only pull. Non-destructive: rejects on divergence rather
-	   than overwriting either side. *)
+	   than overwriting either side. All four outcomes reported via
+	   status banner (no modals). *)
 	| repo |
 	repo:: subject repository.
 	repo remoteUrl isNil ifTrue: [
-		^js global alert: 'This repository has no remote configured.'].
+		^repo setLastOperation: 'No remote configured for this repository.'
+			kind: #failure].
+	repo setLastOperation: 'Pulling...' kind: #pending.
+	updateGUI: [].
 	repo pull
 		then: [:r |
 			| status |
@@ -1590,91 +1602,113 @@ respondToPull = (
 				loadStarted_slot:: false.
 				loadFailed_slot:: nil].
 			status = 'up-to-date' ifTrue: [
-				js global alert: 'Already up to date.'].
+				repo setLastOperation: 'Already up to date.' kind: #success].
 			status = 'fast-forwarded' ifTrue: [
-				js global alert: 'Fast-forwarded to ', ((r at: 'sha') copyFrom: 1 to: 7), '.'].
+				repo setLastOperation:
+					'Fast-forwarded to ', ((r at: 'sha') copyFrom: 1 to: 7), '.'
+					kind: #success].
 			status = 'diverged' ifTrue: [
-				js global alert:
-					'Cannot fast-forward: your local branch has commits not on the remote.',
-					String newline,
-					'Use Force Push (your state wins) or Fetch (remote state wins, local commits lost) to reconcile.'].
+				repo setLastOperation:
+					'Cannot fast-forward: local has commits not on the remote. Use Force Push (local wins) or Fetch (remote wins, local commits lost) to reconcile.'
+					kind: #failure].
+			refreshFromAsync.
 			nil]
 		onRejected: [:e |
 			| msg |
 			msg:: [e messageText] on: Exception do: [:e2 | nil].
 			msg isNil ifTrue: [msg:: e printString].
-			js global alert: 'Pull failed: ', msg.
+			repo setLastOperation: 'Pull failed: ', msg kind: #failure.
+			refreshFromAsync.
 			nil]
 )
 respondToForcePush = (
-	(* Explicit force push -- prompts up front. *)
-	| repo host confirmed |
+	(* Explicit force push -- destructive. Routes through a
+	   non-modal confirmation; outcome reported via status banner. *)
+	| repo host |
 	repo:: subject repository.
 	repo remoteUrl isNil ifTrue: [
-		^js global alert: 'This repository has no remote configured.'].
+		^repo setLastOperation: 'No remote configured for this repository.'
+			kind: #failure].
 	host:: ide repositories hostFromUrl: repo remoteUrl.
 	(ide repositories hasStoredPATForHost: host) ifFalse: [
-		^js global alert: 'No PAT stored for ', host,
-			'. Use Push to Remote first to set one.'].
-	confirmed:: js global confirm:
-		'Force push to ', host, '.', String newline,
-		'This OVERWRITES the remote history with your local commits.',
-		String newline,
-		'Any commits on the remote that you don''t have locally will be LOST.',
-		String newline, 'Continue?'.
-	confirmed ifFalse: [^nil].
-	^doPushForce
+		^repo setLastOperation:
+			'No PAT stored for ', host, '. Use Push to Remote first to set one.'
+			kind: #failure].
+	enterSubject:: ide browsing InteractionSubject
+		confirm: 'Force push to ', host, '.', String newline,
+			'This OVERWRITES the remote history with your local commits.',
+			String newline,
+			'Any commits on the remote that you don''t have locally will be LOST.',
+			String newline, 'Continue?'
+		yesLabel: 'Force Push'
+		onYes: [doPushForce]
+		returnTo: subject
 )
 doPushForce = (
-	(* Shared push-force path used by both the explicit Force Push
-	   menu item and the inline "remote diverged" follow-up. PAT is
-	   assumed to be stored by this point. *)
+	(* Shared push-force path used by the explicit Force Push menu
+	   item. PAT is assumed to be stored by this point. *)
 	| repo host |
 	repo:: subject repository.
 	host:: ide repositories hostFromUrl: repo remoteUrl.
+	repo setLastOperation: 'Force pushing to ', host, '...' kind: #pending.
+	updateGUI: [].
 	(repo pushForce: true)
 		then: [:result |
 			updateGUI: [
 				loadStarted_slot:: false.
 				loadFailed_slot:: nil].
-			js global alert: 'Force push to ', host, ' succeeded.'.
+			repo setLastOperation: 'Force push to ', host, ' succeeded.'
+				kind: #success.
+			refreshFromAsync.
 			nil]
 		onRejected: [:e |
 			| msg |
 			msg:: [e messageText] on: Exception do: [:e2 | nil].
 			msg isNil ifTrue: [msg:: e printString].
-			js global alert: 'Force push failed: ', msg.
+			repo setLastOperation: 'Force push failed: ', msg kind: #failure.
+			refreshFromAsync.
 			nil]
 )
 respondToFetch = (
-	(* Re-baseline this repo's HEAD against the remote. Any local
-	   commits not yet pushed will be lost -- prompt first since this
-	   is destructive and there's no Push affordance yet. Shows a
-	   progress notice while the fetch is in flight; resets the
-	   history cache + UI on success. *)
-	| repo confirmed |
+	(* Destructive: discards any local commits not yet pushed. Routes
+	   through a non-modal confirmation InteractionSubject; on accept
+	   the async work fires and reports through the status banner. *)
+	| repo |
 	repo:: subject repository.
 	repo remoteUrl isNil ifTrue: [
-		^js global alert: 'This repository has no remote configured.'].
-	confirmed:: js global confirm:
-		'Fetch from remote and reset local HEAD to origin/',
-		repo defaultBranch,
-		'.', String newline,
-		'Any local commits not yet pushed will be lost.', String newline,
-		'Continue?'.
-	confirmed ifFalse: [^nil].
+		^repo setLastOperation: 'No remote configured for this repository.'
+			kind: #failure].
+	enterSubject:: ide browsing InteractionSubject
+		confirm: 'Fetch from remote and reset local HEAD to origin/',
+			repo defaultBranch, '.', String newline,
+			'Any local commits not yet pushed will be lost.', String newline,
+			'Continue?'
+		yesLabel: 'Fetch and Reset'
+		onYes: [doFetchAndReportStatus]
+		returnTo: subject
+)
+doFetchAndReportStatus = (
+	| repo host |
+	repo:: subject repository.
+	host:: ide repositories hostFromUrl: repo remoteUrl.
+	repo setLastOperation: 'Fetching from ', host, '...' kind: #pending.
+	updateGUI: [].
 	repo fetchAndResetHEADToRemote
 		then: [:sha |
 			updateGUI: [
 				loadStarted_slot:: false.
 				loadFailed_slot:: nil].
-			js global alert: 'Fetched. New HEAD: ', (sha copyFrom: 1 to: 7).
+			repo setLastOperation:
+				'Fetched. Local HEAD reset to ', (sha copyFrom: 1 to: 7), '.'
+				kind: #success.
+			refreshFromAsync.
 			nil]
 		onRejected: [:e |
 			| msg |
 			msg:: [e messageText] on: Exception do: [:e2 | nil].
 			msg isNil ifTrue: [msg:: e printString].
-			js global alert: 'Fetch failed: ', msg.
+			repo setLastOperation: 'Fetch failed: ', msg kind: #failure.
+			refreshFromAsync.
 			nil]
 )
 respondToCommit = (

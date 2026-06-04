@@ -3110,6 +3110,10 @@ public methodModel ^ <MethodModel> = (
 public methodMirror ^ <MethodMirror> = (
   ^methodModel methodMirror
 )
+public memberMirror = (
+  (* The mirror EntrySubjects need to drive kind dispatch + install. *)
+  ^methodMirror
+)
 public repo = (
   ^model repo
 )
@@ -3165,6 +3169,7 @@ public lazySlotModel = (
 public slotMirror = (
   ^lazySlotModel slotMirror
 )
+public memberMirror = (^slotMirror)
 public repo = (
   ^model repo
 )
@@ -3217,6 +3222,7 @@ public createPresenter ^ <Presenter> = (
 public classMirror = (
   ^model classMirror
 )
+public memberMirror = (^classMirror)
 public repo = (
   ^model repo
 )
@@ -3453,7 +3459,7 @@ expandedFor: entry toggle: toggle = (
   timestamp:: ((entry at: 'commit') at: 'author') at: 'timestamp'.
   dateStr:: formatTimestamp: timestamp.
   path:: subject draftPath.
-  entrySubject:: state subjectFor: entry path: path parent: subject.
+  entrySubject:: state subjectFor: entry path: path memberMirror: subject memberMirror.
   ensureVersionSourceFor: entrySubject path: path sha: sha.
   ^column: {
     row: {
@@ -3577,11 +3583,17 @@ messagesComputed_slot ::= false.
 public createPresenter ^ <Presenter> = (
   ^MemberHistoryEntryPresenter onSubject: self
 )
-public parentSubject = (^model parentSubject)
+public memberMirror = (^model memberMirror)
 public entry = (^model entry)
 public path = (^model path)
 public sha = (^entry at: 'oid')
-public shortSha ^ <String> = (^sha copyFrom: 1 to: 7)
+public shortSha ^ <String> = (
+  (* Bound the upper index by sha size. The live history flow always
+     hands us a full 40-char git oid; the changeset flow synthesises
+     a shorter pseudo-oid (e.g. 'HEAD'). primordialsoup's String>>
+     copyFrom:to: raises ArgumentError when `to > size`. *)
+  ^sha copyFrom: 1 to: (7 min: sha size)
+)
 public commitMessage ^ <String> = (
   ^(entry at: 'commit') at: 'message'
 )
@@ -3593,7 +3605,32 @@ public versionSource: src <String> = (versionSource_slot:: src)
 public editor = (^editor_slot)
 public editor: cm = (editor_slot:: cm)
 public installEdits: text <String> = (
-  parentSubject installHistoricalSource: text
+  (* Install `text` as the new live source of the member this entry
+     is a version of. Dispatches on memberMirror's kind: methods and
+     lazy slots install through the defining mixin's builder; class
+     declarations install through the declaration's own builder
+     mutating its header source. Mirrors the old parent-delegated
+     installHistoricalSource: paths (MethodHistorySubject,
+     LazySlotHistorySubject, ClassHeaderHistorySubject) -- moved here
+     once the parent disappeared. *)
+  | mirror |
+  mirror:: memberMirror.
+  mirror isKindOfMethodMirror ifTrue: [
+    | builder |
+    builder:: mirror definingMixin asBuilder.
+    builder methods addFromSource: text.
+    ^ide installFromBuilders: {builder declaration}].
+  mirror isKindOfLazySlotMirror ifTrue: [
+    | builder |
+    builder:: mirror definingMixin asBuilder.
+    builder lazySlots addFromSource: text.
+    ^ide installFromBuilders: {builder declaration}].
+  mirror isKindOfClassDeclarationMirror ifTrue: [
+    | b |
+    b:: mirror asBuilder.
+    b header source: text.
+    ^ide installFromBuilders: {b}].
+  Error signal: 'MemberHistoryEntrySubject>>installEdits: unrecognized memberMirror kind'
 )
 public messages ^ <List[Symbol] | Nil> = (
   (* Lazily compiles versionSource against the live defining mixin and
@@ -3608,22 +3645,22 @@ public messages ^ <List[Symbol] | Nil> = (
   ^messages_slot
 )
 computeMessages ^ <List[Symbol] | Nil> = (
-  | parent |
-  parent:: parentSubject.
-  parent isKindOfMethodHistorySubject ifTrue: [
+  | mirror |
+  mirror:: memberMirror.
+  mirror isKindOfMethodMirror ifTrue: [
     | imeth |
     imeth:: compiler
       compileMethodSource: versionSource_slot
-      within: parent methodMirror definingMixin.
+      within: mirror definingMixin.
     ^selectorsInBytes: imeth bytes literals: imeth literals].
-  parent isKindOfLazySlotHistorySubject ifTrue: [
+  mirror isKindOfLazySlotMirror ifTrue: [
     | islot init |
     islot:: compiler
       compileLazySlotSource: versionSource_slot
-      within: parent slotMirror definingMixin.
+      within: mirror definingMixin.
     init:: islot intermediateInitMethod.
     ^selectorsInBytes: init bytes literals: init literals].
-  parent isKindOfClassHeaderHistorySubject ifTrue: [
+  mirror isKindOfClassDeclarationMirror ifTrue: [
     ^computeHeaderMessages].
   ^nil
 )
@@ -3700,6 +3737,32 @@ isMyKind: f <Subject> ^ <Boolean> = (
   ^f isKindOfMemberHistoryEntrySubject
 )
 ) : (
+public forChangesetVersionSource: src <String>
+  memberMirror: mm
+  path: path <String>
+  commitOid: oid <String>
+  commitMessage: msg <String>
+  commitTimestamp: ts <Integer>
+  ^ <MemberHistoryEntrySubject> = (
+  (* Build an EntrySubject for a changeset (HEAD vs live) row, where
+     no real isomorphic-git log entry exists. Synthesizes the
+     {oid, commit/message, commit/author/timestamp} Map the EntrySubject
+     reads, pre-seats versionSource, and hands back the subject ready
+     to drive a MemberHistoryEntryPresenter. *)
+  | entry commit author subject |
+  entry:: Map new.
+  entry at: 'oid' put: oid.
+  commit:: Map new.
+  commit at: 'message' put: msg.
+  author:: Map new.
+  author at: 'timestamp' put: ts.
+  commit at: 'author' put: author.
+  entry at: 'commit' put: commit.
+  subject:: self onModel:
+    (MemberHistoryEntryModel entry: entry memberMirror: mm path: path).
+  subject versionSource: src.
+  ^subject
+)
 )
 public class MemberHistoryEntryPresenter onSubject: s <MemberHistoryEntrySubject>
   = ProgrammingPresenter onSubject: s (
@@ -3723,7 +3786,7 @@ public class MemberHistoryEntryPresenter onSubject: s <MemberHistoryEntrySubject
    historical blob when the request matches. Writes still install to
    live (Make Live semantic), matching the button next to them.
 
-   Colorization dispatches on the parent subject's isKindOf*. *)
+   Colorization dispatches on the entry's memberMirror.isKindOf*. *)
 ) (
 public isKindOfMemberHistoryEntryPresenter ^ <Boolean> = (^true)
 isMyKind: f <Fragment> ^ <Boolean> = (
@@ -3733,6 +3796,7 @@ definition = (
   subject versionSource isNil ifTrue: [
     ^label: 'Loading source...'].
   ^column: {
+    helpSection.
     ensureEditor.
     mediumBlank.
     row: {
@@ -3743,12 +3807,62 @@ definition = (
       smallBlank.
       aiChatButton: [installHistoryFocusAction]
         ifFocused: [ide aiSupport
-          isFocusedOnHistory: subject parentSubject
+          isFocusedOnHistory: subject memberMirror
           sha: subject sha].
+      smallBlank.
+      helpButton.
+      smallBlank.
+      dropDownMenu: [entryMenu].
       filler
     }.
     chatSection
   }
+)
+entryMenu = (
+  ^menuWithLabelsAndActions: {
+    {'Inspect Presenter'. [respondToInspectPresenter]}
+  }
+)
+helpText = (
+  | mapping = Map new. kind |
+  kind:: memberKindLabel.
+  mapping
+    at: #hopscotchHelpButton put: helpButton;
+    at: #hopscotchReferencesButton put:
+      (dropDownMenu: [messagesMenu] image: ide images itemReferencesImage);
+    at: #hopscotchMenu put: (dropDownMenu: [entryMenu]).
+  ^ampleforth: 'This is an entry presenter for one version of a ', kind, '.
+The editor below shows the source for that version. Editing the text
+puts the editor into pending-edit mode (accept / cancel appear).
+<br><br>
+<b>Make Live</b> installs whatever''s currently in the editor as the
+new live source for this ', kind, ' -- the same install path used
+elsewhere in the IDE. Cancel resets the editor to the version''s
+original source.
+<br><br>
+Controls in the row below the editor, from left to right:
+<ul>
+<li><b>Make Live</b> -- install editor text as the new live ', kind, '.</li>
+<li><div class="hopscotchReferencesButton"></div> -- menu of selectors
+sent from this version, each navigable.</li>
+<li>AI chat button -- focus the IDE chat on this historical version
+(its sha + source). Source-reading tools fan out to the version''s
+blob; writes still install live, matching <b>Make Live</b>.</li>
+<li><div class="hopscotchHelpButton"></div> -- show this help message.</li>
+<li><div class="hopscotchMenu"></div> -- additional operations
+(<em>Inspect Presenter</em>).</li>
+</ul>
+' mapping: mapping
+)
+memberKindLabel = (
+  (* Dispatched off the entry's memberMirror so we can describe what
+     kind of thing this entry is in the help text. *)
+  | mirror |
+  mirror:: subject memberMirror.
+  mirror isKindOfMethodMirror ifTrue: [^'method'].
+  mirror isKindOfLazySlotMirror ifTrue: [^'lazy slot'].
+  mirror isKindOfClassDeclarationMirror ifTrue: [^'class header'].
+  ^'member'
 )
 installHistoryFocusAction = (
   ide aiSupport setHistoryFocusOnEntry: subject.
@@ -3788,11 +3902,12 @@ referencesMenuMessageItems: msgs <List[Symbol]> ^ <List> = (
 )
 parentMemberName = (
   (* Skip the entry's own name when listing its sends, so we don't
-     suggest "find senders of foo" from inside foo. *)
-  | parent |
-  parent:: subject parentSubject.
-  parent isKindOfMethodHistorySubject ifTrue: [^parent methodMirror name].
-  parent isKindOfLazySlotHistorySubject ifTrue: [^parent slotMirror name].
+     suggest "find senders of foo" from inside foo. Class-header
+     entries don't have a single member name to skip; nil. *)
+  | mirror |
+  mirror:: subject memberMirror.
+  mirror isKindOfMethodMirror ifTrue: [^mirror name].
+  mirror isKindOfLazySlotMirror ifTrue: [^mirror name].
   ^nil
 )
 ensureEditor ^ <CodeMirrorFragment> = (
@@ -3815,24 +3930,24 @@ ensureEditor ^ <CodeMirrorFragment> = (
   ^subject editor
 )
 colorizeSource: src <String> withEditor: cm <CodeMirrorFragment> = (
-  (* Colorization is presentation; kind-dispatch on the parent
-     subject. *)
-  | parent |
-  parent:: subject parentSubject.
-  parent isKindOfMethodHistorySubject ifTrue: [
+  (* Colorization is presentation; kind-dispatch on the entry's
+     memberMirror. *)
+  | mirror |
+  mirror:: subject memberMirror.
+  mirror isKindOfMethodMirror ifTrue: [
     ^ide colorizer
       colorizeMethod: src
-      fromClass: parent methodMirror definingMixin declaration
+      fromClass: mirror definingMixin declaration
       via: (colorizingBlockFor: cm)].
-  parent isKindOfLazySlotHistorySubject ifTrue: [
+  mirror isKindOfLazySlotMirror ifTrue: [
     ^ide colorizer
       colorizeLazySlot: src
-      fromClass: parent slotMirror definingMixin declaration
+      fromClass: mirror definingMixin declaration
       via: (colorizingBlockFor: cm)].
-  parent isKindOfClassHeaderHistorySubject ifTrue: [
+  mirror isKindOfClassDeclarationMirror ifTrue: [
     ^ide colorizer
       colorizeHeader: src
-      fromClass: parent classMirror
+      fromClass: mirror
       via: (colorizingBlockFor: cm)]
 )
 installAndResetEditor: ed <CodeMirrorFragment> = (
@@ -3879,13 +3994,13 @@ entries = (
   entries_slot isNil ifTrue: [entries_slot:: Map new].
   ^entries_slot
 )
-public subjectFor: entry path: path <String> parent: parentSubject
+public subjectFor: entry path: path <String> memberMirror: mm
   ^ <MemberHistoryEntrySubject> = (
   | sha |
   sha:: entry at: 'oid'.
   ^entries at: sha ifAbsentPut: [
     MemberHistoryEntrySubject onModel:
-      (MemberHistoryEntryModel entry: entry parent: parentSubject path: path)]
+      (MemberHistoryEntryModel entry: entry memberMirror: mm path: path)]
 )
 public isKindOfMemberHistoryPresenterState ^ <Boolean> = (^true)
 ) : (
@@ -7269,13 +7384,27 @@ public repo = r.
 public isKindOfClassHeaderHistoryModel ^ <Boolean> = (^true)
 ) : (
 )
-public class MemberHistoryEntryModel entry: e parent: p path: pa = (
+public class MemberHistoryEntryModel entry: e memberMirror: mm path: pa = (
 (* Triple held by a MemberHistoryEntrySubject: the git log entry, the
-   parent MemberHistorySubject (for protocol delegation and isKindOf*
-   dispatch), and the draft file path. *)
+   member mirror this entry is a version of, and the draft file path.
+
+   memberMirror is uniform across live-history and changeset use:
+     * Live history: the MethodMirror / LazySlotMirror /
+       ClassDeclarationMirror of the live member being browsed.
+     * Changeset: same shape (the live mirror of the member the
+       changeset row is about), or a SourceMirror variant for cases
+       where there's no corresponding live member.
+
+   Both flavours respond to isKindOfMethodMirror /
+   isKindOfLazySlotMirror / isKindOfClassDeclarationMirror, expose
+   definingMixin (method / slot) or asBuilder (class declaration),
+   and have a name. That uniform protocol -- aligned in Phase 1-3 of
+   the MemoryHole port -- is what lets the EntrySubject + Presenter
+   drive off the mirror directly instead of delegating to a parent
+   history subject. *)
 |
 public entry = e.
-public parentSubject = p.
+public memberMirror = mm.
 public path <String> = pa.
 |
 ) (

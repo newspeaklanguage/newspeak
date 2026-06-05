@@ -293,7 +293,11 @@ respondToRunApp: paused = (
   subject runApp: paused
 )
 deployAsNSO = (
-	subject deployAsNSO
+  (* The serialize-then-download runs inside the Save click. For most NSO
+     outputs this fits within the activation window; for very large apps
+     it may not (Phase B concern, same shape as vfuel-of-the-IDE). *)
+  confirmSave: 'Deploy ', subject name, ' as Newspeak Object?'
+     saving: [subject deployAsNSO]
 )
 public deployAction = (
 	subject isApplicationConfiguration ifFalse: [^nothing].
@@ -315,27 +319,51 @@ deployAsWebPageWithMirrorBuilders = (
   deployAsWebPageWithRuntimeConfig: ide deployment RuntimeWithMirrorBuilders
 )
 deployAsWebPageWithRuntimeConfig: runtimeClass <Class> = (
-| 
-deployment <DeploymentManager JSPackager JSDeployment> = 
+|
+deployment <DeploymentManager JSPackager JSDeployment> =
   (ide deployment jsPackagerForPlatform: cachedPlatform)
 		packageApplicationConfiguration: (ide namespacing Root at: subject name)
 		withRuntimeConfiguration: runtimeClass
 		usingNamespace: ide namespacing Root.
 |
-  (* Now zip deployment and download it. Maybe try and open the URI afterwards *)
-  deployment save.
-  )
+  confirmSave: 'Compiled ', subject name, '. Save the deployment?'
+     saving: [deployment save]
+)
 deployAsVictoryFuelWithMirrors = (
-      | bytes = subject bytesForVictoryFuelWithMirrors. |
-  	ide webFiles downloadFileName: subject name, '.vfuel' fromBytes: bytes.
+  | bytes = subject bytesForVictoryFuelWithMirrors. |
+  confirmSave: 'Snapshotted ', subject name, ' (with mirrors). Save VictoryFuel?'
+     saving: [ide webFiles downloadFileName: subject name, '.vfuel' fromBytes: bytes]
 )
 deployAsVictoryFuelWithHopscotch = (
-      | bytes = subject bytesForVictoryFuelWithHopscotch. |
-  	ide webFiles downloadFileName: subject name, '.vfuel' fromBytes: bytes.
+  | bytes = subject bytesForVictoryFuelWithHopscotch. |
+  confirmSave: 'Snapshotted ', subject name, ' (with Hopscotch). Save VictoryFuel?'
+     saving: [ide webFiles downloadFileName: subject name, '.vfuel' fromBytes: bytes]
 )
 deployAsVictoryFuel = (
-	| bytes = subject bytesForVictoryFuel. |
-  	ide webFiles downloadFileName: subject name, '.vfuel' fromBytes: bytes.
+  | bytes = subject bytesForVictoryFuel. |
+  confirmSave: 'Snapshotted ', subject name, '. Save VictoryFuel?'
+     saving: [ide webFiles downloadFileName: subject name, '.vfuel' fromBytes: bytes]
+)
+confirmSave: msg <String> saving: saveBlock <[]> = (
+  (* Chrome enforces a transient-activation window for downloads. Any
+     compute / serialize work that runs in the deploy menu click can
+     exhaust that window before the actual file write. Route the file
+     write through a confirmation Subject so the user's click on Save
+     provides fresh activation.
+
+     Phase A (here): saveBlock runs from the Save click. Work inside
+     the block (zip generation, large serializations) can still exceed
+     the fresh activation window for IDE-sized outputs.
+
+     Phase B (TODO): pre-prepare the bytes / blob in the deploy click
+     and have saveBlock just write them; or use the File System Access
+     API to pre-pick a destination handle before the long work and
+     write asynchronously when it's ready. *)
+  enterSubject:: ide browsing InteractionSubject
+     confirm: msg
+     yesLabel: 'Save'
+     onYes: saveBlock
+     returnTo: subject.
 )
 ) : (
 )
@@ -432,11 +460,12 @@ class ClassFactoryPresenter onSubject: s <ClassFactorySubject> = MethodPresenter
  | toggle <ToggleComposer>  public showClassName <Boolean> ::= false. |
 ) (
 installHistory = (
-    (* Override MethodPresenter>>installHistory: class headers wrap a
-       ClassDeclarationMirror in ClassHeaderHistoryModel, not a method. *)
+    (* Override MethodPresenter>>installHistory: class headers carry a
+       ClassDeclarationMirror. Wrap in the multi-repo presenter so
+       drafts AND any tracking permanent repos appear. *)
     historyHolder content:
-        (ClassHeaderHistorySubject onModel:
-            (ClassHeaderHistoryModel classMirror: subject classMirror repo: ide drafts))
+        (MemberRepoHistorySubject onModel:
+            (MemberRepoHistoryModel forClassMirror: subject classMirror))
                 createPresenter
 )
 changeResponse ^ <[:CodeMirrorFragment :Event]> = (
@@ -2042,8 +2071,8 @@ public class LazySlotPresenter onSubject: s <LazySlotSubject> = ProgrammingPrese
 public historySection = (^historyHolder)
 installHistory = (
     historyHolder content:
-        (LazySlotHistorySubject onModel:
-            (LazySlotHistoryModel lazySlotModel: subject slotModel repo: ide drafts))
+        (MemberRepoHistorySubject onModel:
+            (MemberRepoHistoryModel forLazySlotModel: subject slotModel))
                 createPresenter
 )
 toggleHistory = (
@@ -2099,6 +2128,17 @@ errorDisplay: msg <String> ^ <Fragment> = (
 errorMessages ^ <Array[Fragment]> = (
   ^(subject errorMessages collect: [:msg <String> |
        errorDisplay: msg
+    ]) asArray.
+)
+typeErrorDisplay: msg <String> ^ <Fragment> = (
+  ^row: {
+    (label: msg) color: (Color r: 0.7 g: 0 b: 0).
+    button: 'Clear' action: [updateGUI: [subject typeErrorMessages remove: msg]]
+  }
+)
+typeErrorMessages ^ <Array[Fragment]> = (
+  ^(subject typeErrorMessages collect: [:msg <String> |
+       typeErrorDisplay: msg
     ]) asArray.
 )
 editorDefinition  ^ <CodeMirrorFragment | EvaluatorPresenter> = (
@@ -2161,6 +2201,7 @@ acceptResponse ^ <[:CodeMirrorFragment :Event]> = (
 				canonical:: ide prettyPrintLazySlotOr: ed textBeingAccepted.
 				b lazySlots addFromSource: canonical.
 				ide  installFromBuilders: {b declaration}.
+				subject clearTypeErrors.
 				ed text: canonical.
 				colorizeLazySlotSource: (crToLf: canonical) withEditor: ed.
 				ed leaveEditState] on: Error do:  [:ex <Exception> | ed showMessage: ex printString]
@@ -2214,6 +2255,37 @@ respondToAddSlotWorkspace = (
   subject threadForExemplar: subject exemplar.
   updateGUI: [subject addSlotWorkspace]
 )
+respondToTypecheckSlot = (
+    (* Run the typechecker on the current lazy-slot source (editor buffer
+       if non-empty, else the installed source) and surface results in
+       the typeErrorMessages banner column below the editor. *)
+    | ed source typed klass errs failureMessage |
+    ed:: slotEditor.
+    typed:: ed isNil ifTrue: [nil] ifFalse: [ed textBeingAccepted].
+    source:: (typed isNil or: [typed isEmpty])
+        ifTrue: [subject source]
+        ifFalse: [typed].
+    klass:: subject classDeclaration applyToObject reflectee.
+    subject clearTypeErrors.
+    failureMessage:: nil.
+    errs:: [ide freshTypechecker typecheckLazySlot: source ofClass: klass]
+        on: Error do: [:e |
+            failureMessage:: 'Typechecker failed: ', e printString.
+            nil
+        ].
+    updateGUI: [
+        failureMessage isNil ifFalse: [
+            subject typeErrorMessages add: failureMessage
+        ] ifTrue: [
+            errs isEmpty
+                ifTrue: [subject typeErrorMessages add: 'No type errors.']
+                ifFalse: [errs do: [:e |
+                    subject typeErrorMessages add:
+                        'Type error: ', e message, ' [', e start printString, '-', e end printString, ']'
+                ]]
+        ]
+    ]
+)
 public definition ^ <Fragment> = (
 	| toggle |
 	toggle::
@@ -2223,6 +2295,7 @@ public definition ^ <Fragment> = (
 			slotHeader: [toggle collapse].
 			editorDefinition.
             column: errorMessages.
+            column: typeErrorMessages.
             subject hasSlotWorkspace
                ifTrue: [subject workspace presenter]
                ifFalse: [nothing].
@@ -2343,6 +2416,8 @@ slotMenuFor: slotName <String> = (
 		#separator.
 		{'Pretty Print'. [respondToPrettyPrint]}.
 		#separator.
+		{'Typecheck'. [respondToTypecheckSlot]}.
+		#separator.
 		{'Inspect Presenter'. [respondToInspectPresenter]}
 	}.
     |
@@ -2375,9 +2450,10 @@ referencesMenuMessageItems = (
 )
 public class LazySlotSubject onLazySlotModel: mm <LazySlotModel | ClassModel> = Subject onModel: mm (
 (* Manages the UI for a lazy slot definition. Not be confused with LazyObjectSlotSubject, which deals with lazy slots storage. *)
-| 
-public errorMessages <Set[String]> = Set new. 
-public exemplars <List[String]> = computeExemplars.  
+|
+public errorMessages <Set[String]> = Set new.
+public typeErrorMessages <Set[String]> = Set new.
+public exemplars <List[String]> = computeExemplars.
 public exemplar <String>
 evaluator_slot <EvaluationSubject>
 workspace_slot <EvaluationSubject>
@@ -2408,6 +2484,9 @@ public source ^ <String> = (
 )
 public clearErrors = (
   errorMessages removeAll: errorMessages
+)
+public clearTypeErrors = (
+  typeErrorMessages removeAll: typeErrorMessages
 )
 public delete = (
 	| b <MixinBuilder> = slotMirror definingMixin asBuilder. |
@@ -2546,13 +2625,14 @@ public class MethodPresenter onSubject: s <MethodSubject> = ProgrammingPresenter
 ) (
 public historySection = (^historyHolder)
 installHistory = (
-    (* Embed the MethodHistoryPresenter directly in the holder. No
-       outer toggle: the history button itself is the toggle (see
-       toggleHistory), and the embedded presenter has its own
-       per-row toggles for individual entries. *)
+    (* Embed the multi-repo history presenter directly. The history
+       button itself is the toggle (see toggleHistory); the embedded
+       presenter has its own per-row toggles for individual entries
+       and (when multiple repos are present) a chip row to pick which
+       permanent repo to expand alongside drafts. *)
     historyHolder content:
-        (MethodHistorySubject onModel:
-            (MethodHistoryModel methodModel: subject methodModel repo: ide drafts))
+        (MemberRepoHistorySubject onModel:
+            (MemberRepoHistoryModel forMethodModel: subject methodModel))
                 createPresenter
 )
 toggleHistory = (
@@ -2630,6 +2710,17 @@ errorMessages ^ <Array[Fragment]> = (
        errorDisplay: msg
     ]) asArray.
 )
+typeErrorDisplay: msg <String> ^ <Fragment> = (
+  ^row: {
+    (label: msg) color: (Color r: 0.7 g: 0 b: 0).
+    button: 'Clear' action: [updateGUI: [subject typeErrorMessages remove: msg]]
+  }
+)
+typeErrorMessages ^ <Array[Fragment]> = (
+  ^(subject typeErrorMessages collect: [:msg <String> |
+       typeErrorDisplay: msg
+    ]) asArray.
+)
 acceptResponse ^ <[:CodeMirrorFragment :Event]> = (
 	^ [:ed <CodeMirrorFragment> :event <Event> |
 		| b <MixinBuilder> = subject methodMirror definingMixin asBuilder.
@@ -2639,6 +2730,7 @@ acceptResponse ^ <[:CodeMirrorFragment :Event]> = (
 				canonical:: ide prettyPrintMethodOr: ed textBeingAccepted.
 				b methods addFromSource: canonical.
 				ide  installFromBuilders: {b declaration}.
+				subject clearTypeErrors.
 				ed text: canonical.
 				colorizeMethodSource: (crToLf: canonical) withEditor: ed.
 				ed leaveEditState] on: Error do:  [:ex <Exception> | ed showMessage: ex printString]
@@ -2682,6 +2774,8 @@ methodMenuFor: methodName <String> = (
         {'Delete #', methodName. [updateGUI: [subject delete]]}.
 		#separator.
 		{'Pretty Print'. [respondToPrettyPrint]}.
+		#separator.
+		{'Typecheck'. [respondToTypecheck]}.
 		#separator.
 		{'Inspect Presenter'. [respondToInspectPresenter]}
 	}.
@@ -2729,6 +2823,37 @@ evaluatorDefinition ^ <EvaluatorPresenter> = (
 respondToAddMethodWorkspace = (
   subject threadForExemplar: subject exemplar.
   updateGUI: [subject addMethodWorkspace]
+)
+respondToTypecheck = (
+    (* Run the typechecker on the current method source (editor buffer
+       if non-empty, else the installed source) and surface results in
+       the typeErrorMessages banner column below the editor. *)
+    | ed source typed klass errs failureMessage |
+    ed:: methodEditor.
+    typed:: ed isNil ifTrue: [nil] ifFalse: [ed textBeingAccepted].
+    source:: (typed isNil or: [typed isEmpty])
+        ifTrue: [subject source]
+        ifFalse: [typed].
+    klass:: subject classDeclaration applyToObject reflectee.
+    subject clearTypeErrors.
+    failureMessage:: nil.
+    errs:: [ide freshTypechecker typecheckMethodSource: source ofClass: klass]
+        on: Error do: [:e |
+            failureMessage:: 'Typechecker failed: ', e printString.
+            nil
+        ].
+    updateGUI: [
+        failureMessage isNil ifFalse: [
+            subject typeErrorMessages add: failureMessage
+        ] ifTrue: [
+            errs isEmpty
+                ifTrue: [subject typeErrorMessages add: 'No type errors.']
+                ifFalse: [errs do: [:e |
+                    subject typeErrorMessages add:
+                        'Type error: ', e message, ' [', e start printString, '-', e end printString, ']'
+                ]]
+        ]
+    ]
 )
 debugExemplar: e <String> (* :exemplar1: debugExemplar: 'definition' *) = (
    | 
@@ -2861,7 +2986,8 @@ public definition ^ <Fragment> = (
 			methodHeader: [toggle collapse].
 			editorDefinition.
             column: errorMessages.
-            subject hasMethodWorkspace 
+            column: typeErrorMessages.
+            subject hasMethodWorkspace
                ifTrue: [subject workspace presenter]
                ifFalse: [nothing].
 		}]
@@ -2899,9 +3025,10 @@ referencesMenuMessageItems = (
 )
 public class MethodSubject onMethodModel: mm <MethodModel | ClassModel> = Subject onModel: mm (
 (* Manages the UI for a method. *)
-| 
-public errorMessages <Set[String]> = Set new. 
-public exemplars <List[String]> = computeExemplars.  
+|
+public errorMessages <Set[String]> = Set new.
+public typeErrorMessages <Set[String]> = Set new.
+public exemplars <List[String]> = computeExemplars.
 public exemplar <String>
 evaluator_slot <EvaluationSubject>
 workspace_slot <EvaluationSubject>
@@ -2935,6 +3062,9 @@ public source ^ <String> = (
 )
 public clearErrors = (
   errorMessages removeAll: errorMessages
+)
+public clearTypeErrors = (
+  typeErrorMessages removeAll: typeErrorMessages
 )
 public delete = (
 	| b <MixinBuilder> = methodMirror definingMixin asBuilder. |
@@ -3261,6 +3391,236 @@ memberPathName: cd ^ <String> = (
 )
 ) : (
 )
+public class MemberRepoHistorySubject onModel: m <MemberRepoHistoryModel>
+  = ProgrammingSubject onModel: m (
+(* Multi-repo wrapper around a single member's history. Holds the
+   repo-agnostic identity (kind + target via the model); the
+   presenter walks ide drafts (always) plus every Repository in Root
+   whose namespace currently contains the member's defining class
+   (`trackingRepos`), and stacks a collapsible per-repo
+   ToggleComposer per repo. Order is permanent-first / drafts-last
+   so time flows downward toward the live version.
+   Historical-only repos (have commits but don't currently track the
+   class) are not yet surfaced -- Phase-2 follow-up. *)
+) (
+public createPresenter ^ <Presenter> = (
+  ^MemberRepoHistoryPresenter onSubject: self
+)
+public kind ^ <Symbol> = (^model kind)
+public target = (^model target)
+public draftsRepo = (^ide drafts)
+public memberKindLabel ^ <String> = (
+  model kind = #method ifTrue: [^'method'].
+  model kind = #lazySlot ifTrue: [^'lazy slot'].
+  model kind = #classHeader ifTrue: [^'class header'].
+  ^'member'
+)
+public definingClass ^ <ClassDeclarationMirror> = (
+  (* The live ClassDeclarationMirror that owns this member -- used to
+     decide which Repositories track the member. Methods / slots reach
+     through their definingMixin; class headers ARE the class. *)
+  model kind = #method ifTrue: [^model target methodMirror definingMixin declaration].
+  model kind = #lazySlot ifTrue: [^model target slotMirror definingMixin declaration].
+  ^model target  (* classMirror *)
+)
+public memberName ^ <Symbol | Nil> = (
+  (* The selector / slot name we'd filter by inside a multi-member
+     repo file. Nil for class headers (they're the whole declaration
+     and any commit touching the file is relevant). *)
+  model kind = #method ifTrue: [^model target methodMirror name].
+  model kind = #lazySlot ifTrue: [^model target slotMirror name].
+  ^nil
+)
+public title ^ <String> = (
+  | cd kind nameStr classPath |
+  cd:: definingClass.
+  kind:: memberKindLabel.
+  nameStr:: memberName isNil ifTrue: [''] ifFalse: [' >> ', memberName asString].
+  classPath:: qualifiedNameOf: cd.
+  ^'History: ', classPath, nameStr, ' (', kind, ')'
+)
+qualifiedNameOf: cd ^ <String> = (
+  (* Dotted enclosing-class chain, e.g. "MirrorsForJS.MixinBuilder".
+     Mirrors the helper of the same name in AI_IDE_Support and the
+     existing per-kind HistorySubjects so the outer banner matches
+     what the inner presenter would have shown. *)
+  | names path c |
+  names:: List new.
+  c:: cd.
+  [c isNil] whileFalse: [
+    names add: c simpleName asString.
+    c:: c enclosingClass].
+  path:: ''.
+  names size to: 1 by: -1 do: [:i |
+    path:: path, (names at: i).
+    i > 1 ifTrue: [path:: path, '.']].
+  ^path
+)
+public trackingRepos ^ <List[Repository]> = (
+  (* Permanent repos in Root whose namespace currently contains the
+     defining class. drafts is NOT included here -- the presenter
+     always shows drafts separately. *)
+  | className result |
+  className:: definingClass simpleName.
+  result:: List new.
+  ide namespacing Root keysAndValuesDo: [:key :value |
+    (value isKindOfRepository
+      and: [(value namespace at: className ifAbsent: [nil]) isNil not])
+        ifTrue: [result add: value]].
+  ^result
+)
+public historyModelFor: repo = (
+  (* Build the appropriate per-repo *HistoryModel for this member,
+     so we can hand it to the per-repo *HistorySubject + MemberHistory-
+     Presenter. *)
+  model kind = #method ifTrue: [
+    ^MethodHistoryModel methodModel: model target repo: repo].
+  model kind = #lazySlot ifTrue: [
+    ^LazySlotHistoryModel lazySlotModel: model target repo: repo].
+  ^ClassHeaderHistoryModel classMirror: model target repo: repo
+)
+public historySubjectFor: repo = (
+  | hm |
+  hm:: historyModelFor: repo.
+  model kind = #method ifTrue: [^MethodHistorySubject onModel: hm].
+  model kind = #lazySlot ifTrue: [^LazySlotHistorySubject onModel: hm].
+  ^ClassHeaderHistorySubject onModel: hm
+)
+public isKindOfMemberRepoHistorySubject ^ <Boolean> = (^true)
+isMyKind: f <Subject> ^ <Boolean> = (
+  ^f isKindOfMemberRepoHistorySubject
+)
+) : (
+)
+public class MemberRepoHistoryPresenter onSubject: s
+  = ProgrammingPresenter onSubject: s (
+(* Multi-repo history surface. The outer banner identifies the member
+   (with full dotted class path). Below it, each repo gets a
+   collapsible ToggleComposer:
+     - Collapsed: "Repository: <name>" row.
+     - Expanded: an embedded MemberHistoryPresenter rendering its
+       own slim toolbar (expand/collapse-all/refresh/help/menu
+       scoped to the version list) + the version list itself.
+   The outer toolbar (expand/collapse-all + help + menu) operates on
+   the per-repo toggles -- expandAll expands every repo, collapseAll
+   closes them. Per-repo expand/collapse-all is delegated downwards
+   to the embedded MemberHistoryPresenter.
+   Repos are listed oldest-first: permanent (committed) repos at top,
+   drafts at the bottom -- time flows downward toward the live
+   version. *)
+|
+(* Cached taggedColumn of the per-repo ToggleComposers so expandAll /
+   collapseAll can iterate via childrenDo:, mirroring MemberHistory-
+   Presenter>>contentListSlot. Recomputed on each definition pass;
+   that's fine since the toggles' own state (expanded vs collapsed)
+   is held inside taggedColumn's updateVisualsFromSameKind: dance. *)
+repoTogglesSlot
+|
+) (
+public isKindOfMemberRepoHistoryPresenter ^ <Boolean> = (^true)
+isMyKind: f <Fragment> ^ <Boolean> = (
+  ^f isKindOfMemberRepoHistoryPresenter
+)
+definition = (
+  | permanent toggles |
+  permanent:: subject trackingRepos.
+  toggles:: List new.
+  permanent do: [:r | toggles add: (repoToggleFor: r)].
+  toggles add: (repoToggleFor: subject draftsRepo).
+  repoTogglesSlot:: taggedColumn: toggles.
+  ^column: {
+    helpSection.
+    majorHeadingBlock: (
+      row: {
+        (label: subject title) bold.
+        filler.
+        expandButtonWithAction: [expandAll].
+        defaultBlank.
+        collapseButtonWithAction: [collapseAll].
+        defaultBlank.
+        helpButton.
+        defaultBlank.
+        dropDownMenu: [historyMenu]
+      }).
+    mediumBlank.
+    repoTogglesSlot
+  }
+)
+repoToggleFor: repo = (
+  (* One collapsible block per repo. Tag is the repo name so the
+     taggedColumn can match toggles across rebuilds. The expanded
+     body is a fresh-per-render embedded MemberHistoryPresenter; its
+     own toolbar carries the per-repo affordances. Across rebuilds
+     the inner reconciles via MemberHistoryPresenter>>
+     updateVisualsFromSameKind: which transfers loadStarted_slot and
+     the entrySubject Map -- preventing a redundant historyOf:
+     refetch per render. *)
+  | repoName toggle |
+  repoName:: repo name asString.
+  toggle:: collapsed: [
+      row: {
+        (label: 'Repository: ') italic.
+        (link: repoName action: [toggle expand])
+          color: actionLinkColor.
+        filler
+      }]
+    expanded: [
+      column: {
+        row: {
+          (label: 'Repository: ') italic.
+          (link: repoName action: [toggle collapse])
+            color: actionLinkColor.
+          filler
+        }.
+        smallBlank.
+        (subject historySubjectFor: repo) createPresenter
+          embedded: true; yourself
+      }]
+    initiallyExpanded: false
+    tag: repoName.
+  ^toggle
+)
+public expandAll = (
+  repoTogglesSlot isNil ifFalse: [
+    repoTogglesSlot childrenDo: [:t <ToggleComposer> | t expand]]
+)
+public collapseAll = (
+  repoTogglesSlot isNil ifFalse: [
+    repoTogglesSlot childrenDo: [:t <ToggleComposer> | t collapse]]
+)
+historyMenu = (
+  ^menuWithLabelsAndActions: {
+    {'Inspect Presenter'. [respondToInspectPresenter]}
+  }
+)
+helpText = (
+  | mapping = Map new. |
+  mapping
+    at: #hopscotchHelpButton put: helpButton;
+    at: #hopscotchExpandAllButton put: (expandButtonWithAction: [expandAll]);
+    at: #hopscotchCollapseAllButton put: (collapseButtonWithAction: [collapseAll]);
+    at: #hopscotchMenu put: (dropDownMenu: [historyMenu]).
+  ^ampleforth: 'This is the multi-repository history view for a single
+', subject memberKindLabel, '. It lists every repository in which the
+defining class is currently tracked, oldest-first: permanent (committed)
+repositories at the top, the in-IDE <em>drafts</em> store at the
+bottom. Each entry is collapsible; expand a row to see that
+repository''s history of this ', subject memberKindLabel, ' in its own
+panel, with its own expand-all / collapse-all / refresh / help /
+Inspect Presenter affordances.
+<br><br>
+This bar provides the buttons below:
+<ul>
+<li> <div class="hopscotchHelpButton"> </div> Shows this help.</li>
+<li> <div class="hopscotchExpandAllButton"> </div> Expand every
+repository panel.</li>
+<li> <div class="hopscotchCollapseAllButton"> </div> Collapse every
+repository panel.</li>
+<li> <div class="hopscotchMenu"> </div> Inspect this presenter.</li>
+</ul>' mapping: mapping
+)
+) : (
+)
 public class MemberHistoryPresenter onSubject: s
   = ProgrammingPresenter onSubject: s (
 (* Generic history-list presenter shared by methods, lazy slots, and
@@ -3282,15 +3642,35 @@ public class MemberHistoryPresenter onSubject: s
    as a new append-only Accept commit in the repo. Cancel resets the
    editor and collapses the row.
 
+   Two display modes:
+     * Standalone (embeddedSlot=false): full helpSection +
+       majorHeadingBlock title row + body.
+     * Embedded (embeddedSlot=true): used inside
+       MemberRepoHistoryPresenter -- the outer banner owns the
+       title, so we render only a slim per-repo toolbar (label +
+       expand-all / collapse-all / refresh / help / Inspect) and
+       the body.
+
    Data flow:
      * History list: synchronous cachedHistoryOf: check first. Hit ->
        render. Miss -> render 'Loading...' AND kick off historyOf:
        which populates the cache, then updateGUI: rebuilds; the fresh
-       presenter hits the cache.
-     * Source blobs: same pattern, per-(path, sha) cache on DraftsRepo. *)
+       presenter hits the cache. The startFetch trigger gates on
+       repo.isReadyForHistory so we never call git.log on a still-
+       cloning Repository (would hang on lightning-fs locks).
+     * Source blobs: same pattern, per-(path, sha) cache on the repo.
+
+   The "refresh repo history" button uses `refreshHistory`, NOT
+   `refresh`, because Fragment>>refresh is the framework's visual-
+   tree propagation method -- overriding it would turn every render
+   into a cache-invalidate-plus-updateGUI loop. *)
 |
 loadStarted_slot <Boolean> ::= false.
 loadFailed_slot <String>
+(* When true, skip helpSection + majorHeadingBlock title bar in
+   definition. Set by MemberRepoHistoryPresenter so its single
+   outer banner isn't duplicated by per-repo inner banners. *)
+embeddedSlot <Boolean> ::= false.
 (* Memoized taggedColumn of the per-entry toggles, populated once per
    presenter instance. Lets expandAll / collapseAll iterate the toggles
    via childrenDo:. *)
@@ -3309,21 +3689,53 @@ public state ^ <MemberHistoryPresenterState> = (
 )
 updateVisualsFromSameKind: oldPresenter <Self> ^ <Alien[Element]> = (
   (* Transfer the EntrySubjects (and thus their persistent editors)
-     from the old presenter so user edits survive parent rebuilds. *)
+     from the old presenter so user edits survive parent rebuilds.
+     Also carry over the load-state slots so the new presenter knows
+     a fetch is already in flight (or has failed) -- otherwise the
+     fresh-presenter-per-render cycle from updateGUI: kicks off a
+     fresh historyOf: every render. *)
   stateSlot:: oldPresenter state.
+  loadStarted_slot:: oldPresenter loadStarted.
+  loadFailed_slot:: oldPresenter loadFailed.
   ^super updateVisualsFromSameKind: oldPresenter
 )
+public loadStarted ^ <Boolean> = (^loadStarted_slot)
+public loadFailed ^ <String | Nil> = (^loadFailed_slot)
 public isKindOfMemberHistoryPresenter ^ <Boolean> = (^true)
+public embedded: flag <Boolean> = (embeddedSlot:: flag)
 isMyKind: f <Fragment> ^ <Boolean> = (
   ^f isKindOfMemberHistoryPresenter
 )
 definition = (
   | cached |
   cached:: subject repo cachedHistoryOf: subject draftPath.
-  cached isNil ifTrue: [
-    loadStarted_slot ifFalse: [
+  (cached isNil and: [loadStarted_slot not and: [subject repo isReadyForHistory]])
+    ifTrue: [
       loadStarted_slot:: true.
-      startFetch]].
+      startFetch].
+  embeddedSlot ifTrue: [
+    (* Embedded mode: the enclosing MemberRepoHistoryPresenter owns
+       the outer "History: ..." banner. We render a per-repo slim
+       toolbar (expand/collapse-all + refresh + help + Inspect)
+       scoped to this repo's version list. *)
+    ^column: {
+      row: {
+        (label: 'Repository: ') italic.
+        (label: repoName) bold.
+        filler.
+        expandButtonWithAction: [expandAll].
+        defaultBlank.
+        collapseButtonWithAction: [collapseAll].
+        defaultBlank.
+        refreshButtonWithAction: [refreshHistory].
+        defaultBlank.
+        helpButton.
+        defaultBlank.
+        dropDownMenu: [historyMenu]
+      }.
+      mediumBlank.
+      bodyFor: cached
+    }].
   ^column: {
     helpSection.
     majorHeadingBlock: (
@@ -3334,6 +3746,8 @@ definition = (
         defaultBlank.
         collapseButtonWithAction: [collapseAll].
         defaultBlank.
+        refreshButtonWithAction: [refreshHistory].
+        defaultBlank.
         helpButton.
         defaultBlank.
         dropDownMenu: [historyMenu]
@@ -3342,29 +3756,67 @@ definition = (
     bodyFor: cached
   }
 )
+public refreshHistory = (
+  (* Drop the cached history for this repo and re-fetch. The current
+     cache is repo-wide; that's coarser than per-path but fine -- any
+     other open MemberHistoryPresenter on the same repo will simply
+     re-fetch on its next render.
+     NOT named `refresh` because Fragment>>refresh is the framework's
+     visual-tree propagation method (HopscotchForHTML5.ns:1642) -- it
+     fires automatically on every noticeExposure via HolderComposer
+     and other propagating fragments. Overriding `refresh` here would
+     turn every render into a cache-invalidate + updateGUI: loop. *)
+  subject repo invalidateHistoryCache.
+  loadStarted_slot:: false.
+  loadFailed_slot:: nil.
+  updateGUI: []
+)
 bodyFor: cached = (
+  (* Distinguish four states explicitly:
+       1. failed     -> show error.
+       2. not ready  -> repo isn't cloned/local-only yet; tell the user
+                        rather than spinning a misleading "Loading..."
+                        on a repo we deliberately can't fetch from.
+       3. loading    -> fetch in flight.
+       4. empty      -> fetched, but git.log returned no commits
+                        touching this member's file -- the "no changes
+                        in a repo" case the user flagged.
+     Otherwise render the content list. *)
   cached isNil ifTrue: [
-    loadFailed_slot isNil
-      ifTrue: [^label: 'Loading history...']
-      ifFalse: [^label: 'Failed to load history: ', loadFailed_slot]].
+    loadFailed_slot isNil ifFalse: [
+      ^label: 'Failed to load history from ', repoName, ': ',
+        loadFailed_slot].
+    subject repo isReadyForHistory ifFalse: [
+      ^label: 'Repository ', repoName,
+        ' is not ready (clone in progress or unconfigured); no history available yet.'].
+    ^label: 'Loading history from ', repoName, '...'].
   (cached at: 'length') = 0 ifTrue: [
-    ^label: 'No prior versions of this ', subject memberKindLabel, ' in ', repoName, '.'].
+    ^label: 'No prior versions of this ', subject memberKindLabel,
+      ' in ', repoName, '.'].
   ^contentListFor: cached
 )
 repoName = (
-  (* For now there's only one repo (drafts). Hardcode the label until
-     the Repository protocol grows a `name` accessor. *)
-  ^'drafts'
+  (* The Repository protocol now exposes `name` polymorphically:
+     DraftsRepo returns #drafts; user-visible Repositories return
+     their registered Symbol name. *)
+  ^subject repo name asString
 )
 contentListFor: entries = (
   (* Build a taggedColumn of toggles once per presenter instance and
      stash it in contentListSlot so expandAll / collapseAll can iterate
      it. The taggedColumn handles updateVisualsFromSameKind: for the
      children across refreshes. Zebra-striped for readability,
-     matching the namespace / method-list presentation. *)
-  | toggles |
+     matching the namespace / method-list presentation.
+
+     Iterate from last index down to 0 so the oldest commit lands on
+     top and time flows downward toward the live version below. The
+     entries array comes from isomorphic-git which returns newest-
+     first; this reversal matches the MemberRepoHistoryPresenter
+     "time moves downward from top to present" convention. *)
+  | toggles last |
   toggles:: List new.
-  0 to: (entries at: 'length') - 1 do: [:i |
+  last:: (entries at: 'length') - 1.
+  last to: 0 by: -1 do: [:i |
     toggles add: (toggleFor: (entries at: i))].
   contentListSlot:: zebra: (taggedColumn: toggles).
   ^contentListSlot
@@ -3477,21 +3929,35 @@ expandedFor: entry toggle: toggle = (
 )
 ensureVersionSourceFor: entrySubject path: path sha: sha = (
   (* If the entry subject doesn't yet have its versionSource set,
-     check DraftsRepo's blob cache (sync) first; on miss kick off the
-     async fetch which on resolve sets the source and triggers
-     updateGUI: so a fresh definition pass renders the EntryPresenter
-     with source available. *)
+     check the repo's sync cache first; on miss kick off the async
+     fetch which on resolve sets the source and triggers updateGUI:
+     so a fresh definition pass renders the EntryPresenter with
+     source available.
+     memberSourceAt:in: is polymorphic over the repo: DraftsRepo
+     reads the per-member blob directly; user-visible Repositories
+     project to the top-level class file, parse it, and extract the
+     named member's source. The presenter doesn't care which.
+     The fetchStarted guard is critical: each then: calls updateGUI:
+     synchronously, which re-renders the whole content list, which
+     re-iterates entries -- and without the guard, every entry whose
+     promise hasn't yet resolved would refire its memberSourceAt:.
+     With N rows that becomes an O(N^2) updateGUI: cascade that
+     wedges the IDE. Set the flag before launching so subsequent
+     renders skip it; the eventually-resolved then: writes the
+     versionSource, after which the isNil early-exit takes over. *)
   | cached |
   entrySubject versionSource isNil ifFalse: [^self].
-  cached:: subject repo cachedBlobAt: path in: sha.
+  entrySubject versionSourceFetchStarted ifTrue: [^self].
+  cached:: subject repo cachedMemberSourceAt: path in: sha.
   cached isNil ifFalse: [^entrySubject versionSource: cached].
-  (subject repo readBlobAt: path in: sha)
+  entrySubject beginVersionSourceFetch.
+  (subject repo memberSourceAt: path in: sha)
     then: [:src |
       entrySubject versionSource: src.
       updateGUI: []. nil]
     onRejected: [:err |
-      ('MemberHistoryPresenter: blob fetch failed for ', path,
-        ' @ ', sha, ': ', err printString) out.
+      ('MemberHistoryPresenter: member-source fetch failed for ',
+        path, ' @ ', sha, ': ', err printString) out.
       updateGUI: []. nil]
 )
 firstLineOf: msg <String> ^ <String> = (
@@ -3576,6 +4042,14 @@ public class MemberHistoryEntrySubject onModel: m <MemberHistoryEntryModel>
 |
 editor_slot
 versionSource_slot
+(* Per-entry "fetch in flight" guard. Without this every render of
+   the rows section re-fires memberSourceAt: for every entry whose
+   versionSource_slot hasn't been written yet, and each resolve
+   calls updateGUI: synchronously -- an O(N^2) updateGUI cascade
+   that wedges the IDE. Set true on the first call to
+   beginVersionSourceFetch; never reset (each entry is fetched at
+   most once per session). *)
+versionSourceFetchStarted_slot ::= false.
 messages_slot
 messagesComputed_slot ::= false.
 |
@@ -3585,6 +4059,12 @@ public createPresenter ^ <Presenter> = (
 )
 public memberMirror = (^model memberMirror)
 public entry = (^model entry)
+public versionSourceFetchStarted ^ <Boolean> = (
+  ^versionSourceFetchStarted_slot
+)
+public beginVersionSourceFetch = (
+  versionSourceFetchStarted_slot:: true
+)
 public path = (^model path)
 public sha = (^entry at: 'oid')
 public shortSha ^ <String> = (
@@ -5581,6 +6061,12 @@ expandButtonWithAction: aBlock = (
 	^(imageButton: ide images expandImage action: aBlock)
         height: styleButtonSize
 )
+refreshButtonWithAction: aBlock = (
+	(* Variant of refreshButton with a caller-supplied action -- the
+	   default refreshButton rebuilds the whole shell. *)
+	^(imageButton: ide images refreshImage action: aBlock)
+        height: styleButtonSize; toolTip: #refresh
+)
 indentedBlock: body = (
 	^column: {
 		mediumBlank.
@@ -7383,6 +7869,29 @@ public repo = r.
 ) (
 public isKindOfClassHeaderHistoryModel ^ <Boolean> = (^true)
 ) : (
+)
+public class MemberRepoHistoryModel kind: k target: t = (
+(* Repo-agnostic identity for one member's history. `kind` is one of
+   #method / #lazySlot / #classHeader; `target` is the corresponding
+   methodModel / lazySlotModel / classMirror. The MemberRepoHistory-
+   Presenter builds a per-repo *HistoryModel on demand by combining
+   target with each Repository in its list. *)
+|
+public kind <Symbol> = k.
+public target = t.
+|
+) (
+public isKindOfMemberRepoHistoryModel ^ <Boolean> = (^true)
+) : (
+public forMethodModel: mm <MethodModel> = (
+	^self kind: #method target: mm
+)
+public forLazySlotModel: lsm <LazySlotModel> = (
+	^self kind: #lazySlot target: lsm
+)
+public forClassMirror: cm <ClassDeclarationMirror> = (
+	^self kind: #classHeader target: cm
+)
 )
 public class MemberHistoryEntryModel entry: e memberMirror: mm path: pa = (
 (* Triple held by a MemberHistoryEntrySubject: the git log entry, the

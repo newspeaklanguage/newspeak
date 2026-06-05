@@ -120,7 +120,17 @@ public class Repository
 	   on the module-level lazy LightningFSClass / gitFacade /
 	   gitHttpFacade slots for why we can't capture them eagerly. *)
 	historyCache_slot
+	(* Per-draftPath cache for cachedHistoryOf: / historyOf:. Map from
+	   draftPath -> JS-array of commit entries. Lets MemberHistory-
+	   Presenter render synchronously after the first fetch even when
+	   the repo is a permanent (non-drafts) Repository. *)
+	pathHistoryCache_slot
 	blobCache_slot
+	(* Cache for memberSourceAt:in: -- keyed by '<draftPath>@<sha>'.
+	   Distinct from blobCache_slot because that one caches raw class-
+	   file blobs and this one caches the post-parse, post-extract
+	   per-member source text. *)
+	memberSourceCache_slot
 	(* Cached sha -> changeset Map for per-commit diff views. Mirrors
 	   the historyCache_slot / blobCache_slot pattern: lazy populate
 	   on first request, sync read on revisit. Invalidated implicitly
@@ -177,6 +187,14 @@ public cloneStatus ^ <Symbol | Nil> = (^cloneStatus_slot)
 public cloneError ^ <String | Nil> = (^cloneError_slot)
 public isClonedOrLocalOnly ^ <Boolean> = (
 	^cloneStatus_slot = #cloned or: [cloneStatus_slot = #localOnly]
+)
+public isReadyForHistory ^ <Boolean> = (
+	(* Matches the RepositoryPresenter>>startFetch gate. Firing git.log
+	   on a partial / in-flight clone hangs on lightning-fs locks --
+	   exactly the wedge that bit us before (see startFetch comment
+	   at Repositories.ns:1352). MemberHistoryPresenter uses this to
+	   skip its fetch when the repo isn't ready. *)
+	^isClonedOrLocalOnly
 )
 createJSObject = (^JSON parse: '{}')
 createJSArray = (^JSON parse: '[]')
@@ -332,7 +350,54 @@ public history ^ <Alien> = (
 		entries]
 )
 public cachedHistory = (^historyCache_slot)
-public invalidateHistoryCache = (historyCache_slot:: nil)
+public invalidateHistoryCache = (
+	historyCache_slot:: nil.
+	pathHistoryCache_slot:: nil
+)
+(* Per-member history surface. The MemberHistoryPresenter (and via it
+   MemberRepoHistoryPresenter) asks for history along the per-member
+   draftPath scheme (<TopLevel>/.../<Enclosing>/method.<sel>.ns) that
+   DraftsRepo uses natively. Permanent Repositories store one file
+   per top-level class (<TopLevel>.ns -- see snapshotFiles, line 1050),
+   so we project the draftPath down to its top-level class file and
+   filter git.log by that. Every commit that touched the class file
+   surfaces -- per-member filtering inside the class blob is deferred
+   (the entry presenter still shows the right per-member text via the
+   per-commit blob read of the class file + member extraction). *)
+topLevelClassFileFor: draftPath <String> ^ <String> = (
+	(* '<TopLevel>/Enclosing/method.foo.ns' -> '<TopLevel>.ns'.
+	   No slash -> already a top-level (e.g. 'header.ns' on a top-level
+	   class itself), use as-is. *)
+	| idx |
+	idx:: draftPath indexOf: '/' startingAt: 1.
+	idx = 0 ifTrue: [^draftPath].
+	^(draftPath copyFrom: 1 to: idx - 1), '.ns'
+)
+pathHistoryCache = (
+	pathHistoryCache_slot isNil ifTrue: [pathHistoryCache_slot:: Map new].
+	^pathHistoryCache_slot
+)
+public cachedHistoryOf: draftPath <String> = (
+	(* Sync cache lookup keyed by the original draftPath (matches the
+	   DraftsRepo API the MemberHistoryPresenter is written against),
+	   so caller code stays uniform across repos. *)
+	pathHistoryCache_slot isNil ifTrue: [^nil].
+	^pathHistoryCache_slot at: draftPath ifAbsent: [nil]
+)
+public historyOf: draftPath <String> ^ <Alien> = (
+	(* Promise for the commit log filtered to the top-level class file
+	   the draftPath belongs to. Caches under the draftPath key so a
+	   later cachedHistoryOf: with the same draftPath hits sync. *)
+	| classFile opts |
+	classFile:: topLevelClassFileFor: draftPath.
+	opts:: createJSObject.
+	opts at: 'fs' put: fs.
+	opts at: 'dir' put: dir.
+	opts at: 'filepath' put: classFile.
+	^(git log: opts) then: [:entries |
+		pathHistoryCache at: draftPath put: entries.
+		entries]
+)
 commitDiffCache = (
 	commitDiffCache_slot isNil ifTrue: [commitDiffCache_slot:: Map new].
 	^commitDiffCache_slot
@@ -382,6 +447,131 @@ public readBlobAt: filepath <String> in: sha <String> ^ <Alien> = (
 		content:: TextDecoder new decode: (result at: 'blob').
 		blobCache at: (blobCacheKey: filepath sha: sha) put: content.
 		content]
+)
+public cachedMemberSourceAt: draftPath <String> in: sha <String> = (
+	(* Sync per-draftPath member-source cache. Distinct from the raw
+	   blob cache because the same class-file blob serves many
+	   member-source lookups. *)
+	memberSourceCache_slot isNil ifTrue: [^nil].
+	^memberSourceCache_slot at: (blobCacheKey: draftPath sha: sha)
+		ifAbsent: [nil]
+)
+memberSourceCache = (
+	memberSourceCache_slot isNil ifTrue: [memberSourceCache_slot:: Map new].
+	^memberSourceCache_slot
+)
+public memberSourceAt: draftPath <String> in: sha <String> ^ <Alien> = (
+	(* Per-member historical source lookup for the permanent Repository
+	   layout (one file per top-level class -- see snapshotFiles). The
+	   draftPath uses the DraftsRepo per-member scheme:
+	     <TopLevel>/.../<Enclosing>/<leaf>
+	   where <leaf> is 'header.ns' | 'method.<sel>.ns' |
+	   'class-method.<sel>.ns' | 'lazy-slot.<name>.ns'.
+	   We project to '<TopLevel>.ns', read & parse the class blob
+	   (with its Newspeak3 preamble intact -- ClassDeclarationBuilder>>
+	   fromUnitSource: expects it), navigate the nested-class chain,
+	   then extract the named member's source.
+	   The synchronous extraction lives in extractMemberSourceFromRaw:
+	   draftPath:sha:segs: so the then: closure stays free of `^`
+	   non-local returns (which would raise CannotReturn after this
+	   method has already returned). Any Error raised by the helper is
+	   trapped and converted to a Promise rejection -- the alien-bridge
+	   constraint is "no exceptions escape from inside then:" (see
+	   feedback_newspeak_js_promise_exceptions). *)
+	| classFile cached segs |
+	cached:: cachedMemberSourceAt: draftPath in: sha.
+	cached isNil ifFalse: [^JSPromise resolve: cached].
+	classFile:: topLevelClassFileFor: draftPath.
+	segs:: splitPath: draftPath.
+	^(readBlobAt: classFile in: sha) then: [:rawSrc |
+		[extractMemberSourceFromRaw: rawSrc
+			draftPath: draftPath
+			sha: sha
+			classFile: classFile
+			segs: segs]
+			on: Exception
+			do: [:e | JSPromise reject: e messageText]]
+)
+extractMemberSourceFromRaw: rawSrc <String>
+	draftPath: draftPath <String>
+	sha: sha <String>
+	classFile: classFile <String>
+	segs: segs <List[String]> ^ <String> = (
+	(* Synchronous extraction; runs inside an on:Exception do: backstop
+	   from memberSourceAt:in:. ^ here is safe -- it returns from this
+	   helper's own activation, not from the async caller. *)
+	| builder enclosing leafSrc |
+	builder:: phantomBuilderFromSource: rawSrc.
+	builder isNil ifTrue: [
+		^Error signal:
+			'Could not parse ', classFile, ' at ', sha].
+	enclosing:: builder.
+	2 to: segs size - 1 do: [:i |
+		| nestedName nested |
+		nestedName:: (segs at: i) asSymbol.
+		nested:: findNestedBuilderIn: enclosing named: nestedName.
+		nested isNil ifTrue: [
+			^Error signal:
+				'No nested class ', nestedName asString,
+				' in ', classFile, ' at ', sha].
+		enclosing:: nested].
+	leafSrc:: extractMemberSourceFrom: enclosing
+		leaf: (segs at: segs size).
+	leafSrc isNil ifTrue: [
+		^Error signal:
+			'Could not extract ', (segs at: segs size),
+			' from ', classFile, ' at ', sha].
+	memberSourceCache at: (blobCacheKey: draftPath sha: sha)
+		put: leafSrc.
+	^leafSrc
+)
+splitPath: path <String> ^ <List[String]> = (
+	(* Split a draftPath on '/'. Path is well-formed (no leading or
+	   trailing slash by construction). String>>at: returns an Integer
+	   rune so we navigate by indexOf:startingAt: instead. *)
+	| segs start idx |
+	segs:: List new.
+	start:: 1.
+	idx:: path indexOf: '/' startingAt: 1.
+	[idx > 0] whileTrue: [
+		segs add: (path copyFrom: start to: idx - 1).
+		start:: idx + 1.
+		idx:: path indexOf: '/' startingAt: start].
+	start <= path size ifTrue: [
+		segs add: (path copyFrom: start to: path size)].
+	^segs
+)
+extractMemberSourceFrom: builder leaf: leaf <String> ^ <String | Nil> = (
+	(* Decode the .ns leaf filename and pull the corresponding source
+	   from `builder` (a ClassDeclarationBuilder or PhantomDeclMirror
+	   wrapping one). Mirrors the layout from
+	   HopscotchWebIDE>>draftPathFor* and writeFiles. *)
+	leaf = 'header.ns' ifTrue: [^builder header source].
+	(leaf startsWith: 'method.') ifTrue: [
+		| sel |
+		sel:: decodeLeafName: leaf prefix: 'method.'.
+		^memberSourceFrom: builder instanceSide methods named: sel].
+	(leaf startsWith: 'class-method.') ifTrue: [
+		| sel |
+		sel:: decodeLeafName: leaf prefix: 'class-method.'.
+		^memberSourceFrom: builder classSide methods named: sel].
+	(leaf startsWith: 'lazy-slot.') ifTrue: [
+		| name |
+		name:: decodeLeafName: leaf prefix: 'lazy-slot.'.
+		^memberSourceFrom: builder instanceSide lazySlots named: name].
+	^nil
+)
+decodeLeafName: leaf <String> prefix: pfx <String> ^ <Symbol> = (
+	(* '<pfx><encodedName>.ns' -> decoded name as Symbol. *)
+	| stem |
+	stem:: leaf copyFrom: pfx size + 1 to: leaf size - 3.
+	^(ide decodeFromFilename: stem) asSymbol
+)
+memberSourceFrom: group named: n <Symbol> ^ <String | Nil> = (
+	(* Linear scan; member counts per class are small. Returns the
+	   matching member's source or nil. *)
+	group do: [:m | m name = n ifTrue: [^m source]].
+	^nil
 )
 public author ^ <Alien> = (
 	(* Per-commit identity. Per-Repository override (author_slot) wins;
@@ -2442,6 +2632,12 @@ public class PhantomDeclMirror onBuilder: b = (
 public isKindOfClassDeclarationMirror = (^true)
 public asBuilder = (^phantomBuilder)
 public name = (^phantomBuilder name)
+(* Alias for `name`. ClassDeclarationMirror exposes both name and
+   simpleName as the unqualified class name; callers reach for
+   either, and qualifiedNameOf: in AI_IDE_Support uses simpleName.
+   Without this the brain icon ("Install Focus") on a phantom
+   class DNUs. *)
+public simpleName = (^phantomBuilder name)
 public source = (^phantomBuilder source)
 public header = (^phantomBuilder header)
 public enclosingClass = (^nil)
@@ -2464,6 +2660,10 @@ public class PhantomSide onPhantom: p instanceSide: isInstance = (
 	private isInstanceSide = isInstance.
 |) (
 public isKindOfMixinMirror = (^true)
+(* True for the class side, false for the instance side -- matches
+   the live MixinMirror>>isMeta semantics. Used by AI install-focus
+   to label methods/slots as 'class' vs 'instance' side. *)
+public isMeta = (^isInstanceSide not)
 public asBuilder = (
 	(* Real side-specific MixinBuilder for install. *)
 	^isInstanceSide

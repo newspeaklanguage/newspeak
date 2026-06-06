@@ -457,7 +457,13 @@ helpText = (
 )
 class ClassFactoryPresenter onSubject: s <ClassFactorySubject> = MethodPresenter onSubject: s (
 (* Present the factory method, colorized. *)
- | toggle <ToggleComposer>  public showClassName <Boolean> ::= false. |
+ |
+ toggle <ToggleComposer>
+ public showClassName <Boolean> ::= false.
+ (* Captured by editorDefinition so respondToTypecheck can read the
+    pending header source from the editor buffer. *)
+ headerEditor <CodeMirrorFragment>
+ |
 ) (
 installHistory = (
     (* Override MethodPresenter>>installHistory: class headers carry a
@@ -498,15 +504,16 @@ nestingInformationLine ^ <Fragment> = (
 	^row: rowElements asArray
 )
 editorDefinition = (
-	| 
-	src = crToLf: subject classHeaderSource. 
-	editor = codeMirror: src. 
 	|
-	editor 
+	src = crToLf: subject classHeaderSource.
+	editor = codeMirror: src.
+	|
+	editor
 		changeResponse: changeResponse;
         cancelResponse: cancelResponse;
 		acceptResponse: acceptResponse.
 	colorizeHeaderSource: src withEditor: editor.
+	headerEditor:: editor.
 	^editor
 )
 cancelResponse ^ <[:CodeMirrorFragment]> = (
@@ -525,12 +532,45 @@ acceptResponse ^ <[:CodeMirrorFragment :Event]> = (
 				canonical:: ide prettyPrintClassHeaderOr: ed textBeingAccepted.
 				b header source: canonical.
 				ide installFromBuilders: {b}.
+				subject clearTypeErrors.
 				ed text: canonical.
 				colorizeHeaderSource: (crToLf: canonical) withEditor: ed.
 				ed leaveEditState] on: Error do:  [:ex <Exception> | ed showMessage: ex printString] .
 		].
 		ed editor focus.
 	]
+)
+respondToTypecheck = (
+    (* Override MethodPresenter>>respondToTypecheck. The factory IS the
+       class header; route through typecheckClassHeader: instead of
+       typecheckMethodSource:. Uses the captured headerEditor for the
+       in-progress buffer, falling back to the installed header. *)
+    | ed source typed mixin errs failureMessage |
+    ed:: headerEditor.
+    typed:: ed isNil ifTrue: [nil] ifFalse: [ed textBeingAccepted].
+    source:: (typed isNil or: [typed isEmpty])
+        ifTrue: [subject classHeaderSource]
+        ifFalse: [typed].
+    mixin:: subject classMirror instanceSide.
+    subject clearTypeErrors.
+    failureMessage:: nil.
+    errs:: [ide freshTypechecker typecheckClassHeader: source ofClass: mixin]
+        on: Error do: [:e |
+            failureMessage:: 'Typechecker failed: ', e printString.
+            nil
+        ].
+    updateGUI: [
+        failureMessage isNil ifFalse: [
+            subject typeErrorMessages add: failureMessage
+        ] ifTrue: [
+            errs isEmpty
+                ifTrue: [subject typeErrorMessages add: 'No type errors.']
+                ifFalse: [errs do: [:e |
+                    subject typeErrorMessages add:
+                        'Type error: ', e message, ' [', e start printString, '-', e end printString, ']'
+                ]]
+        ]
+    ]
 )
 slotList ^ <Fragment> = (
   | sl |
@@ -561,6 +601,7 @@ collapsedDefinition ^ <Fragment> = (
       headerDefinition.
       historySection.
       chatSection.
+      column: typeErrorMessages.
       label: subject classCommentSummary.
       mediumBlank.
 	slotList.
@@ -573,6 +614,7 @@ expandedDefinition = (
       historySection.
       chatSection.
 	  editorDefinition.
+	  column: typeErrorMessages.
 	}
 )
 headerDefinition ^ <Fragment> = (
@@ -741,6 +783,10 @@ class ClassPresenter onSubject: s = ProgrammingPresenter onSubject: s (
   (* Captured by classSourceDefinition so the 'Pretty Print' menu
      action can address the current header editor. *)
   headerEditor <CodeMirrorFragment>
+  (* Cache the factory subject so its state (e.g., typeErrorMessages
+     populated by the embedded ClassFactoryPresenter's Typecheck action)
+     survives updateGUI: re-renders of the enclosing ClassPresenter. *)
+  factorySubject <ClassFactorySubject> = ClassFactorySubject onModel: subject classMirror.
   |
 ) (
 changeResponse ^ <[:CodeMirrorFragment :Event]> = (
@@ -806,7 +852,7 @@ colorizeHeaderSource: s <String> withEditor: cm <CodeMirrorFragment> = (
 expandedHeadingDefinition ^ <Fragment> = (
   ^column: {
       classNameAndHierarchySummary.
-      (ClassFactorySubject onModel: subject classMirror) presenter
+      factorySubject presenter
    }
 )
 headingDefinition ^ <Fragment> = (
@@ -2131,8 +2177,12 @@ errorMessages ^ <Array[Fragment]> = (
     ]) asArray.
 )
 typeErrorDisplay: msg <String> ^ <Fragment> = (
+  | textColor |
+  textColor:: msg = 'No type errors.'
+    ifTrue: [Color r: 0 g: 0.5 b: 0]
+    ifFalse: [Color r: 0.7 g: 0 b: 0].
   ^row: {
-    (label: msg) color: (Color r: 0.7 g: 0 b: 0).
+    (label: msg) color: textColor.
     button: 'Clear' action: [updateGUI: [subject typeErrorMessages remove: msg]]
   }
 )
@@ -2259,16 +2309,16 @@ respondToTypecheckSlot = (
     (* Run the typechecker on the current lazy-slot source (editor buffer
        if non-empty, else the installed source) and surface results in
        the typeErrorMessages banner column below the editor. *)
-    | ed source typed klass errs failureMessage |
+    | ed source typed mixin errs failureMessage |
     ed:: slotEditor.
     typed:: ed isNil ifTrue: [nil] ifFalse: [ed textBeingAccepted].
     source:: (typed isNil or: [typed isEmpty])
         ifTrue: [subject source]
         ifFalse: [typed].
-    klass:: subject classDeclaration applyToObject reflectee.
+    mixin:: subject slotMirror definingMixin.
     subject clearTypeErrors.
     failureMessage:: nil.
-    errs:: [ide freshTypechecker typecheckLazySlot: source ofClass: klass]
+    errs:: [ide freshTypechecker typecheckLazySlot: source ofClass: mixin]
         on: Error do: [:e |
             failureMessage:: 'Typechecker failed: ', e printString.
             nil
@@ -2711,8 +2761,12 @@ errorMessages ^ <Array[Fragment]> = (
     ]) asArray.
 )
 typeErrorDisplay: msg <String> ^ <Fragment> = (
+  | textColor |
+  textColor:: msg = 'No type errors.'
+    ifTrue: [Color r: 0 g: 0.5 b: 0]
+    ifFalse: [Color r: 0.7 g: 0 b: 0].
   ^row: {
-    (label: msg) color: (Color r: 0.7 g: 0 b: 0).
+    (label: msg) color: textColor.
     button: 'Clear' action: [updateGUI: [subject typeErrorMessages remove: msg]]
   }
 )
@@ -2828,16 +2882,16 @@ respondToTypecheck = (
     (* Run the typechecker on the current method source (editor buffer
        if non-empty, else the installed source) and surface results in
        the typeErrorMessages banner column below the editor. *)
-    | ed source typed klass errs failureMessage |
+    | ed source typed mixin errs failureMessage |
     ed:: methodEditor.
     typed:: ed isNil ifTrue: [nil] ifFalse: [ed textBeingAccepted].
     source:: (typed isNil or: [typed isEmpty])
         ifTrue: [subject source]
         ifFalse: [typed].
-    klass:: subject classDeclaration applyToObject reflectee.
+    mixin:: subject methodMirror definingMixin.
     subject clearTypeErrors.
     failureMessage:: nil.
-    errs:: [ide freshTypechecker typecheckMethodSource: source ofClass: klass]
+    errs:: [ide freshTypechecker typecheckMethodSource: source ofClass: mixin]
         on: Error do: [:e |
             failureMessage:: 'Typechecker failed: ', e printString.
             nil
@@ -3843,10 +3897,13 @@ helpText = (
     at: #hopscotchHelpButton put: helpButton;
     at: #hopscotchExpandAllButton put: (expandButtonWithAction: [expandAll]);
     at: #hopscotchCollapseAllButton put: (collapseButtonWithAction: [collapseAll]);
+    at: #hopscotchRefreshButton put: (refreshButtonWithAction: [refreshHistory]);
     at: #hopscotchMenu put: (dropDownMenu: [historyMenu]).
-  ^ampleforth: 'This is the history presenter for a single ', kind, '. It lists every
-commit in the drafts repository that touched this ', kind, '''s file, newest first.
-Each row shows the short commit SHA (click to expand), the commit date, the
+  ^ampleforth: 'This is the history presenter for a single ', kind, ' as
+recorded in one source repository -- ', repoName, ', in this instance. It lists
+every commit in that repository that touched this ', kind, '''s file, oldest
+on top so time flows downward toward the live version at the bottom. Each
+row shows the short commit SHA (click to expand), the commit date, the
 commit''s subject line, and an inline summary of which members were added (+),
 modified (~), or removed (-).
 <br><br>
@@ -3859,14 +3916,41 @@ You can also further edit the historical text before accepting, in which case
 the Accept records exactly what you typed -- the historical version is just a
 starting point.
 <br><br>
-The drafts repository is browser-local (IndexedDB) and currently records every
-edit you accept through the IDE. It is the only repository wired up here; later
-versions will list permanent repositories alongside it.
+Each MemberHistoryPresenter is scoped to a single repository. Two flavours
+of repository are wired up:
+<ul>
+<li><em>drafts</em> -- the browser-local (IndexedDB) repository that the
+IDE auto-commits to on every Accept. Always available.</li>
+<li>Any user-visible <em>Repository</em> in Root whose namespace currently
+contains the defining class.</li>
+</ul>
+The full list (drafts + any tracking Repository) is the multi-repository view
+above, MemberRepoHistoryPresenter, which stacks one of these per repo as a
+collapsible toggle.
 <br><br>
-Controls in the header, from left to right after the title:
+The body shows one of four states depending on the underlying fetch:
+<ul>
+<li><em>Loading history from &lt;repo&gt;...</em> while git.log is in
+flight.</li>
+<li><em>Repository &lt;repo&gt; is not ready</em> when the repo is still
+cloning or the clone failed -- we deliberately don''t fire git.log on a
+partial working dir (lightning-fs takes a lock that would hang the IDE).</li>
+<li><em>Failed to load history from &lt;repo&gt;: &lt;err&gt;</em> on
+git.log rejection.</li>
+<li><em>No prior versions of this ', kind, ' in &lt;repo&gt;</em> when the
+fetch resolved but no commit in this repo touched the ', kind, '''s file
+(in a per-top-level-class repo this means no commit changed any member of
+the class; per-member precision is a Phase-2 follow-up).</li>
+</ul>
+<br>
+Controls in the header bar (or, in the multi-repo view, in this repo''s
+slim per-repo toolbar), from left to right after the title:
 <ul>
 <li><div class="hopscotchExpandAllButton"></div> Expand every row.</li>
 <li><div class="hopscotchCollapseAllButton"></div> Collapse every row.</li>
+<li><div class="hopscotchRefreshButton"></div> Re-fetch the history. Drops the
+repo-wide history cache and re-runs git.log -- useful after an external
+commit / pull (in-IDE Accepts already invalidate the cache automatically).</li>
 <li><div class="hopscotchHelpButton"></div> Show this help message.</li>
 <li><div class="hopscotchMenu"></div> A menu of additional operations; currently
 just <em>Inspect Presenter</em>, which opens an object inspector on this presenter

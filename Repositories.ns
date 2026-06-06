@@ -359,11 +359,15 @@ public invalidateHistoryCache = (
    draftPath scheme (<TopLevel>/.../<Enclosing>/method.<sel>.ns) that
    DraftsRepo uses natively. Permanent Repositories store one file
    per top-level class (<TopLevel>.ns -- see snapshotFiles, line 1050),
-   so we project the draftPath down to its top-level class file and
-   filter git.log by that. Every commit that touched the class file
-   surfaces -- per-member filtering inside the class blob is deferred
-   (the entry presenter still shows the right per-member text via the
-   per-commit blob read of the class file + member extraction). *)
+   so the path-resolution side projects the draftPath down to its top-
+   level class file. git.log on that file finds candidate commits
+   (every commit that touched the class), then a per-member filter
+   pass excludes commits where THIS member's source is unchanged from
+   its parent -- so the list the user sees matches the per-member
+   precision DraftsRepo provides natively. The filter chains async
+   memberSourceAt: reads (fanned out via Promise.all) and is cached
+   into pathHistoryCache_slot under the original draftPath; revisits
+   hit the cached filtered list synchronously. *)
 topLevelClassFileFor: draftPath <String> ^ <String> = (
 	(* '<TopLevel>/Enclosing/method.foo.ns' -> '<TopLevel>.ns'.
 	   No slash -> already a top-level (e.g. 'header.ns' on a top-level
@@ -385,9 +389,21 @@ public cachedHistoryOf: draftPath <String> = (
 	^pathHistoryCache_slot at: draftPath ifAbsent: [nil]
 )
 public historyOf: draftPath <String> ^ <Alien> = (
-	(* Promise for the commit log filtered to the top-level class file
-	   the draftPath belongs to. Caches under the draftPath key so a
-	   later cachedHistoryOf: with the same draftPath hits sync. *)
+	(* Promise for the commit log filtered to commits that actually
+	   changed THIS member's source. Two-stage:
+	     1. git.log filtered by the top-level class file -> candidates.
+	     2. For each candidate, fetch memberSourceAt: at the commit and
+	        at its parent and keep only ones where the two differ.
+	   The filtered list is cached under the original draftPath key.
+
+	   Every then: block here is wrapped in `[sync] on: Exception do:
+	   [:e | JSPromise reject: e messageText]` -- per
+	   feedback_newspeak_js_promise_exceptions, an exception escaping
+	   a JS promise's then: closure corrupts the alien bridge and
+	   subsequent resolves return garbage from the alien stack (the
+	   bug that surfaced as "ifTrue: sent to an HTML element"). The
+	   backstop converts any sync raise into a clean Promise rejection
+	   that startFetch's onRejected: can render. *)
 	| classFile opts |
 	classFile:: topLevelClassFileFor: draftPath.
 	opts:: createJSObject.
@@ -395,8 +411,104 @@ public historyOf: draftPath <String> ^ <Alien> = (
 	opts at: 'dir' put: dir.
 	opts at: 'filepath' put: classFile.
 	^(git log: opts) then: [:entries |
-		pathHistoryCache at: draftPath put: entries.
-		entries]
+		[(filterEntriesForMember: entries draftPath: draftPath)
+			then: [:filtered |
+				[pathHistoryCache at: draftPath put: filtered.
+				 filtered]
+				on: Exception
+				do: [:e | JSPromise reject: e messageText]]]
+		on: Exception
+		do: [:e | JSPromise reject: e messageText]]
+)
+filterEntriesForMember: entries <Alien[Array]> draftPath: dp <String>
+	^ <Alien[Promise]> = (
+	(* Resolve a JS array of git.log entries to the subset that
+	   actually changed `dp`'s member source. Fires 2N memberSourceAt:
+	   reads in parallel (entry sha + parent sha, where present) and
+	   pairs each with its raw entry; once Promise.all resolves we
+	   push the entries whose flag came back true into a fresh JS
+	   array, preserving the git.log newest-first order so the
+	   downstream zebra/taggedColumn rendering is identical to the
+	   unfiltered path. *)
+	| n promises |
+	n:: entries at: 'length'.
+	promises:: createJSArray.
+	0 to: n - 1 do: [:i |
+		promises push: (entryAffectsMember: (entries at: i) draftPath: dp)].
+	^(JSPromise all: promises) then: [:flags |
+		[| filtered |
+		 filtered:: createJSArray.
+		 0 to: n - 1 do: [:i |
+			(flags at: i) ifTrue: [filtered push: (entries at: i)]].
+		 filtered]
+		on: Exception
+		do: [:e | JSPromise reject: e messageText]]
+)
+entryAffectsMember: entry draftPath: dp <String> ^ <Alien[Promise]> = (
+	(* Promise[Boolean] -- true if this commit's class blob holds a
+	   different `dp`-member source than the parent commit's.
+	     - No parent (root commit, or first commit that introduced
+	       the class file): include iff the member exists at this sha.
+	     - Parent exists: include iff the source at sha differs from
+	       the source at parentSha. memberSourceAt: rejections (parse
+	       failure, member-not-found, blob-not-found) get caught by
+	       sourceOrNil: and surface as nil, so present-vs-absent
+	       transitions also count as "changed".
+	   The synchronous setup (parentShaOf:, pair construction) runs
+	   inside the caller's then: closure, so any exception here would
+	   escape that closure and corrupt the alien bridge -- we wrap
+	   the body in on:Exception do: + JSPromise reject: to keep the
+	   rejection clean. *)
+	^[| sha parentSha pair |
+	  sha:: entry at: 'oid'.
+	  parentSha:: parentShaOf: entry.
+	  parentSha isNil
+		ifTrue: [
+			(sourceOrNil: dp at: sha) then: [:atSrc |
+				[atSrc isNil not]
+					on: Exception
+					do: [:e | JSPromise reject: e messageText]]]
+		ifFalse: [
+			pair:: createJSArray.
+			pair push: (sourceOrNil: dp at: sha).
+			pair push: (sourceOrNil: dp at: parentSha).
+			(JSPromise all: pair) then: [:results |
+				(* Parenthesize the `=` so `not` applies to the
+				   Boolean result, not to (results at: 1). Unary
+				   `not` binds tighter than binary `=`. *)
+				[((results at: 0) = (results at: 1)) not]
+					on: Exception
+					do: [:e | JSPromise reject: e messageText]]]]
+	on: Exception
+	do: [:e | JSPromise reject: e messageText]
+)
+sourceOrNil: dp <String> at: sha <String> ^ <Alien[Promise]> = (
+	(* Wrap memberSourceAt:in: so the caller can treat present-vs-
+	   absent symmetrically: a parse failure or member-not-found at
+	   a given sha resolves to nil rather than failing the whole
+	   Promise.all. The then: identity is wrapped in the on:Exception
+	   backstop for the same reason as the rest of the chain. *)
+	^(memberSourceAt: dp in: sha)
+		then: [:src |
+			[src]
+				on: Exception
+				do: [:e | JSPromise reject: e messageText]]
+		onRejected: [:e | nil]
+)
+parentShaOf: entry = (
+	(* First parent of a commit, or nil if it has no parents (root
+	   commit, or first commit that introduced the file). isomorphic-
+	   git represents `commit.parent` as a JS array of SHAs (multiple
+	   for merges); we use the first, matching git's "main-line
+	   history" convention. Defensive against undefined / missing
+	   fields so a malformed entry can't crash the filter. *)
+	| commit parents |
+	commit:: entry at: 'commit'.
+	commit isNil ifTrue: [^nil].
+	parents:: commit at: 'parent'.
+	parents isNil ifTrue: [^nil].
+	(parents at: 'length') = 0 ifTrue: [^nil].
+	^parents at: 0
 )
 commitDiffCache = (
 	commitDiffCache_slot isNil ifTrue: [commitDiffCache_slot:: Map new].

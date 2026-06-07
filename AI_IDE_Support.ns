@@ -23,6 +23,7 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = (
 	private ClassDeclarationBuilder = platform mirrors ClassDeclarationBuilder.
 	private List = platform collections List.
 	private Map = platform collections Map.
+	private Set = platform collections Set.
 	private ide = webIde.
 	private js = platform js.
 	private Document = webIde documents Document.
@@ -476,7 +477,21 @@ public class ChatDocument named: n <String>
 |
 	public providerName <String> = pn.
 	public modelName <String> ::= mn.
-	chatSubject_slot
+	chatSubject_slot.
+	(* List of changeset ids proposed during the in-flight assistant
+	   turn. Drained by IDEChatDocumentSubject>>markComplete, which
+	   appends one ampleforth amplet per id after the assistant section
+	   has been inserted. The amplets render via changesetPresenterFor:
+	   below. *)
+	public pendingChangesetIds <List[String]> = List new.
+	(* Cache of ChangesetSubject by changeset id. prepareForLiveViewRefresh:
+	   nukes the Ampleforth fragment cache on every refresh, so
+	   changesetPresenterFor: gets re-invoked per render. Without a
+	   stable subject the first render's synchronous compute calls
+	   refreshBlock → updateGUI → another render → fresh subject →
+	   compute → ... runaway. Caching the subject keeps changeset_slot
+	   populated so computeAsync: short-circuits on the second pass. *)
+	public changesetSubjectsById <Map[String, Object]> = Map new.
 |
 ) (
 public isKindOfChatDocument ^ <Boolean> = ( ^true )
@@ -593,6 +608,65 @@ public appendAssistantSection: text <String> = (
 public appendErrorSection: text <String> = (
 	insertTurnSection: text role: 'error'
 )
+public appendChangesetAmpletFor: id <String> = (
+	(* Insert a new ampleforth amplet just before thinkingOrModelPicker
+	   so it sits inline in the transcript at the point the assistant
+	   delivered the proposal. The amplet's `name` is the source
+	   expression evaluated by evaluateFragment: — `self` is the
+	   ChatDocument, so `changesetPresenterFor: 'csN'` resolves
+	   directly to the method below. *)
+	| container thinking jsDoc amplet ampletId parent expr |
+	container:: parseAmpletContainer: contents.
+	thinking:: findChatStructuralAmplet: 'thinkingOrModelPicker' in: container.
+	thinking isNil ifTrue: [
+		Error signal: 'ChatDocument is missing its structural amplets; cannot append amplet'
+	].
+	jsDoc:: js global at: 'document'.
+	maxAmpletCount: maxAmpletCount + 1.
+	ampletId:: maxAmpletCount printString.
+	expr:: 'changesetPresenterFor: ''', id, ''''.
+	amplet:: jsDoc createElement: 'div'.
+	amplet setAttribute: 'class' to: 'ampleforth'.
+	amplet setAttribute: 'ampletId' to: ampletId.
+	amplet setAttribute: 'name' to: expr.
+	amplet setAttribute: 'contenteditable' to: 'false'.
+	amplet setAttribute: 'style' to: 'display:block; margin:8px 0;'.
+	parent:: thinking at: 'parentNode'.
+	parent insertBefore: amplet before: thinking.
+	mutateContentsTo: (container at: 'innerHTML')
+)
+public changesetPresenterFor: id <String> ^ <Object> = (
+	(* Amplet entry-point: evaluated by evaluateFragment: when the
+	   ChatDocument re-renders. Returns a fresh ChangesetPresenter
+	   wrapping the cached ChangesetSubject for this id, so the
+	   computed changeset_slot persists across renders and
+	   computeAsync: short-circuits — without the cache, each render
+	   builds a new subject whose synchronous compute triggers
+	   updateGUI → another render → ... runaway memory.
+
+	   When the changeset is no longer pending (applied, discarded,
+	   or never staged under this id), drop any cached subject and
+	   render a stable italic banner. *)
+	| records subject |
+	records:: proposedChangesets at: id ifAbsent: [nil].
+	records isNil ifTrue: [
+		changesetSubjectsById removeKey: id ifAbsent: [].
+		^(label: 'Changeset ', id, ' is no longer pending.') italic
+	].
+	subject:: changesetSubjectsById at: id ifAbsent: [
+		| strategy s |
+		strategy:: AIInstallStrategy
+			onRecords: records
+			changesetId: id
+			chatDocument: self.
+		s:: ChangesetSubject
+			onLiveNamespace: Root
+			title: 'Apply changeset ', id
+			strategy: strategy.
+		changesetSubjectsById at: id put: s.
+		s].
+	^ChangesetPresenter onSubject: subject
+)
 public clearConversation = (
 	chatSubject_slot isNil ifFalse: [chatSubject_slot session clearHistory]
 )
@@ -698,6 +772,13 @@ public sendText: text <String> ^ <Alien[Promise] | UndefinedObject> = (
 public markComplete = (
 	super markComplete.
 	appendNewAssistantTurnsAfter: lastTurnIndexBeforeSend.
+	(* Drain any changeset ids proposed during this turn. Each id
+	   becomes a ChangesetPresenter amplet appended after the last
+	   assistant section, inline with the conversation transcript. *)
+	[document pendingChangesetIds isEmpty] whileFalse: [
+		| id |
+		id:: document pendingChangesetIds removeFirst.
+		document appendChangesetAmpletFor: id].
 	(* super flipped waiting back to false. Re-publish so the thinking
 	   indicator is replaced with the model picker. *)
 	document mutateContentsTo: document contents.
@@ -740,6 +821,89 @@ public sendText: text <String> attachments: docs <List> ^ <Alien[Promise] | Unde
 )
 ) : (
 )
+public class AIInstallStrategy onRecords: recs <List>
+                                 changesetId: csid <String>
+                                 chatDocument: doc <ChatDocument | UndefinedObject>
+	= ApplyStrategy (
+(*
+ Strategy used by ChangesetSubject in the AI chat flow. When the
+ user clicks "Apply" on a ChangesetPresenter rendered from a
+ proposed AI changeset, this strategy installs the underlying
+ records via the atomic installer, removes the entry from
+ proposedChangesets, and appends a one-line confirmation into the
+ chat document so the conversation log reflects what happened.
+
+ Lexical access to the enclosing AI_IDE_Support module gives the
+ strategy direct call sites for applyChangesetRecords:,
+ proposedChangesets, and simulateRecordsAsChangeset:.
+*)
+|
+	private records <List> = recs.
+	private changesetId <String> = csid.
+	private chatDocument <ChatDocument | UndefinedObject> = doc.
+|
+) (
+public actionLabel ^ <String> = ( ^'Apply' )
+public requiresMessage ^ <Boolean> = ( ^false )
+public requiresAuthor ^ <Boolean> = ( ^false )
+public requiresApply ^ <Boolean> = ( ^true )
+public validate: input <Map> onError: errBlock <[:String]> ^ <Boolean> = ( ^true )
+
+public apply: changeset <Map> withInput: input <Map> ^ <Alien> = (
+	(* Install the records, remove from proposedChangesets, and post a
+	   confirmation note into the chat doc (if any), then resolve.
+	   Errors are caught and pushed through Promise.reject — raising
+	   across the alien bridge would corrupt the live view. *)
+	| deferred resolveFn rejectFn |
+	deferred:: aiAccess JSPromise withResolvers.
+	resolveFn:: deferred at: 'resolve'.
+	rejectFn:: deferred at: 'reject'.
+	[
+		applyChangesetRecords: records.
+		proposedChangesets removeKey: changesetId ifAbsent: [].
+		chatDocument isNil ifFalse: [
+			chatDocument appendAssistantSection:
+				'Applied changeset ', changesetId, ' (',
+				records size printString,
+				(records size = 1
+					ifTrue: [' record).']
+					ifFalse: [' records).'])].
+		resolveFn call: js undefined with: changesetId
+	] on: Exception do: [:e |
+		| msg |
+		msg:: [e messageText] on: Exception do: [:e2 | nil].
+		msg isNil ifTrue: [msg:: e printString].
+		rejectFn call: js undefined with: msg].
+	^deferred at: 'promise'
+)
+
+public computeChangesetOnComplete: doneBlock <[:Map]>
+	onError: errBlock <[:String]> = (
+	(* Build the Changeset Map synchronously from the records, then
+	   deliver it via the continuation. No JS Promise boundary is
+	   crossed here, so returning a Newspeak Map is safe. *)
+	[doneBlock value: (simulateRecordsAsChangeset: records)]
+		on: Exception do: [:e |
+			| msg |
+			msg:: [e messageText] on: Exception do: [:e2 | nil].
+			msg isNil ifTrue: [msg:: e printString].
+			errBlock value: msg]
+)
+) : (
+)
+(* Repositories module accessors. Lazy so they don't run at
+   AI_IDE_Support construction time — HopscotchWebIDE declares
+   aiSupport before repositories, so `ide repositories` would be
+   nil during eager slot init. As lazy slots they resolve on first
+   send, by which point the IDE is fully constructed.
+
+   Note: lazy slot initializers are NOT in the constructor's lexical
+   scope, so refer to `ide` (the captured slot) rather than the
+   `webIde` constructor parameter. *)
+lazy public repositories = ide repositories.
+lazy public ApplyStrategy = repositories ApplyStrategy.
+lazy public ChangesetSubject = repositories ChangesetSubject.
+lazy public ChangesetPresenter = repositories ChangesetPresenter.
 findChatStructuralAmplet: name <String> in: container <Object> ^ <Object | UndefinedObject> = (
 	| amplets count i |
 	amplets:: container getElementsByClassName: 'ampleforth'.
@@ -1326,6 +1490,73 @@ validateChange: change ^ <Object> = (
 	].
 	Error signal: 'Unknown change kind: ', kind
 )
+enqueuePendingChangesetId: id <String> = (
+	(* Push id onto the active chat document's pendingChangesetIds, so
+	   markComplete drains it as an inline ChangesetPresenter amplet.
+	   If there is no active doc-backed chat (inline ChatPresenter,
+	   or no chat at all), the id is silently not queued — applying
+	   still works via the apply_changeset tool. *)
+	| subj |
+	subj:: sharedChatSubject_slot.
+	subj isNil ifTrue: [^self].
+	([subj isKindOfIDEChatDocumentSubject] on: Exception do: [:e | false])
+		ifFalse: [^self].
+	subj document pendingChangesetIds add: id
+)
+summarizeChangesetId: id <String> records: records <List> ^ <String> = (
+	(* Short, structured-y summary returned to the model as the tool
+	   result. The user sees the proper structured diff in the chat doc
+	   via the embedded ChangesetPresenter; the model only needs enough
+	   to reference the proposal in follow-up turns. *)
+	| newClasses changedMembers removedMembers result |
+	newClasses:: List new.
+	changedMembers:: List new.
+	removedMembers:: List new.
+	records do: [:r |
+		| kind cn side selOrNew |
+		kind:: r at: 'kind'.
+		cn:: r at: 'class_name'.
+		side:: (r includesKey: 'side') ifTrue: [r at: 'side'] ifFalse: ['instance'].
+		kind = 'add_top_level_class' ifTrue: [newClasses add: cn].
+		kind = 'add_or_replace_method' ifTrue: [
+			selOrNew:: [(extractMethodSelectorFromSource: (r at: 'source')) asString]
+				on: Exception do: [:e | '?'].
+			changedMembers add: cn, (side = 'class' ifTrue: [' class>>'] ifFalse: ['>>']), selOrNew].
+		kind = 'add_or_replace_lazy_slot' ifTrue: [
+			selOrNew:: [(extractLazySlotSelectorFromSource: (r at: 'source')) asString]
+				on: Exception do: [:e | '?'].
+			changedMembers add: cn, (side = 'class' ifTrue: [' class>>'] ifFalse: ['>>']), selOrNew, ' (slot)'].
+		kind = 'set_class_header' ifTrue: [
+			changedMembers add: cn, ' (header)'].
+		kind = 'add_or_replace_nested_class' ifTrue: [
+			changedMembers add: cn, '.<nested>'].
+		kind = 'delete_method' ifTrue: [
+			removedMembers add: cn, (side = 'class' ifTrue: [' class>>'] ifFalse: ['>>']), (r at: 'selector') asString].
+		kind = 'delete_lazy_slot' ifTrue: [
+			removedMembers add: cn, (side = 'class' ifTrue: [' class>>'] ifFalse: ['>>']), (r at: 'selector') asString, ' (slot)'].
+		kind = 'delete_nested_class' ifTrue: [
+			removedMembers add: cn]].
+	result:: 'Staged changeset ', id, ' (',
+		records size printString,
+		(records size = 1 ifTrue: [' change).'] ifFalse: [' changes).']).
+	newClasses isEmpty ifFalse: [
+		result:: result, ' New: ', (joinStrings: newClasses with: ', '), '.'].
+	changedMembers isEmpty ifFalse: [
+		result:: result, ' Changed: ', (joinStrings: changedMembers with: ', '), '.'].
+	removedMembers isEmpty ifFalse: [
+		result:: result, ' Removed: ', (joinStrings: removedMembers with: ', '), '.'].
+	result:: result, ' The IDE is rendering a structured diff inline; wait for the user to review and explicitly approve (or click Apply themselves) before calling apply_changeset.'.
+	^result
+)
+joinStrings: strs <List[String]> with: sep <String> ^ <String> = (
+	| result first |
+	result:: ''.
+	first:: true.
+	strs do: [:s |
+		first ifTrue: [result:: s. first:: false]
+		      ifFalse: [result:: result, sep, s]].
+	^result
+)
 formatChangesetId: id records: records ^ <String> = (
 	| result count |
 	count:: records size.
@@ -1482,6 +1713,176 @@ applyChangesetRecords: records = (
 			Root at: m name asSymbol put: m declaration applyToObject reflectee
 		]
 	].
+)
+simulateRecordsAsChangeset: records <List> ^ <Map> = (
+	(* Build a Changeset Map (the shape consumed by ChangesetPresenter)
+	   that describes what `applyChangesetRecords: records` would do
+	   against the live namespace, *without* installing anything.
+
+	   Strategy: start from each touched top-level class's live snapshot
+	   (or an empty snapshot for an add_top_level_class record), then
+	   apply each record's effect at the snapshot level (mutating the
+	   methods / classMethods / lazySlots / nestedClasses / header
+	   sub-maps directly). Finally diff each proposed snapshot against
+	   the live snapshot and classify as #new / #changed.
+
+	   We do not pretend to handle every corner case the full atomic
+	   installer covers (e.g. an add_top_level_class whose name already
+	   exists raises in the installer; here we simply mark the class as
+	   #changed). The presenter's role is to show the user what will
+	   change; the actual install path still validates. *)
+	| snapsByTop newClasses sourcesByTop classDiffs |
+	snapsByTop:: Map new.
+	newClasses:: Set new.
+	sourcesByTop:: Map new.
+	records do: [:r | seedSnapshotForRecord: r
+		snapsByTop: snapsByTop
+		newClasses: newClasses
+		sourcesByTop: sourcesByTop].
+	records do: [:r | applyRecordToSnapshot: r in: snapsByTop].
+	classDiffs:: Map new.
+	snapsByTop keysAndValuesDo: [:topName :proposedSnap |
+		| liveCls |
+		(newClasses includes: topName) ifTrue: [
+			classDiffs at: topName put: (Map new
+				at: #status put: #new;
+				at: #liveSnapshot put: proposedSnap;
+				at: #liveSource put: (sourcesByTop at: topName ifAbsent: [nil]);
+				yourself)
+		] ifFalse: [
+			liveCls:: Root at: topName ifAbsent: [nil].
+			liveCls isNil ifFalse: [
+				| liveSnap diff |
+				liveSnap:: repositories liveSnapshotOf: liveCls.
+				diff:: repositories diffSnapshot: liveSnap to: proposedSnap.
+				(repositories diffIsEmpty: diff) ifFalse: [
+					| headSrc |
+					headSrc:: [(classDeclarationNamed: topName asString) source]
+						on: Exception do: [:e | nil].
+					classDiffs at: topName put: (Map new
+						at: #status put: #changed;
+						at: #diff put: diff;
+						at: #headSnapshot put: liveSnap;
+						at: #liveSnapshot put: proposedSnap;
+						at: #headSource put: headSrc;
+						yourself)]]]].
+	^Map new
+		at: #classDiffs put: classDiffs;
+		at: #skipped put: List new;
+		yourself
+)
+seedSnapshotForRecord: r <Map>
+	snapsByTop: snapsByTop <Map>
+	newClasses: newClasses <Set>
+	sourcesByTop: sourcesByTop <Map> = (
+	(* Make sure snapsByTop has an entry for the top-level class touched
+	   by record r. add_top_level_class seeds from the record's full
+	   source; everything else seeds from the live namespace if the class
+	   exists. Records touching an unknown live class are silently
+	   skipped at this stage — the corresponding entry simply won't make
+	   it into classDiffs. *)
+	| kind topName liveCls |
+	kind:: r at: 'kind'.
+	kind = 'add_top_level_class' ifTrue: [
+		| src |
+		topName:: (r at: 'class_name') asSymbol.
+		src:: r at: 'source'.
+		newClasses add: topName.
+		sourcesByTop at: topName put: src.
+		(snapsByTop includesKey: topName) ifFalse: [
+			snapsByTop at: topName put:
+				(repositories extractedSnapshotFromSource: src)].
+		^self
+	].
+	topName:: ((r at: 'class_name') findTokens: '.') at: 1.
+	topName:: topName asSymbol.
+	(snapsByTop includesKey: topName) ifTrue: [^self].
+	liveCls:: Root at: topName ifAbsent: [nil].
+	liveCls isNil ifFalse: [
+		snapsByTop at: topName put: (repositories liveSnapshotOf: liveCls)]
+)
+applyRecordToSnapshot: r <Map> in: snapsByTop <Map> = (
+	(* Mutate the proposed snapshot for the top-level class of record r
+	   to reflect r's effect. Walks down nested classes by dotted name.
+	   No-op if the relevant top-level snapshot isn't present (record
+	   was orphaned in seedSnapshotForRecord:). *)
+	| kind segments topName snap target side membersKey |
+	kind:: r at: 'kind'.
+	kind = 'add_top_level_class' ifTrue: [^self].
+	segments:: (r at: 'class_name') findTokens: '.'.
+	topName:: (segments at: 1) asSymbol.
+	snap:: snapsByTop at: topName ifAbsent: [^self].
+	target:: snap.
+	2 to: segments size do: [:i |
+		| seg nested |
+		seg:: (segments at: i) asSymbol.
+		nested:: (target at: #nestedClasses) at: seg ifAbsent: [nil].
+		nested isNil ifTrue: [^self].
+		target:: nested
+	].
+	kind = 'set_class_header' ifTrue: [
+		target at: #header put: (r at: 'source').
+		^self
+	].
+	kind = 'add_or_replace_nested_class' ifTrue: [
+		| newSnap nestedName |
+		newSnap:: repositories extractedSnapshotFromSource: (r at: 'source').
+		nestedName:: (newSnap at: #name) asSymbol.
+		(target at: #nestedClasses) at: nestedName put: newSnap.
+		^self
+	].
+	kind = 'delete_nested_class' ifTrue: [
+		(* class_name is the nested class to remove; segments[1..n-1] is
+		   the parent path. Re-walk to the parent. *)
+		| parent nestedName |
+		parent:: snap.
+		2 to: segments size - 1 do: [:i |
+			| seg nested |
+			seg:: (segments at: i) asSymbol.
+			nested:: (parent at: #nestedClasses) at: seg ifAbsent: [nil].
+			nested isNil ifTrue: [^self].
+			parent:: nested
+		].
+		nestedName:: (segments at: segments size) asSymbol.
+		(parent at: #nestedClasses) removeKey: nestedName ifAbsent: [].
+		^self
+	].
+	side:: (r includesKey: 'side') ifTrue: [r at: 'side'] ifFalse: ['instance'].
+	(kind = 'add_or_replace_lazy_slot' or: [kind = 'delete_lazy_slot'])
+		ifTrue: [membersKey:: #lazySlots]
+		ifFalse: [
+			(kind = 'add_or_replace_method' or: [kind = 'delete_method'])
+				ifTrue: [membersKey:: side = 'class' ifTrue: [#classMethods] ifFalse: [#methods]]
+				ifFalse: [^self]].
+	kind = 'add_or_replace_method' ifTrue: [
+		| selName |
+		selName:: extractMethodSelectorFromSource: (r at: 'source').
+		(target at: membersKey) at: selName put: (r at: 'source').
+		^self
+	].
+	kind = 'add_or_replace_lazy_slot' ifTrue: [
+		| selName |
+		selName:: extractLazySlotSelectorFromSource: (r at: 'source').
+		(target at: membersKey) at: selName put: (r at: 'source').
+		^self
+	].
+	(* delete_method / delete_lazy_slot *)
+	(target at: membersKey) removeKey: (r at: 'selector') asSymbol ifAbsent: []
+)
+extractMethodSelectorFromSource: src <String> ^ <Symbol> = (
+	(* Parse via a throwaway builder. The real installer uses the same
+	   addFromSource: API, which returns a mirror with a `name`. We use
+	   that name as the snapshot key. *)
+	| tmp m |
+	tmp:: ClassDeclarationBuilder fromSource: 'class NewspeakSelectorProbe = () ()'.
+	m:: tmp instanceSide methods addFromSource: src.
+	^m name
+)
+extractLazySlotSelectorFromSource: src <String> ^ <Symbol> = (
+	| tmp s |
+	tmp:: ClassDeclarationBuilder fromSource: 'class NewspeakSelectorProbe = () ()'.
+	s:: tmp instanceSide lazySlots addFromSource: src.
+	^s name
 )
 aiWorkspaceSubject ^ <Object> = (
 	(* Get-or-create the AI workspace via the WorkspaceManager's standard
@@ -2581,7 +2982,7 @@ runOneTestTool ^ <Tool> = (
 proposeChangesTool ^ <Tool> = (
 	^Tool
 		name: 'propose_changes'
-		description: 'Stage a set of code edits for atomic installation. Does NOT install. Returns a textual diff plus a changeset id. After calling this, present the diff to the user and wait for explicit approval ("apply", "ok", "go ahead") before calling apply_changeset. If the user wants something different, refine the changes and propose again.
+		description: 'Stage a set of code edits for atomic installation. Does NOT install. Returns a short summary plus a changeset id; the IDE renders the proposal as a structured diff inline in the chat. Wait for explicit user approval ("apply", "ok", "go ahead") before calling apply_changeset — or, if the user clicks the inline Apply button themselves, you will see a follow-up assistant note saying the changeset was applied. If the user wants something different, refine the changes and call propose_changes again.
 
 Each entry in the changes array is one of:
 - {kind: "add_or_replace_method",       class_name, side?, source}
@@ -2610,7 +3011,8 @@ Top-level class DELETION is not supported by this tool (different mechanism, not
 			].
 			id:: freshChangesetId.
 			proposedChangesets at: id put: records.
-			formatChangesetId: id records: records
+			enqueuePendingChangesetId: id.
+			summarizeChangesetId: id records: records
 		]
 )
 applyChangesetTool ^ <Tool> = (

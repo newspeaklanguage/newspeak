@@ -4205,6 +4205,21 @@ versionSource_slot
    beginVersionSourceFetch; never reset (each entry is fetched at
    most once per session). *)
 versionSourceFetchStarted_slot ::= false.
+(* True when the user has hit "Compare to live" on this entry's
+   editor. The diff marks are re-applied on every noticeExposure by
+   a CompareToLiveDecorator fragment sibling of the editor; the
+   slot is the only source of truth. Persisted on the subject
+   (not on the presenter) so the state survives presenter rebuilds.
+   See CompareToLiveDecorator's docstring for the wipe-and-re-apply
+   protocol that motivates the decorator. *)
+compareLiveActive_slot <Boolean> ::= false.
+(* True for entries synthesised by `forChangesetVersionSource:`
+   (changeset HEAD vs live rows). Those rows already render a
+   side-by-side diff via DiffSideBySideTrigger; adding the live
+   compare affordance on top would be redundant on the "Live"
+   side and confusing on the "HEAD" side. The presenter omits
+   the compareToLive button when this is true. *)
+isChangesetEntry_slot <Boolean> ::= false.
 messages_slot
 messagesComputed_slot ::= false.
 |
@@ -4239,6 +4254,26 @@ public versionSource ^ <String | Nil> = (^versionSource_slot)
 public versionSource: src <String> = (versionSource_slot:: src)
 public editor = (^editor_slot)
 public editor: cm = (editor_slot:: cm)
+public compareLiveActive ^ <Boolean> = (^compareLiveActive_slot)
+public compareLiveActive: b <Boolean> = (compareLiveActive_slot:: b)
+public isChangesetEntry ^ <Boolean> = (^isChangesetEntry_slot)
+public isChangesetEntry: b <Boolean> = (isChangesetEntry_slot:: b)
+public liveSource ^ <String | Nil> = (
+  (* Source of the LIVE version of this member, for the "Compare to
+     live" diff. Dispatches on memberMirror kind: methods and lazy
+     slots expose source directly, class declarations expose header
+     source. Returns nil for memberMirrors that don't resolve to a
+     live mirror (e.g. SourceMirror-flavoured stand-ins used in the
+     changeset flow) -- the presenter checks and disables the
+     compare button in that case. *)
+  | m |
+  m:: memberMirror.
+  m isKindOfClassDeclarationMirror ifTrue: [
+    ^[m header source] on: Exception do: [:e | nil]].
+  (m isKindOfMethodMirror or: [m isKindOfLazySlotMirror]) ifTrue: [
+    ^[m source] on: Exception do: [:e | nil]].
+  ^nil
+)
 public installEdits: text <String> = (
   (* Install `text` as the new live source of the member this entry
      is a version of. Dispatches on memberMirror's kind: methods and
@@ -4396,6 +4431,7 @@ public forChangesetVersionSource: src <String>
   subject:: self onModel:
     (MemberHistoryEntryModel entry: entry memberMirror: mm path: path).
   subject versionSource: src.
+  subject isChangesetEntry: true.
   ^subject
 )
 )
@@ -4434,24 +4470,47 @@ definition = (
     helpSection.
     ensureEditor.
     mediumBlank.
-    row: {
-      mediumBlank.
-      button: 'Make Live' action: [installCurrentEditorText].
-      smallBlank.
-      dropDownMenu: [messagesMenu] image: ide images itemReferencesImage.
-      smallBlank.
-      aiChatButton: [installHistoryFocusAction]
-        ifFocused: [ide aiSupport
-          isFocusedOnHistory: subject memberMirror
-          sha: subject sha].
-      smallBlank.
-      helpButton.
-      smallBlank.
-      dropDownMenu: [entryMenu].
-      filler
-    }.
-    chatSection
+    actionRow.
+    chatSection.
+    (* Decorator must come AFTER the editor: its noticeExposure
+       re-applies the diff each round-trip (Hopscotch's CodeMirror
+       reconciliation calls editor setValue, which clears marks),
+       and the editor has to exist at noticeExposure time. *)
+    CompareToLiveDecorator onEntry: subject
   }
+)
+actionRow = (
+  (* compareToLive only appears when the diff is meaningful:
+     never on a changeset HEAD/live row (those already render a
+     side-by-side diff via DiffSideBySideTrigger), and never when
+     the member has no live counterpart (deleted member, phantom
+     SourceMirror in #added rows). Showing-it-greyed-out was
+     reported as ambiguous, so the affordance is removed entirely
+     in those cases rather than dimmed. *)
+  | items |
+  items:: List new.
+  items add: mediumBlank.
+  items add: (button: 'Make Live' action: [installCurrentEditorText]).
+  items add: smallBlank.
+  showCompareToLive ifTrue: [
+    items add: compareToLiveButton.
+    items add: smallBlank].
+  items add: (dropDownMenu: [messagesMenu] image: ide images itemReferencesImage).
+  items add: smallBlank.
+  items add: (aiChatButton: [installHistoryFocusAction]
+    ifFocused: [ide aiSupport
+      isFocusedOnHistory: subject memberMirror
+      sha: subject sha]).
+  items add: smallBlank.
+  items add: helpButton.
+  items add: smallBlank.
+  items add: (dropDownMenu: [entryMenu]).
+  items add: filler.
+  ^row: items
+)
+showCompareToLive ^ <Boolean> = (
+  subject isChangesetEntry ifTrue: [^false].
+  ^subject liveSource isNil not
 )
 entryMenu = (
   ^menuWithLabelsAndActions: {
@@ -4478,6 +4537,13 @@ original source.
 Controls in the row below the editor, from left to right:
 <ul>
 <li><b>Make Live</b> -- install editor text as the new live ', kind, '.</li>
+<li><b>Compare to live</b> (when present) -- tints lines and character
+spans in this historical view that are <em>no longer in</em> the
+current live source. Content that was <em>added</em> in live since
+this version is not shown here -- only one editor pane is available,
+so the diff is one-sided by design. Click again to clear. Absent on
+changeset rows (those already render a side-by-side diff) and on
+entries whose member no longer exists live.</li>
 <li><div class="hopscotchReferencesButton"></div> -- menu of selectors
 sent from this version, each navigable.</li>
 <li>AI chat button -- focus the IDE chat on this historical version
@@ -4612,6 +4678,26 @@ resetEditor: cm <CodeMirrorFragment> = (
   cm text: src.
   colorizeSource: src withEditor: cm.
   cm leaveEditState
+)
+compareToLiveButton = (
+  (* Button label flips between "Compare to live" and "Clear compare"
+     based on the subject's persisted state. Only rendered when
+     showCompareToLive is true (live source exists, not a changeset
+     entry) -- the gating happens in actionRow. *)
+  ^button:
+      (subject compareLiveActive
+        ifTrue: ['Clear compare']
+        ifFalse: ['Compare to live'])
+    action: [toggleCompareToLive]
+)
+toggleCompareToLive = (
+  (* Flip the persisted flag and refresh. The actual diff machinery
+     lives in CompareToLiveDecorator's noticeExposure: re-applying
+     marks after the reconciliation's setValue has wiped them is
+     the only thing that makes the decorations visible across
+     updateGUI: round-trips. *)
+  subject compareLiveActive: subject compareLiveActive not.
+  updateGUI: []
 )
 ) : (
 )
@@ -4816,7 +4902,14 @@ public isKindOfDiffSideBySideTrigger ^ <Boolean> = (^true)
 isMyKind: f <Fragment> ^ <Boolean> = (
   ^f isKindOfDiffSideBySideTrigger
 )
+public applied ^ <Boolean> = (^applied_slot)
 updateVisualsFromSameKind: oldFragment ^ <Alien[Element]> = (
+  (* Carry forward applied_slot so the reconciled trigger doesn't
+     re-run applyDiffIfReady against editors that already hold our
+     decorations. addLineClass is idempotent, but markText is not --
+     repeated calls layer fresh TextMarks on top of one another and
+     visually accumulate the class. *)
+  applied_slot:: oldFragment applied.
   ^oldFragment visual
 )
 public noticeExposure = (
@@ -4843,6 +4936,78 @@ applyDiffIfReady ^ <Boolean> = (
   diff applyToOldEditor: leftAlien.
   diff applyToNewEditor: rightAlien.
   ^true
+)
+) : (
+)
+public class CompareToLiveDecorator onEntry: e <MemberHistoryEntrySubject>
+  = Fragment (
+(* Invisible fragment that lives last in the column of a
+   MemberHistoryEntryPresenter. On every noticeExposure it consults
+   the entry's compareLiveActive flag and either applies a fresh
+   SideBySideDiff(historical, live) to the entry's CodeMirror or
+   leaves the editor alone.
+
+   Re-applying on every exposure (rather than once-and-cache like
+   DiffSideBySideTrigger does) is load-bearing: HopscotchForHTML5
+   CodeMirrorFragment>>updateVisualsFromSameKind: invokes
+   editor setValue: textSlot whenever the fragment is not in edit
+   state, and CodeMirror's setValue clears every TextMark and
+   line-class on the editor. So each updateGUI: round-trip wipes
+   the decorations; the decorator's job is to put them back on the
+   same trip. The framework calls noticeExposure top-down AFTER
+   updateVisualsFromSameKind: has finished, so by the time apply
+   runs the editor is in its post-setValue clean state.
+
+   This wipe-then-re-apply protocol makes the "Clear compare"
+   path trivial: flipping compareLiveActive to false and calling
+   updateGUI: produces a refresh in which setValue wipes the
+   previous marks and the decorator declines to re-apply -- no
+   explicit removeLineClass / TextMark.clear is needed. *)
+|
+private entry = e.
+|) (
+public createVisual = (
+  | div |
+  div:: document createElement: 'div'.
+  (div at: 'style') at: 'display' put: 'none'.
+  ^div
+)
+public childrenDo: aBlock <[:Fragment]> = (
+  (* Leaf with a side-effecting noticeExposure, not a container. *)
+)
+public isKindOfCompareToLiveDecorator ^ <Boolean> = (^true)
+isMyKind: f <Fragment> ^ <Boolean> = (
+  ^f isKindOfCompareToLiveDecorator
+)
+updateVisualsFromSameKind: oldFragment ^ <Alien[Element]> = (
+  (* No transferable state -- entry is captured at construction and
+     the diff is recomputed from CodeMirror's current text on every
+     noticeExposure. Just hand the previous (hidden) <div> back so
+     Hopscotch's reconciliation completes without unwinding the
+     subtree. Forgetting this override raises subclassResponsibility
+     mid-reconciliation; the unwind collapses the parent toggle row. *)
+  ^oldFragment visual
+)
+public noticeExposure = (
+  super noticeExposure.
+  entry compareLiveActive ifFalse: [^self].
+  applyDiff
+)
+applyDiff = (
+  (* Bail silently when the editor isn't mounted or live source is
+     unavailable. The action row would normally have hidden the
+     button in those cases, but the decorator stays mounted and
+     defensive against transient null states. *)
+  | cm cmAlien histSrc liveSrc diff |
+  cm:: entry editor.
+  cm isNil ifTrue: [^self].
+  cmAlien:: cm editor.
+  cmAlien isNil ifTrue: [^self].
+  liveSrc:: entry liveSource.
+  liveSrc isNil ifTrue: [^self].
+  histSrc:: cmAlien getValue.
+  diff:: SideBySideDiff onOld: histSrc new: liveSrc.
+  diff applyToOldEditor: cmAlien
 )
 ) : (
 )

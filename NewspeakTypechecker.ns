@@ -1424,7 +1424,7 @@ public blockNode: node ^ <ObjectType> = (
   domain:: node parameters collect: [:p <VarDecl> |
     p isNil
       ifTrue: [
-        invalidDeclarations add: 'Block has nil parameter'.
+        error: 'Block has nil parameter' at: {node start. node end}.
         errorType
       ]
       ifFalse: [p apply: self]
@@ -1801,9 +1801,15 @@ public setterSendNode: node <SetterSendAST> ^ <Type> = (
 )
 public slotDefNode: node <SlotDefAST> ^ <ObjectType> = (
 	| declaredType <ObjectType> initializerType <ObjectType> |
-	(* Get the declared type of the slot *)
+	(* Get the declared type of the slot. A missing annotation is itself a
+	   type error: without one, the initializer-vs-slot subtype check below
+	   degenerates to errorType >: anything and silently accepts garbage. *)
 	declaredType:: node type isNil
-		ifTrue: [errorType]
+		ifTrue: [
+			error: 'Slot ', node name, ' has no type annotation'
+				at: {node start. node end}.
+			errorType
+		]
 		ifFalse: [node type apply: typeBuilder].
 
 	(* Type check the initializer if present *)
@@ -1919,6 +1925,86 @@ public typecheckMethodSource: src <String> ofClass: c <Class> ^ <Set[TypeError]>
 	m:: parser parseMethodDeclaration: src.
 	^typecheckMethod: m ofClass: c.
 )
+public typecheckExpression: src <String> ofClass: c <Class | MixinMirror> ^ <Set[TypeError]> = (
+	(* Typecheck src as an expression evaluated in the scope of class c.
+	   Returns the set of TypeErrors produced; empty if the expression checks. *)
+	| expr <ExpressionAST> toplevelCandidate <MixinMirror> ::= mixinOf: c. |
+	expr:: parser parseExpression: src.
+	currentClass:: toplevelCandidate.
+	typeBuilder:: TypeBuilder forTypesIn: toplevelCandidate.
+	currentDeclaration:: #'<expression>'.
+	[nil ~= toplevelCandidate enclosingMixin] whileTrue: [toplevelCandidate:: toplevelCandidate enclosingMixin].
+	currentTopLevelClass:: toplevelCandidate declaration.
+	errorSet:: Set new.
+	pushScope: Scope new.
+	expr apply: self.
+	popScope.
+	^errorSet
+)
+public typecheckLazySlot: src <String> ofClass: c <Class | MixinMirror> ^ <Set[TypeError]> = (
+	(* Typecheck src as a lazy slot declaration (e.g., 'lazy public x <T> = expr.')
+	   in the scope of class c. Returns the set of TypeErrors produced; empty if
+	   the slot's initializer matches its declared type. *)
+	| slot <SlotDefAST> toplevelCandidate <MixinMirror> ::= mixinOf: c. |
+	slot:: parser parseLazySlotDeclaration: src.
+	currentClass:: toplevelCandidate.
+	typeBuilder:: TypeBuilder forTypesIn: toplevelCandidate.
+	currentDeclaration:: slot name.
+	[nil ~= toplevelCandidate enclosingMixin] whileTrue: [toplevelCandidate:: toplevelCandidate enclosingMixin].
+	currentTopLevelClass:: toplevelCandidate declaration.
+	errorSet:: Set new.
+	pushScope: Scope new.
+	slot apply: self.
+	popScope.
+	^errorSet
+)
+public typecheckClassHeader: src <String> ofClass: c <Class | MixinMirror> ^ <Set[TypeError]> = (
+	(* Typecheck src as a class header. c is the already-installed class whose
+	   header is being re-checked; its enclosingMixin provides the lookup scope
+	   for the superclass clause. Returns the set of TypeErrors produced. *)
+	| header <ClassHeaderAST>
+	  klassMirror <MixinMirror>
+	  enclosing <MixinMirror | Nil>
+	  superclassClauseType <ObjectType>
+	  toplevelCandidate <MixinMirror>
+	|
+	header:: parser parseClassHeader: src.
+	klassMirror:: mixinOf: c.
+	currentClass:: klassMirror.
+	typeBuilder:: TypeBuilder forTypesIn: klassMirror.
+	currentDeclaration:: header name.
+	toplevelCandidate:: klassMirror.
+	[nil ~= toplevelCandidate enclosingMixin] whileTrue: [toplevelCandidate:: toplevelCandidate enclosingMixin].
+	currentTopLevelClass:: toplevelCandidate declaration.
+	errorSet:: Set new.
+	pushScope: Scope new.
+	enclosing:: klassMirror enclosingMixin.
+	nil = enclosing ifFalse: [
+		setClass: enclosing.
+		superclassClauseType:: header superclassCall apply: self.
+		setClass: klassMirror.
+		superclassClauseType mixin isNil ifFalse: [
+			superclassClauseType mixin isMeta ifFalse: [
+				error: 'Class type expected'
+					at: {header superclassCall start. header superclassCall end}
+			]
+		]
+	].
+	(* Check the factory parameters' type annotations. Each parameter is
+	   added to the current scope so the slot initializers and
+	   initialization expressions below can resolve them. *)
+	header constructor parameters do: [:p | p apply: self].
+	(* Check the slot declarations in the instance initializer: missing
+	   annotations and any initializer-vs-declared-type mismatches.
+	   Slots become available in scope for subsequent declarations and
+	   initialization expressions. *)
+	header slots do: [:s | s apply: self].
+	(* Check the free-standing initialization expressions in the
+	   instance initializer body. *)
+	header initExprs do: [:e | e apply: self].
+	popScope.
+	^errorSet
+)
 public unresolvedSendNode: node <UnresolvedSendAST> ^ <ObjectType> = (
 	| functionType <FunctionType> domain <List[ObjectType]> argASTs <List[ExpressionAST]> args <List[ObjectType]> selector <Symbol> localType receiverType |
 
@@ -1970,15 +2056,15 @@ public varDeclNode: node = (
 	| resolvedType |
 	node type isNil
 		ifTrue: [
-			(* No type declaration - use errorType and report error *)
-			invalidDeclarations add: (node name, ' must have a type declaration').
+			error: 'Local ', node name, ' has no type annotation'
+				at: {node start. node end}.
 			^currentScope at: node name put: errorType
 		]
 		ifFalse: [
 			resolvedType:: (node type apply: typeBuilder).
-			(* Defensive check - if typeBuilder returned nil, use errorType *)
 			resolvedType isNil ifTrue: [
-				invalidDeclarations add: (node name, ' has invalid type').
+				error: 'Local ', node name, ' has an invalid type'
+					at: {node start. node end}.
 				resolvedType:: errorType
 			]
 		].
@@ -1986,19 +2072,19 @@ public varDeclNode: node = (
 )
 public parameterDeclNode: node = (
 	(* Parameters are added to scope just like variable declarations.
-	   If no type is declared, use errorType and report an error. *)
+	   If no type is declared, report an error and use errorType. *)
 	| resolvedType |
 	node type isNil
 		ifTrue: [
-			(* Issue type error for missing parameter type *)
-			invalidDeclarations add: (node name, ' parameter must have a type declaration').
+			error: 'Parameter ', node name, ' has no type annotation'
+				at: {node start. node end}.
 			resolvedType:: errorType
 		]
 		ifFalse: [
 			resolvedType:: (node type apply: typeBuilder).
-			(* Defensive check - if typeBuilder returned nil, use errorType *)
 			resolvedType isNil ifTrue: [
-				invalidDeclarations add: (node name, ' parameter has invalid type').
+				error: 'Parameter ', node name, ' has an invalid type'
+					at: {node start. node end}.
 				resolvedType:: errorType
 			]
 		].
@@ -2048,7 +2134,10 @@ type: selector <Symbol> at: mixin <MixinMirror>
   selector = #Instance ifTrue: [
     (* Instance is only valid in class methods (metaclass side) *)
     mixin isMeta ifFalse: [
-      invalidDeclarations add: 'Instance type is only valid in class methods'.
+      (* No AST position available at this depth; caller typeIdNode: passes
+         #Instance through us without source coordinates. Position 1..1 is
+         a placeholder; the message alone is enough to diagnose. *)
+      error: 'Instance type is only valid in class methods' at: {1. 1}.
       ^errorType
     ].
     (* Get the instance side mixin via declaration and create a TypeVariable for it *)
@@ -2085,25 +2174,14 @@ type: selector <Symbol> at: mixin <MixinMirror>
    ^classMirror mixin declaration]
     on: Error
     do: [:ex |
-      '=== ERROR in type:at: ===' out.
-      'selector: ' out. selector out.
-      'namespaceResult: ' out. namespaceResult out.
-      'namespaceResult class: ' out. (classOf: namespaceResult) out.
-      'Error: ' out. ex out.
-      'Attempting ClassMirror reflecting:' out.
-      [classMirror:: ClassMirror reflecting: namespaceResult.
-       'ClassMirror created: ' out. classMirror out.
-       'Attempting .mixin on ClassMirror' out.
-       classMirror mixin out.
-      ] on: Error do: [:ex2 |
-        'ERROR calling .mixin: ' out. ex2 out.
-        halt
-      ].
-      ex pass
+      (* Namespace entry exists but isn't a reflectable class (e.g., a
+         document or other non-Behavior). Treat as not-found so the typecheck
+         continues; typeIdNode: will fall through to errorType. *)
+      ^nil
     ]
 )
-public typecheckMethod: m <MethodAST> ofClass: c <Class> ^ <Set[TypeError]> = (
-	| toplevelCandidate <MixinMirror> ::= (ClassMirror reflecting: c) mixin. |
+public typecheckMethod: m <MethodAST> ofClass: c <Class | MixinMirror> ^ <Set[TypeError]> = (
+	| toplevelCandidate <MixinMirror> ::= mixinOf: c. |
 	currentClass:: toplevelCandidate.
 	typeBuilder:: TypeBuilder forTypesIn: toplevelCandidate.
 	currentDeclaration:: m selector.
@@ -2112,6 +2190,15 @@ public typecheckMethod: m <MethodAST> ofClass: c <Class> ^ <Set[TypeError]> = (
 	errorSet:: Set new.
 	methodNode: m.
 	^errorSet
+)
+mixinOf: c <Class | MixinMirror> ^ <MixinMirror> = (
+	(* Accept either a live Class object or a MixinMirror. Returns the
+	   MixinMirror. The IDE supplies MixinMirrors (since applyToObject
+	   is only defined for top-level declarations); the test harness
+	   still supplies Class objects. *)
+	^c isKindOfMixinMirror
+		ifTrue: [c]
+		ifFalse: [(ClassMirror reflecting: c) mixin]
 )
 localMember: selector <Symbol> in: mixin <MixinMirror> ^ <MethodMirror | ClassDeclarationMirror | SlotDeclarationMirror | Nil> = (
 | result <Mirror> selectorString <String> slotName <Symbol> |

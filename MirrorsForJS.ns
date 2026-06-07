@@ -125,7 +125,6 @@ public install ^<ClassDeclarationMirror> = (
 	cdir:: computeClassDeclIR.
 	writer generateSourceFor: cdir runtimeMixin on: sb. (* compute up to date JS translation *)
 	src:: sb asString.
-	src out.
 	runtimeMixin:: _js call: (_js ident: 'eval') with: {src}. (* compute up to date runtime mixin *)
 	prvtExistingMixin isNil (* Update based on latest mixin *)
 		ifTrue: [
@@ -207,7 +206,6 @@ updateHeaderSourceForNewRuntimeMixin: runtimeMixin <JRM> from: cdir <Intermediat
   headerSourceIndex <Integer> ::= _js propertyOf: (_js ident: 'sources') at: (_js literal: 'length').
   headerSource = cdir headerSource.
  |
-
   _js assign: (_js propertyOf: runtimeMixin at: (_js literal: 'header')) toBe: headerSourceIndex.
   _js assign: (_js propertyOf: (_js ident: 'sources') at: headerSourceIndex) toBe: headerSource.
 )
@@ -324,6 +322,19 @@ updateMixinFrom: runtimeMixin <JRM> with: cdir <IntermediateClassDeclaration> = 
 		  (* Update class header source index *)
 	_js assign: (_js propertyOf: runtimeMixin at: (_js literal: 'header')) toBe: (_js propertyOf: existingMixin at: (_js literal: 'header')).
 
+	(* Recurse into nested mixins. Each nested mixin in [runtimeMixin]
+	   was freshly emitted with COMPILER-LOCAL source indices that don't
+	   correspond to the JS-global [sources] array. Without this fixup,
+	   any read of a nested class's source after this top-level re-install
+	   gets the wrong text. Treat nested mixins as fresh installs
+	   (delegate to [updateSourceIndicesOfNewRuntimeMixin:] which already
+	   recurses further). *)
+	cdir instanceSide nestedClasses do: [:nestedCdir <IntermediateClassDeclaration> |
+		| nestedRtm |
+		nestedRtm:: _js propertyOf: runtimeMixin at: (vmmirror mangleSelector: nestedCdir qualifiedName).
+		(_js operator: '!==' with: nestedRtm and: (_js ident: 'undefined')) ifTrue: [
+			updateSourceIndicesOfNewRuntimeMixin: nestedRtm from: nestedCdir]].
+
 	(* Update the  existing runtime based on the new one *)
 	updateMixin: prvtExistingMixin from: runtimeMixin by: cdir
 )
@@ -350,11 +361,14 @@ updateSourceIndicesOfNewRuntimeMixin: runtimeMixin <JRM> from: cdir <Intermediat
 		 ].
 
 	  (* Update global sources array with any changed or new source code *)
-	instanceSide methods do: [:m <MethodBuilder> | | sourceIndex <Integer> |
+	(* Use [cdir] (the IR) instead of [self instanceSide] so this works
+	   correctly when recursing into nested mixins (where [self] is still
+	   the top-level builder). *)
+	cdir instanceSide methods do: [:m <IntermediateMethod> | | sourceIndex <Integer> |
 		  sourceIndex:: instanceMethodSourceIndices at: m name.
 		  m source ~= nil ifTrue: [_js assign: (_js propertyOf: (_js ident: 'sources') at: sourceIndex) toBe: m source].
 		].
-	classSide methods do: [:m <MethodBuilder> | | sourceIndex <Integer> |
+	cdir classSide methods do: [:m <IntermediateMethod> | | sourceIndex <Integer> |
 		  sourceIndex:: classMethodSourceIndices at: m name.
 		  m source ~= nil ifTrue: [_js assign: (_js propertyOf: (_js ident: 'sources') at: sourceIndex) toBe: m source].
 		].
@@ -370,6 +384,16 @@ updateSourceIndicesOfNewRuntimeMixin: runtimeMixin <JRM> from: cdir <Intermediat
 		].
 		  (* Update class header source index *)
 	updateHeaderSourceForNewRuntimeMixin: runtimeMixin from: cdir.
+	  (* Recurse into nested classes — their headers and methods were
+	     encoded against the COMPILER-LOCAL sourcesList during JS gen and
+	     the embedded indices are meaningless for the JS-global sources
+	     array. Without this fixup, nested mixin.header points at an
+	     unrelated source string. *)
+	cdir instanceSide nestedClasses do: [:nestedCdir <IntermediateClassDeclaration> |
+		| nestedRtm |
+		nestedRtm:: _js propertyOf: runtimeMixin at: (vmmirror mangleSelector: nestedCdir qualifiedName).
+		(_js operator: '!==' with: nestedRtm and: (_js ident: 'undefined')) ifTrue: [
+			updateSourceIndicesOfNewRuntimeMixin: nestedRtm from: nestedCdir]].
 )
 ) : (
 public fromSource: src <String> ^<ClassDeclarationBuilder> = (
@@ -391,7 +415,7 @@ public reflecting: mixin <InstanceMixin> ^<ClassDeclarationBuilder> = (
 )
 )
 class ClassDeclarationMirror reflecting: mixin = (|
-	private reflectee = mixin.
+	public reflectee = mixin.
 	public instanceSide <MixinMirror> = MixinMirror reflecting: mixin.
 	public classSide <MixinMirror> = MixinMirror reflecting: (classMixinOf: mixin).
 |) (
@@ -446,13 +470,33 @@ public source ^<String> = (
 	sb writeln: ' )'.
 	^sb asString
 )
+public = other = (
+	other isKindOfClassDeclarationMirror ifFalse: [^false].
+	^_js operator: '===' with: reflectee and: other reflectee
+)
+public hash ^ <Integer> = (
+	^(identityHashOf: reflectee) bitXor: class hash
+)
+public printString = (
+	^'ClassDeclarationMirror:', simpleName
+)
+public metadata = (
+	^header metadata
+)
 ) : (
 )
 class ClassHeaderMirror reflecting: mixin = AbstractClassHeaderMirror (|
-	private reflectee <Mixin> = mixin.
+	public reflectee <Mixin> = mixin.
 |) (
 public isKindOfClassHeaderMirror ^<Boolean> = (
 	^true
+)
+public = other = (
+	other isKindOfClassHeaderMirror ifFalse: [^false].
+	^_js operator: '===' with: reflectee and: other reflectee
+)
+public hash ^ <Integer> = (
+	^(identityHashOf: reflectee) bitXor: class hash
 )
 public name = (
 	^(reflectee name splitBy: '`') last
@@ -566,7 +610,14 @@ computeClassSide ^ <MixinBuilder> = (
 	^MixinBuilder for: prvtIR classSide classDeclaration: self existingMixin: existingClassMixin.
 )
 computeInstanceSide ^ <MixinBuilder> = (
-	^MixinBuilder for: prvtIR instanceSide classDeclaration: self existingMixin: prvtIR instanceSide.
+	(* existingMixin: was previously [prvtIR instanceSide] — an
+	   IntermediateMixin, which has no [runtimeMixin] property and
+	   crashes MixinBuilder>>nestedClassBuilderFor:within: when it
+	   tries to find nested mixins by name in [em.runtimeMixin].
+	   Pass [prvtExistingMixin] (a real Mixin, or nil for a fresh
+	   class), matching the pattern in MixinBasedClassDeclarationBuilder>>computeInstanceSide
+	   and IRBasedClassDeclarationBuilder>>computeClassSide. *)
+	^MixinBuilder for: prvtIR instanceSide classDeclaration: self existingMixin: prvtExistingMixin.
 )
 declarationData = (
 	^prvtIR
@@ -606,6 +657,28 @@ class MethodMirror name: n accessModifier: a mixin: m source: s = (|
 |) (
 public isKindOfMethodMirror ^<Boolean> = (
 	^true
+)
+public = other = (
+	other isKindOfMethodMirror ifFalse: [^false].
+	^name = other name and: [definingMixin = other definingMixin]
+)
+public hash ^ <Integer> = (
+	^name hash bitXor: class hash
+)
+public isSynthetic ^ <Boolean> = (
+	(* MixinMirror>>methods already filters out isSynthetic methods, so any
+	   MethodMirror that exists in user-facing groups is non-synthetic.
+	   Returning false here matches what the IDE sees. A real fix would
+	   thread the flag through the constructor. *)
+	^false
+)
+public isPrimitive ^ <Boolean> = (
+	(* JS-emitted methods have no [primitive] field; they're all plain JS
+	   functions. *)
+	^false
+)
+public primitive ^ <Integer> = (
+	^0
 )
 public selectors ^ <List[Symbol]> = (
   #BIOGUS yourself. (* need to construct an index when parsing *)
@@ -682,9 +755,28 @@ public canUnderstand: selector <Symbol> ^ <Boolean> = (
 	^methods includesMirrorNamed: selector
 )
 find: name <String> in: aMixin <Mixin>^ <Mixin> = (
-	^Mixin fromRuntimeMixin:
-		(_js propertyOf:
-			(_js propertyOf: aMixin at: (_js literal: 'runtimeMixin')) at: (compilation names manglePublic: name)).
+	(* Defensive: when there is no existing mixin to look in (the
+	   enclosing MixinBuilder represents a brand-new class) — or no
+	   nested-class entry matching [name] in the runtime mixin — return
+	   nil rather than letting downstream code see a Mixin whose
+	   [runtimeMixin] is undefined (which then crashes [isMeta] etc.).
+	   Four cases handled:
+	     - [aMixin] is the Newspeak nil singleton (UndefinedObject)
+	     - [aMixin] is the JS [undefined] primitive
+	     - [aMixin.runtimeMixin] is undefined (e.g., an IntermediateMixin
+	       slipped in via a caller bug; see the prior
+	       IRBasedClassDeclarationBuilder>>computeInstanceSide issue)
+	     - [aMixin.runtimeMixin[manglePublicName]] is undefined (the
+	       nested-class slot doesn't exist in this mixin yet — a fresh
+	       nested class being added) *)
+	| runtimeMixin nested |
+	nil = aMixin ifTrue: [^nil].
+	(_js operator: '===' with: aMixin and: (_js ident: 'undefined')) ifTrue: [^nil].
+	runtimeMixin:: _js propertyOf: aMixin at: (_js literal: 'runtimeMixin').
+	(_js operator: '===' with: runtimeMixin and: (_js ident: 'undefined')) ifTrue: [^nil].
+	nested:: _js propertyOf: runtimeMixin at: (compilation names manglePublic: name).
+	(_js operator: '===' with: nested and: (_js ident: 'undefined')) ifTrue: [^nil].
+	^Mixin fromRuntimeMixin: nested.
 )
 public isKindOfMixinMirror ^<Boolean> = (
 	^true
@@ -706,7 +798,7 @@ public reflecting: mxn <Mixin | ClassMixin> ^<MixinBuilder> = (
 )
 )
 class MixinMirror reflecting: mixin <Mixin> = (|
-	private reflectee <Mixin> = mixin.
+	public reflectee <Mixin> = mixin.
 |) (
 public apply: newSuperclass <Class> withName: n <Symbol> ^ <ClassMirror> = (
 	^ClassMirror reflecting: (reflectee applyTo: newSuperclass withName: n)
@@ -719,11 +811,16 @@ public asBuilder ^<MixinBuilder> = (
 public canUnderstand: selector <Symbol> ^ <Boolean> = (
 	^methods includesMirrorNamed: selector
 )
-public declaration ^<ClassDeclarationMirror> = (
-	^ClassDeclarationMirror
-		reflecting: (isMeta
-			ifFalse: [reflectee]
-			ifTrue: [(Mixin fromRuntimeMixin: (_js propertyOf: (_js propertyOf: reflectee at: (_js literal: 'runtimeMixin')) at: (_js literal: 'nonMeta')))])
+public declaration ^<ClassDeclarationMirror | nil> = (
+	(* For non-meta, reflectee IS the instance-side mixin — wrap directly.
+	   For meta, the non-meta mixin lives at runtimeMixin.nonMeta; defend
+	   against it being undefined (would otherwise produce a Mixin with
+	   undefined runtimeMixin that crashes downstream on [isMeta]). *)
+	| nonMeta |
+	isMeta ifFalse: [^ClassDeclarationMirror reflecting: reflectee].
+	nonMeta:: _js propertyOf: (_js propertyOf: reflectee at: (_js literal: 'runtimeMixin')) at: (_js literal: 'nonMeta').
+	(_js operator: '===' with: nonMeta and: (_js ident: 'undefined')) ifTrue: [^nil].
+	^ClassDeclarationMirror reflecting: (Mixin fromRuntimeMixin: nonMeta)
 )
 public isKindOfMixinMirror ^<Boolean> = (
 	^true
@@ -746,12 +843,19 @@ public name = (
 	^(reflectee name splitBy: '`') last
 )
 public nestedClasses ^<MirrorGroup[ClassDeclarationMirror]> = (
-	| raw <Array[ClassDeclarationMirror]> |
-	raw:: (_js propertyOf: (_js propertyOf: reflectee at: (_js literal: 'runtimeMixin')) at: (_js literal: 'nestedClasses'))
-		collect: [:each | ClassDeclarationMirror reflecting:
-			(Mixin fromRuntimeMixin:
-				(_js propertyOf: (_js propertyOf: reflectee at: (_js literal: 'runtimeMixin')) at: (vmmirror mangleSelector: each)))].
-	^ImmutableMirrorGroup group: raw
+	(* Skip entries whose runtime-mixin slot is undefined (would otherwise
+	   produce a Mixin with undefined runtimeMixin — same hazard as
+	   MixinBuilder>>find:in: had pre-guard). *)
+	| raw rtm |
+	rtm:: _js propertyOf: reflectee at: (_js literal: 'runtimeMixin').
+	raw:: (_js propertyOf: rtm at: (_js literal: 'nestedClasses'))
+		collect: [:each |
+			| nestedMixin |
+			nestedMixin:: _js propertyOf: rtm at: (vmmirror mangleSelector: each).
+			(_js operator: '===' with: nestedMixin and: (_js ident: 'undefined'))
+				ifTrue: [nil]
+				ifFalse: [ClassDeclarationMirror reflecting: (Mixin fromRuntimeMixin: nestedMixin)]].
+	^ImmutableMirrorGroup group: (raw reject: [:m | nil = m])
 )
 public primaryFactorySelector ^ <Symbol> = (
   ^declaration primaryFactorySelector
@@ -772,7 +876,7 @@ public lazySlots = (
 	| results = List new. |
 (*    (* Go thru raw slots *)
 	mixin _slots do:
-		[:slotDescriptor | | slotName = slotDescriptor at: 1.  i = slotName indexOf: '`cacheSlot'. | 
+		[:slotDescriptor | | slotName = slotDescriptor at: 1.  i = slotName indexOf: '`cacheSlot'. |
           (* select slots whose name ends with `cachedSlot *)
           (i ~= 0 and: [slotName size - 9 = i]) ifTrue: [
              (* and create a mirror for them *)
@@ -780,6 +884,38 @@ public lazySlots = (
               ]
        ].*)
 	^ImmutableMirrorGroup group: results
+)
+public enclosingMixin ^ <MixinMirror | nil> = (
+	| enclosing |
+	enclosing:: _js propertyOf: (_js propertyOf: reflectee at: (_js literal: 'runtimeMixin')) at: (_js literal: 'enclosingMixin').
+	(_js operator: '===' with: enclosing and: (_js ident: 'undefined')) ifTrue: [^nil].
+	^MixinMirror reflecting: (Mixin fromRuntimeMixin: enclosing)
+)
+public applications ^ <List[ClassMirror]> = (
+	(* Returns ClassMirrors for every live class built from this mixin.
+	   The runtime mixin's [applications] property is populated by
+	   $applyMixin$toSuperclass$withEnclosingObjects$ in the vmmirror
+	   bootstrap heredoc each time the mixin is applied. *)
+	| raw |
+	raw:: _js propertyOf: (_js propertyOf: reflectee at: (_js literal: 'runtimeMixin')) at: (_js literal: 'applications').
+	^raw collect: [:runtimeClass |
+		ClassMirror reflecting: (_js propertyOf: runtimeClass at: (_js literal: 'newspeakClass'))]
+)
+public primaryFactoryMethod ^ <MethodMirror | nil> = (
+	| selector |
+	selector:: primaryFactorySelector.
+	nil = selector ifTrue: [^nil].
+	(classMixinOf: reflectee) ifNil: [^nil].
+	(MixinMirror reflecting: (classMixinOf: reflectee)) methods do: [:m |
+		m name = selector ifTrue: [^m]].
+	^nil
+)
+public = other = (
+	other isKindOfMixinMirror ifFalse: [^false].
+	^_js operator: '===' with: reflectee and: other reflectee
+)
+public hash ^ <Integer> = (
+	^(identityHashOf: reflectee) bitXor: class hash
 )
 ) : (
 )
@@ -834,6 +970,28 @@ public removeMirrorNamed: m <Symbol | String>^ <Mirror> = (
 )
 class MutableNestedClassGroup group: ms within: mb = MutableMirrorGroup group: ms within: mb  (
 ) (
+public addFromSource: src <String> ^ <ClassDeclarationBuilder> = (
+	(* Compile a fresh top-level class declaration from src and add a
+	   builder for it. Per-mixin nesting context is currently approximate
+	   ([within: nil] for the compile step); install resolves naming. *)
+	| ir newCDB |
+	ir:: compiler compileClassSource: src within: nil.
+	newCDB:: IRBasedClassDeclarationBuilder
+		fromIR: ir
+		existingMixin: nil
+		within: definingMixin declaration.
+	removeMirrorNamed: newCDB simpleName.
+	addMirror: newCDB.
+	^newCDB
+)
+) : (
+)
+class MutableSlotGroup group: ms within: mb = MutableMirrorGroup group: ms within: mb (
+(* Marker subclass for slot-declaration groups. Mutation (add/remove a
+   slot) requires recompiling the class header via ClassHeaderBuilder,
+   which is Tier 2. For now this group is read-only and inherits the
+   generic MutableMirrorGroup add/remove behavior on the in-memory list. *)
+) (
 ) : (
 )
 public class ObjectMirror reflecting: r = (|
@@ -872,7 +1030,6 @@ private compileExpression: expression <String> with: rawScope <Map[Symbol, Objec
 	sb:: StringBuilder new.
 	writer generateSourceFor: ir function on: sb.
 	src:: sb asString.
-	src out.
 	^_js call: (_js ident: 'eval') with: {'(',src, ')'}
 )
 public evaluate: expression <String> ^<ThreadMirror> = (
@@ -912,12 +1069,33 @@ public hash ^<Integer> = (
 public isKindOfObjectMirror ^<Boolean> = (
 	^true
 )
+public perform: selector with: arguments ifFail: failBlock = (
+	(* Reflectively invoke [selector] on the reflectee with [arguments].
+	   On any Exception, runs failBlock with the exception. *)
+	^[(Message selector: selector arguments: arguments) sendTo: reflectee]
+		on: Exception
+		do: [:e | failBlock value: e]
+)
+public performPublic: selector with: arguments = (
+	^(Message selector: selector arguments: arguments) sendTo: reflectee
+)
+public printString = (
+	^'ObjectMirror on ', reflectee printString
+)
+public compileExpression: expression <String> scope: scope ^ <JS[Function]> = (
+	(* Public wrapper around the private [compileExpression:with:]. *)
+	^compileExpression: expression with: scope
+)
 public setSlot: selector to: value = (
-	|
-	mangledName = vmmirror mangleSelector: selector, '`slot'.
-	raw = _js propertyOf: reflectee at: mangledName.
-	|
-	(_js operator: '===' with: (_js ident: 'undefined') and: raw) ifTrue: [^halt].
+	(* JS strict mode forbids setting properties on primitives (number,
+	   string, boolean). If [reflectee] is one of those, the [_js assign:]
+	   below would throw [Cannot create property '...' on number 'N'].
+	   Refuse cleanly. *)
+	| mangledName <String> t <String> |
+	mangledName:: vmmirror mangleSelector: selector, '`slot'.
+	t:: _js prefixOperator: 'typeof ' on: reflectee.
+	(t = 'number' or: [t = 'string' or: [t = 'boolean']]) ifTrue: [
+		^Error signal: 'Cannot set slot on JS primitive: ', reflectee printString].
 	_js assign: (_js propertyOf: reflectee at: mangledName) toBe: value.
 )
 ) : (
@@ -930,6 +1108,26 @@ class SlotDeclarationMirror name: n accessModifier: a isMutable: m mixin: mxn = 
 |) (
 public isKindOfSlotDeclarationMirror ^<Boolean> = (
 	^true
+)
+public isSynthetic ^ <Boolean> = (
+	(* MixinMirror>>slots already filters out isSynthetic slots, so any
+	   SlotDeclarationMirror reaching user-facing code is non-synthetic.
+	   Matches the same pattern in MethodMirror>>isSynthetic. *)
+	^false
+)
+public source ^ <String | nil> = (
+	(* Best-effort: parse the class header and slice out the slot decl by
+	   matching the slot's name in the parsed header AST. Returns nil if
+	   the slot can't be found in the header text (e.g., synthetic slots
+	   added by the compiler). *)
+	| header headerSource headerAst |
+	header:: definingMixin declaration header.
+	headerSource:: header source.
+	headerAst:: compilation parser classHeader parseString: headerSource.
+	headerAst slots do: [:slotAst |
+		slotAst name = name ifTrue: [
+			^headerSource copyFrom: slotAst start to: slotAst end]].
+	^nil
 )
 ) : (
 )
@@ -958,23 +1156,90 @@ public isKindOfThreadMirror ^ <Boolean> = (
 public isSuspended ^<Boolean> = (
 	^state = #suspended
 )
+public isRunning ^<Boolean> = (
+	^state = #running
+)
+public isTerminated ^<Boolean> = (
+	^state = #terminated
+)
+public hash ^ <Integer> = (
+	^state hash bitXor: class hash
+)
+public = other = (
+	other isKindOfThreadMirror ifFalse: [^false].
+	^state = other state and: [result = other result]
+)
 ) : (
 )
 public class LazySlotMirror reflecting: m <Symbol> in: em <MixinMirror> =  (
-(* The mirror for a particular lazy slot. Every lazy slot consist of an underlying storage location (the cache) and 2-3 methods: 
+(* The mirror for a particular lazy slot. Every lazy slot consist of an underlying storage location (the cache) and 2-3 methods:
 
 a. The getter, which tests if the slot is nil, and if so, calls the init method (see (b) below) to compute the value and set the underlying storage. In any case it returns the value stored in the slot.  This method is sometimes referred to as the the main method of the lazy slot.
 
-b. The init method, in charge of doing the actual computation. 
+b. The init method, in charge of doing the actual computation.
 
-c. If the slot is mutable, there will be a third method, which is an ordinary setter.  
+c. If the slot is mutable, there will be a third method, which is an ordinary setter.
 *)
 |
     reflectee  <Symbol> = m.
 	enclosingMixinMirror <MixinMirror>  = em.
-	public mainMethod <MethodMirror> = MethodMirror reflecting: (mixin _methods select: [:mtd | mtd selector = m]) first.
+	(* [mainMethod] was previously a slot eagerly initialized to
+	   [MethodMirror reflecting: ...] — but MethodMirror has no [reflecting:]
+	   factory, and the slot referenced an undefined [mixin] (should be
+	   [em]). The eager init crashes when LazySlotMirror is constructed.
+	   Removed; mainMethod is now a method that looks up on demand.
+	   Tier-2 work (MixinMirror>>lazySlots that actually constructs lazy
+	   slot mirrors) will exercise this and is gated on pinning the lazy
+	   slot naming convention. *)
 |
 ) (
+public name = (
+	^reflectee
+)
+public simpleName = (
+	^reflectee
+)
+public definingMixin = (
+	^enclosingMixinMirror
+)
+public enclosingMixin = (
+	^enclosingMixinMirror reflectee
+)
+public isExpression ^ <Boolean> = (
+	^false
+)
+public isKindOfLazySlotMirror ^ <Boolean> = (
+	^true
+)
+public category = (
+	^#'lazyslots'
+)
+public hash = (
+	^reflectee hash
+)
+public = other = (
+	other isKindOfLazySlotMirror ifFalse: [^false].
+	^reflectee = other name
+)
+public mainMethod ^ <MethodMirror | nil> = (
+	(* On-demand lookup. Returns nil if MixinMirror>>methods doesn't surface
+	   a method whose name equals the lazy slot's name (which is the case
+	   today — lazy slot init / getter methods are not yet exposed via the
+	   methods group). Tier 2 work pins this down. *)
+	enclosingMixinMirror methods do: [:m |
+		m name = reflectee ifTrue: [^m]].
+	^nil
+)
+public source ^ <String | nil> = (
+	| mm = mainMethod. |
+	nil = mm ifTrue: [^nil].
+	^mm source
+)
+public accessModifier ^ <Symbol> = (
+	| mm = mainMethod. |
+	nil = mm ifTrue: [^#public].
+	^mm accessModifier
+)
 ) : (
 )
 class LazyMutableSlotGroup group: ms <List[Mirror]>
@@ -999,7 +1264,7 @@ public install: builders <List[ClassDeclarationBuilder]> into: ns <Map[Symbol, O
 (* Nothing atomic about this. We'd have to implement the whole thing in JS, and even then, it needs to be a transaction *)
   #BOGUS yourself.
   ^builders collect: [:b <ClassDeclarationBuilder> |  | mm <MixinMirror> |
-       mm:: b install.
+       mm:: b install instanceSide.
        ns at: b name ifAbsent: [ns at: b name put: (mm apply: Object withName: b name) reflectee].
        mm
        ].
@@ -1007,13 +1272,30 @@ public install: builders <List[ClassDeclarationBuilder]> into: ns <Map[Symbol, O
 ) : (
 )
 public class ClosureMirror  reflecting: c <Closure> = (
-(* :TODO :Bogus *)
+(* Read-only introspection on a closure. Source / definingMethod /
+   receiver depend on closure metadata wiring in the JS code generator
+   (Tier 3 / debugger track). *)
     |
     public reflectee <Closure> = c.
     definingActivation <Activation> = definingActivationOf: c.
     |
     (*reflectees at: self put: c.*)
 ) (
+public isKindOfClosureMirror ^ <Boolean> = (
+	^true
+)
+public = other = (
+	other isKindOfClosureMirror ifFalse: [^false].
+	^_js operator: '===' with: reflectee and: other reflectee
+)
+public hash ^ <Integer> = (
+	^(identityHashOf: reflectee) bitXor: class hash
+)
+public isDead ^ <Boolean> = (
+	(* JS closures don't have a notion of "dead" — they exist as long as
+	   anything references them. Always false for now. *)
+	^false
+)
 ) : (
 )
 public class LazySlotActivationMirror reflecting: a <Activation> thread: t <Thread> = ActivationMirror reflecting: a thread: t  (
@@ -1025,11 +1307,33 @@ Mirror for the activation of a lazy slot. It takes care of computing the right s
 ) : (
 )
 public class LazySlotBuilder  reflecting: ir <IntermediateLazySlot> in: mb <MixinBuilder> = (
-(* :TODO :Bogus *)
+(* Trivial delegations to the underlying IntermediateLazySlot for the
+   IDE's read path. Mutation (rename, etc.) requires Tier 2 work. *)
 |
 	public prvtIntermediate <IntermediateLazySlot> = ir.
 	prvtMixinBuilder <MixinBuilder> = mb.
 |) (
+public source = (
+	^prvtIntermediate source
+)
+public name = (
+	^prvtIntermediate name
+)
+public simpleName = (
+	^prvtIntermediate name
+)
+public accessModifier = (
+	^prvtIntermediate accessModifier
+)
+public isMutable ^ <Boolean> = (
+	^prvtIntermediate isMutable
+)
+public definingMixin = (
+	^prvtMixinBuilder
+)
+public isKindOfLazySlotMirror ^ <Boolean> = (
+	^true
+)
 ) : (
 )
 classDeclIRFor: mixin within: enclosing = (
@@ -1037,16 +1341,36 @@ classDeclIRFor: mixin within: enclosing = (
 	(*('compiling class:', source) out.*)
 	^compiler compileClassSource: source within: enclosing
 )
-classMixinOf: m <InstanceMixin> ^ <ClassMixin> = (
+classMixinOf: m <InstanceMixin> ^ <ClassMixin | nil> = (
  (* Sometimes we need to get the class side of a mixin. Since reflectee is not exposed by MixinMirror, we must rely
-	on knowledge of the runtime structure.
+	on knowledge of the runtime structure. Returns nil if [m] has no
+	meta side (some bootstrapping / metaclass corner cases) — avoids
+	producing a Mixin with undefined runtimeMixin.
  *)
-	^Mixin fromRuntimeMixin: (_js propertyOf: (_js propertyOf: m at: (_js literal: 'runtimeMixin')) at: (_js literal: 'meta'))
+	| meta |
+	meta:: _js propertyOf: (_js propertyOf: m at: (_js literal: 'runtimeMixin')) at: (_js literal: 'meta').
+	(_js operator: '===' with: meta and: (_js ident: 'undefined')) ifTrue: [^nil].
+	^Mixin fromRuntimeMixin: meta
 )
 private identityHashOf: object ^<Integer> = (
-	[(_js propertyOf: object at: (_js literal: 'hashCode')) = 0] whileTrue:
+	(* Compute an identity hash for [object]. Different paths by JS type
+	   because primitives (number / string / boolean) can't have a
+	   [hashCode] property assigned to them in JS strict mode (which is
+	   what the compiler emits). For Newspeak objects we keep the
+	   lazy-hashCode pattern (assign on first read).
+
+	   The previous body did the [hashCode] dance unconditionally and
+	   threw [Cannot create property on number 'N'] whenever an
+	   ObjectMirror reflected on a primitive (a common case in the
+	   Object Presenter). *)
+	| t <String> |
+	t:: _js prefixOperator: 'typeof ' on: object.
+	t = 'number' ifTrue: [^_js operator: '|' with: object and: (_js literal: 0)].
+	t = 'string' ifTrue: [^object hash].
+	t = 'boolean' ifTrue: [^object ifTrue: [1] ifFalse: [0]].
+	[_js prefixOperator: '!' on: (_js propertyOf: object at: (_js literal: 'hashCode'))] whileTrue:
 		[_js assign: (_js propertyOf: object at: (_js literal: 'hashCode')) toBe: (_js verbatim: 'Math.random() * 0x3FFFFFF | 0')].
-	^(_js propertyOf: object at: (_js literal: 'hashCode'))
+	^_js propertyOf: object at: (_js literal: 'hashCode')
 )
 sourceForMethod: methodName <String> ofMixin: m <Mixin> ^ <String> = (
 	| _js = generation factory. sourceIndex <Integer> |

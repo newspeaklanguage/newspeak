@@ -311,13 +311,125 @@ isMyKind: other ^ <Boolean> = ( ^other isKindOfIDEChatSetupSubject )
 public class IDEChatSubject onModel: session <Session> = BaseChatSubject onModel: session (
 (*
  IDE-aware chat subject; returns an IDE presenter so Inspect Presenter works.
+
+ Also carries the inline-chat side of the changeset-attachment machinery:
+   pendingChangesetIds          ids staged by propose_changes during the
+                                in-flight turn, drained by markComplete
+                                onto the last assistant message index.
+   changesetIdsByMessageIndex   Map[Integer, List[String]] — which
+                                proposals belong to which assistant
+                                message in displayMessages.
+   changesetSubjectsById        per-id ChangesetSubject cache so the
+                                presenter survives across renders without
+                                hitting the runaway-compute bug.
+
+ IDEChatDocumentSubject inherits these slots but uses ChatDocument's
+ own pendingChangesetIds / appendChangesetAmpletFor: pipeline; the
+ inherited fields stay empty in that flow.
 *)
+|
+	public pendingChangesetIds <List[String]> ::= List new.
+	public changesetIdsByMessageIndex <Map[Integer, List[String]]> ::= Map new.
+	public changesetSubjectsById <Map[String, Object]> ::= Map new.
+|
 ) (
 public createPresenter = (
 	^IDEChatPresenter onSubject: self
 )
 public isKindOfIDEChatSubject ^ <Boolean> = ( ^true )
 isMyKind: other ^ <Boolean> = ( ^other isKindOfIDEChatSubject )
+
+public attachedChangesetIdsAt: messageIndex <Integer> ^ <List[String]> = (
+	^changesetIdsByMessageIndex at: messageIndex ifAbsent: [List new]
+)
+
+public forgetCachedChangesetSubjectFor: id <String> = (
+	changesetSubjectsById removeKey: id ifAbsent: []
+)
+
+public changesetSubjectFor: id <String> ^ <Object | UndefinedObject> = (
+	(* Pure model accessor: return the cached ChangesetSubject for
+	   this proposal id, building it on first use, or nil if the
+	   underlying records are gone (applied / discarded / never
+	   staged). The caller (IDEChatPresenter>>messagesArea) wraps a
+	   non-nil result in a ChangesetPresenter and renders a
+	   "no longer pending" label for the nil case — presentation
+	   stays on the presenter side.
+
+	   Caching is required: prepareForLiveViewRefresh: nukes the
+	   Ampleforth fragment cache on every refresh and the inline
+	   presenter rebuilds messagesArea on every uiGeneration bump,
+	   so without a stable subject the first render's synchronous
+	   compute would fire refreshBlock → updateGUI → another render
+	   → fresh subject → ... runaway. *)
+	| records |
+	records:: proposedChangesets at: id ifAbsent: [nil].
+	records isNil ifTrue: [
+		changesetSubjectsById removeKey: id ifAbsent: [].
+		^nil
+	].
+	^changesetSubjectsById at: id ifAbsent: [
+		| strategy s subj |
+		subj:: self.
+		strategy:: AIInstallStrategy
+			onRecords: records
+			changesetId: id
+			onApplied: []
+			onCanceled: [
+				subj forgetCachedChangesetSubjectFor: id.
+				ide browsing updateCurrentDisplay].
+		s:: ChangesetSubject
+			onLiveNamespace: Root
+			title: 'Apply changeset ', id
+			strategy: strategy.
+		s autoExpand: true.
+		changesetSubjectsById at: id put: s.
+		s]
+)
+
+public markComplete = (
+	(* Drain pendingChangesetIds onto the last assistant message
+	   index, so the inline ChatPresenter's messagesArea can render
+	   a ChangesetPresenter inline under that turn. For doc-backed
+	   subjects the same ids are *also* queued on the chat doc
+	   (enqueuePendingChangesetId: pushes to both queues), so the
+	   doc's amplet pipeline keeps working in parallel. *)
+	super markComplete.
+	pendingChangesetIds isEmpty ifFalse: [
+		| lastIdx bucket fresh |
+		lastIdx:: self lastAssistantMessageIndex.
+		lastIdx isNil ifFalse: [
+			bucket:: changesetIdsByMessageIndex
+				at: lastIdx
+				ifAbsent: [
+					| b |
+					b:: List new.
+					changesetIdsByMessageIndex at: lastIdx put: b.
+					b].
+			pendingChangesetIds do: [:id | bucket add: id]].
+		(* Clear pending — replace with a fresh List rather than
+		   removeAll, since List's API for in-place truncation varies
+		   across runtimes. *)
+		fresh:: List new.
+		pendingChangesetIds:: fresh]
+)
+
+lastAssistantMessageIndex ^ <Integer | UndefinedObject> = (
+	| msgs i |
+	msgs:: session displayMessages.
+	i:: msgs size.
+	[i > 0] whileTrue: [
+		((msgs at: i) at: 1) = 'assistant' ifTrue: [^i].
+		i:: i - 1].
+	^nil
+)
+
+public clearHistory = (
+	super clearHistory.
+	changesetIdsByMessageIndex:: Map new.
+	changesetSubjectsById:: Map new.
+	pendingChangesetIds:: List new
+)
 ) : (
 )
 public class IDEChatSetupPresenter onSubject: s <IDEChatSetupSubject> = AIChatSetupPresenter onSubject: s (
@@ -462,6 +574,46 @@ respondToInspectPresenter = (
 )
 public isKindOfIDEChatPresenter ^ <Boolean> = ( ^true )
 isMyKind: other ^ <Boolean> = ( ^other isKindOfIDEChatPresenter )
+
+messagesArea = (
+	(* Override of BaseChatPresenter>>messagesArea that interleaves
+	   ChangesetPresenters under any assistant message they were
+	   attached to (via subject changesetIdsByMessageIndex, populated
+	   by IDEChatSubject>>markComplete from propose_changes calls
+	   made during the turn). The base method renders only the
+	   {role, text} pairs; we keep its messageFragment: for the row
+	   itself and add a ChangesetPresenter as a sibling in the column
+	   for each attached id whose proposal is still pending. When the
+	   proposal has been applied or discarded, subject returns nil and
+	   we render a small italic banner instead — keeping presentation
+	   concerns out of the subject. *)
+	| fragments msgs i |
+	fragments:: List new.
+	msgs:: subject messages.
+	i:: 1.
+	[i <= msgs size] whileTrue: [
+		| attachedIds |
+		fragments add: (messageFragment: (msgs at: i)).
+		attachedIds:: subject attachedChangesetIdsAt: i.
+		attachedIds do: [:csId |
+			| cs |
+			cs:: subject changesetSubjectFor: csId.
+			fragments add: smallBlank.
+			fragments add: (cs isNil
+				ifTrue: [(label: 'Changeset ', csId, ' is no longer pending.') italic]
+				ifFalse: [ChangesetPresenter onSubject: cs])].
+		fragments add: smallBlank.
+		i:: i + 1
+	].
+	subject errorMessage isNil ifFalse: [
+		fragments add: ((label: 'Error: ', subject errorMessage)
+			color: (Color r: 0.8 g: 0 b: 0))
+	].
+	fragments isEmpty ifTrue: [
+		fragments add: (label: 'Send a message to start a conversation.') italic
+	].
+	^column: fragments
+)
 ) : (
 )
 public class ChatDocument named: n <String>
@@ -619,18 +771,20 @@ public appendErrorSection: text <String> = (
 	insertTurnSection: text role: 'error'
 )
 public appendChangesetAmpletFor: id <String> = (
-	(* Insert a new ampleforth amplet just before thinkingOrModelPicker
-	   so it sits inline in the transcript at the point the assistant
-	   delivered the proposal. The amplet's `name` is the source
-	   expression evaluated by evaluateFragment: — `self` is the
-	   ChatDocument, so `changesetPresenterFor: 'csN'` resolves
-	   directly to the method below. *)
-	| container thinking jsDoc amplet ampletId parent expr |
+	(* Insert a new ampleforth amplet just before the model machinery
+	   gap so it sits inline in the transcript at the point the
+	   assistant delivered the proposal, while leaving the picker /
+	   input editor on their own line below. The amplet's `name` is
+	   the source expression evaluated by evaluateFragment: — `self`
+	   is the ChatDocument, so `changesetPresenterFor: 'csN'`
+	   resolves directly to the method below. *)
+	| container thinking gap jsDoc amplet ampletId parent expr |
 	container:: parseAmpletContainer: contents.
 	thinking:: findChatStructuralAmplet: 'thinkingOrModelPicker' in: container.
 	thinking isNil ifTrue: [
 		Error signal: 'ChatDocument is missing its structural amplets; cannot append amplet'
 	].
+	gap:: ensureModelMachineryGap: container beforeThinking: thinking.
 	jsDoc:: js global at: 'document'.
 	maxAmpletCount: maxAmpletCount + 1.
 	ampletId:: maxAmpletCount printString.
@@ -641,8 +795,8 @@ public appendChangesetAmpletFor: id <String> = (
 	amplet setAttribute: 'name' to: expr.
 	amplet setAttribute: 'contenteditable' to: 'false'.
 	amplet setAttribute: 'style' to: 'display:block; margin:8px 0;'.
-	parent:: thinking at: 'parentNode'.
-	parent insertBefore: amplet before: thinking.
+	parent:: gap at: 'parentNode'.
+	parent insertBefore: amplet before: gap.
 	mutateContentsTo: (container at: 'innerHTML')
 )
 public forgetCachedChangesetSubjectFor: id <String> = (
@@ -670,11 +824,21 @@ public changesetPresenterFor: id <String> ^ <Object> = (
 		^(label: 'Changeset ', id, ' is no longer pending.') italic
 	].
 	subject:: changesetSubjectsById at: id ifAbsent: [
-		| strategy s |
+		| strategy s doc |
+		doc:: self.
 		strategy:: AIInstallStrategy
 			onRecords: records
 			changesetId: id
-			chatDocument: self.
+			onApplied: [:csId :recCount |
+				doc appendAssistantSection:
+					'Applied changeset ', csId, ' (',
+					recCount printString,
+					(recCount = 1
+						ifTrue: [' record).']
+						ifFalse: [' records).'])]
+			onCanceled: [
+				doc forgetCachedChangesetSubjectFor: id.
+				doc mutateContentsTo: doc contents].
 		s:: ChangesetSubject
 			onLiveNamespace: Root
 			title: 'Apply changeset ', id
@@ -693,11 +857,13 @@ public clearConversation = (
 insertTurnSection: text <String> role: role <String> = (
 	(* Build a chat-turn <div> matching the inline ChatPresenter's
 	   messageFragment: shape (same colours, same layout) and insert it
-	   into the document contents just *before* the thinkingOrModelPicker
-	   amplet — so chronological order is preserved as turns accumulate
-	   above the input. The new HTML is then written back via contents:,
+	   into the document contents just *before* the modelMachineryGap
+	   — so chronological order is preserved as turns accumulate
+	   above the input and the gap keeps the picker/input on their
+	   own line. The new HTML is then written back via contents:,
 	   which re-parses and re-renders. *)
-	| container <Alien> thinking <Alien | UndefinedObject> jsDoc <Alien>
+	| container <Alien> thinking <Alien | UndefinedObject>
+	  gap <Alien> jsDoc <Alien>
 	  section <Alien> labelCol <Alien> textCol <Alien> parent <Alien>
 	  labelEl <Alien> textSpan <Alien>
 	  labelText <String> bg <String> border <String> fontStyle <String> |
@@ -706,6 +872,7 @@ insertTurnSection: text <String> role: role <String> = (
 	thinking isNil ifTrue: [
 		Error signal: 'ChatDocument is missing its structural amplets; cannot append turn'
 	].
+	gap:: ensureModelMachineryGap: container beforeThinking: thinking.
 	jsDoc:: js global at: 'document'.
 	section:: jsDoc createElement: 'div'.
 	section setAttribute: 'class' to: 'chat-turn'.
@@ -753,8 +920,8 @@ insertTurnSection: text <String> role: role <String> = (
 	textCol appendChild: textSpan.
 	section appendChild: labelCol.
 	section appendChild: textCol.
-	parent:: thinking at: 'parentNode'.
-	parent insertBefore: section before: thinking.
+	parent:: gap at: 'parentNode'.
+	parent insertBefore: section before: gap.
 	mutateContentsTo: (container at: 'innerHTML')
 )
 ) : (
@@ -843,15 +1010,19 @@ public sendText: text <String> attachments: docs <List> ^ <Alien[Promise] | Unde
 )
 public class AIInstallStrategy onRecords: recs <List>
                                  changesetId: csid <String>
-                                 chatDocument: doc <ChatDocument | UndefinedObject>
+                                 onApplied: appliedBlk <[:String :Integer]>
+                                 onCanceled: canceledBlk <[]>
 	= ApplyStrategy (
 (*
  Strategy used by ChangesetSubject in the AI chat flow. When the
  user clicks "Apply" on a ChangesetPresenter rendered from a
  proposed AI changeset, this strategy installs the underlying
- records via the atomic installer, removes the entry from
- proposedChangesets, and appends a one-line confirmation into the
- chat document so the conversation log reflects what happened.
+ records via the atomic installer and removes the entry from
+ proposedChangesets. Two caller-supplied blocks let the host
+ (ChatDocument or inline IDEChatSubject) react: appliedBlock fires
+ on a successful install with (changesetId, recordCount); canceled-
+ Block fires when the user clicks Cancel and is responsible for
+ forgetting any cached presenter and forcing a host refresh.
 
  Lexical access to the enclosing AI_IDE_Support module gives the
  strategy direct call sites for applyChangesetRecords:,
@@ -860,7 +1031,8 @@ public class AIInstallStrategy onRecords: recs <List>
 |
 	private records <List> = recs.
 	private changesetId <String> = csid.
-	private chatDocument <ChatDocument | UndefinedObject> = doc.
+	private appliedBlock <[:String :Integer]> = appliedBlk.
+	private canceledBlock <[]> = canceledBlk.
 |
 ) (
 public actionLabel ^ <String> = ( ^'Apply' )
@@ -871,22 +1043,21 @@ public validate: input <Map> onError: errBlock <[:String]> ^ <Boolean> = ( ^true
 
 public onCancel = (
 	(* Discard the proposal. Drop the staged records from
-	   proposedChangesets and the cached subject from the host
-	   document, then ask the document to refresh — that re-evaluates
-	   the amplet, which now finds no records under this id and
-	   renders the "no longer pending" banner in place of the diff,
-	   letting the chat continue without a blocking dialog. *)
+	   proposedChangesets, then let the caller forget any cached
+	   presenter and force a host-side refresh so the amplet flips
+	   to the "no longer pending" banner. *)
 	proposedChangesets removeKey: changesetId ifAbsent: [].
-	chatDocument isNil ifFalse: [
-		chatDocument forgetCachedChangesetSubjectFor: changesetId.
-		chatDocument mutateContentsTo: chatDocument contents]
+	canceledBlock value
 )
 
 public apply: changeset <Map> withInput: input <Map> ^ <Alien> = (
-	(* Install the records, remove from proposedChangesets, and post a
-	   confirmation note into the chat doc (if any), then resolve.
-	   Errors are caught and pushed through Promise.reject — raising
-	   across the alien bridge would corrupt the live view. *)
+	(* Install the records, remove from proposedChangesets, fire the
+	   appliedBlock for host-specific bookkeeping (e.g. doc-backed
+	   chats append a confirmation turn; inline chats no-op and let
+	   the post-submit banner inside the presenter speak for itself),
+	   then resolve. Errors are caught and pushed through
+	   Promise.reject — raising across the alien bridge would corrupt
+	   the live view. *)
 	| deferred resolveFn rejectFn |
 	deferred:: aiAccess JSPromise withResolvers.
 	resolveFn:: deferred at: 'resolve'.
@@ -894,13 +1065,7 @@ public apply: changeset <Map> withInput: input <Map> ^ <Alien> = (
 	[
 		applyChangesetRecords: records.
 		proposedChangesets removeKey: changesetId ifAbsent: [].
-		chatDocument isNil ifFalse: [
-			chatDocument appendAssistantSection:
-				'Applied changeset ', changesetId, ' (',
-				records size printString,
-				(records size = 1
-					ifTrue: [' record).']
-					ifFalse: [' records).'])].
+		appliedBlock value: changesetId value: records size.
 		resolveFn call: js undefined with: changesetId
 	] on: Exception do: [:e |
 		| msg |
@@ -949,6 +1114,29 @@ lazy public repositories = ide repositories.
 lazy public ApplyStrategy = repositories ApplyStrategy.
 lazy public ChangesetSubject = repositories ChangesetSubject.
 lazy public ChangesetPresenter = repositories ChangesetPresenter.
+ensureModelMachineryGap: container <Object> beforeThinking: thinking <Object> ^ <Object> = (
+	(* Find the block-level gap that sits between the chat content and
+	   the model machinery, creating one in-place if the doc was
+	   built before initialChatDocumentContents: started emitting one.
+	   Returned element is used as the insertion anchor by
+	   insertTurnSection: and appendChangesetAmpletFor: so every new
+	   row lands above the gap and the model picker / input editor
+	   stay on their own line below it. *)
+	| gaps gap jsDoc parent |
+	gaps:: container getElementsByClassName: 'modelMachineryGap'.
+	(gaps at: 'length') > 0 ifTrue: [^gaps at: 0].
+	jsDoc:: js global at: 'document'.
+	gap:: jsDoc createElement: 'div'.
+	gap setAttribute: 'class' to: 'modelMachineryGap'.
+	gap setAttribute: 'style' to:
+		'display:block; min-height:3em; padding:0.5em; margin:0.5em 0;'.
+	(* No contenteditable override — inherits "true" from the
+	   self_ampleforth wrapper so the user can type freeform notes
+	   between AI responses and the model machinery. *)
+	parent:: thinking at: 'parentNode'.
+	parent insertBefore: gap before: thinking.
+	^gap
+)
 findChatStructuralAmplet: name <String> in: container <Object> ^ <Object | UndefinedObject> = (
 	| amplets count i |
 	amplets:: container getElementsByClassName: 'ampleforth'.
@@ -965,12 +1153,20 @@ findChatStructuralAmplet: name <String> in: container <Object> ^ <Object | Undef
 )
 initialChatDocumentContents: n <String> ^ <String> = (
 	(* Initial HTML for a fresh ChatDocument. Three structural amplets:
-	   chatControls at top (New Chat button, etc.), thinkingOrModelPicker
-	   and userInputEditor anchored at the bottom. Chat turns accumulate
-	   between chatControls and thinkingOrModelPicker. *)
+	   chatControls at top, thinkingOrModelPicker + userInputEditor at
+	   the bottom. Between the last content and the model machinery
+	   sits a non-amplet block-level gap (class modelMachineryGap)
+	   that guarantees the model picker / input editor wrap onto a
+	   new line regardless of what precedes them — Ampleforth's
+	   processChildren rewrites every amplet's style to
+	   `display:inline-flex` on each render, so two adjacent amplets
+	   would otherwise share a row. New turns and changeset amplets
+	   insert before this gap; ensureModelMachineryGap:in: lazily
+	   adds it to legacy chat docs that predate this layout. *)
 	^'<div class="self_ampleforth" contenteditable="true" style="border: 2px solid blue; resize: horizontal; overflow: auto; overflow-wrap: break-word; width: 40em;" onkeyup="updateRawHTML()" ondragover="((e) => {e.preventDefault();})(event)"> <!-- self_ampleforth -->
 <h1>', n, '</h1>
 <div class="ampleforth" ampletId="1" name="chatControls" contenteditable="false"> </div>
+<div class="modelMachineryGap" style="display:block; min-height:3em; padding:0.5em; margin:0.5em 0;"> </div>
 <div class="ampleforth" ampletId="2" name="thinkingOrModelPicker" contenteditable="false"> </div>
 <div class="ampleforth" ampletId="3" name="userInputEditor" contenteditable="false" style="display:block; width:100%; min-height:4em; margin-top:0.5em;"> </div>
 </div>'
@@ -1668,17 +1864,26 @@ validateChange: change ^ <Object> = (
 	Error signal: 'Unknown change kind: ', kind
 )
 enqueuePendingChangesetId: id <String> = (
-	(* Push id onto the active chat document's pendingChangesetIds, so
-	   markComplete drains it as an inline ChangesetPresenter amplet.
-	   If there is no active doc-backed chat (inline ChatPresenter,
-	   or no chat at all), the id is silently not queued — applying
-	   still works via the apply_changeset tool. *)
+	(* Stage id for the next markComplete. The same id has to surface
+	   in both presenter flavours of the chat — the doc view (amplets
+	   inserted into the chat doc HTML by IDEChatDocumentSubject>>
+	   markComplete) and the inline view (per-message-index map
+	   populated by IDEChatSubject>>markComplete and read by
+	   IDEChatPresenter>>messagesArea). Push to BOTH queues so a
+	   doc-backed chat displayed inline still shows the proposals;
+	   each markComplete override drains its own list. *)
 	| subj |
 	subj:: sharedChatSubject_slot.
 	subj isNil ifTrue: [^self].
-	([subj isKindOfIDEChatDocumentSubject] on: Exception do: [:e | false])
-		ifFalse: [^self].
-	subj document pendingChangesetIds add: id
+	(* Always populate the subject-level queue (inherited by both
+	   inline and doc-backed subjects) — that's what the inline
+	   presenter reads. *)
+	subj isKindOfIDEChatSubject ifTrue: [
+		subj pendingChangesetIds add: id].
+	(* And, for doc-backed subjects, also populate the document-level
+	   queue so the existing amplet pipeline keeps working. *)
+	subj isKindOfIDEChatDocumentSubject ifTrue: [
+		subj document pendingChangesetIds add: id]
 )
 summarizeChangesetId: id <String> records: records <List> ^ <String> = (
 	(* Short, structured-y summary returned to the model as the tool

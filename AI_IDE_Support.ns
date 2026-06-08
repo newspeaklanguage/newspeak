@@ -377,7 +377,8 @@ public changesetSubjectFor: id <String> ^ <Object | UndefinedObject> = (
 			onApplied: []
 			onCanceled: [
 				subj forgetCachedChangesetSubjectFor: id.
-				ide browsing updateCurrentDisplay].
+				ide browsing updateCurrentDisplay]
+			onComputed: [].
 		s:: ChangesetSubject
 			onLiveNamespace: Root
 			title: 'Apply changeset ', id
@@ -838,6 +839,12 @@ public changesetPresenterFor: id <String> ^ <Object> = (
 						ifFalse: [' records).'])]
 			onCanceled: [
 				doc forgetCachedChangesetSubjectFor: id.
+				doc mutateContentsTo: doc contents]
+			onComputed: [
+				(* The deferred simulator has populated
+				   changeset_slot and updateGUI:'d, but the chat
+				   doc's live view only re-evaluates amplets when
+				   contentsChanged fires. Tickle it. *)
 				doc mutateContentsTo: doc contents].
 		s:: ChangesetSubject
 			onLiveNamespace: Root
@@ -956,6 +963,22 @@ public sendText: text <String> ^ <Alien[Promise] | UndefinedObject> = (
 	document mutateContentsTo: document contents.
 	^promise
 )
+appendNewAssistantTurnsAfter: startIdx <Integer> = (
+	(* Render only the assistant turns added since startIdx. Tool-use
+	   rounds can produce multiple assistant messages per send (one per
+	   model→tool→model cycle); we want each as its own bubble. *)
+	| msgs <List> i <Integer> |
+	msgs:: session displayMessages.
+	i:: startIdx + 1.
+	[i <= msgs size] whileTrue: [
+		| msg <Array> role <String> text <String> |
+		msg:: msgs at: i.
+		role:: msg at: 1.
+		text:: msg at: 2.
+		role = 'assistant' ifTrue: [document appendAssistantSection: text].
+		i:: i + 1
+	]
+)
 public markComplete = (
 	super markComplete.
 	appendNewAssistantTurnsAfter: lastTurnIndexBeforeSend.
@@ -975,22 +998,6 @@ public markError: msg <String> = (
 	super markError: msg.
 	document appendErrorSection: msg.
 	ide browsing updateCurrentDisplay
-)
-appendNewAssistantTurnsAfter: startIdx <Integer> = (
-	(* Render only the assistant turns added since startIdx. Tool-use
-	   rounds can produce multiple assistant messages per send (one per
-	   model→tool→model cycle); we want each as its own bubble. *)
-	| msgs <List> i <Integer> |
-	msgs:: session displayMessages.
-	i:: startIdx + 1.
-	[i <= msgs size] whileTrue: [
-		| msg <Array> role <String> text <String> |
-		msg:: msgs at: i.
-		role:: msg at: 1.
-		text:: msg at: 2.
-		role = 'assistant' ifTrue: [document appendAssistantSection: text].
-		i:: i + 1
-	]
 )
 public sendText: text <String> attachments: docs <List> ^ <Alien[Promise] | UndefinedObject> = (
 	(* Like sendText: but forwards document attachments down the chain.
@@ -1012,17 +1019,32 @@ public class AIInstallStrategy onRecords: recs <List>
                                  changesetId: csid <String>
                                  onApplied: appliedBlk <[:String :Integer]>
                                  onCanceled: canceledBlk <[]>
+                                 onComputed: computedBlk <[]>
 	= ApplyStrategy (
 (*
  Strategy used by ChangesetSubject in the AI chat flow. When the
  user clicks "Apply" on a ChangesetPresenter rendered from a
  proposed AI changeset, this strategy installs the underlying
  records via the atomic installer and removes the entry from
- proposedChangesets. Two caller-supplied blocks let the host
- (ChatDocument or inline IDEChatSubject) react: appliedBlock fires
- on a successful install with (changesetId, recordCount); canceled-
- Block fires when the user clicks Cancel and is responsible for
- forgetting any cached presenter and forcing a host refresh.
+ proposedChangesets. Three caller-supplied blocks let the host
+ (ChatDocument or inline IDEChatSubject) react:
+
+   appliedBlock   fires after a successful install with
+                  (changesetId, recordCount); host can post a
+                  confirmation turn / banner.
+   canceledBlock  fires when the user clicks Cancel; host forgets
+                  any cached presenter and forces a refresh.
+   computedBlock  fires after the synchronous compute simulates
+                  the changeset and the presenter's refreshBlock
+                  has been invoked. Doc-backed hosts use this to
+                  fire contentsChanged on the chat doc — without
+                  it, refreshBlock = updateGUI: only rebuilds
+                  Hopscotch presenter substances and the doc's
+                  live view (which observes contentsChanged) keeps
+                  showing the cached "Computing changeset..." label
+                  until the user manually refreshes. Inline hosts
+                  pass an empty block because their presenter does
+                  re-render on updateGUI:.
 
  Lexical access to the enclosing AI_IDE_Support module gives the
  strategy direct call sites for applyChangesetRecords:,
@@ -1033,6 +1055,7 @@ public class AIInstallStrategy onRecords: recs <List>
 	private changesetId <String> = csid.
 	private appliedBlock <[:String :Integer]> = appliedBlk.
 	private canceledBlock <[]> = canceledBlk.
+	private computedBlock <[]> = computedBlk.
 |
 ) (
 public actionLabel ^ <String> = ( ^'Apply' )
@@ -1091,7 +1114,8 @@ public computeChangesetOnComplete: doneBlock <[:Map]>
 	   only fires after the current frame unwinds; this setTimeout(0)
 	   matches that timing for the pure-synchronous AI flow. *)
 	js global setTimeout: [
-		[doneBlock value: (simulateRecordsAsChangeset: records)]
+		[doneBlock value: (simulateRecordsAsChangeset: records).
+		 computedBlock value]
 			on: Exception do: [:e |
 				| msg |
 				msg:: [e messageText] on: Exception do: [:e2 | nil].

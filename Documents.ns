@@ -93,7 +93,19 @@ public document ^ <Document> = (
   ^model
 )
 public setText: s <String> = (
+  (* Quiet write, kept for compatibility. Hand-edit paths should use
+     setText:from: so other presentations of the document react. *)
   document contents: s
+)
+public setText: s <String> from: origin <TwoViewEditorPresenter> = (
+  (* Hand-edit write path: publish the change through the document's
+     contentsChanged duct, tagged with the originating presenter so its
+     own live view is not clobbered (see Document>>mutateContentsTo:from:).
+     No-op when the text is unchanged — the raw-view CodeMirror fires its
+     change response on programmatic setValue too, and an equal write
+     must not fan out a refresh. *)
+  s = document contents ifTrue: [^self].
+  document mutateContentsTo: s from: origin
 )
 public text ^ <String> = (
   ^document contents
@@ -151,9 +163,16 @@ These maps are stored here so that they can be passed to newly created Amplefort
   rendered <HolderComposer> = holder: render. 
   (* Is the user editing the live view? *)
   updatingFromLive <Boolean> ::= false.
-  (* Did the user just paste into the live view? *)  
+  (* Did the user just paste into the live view? *)
   pasting <Boolean> ::= false.
-  cm <CodeMirrorFragment>  
+  (* Set when a newer presenter generation adopts this presenter's DOM
+     (see updateVisualsFromSameKind:). Through that adoption a dead
+     generation's `rendered` holder still references the DISPLAYED DOM,
+     so a retired editor must never refresh — its updateFromRawView
+     would replace the live body on screen (killing caret/focus and
+     racing keystrokes). The contentsChanged outlet checks this flag. *)
+  public retired <Boolean> ::= false.
+  cm <CodeMirrorFragment>
   rawViewToggle <ToggleComposer>
   |
 ) (
@@ -167,7 +186,13 @@ updateFromRawView = (
   (* Recompute the live view using #render and update the holder *)
   rendered content: render.
   (* Add an update handler to the new live view. *)
-  addUpdateHandler
+  addUpdateHandler.
+  (* The freshly installed body re-attaches cached amplet visuals
+     (processChildren moves them into the new parse). Re-attached
+     CodeMirrors keep a stale painted viewport until told they are
+     visible again, and unlike the navigation path (where the shell
+     sends it) nothing else sends exposure here. *)
+  rendered content noticeExposure
 )
 public refresh = (
   (* External hook: re-render the live view from the current raw text.
@@ -175,10 +200,30 @@ public refresh = (
      programmatically (appending turn sections, etc.) so the displayed
      live view reflects the new contents without the user having to
      navigate away and back. *)
+  (* Sync the raw view as well — updateFromRawView only rebuilds the
+     live view, so without this a sibling presentation's raw pane keeps
+     stale text even as its live view updates. Setting updatingFromLive
+     suppresses changeResponse's redundant re-render of the live view
+     (which updateFromRawView does below), and the equality guard in
+     setText:from: prevents a republish loop. Skipped when the raw text
+     is already current, so we never disturb the raw editor needlessly.
+     A visible editor repaints on setValue; a detached one repaints when
+     it next becomes visible, via CodeMirrorFragment's visibilityObserver
+     (no synchronous refresh helps a detached editor — it measures
+     nothing). *)
+  (cm isNil not and: [cm hasVisual]) ifTrue: [
+    cm textBeingAccepted = subject text ifFalse: [
+      updatingFromLive: true.
+      cm text: subject text]].
   updateFromRawView
 )
 updateVisualsFromSameKind: oldPresenter <Self> ^ <Alien[Element]> = (
   | result <Alien[Element]> = super updateVisualsFromSameKind: oldPresenter. |
+  (* This presenter has adopted oldPresenter's DOM; oldPresenter's holder
+     still references the displayed nodes, so it must never refresh again
+     (see the `retired` slot comment). Exactly one generation per
+     presentation stays unretired: the latest. *)
+  oldPresenter retired: true.
   addUpdateHandler.
   ^result
 )
@@ -229,12 +274,34 @@ public respondToMakeLink = (
 )
 definition ^ <Fragment> = (
 | docWidth <Integer> = ((jsDocument at: #body) at: #clientWidth). |
+  (* Subscribe this live view to mutations of the document — programmatic
+     (tools, chat) and hand edits made through any other presentation of
+     the same document. The subscription lives here, on the editor itself,
+     rather than on any particular host (DocumentPresenter, ObjectPresenter
+     inspector, transcluded embedding), so every hosting is uniformly
+     reactive. The packet is {document. origin}: origin identifies the
+     editor that produced a hand edit, and that editor skips its own
+     refresh (its DOM and caret are already authoritative); nil origin
+     (programmatic write) refreshes everyone. A retired editor (one whose
+     DOM was adopted by a newer generation — see the `retired` slot) must
+     never refresh: through adoption it still references displayed nodes,
+     and its updateFromRawView would replace the live body mid-keystroke. *)
+  subject document contentsChanged => [:packet |
+      | doc origin |
+      doc:: packet at: 1.
+      origin:: packet at: 2.
+      (retired or: [origin == self]) ifFalse: [
+          [doc prepareForLiveViewRefresh: self.
+           refresh]
+            on: Exception do: [:e | nil]
+      ]
+  ].
   cm:: codeMirror: subject text.
   updateFromRawView.
   cm useEditControls: false.
   cm 
-    changeResponse: [:ed <CodeMirrorFragment> :event <Event>  | 
-    subject setText: ed textBeingAccepted. 
+    changeResponse: [:ed <CodeMirrorFragment> :event <Event>  |
+    subject setText: ed textBeingAccepted from: self.
     (updatingFromLive and: [pasting not])
       ifTrue: [(* Reset updatingFromLive, in case the user edits the raw view next;
                         The live view's handler(s) will programmatically update the rest *)
@@ -246,7 +313,7 @@ definition ^ <Fragment> = (
         updateFromRawView
       ].
     ]; 
-    acceptResponse: [:ed <CodeMirrorFragment> :event <Event>  | updateGUI: [subject setText: ed textBeingAccepted]].
+    acceptResponse: [:ed <CodeMirrorFragment> :event <Event>  | updateGUI: [subject setText: ed textBeingAccepted from: self]].
     (cm visual at: #style) at: 'width' put: docWidth//2;  at: 'max-width' put: docWidth//2; at: 'min-width' put: 200.
     rawViewToggle:: collapsed: [nothing] expanded: [cm visual. cm editor setSize: '40em'. cm].
     ^row: { 
@@ -365,7 +432,7 @@ isElement: e <Alien[Element]> enclosedIn: tagName <String> = (
 updateAfterEdit = (
   (* force an update of the live view; this will update the raw view to include the changes *)
   updater value.
-  subject setText: scrubbedLiveViewSource.
+  subject setText: scrubbedLiveViewSource from: self.
   (* Then force a re-rendering based on the updated raw view to activate the amplet*)
   updateFromRawView
 )
@@ -900,12 +967,23 @@ public addContentsUsingFolder: folder = (
 public mutateContentsTo: s <String> = (
   (* Programmatic mutation entry point: set `contents` and publish a
      change event through `contentsChanged`. Tools, chat sessions, and
-     any out-of-band write that needs the live view to reflect the new
-     bytes should use this. The auto-generated `contents:` setter
-     remains the quiet path used by the live view's own keystroke
-     handler. *)
+     any out-of-band write that needs every live view to reflect the new
+     bytes should use this. With no origin, no presentation is exempt
+     from the refresh. *)
+  mutateContentsTo: s from: nil
+)
+public mutateContentsTo: s <String> from: origin <TwoViewEditorPresenter | Nil> = (
+  (* Set `contents` and publish {document. origin} through
+     `contentsChanged`. The origin identifies the presentation that
+     produced the change (the TwoViewEditorPresenter handling the user's
+     keystroke); its own outlet skips the refresh — it already holds the
+     authoritative DOM and caret — while every other presentation of this
+     document refreshes. Programmatic mutators pass nil (via
+     mutateContentsTo:) so all presentations refresh.
+     The auto-generated `contents:` setter remains the fully quiet path
+     (no publication at all). *)
   contents:: s.
-  contentsChanged send: self
+  contentsChanged send: {self. origin}
 )
 jsDocument = (
   ^platform js global at: #document
@@ -1192,19 +1270,11 @@ helpText ^ <AmpleforthFragment> = (
 )
 definition ^ <Fragment> = (
   twoViewEditor::  (TwoViewEditorSubject onModel:  subject document) presenter.
-  (* Subscribe this presenter's live view to programmatic mutations of
-     the document. The doc gets a `prepareForLiveViewRefresh:` callback
-     before the refresh so subclasses can invalidate caches whose
-     state-dependent fragments would survive incorrectly (chat docs use
-     this). The response block is exception-guarded so a stale outlet
-     that fires after this presenter is torn down can't break the chat
-     session — a detached editor raises on `refresh` and we swallow. *)
-  subject document contentsChanged => [:doc |
-      twoViewEditor isNil ifFalse: [
-          [doc prepareForLiveViewRefresh: twoViewEditor.
-           twoViewEditor refresh] on: Exception do: [:e | nil]
-      ]
-  ].
+  (* The live view subscribes itself to the document's contentsChanged
+     duct — see TwoViewEditorPresenter>>definition. The subscription was
+     formerly attached here, which left non-DocumentPresenter hostings of
+     a TwoViewEditor (e.g. the ObjectPresenter inspector view of a
+     Document) deaf to document mutations. *)
   ^column: {
        helpSection.
        toolbarToggle.

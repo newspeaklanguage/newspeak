@@ -10,7 +10,8 @@ class Browsing usingPlatform: p ide: webIde
 |	(* imports *)
     private StringBuilder = p kernel StringBuilder.
     private Subject = p hopscotch Subject.
-    private Presenter = p hopscotch Presenter.	
+    private Presenter = p hopscotch Presenter.
+    private Fragment = p hopscotch Fragment.
     private SearchFieldFragment = p hopscotch fragments SearchFieldFragment.
     private Window = p hopscotch Window.
     private DOMParser = p hopscotch DOMParser.
@@ -40,7 +41,8 @@ class Browsing usingPlatform: p ide: webIde
 
     
     (* module variables *)
-    body = (p js global at: 'document') at: 'body'.
+    document = p js global at: 'document'.
+    body = document at: 'body'.
     localStorage = p js localStorage.
     atomicInstaller = p mirrors installer.
     compiler = p mirrors compiler.
@@ -60,6 +62,7 @@ class Browsing usingPlatform: p ide: webIde
 
 p hopscotch homeSubjectClass: HomeSubject.
 initializeObjectViews.
+installDiffSideBySideStyles.
 ) (
 public class AssortedMethodsPresenter onSubject: s = DefinitionListPresenter onSubject: s (
 (* The subject is a collection of MethodSubjects that can come from diverse sources (in the sense that they do not have to belong to the same class). The presenter displays them as a column of expandable method presenters and takes care of reasonably handling the various creation and deletion requests coming from them.   *)
@@ -293,7 +296,11 @@ respondToRunApp: paused = (
   subject runApp: paused
 )
 deployAsNSO = (
-	subject deployAsNSO
+  (* The serialize-then-download runs inside the Save click. For most NSO
+     outputs this fits within the activation window; for very large apps
+     it may not (Phase B concern, same shape as vfuel-of-the-IDE). *)
+  confirmSave: 'Deploy ', subject name, ' as Newspeak Object?'
+     saving: [subject deployAsNSO]
 )
 public deployAction = (
 	subject isApplicationConfiguration ifFalse: [^nothing].
@@ -315,27 +322,51 @@ deployAsWebPageWithMirrorBuilders = (
   deployAsWebPageWithRuntimeConfig: ide deployment RuntimeWithMirrorBuilders
 )
 deployAsWebPageWithRuntimeConfig: runtimeClass <Class> = (
-| 
-deployment <DeploymentManager JSPackager JSDeployment> = 
+|
+deployment <DeploymentManager JSPackager JSDeployment> =
   (ide deployment jsPackagerForPlatform: cachedPlatform)
 		packageApplicationConfiguration: (ide namespacing Root at: subject name)
 		withRuntimeConfiguration: runtimeClass
 		usingNamespace: ide namespacing Root.
 |
-  (* Now zip deployment and download it. Maybe try and open the URI afterwards *)
-  deployment save.
-  )
+  confirmSave: 'Compiled ', subject name, '. Save the deployment?'
+     saving: [deployment save]
+)
 deployAsVictoryFuelWithMirrors = (
-      | bytes = subject bytesForVictoryFuelWithMirrors. |
-  	ide webFiles downloadFileName: subject name, '.vfuel' fromBytes: bytes.
+  | bytes = subject bytesForVictoryFuelWithMirrors. |
+  confirmSave: 'Snapshotted ', subject name, ' (with mirrors). Save VictoryFuel?'
+     saving: [ide webFiles downloadFileName: subject name, '.vfuel' fromBytes: bytes]
 )
 deployAsVictoryFuelWithHopscotch = (
-      | bytes = subject bytesForVictoryFuelWithHopscotch. |
-  	ide webFiles downloadFileName: subject name, '.vfuel' fromBytes: bytes.
+  | bytes = subject bytesForVictoryFuelWithHopscotch. |
+  confirmSave: 'Snapshotted ', subject name, ' (with Hopscotch). Save VictoryFuel?'
+     saving: [ide webFiles downloadFileName: subject name, '.vfuel' fromBytes: bytes]
 )
 deployAsVictoryFuel = (
-	| bytes = subject bytesForVictoryFuel. |
-  	ide webFiles downloadFileName: subject name, '.vfuel' fromBytes: bytes.
+  | bytes = subject bytesForVictoryFuel. |
+  confirmSave: 'Snapshotted ', subject name, '. Save VictoryFuel?'
+     saving: [ide webFiles downloadFileName: subject name, '.vfuel' fromBytes: bytes]
+)
+confirmSave: msg <String> saving: saveBlock <[]> = (
+  (* Chrome enforces a transient-activation window for downloads. Any
+     compute / serialize work that runs in the deploy menu click can
+     exhaust that window before the actual file write. Route the file
+     write through a confirmation Subject so the user's click on Save
+     provides fresh activation.
+
+     Phase A (here): saveBlock runs from the Save click. Work inside
+     the block (zip generation, large serializations) can still exceed
+     the fresh activation window for IDE-sized outputs.
+
+     Phase B (TODO): pre-prepare the bytes / blob in the deploy click
+     and have saveBlock just write them; or use the File System Access
+     API to pre-pick a destination handle before the long work and
+     write asynchronously when it's ready. *)
+  enterSubject:: ide browsing InteractionSubject
+     confirm: msg
+     yesLabel: 'Save'
+     onYes: saveBlock
+     returnTo: subject.
 )
 ) : (
 )
@@ -429,14 +460,21 @@ helpText = (
 )
 class ClassFactoryPresenter onSubject: s <ClassFactorySubject> = MethodPresenter onSubject: s (
 (* Present the factory method, colorized. *)
- | toggle <ToggleComposer>  public showClassName <Boolean> ::= false. |
+ |
+ toggle <ToggleComposer>
+ public showClassName <Boolean> ::= false.
+ (* Captured by editorDefinition so respondToTypecheck can read the
+    pending header source from the editor buffer. *)
+ headerEditor <CodeMirrorFragment>
+ |
 ) (
 installHistory = (
-    (* Override MethodPresenter>>installHistory: class headers wrap a
-       ClassDeclarationMirror in ClassHeaderHistoryModel, not a method. *)
+    (* Override MethodPresenter>>installHistory: class headers carry a
+       ClassDeclarationMirror. Wrap in the multi-repo presenter so
+       drafts AND any tracking permanent repos appear. *)
     historyHolder content:
-        (ClassHeaderHistorySubject onModel:
-            (ClassHeaderHistoryModel classMirror: subject classMirror repo: ide drafts))
+        (MemberRepoHistorySubject onModel:
+            (MemberRepoHistoryModel forClassMirror: subject classMirror))
                 createPresenter
 )
 changeResponse ^ <[:CodeMirrorFragment :Event]> = (
@@ -469,15 +507,16 @@ nestingInformationLine ^ <Fragment> = (
 	^row: rowElements asArray
 )
 editorDefinition = (
-	| 
-	src = crToLf: subject classHeaderSource. 
-	editor = codeMirror: src. 
 	|
-	editor 
+	src = crToLf: subject classHeaderSource.
+	editor = codeMirror: src.
+	|
+	editor
 		changeResponse: changeResponse;
         cancelResponse: cancelResponse;
 		acceptResponse: acceptResponse.
 	colorizeHeaderSource: src withEditor: editor.
+	headerEditor:: editor.
 	^editor
 )
 cancelResponse ^ <[:CodeMirrorFragment]> = (
@@ -491,13 +530,50 @@ acceptResponse ^ <[:CodeMirrorFragment :Event]> = (
 	^[:ed <CodeMirrorFragment> :event <Event> |
 		| b <ClassDeclarationBuilder> = subject classMirror asBuilder. |
 		updateGUI: [
-			[b header source: ed textBeingAccepted.
-			ide installFromBuilders: {b}.
-			colorizeHeaderSource: (crToLf: ed textBeingAccepted)  withEditor: ed.
-			ed leaveEditState] on: Error do:  [:ex <Exception> | ed showMessage: ex printString] .
+			[
+				| canonical |
+				canonical:: ide prettyPrintClassHeaderOr: ed textBeingAccepted.
+				b header source: canonical.
+				ide installFromBuilders: {b}.
+				subject clearTypeErrors.
+				ed text: canonical.
+				colorizeHeaderSource: (crToLf: canonical) withEditor: ed.
+				ed leaveEditState] on: Error do:  [:ex <Exception> | ed showMessage: ex printString] .
 		].
 		ed editor focus.
 	]
+)
+respondToTypecheck = (
+    (* Override MethodPresenter>>respondToTypecheck. The factory IS the
+       class header; route through typecheckClassHeader: instead of
+       typecheckMethodSource:. Uses the captured headerEditor for the
+       in-progress buffer, falling back to the installed header. *)
+    | ed source typed mixin errs failureMessage |
+    ed:: headerEditor.
+    typed:: ed isNil ifTrue: [nil] ifFalse: [ed textBeingAccepted].
+    source:: (typed isNil or: [typed isEmpty])
+        ifTrue: [subject classHeaderSource]
+        ifFalse: [typed].
+    mixin:: subject classMirror instanceSide.
+    subject clearTypeErrors.
+    failureMessage:: nil.
+    errs:: [ide freshTypechecker typecheckClassHeader: source ofClass: mixin]
+        on: Error do: [:e |
+            failureMessage:: 'Typechecker failed: ', e printString.
+            nil
+        ].
+    updateGUI: [
+        failureMessage isNil ifFalse: [
+            subject typeErrorMessages add: failureMessage
+        ] ifTrue: [
+            errs isEmpty
+                ifTrue: [subject typeErrorMessages add: 'No type errors.']
+                ifFalse: [errs do: [:e |
+                    subject typeErrorMessages add:
+                        'Type error: ', e message, ' [', e start printString, '-', e end printString, ']'
+                ]]
+        ]
+    ]
 )
 slotList ^ <Fragment> = (
   | sl |
@@ -528,6 +604,7 @@ collapsedDefinition ^ <Fragment> = (
       headerDefinition.
       historySection.
       chatSection.
+      column: typeErrorMessages.
       label: subject classCommentSummary.
       mediumBlank.
 	slotList.
@@ -540,6 +617,7 @@ expandedDefinition = (
       historySection.
       chatSection.
 	  editorDefinition.
+	  column: typeErrorMessages.
 	}
 )
 headerDefinition ^ <Fragment> = (
@@ -700,11 +778,14 @@ public onModel: m <ClassDeclarationMirror> = (
 )
 class ClassPresenter onSubject: s = ProgrammingPresenter onSubject: s (
   |
-  public lazySlotsPresenter <LazySlotGroupPresenter>  
+  public lazySlotsPresenter <LazySlotGroupPresenter>
   public nestedClassesPresenter <NestedClassGroupPresenter>
   public instanceMethodsPresenter <MethodGroupPresenter>
   public classMethodsPresenter <MethodGroupPresenter>
   classActionsPresenter <ClassActionsPresenter> ::= (ClassActionsPresenter onSubject: subject) elasticity: 1.
+  (* Captured by classSourceDefinition so the 'Pretty Print' menu
+     action can address the current header editor. *)
+  headerEditor <CodeMirrorFragment>
   |
 ) (
 changeResponse ^ <[:CodeMirrorFragment :Event]> = (
@@ -716,11 +797,31 @@ classActionsMenu = (
 	^menuWithLabelsAndActions: {
 	 	{'Save to File'. [respondToSave]}.
 		 #separator.
+		{'Pretty Print'. [respondToPrettyPrint]}.
+		 #separator.
+		{'Typecheck Class'. [enterSubject:: subject typecheckReportSubject]}.
+		 #separator.
 		{'Inspect Mirror'. [inspectObject: subject classMirror]}.
 		{'Inspect Presenter'. [respondToInspectPresenter]}.
 		#separator.
 		{'Delete'. [respondToDelete]}.
 	}
+)
+respondToPrettyPrint = (
+    (* Pretty-print the current class header source and replace the
+       editor contents in place. Does NOT trigger Accept. *)
+    | ed source formatted |
+    ed:: headerEditor.
+    ed isNil ifTrue: [^self].
+    source:: ed textBeingAccepted.
+    (source isNil or: [source isEmpty]) ifTrue: [source:: subject classHeaderSource].
+    formatted:: [ide prettyPrinter prettyPrintClassHeader: source]
+        on: Exception do: [:e |
+            ed showMessage: 'Pretty print failed: ', e printString.
+            ^self].
+    ed text: formatted.
+    colorizeHeaderSource: (crToLf: formatted) withEditor: ed.
+    ed editor focus.
 )
 classCommentSummary ^ <String> = (
 	|
@@ -739,10 +840,11 @@ classNameAndContainmentDefinition ^ <Fragment> = (
 )
 classSourceDefinition = (
 	| src = crToLf: subject classHeaderSource. editor =  codeMirror: src. |
-	editor 
+	editor
 		changeResponse: changeResponse;
 		acceptResponse: acceptResponse.
 		colorizeHeaderSource: src withEditor: editor.
+	headerEditor:: editor.
 	^editor
 )
 colorizeHeaderSource: s <String> withEditor: cm <CodeMirrorFragment> = (
@@ -751,7 +853,7 @@ colorizeHeaderSource: s <String> withEditor: cm <CodeMirrorFragment> = (
 expandedHeadingDefinition ^ <Fragment> = (
   ^column: {
       classNameAndHierarchySummary.
-      (ClassFactorySubject onModel: subject classMirror) presenter
+      subject factorySubject presenter
    }
 )
 headingDefinition ^ <Fragment> = (
@@ -817,11 +919,13 @@ respondToDelete = (
 )
 acceptResponse ^ <[:CodeMirrorFragment :Event]> = (
 	^[:ed <CodeMirrorFragment> :event <Event> |
-		| b <ClassDeclarationBuilder> = subject classMirror asBuilder. |
-		(*('ed text:', ed textBeingAccepted) out.*)
-		b header source: ed textBeingAccepted.
+		| b <ClassDeclarationBuilder> = subject classMirror asBuilder.
+		canonical |
+		canonical:: ide prettyPrintClassHeaderOr: ed textBeingAccepted.
+		b header source: canonical.
 		ide  installFromBuilders: {b}.
-		colorizeHeaderSource: (crToLf: ed textBeingAccepted) withEditor: ed.
+		ed text: canonical.
+		colorizeHeaderSource: (crToLf: canonical) withEditor: ed.
 		ed leaveEditState.
 		]
 )
@@ -939,15 +1043,20 @@ respondToSave = (
 ) : (
 )
 public class ClassSubject onClassModel: m <ClassModel> = ProgrammingSubject onModel: m (
-  | 
+  |
   public exemplar <ObjectMirror> ::= classModel exemplar.
-  lazySlotsSubject_slot  <LazySlotGroupSubject>  
-  nestedClassesSubject_slot  <NestedClassGroupSubject>
-  methodsSubject_slot  <MethodGroupSubject>
-  classMethodsSubject_slot  <MethodGroupSubject>
-  objectSubject_slot <ObjectSubject>
+    
+  
+  
+  
   |
 ) (
+lazy public factorySubject <ClassFactorySubject> = ClassFactorySubject onModel: classMirror.
+lazy objectSubject <ObjectSubject> = ObjectSubject onModel: exemplar.
+lazy public classMethodsSubject <MethodGroupSubject> = MethodGroupSubject onModel: (MirrorGroupModel mirrorGroup: classMirror classSide methods ofMixin: classMirror classSide exemplar: exemplar).
+lazy public methodsSubject <MethodGroupSubject> = MethodGroupSubject onModel: (MirrorGroupModel mirrorGroup: classMirror instanceSide methods ofMixin: classMirror instanceSide exemplar: exemplar).
+lazy public nestedClassesSubject <NestedClassGroupSubject> = NestedClassGroupSubject onModel: (MirrorGroupModel mirrorGroup: classMirror instanceSide ofMixin: classMirror instanceSide exemplar: exemplar).
+lazy public lazySlotsSubject <LazySlotGroupSubject> = LazySlotGroupSubject onModel: ( MirrorGroupModel mirrorGroup: classMirror instanceSide lazySlots ofMixin: classMirror instanceSide exemplar: exemplar).
 public accessModifier = (
 	^classMirror accessModifier
 )
@@ -1023,44 +1132,11 @@ public isTestConfiguration = (
 public createPresenter = (
 	^chosenPresenter
 )
-objectSubject ^ <ObjectSubject> = (
-  objectSubject_slot isNil ifTrue: [
-     objectSubject_slot:: ObjectSubject onModel: exemplar.
-  ].
-  ^objectSubject_slot
-)
 public isTopLevel = (
 	^nil = classMirror enclosingClass
 )
 public name = (
 	^classMirror name
-)
-public classMethodsSubject ^ <MethodGroupSubject> = (
-   classMethodsSubject_slot isNil ifTrue: [
-     | methodsModel <MirrorGroupModel> = 
-       MirrorGroupModel mirrorGroup: classMirror classSide methods ofMixin: classMirror classSide exemplar: exemplar. 
-     |   
-	 classMethodsSubject_slot:: MethodGroupSubject onModel: methodsModel
-    ].
-   ^classMethodsSubject_slot
-)
-public methodsSubject ^ <MethodGroupSubject> = (
-   methodsSubject_slot isNil ifTrue: [
-     | methodsModel <MirrorGroupModel> = 
-       MirrorGroupModel mirrorGroup: classMirror instanceSide methods ofMixin: classMirror instanceSide exemplar: exemplar. 
-     |    
-	 methodsSubject_slot:: 	MethodGroupSubject onModel: methodsModel
-    ].
-   ^methodsSubject_slot
-)
-public nestedClassesSubject ^ <NestedClassGroupSubject> = (
-   nestedClassesSubject_slot isNil ifTrue: [
-     | nestedClassesModel <MirrorGroupModel> = 
-       MirrorGroupModel mirrorGroup: classMirror instanceSide ofMixin: classMirror instanceSide exemplar: exemplar. 
-     |
-	 nestedClassesSubject_slot:: NestedClassGroupSubject onModel: nestedClassesModel
-    ].
-   ^nestedClassesSubject_slot
 )
 public classModel ^ <ClassModel> = (
   ^model
@@ -1092,15 +1168,6 @@ chosenPresenter ^ <ObjectPresenter | ClassPresenter> = (
   ].
   classModel exemplar: exemplar.
   ^objectSubject presenter openClass: true; yourself
-)
-public lazySlotsSubject ^ <LazySlotGroupSubject> = (
-   lazySlotsSubject_slot isNil ifTrue: [
-     | lazySlotsModel <MirrorGroupModel> = 
-       MirrorGroupModel mirrorGroup: classMirror instanceSide lazySlots ofMixin: classMirror instanceSide exemplar: exemplar. 
-     |    
-	 lazySlotsSubject_slot:: 	LazySlotGroupSubject onModel: lazySlotsModel
-    ].
-   ^lazySlotsSubject_slot
 )
 public deleteClass = (
 	| builder |
@@ -1137,6 +1204,59 @@ public runApp: paused = (
 	thread isFulfilled ifFalse:
 		[Utilities enterSubject: (ide debugging ThreadSubject onModel: thread)].
 )
+public typecheckReportSubject ^ <ClassTypecheckReportSubject> = (
+	(* Typecheck this class and all nested classes (header, instance and
+	   class methods, lazy slots). Populates each member's typeErrorMessages
+	   banner (errors only) as a side effect, and returns a summary report
+	   subject listing every member. One typechecker is shared across the
+	   whole walk. *)
+	| tc <NewspeakTypechecker> = ide freshTypechecker.
+	  entries <List[TypecheckReportEntry]> = List new. |
+	collectTypecheckEntriesWith: tc into: entries prefix: ''.
+	^ClassTypecheckReportSubject onClassNamed: name entries: entries
+)
+public collectTypecheckEntriesWith: tc <NewspeakTypechecker> into: entries <List[TypecheckReportEntry]> prefix: prefix <String> = (
+	| mixin = classMirror instanceSide. classSideMixin = classMirror classSide. |
+	addEntryTo: entries label: prefix, name, ' (class header)'
+		banner: factorySubject nav: self
+		errors: [tc typecheckClassHeader: classHeaderSource ofClass: mixin].
+	methodsSubject elements do: [:ms <MethodSubject> |
+		addEntryTo: entries label: prefix, ms name, ' (method)'
+			banner: ms nav: ms
+			errors: [tc typecheckMethodSource: ms source ofClass: mixin]
+	].
+	classMethodsSubject elements do: [:ms <MethodSubject> |
+		addEntryTo: entries label: prefix, ms name, ' (class method)'
+			banner: ms nav: ms
+			errors: [tc typecheckMethodSource: ms source ofClass: classSideMixin]
+	].
+	lazySlotsSubject elements do: [:ls <LazySlotSubject> |
+		addEntryTo: entries label: prefix, ls name, ' (lazy slot)'
+			banner: ls nav: ls
+			errors: [tc typecheckLazySlot: ls source ofClass: mixin]
+	].
+	nestedClassesSubject elements do: [:nc <ClassSubject> |
+		nc collectTypecheckEntriesWith: tc into: entries prefix: prefix, name, ' >> '
+	].
+)
+addEntryTo: entries <List[TypecheckReportEntry]> label: lbl <String> banner: bannerSubject <Subject> nav: navSubject <Subject> errors: errorBlock <[Set]> = (
+	| errs <Set> messages <List[String]> = List new. failure <String> |
+	failure:: nil.
+	errs:: errorBlock on: Error do: [:e <Error> | failure:: 'Typechecker failed: ', e printString. nil].
+	failure isNil
+		ifFalse: [messages add: failure]
+		ifTrue: [errs do: [:e |
+			messages add: 'Type error: ', e message, ' [', e start printString, '-', e end printString, ']'
+		]].
+	bannerSubject clearTypeErrors.
+	messages do: [:m <String> | bannerSubject typeErrorMessages add: m].
+	entries add: (TypecheckReportEntry
+		label: lbl
+		bannerSubject: bannerSubject
+		navSubject: navSubject
+		messages: messages
+		hasErrors: messages isEmpty not)
+)
 ) : (
 public fromModel: cm <ClassModel> ^ <Instance> = (
   ^onClassModel: cm
@@ -1148,16 +1268,88 @@ public onModel: cm <ClassModel> ^ <Instance> = (
   ^onClassModel: cm
 )
 )
+public class TypecheckReportEntry label: lbl <String> bannerSubject: bs <Subject> navSubject: ns <Subject> messages: msgs <List[String]> hasErrors: he <Boolean> = (
+(* One row of a whole-class typecheck report: a member's display label, the
+   subject whose banner was populated, the subject to navigate to when the
+   label is clicked, the formatted error messages, and whether any were found. *)
+|
+public label <String> = lbl.
+public bannerSubject <Subject> = bs.
+public navSubject <Subject> = ns.
+public messages <List[String]> = msgs.
+public hasErrors <Boolean> = he.
+|
+) (
+) : (
+)
+public class ClassTypecheckReportSubject onClassNamed: cn <String> entries: es <List[TypecheckReportEntry]> = Subject onModel: cn (
+(* A transient summary of typechecking a whole class (and its nested classes).
+   Built by ClassSubject>>typecheckReportSubject. *)
+|
+public className <String> = cn.
+public entries <List[TypecheckReportEntry]> = es.
+|
+) (
+public createPresenter ^ <Presenter> = (
+	^ClassTypecheckReportPresenter onSubject: self
+)
+public title ^ <String> = (
+	^'Typecheck: ', className
+)
+public refreshmentSubject ^ <Subject> = (
+	(* The report is a point-in-time snapshot; there is nothing to recompute. *)
+	^self
+)
+public isKindOfClassTypecheckReportSubject ^ <Boolean> = (
+	^true
+)
+isMyKind: s <Subject> ^ <Boolean> = (
+	^s isKindOfClassTypecheckReportSubject
+)
+) : (
+)
+public class ClassTypecheckReportPresenter onSubject: s <ClassTypecheckReportSubject> = ProgrammingPresenter onSubject: s (
+(* Renders a whole-class typecheck report: a title, then one block per member
+   with the member name as a link (navigating to the member) followed by its
+   red error lines or a green 'No type errors.' confirmation. *)
+) (
+public definition ^ <Fragment> = (
+	| rows <List[Fragment]> = List new. |
+	rows add: (label: subject title) bold.
+	rows add: smallBlank.
+	subject entries do: [:entry <TypecheckReportEntry> | rows add: (entryRow: entry)].
+	^column: rows
+)
+entryRow: entry <TypecheckReportEntry> ^ <Fragment> = (
+	| rows <List[Fragment]> = List new. |
+	rows add: ((link: entry label action: [enterSubject:: entry navSubject]) color: actionLinkColor).
+	entry hasErrors
+		ifTrue: [entry messages do: [:m <String> |
+			rows add: ((label: m) color: (Color r: 0.7 g: 0 b: 0))]]
+		ifFalse: [rows add: ((label: 'No type errors.') color: (Color r: 0 g: 0.5 b: 0))].
+	rows add: smallBlank.
+	^column: rows
+)
+public isKindOfClassTypecheckReportPresenter ^ <Boolean> = (
+	^true
+)
+isMyKind: other <Fragment> ^ <Boolean> = (
+	^other isKindOfClassTypecheckReportPresenter
+)
+) : (
+)
 public class DefinitionListPresenter onSubject: s = ProgrammingPresenter onSubject: s (
 (* 
 DefinitionListPresenter is an abstract superclass of presenters that displays helper ''transient'' presenters that visually appear to belong to the main list of subject presenters. One common example is a method list presenter which can at times include presenters for methods being added. 
 *)
 
 | 
-stateSlot <DefinitionListPresenterState> 
-contentListSlot <ToggleList>
+ 
+
 |
 ) (
+lazy public state <DefinitionListPresenterState> ::= DefinitionListPresenterState new.
+lazy contentList <ToggleList> = taggedColumn: contentPresenters.
 addButton = (
   ^addButtonWithAction: [updateGUI: [respondToAdd]].
 )
@@ -1188,15 +1380,11 @@ isMyKind: f <Fragment> ^ <Boolean> = (
 respondToAdd = (
   addNewItemTemplate
 )
-public state = (
-  stateSlot isNil ifTrue: [stateSlot:: DefinitionListPresenterState new].
-  ^stateSlot
-)
 public title = (
   subclassResponsibility
 )
 updateVisualsFromSameKind: oldPresenter <Self> ^ <Alien[Element]> = (
-  stateSlot:: oldPresenter state.
+  state:: oldPresenter state.
   substanceSlot:: nil.
   ensureSubstance.
   ^super updateVisualsFromSameKind: oldPresenter
@@ -1242,12 +1430,6 @@ buttonListHelp ^ <String> = (
   <li> <div class="hopscotchRefreshButton"> </div> Refreshes the list (just in case of UI bugs).</li>
   <li> <div class="hopscotchHelpButton"> </div> Shows this help message.</li>
   <li> <div class="definitionListMenuButton"> </div> Opens a menu of additional operations, ', menuOperationsHelp, '.</li>'
-)
-contentList = (
-   contentListSlot isNil ifTrue: [
-	contentListSlot:: taggedColumn: contentPresenters
-	].
-  ^contentListSlot.
 )
 specificHelp ^ <String> = (
   ^''
@@ -1424,9 +1606,47 @@ definition = (
 )
 entryActionsMenuFor: key = (
 	^menuWithLabelsAndActions: {
+		{'Add to namespace…'. [respondToAddEntry: key toNamespace: nil]}.
 		{'Remove ', key. [updateGUI: [ide namespacing removeKey: key.]]}.
         {'Inspect Presenter'. [respondToInspectPresenter]}.
 	}
+)
+respondToAddEntry: key toNamespace: ignored = (
+	(* Pull this entry into another namespace by Root key. The picker
+	   is a non-modal InteractionSubject prompt; on accept, the target
+	   is validated and the entry copied. Validation failures and the
+	   success path log to the JS console (no per-namespace status
+	   banner yet) -- successful adds also re-render the namespace
+	   via updateGUI: so the new entry shows up. *)
+	| val |
+	val:: ide namespacing Root at: key asSymbol ifAbsent: [
+		cachedPlatform js global console
+			log: 'Cannot find ', key, ' in Root.'.
+		^nil].
+	enterSubject:: ide browsing InteractionSubject
+		prompt: 'Add ', key, ' to which namespace (Root key)?'
+		default: ''
+		onAccept: [:targetName |
+			(targetName isNil or: [targetName isEmpty])
+				ifFalse: [doAddEntry: key value: val toNamespaceName: targetName]]
+		returnTo: subject
+)
+doAddEntry: key <Symbol | String> value: val toNamespaceName: targetName <String> = (
+	| target |
+	target:: ide namespacing Root at: targetName asSymbol ifAbsent: [nil].
+	target isNil ifTrue: [
+		cachedPlatform js global console
+			log: 'No namespace named ', targetName, ' in Root.'.
+		^nil].
+	[target at: key asSymbol put: val]
+		on: Exception
+		do: [:e |
+			cachedPlatform js global console
+				log: targetName, ' is not a namespace: ', e messageText.
+			^nil].
+	updateGUI: [].
+	cachedPlatform js global console
+		log: 'Added ', key, ' to ', targetName, '.'
 )
 ) : (
 )
@@ -1533,6 +1753,9 @@ navigateToNamespace = (
 navigateToWorkspaces = (
 	enterSubject:: ide theWorkspaceManager AllWorkspacesSubject new.
 )
+navigateToRepositories = (
+	enterSubject:: ide repositories list.
+)
 respondToAboutSystem = (
 	alert: 'WebIDEApp version 0.1984'
 )
@@ -1573,6 +1796,7 @@ definition = (
 				link: 'Workspaces' action: [navigateToWorkspaces].
 			}
 			column3: {
+				link: 'Repositories' action: [navigateToRepositories].
 			}).
 		mediumBlank.
 
@@ -1808,9 +2032,15 @@ public colorizeSource: source <String> editor: cm <CodeMirrorFragment> ^ <TextFr
 		via: (colorizingBlockFor: cm)
 )
 public compileSource: source <String> ifSuccess: successBlock <[:MethodMirror]> ifFailure: failureBlock <[:String]> = (
+	(* Run the source through prettyPrintLazySlotOr: first so the
+	   stored declaration matches what the pretty printer would
+	   emit on reopen -- enforces canonical formatting at accept
+	   time. Falls back to the original on any printer failure. *)
+	| canonical |
+	canonical:: ide prettyPrintLazySlotOr: source.
 	[ | builder <MixinBuilder> newBuilder <LazySlotBuilder> newMirror <LazySlotMirror> |
 	builder:: definingMixin asBuilder.
-	newBuilder:: builder lazySlots addFromSource: source.
+	newBuilder:: builder lazySlots addFromSource: canonical.
 	ide  installFromBuilders: {builder declaration}.
 	newMirror:: definingMixin lazySlots findMirrorNamed: newBuilder name.
 	successBlock value: newMirror]
@@ -1923,9 +2153,13 @@ public methodTemplateText ^ <String> = (
 )'
 )
 public compileSource: source <String> ifSuccess: successBlock <[:MethodMirror]> ifFailure: failureBlock <[:String]> = (
+	(* Canonicalise via prettyPrintMethodOr: before compiling. See
+	   the LazySlotGroupPresenter sibling above for rationale. *)
+	| canonical |
+	canonical:: ide prettyPrintMethodOr: source.
 	[ | builder <MixinBuilder> newBuilder <MethodBuilder> newMirror <MethodMirror> |
 	builder:: definingMixin asBuilder.
-	newBuilder:: builder methods addFromSource: source.
+	newBuilder:: builder methods addFromSource: canonical.
 	ide  installFromBuilders: {builder declaration}.
 	newMirror:: definingMixin methods findMirrorNamed: newBuilder name.
 	successBlock value: newMirror]
@@ -1954,13 +2188,21 @@ public class LazySlotPresenter onSubject: s <LazySlotSubject> = ProgrammingPrese
        the history button click. Same pattern as chatHolder on the
        superclass. *)
     historyHolder = holder: nothing.
+    (* Captured by codeMirrorDefinition so the 'Pretty Print' menu
+       action can address the current editor. *)
+    slotEditor <CodeMirrorFragment>
+    (* Captured by evaluatorDefinition when this slot has exemplars and
+       the editor is an EvaluatorPresenter rather than a plain
+       CodeMirror. Lets respondToTypecheckSlot read the in-progress
+       text via the evaluator's embedded codeMirror. *)
+    slotEvaluatorPresenter <EvaluatorPresenter>
 	|
 ) (
 public historySection = (^historyHolder)
 installHistory = (
     historyHolder content:
-        (LazySlotHistorySubject onModel:
-            (LazySlotHistoryModel lazySlotModel: subject slotModel repo: ide drafts))
+        (MemberRepoHistorySubject onModel:
+            (MemberRepoHistoryModel forLazySlotModel: subject slotModel))
                 createPresenter
 )
 toggleHistory = (
@@ -2018,6 +2260,21 @@ errorMessages ^ <Array[Fragment]> = (
        errorDisplay: msg
     ]) asArray.
 )
+typeErrorDisplay: msg <String> ^ <Fragment> = (
+  | textColor |
+  textColor:: msg = 'No type errors.'
+    ifTrue: [Color r: 0 g: 0.5 b: 0]
+    ifFalse: [Color r: 0.7 g: 0 b: 0].
+  ^row: {
+    (label: msg) color: textColor.
+    button: 'Clear' action: [updateGUI: [subject typeErrorMessages remove: msg]]
+  }
+)
+typeErrorMessages ^ <Array[Fragment]> = (
+  ^(subject typeErrorMessages collect: [:msg <String> |
+       typeErrorDisplay: msg
+    ]) asArray.
+)
 editorDefinition  ^ <CodeMirrorFragment | EvaluatorPresenter> = (
  ^hasExemplars ifTrue: [evaluatorDefinition] ifFalse: [codeMirrorDefinition]
 )
@@ -2056,7 +2313,8 @@ hasExemplars ^ <Boolean> = (
 )
 evaluatorDefinition ^ <EvaluatorPresenter> = (
  subject threadForExemplar: subject exemplar.
- ^subject evaluator presenter.
+ slotEvaluatorPresenter:: subject evaluator presenter.
+ ^slotEvaluatorPresenter
 )
 linkToBrowseEnclosingClass: klass <ClassDeclarationMirror> = (
 	^(link: klass simpleName
@@ -2071,12 +2329,17 @@ isMyKind: f <Fragment> ^ <Boolean> = (
 )
 acceptResponse ^ <[:CodeMirrorFragment :Event]> = (
 	^ [:ed <CodeMirrorFragment> :event <Event> |
-		| b <MixinBuilder> = subject slotMirror definingMixin asBuilder. |
+		| b <MixinBuilder> = subject slotMirror definingMixin asBuilder.
+		canonical |
 		updateGUI: [
-			[b lazySlots addFromSource: ed textBeingAccepted.
-			ide  installFromBuilders: {b declaration}.
-			colorizeLazySlotSource: (crToLf: ed textBeingAccepted) withEditor: ed.
-			ed leaveEditState] on: Error do:  [:ex <Exception> | ed showMessage: ex printString]
+			[
+				canonical:: ide prettyPrintLazySlotOr: ed textBeingAccepted.
+				b lazySlots addFromSource: canonical.
+				ide  installFromBuilders: {b declaration}.
+				subject clearTypeErrors.
+				ed text: canonical.
+				colorizeLazySlotSource: (crToLf: canonical) withEditor: ed.
+				ed leaveEditState] on: Error do:  [:ex <Exception> | ed showMessage: ex printString]
 			].
 		ed editor focus.
 		]
@@ -2091,11 +2354,29 @@ changeResponse ^ <[:CodeMirrorFragment :Event]> = (
 )
 codeMirrorDefinition  ^ <CodeMirrorFragment> = (
   |  src = crToLf: subject source. cm = codeMirror: src. |
-  cm changeResponse: changeResponse; 
+  cm changeResponse: changeResponse;
         cancelResponse: cancelResponse;
         acceptResponse: acceptResponse.
   colorizeLazySlotSource: src withEditor: cm.
+  slotEditor:: cm.
   ^cm
+)
+respondToPrettyPrint = (
+    (* Pretty-print the current lazy-slot source and replace the
+       editor contents in place. Does NOT trigger Accept. On parse
+       failure, shows an inline message and leaves the text unchanged. *)
+    | ed source formatted |
+    ed:: slotEditor.
+    ed isNil ifTrue: [^self].
+    source:: ed textBeingAccepted.
+    (source isNil or: [source isEmpty]) ifTrue: [source:: subject source].
+    formatted:: [ide prettyPrinter prettyPrintLazySlot: source]
+        on: Exception do: [:e |
+            ed showMessage: 'Pretty print failed: ', e printString.
+            ^self].
+    ed text: formatted.
+    colorizeLazySlotSource: (crToLf: formatted) withEditor: ed.
+    ed editor focus.
 )
 debugExemplar: e <String> (* :exemplar1: debugExemplar: 'definition' *) = (
    | 
@@ -2109,6 +2390,45 @@ respondToAddSlotWorkspace = (
   subject threadForExemplar: subject exemplar.
   updateGUI: [subject addSlotWorkspace]
 )
+respondToTypecheckSlot = (
+    (* Run the typechecker on the current lazy-slot source (editor buffer
+       if non-empty, else the installed source) and surface results in
+       the typeErrorMessages banner column below the editor.
+       Source priority: codeMirror editor (no-exemplar mode), else the
+       embedded evaluator's editor (exemplar mode), else the installed
+       source. *)
+    | source typed mixin errs failureMessage |
+    typed:: slotEditor isNil
+        ifTrue: [
+            slotEvaluatorPresenter isNil
+                ifTrue: [nil]
+                ifFalse: [slotEvaluatorPresenter editorText]
+        ]
+        ifFalse: [slotEditor textBeingAccepted].
+    source:: (typed isNil or: [typed isEmpty])
+        ifTrue: [subject source]
+        ifFalse: [typed].
+    mixin:: subject slotMirror definingMixin.
+    subject clearTypeErrors.
+    failureMessage:: nil.
+    errs:: [ide freshTypechecker typecheckLazySlot: source ofClass: mixin]
+        on: Error do: [:e |
+            failureMessage:: 'Typechecker failed: ', e printString.
+            nil
+        ].
+    updateGUI: [
+        failureMessage isNil ifFalse: [
+            subject typeErrorMessages add: failureMessage
+        ] ifTrue: [
+            errs isEmpty
+                ifTrue: [subject typeErrorMessages add: 'No type errors.']
+                ifFalse: [errs do: [:e |
+                    subject typeErrorMessages add:
+                        'Type error: ', e message, ' [', e start printString, '-', e end printString, ']'
+                ]]
+        ]
+    ]
+)
 public definition ^ <Fragment> = (
 	| toggle |
 	toggle::
@@ -2118,6 +2438,7 @@ public definition ^ <Fragment> = (
 			slotHeader: [toggle collapse].
 			editorDefinition.
             column: errorMessages.
+            column: typeErrorMessages.
             subject hasSlotWorkspace
                ifTrue: [subject workspace presenter]
                ifFalse: [nothing].
@@ -2232,9 +2553,13 @@ helpText = (
   mapping: mapping
 )
 slotMenuFor: slotName <String> = (
-  | 
+  |
     labelsAndActions ::= {
         {'Delete #', slotName. [updateGUI: [subject delete]]}.
+		#separator.
+		{'Pretty Print'. [respondToPrettyPrint]}.
+		#separator.
+		{'Typecheck'. [respondToTypecheckSlot]}.
 		#separator.
 		{'Inspect Presenter'. [respondToInspectPresenter]}
 	}.
@@ -2268,9 +2593,10 @@ referencesMenuMessageItems = (
 )
 public class LazySlotSubject onLazySlotModel: mm <LazySlotModel | ClassModel> = Subject onModel: mm (
 (* Manages the UI for a lazy slot definition. Not be confused with LazyObjectSlotSubject, which deals with lazy slots storage. *)
-| 
-public errorMessages <Set[String]> = Set new. 
-public exemplars <List[String]> = computeExemplars.  
+|
+public errorMessages <Set[String]> = Set new.
+public typeErrorMessages <Set[String]> = Set new.
+public exemplars <List[String]> = computeExemplars.
 public exemplar <String>
 evaluator_slot <EvaluationSubject>
 workspace_slot <EvaluationSubject>
@@ -2302,15 +2628,21 @@ public source ^ <String> = (
 public clearErrors = (
   errorMessages removeAll: errorMessages
 )
+public clearTypeErrors = (
+  typeErrorMessages removeAll: typeErrorMessages
+)
 public delete = (
 	| b <MixinBuilder> = slotMirror definingMixin asBuilder. |
 	b lazySlots removeMirrorNamed: slotMirror name.
 	ide installFromBuilders: {b declaration}
 )
 public compileSource: src <String> ifSuccess: successBlock <[:MethodMirror]> ifFailure: failureBlock <[:String]> = (
+	(* Canonicalise via prettyPrintLazySlotOr: before compiling. *)
+	| canonical |
+	canonical:: ide prettyPrintLazySlotOr: src.
 	[ | builder <MixinBuilder> newBuilder <LazySlotBuilder> newMirror <LazySlotMirror> |
 	builder:: slotMirror definingMixin asBuilder.
-	newBuilder:: builder lazySlots addFromSource: src.
+	newBuilder:: builder lazySlots addFromSource: canonical.
 	ide installFromBuilders: {builder declaration}.
 	newMirror:: definingMixin lazySlots findMirrorNamed: newBuilder name.
 	successBlock value: newMirror]
@@ -2429,17 +2761,26 @@ public class MethodPresenter onSubject: s <MethodSubject> = ProgrammingPresenter
     (* Inline holder for the per-method history view, populated by the
        history button click. Same pattern as chatHolder on the superclass. *)
     historyHolder = holder: nothing.
+    (* Captured by codeMirrorDefinition so the 'Pretty Print' menu
+       action can address the current editor. *)
+    methodEditor <CodeMirrorFragment>
+    (* Captured by evaluatorDefinition when the method has exemplars and
+       the editor is an EvaluatorPresenter rather than a plain
+       CodeMirror. Lets respondToTypecheck read the in-progress text via
+       the evaluator's embedded codeMirror. *)
+    methodEvaluatorPresenter <EvaluatorPresenter>
 	|
 ) (
 public historySection = (^historyHolder)
 installHistory = (
-    (* Embed the MethodHistoryPresenter directly in the holder. No
-       outer toggle: the history button itself is the toggle (see
-       toggleHistory), and the embedded presenter has its own
-       per-row toggles for individual entries. *)
+    (* Embed the multi-repo history presenter directly. The history
+       button itself is the toggle (see toggleHistory); the embedded
+       presenter has its own per-row toggles for individual entries
+       and (when multiple repos are present) a chip row to pick which
+       permanent repo to expand alongside drafts. *)
     historyHolder content:
-        (MethodHistorySubject onModel:
-            (MethodHistoryModel methodModel: subject methodModel repo: ide drafts))
+        (MemberRepoHistorySubject onModel:
+            (MemberRepoHistoryModel forMethodModel: subject methodModel))
                 createPresenter
 )
 toggleHistory = (
@@ -2517,33 +2858,76 @@ errorMessages ^ <Array[Fragment]> = (
        errorDisplay: msg
     ]) asArray.
 )
+typeErrorDisplay: msg <String> ^ <Fragment> = (
+  | textColor |
+  textColor:: msg = 'No type errors.'
+    ifTrue: [Color r: 0 g: 0.5 b: 0]
+    ifFalse: [Color r: 0.7 g: 0 b: 0].
+  ^row: {
+    (label: msg) color: textColor.
+    button: 'Clear' action: [updateGUI: [subject typeErrorMessages remove: msg]]
+  }
+)
+typeErrorMessages ^ <Array[Fragment]> = (
+  ^(subject typeErrorMessages collect: [:msg <String> |
+       typeErrorDisplay: msg
+    ]) asArray.
+)
 acceptResponse ^ <[:CodeMirrorFragment :Event]> = (
 	^ [:ed <CodeMirrorFragment> :event <Event> |
-		| b <MixinBuilder> = subject methodMirror definingMixin asBuilder. |
+		| b <MixinBuilder> = subject methodMirror definingMixin asBuilder.
+		canonical |
 		updateGUI: [
-			[b methods addFromSource: ed textBeingAccepted.
-			ide  installFromBuilders: {b declaration}.
-			colorizeMethodSource: (crToLf: ed textBeingAccepted) withEditor: ed.
-			ed leaveEditState] on: Error do:  [:ex <Exception> | ed showMessage: ex printString]
+			[
+				canonical:: ide prettyPrintMethodOr: ed textBeingAccepted.
+				b methods addFromSource: canonical.
+				ide  installFromBuilders: {b declaration}.
+				subject clearTypeErrors.
+				ed text: canonical.
+				colorizeMethodSource: (crToLf: canonical) withEditor: ed.
+				ed leaveEditState] on: Error do:  [:ex <Exception> | ed showMessage: ex printString]
 			].
 		ed editor focus.
 		]
 )
 codeMirrorDefinition  ^ <CodeMirrorFragment> = (
   |  src = crToLf: subject source. cm = codeMirror: src. |
-  cm changeResponse: changeResponse; 
+  cm changeResponse: changeResponse;
         cancelResponse: cancelResponse;
         acceptResponse: acceptResponse.
   colorizeMethodSource: src withEditor: cm.
+  methodEditor:: cm.
   ^cm
+)
+respondToPrettyPrint = (
+    (* Pretty-print the current method source and replace the editor
+       contents in place. Does NOT trigger Accept — the user decides
+       whether to commit. On parse failure, shows an inline message
+       under the editor and leaves the text unchanged. *)
+    | ed source formatted |
+    ed:: methodEditor.
+    ed isNil ifTrue: [^self].
+    source:: ed textBeingAccepted.
+    (source isNil or: [source isEmpty]) ifTrue: [source:: subject source].
+    formatted:: [ide prettyPrinter prettyPrintMethod: source]
+        on: Exception do: [:e |
+            ed showMessage: 'Pretty print failed: ', e printString.
+            ^self].
+    ed text: formatted.
+    colorizeMethodSource: (crToLf: formatted) withEditor: ed.
+    ed editor focus.
 )
 editorDefinition  ^ <CodeMirrorFragment | EvaluatorPresenter> = (
  ^hasExemplars ifTrue: [evaluatorDefinition] ifFalse: [codeMirrorDefinition]
 )
 methodMenuFor: methodName <String> = (
-  | 
+  |
     labelsAndActions ::= {
         {'Delete #', methodName. [updateGUI: [subject delete]]}.
+		#separator.
+		{'Pretty Print'. [respondToPrettyPrint]}.
+		#separator.
+		{'Typecheck'. [respondToTypecheck]}.
 		#separator.
 		{'Inspect Presenter'. [respondToInspectPresenter]}
 	}.
@@ -2586,11 +2970,51 @@ hasExemplars ^ <Boolean> = (
 )
 evaluatorDefinition ^ <EvaluatorPresenter> = (
  subject threadForExemplar: subject exemplar.
- ^subject evaluator presenter.
+ methodEvaluatorPresenter:: subject evaluator presenter.
+ ^methodEvaluatorPresenter
 )
 respondToAddMethodWorkspace = (
   subject threadForExemplar: subject exemplar.
   updateGUI: [subject addMethodWorkspace]
+)
+respondToTypecheck = (
+    (* Run the typechecker on the current method source (editor buffer
+       if non-empty, else the installed source) and surface results in
+       the typeErrorMessages banner column below the editor.
+       Source priority: codeMirror editor (no-exemplar mode), else the
+       embedded evaluator's editor (exemplar mode), else the installed
+       source. *)
+    | source typed mixin errs failureMessage |
+    typed:: methodEditor isNil
+        ifTrue: [
+            methodEvaluatorPresenter isNil
+                ifTrue: [nil]
+                ifFalse: [methodEvaluatorPresenter editorText]
+        ]
+        ifFalse: [methodEditor textBeingAccepted].
+    source:: (typed isNil or: [typed isEmpty])
+        ifTrue: [subject source]
+        ifFalse: [typed].
+    mixin:: subject methodMirror definingMixin.
+    subject clearTypeErrors.
+    failureMessage:: nil.
+    errs:: [ide freshTypechecker typecheckMethodSource: source ofClass: mixin]
+        on: Error do: [:e |
+            failureMessage:: 'Typechecker failed: ', e printString.
+            nil
+        ].
+    updateGUI: [
+        failureMessage isNil ifFalse: [
+            subject typeErrorMessages add: failureMessage
+        ] ifTrue: [
+            errs isEmpty
+                ifTrue: [subject typeErrorMessages add: 'No type errors.']
+                ifFalse: [errs do: [:e |
+                    subject typeErrorMessages add:
+                        'Type error: ', e message, ' [', e start printString, '-', e end printString, ']'
+                ]]
+        ]
+    ]
 )
 debugExemplar: e <String> (* :exemplar1: debugExemplar: 'definition' *) = (
    | 
@@ -2723,7 +3147,8 @@ public definition ^ <Fragment> = (
 			methodHeader: [toggle collapse].
 			editorDefinition.
             column: errorMessages.
-            subject hasMethodWorkspace 
+            column: typeErrorMessages.
+            subject hasMethodWorkspace
                ifTrue: [subject workspace presenter]
                ifFalse: [nothing].
 		}]
@@ -2761,9 +3186,10 @@ referencesMenuMessageItems = (
 )
 public class MethodSubject onMethodModel: mm <MethodModel | ClassModel> = Subject onModel: mm (
 (* Manages the UI for a method. *)
-| 
-public errorMessages <Set[String]> = Set new. 
-public exemplars <List[String]> = computeExemplars.  
+|
+public errorMessages <Set[String]> = Set new.
+public typeErrorMessages <Set[String]> = Set new.
+public exemplars <List[String]> = computeExemplars.
 public exemplar <String>
 evaluator_slot <EvaluationSubject>
 workspace_slot <EvaluationSubject>
@@ -2798,15 +3224,21 @@ public source ^ <String> = (
 public clearErrors = (
   errorMessages removeAll: errorMessages
 )
+public clearTypeErrors = (
+  typeErrorMessages removeAll: typeErrorMessages
+)
 public delete = (
 	| b <MixinBuilder> = methodMirror definingMixin asBuilder. |
 	b methods removeMirrorNamed: methodMirror name.
 	ide installFromBuilders: {b declaration}
 )
 public compileSource: src <String> ifSuccess: successBlock <[:MethodMirror]> ifFailure: failureBlock <[:String]> = (
+	(* Canonicalise via prettyPrintMethodOr: before compiling. *)
+	| canonical |
+	canonical:: ide prettyPrintMethodOr: src.
 	[ | builder <MixinBuilder> newBuilder <MethodBuilder> newMirror <MethodMirror> |
 	builder:: methodMirror definingMixin asBuilder.
-	newBuilder:: builder methods addFromSource: src.
+	newBuilder:: builder methods addFromSource: canonical.
 	ide installFromBuilders: {builder declaration}.
 	newMirror:: definingMixin methods findMirrorNamed: newBuilder name.
 	successBlock value: newMirror]
@@ -2969,6 +3401,10 @@ public methodModel ^ <MethodModel> = (
 public methodMirror ^ <MethodMirror> = (
   ^methodModel methodMirror
 )
+public memberMirror = (
+  (* The mirror EntrySubjects need to drive kind dispatch + install. *)
+  ^methodMirror
+)
 public repo = (
   ^model repo
 )
@@ -3024,6 +3460,7 @@ public lazySlotModel = (
 public slotMirror = (
   ^lazySlotModel slotMirror
 )
+public memberMirror = (^slotMirror)
 public repo = (
   ^model repo
 )
@@ -3076,6 +3513,7 @@ public createPresenter ^ <Presenter> = (
 public classMirror = (
   ^model classMirror
 )
+public memberMirror = (^classMirror)
 public repo = (
   ^model repo
 )
@@ -3114,6 +3552,244 @@ memberPathName: cd ^ <String> = (
 )
 ) : (
 )
+public class MemberRepoHistorySubject onModel: m <MemberRepoHistoryModel>
+  = ProgrammingSubject onModel: m (
+(* Multi-repo wrapper around a single member's history. Holds the
+   repo-agnostic identity (kind + target via the model); the
+   presenter walks ide drafts (always) plus every Repository in Root
+   whose namespace currently contains the member's defining class
+   (`trackingRepos`), and stacks a collapsible per-repo
+   ToggleComposer per repo. Order is permanent-first / drafts-last
+   so time flows downward toward the live version.
+   Historical-only repos (have commits but don't currently track the
+   class) are not yet surfaced -- Phase-2 follow-up. *)
+) (
+public createPresenter ^ <Presenter> = (
+  ^MemberRepoHistoryPresenter onSubject: self
+)
+public kind ^ <Symbol> = (^model kind)
+public target = (^model target)
+public draftsRepo = (^ide drafts)
+public memberKindLabel ^ <String> = (
+  model kind = #method ifTrue: [^'method'].
+  model kind = #lazySlot ifTrue: [^'lazy slot'].
+  model kind = #classHeader ifTrue: [^'class header'].
+  ^'member'
+)
+public definingClass ^ <ClassDeclarationMirror> = (
+  (* The live ClassDeclarationMirror that owns this member -- used to
+     decide which Repositories track the member. Methods / slots reach
+     through their definingMixin; class headers ARE the class. *)
+  model kind = #method ifTrue: [^model target methodMirror definingMixin declaration].
+  model kind = #lazySlot ifTrue: [^model target slotMirror definingMixin declaration].
+  ^model target  (* classMirror *)
+)
+public memberName ^ <Symbol | Nil> = (
+  (* The selector / slot name we'd filter by inside a multi-member
+     repo file. Nil for class headers (they're the whole declaration
+     and any commit touching the file is relevant). *)
+  model kind = #method ifTrue: [^model target methodMirror name].
+  model kind = #lazySlot ifTrue: [^model target slotMirror name].
+  ^nil
+)
+public title ^ <String> = (
+  | cd kind nameStr classPath |
+  cd:: definingClass.
+  kind:: memberKindLabel.
+  nameStr:: memberName isNil ifTrue: [''] ifFalse: [' >> ', memberName asString].
+  classPath:: qualifiedNameOf: cd.
+  ^'History: ', classPath, nameStr, ' (', kind, ')'
+)
+qualifiedNameOf: cd ^ <String> = (
+  (* Dotted enclosing-class chain, e.g. "MirrorsForJS.MixinBuilder".
+     Mirrors the helper of the same name in AI_IDE_Support and the
+     existing per-kind HistorySubjects so the outer banner matches
+     what the inner presenter would have shown. *)
+  | names path c |
+  names:: List new.
+  c:: cd.
+  [c isNil] whileFalse: [
+    names add: c simpleName asString.
+    c:: c enclosingClass].
+  path:: ''.
+  names size to: 1 by: -1 do: [:i |
+    path:: path, (names at: i).
+    i > 1 ifTrue: [path:: path, '.']].
+  ^path
+)
+public trackingRepos ^ <List[Repository]> = (
+  (* Permanent repos in Root whose namespace currently contains the
+     defining class. drafts is NOT included here -- the presenter
+     always shows drafts separately. *)
+  | className result |
+  className:: definingClass simpleName.
+  result:: List new.
+  ide namespacing Root keysAndValuesDo: [:key :value |
+    (value isKindOfRepository
+      and: [(value namespace at: className ifAbsent: [nil]) isNil not])
+        ifTrue: [result add: value]].
+  ^result
+)
+public historyModelFor: repo = (
+  (* Build the appropriate per-repo *HistoryModel for this member,
+     so we can hand it to the per-repo *HistorySubject + MemberHistory-
+     Presenter. *)
+  model kind = #method ifTrue: [
+    ^MethodHistoryModel methodModel: model target repo: repo].
+  model kind = #lazySlot ifTrue: [
+    ^LazySlotHistoryModel lazySlotModel: model target repo: repo].
+  ^ClassHeaderHistoryModel classMirror: model target repo: repo
+)
+public historySubjectFor: repo = (
+  | hm |
+  hm:: historyModelFor: repo.
+  model kind = #method ifTrue: [^MethodHistorySubject onModel: hm].
+  model kind = #lazySlot ifTrue: [^LazySlotHistorySubject onModel: hm].
+  ^ClassHeaderHistorySubject onModel: hm
+)
+public isKindOfMemberRepoHistorySubject ^ <Boolean> = (^true)
+isMyKind: f <Subject> ^ <Boolean> = (
+  ^f isKindOfMemberRepoHistorySubject
+)
+) : (
+)
+public class MemberRepoHistoryPresenter onSubject: s
+  = ProgrammingPresenter onSubject: s (
+(* Multi-repo history surface. The outer banner identifies the member
+   (with full dotted class path). Below it, each repo gets a
+   collapsible ToggleComposer:
+     - Collapsed: "Repository: <name>" row.
+     - Expanded: an embedded MemberHistoryPresenter rendering its
+       own slim toolbar (expand/collapse-all/refresh/help/menu
+       scoped to the version list) + the version list itself.
+   The outer toolbar (expand/collapse-all + help + menu) operates on
+   the per-repo toggles -- expandAll expands every repo, collapseAll
+   closes them. Per-repo expand/collapse-all is delegated downwards
+   to the embedded MemberHistoryPresenter.
+   Repos are listed oldest-first: permanent (committed) repos at top,
+   drafts at the bottom -- time flows downward toward the live
+   version. *)
+|
+(* Cached taggedColumn of the per-repo ToggleComposers so expandAll /
+   collapseAll can iterate via childrenDo:, mirroring MemberHistory-
+   Presenter>>contentListSlot. Recomputed on each definition pass;
+   that's fine since the toggles' own state (expanded vs collapsed)
+   is held inside taggedColumn's updateVisualsFromSameKind: dance. *)
+repoTogglesSlot
+|
+) (
+public isKindOfMemberRepoHistoryPresenter ^ <Boolean> = (^true)
+isMyKind: f <Fragment> ^ <Boolean> = (
+  ^f isKindOfMemberRepoHistoryPresenter
+)
+definition = (
+  | permanent toggles |
+  permanent:: subject trackingRepos.
+  toggles:: List new.
+  (* Permanent (committed) repos start collapsed -- they're context
+     the user opens deliberately. Drafts starts expanded since it's
+     the always-present, always-edited repo and is what most users
+     are coming here to look at. Once the user collapses or expands
+     a toggle, the new state is carried across rebuilds via
+     ToggleComposer>>updateVisualsFromSameKind:; the initiallyExpanded:
+     value only takes effect on a fresh visit to the subject. *)
+  permanent do: [:r |
+    toggles add: (repoToggleFor: r initiallyExpanded: false)].
+  toggles add: (repoToggleFor: subject draftsRepo initiallyExpanded: true).
+  repoTogglesSlot:: taggedColumn: toggles.
+  ^column: {
+    helpSection.
+    majorHeadingBlock: (
+      row: {
+        (label: subject title) bold.
+        filler.
+        expandButtonWithAction: [expandAll].
+        defaultBlank.
+        collapseButtonWithAction: [collapseAll].
+        defaultBlank.
+        helpButton.
+        defaultBlank.
+        dropDownMenu: [historyMenu]
+      }).
+    mediumBlank.
+    repoTogglesSlot
+  }
+)
+repoToggleFor: repo initiallyExpanded: open <Boolean> = (
+  (* One collapsible block per repo. Tag is the repo name so the
+     taggedColumn can match toggles across rebuilds. The expanded
+     body is a fresh-per-render embedded MemberHistoryPresenter; its
+     own toolbar carries the per-repo affordances. Across rebuilds
+     the inner reconciles via MemberHistoryPresenter>>
+     updateVisualsFromSameKind: which transfers loadStarted_slot and
+     the entrySubject Map -- preventing a redundant historyOf:
+     refetch per render. *)
+  | repoName toggle |
+  repoName:: repo name asString.
+  toggle:: collapsed: [
+      row: {
+        (label: 'Repository: ') italic.
+        (link: repoName action: [toggle expand])
+          color: actionLinkColor.
+        filler
+      }]
+    expanded: [
+      column: {
+        row: {
+          (label: 'Repository: ') italic.
+          (link: repoName action: [toggle collapse])
+            color: actionLinkColor.
+          filler
+        }.
+        smallBlank.
+        (subject historySubjectFor: repo) createPresenter
+          embedded: true; yourself
+      }]
+    initiallyExpanded: open
+    tag: repoName.
+  ^toggle
+)
+public expandAll = (
+  repoTogglesSlot isNil ifFalse: [
+    repoTogglesSlot childrenDo: [:t <ToggleComposer> | t expand]]
+)
+public collapseAll = (
+  repoTogglesSlot isNil ifFalse: [
+    repoTogglesSlot childrenDo: [:t <ToggleComposer> | t collapse]]
+)
+historyMenu = (
+  ^menuWithLabelsAndActions: {
+    {'Inspect Presenter'. [respondToInspectPresenter]}
+  }
+)
+helpText = (
+  | mapping = Map new. |
+  mapping
+    at: #hopscotchHelpButton put: helpButton;
+    at: #hopscotchExpandAllButton put: (expandButtonWithAction: [expandAll]);
+    at: #hopscotchCollapseAllButton put: (collapseButtonWithAction: [collapseAll]);
+    at: #hopscotchMenu put: (dropDownMenu: [historyMenu]).
+  ^ampleforth: 'This is the multi-repository history view for a single
+', subject memberKindLabel, '. It lists every repository in which the
+defining class is currently tracked, oldest-first: permanent (committed)
+repositories at the top, the in-IDE <em>drafts</em> store at the
+bottom. Each entry is collapsible; expand a row to see that
+repository''s history of this ', subject memberKindLabel, ' in its own
+panel, with its own expand-all / collapse-all / refresh / help /
+Inspect Presenter affordances.
+<br><br>
+This bar provides the buttons below:
+<ul>
+<li> <div class="hopscotchHelpButton"> </div> Shows this help.</li>
+<li> <div class="hopscotchExpandAllButton"> </div> Expand every
+repository panel.</li>
+<li> <div class="hopscotchCollapseAllButton"> </div> Collapse every
+repository panel.</li>
+<li> <div class="hopscotchMenu"> </div> Inspect this presenter.</li>
+</ul>' mapping: mapping
+)
+) : (
+)
 public class MemberHistoryPresenter onSubject: s
   = ProgrammingPresenter onSubject: s (
 (* Generic history-list presenter shared by methods, lazy slots, and
@@ -3135,32 +3811,124 @@ public class MemberHistoryPresenter onSubject: s
    as a new append-only Accept commit in the repo. Cancel resets the
    editor and collapses the row.
 
+   Two display modes:
+     * Standalone (embeddedSlot=false): full helpSection +
+       majorHeadingBlock title row + body.
+     * Embedded (embeddedSlot=true): used inside
+       MemberRepoHistoryPresenter -- the outer banner owns the
+       title, so we render only a slim per-repo toolbar (label +
+       expand-all / collapse-all / refresh / help / Inspect) and
+       the body.
+
    Data flow:
      * History list: synchronous cachedHistoryOf: check first. Hit ->
        render. Miss -> render 'Loading...' AND kick off historyOf:
        which populates the cache, then updateGUI: rebuilds; the fresh
-       presenter hits the cache.
-     * Source blobs: same pattern, per-(path, sha) cache on DraftsRepo. *)
+       presenter hits the cache. The startFetch trigger gates on
+       repo.isReadyForHistory so we never call git.log on a still-
+       cloning Repository (would hang on lightning-fs locks).
+     * Source blobs: same pattern, per-(path, sha) cache on the repo.
+
+   The "refresh repo history" button uses `refreshHistory`, NOT
+   `refresh`, because Fragment>>refresh is the framework's visual-
+   tree propagation method -- overriding it would turn every render
+   into a cache-invalidate-plus-updateGUI loop. *)
 |
 loadStarted_slot <Boolean> ::= false.
 loadFailed_slot <String>
+(* Tracks whether the cache has ever been observed populated for
+   this presenter. Set true in definition the first render that sees
+   cached non-nil; carried across rebuilds via
+   updateVisualsFromSameKind:. Used to detect cache-was-invalidated:
+   if a later render sees cached=nil while cacheObservedSlot is
+   true, an external commit (or refresh) cleared the cache between
+   renders, so loadStarted_slot is stale and we need to re-fire
+   startFetch -- otherwise the body sticks on "Loading..." forever
+   (because loadStarted_slot is still true from the previous fetch
+   even though no fetch is in flight). *)
+cacheObservedSlot <Boolean> ::= false.
+(* When true, skip helpSection + majorHeadingBlock title bar in
+   definition. Set by MemberRepoHistoryPresenter so its single
+   outer banner isn't duplicated by per-repo inner banners. *)
+embeddedSlot <Boolean> ::= false.
 (* Memoized taggedColumn of the per-entry toggles, populated once per
    presenter instance. Lets expandAll / collapseAll iterate the toggles
    via childrenDo:. *)
 contentListSlot
 |
 ) (
+lazy public state <MemberHistoryPresenterState> ::= 
+(* Holds the sha-keyed MemberHistoryEntrySubjects so that their
+   CodeMirror editors persist across presenter rebuilds and row
+   collapse/expand. Transferred between presenter instances via
+   updateVisualsFromSameKind:, mirroring DefinitionListPresenter
+   (Browsing.ns:1198). *)
+MemberHistoryPresenterState new.
+updateVisualsFromSameKind: oldPresenter <Self> ^ <Alien[Element]> = (
+  (* Transfer the EntrySubjects (and thus their persistent editors)
+     from the old presenter so user edits survive parent rebuilds.
+     Also carry over the load-state slots so the new presenter knows
+     a fetch is already in flight (or has failed) -- otherwise the
+     fresh-presenter-per-render cycle from updateGUI: kicks off a
+     fresh historyOf: every render. cacheObservedSlot is part of
+     this transfer: definition uses (cacheObserved AND cached=nil)
+     to detect a between-renders cache invalidation and re-fire. *)
+  state:: oldPresenter state.
+  loadStarted_slot:: oldPresenter loadStarted.
+  loadFailed_slot:: oldPresenter loadFailed.
+  cacheObservedSlot:: oldPresenter cacheObserved.
+  ^super updateVisualsFromSameKind: oldPresenter
+)
+public loadStarted ^ <Boolean> = (^loadStarted_slot)
+public loadFailed ^ <String | Nil> = (^loadFailed_slot)
+public cacheObserved ^ <Boolean> = (^cacheObservedSlot)
 public isKindOfMemberHistoryPresenter ^ <Boolean> = (^true)
+public embedded: flag <Boolean> = (embeddedSlot:: flag)
 isMyKind: f <Fragment> ^ <Boolean> = (
   ^f isKindOfMemberHistoryPresenter
 )
 definition = (
   | cached |
   cached:: subject repo cachedHistoryOf: subject draftPath.
-  cached isNil ifTrue: [
-    loadStarted_slot ifFalse: [
+  (* If we previously observed a populated cache but now see nil, an
+     external event (a drafts commit, a refresh, or a permanent repo
+     commit/pull) invalidated it. The fetch we initiated last time
+     has long since resolved, so loadStarted_slot is stale -- reset
+     the load state so the gate below fires a fresh fetch. Otherwise
+     the body sticks on "Loading..." until the user manually clicks
+     refresh. *)
+  (cached isNil and: [cacheObservedSlot]) ifTrue: [
+    loadStarted_slot:: false.
+    loadFailed_slot:: nil.
+    cacheObservedSlot:: false].
+  cached isNil ifFalse: [cacheObservedSlot:: true].
+  (cached isNil and: [loadStarted_slot not and: [subject repo isReadyForHistory]])
+    ifTrue: [
       loadStarted_slot:: true.
-      startFetch]].
+      startFetch].
+  embeddedSlot ifTrue: [
+    (* Embedded mode: the enclosing MemberRepoHistoryPresenter owns
+       the outer "History: ..." banner. We render a per-repo slim
+       toolbar (expand/collapse-all + refresh + help + Inspect)
+       scoped to this repo's version list. *)
+    ^column: {
+      row: {
+        (label: 'Repository: ') italic.
+        (label: repoName) bold.
+        filler.
+        expandButtonWithAction: [expandAll].
+        defaultBlank.
+        collapseButtonWithAction: [collapseAll].
+        defaultBlank.
+        refreshButtonWithAction: [refreshHistory].
+        defaultBlank.
+        helpButton.
+        defaultBlank.
+        dropDownMenu: [historyMenu]
+      }.
+      mediumBlank.
+      bodyFor: cached
+    }].
   ^column: {
     helpSection.
     majorHeadingBlock: (
@@ -3171,6 +3939,8 @@ definition = (
         defaultBlank.
         collapseButtonWithAction: [collapseAll].
         defaultBlank.
+        refreshButtonWithAction: [refreshHistory].
+        defaultBlank.
         helpButton.
         defaultBlank.
         dropDownMenu: [historyMenu]
@@ -3179,30 +3949,69 @@ definition = (
     bodyFor: cached
   }
 )
+public refreshHistory = (
+  (* Drop the cached history for this repo and re-fetch. The current
+     cache is repo-wide; that's coarser than per-path but fine -- any
+     other open MemberHistoryPresenter on the same repo will simply
+     re-fetch on its next render.
+     NOT named `refresh` because Fragment>>refresh is the framework's
+     visual-tree propagation method (HopscotchForHTML5.ns:1642) -- it
+     fires automatically on every noticeExposure via HolderComposer
+     and other propagating fragments. Overriding `refresh` here would
+     turn every render into a cache-invalidate + updateGUI: loop. *)
+  subject repo invalidateHistoryCache.
+  loadStarted_slot:: false.
+  loadFailed_slot:: nil.
+  updateGUI: []
+)
 bodyFor: cached = (
+  (* Distinguish four states explicitly:
+       1. failed     -> show error.
+       2. not ready  -> repo isn't cloned/local-only yet; tell the user
+                        rather than spinning a misleading "Loading..."
+                        on a repo we deliberately can't fetch from.
+       3. loading    -> fetch in flight.
+       4. empty      -> fetched, but git.log returned no commits
+                        touching this member's file -- the "no changes
+                        in a repo" case the user flagged.
+     Otherwise render the content list. *)
   cached isNil ifTrue: [
-    loadFailed_slot isNil
-      ifTrue: [^label: 'Loading history...']
-      ifFalse: [^label: 'Failed to load history: ', loadFailed_slot]].
+    loadFailed_slot isNil ifFalse: [
+      ^label: 'Failed to load history from ', repoName, ': ',
+        loadFailed_slot].
+    subject repo isReadyForHistory ifFalse: [
+      ^label: 'Repository ', repoName,
+        ' is not ready (clone in progress or unconfigured); no history available yet.'].
+    ^label: 'Loading history from ', repoName, '...'].
   (cached at: 'length') = 0 ifTrue: [
-    ^label: 'No prior versions of this ', subject memberKindLabel, ' in ', repoName, '.'].
+    ^label: 'No prior versions of this ', subject memberKindLabel,
+      ' in ', repoName, '.'].
   ^contentListFor: cached
 )
 repoName = (
-  (* For now there's only one repo (drafts). Hardcode the label until
-     the Repository protocol grows a `name` accessor. *)
-  ^'drafts'
+  (* The Repository protocol now exposes `name` polymorphically:
+     DraftsRepo returns #drafts; user-visible Repositories return
+     their registered Symbol name. *)
+  ^subject repo name asString
 )
 contentListFor: entries = (
   (* Build a taggedColumn of toggles once per presenter instance and
      stash it in contentListSlot so expandAll / collapseAll can iterate
      it. The taggedColumn handles updateVisualsFromSameKind: for the
-     children across refreshes. *)
-  | toggles |
+     children across refreshes. Zebra-striped for readability,
+     matching the namespace / method-list presentation.
+
+     Iterate from last index down to 0 so the oldest commit lands on
+     top and time flows downward toward the live version below. The
+     entries array comes from isomorphic-git which returns newest-
+     first; this reversal matches the MemberRepoHistoryPresenter
+     "time moves downward from top to present" convention. *)
+  | toggles last |
   toggles:: List new.
-  0 to: (entries at: 'length') - 1 do: [:i |
+  last:: (entries at: 'length') - 1.
+  last to: 0 by: -1 do: [:i |
     toggles add: (toggleFor: (entries at: i))].
-  contentListSlot:: taggedColumn: toggles.
+  contentListSlot:: zebra: (taggedColumn: toggles).
   ^contentListSlot
 )
 public contentList = (
@@ -3227,10 +4036,13 @@ helpText = (
     at: #hopscotchHelpButton put: helpButton;
     at: #hopscotchExpandAllButton put: (expandButtonWithAction: [expandAll]);
     at: #hopscotchCollapseAllButton put: (collapseButtonWithAction: [collapseAll]);
+    at: #hopscotchRefreshButton put: (refreshButtonWithAction: [refreshHistory]);
     at: #hopscotchMenu put: (dropDownMenu: [historyMenu]).
-  ^ampleforth: 'This is the history presenter for a single ', kind, '. It lists every
-commit in the drafts repository that touched this ', kind, '''s file, newest first.
-Each row shows the short commit SHA (click to expand), the commit date, the
+  ^ampleforth: 'This is the history presenter for a single ', kind, ' as
+recorded in one source repository -- ', repoName, ', in this instance. It lists
+every commit in that repository that touched this ', kind, '''s file, oldest
+on top so time flows downward toward the live version at the bottom. Each
+row shows the short commit SHA (click to expand), the commit date, the
 commit''s subject line, and an inline summary of which members were added (+),
 modified (~), or removed (-).
 <br><br>
@@ -3243,14 +4055,43 @@ You can also further edit the historical text before accepting, in which case
 the Accept records exactly what you typed -- the historical version is just a
 starting point.
 <br><br>
-The drafts repository is browser-local (IndexedDB) and currently records every
-edit you accept through the IDE. It is the only repository wired up here; later
-versions will list permanent repositories alongside it.
+Each MemberHistoryPresenter is scoped to a single repository. Two flavours
+of repository are wired up:
+<ul>
+<li><em>drafts</em> -- the browser-local (IndexedDB) repository that the
+IDE auto-commits to on every Accept. Always available.</li>
+<li>Any user-visible <em>Repository</em> in Root whose namespace currently
+contains the defining class.</li>
+</ul>
+The full list (drafts + any tracking Repository) is the multi-repository view
+above, MemberRepoHistoryPresenter, which stacks one of these per repo as a
+collapsible toggle.
 <br><br>
-Controls in the header, from left to right after the title:
+The body shows one of four states depending on the underlying fetch:
+<ul>
+<li><em>Loading history from &lt;repo&gt;...</em> while git.log is in
+flight.</li>
+<li><em>Repository &lt;repo&gt; is not ready</em> when the repo is still
+cloning or the clone failed -- we deliberately don''t fire git.log on a
+partial working dir (lightning-fs takes a lock that would hang the IDE).</li>
+<li><em>Failed to load history from &lt;repo&gt;: &lt;err&gt;</em> on
+git.log rejection.</li>
+<li><em>No prior versions of this ', kind, ' in &lt;repo&gt;</em> when no
+commit in this repo changed this specific ', kind, '''s source. The
+filter is precise even for permanent (per-top-level-class) repos:
+git.log finds candidate commits by class file, then each candidate''s
+', kind, ' source is compared to the parent commit''s and only
+differing ones survive.</li>
+</ul>
+<br>
+Controls in the header bar (or, in the multi-repo view, in this repo''s
+slim per-repo toolbar), from left to right after the title:
 <ul>
 <li><div class="hopscotchExpandAllButton"></div> Expand every row.</li>
 <li><div class="hopscotchCollapseAllButton"></div> Collapse every row.</li>
+<li><div class="hopscotchRefreshButton"></div> Re-fetch the history. Drops the
+repo-wide history cache and re-runs git.log -- useful after an external
+commit / pull (in-IDE Accepts already invalidate the cache automatically).</li>
 <li><div class="hopscotchHelpButton"></div> Show this help message.</li>
 <li><div class="hopscotchMenu"></div> A menu of additional operations; currently
 just <em>Inspect Presenter</em>, which opens an object inspector on this presenter
@@ -3262,7 +4103,8 @@ toggleFor: entry = (
   | toggle |
   toggle:: collapsed: [collapsedFor: entry toggle: toggle]
     expanded: [expandedFor: entry toggle: toggle]
-    initiallyExpanded: false.
+    initiallyExpanded: false
+    tag: (entry at: 'oid').
   ^toggle
 )
 collapsedFor: entry toggle: toggle = (
@@ -3285,7 +4127,7 @@ collapsedFor: entry toggle: toggle = (
   }
 )
 expandedFor: entry toggle: toggle = (
-  | sha shortSha message firstLine inlineBody timestamp dateStr path source |
+  | sha shortSha message firstLine inlineBody timestamp dateStr path entrySubject |
   sha:: entry at: 'oid'.
   shortSha:: sha copyFrom: 1 to: 7.
   message:: (entry at: 'commit') at: 'message'.
@@ -3294,8 +4136,8 @@ expandedFor: entry toggle: toggle = (
   timestamp:: ((entry at: 'commit') at: 'author') at: 'timestamp'.
   dateStr:: formatTimestamp: timestamp.
   path:: subject draftPath.
-  source:: subject repo cachedBlobAt: path in: sha.
-  source isNil ifTrue: [kickOffSourceFetchFor: path sha: sha].
+  entrySubject:: state subjectFor: entry path: path memberMirror: subject memberMirror.
+  ensureVersionSourceFor: entrySubject path: path sha: sha.
   ^column: {
     row: {
       (link: shortSha action: [toggle collapse]) color: actionLinkColor.
@@ -3307,41 +4149,40 @@ expandedFor: entry toggle: toggle = (
       label: inlineBody
     }.
     mediumBlank.
-    source isNil
-      ifTrue: [label: 'Loading source...']
-      ifFalse: [historicalEditorFor: source toggle: toggle]
+    entrySubject createPresenter
   }
 )
-historicalEditorFor: historicalSource <String> toggle: toggle ^ <CodeMirrorFragment> = (
-  (* Build a CodeMirror initialized with the LIVE member source, then
-     push the historical source in. The editor enters its pending-edit
-     state (yellow background + accept/cancel) because the displayed
-     text differs from the init source. Accept routes through subject
-     installHistoricalSource: -- the revert lands as a new append-only
-     Accept commit. Cancel resets to live source and collapses. *)
-  | liveSrc cm |
-  liveSrc:: crToLf: subject liveSource.
-  cm:: codeMirror: liveSrc.
-  cm text: (crToLf: historicalSource).
-  cm acceptResponse: [:ed :event |
-    updateGUI: [
-      [subject installHistoricalSource: ed textBeingAccepted.
-       ed leaveEditState.
-       toggle collapse]
-        on: Error do: [:ex <Exception> | ed showMessage: ex printString]].
-    ed editor focus].
-  cm cancelResponse: [:ed |
-    ed text: liveSrc.
-    ed leaveEditState.
-    toggle collapse].
-  ^cm
-)
-kickOffSourceFetchFor: path <String> sha: sha <String> = (
-  (subject repo readBlobAt: path in: sha)
-    then: [:src | updateGUI: []. nil]
+ensureVersionSourceFor: entrySubject path: path sha: sha = (
+  (* If the entry subject doesn't yet have its versionSource set,
+     check the repo's sync cache first; on miss kick off the async
+     fetch which on resolve sets the source and triggers updateGUI:
+     so a fresh definition pass renders the EntryPresenter with
+     source available.
+     memberSourceAt:in: is polymorphic over the repo: DraftsRepo
+     reads the per-member blob directly; user-visible Repositories
+     project to the top-level class file, parse it, and extract the
+     named member's source. The presenter doesn't care which.
+     The fetchStarted guard is critical: each then: calls updateGUI:
+     synchronously, which re-renders the whole content list, which
+     re-iterates entries -- and without the guard, every entry whose
+     promise hasn't yet resolved would refire its memberSourceAt:.
+     With N rows that becomes an O(N^2) updateGUI: cascade that
+     wedges the IDE. Set the flag before launching so subsequent
+     renders skip it; the eventually-resolved then: writes the
+     versionSource, after which the isNil early-exit takes over. *)
+  | cached |
+  entrySubject versionSource isNil ifFalse: [^self].
+  entrySubject versionSourceFetchStarted ifTrue: [^self].
+  cached:: subject repo cachedMemberSourceAt: path in: sha.
+  cached isNil ifFalse: [^entrySubject versionSource: cached].
+  entrySubject beginVersionSourceFetch.
+  (subject repo memberSourceAt: path in: sha)
+    then: [:src |
+      entrySubject versionSource: src.
+      updateGUI: []. nil]
     onRejected: [:err |
-      ('MemberHistoryPresenter: blob fetch failed for ', path,
-        ' @ ', sha, ': ', err printString) out.
+      ('MemberHistoryPresenter: member-source fetch failed for ',
+        path, ' @ ', sha, ': ', err printString) out.
       updateGUI: []. nil]
 )
 firstLineOf: msg <String> ^ <String> = (
@@ -3413,6 +4254,853 @@ startFetch = (
     onRejected: [:err |
       updateGUI: [loadFailed_slot:: err printString]. nil]
 )
+) : (
+)
+public class MemberHistoryEntrySubject onModel: m <MemberHistoryEntryModel>
+  = ProgrammingSubject onModel: m (
+(* Subject for a single historical version of a member. Lives in
+   MemberHistoryPresenterState (keyed by sha), so it persists across
+   row collapse/expand and across parent presenter rebuilds. Holds the
+   editor CodeMirrorFragment lazily; the fragment is created once by
+   the EntryPresenter and stashed here, then reused on every render
+   for cursor / selection / undo persistence. *)
+|
+editor_slot
+versionSource_slot
+(* Per-entry "fetch in flight" guard. Without this every render of
+   the rows section re-fires memberSourceAt: for every entry whose
+   versionSource_slot hasn't been written yet, and each resolve
+   calls updateGUI: synchronously -- an O(N^2) updateGUI cascade
+   that wedges the IDE. Set true on the first call to
+   beginVersionSourceFetch; never reset (each entry is fetched at
+   most once per session). *)
+versionSourceFetchStarted_slot ::= false.
+(* True when the user has hit "Compare to live" on this entry's
+   editor. The diff marks are re-applied on every noticeExposure by
+   a CompareToLiveDecorator fragment sibling of the editor; the
+   slot is the only source of truth. Persisted on the subject
+   (not on the presenter) so the state survives presenter rebuilds.
+   See CompareToLiveDecorator's docstring for the wipe-and-re-apply
+   protocol that motivates the decorator. *)
+compareLiveActive_slot <Boolean> ::= false.
+(* True for entries synthesised by `forChangesetVersionSource:`
+   (changeset HEAD vs live rows). Those rows already render a
+   side-by-side diff via DiffSideBySideTrigger; adding the live
+   compare affordance on top would be redundant on the "Live"
+   side and confusing on the "HEAD" side. The presenter omits
+   the compareToLive button when this is true. *)
+isChangesetEntry_slot <Boolean> ::= false.
+messages_slot
+messagesComputed_slot ::= false.
+|
+) (
+public createPresenter ^ <Presenter> = (
+  ^MemberHistoryEntryPresenter onSubject: self
+)
+public memberMirror = (^model memberMirror)
+public entry = (^model entry)
+public versionSourceFetchStarted ^ <Boolean> = (
+  ^versionSourceFetchStarted_slot
+)
+public beginVersionSourceFetch = (
+  versionSourceFetchStarted_slot:: true
+)
+public path = (^model path)
+public sha = (^entry at: 'oid')
+public shortSha ^ <String> = (
+  (* Bound the upper index by sha size. The live history flow always
+     hands us a full 40-char git oid; the changeset flow synthesises
+     a shorter pseudo-oid (e.g. 'HEAD'). primordialsoup's String>>
+     copyFrom:to: raises ArgumentError when `to > size`. *)
+  ^sha copyFrom: 1 to: (7 min: sha size)
+)
+public commitMessage ^ <String> = (
+  ^(entry at: 'commit') at: 'message'
+)
+public commitTimestamp = (
+  ^((entry at: 'commit') at: 'author') at: 'timestamp'
+)
+public versionSource ^ <String | Nil> = (^versionSource_slot)
+public versionSource: src <String> = (versionSource_slot:: src)
+public editor = (^editor_slot)
+public editor: cm = (editor_slot:: cm)
+public compareLiveActive ^ <Boolean> = (^compareLiveActive_slot)
+public compareLiveActive: b <Boolean> = (compareLiveActive_slot:: b)
+public isChangesetEntry ^ <Boolean> = (^isChangesetEntry_slot)
+public isChangesetEntry: b <Boolean> = (isChangesetEntry_slot:: b)
+public liveSource ^ <String | Nil> = (
+  (* Source of the LIVE version of this member, for the "Compare to
+     live" diff. Dispatches on memberMirror kind: methods and lazy
+     slots expose source directly, class declarations expose header
+     source. Returns nil for memberMirrors that don't resolve to a
+     live mirror (e.g. SourceMirror-flavoured stand-ins used in the
+     changeset flow) -- the presenter checks and disables the
+     compare button in that case. *)
+  | m |
+  m:: memberMirror.
+  m isKindOfClassDeclarationMirror ifTrue: [
+    ^[m header source] on: Exception do: [:e | nil]].
+  (m isKindOfMethodMirror or: [m isKindOfLazySlotMirror]) ifTrue: [
+    ^[m source] on: Exception do: [:e | nil]].
+  ^nil
+)
+public installEdits: text <String> = (
+  (* Install `text` as the new live source of the member this entry
+     is a version of. Dispatches on memberMirror's kind: methods and
+     lazy slots install through the defining mixin's builder; class
+     declarations install through the declaration's own builder
+     mutating its header source. Mirrors the old parent-delegated
+     installHistoricalSource: paths (MethodHistorySubject,
+     LazySlotHistorySubject, ClassHeaderHistorySubject) -- moved here
+     once the parent disappeared. *)
+  | mirror |
+  mirror:: memberMirror.
+  mirror isKindOfMethodMirror ifTrue: [
+    | builder |
+    builder:: mirror definingMixin asBuilder.
+    builder methods addFromSource: text.
+    ^ide installFromBuilders: {builder declaration}].
+  mirror isKindOfLazySlotMirror ifTrue: [
+    | builder |
+    builder:: mirror definingMixin asBuilder.
+    builder lazySlots addFromSource: text.
+    ^ide installFromBuilders: {builder declaration}].
+  mirror isKindOfClassDeclarationMirror ifTrue: [
+    | b |
+    b:: mirror asBuilder.
+    b header source: text.
+    ^ide installFromBuilders: {b}].
+  Error signal: 'MemberHistoryEntrySubject>>installEdits: unrecognized memberMirror kind'
+)
+public messages ^ <List[Symbol] | Nil> = (
+  (* Lazily compiles versionSource against the live defining mixin and
+     walks the resulting bytecode for sent selectors. Returns nil when
+     compilation fails (e.g. the source predates a syntax change) or
+     when there's no source yet. nil is the "menu shows a disabled
+     entry" signal; an empty list is "compiled fine but no sends". *)
+  messagesComputed_slot ifTrue: [^messages_slot].
+  versionSource_slot isNil ifTrue: [^nil].
+  messagesComputed_slot:: true.
+  messages_slot:: [computeMessages] on: Error do: [:e | nil].
+  ^messages_slot
+)
+computeMessages ^ <List[Symbol] | Nil> = (
+  | mirror |
+  mirror:: memberMirror.
+  mirror isKindOfMethodMirror ifTrue: [
+    | imeth |
+    imeth:: compiler
+      compileMethodSource: versionSource_slot
+      within: mirror definingMixin.
+    ^selectorsInBytes: imeth bytes literals: imeth literals].
+  mirror isKindOfLazySlotMirror ifTrue: [
+    | islot init |
+    islot:: compiler
+      compileLazySlotSource: versionSource_slot
+      within: mirror definingMixin.
+    init:: islot intermediateInitMethod.
+    ^selectorsInBytes: init bytes literals: init literals].
+  mirror isKindOfClassDeclarationMirror ifTrue: [
+    ^computeHeaderMessages].
+  ^nil
+)
+computeHeaderMessages ^ <List[Symbol]> = (
+  (* Mirrors the live ClassFactoryPresenter>>messages at
+     Browsing.ns:685: explicit slot names (and setters for mutable
+     slots) plus the bytecode-walked selectors of the synthetic class-
+     declaration initializer, with backtick-mangled internal selectors
+     dropped. We deliberately do NOT walk the factory -- the live menu
+     doesn't either, so basicNew etc. would just be noise. `within:`
+     is nil; Newspeak's late binding means selector extraction does
+     not need an enclosing-scope lookup. *)
+  | icd accum initSelectors |
+  icd:: compiler compileClassHeader2: versionSource_slot within: nil.
+  accum:: List new.
+  icd instanceSide slots do: [:slot |
+    accum add: slot name.
+    slot isMutable ifTrue: [accum add: slot name, ':']].
+  icd initializers isNil ifFalse: [
+    icd initializers do: [:imeth |
+      initSelectors::
+        (selectorsInBytes: imeth bytes literals: imeth literals)
+          removeAllSuchThat: [:s | (s indexOf: '`') > 0].
+      initSelectors do: [:s |
+        (accum indexOf: s) = 0 ifTrue: [accum add: s]]]].
+  ^accum
+)
+selectorsInBytes: bytes literals: literals ^ <List[Symbol]> = (
+  (* Bytecode walker. Mirrors MethodMirror>>selectors in
+     out/MirrorsForPrimordialSoup.ns:1090 -- common sends, ordinary
+     sends, and the extension-byte forms for implicit-receiver / super
+     / self / outer sends. Selectors are accumulated from the literal
+     pool. *)
+  | pc extA result |
+  pc:: 1.
+  extA:: 0.
+  result:: Set new.
+  [pc > bytes size] whileFalse: [
+    | instruction |
+    instruction:: bytes at: pc.
+    (instruction > 79 and: [instruction <= 111]) ifTrue: [
+      result add: (commonSendSelector: instruction - 79)].
+    (instruction > 112 and: [instruction <= 175]) ifTrue: [
+      | index |
+      index:: 1 + (instruction bitAnd: 15).
+      result add: (literals at: index)].
+    instruction = 224 ifTrue: [
+      | byte2 |
+      byte2:: bytes at: pc + 1.
+      extA:: (extA << 8) + byte2].
+    ({227. 228. 253} indexOf: instruction) > 0 ifTrue: [extA:: 0].
+    ({238. 240. 241. 245. 254} indexOf: instruction) > 0 ifTrue: [
+      | byte2 index |
+      byte2:: bytes at: pc + 1.
+      index:: 1 + (extA << 5) + (byte2 >> 3).
+      extA:: 0.
+      result add: (literals at: index)].
+    pc:: pc + (bytecodeSize: instruction)].
+  ^List withAll: result asArray
+)
+bytecodeSize: instruction = (
+  instruction <= 223 ifTrue: [^1].
+  instruction <= 248 ifTrue: [^2].
+  ^3
+)
+commonSendSelector: offset = (
+  ^{#+. #-. #<. #>. #<=. #>=. #=. #~=. #*. #/. #\\. #@. #bitShift:. #//.
+    #bitAnd:. #bitOr:. #at:. #at:put:. #size. #next. #nextPut:. #atEnd.
+    #==. #class. #blockCopy:. #value. #value:. #do:. #new. #new:. #x.
+    #y.} at: offset
+)
+public isKindOfMemberHistoryEntrySubject ^ <Boolean> = (^true)
+isMyKind: f <Subject> ^ <Boolean> = (
+  ^f isKindOfMemberHistoryEntrySubject
+)
+) : (
+public forChangesetVersionSource: src <String>
+  memberMirror: mm
+  path: path <String>
+  commitOid: oid <String>
+  commitMessage: msg <String>
+  commitTimestamp: ts <Integer>
+  ^ <MemberHistoryEntrySubject> = (
+  (* Build an EntrySubject for a changeset (HEAD vs live) row, where
+     no real isomorphic-git log entry exists. Synthesizes the
+     {oid, commit/message, commit/author/timestamp} Map the EntrySubject
+     reads, pre-seats versionSource, and hands back the subject ready
+     to drive a MemberHistoryEntryPresenter. *)
+  | entry commit author subject |
+  entry:: Map new.
+  entry at: 'oid' put: oid.
+  commit:: Map new.
+  commit at: 'message' put: msg.
+  author:: Map new.
+  author at: 'timestamp' put: ts.
+  commit at: 'author' put: author.
+  entry at: 'commit' put: commit.
+  subject:: self onModel:
+    (MemberHistoryEntryModel entry: entry memberMirror: mm path: path).
+  subject versionSource: src.
+  subject isChangesetEntry: true.
+  ^subject
+)
+)
+public class MemberHistoryEntryPresenter onSubject: s <MemberHistoryEntrySubject>
+  = ProgrammingPresenter onSubject: s (
+(* Renders ONE historical version. Drops live-only affordances
+   (exemplar / debug). Editor is the subject's persistent
+   CodeMirrorFragment, created lazily on first render and reused
+   thereafter -- this is the load-bearing piece for edit persistence
+   across collapse and refresh.
+
+   Make Live button is always visible: it installs whatever's in the
+   editor (edited or original) through the parent subject's
+   installHistoricalSource:. CodeMirror's standard accept does the
+   same when edits are pending. Cancel (CodeMirror's red button) is
+   only visible with edits and resets the editor to the version's
+   original source.
+
+   References menu and AI brain reuse the live affordances, scoped to
+   this historical version. The brain installs a historical focus on
+   ide aiSupport so the shared chat picks up the version's sha and
+   source through current_focus; source-reading tools fan out to the
+   historical blob when the request matches. Writes still install to
+   live (Make Live semantic), matching the button next to them.
+
+   Colorization dispatches on the entry's memberMirror.isKindOf*. *)
+) (
+public isKindOfMemberHistoryEntryPresenter ^ <Boolean> = (^true)
+isMyKind: f <Fragment> ^ <Boolean> = (
+  ^f isKindOfMemberHistoryEntryPresenter
+)
+definition = (
+  subject versionSource isNil ifTrue: [
+    ^label: 'Loading source...'].
+  ^column: {
+    helpSection.
+    ensureEditor.
+    mediumBlank.
+    actionRow.
+    chatSection.
+    (* Decorator must come AFTER the editor: its noticeExposure
+       re-applies the diff each round-trip (Hopscotch's CodeMirror
+       reconciliation calls editor setValue, which clears marks),
+       and the editor has to exist at noticeExposure time. *)
+    CompareToLiveDecorator onEntry: subject
+  }
+)
+actionRow = (
+  (* compareToLive only appears when the diff is meaningful:
+     never on a changeset HEAD/live row (those already render a
+     side-by-side diff via DiffSideBySideTrigger), and never when
+     the member has no live counterpart (deleted member, phantom
+     SourceMirror in #added rows). Showing-it-greyed-out was
+     reported as ambiguous, so the affordance is removed entirely
+     in those cases rather than dimmed. *)
+  | items |
+  items:: List new.
+  items add: mediumBlank.
+  items add: (button: 'Make Live' action: [installCurrentEditorText]).
+  items add: smallBlank.
+  showCompareToLive ifTrue: [
+    items add: compareToLiveButton.
+    items add: smallBlank].
+  items add: (dropDownMenu: [messagesMenu] image: ide images itemReferencesImage).
+  items add: smallBlank.
+  items add: (aiChatButton: [installHistoryFocusAction]
+    ifFocused: [ide aiSupport
+      isFocusedOnHistory: subject memberMirror
+      sha: subject sha]).
+  items add: smallBlank.
+  items add: helpButton.
+  items add: smallBlank.
+  items add: (dropDownMenu: [entryMenu]).
+  items add: filler.
+  ^row: items
+)
+showCompareToLive ^ <Boolean> = (
+  subject isChangesetEntry ifTrue: [^false].
+  ^subject liveSource isNil not
+)
+entryMenu = (
+  ^menuWithLabelsAndActions: {
+    {'Inspect Presenter'. [respondToInspectPresenter]}
+  }
+)
+helpText = (
+  | mapping = Map new. kind |
+  kind:: memberKindLabel.
+  mapping
+    at: #hopscotchHelpButton put: helpButton;
+    at: #hopscotchReferencesButton put:
+      (dropDownMenu: [messagesMenu] image: ide images itemReferencesImage);
+    at: #hopscotchMenu put: (dropDownMenu: [entryMenu]).
+  ^ampleforth: 'This is an entry presenter for one version of a ', kind, '.
+The editor below shows the source for that version. Editing the text
+puts the editor into pending-edit mode (accept / cancel appear).
+<br><br>
+<b>Make Live</b> installs whatever''s currently in the editor as the
+new live source for this ', kind, ' -- the same install path used
+elsewhere in the IDE. Cancel resets the editor to the version''s
+original source.
+<br><br>
+Controls in the row below the editor, from left to right:
+<ul>
+<li><b>Make Live</b> -- install editor text as the new live ', kind, '.</li>
+<li><b>Compare to live</b> (when present) -- tints lines and character
+spans in this historical view that are <em>no longer in</em> the
+current live source. Content that was <em>added</em> in live since
+this version is not shown here -- only one editor pane is available,
+so the diff is one-sided by design. Click again to clear. Absent on
+changeset rows (those already render a side-by-side diff) and on
+entries whose member no longer exists live.</li>
+<li><div class="hopscotchReferencesButton"></div> -- menu of selectors
+sent from this version, each navigable.</li>
+<li>AI chat button -- focus the IDE chat on this historical version
+(its sha + source). Source-reading tools fan out to the version''s
+blob; writes still install live, matching <b>Make Live</b>.</li>
+<li><div class="hopscotchHelpButton"></div> -- show this help message.</li>
+<li><div class="hopscotchMenu"></div> -- additional operations
+(<em>Inspect Presenter</em>).</li>
+</ul>
+' mapping: mapping
+)
+memberKindLabel = (
+  (* Dispatched off the entry's memberMirror so we can describe what
+     kind of thing this entry is in the help text. *)
+  | mirror |
+  mirror:: subject memberMirror.
+  mirror isKindOfMethodMirror ifTrue: [^'method'].
+  mirror isKindOfLazySlotMirror ifTrue: [^'lazy slot'].
+  mirror isKindOfClassDeclarationMirror ifTrue: [^'class header'].
+  ^'member'
+)
+installHistoryFocusAction = (
+  ide aiSupport setHistoryFocusOnEntry: subject.
+)
+messagesMenu = (
+  (* If compilation fell over (syntax change since the commit), show a
+     single disabled placeholder. Otherwise build the same item set the
+     live MethodPresenter uses, dropping selectors that contain spaces
+     (the existing string-heuristic for "not a real selector") and
+     skipping the entry's own selector when it matches one. *)
+  | msgs items |
+  msgs:: subject messages.
+  msgs isNil ifTrue: [
+    ^menuWithLabelsAndActions: {
+      {'(source predates a syntax change)'. []}}].
+  items:: referencesMenuMessageItems: msgs.
+  items isEmpty ifTrue: [
+    ^menuWithLabelsAndActions: {
+      {'(no references in this version)'. []}}].
+  ^menuWithLabelsAndActions: items
+)
+referencesMenuMessageItems: msgs <List[Symbol]> ^ <List> = (
+  (* Same shape as the live MethodPresenter's referencesMenuMessageItems
+     at Browsing.ns:2744 -- filter, sort lexically, emit
+     {label. [browseSelector: selector]}. *)
+  | items likely sorted name |
+  items:: List new.
+  name:: parentMemberName.
+  likely:: msgs select: [:s <String> | 0 = (s indexOf: ' ')].
+  sorted:: likely sort: [:m1 :m2 | lexicallyLessOrEqual: m1 than: m2].
+  sorted do: [:selector |
+    selector == name ifFalse: [
+      items add:
+        {selector copyFrom: 1 to: (64 min: selector size).
+         [browseSelector: selector]}]].
+  ^items
+)
+parentMemberName = (
+  (* Skip the entry's own name when listing its sends, so we don't
+     suggest "find senders of foo" from inside foo. Class-header
+     entries don't have a single member name to skip; nil. *)
+  | mirror |
+  mirror:: subject memberMirror.
+  mirror isKindOfMethodMirror ifTrue: [^mirror name].
+  mirror isKindOfLazySlotMirror ifTrue: [^mirror name].
+  ^nil
+)
+ensureEditor ^ <CodeMirrorFragment> = (
+  (* Lazy-init the CodeMirror once; subsequent renders return the same
+     Fragment instance, preserving text, cursor, undo. *)
+  subject editor isNil ifTrue: [
+    | src cm |
+    src:: crToLf: subject versionSource.
+    cm:: codeMirror: src.
+    cm
+      changeResponse: [:ed :ev |
+        colorizeSource: (crToLf: ed textBeingAccepted) withEditor: ed];
+      cancelResponse: [:ed |
+        ed text: src.
+        colorizeSource: src withEditor: ed.
+        ed leaveEditState];
+      acceptResponse: [:ed :ev | installAndResetEditor: ed].
+    colorizeSource: src withEditor: cm.
+    subject editor: cm].
+  ^subject editor
+)
+colorizeSource: src <String> withEditor: cm <CodeMirrorFragment> = (
+  (* Colorization is presentation; kind-dispatch on the entry's
+     memberMirror. *)
+  | mirror |
+  mirror:: subject memberMirror.
+  mirror isKindOfMethodMirror ifTrue: [
+    ^ide colorizer
+      colorizeMethod: src
+      fromClass: mirror definingMixin declaration
+      via: (colorizingBlockFor: cm)].
+  mirror isKindOfLazySlotMirror ifTrue: [
+    ^ide colorizer
+      colorizeLazySlot: src
+      fromClass: mirror definingMixin declaration
+      via: (colorizingBlockFor: cm)].
+  mirror isKindOfClassDeclarationMirror ifTrue: [
+    ^ide colorizer
+      colorizeHeader: src
+      fromClass: mirror
+      via: (colorizingBlockFor: cm)]
+)
+installAndResetEditor: ed <CodeMirrorFragment> = (
+  (* CodeMirror's accept path: install edited text, reset editor to
+     the version's original. *)
+  updateGUI: [
+    [subject installEdits: ed textBeingAccepted.
+     resetEditor: ed]
+       on: Error do: [:ex <Exception> | ed showMessage: ex printString]].
+  ed editor focus
+)
+installCurrentEditorText = (
+  (* Make Live button: always available. Installs whatever's currently
+     in the editor (edited or not), then resets to the version's
+     original. *)
+  | cm |
+  cm:: subject editor.
+  cm isNil ifTrue: [^self].
+  updateGUI: [
+    [subject installEdits: cm textBeingAccepted.
+     resetEditor: cm]
+       on: Error do: [:ex <Exception> | cm showMessage: ex printString]]
+)
+resetEditor: cm <CodeMirrorFragment> = (
+  | src |
+  src:: crToLf: subject versionSource.
+  cm text: src.
+  colorizeSource: src withEditor: cm.
+  cm leaveEditState
+)
+compareToLiveButton = (
+  (* Button label flips between "Compare to live" and "Clear compare"
+     based on the subject's persisted state. Only rendered when
+     showCompareToLive is true (live source exists, not a changeset
+     entry) -- the gating happens in actionRow. *)
+  ^button:
+      (subject compareLiveActive
+        ifTrue: ['Clear compare']
+        ifFalse: ['Compare to live'])
+    action: [toggleCompareToLive]
+)
+toggleCompareToLive = (
+  (* Flip the persisted flag and refresh. The actual diff machinery
+     lives in CompareToLiveDecorator's noticeExposure: re-applying
+     marks after the reconciliation's setValue has wiped them is
+     the only thing that makes the decorations visible across
+     updateGUI: round-trips. *)
+  subject compareLiveActive: subject compareLiveActive not.
+  updateGUI: []
+)
+) : (
+)
+public class SideBySideDiff onOld: ot <String> new: nt <String> = (
+(* Computes a textual diff between two source strings using google's
+   diff-match-patch (vendored at out/vendor/diff_match_patch-2019-07.js;
+   loaded via primordialsoup.html as window.diff_match_patch) and
+   exposes the result as two lists of CodeMirror decoration ops -- one
+   for the old-side editor, one for the new-side. Each op is a Map:
+     #kind       -> #line | #span
+     #line       -> line index (when kind = #line)
+     #className  -> CSS class to apply
+     #fromLine, #fromCol, #toLine, #toCol  (when kind = #span)
+
+   Used by ChangesetPresenter's #changed-member rows
+   (Repositories.ns: changedMemberToggleFor:, changedHeaderSectionFor:)
+   to tint the two side-by-side editors with line + intra-line
+   character marks. Decoration colors are defined inline in
+   primordialsoup.html (cm-diff-removed-line / cm-diff-added-line /
+   cm-diff-removed-span / cm-diff-added-span).
+
+   Computation runs eagerly in the initializer -- the line+character
+   diff is microsecond-scale for typical member-source sizes; we
+   intentionally avoid memoization since the inputs are immutable
+   strings and instances are short-lived. *)
+|
+oldText = ot.
+newText = nt.
+leftOps_slot <List>
+rightOps_slot <List>
+|
+compute.
+) (
+public leftOps ^ <List> = (^leftOps_slot)
+public rightOps ^ <List> = (^rightOps_slot)
+compute = (
+  (* Run diff_main on the raw strings (character-level diff), then
+     iterate the ops tracking (line, col) cursors in old and new
+     independently. EQUAL advances both; DELETE emits decorations on
+     the old side and advances old; INSERT does the same on new.
+     Cursors are 0-based to match CodeMirror's API directly. *)
+  | dmp diffs n leftLine leftCol rightLine rightCol |
+  dmp:: (cachedPlatform js global at: 'diff_match_patch') new.
+  diffs:: dmp diff_main: oldText _: newText.
+  dmp diff_cleanupSemantic: diffs.
+  leftOps_slot:: List new.
+  rightOps_slot:: List new.
+  leftLine:: 0. leftCol:: 0.
+  rightLine:: 0. rightCol:: 0.
+  n:: diffs at: 'length'.
+  0 to: n - 1 do: [:idx |
+    | entry op text adv |
+    entry:: diffs at: idx.
+    op:: entry at: 0.
+    text:: entry at: 1.
+    op = 0 ifTrue: [
+      adv:: advanceLine: leftLine col: leftCol byText: text.
+      leftLine:: adv at: 1. leftCol:: adv at: 2.
+      adv:: advanceLine: rightLine col: rightCol byText: text.
+      rightLine:: adv at: 1. rightCol:: adv at: 2].
+    op = -1 ifTrue: [
+      | sl sc |
+      sl:: leftLine. sc:: leftCol.
+      adv:: advanceLine: leftLine col: leftCol byText: text.
+      leftLine:: adv at: 1. leftCol:: adv at: 2.
+      emitDecorationsInto: leftOps_slot
+        startLine: sl startCol: sc
+        endLine: leftLine endCol: leftCol
+        lineClass: 'cm-diff-removed-line'
+        spanClass: 'cm-diff-removed-span'].
+    op = 1 ifTrue: [
+      | sl sc |
+      sl:: rightLine. sc:: rightCol.
+      adv:: advanceLine: rightLine col: rightCol byText: text.
+      rightLine:: adv at: 1. rightCol:: adv at: 2.
+      emitDecorationsInto: rightOps_slot
+        startLine: sl startCol: sc
+        endLine: rightLine endCol: rightCol
+        lineClass: 'cm-diff-added-line'
+        spanClass: 'cm-diff-added-span']]
+)
+advanceLine: line col: col byText: text ^ <Array> = (
+  (* Returns {newLine. newCol} -- the caller destructures via
+     `at: 1` / `at: 2` to dodge the no-multiple-return-values rule.
+     Walks the rune sequence directly: rune 10 (LF) drops to the
+     next line, anything else advances the column. Works uniformly
+     on Newspeak Strings and on alien JS strings; both respond to
+     `at: i` with the integer rune at position i.
+
+     Earlier revisions used `text indexOf: newlineStr startingAt: ...`
+     for a bulk-newline scan, with `newlineStr:: String fromRunes:
+     { 10 }`. That construction returned an empty string in this
+     code's runtime, so the loop never advanced; the rune walk here
+     is both simpler and runtime-agnostic. For typical method-body
+     sizes the per-character cost is negligible. *)
+  | sz line2 col2 i ch |
+  sz:: text size.
+  line2:: line.
+  col2:: col.
+  i:: 1.
+  [i <= sz] whileTrue: [
+    ch:: text at: i.
+    ch = 10
+      ifTrue: [line2:: line2 + 1. col2:: 0]
+      ifFalse: [col2:: col2 + 1].
+    i:: i + 1].
+  ^{ line2. col2 }
+)
+emitDecorationsInto: ops startLine: sl startCol: sc
+  endLine: el endCol: ec lineClass: lc spanClass: spc = (
+  (* Emit one span op covering (sl,sc)..(el,ec) plus one line op per
+     line that the span touches. If ec = 0 the span ends right at the
+     start of `el`, so `el` itself wasn't actually touched -- exclude
+     it from the line-op range. Without this guard, a single inserted
+     '\n' would tint the line after the newline as "added" even
+     though no character on it actually changed. *)
+  | loopEnd |
+  ops add: (Map new
+    at: #kind put: #span;
+    at: #fromLine put: sl;
+    at: #fromCol put: sc;
+    at: #toLine put: el;
+    at: #toCol put: ec;
+    at: #className put: spc;
+    yourself).
+  loopEnd:: ec = 0 ifTrue: [el - 1] ifFalse: [el].
+  sl to: loopEnd do: [:lineIdx |
+    ops add: (Map new
+      at: #kind put: #line;
+      at: #line put: lineIdx;
+      at: #className put: lc;
+      yourself)]
+)
+public applyTo: cm <Alien> usingOps: ops <List> = (
+  (* Apply this side's ops to a CodeMirror instance. Line ops use
+     addLineClass with the 'background' wrap so the tint covers the
+     whole row including the gutter. Span ops use markText with the
+     className option for the intra-line character mark. *)
+  ops do: [:op |
+    (op at: #kind) = #line ifTrue: [
+      cm addLineClass: (op at: #line)
+        _: 'background'
+        _: (op at: #className)].
+    (op at: #kind) = #span ifTrue: [
+      | fromObj toObj optsObj |
+      fromObj:: JSObject new.
+      fromObj at: 'line' put: (op at: #fromLine).
+      fromObj at: 'ch' put: (op at: #fromCol).
+      toObj:: JSObject new.
+      toObj at: 'line' put: (op at: #toLine).
+      toObj at: 'ch' put: (op at: #toCol).
+      optsObj:: JSObject new.
+      optsObj at: 'className' put: (op at: #className).
+      cm markText: fromObj _: toObj _: optsObj]]
+)
+public applyToOldEditor: cm <Alien> = (^applyTo: cm usingOps: leftOps_slot)
+public applyToNewEditor: cm <Alien> = (^applyTo: cm usingOps: rightOps_slot)
+) : (
+)
+public class DiffSideBySideTrigger onOldEntry: oe <MemberHistoryEntrySubject>
+  newEntry: ne <MemberHistoryEntrySubject> = Fragment (
+(* Invisible fragment placed last in the column of a #changed-member
+   side-by-side row. On the first noticeExposure -- which fires top-
+   down after the whole subtree has been mounted (createVisual done,
+   editor slots populated) -- it reads both editors' current text,
+   computes a SideBySideDiff, and applies the decorations to each
+   side.
+
+   Why a noticeExposure trigger instead of e.g. wiring into
+   MemberHistoryEntryPresenter's substance computation: the diff
+   needs BOTH JS CodeMirror instances to exist, and they only exist
+   after each CodeMirrorFragment's createVisual runs. noticeExposure
+   is the first hook the framework guarantees AFTER the visual tree
+   is mounted, so it's the simplest correct hook.
+
+   We guard with applied_slot so a second noticeExposure (e.g. from
+   refresh propagation through helpHolder, or a re-expose after
+   tab-switching) doesn't re-apply over the existing decorations.
+   This is a v1 trade-off: if the user edits a side, the decorations
+   become stale -- a v2 follow-up could clear and re-compute on edit.
+
+   Note that the entrySubject's `editor` is the CodeMirrorFragment;
+   the fragment's `editor` is the JS CM5 alien. The path
+   `entrySubject editor editor` therefore reads as
+   `subject.fragment.cmInstance`. *)
+|
+private oldEntry = oe.
+private newEntry = ne.
+applied_slot <Boolean> ::= false.
+|) (
+public createVisual = (
+  | div |
+  div:: document createElement: 'div'.
+  (div at: 'style') at: 'display' put: 'none'.
+  ^div
+)
+public childrenDo: aBlock <[:Fragment]> = (
+  (* No children -- the trigger is a leaf with a side-effecting
+     noticeExposure, not a container. *)
+)
+public isKindOfDiffSideBySideTrigger ^ <Boolean> = (^true)
+isMyKind: f <Fragment> ^ <Boolean> = (
+  ^f isKindOfDiffSideBySideTrigger
+)
+public applied ^ <Boolean> = (^applied_slot)
+updateVisualsFromSameKind: oldFragment ^ <Alien[Element]> = (
+  (* Carry forward applied_slot so the reconciled trigger doesn't
+     re-run applyDiffIfReady against editors that already hold our
+     decorations. addLineClass is idempotent, but markText is not --
+     repeated calls layer fresh TextMarks on top of one another and
+     visually accumulate the class. *)
+  applied_slot:: oldFragment applied.
+  ^oldFragment visual
+)
+public noticeExposure = (
+  super noticeExposure.
+  applied_slot ifTrue: [^self].
+  applied_slot:: applyDiffIfReady
+)
+applyDiffIfReady ^ <Boolean> = (
+  (* Returns true if the diff actually got applied; false if either
+     editor wasn't mounted yet (caller leaves applied_slot false so
+     a later noticeExposure can retry). The framework calls
+     noticeExposure at least once after the tree is mounted, but we
+     guard defensively against early invocation. *)
+  | leftCM rightCM leftAlien rightAlien diff |
+  leftCM:: oldEntry editor.
+  rightCM:: newEntry editor.
+  (leftCM isNil or: [rightCM isNil]) ifTrue: [^false].
+  leftAlien:: leftCM editor.
+  rightAlien:: rightCM editor.
+  (leftAlien isNil or: [rightAlien isNil]) ifTrue: [^false].
+  diff:: SideBySideDiff
+    onOld: leftAlien getValue
+    new: rightAlien getValue.
+  diff applyToOldEditor: leftAlien.
+  diff applyToNewEditor: rightAlien.
+  ^true
+)
+) : (
+)
+public class CompareToLiveDecorator onEntry: e <MemberHistoryEntrySubject>
+  = Fragment (
+(* Invisible fragment that lives last in the column of a
+   MemberHistoryEntryPresenter. On every noticeExposure it consults
+   the entry's compareLiveActive flag and either applies a fresh
+   SideBySideDiff(historical, live) to the entry's CodeMirror or
+   leaves the editor alone.
+
+   Re-applying on every exposure (rather than once-and-cache like
+   DiffSideBySideTrigger does) is load-bearing: HopscotchForHTML5
+   CodeMirrorFragment>>updateVisualsFromSameKind: invokes
+   editor setValue: textSlot whenever the fragment is not in edit
+   state, and CodeMirror's setValue clears every TextMark and
+   line-class on the editor. So each updateGUI: round-trip wipes
+   the decorations; the decorator's job is to put them back on the
+   same trip. The framework calls noticeExposure top-down AFTER
+   updateVisualsFromSameKind: has finished, so by the time apply
+   runs the editor is in its post-setValue clean state.
+
+   This wipe-then-re-apply protocol makes the "Clear compare"
+   path trivial: flipping compareLiveActive to false and calling
+   updateGUI: produces a refresh in which setValue wipes the
+   previous marks and the decorator declines to re-apply -- no
+   explicit removeLineClass / TextMark.clear is needed. *)
+|
+private entry = e.
+|) (
+public createVisual = (
+  | div |
+  div:: document createElement: 'div'.
+  (div at: 'style') at: 'display' put: 'none'.
+  ^div
+)
+public childrenDo: aBlock <[:Fragment]> = (
+  (* Leaf with a side-effecting noticeExposure, not a container. *)
+)
+public isKindOfCompareToLiveDecorator ^ <Boolean> = (^true)
+isMyKind: f <Fragment> ^ <Boolean> = (
+  ^f isKindOfCompareToLiveDecorator
+)
+updateVisualsFromSameKind: oldFragment ^ <Alien[Element]> = (
+  (* No transferable state -- entry is captured at construction and
+     the diff is recomputed from CodeMirror's current text on every
+     noticeExposure. Just hand the previous (hidden) <div> back so
+     Hopscotch's reconciliation completes without unwinding the
+     subtree. Forgetting this override raises subclassResponsibility
+     mid-reconciliation; the unwind collapses the parent toggle row. *)
+  ^oldFragment visual
+)
+public noticeExposure = (
+  super noticeExposure.
+  entry compareLiveActive ifFalse: [^self].
+  applyDiff
+)
+applyDiff = (
+  (* Bail silently when the editor isn't mounted or live source is
+     unavailable. The action row would normally have hidden the
+     button in those cases, but the decorator stays mounted and
+     defensive against transient null states. *)
+  | cm cmAlien histSrc liveSrc diff |
+  cm:: entry editor.
+  cm isNil ifTrue: [^self].
+  cmAlien:: cm editor.
+  cmAlien isNil ifTrue: [^self].
+  liveSrc:: entry liveSource.
+  liveSrc isNil ifTrue: [^self].
+  histSrc:: cmAlien getValue.
+  diff:: SideBySideDiff onOld: histSrc new: liveSrc.
+  diff applyToOldEditor: cmAlien
+)
+) : (
+)
+public class MemberHistoryPresenterState = (
+(* Per-MemberHistoryPresenter-instance state. Holds the
+   sha-keyed EntrySubjects so they survive parent rebuilds and row
+   collapse/expand. Transferred between presenter instances via
+   MemberHistoryPresenter>>updateVisualsFromSameKind:, exactly the
+   way DefinitionListPresenterState (Browsing.ns:1274) is transferred. *)
+|
+
+|
+) (
+lazy entries = Map new.
+public subjectFor: entry path: path <String> memberMirror: mm
+  ^ <MemberHistoryEntrySubject> = (
+  | sha |
+  sha:: entry at: 'oid'.
+  ^entries at: sha ifAbsentPut: [
+    MemberHistoryEntrySubject onModel:
+      (MemberHistoryEntryModel entry: entry memberMirror: mm path: path)]
+)
+public isKindOfMemberHistoryPresenterState ^ <Boolean> = (^true)
 ) : (
 )
 class MirrorGroupSubject onModel: m <MirrorGroupModel> = ProgrammingSubject onModel: m (
@@ -3823,10 +5511,22 @@ addCategoryMenu = (
 		{'Add Class'. [addClassTemplate]}.
 		{ 'Add Namespace'. [addNamespaceTemplate]}.
         { 'Add Document'. [addDocumentTemplate]}.
+        { 'Add Repository'. [addRepositoryForCurrentNamespace]}.
 		(*{'Add Image From File'. [respondToAddImage].}.
 		{'Add Text From File'. [respondToAddText]}.
 		 'Add Value' -> [Error signal: 'Unimplemented']. *)
 	}
+)
+addRepositoryForCurrentNamespace = (
+	(* Open the Repository setup form pre-filled with the current
+	   namespace's key. The user adjusts name / remote URL / branch /
+	   CORS proxy and confirms; the new Repository is registered in
+	   Root and bound to this namespace. *)
+	| setup |
+	setup:: ide repositories setup.
+	setup namespaceKey: subject key asString.
+	setup createNewNamespace: false.
+	enterSubject:: setup
 )
 presenterForEntryAt: key <Symbol> ^ <EntryPresenter> = (
 	| 
@@ -3893,6 +5593,8 @@ namespaceMenu = (
 	^menuWithLabelsAndActions: {
 		{'Inspect Presenter' . [respondToInspectPresenter]}.
 		#separator.
+		{'Typecheck Namespace'. [enterSubject:: subject typecheckReportSubject]}.
+		#separator.
 		{'Compile File(s)'. [respondToCompileFiles]}.
 		{'Load Document(s)'. [respondToLoadDocuments]}.
         {'Load App'. [respondToLoadApp]}.
@@ -3900,6 +5602,34 @@ namespaceMenu = (
 )
 respondToLoadApp = (
   fileChooser chooseSingleFile: [:f | subject loadAppFromNSO: f ifFail: [:msg | alert: msg. nil]]
+)
+definition ^ <Fragment> = (
+	(* Override to render a "Repository:" link row above the standard
+	   namespace list when one or more user-visible Repositories target
+	   this namespace. The reverse lookup is on
+	   `ide repositories repositoriesForNamespaceKey:`. *)
+	| linkedRepos baseDefn |
+	linkedRepos:: ide repositories
+		repositoriesForNamespaceKey: subject key asString.
+	baseDefn:: super definition.
+	linkedRepos isEmpty ifTrue: [^baseDefn].
+	^column: { repositoriesLinkRow: linkedRepos. baseDefn}
+)
+repositoriesLinkRow: linkedRepos <List> = (
+	| parts first lbl |
+	parts:: List new.
+    lbl:: linkedRepos size = 1
+		ifTrue: ['Repository: ']
+		ifFalse: ['Repositories: '].
+	parts add: (label: lbl) bold.
+	first:: true.
+	linkedRepos do: [:repo |
+		first ifFalse: [parts add: (label: ', ')].
+		first:: false.
+		parts add: (link: repo name asString action: [
+			enterSubject:: ide repositories RepositorySubject onModel: repo])].
+	parts add: filler.
+	^row: parts asArray
 )
 ) : (
 )
@@ -3950,6 +5680,24 @@ public refreshmentSubject = (
 )
 public title ^<String> = (
 	^key
+)
+public typecheckReportSubject ^ <ClassTypecheckReportSubject> = (
+	(* Typecheck every class in this namespace, each recursing into its nested
+	   classes via ClassSubject>>collectTypecheckEntriesWith:into:prefix:, sharing
+	   one typechecker across the whole sweep, and return an aggregated summary
+	   report. Documents, forms, and nested namespaces are skipped (only
+	   behaviors are typecheckable — same filter as the IDE's makeTypechecker).
+	   Per-member banners are populated on the cached class subjects, so they
+	   show when those classes are opened from this namespace. *)
+	| tc <NewspeakTypechecker> = ide freshTypechecker.
+	  entries <List[TypecheckReportEntry]> = List new.
+	  subs <Map[Symbol, Subject]> = namespaceSubjects. |
+	namespace keysAndValuesDo: [:k <Symbol> :v |
+		v isKindOfBehavior ifTrue: [
+			(subs at: k) collectTypecheckEntriesWith: tc into: entries prefix: ''
+		]
+	].
+	^ClassTypecheckReportSubject onClassNamed: title entries: entries
 )
 public addClassFromDefinition: definition <String> ifSuccess: successBlock <[]> ifFailure: failureBlock <[:String]> = (
 	| builder <ClassDeclarationBuilder> klass |
@@ -4087,6 +5835,168 @@ public new = (
 	#NAMESPACEBOGUS.
 	^self onModel: ide namespacing Root key: 'Root'
 )
+)
+public class InteractionSubject
+	onMessage: m <String>
+	kind: k <Symbol>
+	onAccept: aBlock <[:String]>
+	onCancel: cBlock <[]>
+	returnTo: rs <Subject>
+	= ProgrammingSubject onModel: nil (
+(* Reusable confirm / prompt Subject. Replaces JS-side modal alert /
+   confirm / prompt calls with an in-IDE navigable view that obeys the
+   Hopscotch back-stack. Two kinds:
+
+     #confirm  message + Accept / Cancel buttons.
+     #prompt   message + text input + Accept / Cancel buttons.
+
+   onAccept is called with the input string (#prompt) or nil (#confirm)
+   when the user accepts. onCancel is called when the user cancels.
+   returnTo is the Subject the presenter navigates to after either
+   button. There is no #notify variant: simple notifications go to the
+   originating presenter's status banner, not to a navigable view. *)
+|
+	public message <String> = m.
+	public kind <Symbol> = k.
+	onAccept_slot <[:String]> = aBlock.
+	onCancel_slot <[]> = cBlock.
+	public returnTo <Subject> = rs.
+	public acceptLabel <String> ::= 'OK'.
+	public cancelLabel <String> ::= 'Cancel'.
+	public input <String> ::= ''.
+	titleText_slot <String>.
+|
+	titleText_slot:: kind = #prompt ifTrue: ['Input'] ifFalse: ['Confirm'].
+) (
+public createPresenter = (^InteractionPresenter onSubject: self)
+public title = (^titleText_slot)
+public title: t <String> = (titleText_slot:: t)
+public isKindOfInteractionSubject ^ <Boolean> = (^true)
+isMyKind: s <Subject> ^ <Boolean> = (^s isKindOfInteractionSubject)
+public accept = (
+	kind = #prompt
+		ifTrue: [onAccept_slot value: input]
+		ifFalse: [onAccept_slot value: nil]
+)
+public cancel = (onCancel_slot value)
+) : (
+public confirm: m <String>
+	yesLabel: yl <String>
+	onYes: yesBlock <[]>
+	returnTo: rs <Subject>
+	^ <InteractionSubject> = (
+	| s |
+	s:: self
+		onMessage: m
+		kind: #confirm
+		onAccept: [:i | yesBlock value]
+		onCancel: []
+		returnTo: rs.
+	s acceptLabel: yl.
+	^s
+)
+public confirm: m <String>
+	yesLabel: yl <String>
+	onYes: yesBlock <[]>
+	noLabel: nl <String>
+	onNo: noBlock <[]>
+	returnTo: rs <Subject>
+	^ <InteractionSubject> = (
+	| s |
+	s:: self
+		onMessage: m
+		kind: #confirm
+		onAccept: [:i | yesBlock value]
+		onCancel: noBlock
+		returnTo: rs.
+	s acceptLabel: yl.
+	s cancelLabel: nl.
+	^s
+)
+public prompt: m <String>
+	default: dft <String>
+	onAccept: acceptBlock <[:String]>
+	returnTo: rs <Subject>
+	^ <InteractionSubject> = (
+	| s |
+	s:: self
+		onMessage: m
+		kind: #prompt
+		onAccept: acceptBlock
+		onCancel: []
+		returnTo: rs.
+	s input: dft.
+	^s
+)
+)
+public class InteractionPresenter onSubject: s <InteractionSubject>
+	= ProgrammingPresenter onSubject: s (
+|
+inputEditor
+|
+) (
+public isKindOfInteractionPresenter ^ <Boolean> = (^true)
+isMyKind: f <Fragment> ^ <Boolean> = (^f isKindOfInteractionPresenter)
+definition = (
+	^column: {
+		majorHeadingBlock: (
+			row: { (label: subject title) bold. filler}).
+		mediumBlank.
+		messageColumn.
+		mediumBlank.
+		(subject kind = #prompt)
+			ifTrue: [inputArea]
+			ifFalse: [nothing].
+		mediumBlank.
+		buttonRow}
+)
+messageColumn = (
+	| labels lines start lf size text |
+	text:: subject message.
+	labels:: List new.
+	lines:: List new.
+	lf:: String fromRunes: { 10 }.
+	start:: 1.
+	size:: text size.
+	[start <= size] whileTrue: [
+		| idx |
+		idx:: text indexOf: lf startingAt: start.
+		idx = 0
+			ifTrue: [
+				lines add: (text copyFrom: start to: size).
+				start:: size + 1]
+			ifFalse: [
+				lines add: (text copyFrom: start to: idx - 1).
+				start:: idx + 1]].
+	lines do: [:line | labels add: (label: line)].
+	^column: labels asArray
+)
+inputArea = (
+	inputEditor:: codeMirror: subject input.
+	inputEditor changeResponse: [:frag |
+		subject input: frag textBeingAccepted].
+	^inputEditor
+)
+buttonRow = (
+	^row: {
+		filler.
+		button: subject cancelLabel action: [respondToCancel].
+		smallBlank.
+		button: subject acceptLabel action: [respondToAccept]}
+)
+respondToAccept = (
+	updateGUI: [
+		inputEditor isNil ifFalse: [
+			subject input: inputEditor textBeingAccepted].
+		subject accept.
+		enterSubject:: subject returnTo]
+)
+respondToCancel = (
+	updateGUI: [
+		subject cancel.
+		enterSubject:: subject returnTo]
+)
+) : (
 )
 class NestedClassGroupPresenter onSubject: s <Subject> = MirrorGroupPresenter onSubject: s (
 (* Presents the subject, a NestedClassGroupSubject, as a column of presenters for the nested classes in the group. Automatically gets updated after the subject mirror group. Anything that has to do with adding, editing or deleting NS nested classes goes here. *)
@@ -4408,9 +6318,10 @@ public class ObjectSubject onModel: m <ObjectMirror> evaluator: e <EvaluationVie
   slotMap <Map[Symbol, SlotSubject]> ::= Map new.
   lazySlotMap <Map[Symbol, SlotSubject]> ::= Map new.
   public preferredViewName <String>
-  classSubject_slot <ClassSubject>
+  
   |
 ) (
+lazy public classSubject <ClassSubject> = ClassSubject onClassModel: (ClassModel declaration: classMirror mixin declaration exemplar: objectMirror).
 public = another <Object> ^<Boolean> = (
 	^(another isKindOfObjectSubject) and:
 		[objectMirror = another objectMirror]
@@ -4500,12 +6411,6 @@ public kindOfSelectors  ^ <List[String]> = (
         ]
     ].
   ^result
-)
-public classSubject ^ <ClassSubject> = (
-    classSubject_slot isNil ifTrue: [
-      classSubject_slot:: ClassSubject onClassModel: (ClassModel declaration: classMirror mixin declaration exemplar: objectMirror)
-    ].
-	^classSubject_slot
 )
 computeLazySlots = (
   | 
@@ -4626,6 +6531,15 @@ aiChatButton: installFocusAction ifFocused: isFocusedPredicate = (
 	   helpers — installing a structured focus with description block, owner,
 	   and existence validator), and opens the shared AI chat just below
 	   this presenter's header.
+
+	   Setup short-circuit: if `ide aiSupport ensureSharedChat` returns a
+	   chat setup subject (no API key configured yet), we install the
+	   focus and navigate to setup directly, BEFORE the updateGUI: dance.
+	   Routing setup through installAIChat's `^enterSubject:` inside an
+	   updateGUI: block leaves the user staring at an unchanged page
+	   with just the brain highlighted — the navigation happens but the
+	   GUI-bump bookkeeping appears to clobber it.
+
 	   isFocusedPredicate returns whether this presenter's entity is currently
 	   focused (matched structurally — by class path + side + selector — not by
 	   Subject object identity, since atomic install does not preserve
@@ -4634,35 +6548,45 @@ aiChatButton: installFocusAction ifFocused: isFocusedPredicate = (
 	isFocused:: isFocusedPredicate value.
 	btn:: (imageButton: ide images brainImage
 		action: [
-			| stage <String> |
+			| stage <String> shared |
 			stage:: 'start'.
 			[
-				updateGUI: [
-					| previousChatHolder previousPage currentPage |
-					(* Auto-close a previously-active chat region only when
-					   it's on the SAME page. If the user opened chat on A,
-					   navigated to B, opened chat there, and is now coming
-					   back to A — we want A's chat region preserved.
-					   Same-page test: the page subject the chat was opened
-					   on equals the page subject the IDE is currently
-					   rendering. *)
-					stage:: 'read activeChatHolder'.
-					previousChatHolder:: ide aiSupport activeChatHolder.
-					stage:: 'read activeChatHolderPage'.
-					previousPage:: ide aiSupport activeChatHolderPage.
-					stage:: 'read currentPageSubject'.
-					currentPage:: ide browsing currentPageSubject.
-					stage:: 'close previous chat'.
-					(previousChatHolder isNil not
-						and: [previousChatHolder ~= chatHolder
-							and: [previousPage = currentPage]])
-						ifTrue: [previousChatHolder content: nothing].
-					stage:: 'install focus'.
+				shared:: ide aiSupport ensureSharedChat.
+				shared isKindOfIDEChatSetupSubject ifTrue: [
+					(* No key yet — install the focus (so the brain shows
+					   amber on the next visit) and head to the setup
+					   screen. Skip the updateGUI:/installAIChat cycle
+					   entirely. *)
 					installFocusAction value.
-					stage:: 'install AI chat'.
-					installAIChat.
-					stage:: 'record active chat'.
-					ide aiSupport activeChatHolder: chatHolder page: currentPage
+					enterSubject: shared
+				] ifFalse: [
+					updateGUI: [
+						| previousChatHolder previousPage currentPage |
+						(* Auto-close a previously-active chat region only when
+						   it's on the SAME page. If the user opened chat on A,
+						   navigated to B, opened chat there, and is now coming
+						   back to A — we want A's chat region preserved.
+						   Same-page test: the page subject the chat was opened
+						   on equals the page subject the IDE is currently
+						   rendering. *)
+						stage:: 'read activeChatHolder'.
+						previousChatHolder:: ide aiSupport activeChatHolder.
+						stage:: 'read activeChatHolderPage'.
+						previousPage:: ide aiSupport activeChatHolderPage.
+						stage:: 'read currentPageSubject'.
+						currentPage:: ide browsing currentPageSubject.
+						stage:: 'close previous chat'.
+						(previousChatHolder isNil not
+							and: [previousChatHolder ~= chatHolder
+								and: [previousPage = currentPage]])
+							ifTrue: [previousChatHolder content: nothing].
+						stage:: 'install focus'.
+						installFocusAction value.
+						stage:: 'install AI chat'.
+						installAIChat.
+						stage:: 'record active chat'.
+						ide aiSupport activeChatHolder: chatHolder page: currentPage
+					]
 				]
 			] on: Error do: [:e |
 				| desc |
@@ -4769,6 +6693,12 @@ collapseButtonWithAction: aBlock = (
 expandButtonWithAction: aBlock = (
 	^(imageButton: ide images expandImage action: aBlock)
         height: styleButtonSize
+)
+refreshButtonWithAction: aBlock = (
+	(* Variant of refreshButton with a caller-supplied action -- the
+	   default refreshButton rebuilds the whole shell. *)
+	^(imageButton: ide images refreshImage action: aBlock)
+        height: styleButtonSize; toolTip: #refresh
 )
 indentedBlock: body = (
 	^column: {
@@ -5174,11 +7104,16 @@ isMyKind: other <Fragment> ^ <Boolean> = (
 ) : (
 )
 public class EvaluatorPresenter onSubject: s <ObjectSubject | ActivationSubject> = ProgrammingPresenter onSubject: s (
-| 
-cm <CodeMirrorFragment> 
+|
+cm <CodeMirrorFragment>
 results_slot <List[TaggedHolderComposer]>
 |
 ) (
+public editorText ^ <String | Nil> = (
+    (* The current text in the embedded CodeMirror. Returns nil when the
+       editor hasn't been rendered yet (cm not yet assigned). *)
+    ^cm isNil ifTrue: [nil] ifFalse: [cm textBeingAccepted]
+)
 deadChangeResponse = (
     ^[:editor <CodeMirrorFragment>  | 
         | src <String> =  editor textBeingAccepted. |
@@ -5304,8 +7239,28 @@ public respondToMakeButton = (
 )
 actionsMenu = (
 	^menuWithLabelsAndActions: {
+		{'Pretty Print Selection'. [respondToPrettyPrintSelection]}.
+		#separator.
 		{'Inspect Presenter'. [respondToInspectPresenter]}.
 	}
+)
+respondToPrettyPrintSelection = (
+    (* Pretty-print the current selection (or the whole buffer if
+       nothing is selected — actually no: show a message and bail).
+       Replaces the selection in place via CodeMirror's
+       replaceSelection. Does NOT trigger evaluate. *)
+    | source formatted |
+    cm isNil ifTrue: [^self].
+    source:: cm editor getSelection.
+    (source isNil or: [source isEmpty]) ifTrue: [
+        cm showMessage: 'Pretty Print Selection: nothing selected.'.
+        ^self].
+    formatted:: [ide prettyPrinter prettyPrintExpression: source]
+        on: Exception do: [:e |
+            cm showMessage: 'Pretty print failed: ', e printString.
+            ^self].
+    cm editor replaceSelection: formatted.
+    cm editor focus.
 )
 linkForEvaluation: r <ThreadMirror | Error> ^ <Fragment> = (
   r isKindOfError ifTrue: [:e <Error> | ^linkForCompileError: e].
@@ -6245,12 +8200,16 @@ class MethodEvaluatorPresenter onSubject: s = EvaluatorPresenter onSubject: s (
 ) (
 acceptResponse ^ <[:CodeMirrorFragment :Event]> = (
 	^ [:ed <CodeMirrorFragment> :event <Event> |
-		| b <MixinBuilder> = subject method definingMixin asBuilder. |
+		| b <MixinBuilder> = subject method definingMixin asBuilder.
+		canonical |
 		updateGUI: [
-			[b methods addFromSource: ed textBeingAccepted.
-			ide  installFromBuilders: {b declaration}.
-			ide colorizer colorizeMethod: (crToLf: ed textBeingAccepted) fromClass: subject method definingMixin declaration via: (colorizingBlockFor: ed).
-			ed leaveEditState] on: Error do:  [:ex <Exception> | ed showMessage: ex printString]
+			[
+				canonical:: ide prettyPrintMethodOr: ed textBeingAccepted.
+				b methods addFromSource: canonical.
+				ide  installFromBuilders: {b declaration}.
+				ed text: canonical.
+				ide colorizer colorizeMethod: (crToLf: canonical) fromClass: subject method definingMixin declaration via: (colorizingBlockFor: ed).
+				ed leaveEditState] on: Error do:  [:ex <Exception> | ed showMessage: ex printString]
 			].
 		ed editor focus.
 		]
@@ -6549,6 +8508,56 @@ public repo = r.
 public isKindOfClassHeaderHistoryModel ^ <Boolean> = (^true)
 ) : (
 )
+public class MemberRepoHistoryModel kind: k target: t = (
+(* Repo-agnostic identity for one member's history. `kind` is one of
+   #method / #lazySlot / #classHeader; `target` is the corresponding
+   methodModel / lazySlotModel / classMirror. The MemberRepoHistory-
+   Presenter builds a per-repo *HistoryModel on demand by combining
+   target with each Repository in its list. *)
+|
+public kind <Symbol> = k.
+public target = t.
+|
+) (
+public isKindOfMemberRepoHistoryModel ^ <Boolean> = (^true)
+) : (
+public forMethodModel: mm <MethodModel> = (
+	^self kind: #method target: mm
+)
+public forLazySlotModel: lsm <LazySlotModel> = (
+	^self kind: #lazySlot target: lsm
+)
+public forClassMirror: cm <ClassDeclarationMirror> = (
+	^self kind: #classHeader target: cm
+)
+)
+public class MemberHistoryEntryModel entry: e memberMirror: mm path: pa = (
+(* Triple held by a MemberHistoryEntrySubject: the git log entry, the
+   member mirror this entry is a version of, and the draft file path.
+
+   memberMirror is uniform across live-history and changeset use:
+     * Live history: the MethodMirror / LazySlotMirror /
+       ClassDeclarationMirror of the live member being browsed.
+     * Changeset: same shape (the live mirror of the member the
+       changeset row is about), or a SourceMirror variant for cases
+       where there's no corresponding live member.
+
+   Both flavours respond to isKindOfMethodMirror /
+   isKindOfLazySlotMirror / isKindOfClassDeclarationMirror, expose
+   definingMixin (method / slot) or asBuilder (class declaration),
+   and have a name. That uniform protocol -- aligned in Phase 1-3 of
+   the MemoryHole port -- is what lets the EntrySubject + Presenter
+   drive off the mirror directly instead of delegating to a parent
+   history subject. *)
+|
+public entry = e.
+public memberMirror = mm.
+public path <String> = pa.
+|
+) (
+public isKindOfMemberHistoryEntryModel ^ <Boolean> = (^true)
+) : (
+)
 public class LazySlotModel slot: m <LazySlotMirror> exemplar: e <Object | Nil>
 (*  :exemplar: 
 [| om = ObjectMirror reflecting: self. | LazySlotModel slot: (om getClass lazySlots findMirrorNamed: #hash) exemplar: om] value 
@@ -6608,12 +8617,16 @@ deadChangeResponse ^ <[:CodeMirrorFragment :Event]> = (
 )
 acceptResponse ^ <[:CodeMirrorFragment :Event]> = (
 	^ [:ed <CodeMirrorFragment> :event <Event> |
-		| b <MixinBuilder> = subject method definingMixin asBuilder. |
+		| b <MixinBuilder> = subject method definingMixin asBuilder.
+		canonical |
 		updateGUI: [
-			[b lazySlots addFromSource: ed textBeingAccepted.
-			ide  installFromBuilders: {b declaration}.
-			ide colorizer colorizeLazySlot: (crToLf: ed textBeingAccepted) fromClass: subject method definingMixin declaration via: (colorizingBlockFor: ed).
-			ed leaveEditState] on: Error do:  [:ex <Exception> | ed showMessage: ex printString]
+			[
+				canonical:: ide prettyPrintLazySlotOr: ed textBeingAccepted.
+				b lazySlots addFromSource: canonical.
+				ide  installFromBuilders: {b declaration}.
+				ed text: canonical.
+				ide colorizer colorizeLazySlot: (crToLf: canonical) fromClass: subject method definingMixin declaration via: (colorizingBlockFor: ed).
+				ed leaveEditState] on: Error do:  [:ex <Exception> | ed showMessage: ex printString]
 			].
 		ed editor focus.
 		]
@@ -7067,6 +9080,33 @@ public currentPageSubject = (
 	   chat region is on the same page as the new click — only same-page
 	   regions are auto-closed. *)
 	^[currentWindow currentPresenter subject] on: Error do: [:e | nil]
+)
+installDiffSideBySideStyles = (
+	(* Inject the four CSS rules that SideBySideDiff applies via
+	   CodeMirror addLineClass / markText. Done programmatically from
+	   the Browsing module's factory body rather than committed to
+	   primordialsoup.html so that UI decisions stay on the
+	   Newspeak/Hopscotch side (the IDE's appearance is the IDE's
+	   responsibility, not the host page's). Idempotent: looks for the
+	   sentinel <style id="nsbDiffSideBySideStyles"> and skips if it
+	   already exists, so re-instantiating the Browsing module (e.g.
+	   on snapshot reload) doesn't pile up duplicate rules.
+
+	   Colors deliberately desaturated: the editor's syntax
+	   highlighting is the primary signal, the diff tint is a
+	   secondary cue layered behind it. *)
+	| head style rules |
+	head:: document at: 'head'.
+	(head querySelector: '#nsbDiffSideBySideStyles') isNil ifFalse: [^self].
+	rules::
+		'.cm-diff-removed-line  { background-color: #fdecec; }', String newline,
+		'.cm-diff-added-line    { background-color: #ecfdec; }', String newline,
+		'.cm-diff-removed-span  { background-color: #fbcdcd; }', String newline,
+		'.cm-diff-added-span    { background-color: #cdf3cd; }'.
+	style:: document createElement: 'style'.
+	style at: 'id' put: 'nsbDiffSideBySideStyles'.
+	style at: 'textContent' put: rules.
+	head appendChild: style
 )
 ) : (
 )

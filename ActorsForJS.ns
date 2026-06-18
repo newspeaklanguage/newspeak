@@ -1,5 +1,5 @@
 Newspeak3
-'Root'
+'Newspeak'
 class ActorsForJS usingPlatform: p = (|
 private WeakMap = p collections IdentityMap.
 private List = p collections List.
@@ -8,6 +8,8 @@ private Message = p kernel Message.
 private internalRefs <WeakMap[FarReference, InternalFarReference]> = WeakMap new.
 
 public Promise = PromiseUtils new.
+
+handlerOfLastResort_slot
 
 defaultActor = DOMActor named: 'Default actor'.
 |_js assign: (_js ident: 'currentActor') toBe: defaultActor) (
@@ -85,6 +87,15 @@ public currentActor = (
 	(* BOGUS. Polymorphic with other actor system. *)
 	^self
 )
+public enqueueReceiver: receiver selector: selector arguments: arguments resolver: resolver = (
+	(* Convenience wrapper matching psoup's [InternalActor]>>same. Posts a
+	   PendingDelivery to this actor's queue. *)
+	self enqueueMessage: (PendingDelivery
+		receiver: receiver
+		selector: selector
+		arguments: arguments
+		resolver: resolver)
+)
 public eventualSendTo: receiver selector: selector arguments: arguments ^<Ref> = (
 	(* Sent from the compilation of an eventual send, via the same method in ProcessScheduler. *)
 	^(asInternalRef: receiver) eventualSend: selector arguments: arguments
@@ -130,7 +141,6 @@ public whenFulfilled: onValue whenBroken: onError ^<Ref> = (
 )
 public wrapFor: targetActor = (
 	self checkCurrentActor.
-	#BOGUS.
 	^(InternalBrokenRef problem: problem __owner: targetActor) externalRef
 )
 ) : (
@@ -508,7 +518,7 @@ public deliverIn: fastCurrentActor = (
 
 	[resolution:: msg sendTo: receiver.
 	type:: #internalResolve:]
-		on: Error (* BOGUS: Exception? *)
+		on: Exception (* was [on: Error], which doesn't catch MessageNotUnderstood (an Exception, not an Error) *)
 		do: [:error |
 			error out.
 			resolver == nil ifTrue: [error pass].
@@ -523,7 +533,8 @@ public deliverIn: fastCurrentActor = (
 
 	resolver internalResolve: (type == #internalResolve:
 		ifTrue: [asInternalRef: resolution]
-		ifFalse: [InternalBrokenRef problem: resolution __owner: self]).
+		ifFalse: [InternalBrokenRef problem: resolution __owner: currentActor]).
+		(* __owner: was [self] (a PendingDelivery); should be the actor that owns the ref. *)
 )
 public postedTo: actor = (
 	(*check: receiver allowedIn: actor.
@@ -604,16 +615,23 @@ class Ref wrapping: ref = (|
 protected internalRef = ref.
 |internalRefs at: self put: ref) (
 protected doesNotUnderstand: message <Message> = (
-	(* For the debugger/inspector. Questionable. *)
-	(* Should probably override public method of Object as well. *)
-	0 = message arguments size ifTrue: [(message selector startsWith: 'is') ifTrue: [^false]].
+	(* For the debugger/inspector. Short-circuit [isKindOfX]-style predicates
+	   to false (matches psoup's Object>>doesNotUnderstand: behavior); use
+	   psoup's narrow [isKindOf] prefix rather than the over-broad [is]
+	   prefix that previously swallowed [isEmpty]/[isNil]/[isPromise]/etc. *)
+	0 = message arguments size ifTrue: [(message selector startsWith: 'isKindOf') ifTrue: [^false]].
 	^internalRef immediateSend: message
 )
 public identityHash = (
 	(* :bogus: Need a proper implementation of WeakMap that does not send messages to its keys. *)
 	^super hash
 )
+public isKindOfPromise ^ <Boolean> = (
+	^true
+)
 public isPromise = (
+	(* Retained as an alias of isKindOfPromise for callers that used the
+	   short form before the naming was aligned with psoup. *)
 	^true
 )
 public printOn: stream = (
@@ -637,39 +655,51 @@ public break: error <E> = (
 public fulfill: value <V> = (
 	internalResolver internalResolve: (asInternalRef: value).
 )
-public isResolver ^<Boolean> = (
+public isKindOfResolver ^<Boolean> = (
 	^true
 )
-) : (
-)
-class Scheduler = () (
-public eventualSendTo: r selector: s arguments: a = (
+public isResolver ^<Boolean> = (
+	(* Alias of isKindOfResolver — see Ref>>isPromise for the same rationale. *)
+	^true
 )
 ) : (
 )
 public class Timer __duration: milliseconds callback: callback repeating: repeating = (|
 	protected cancelled ::= false.
+	protected handle
+	protected isRepeating <Boolean> = repeating.
+	protected userCallback = callback.
 |repeating
 		ifTrue: [self schedule: callback every: milliseconds]
 		ifFalse: [self schedule: callback after: milliseconds]) (
 public cancel = (
+	(* Previously referenced an undeclared [process] slot — sending [cancel]
+	   to any Timer crashed with DNU. We now capture the JS timer handle in
+	   [schedule:after:]/[schedule:every:] and clearTimeout/clearInterval
+	   here. *)
 	cancelled:: true.
-	nil == process ifFalse: [process terminate. process:: nil].
+	nil = handle ifFalse: [
+		isRepeating
+			ifTrue: [_js call: (_js propertyOf: (_js ident: 'window') at: (_js literal: 'clearInterval')) with: {handle}]
+			ifFalse: [_js call: (_js propertyOf: (_js ident: 'window') at: (_js literal: 'clearTimeout')) with: {handle}].
+		handle:: nil].
 )
 public isActive ^<Boolean> = (
 	cancelled ifTrue: [^false].
-	^nil ~= process
+	^nil ~= handle
 )
 public isTimer ^<Boolean> = (
 	^true
 )
 protected schedule: callback after: ms = (
-	_js call: (_js propertyOf: (_js ident: 'window') at: (_js literal: 'setTimeout'))
-	with: {callback. ms}
+	handle:: _js call: (_js propertyOf: (_js ident: 'window') at: (_js literal: 'setTimeout'))
+		with: {callback. ms}.
 )
 protected schedule: callback every: ms = (
-	_js call: (_js propertyOf: (_js ident: 'window') at: (_js literal: 'setInterval'))
-	with: {callback. ms}
+	(* Wrap the user callback so it receives [self] as the argument,
+	   matching psoup's [:Timer] signature for [Timer>>every:do:]. *)
+	handle:: _js call: (_js propertyOf: (_js ident: 'window') at: (_js literal: 'setInterval'))
+		with: {[callback value: self]. ms}.
 )
 ) : (
 public after: duration do: callback <[]> ^<Timer> = (
@@ -776,9 +806,15 @@ private wrapArguments: arguments from: sourceActor to: targetActor = (
 	^arguments collect: [:argument | wrapArgument: argument from: sourceActor to: targetActor].
 )
 public ultimateExceptionHandler: h <[:Exception :Activation]> = (
-  (*:TODO :Bogus Used by the debugger
-    handlerOfLastResort:: h
-    *)
+  (* Stash the handler in the module-level slot. The browser-side path
+     that surfaces unhandled exceptions still needs to call
+     [handlerOfLastResort_slot value: e value: nil] on a real failure;
+     wiring that up to JS [window.onerror] / [unhandledrejection] is a
+     follow-up. *)
+  handlerOfLastResort_slot:: h.
+)
+public handlerOfLastResort = (
+  ^handlerOfLastResort_slot
 )
 ) : (
 )

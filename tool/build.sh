@@ -42,6 +42,24 @@ cd ${PRIMORDIALSOUP} || exit 1
   ${NEWSPEAK}/NewspeakTestRunner.ns \
   RuntimeWithMirrorsForPrimordialSoup NewspeakTestRunner ./out/snapshots/NewspeakTestRunner.vfuel
 
+# 4c. Build NewspeakPrettyPrintApp.vfuel for tool/pretty-print.sh script
+./out/ReleaseX64/primordialsoup \
+  ./out/snapshots/WebCompiler.vfuel \
+  ./newspeak/*.ns \
+  ${NEWSPEAK}/NewspeakASTs.ns \
+  ${NEWSPEAK}/NewspeakPrettyPrinter.ns \
+  ${NEWSPEAK}/NewspeakPrettyPrintApp.ns \
+  RuntimeWithMirrorsForPrimordialSoup NewspeakPrettyPrintApp ./out/snapshots/NewspeakPrettyPrintApp.vfuel
+
+# 4d. Build NewspeakRoundTripCheckApp.vfuel for tool/round-trip-check.sh script
+./out/ReleaseX64/primordialsoup \
+  ./out/snapshots/WebCompiler.vfuel \
+  ./newspeak/*.ns \
+  ${NEWSPEAK}/NewspeakASTs.ns \
+  ${NEWSPEAK}/NewspeakPrettyPrinter.ns \
+  ${NEWSPEAK}/NewspeakRoundTripCheckApp.ns \
+  RuntimeWithMirrorsForPrimordialSoup NewspeakRoundTripCheckApp ./out/snapshots/NewspeakRoundTripCheckApp.vfuel
+
 # Back to 'newspeak'.
 cd ${NEWSPEAK} || exit 1
 
@@ -58,6 +76,12 @@ cp ${PRIMORDIALSOUP}/newspeak/*.ns out
 # 7. Merge in Newspeak IDE dependencies
 cp ./*.ns ./*.png out
 # cp -R CodeMirror out # CodeMirror is copied during deploy
+
+# 7a. Stage self-hosted third-party JS (isomorphic-git, lightning-fs).
+# Vendored under vendor/ at the repo root and consumed by the deploy
+# scripts. Mirror the whole dir so additions land automatically.
+mkdir -p out/vendor
+cp ./vendor/*.js out/vendor/
 
 cd ${NEWSPEAK}/out || exit 1
 

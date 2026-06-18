@@ -65,7 +65,7 @@
 // The version update can be done either manually (we rely on this),
 // or by applying some framework that generates this sw.js worker script.
 
-const pwaVersion = 856;
+const pwaVersion = 887;
 
 // Cache name used by the 'caches' global variable.
 // The pwaCacheName now includes the pwaVersion;
@@ -84,7 +84,16 @@ const pwaAppResources = [
     '/webIDE/public/assets/lib/codemirror.js',
     '/webIDE/public/assets/lib/codemirror_autorefresh.js',
     '/webIDE/public/assets/lib/jszip.min.js',
-    
+
+    // Self-hosted vendor JS (must match the <script> list in index.html).
+    // Service worker pre-caches them so the IDE works offline once the
+    // first online load completes.
+    '/webIDE/public/assets/lib/vendor/buffer-6.0.3.bundle.min.js',
+    '/webIDE/public/assets/lib/vendor/isomorphic-git-1.38.4.umd.min.js',
+    '/webIDE/public/assets/lib/vendor/lightning-fs-4.6.2.min.js',
+    '/webIDE/public/assets/lib/vendor/isomorphic-git-1.38.4-http-web.umd.js',
+    '/webIDE/public/assets/lib/vendor/diff_match_patch-2019-07.js',
+
     '/webIDE/public/assets/lib/codemirror.css',
     '/webIDE/public/assets/lib/primordialsoup.wasm',
     '/webIDE/public/assets/lib/HopscotchWebIDE.vfuel',
@@ -140,6 +149,7 @@ const addAllResourcesToCache = async (resources, cacheName) => {
 //   (when request.url is not in pwaAppResources)
 
 const putInCache = async (request, response, cacheName) => {
+    if (request.method !== 'GET') return;    
     const cache = await caches.open(cacheName);
     await cache.put(request, response);
 };

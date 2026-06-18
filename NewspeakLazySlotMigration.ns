@@ -1,0 +1,757 @@
+Newspeak3
+'Newspeak'
+class NewspeakLazySlotMigration usingPlatform: platform
+	ast: astModule
+	parser: commonParser
+	metadata: md = (
+(* Migrates hand-written lazy-initialization accessors to proper `lazy` slots.
+
+PROBLEM. Much Newspeak code predates the `lazy` slot feature. The effect of
+a lazy slot
+
+	lazy n = e.
+
+was achieved by pairing a backing slot with a caching accessor:
+
+	(* in the class header *) n_slot <T>
+	n = (
+		n_slot isNil ifTrue: [n_slot:: e].
+		^n_slot
+	)
+
+This module rewrites every such *safe* occurrence into the equivalent
+`lazy n <T> = e.`, deleting the backing slot from the header and replacing the
+accessor method with the lazy slot. It recurses into nested classes. Newspeak
+has no class-side slots, so only instance-side accessors are ever candidates;
+class-side methods (the `: ( ... )` section) are never touched.
+
+RECOGNIZED SHAPES. Let B be the backing slot, e the init expression, n the
+selector. The accessor body (after its optional leading comment) must be exactly
+one of:
+
+ 1. guard-then-return:   <nilTest> ifTrue: [B:: e]. ^B
+ 2. ifNil:               B ifNil: [B:: e]. ^B
+ 3. combined return:     ^<nilTest> ifTrue: [B:: e] ifFalse: [B]
+                         ^<nilTest> ifTrue: [B:: e. B] ifFalse: [B]
+ 4. reversed early-exit: <nilTest> ifFalse: [^B]. B:: e. ^B
+
+where <nilTest> is any of:  B isNil | B = nil | nil = B | B == nil | nil == B.
+
+EQUIVALENCE. All four shapes treat nil as ''not yet computed'' and recompute when
+e itself yields nil. The `lazy n = e` desugaring uses the same nil-as-uncomputed
+test on its private cache slot, so the rewrite is behavior-preserving — including
+the recompute-on-nil corner.
+
+SAFETY (skips, never silent loss). A shape match is rewritten only when it is
+safe; otherwise a SkipRecord is logged and the source for that member is left
+untouched. Skip reasons:
+ - #slotReadElsewhere — B is READ outside the accessor in a way that peeks
+   without forcing (e.g. Holder>>value: tests `changedS isNil` to avoid
+   instantiating the duct). No lazy slot — mutable or not — can express ''is it
+   computed yet'', so these are genuinely unconvertible.
+ - (B written but not read elsewhere) → a MUTABLE conversion, not a skip: the
+   accessor becomes `lazy n ::= e` (its generated setter `n:` absorbs the external
+   writes; setting the cache to nil makes the next access recompute), and every
+   external `B:: x` is rewritten to `n:: x`. This is the one non-local edit — it
+   touches other methods. Two sub-cases are EXCLUDED and kept as skips:
+     - #explicitSetterConflict — the class already declares a method `n:`; the
+       generated setter would duplicate it (e.g. Brazil>>theDesktop:).
+     - #slotEagerlyInitialized — the slot is filled by a method reached from the
+       instance initializer (e.g. Collections hashtable_ via createTable:), so it
+       is eager, not lazy. Converting would work mechanically but misrepresents
+       intent; left alone by request.
+   When B is both read and written elsewhere, #slotReadElsewhere wins (a peek-read
+   can never be made lazy).
+ - #slotHasInitializer — B''s header declaration eagerly initializes it.
+ - #slotNotFound — the identifier in the shape is not a removable header slot of
+   this side (e.g. inherited, or otherwise unresolvable here).
+ - #initNotSingleExpression — the cached value is not a single expression
+   (the assignment block holds extra statements).
+ - #extraStatements — the method has statements beyond the recognized skeleton.
+
+NON-CANDIDATES (no record, untouched): plain accessors (^B with no init),
+methods with arguments, nil-coalescing over a method-local temporary, a shape
+whose returned value differs from the assigned slot, and existing `lazy` slots.
+
+ACCESS MODIFIER. The lazy slot takes the *method''s* access modifier (the
+accessor''s visibility, which becomes the getter''s visibility). The backing
+slot''s own modifier is irrelevant — it is deleted. An immutable `lazy n = e` is
+emitted when the backing slot is never written outside the accessor; a mutable
+`lazy n ::= e` (plus external-write renames) when it is — see SAFETY below.
+
+TYPE. The lazy slot''s type is the backing slot''s `<T>` if present, else the
+accessor''s return type `^<T>`, else none.
+
+COMMENTS. The accessor''s leading body comment is preserved by moving it to
+precede the lazy slot. If the backing slot also carried a *trailing* (same-line)
+comment, it is preserved too (appended after the method comment). Every
+TransformationRecord logs methodHadComment and slotHadComment so a human can
+audit relocations.
+
+KNOWN LIMITATION — leading slot comments are NOT relocated. A comment on the
+line(s) *before* the backing slot (the newer leading-comment convention, e.g.
+Browsing MemberHistoryPresenter>>state explaining why the value is cached) is
+left behind in the header when the slot is deleted, orphaned, and is NOT counted
+in slotHadComment. This is deliberate: comment attachment is not consistent
+across the codebase — older code tends to trail its slot comments, newer code
+leads them but usually already uses real lazy slots — so deciding whether a
+leading comment belongs to THIS slot, the PREVIOUS slot, or a whole section
+needs semantic judgment the tool can''t reliably make. After a run, scan the
+touched class headers for an orphaned comment and move it to the new lazy slot by
+hand (or have an AI do it). Trailing comments and the accessor''s own body
+comment are handled automatically.
+
+IMPLEMENTATION. Detection is AST-based (parse, pattern-match the body, look up the
+header slot). Node types are classified by `apply:` double-dispatch via NodeKindTool
+(the AST base declares no isKindOf... false defaults, so blind predicate sends would
+DNU). The ''referenced elsewhere'' safety check is a conservative whole-word textual
+scan of the class source — over-approximating (a mention in a comment counts) only
+ever causes an extra skip, never an unsafe rewrite. Rewrites are SURGICAL,
+position-based source edits: the rest of the file is left byte-for-byte identical
+to keep migration diffs minimal. The init expression is spliced verbatim from source.
+
+This is the migration ENGINE only. The whole-codebase driver script (over both
+the newspeak and primordialsoup/newspeak trees) is a separate deliverable. *)
+|
+	private List = platform collections List.
+	private parser = commonParser.
+	private ASTTool = astModule ASTTool.
+	private Exception = platform kernel Exception.
+	private nodeKindTool
+|
+nodeKindTool:: NodeKindTool new.
+) (
+public class MigrationResult onSource: src <String> = (
+(* The outcome of migrating one class-declaration source string.
+
+ - transformedSource: the rewritten source (= the input when nothing changed).
+ - changed: true iff at least one accessor was rewritten.
+ - transformations: a TransformationRecord per rewritten accessor.
+ - skips: a SkipRecord per shape-match that was unsafe to rewrite. *)
+|
+	public transformedSource <String> ::= src.
+	public changed <Boolean> ::= false.
+	public transformations <List[TransformationRecord]> = List new.
+	public skips <List[SkipRecord]> = List new.
+|) (
+public addTransformation: t <TransformationRecord> = (
+	transformations add: t.
+	changed:: true.
+)
+public addSkip: s <SkipRecord> = (
+	skips add: s.
+)
+) : (
+)
+public class TransformationRecord
+	method: m <Symbol>
+	modifier: am <Symbol>
+	slot: s <Symbol>
+	methodComment: mc <Boolean>
+	slotComment: sc <Boolean>
+	mutable: mut <Boolean>
+	renames: rn <Integer> = (
+(* A record of one accessor rewritten to a lazy slot. `isMutable` is true for a
+   `lazy n ::= e` (the backing slot was written elsewhere); `renameCount` is how
+   many external `B:: x` writes were rewritten to the generated setter `n:: x`. *)
+|
+	public methodName <Symbol> = m.
+	public accessModifier <Symbol> = am.
+	public slotName <Symbol> = s.
+	public methodHadComment <Boolean> = mc.
+	public slotHadComment <Boolean> = sc.
+	public isMutable <Boolean> = mut.
+	public renameCount <Integer> = rn.
+|) (
+) : (
+)
+public class SkipRecord method: m <Symbol> reason: r <Symbol> = (
+(* A shape-match that was not rewritten, with the reason symbol. *)
+|
+	public methodName <Symbol> = m.
+	public reason <Symbol> = r.
+|) (
+) : (
+)
+class NodeKindTool = ASTTool (
+(* Classifies any expression/statement AST node by `apply:` double-dispatch,
+   returning a kind symbol. Used instead of isKindOf... sends, which DNU on the
+   AST base. Covers every ASTTool method so dispatch never hits
+   subclassResponsibility. *)
+) (
+public blockNode: n = (^#block)
+public cascadedSendNode: n = (^#cascade)
+public characterNode: n = (^#character)
+public classNode: n = (^#class)
+public codeBodyNode: n = (^#codeBody)
+public messageNode: n = (^#message)
+public messagePatternNode: n = (^#messagePattern)
+public methodNode: n = (^#method)
+public mixinApplication: n = (^#mixinApplication)
+public mixinApplicationClass: n = (^#mixinApplicationClass)
+public numberNode: n = (^#number)
+public returnStatNode: n = (^#return)
+public setterSendNode: n = (^#setterSend)
+public sideNode: n = (^#side)
+public stringNode: n = (^#string)
+public symbolNode: n = (^#symbol)
+public tupleNode: n = (^#tuple)
+public unresolvedSendNode: n = (^#unresolvedSend)
+public varDeclNode: n = (^#varDecl)
+public variableNode: n = (^#variable)
+) : (
+)
+public migrateClassSource: src <String> ^ <MigrationResult> = (
+	(* src is a bare class declaration (no language-id / category prefix). *)
+	^migrate: src parseWith: [parser parseClassDeclaration: src]
+)
+public migrateCompilationUnitSource: src <String> ^ <MigrationResult> = (
+	(* src is a whole .ns file: `Newspeak3` line, category string, then the class.
+	   Node positions are absolute in src, so the prefix is preserved untouched. *)
+	^migrate: src parseWith: [parser parseCompilationUnit: src]
+)
+migrate: src parseWith: parseBlock ^ <MigrationResult> = (
+	| result ast edits |
+	result:: MigrationResult onSource: src.
+	ast:: [parseBlock value] on: Exception do: [:e | nil].
+	ast isNil ifTrue: [^result].
+	edits:: List new.
+	processClass: ast into: result edits: edits src: src.
+	edits isEmpty ifFalse: [result transformedSource: (applyEdits: edits to: src)].
+	^result
+)
+processClass: classAST into: result edits: edits src: src = (
+	| methods |
+	methods:: classAST instanceSide methods.
+	methods isNil ifFalse:
+		[methods do: [:m | processMethod: m class: classAST into: result edits: edits src: src]].
+	recurseSide: classAST instanceSide into: result edits: edits src: src.
+	recurseSide: classAST classSide into: result edits: edits src: src.
+)
+recurseSide: side into: result edits: edits src: src = (
+	side isNil ifTrue: [^self].
+	side nestedClasses isNil ifFalse:
+		[side nestedClasses do: [:nc | processClass: nc into: result edits: edits src: src]].
+)
+processMethod: m class: classAST into: result edits: edits src: src = (
+	| analysis bSym initNode sd se ce refs writes mutable fs mc scInfo sc delEnd tt initSrc lazyText nStr bLen |
+	analysis:: analyzeMethod: m.
+	analysis isNil ifTrue: [^self].
+	(analysis at: 1) = #skip ifTrue:
+		[result addSkip: (SkipRecord method: m selector reason: (analysis at: 2)). ^self].
+
+	bSym:: analysis at: 2.
+	initNode:: analysis at: 3.
+
+	sd:: headerSlotNamed: bSym in: classAST header.
+	sd isNil ifTrue: [result addSkip: (SkipRecord method: m selector reason: #slotNotFound). ^self].
+	(slotHasRealInitializer: sd) ifTrue:
+		[result addSkip: (SkipRecord method: m selector reason: #slotHasInitializer). ^self].
+
+	(* If a nested class declares a slot of the same name, the whole-class textual
+	   scan can''t tell the two slots apart — references to the nested slot would be
+	   miscounted (and, on the mutable path, mis-renamed). Bail with a clear reason. *)
+	(slotNameDeclaredInNested: bSym in: classAST) ifTrue:
+		[result addSkip: (SkipRecord method: m selector reason: #slotNameShadowed). ^self].
+
+	(* The parser leaves ClassDeclarationAST end at 0 and an uninitialized slot''s
+	   end pointing at the NEXT token, so derive both spans ourselves. *)
+	se:: slotTrueEnd: sd from: src.
+	ce:: classRawEnd: classAST.
+	ce = 0 ifTrue: [ce:: src size].
+
+	refs:: countRefsOf: bSym in: src
+		classStart: classAST start classEnd: ce
+		methodStart: m start methodEnd: m end
+		slotStart: sd start slotEnd: se.
+	(refs at: 1) ifTrue: [result addSkip: (SkipRecord method: m selector reason: #slotReadElsewhere). ^self].
+	writes:: refs at: 2.
+
+	(* External writes (and no peek-reads) → a MUTABLE `lazy n ::= e`: the lazy slot
+	   generates a setter `n:`, and each external `B:: x` is rewritten to `n:: x`.
+	   Two cases are excluded (per the agreed scope) and kept as skips:
+	   - an explicit `n:` setter already exists → it would clash with the generated
+	     one (#explicitSetterConflict);
+	   - the slot is filled from a method reached by the instance initializer, so it
+	     is eager, not lazy (#slotEagerlyInitialized). *)
+	mutable:: writes isEmpty not.
+	mutable ifTrue:
+		[(hasExplicitSetterFor: m selector in: classAST) ifTrue:
+			[result addSkip: (SkipRecord method: m selector reason: #explicitSetterConflict). ^self].
+		 (isEagerInit: writes in: classAST src: src) ifTrue:
+			[result addSkip: (SkipRecord method: m selector reason: #slotEagerlyInitialized). ^self]].
+
+	fs:: m body statements first start.
+	mc:: methodCommentOf: m src: src firstStmtStart: fs.
+	scInfo:: slotTrailingCommentInfo: sd endingAt: se src: src.
+	sc:: scInfo isNil ifTrue: [nil] ifFalse: [scInfo at: 1].
+	delEnd:: scInfo isNil ifTrue: [se] ifFalse: [scInfo at: 2].
+	tt:: slotTypeText: sd endingAt: se from: src.
+	tt isEmpty ifTrue: [tt:: methodReturnTypeText: m from: src].
+	initSrc:: initSourceOf: initNode in: src.
+	lazyText:: buildLazyForSelector: m selector modifier: m accessModifier
+		typeText: tt initSrc: initSrc methodComment: mc slotComment: sc mutable: mutable.
+
+	edits add: {m start. m end. lazyText}.
+	edits add: {sd start. delEnd. ''}.
+	nStr:: m selector asString.
+	bLen:: bSym asString size.
+	writes do: [:p | edits add: {p. (p + bLen) - 1. nStr}].
+	result addTransformation: (TransformationRecord
+		method: m selector
+		modifier: m accessModifier
+		slot: bSym
+		methodComment: (mc isNil) not
+		slotComment: (sc isNil) not
+		mutable: mutable
+		renames: writes size).
+)
+analyzeMethod: m ^ <Array | nil> = (
+	(* nil = not a candidate (untouched); {#skip. reason}; {#ok. slotSym. initNode}. *)
+	| params temps stmts |
+	params:: m pattern parameters.
+	((params isNil) not and: [(params isEmpty) not]) ifTrue: [^nil].
+	temps:: m body temporaries.
+	((temps isNil) not and: [(temps isEmpty) not]) ifTrue: [^nil].
+	stmts:: m body statements.
+	(stmts isNil or: [stmts isEmpty]) ifTrue: [^nil].
+	stmts size = 1 ifTrue: [^analyzeCombinedReturn: stmts].
+	^analyzeMultiStatement: stmts
+)
+analyzeMultiStatement: stmts ^ <Array | nil> = (
+	| first sel |
+	first:: stmts first.
+	(kindOf: first) = #unresolvedSend ifFalse: [^nil].
+	sel:: first message selector.
+	sel = #ifTrue: ifTrue: [^analyzeGuardReturn: stmts].
+	sel = #ifNil: ifTrue: [^analyzeIfNilReturn: stmts].
+	sel = #ifFalse: ifTrue: [^analyzeReversed: stmts].
+	^nil
+)
+analyzeGuardReturn: stmts ^ <Array | nil> = (
+	| first last testSlot block blkStmts |
+	first:: stmts first.
+	last:: stmts last.
+	first message arguments size = 1 ifFalse: [^nil].
+	testSlot:: nilTestSlotOf: (first receiver).
+	testSlot isNil ifTrue: [^nil].
+	(isReturnOf: last slot: testSlot) ifFalse: [^nil].
+	stmts size > 2 ifTrue: [^{#skip. #extraStatements}].
+	block:: first message arguments first.
+	(kindOf: block) = #block ifFalse: [^nil].
+	((block parameters isNil) not and: [(block parameters isEmpty) not]) ifTrue: [^nil].
+	(blockHasTemps: block) ifTrue: [^{#skip. #initNotSingleExpression}].
+	blkStmts:: block body statements.
+	blkStmts isNil ifTrue: [^nil].
+	blkStmts size = 1 ifFalse: [^{#skip. #initNotSingleExpression}].
+	(writeRHSOf: (blkStmts first) slot: testSlot) isNil ifTrue: [^nil].
+	^{#ok. testSlot. blkStmts first}
+)
+analyzeIfNilReturn: stmts ^ <Array | nil> = (
+	| first last bSym block blkStmts |
+	first:: stmts first.
+	last:: stmts last.
+	first message arguments size = 1 ifFalse: [^nil].
+	bSym:: readNameOf: (first receiver).
+	(bSym isNil or: [bSym = #nil]) ifTrue: [^nil].
+	(isReturnOf: last slot: bSym) ifFalse: [^nil].
+	stmts size > 2 ifTrue: [^{#skip. #extraStatements}].
+	block:: first message arguments first.
+	(kindOf: block) = #block ifFalse: [^nil].
+	((block parameters isNil) not and: [(block parameters isEmpty) not]) ifTrue: [^nil].
+	(blockHasTemps: block) ifTrue: [^{#skip. #initNotSingleExpression}].
+	blkStmts:: block body statements.
+	blkStmts isNil ifTrue: [^nil].
+	blkStmts size = 1 ifFalse: [^{#skip. #initNotSingleExpression}].
+	(writeRHSOf: (blkStmts first) slot: bSym) isNil ifTrue: [^nil].
+	^{#ok. bSym. blkStmts first}
+)
+analyzeReversed: stmts ^ <Array | nil> = (
+	| first second third bSym block blkStmts |
+	stmts size = 3 ifFalse: [^nil].
+	first:: stmts at: 1. second:: stmts at: 2. third:: stmts at: 3.
+	first message arguments size = 1 ifFalse: [^nil].
+	bSym:: nilTestSlotOf: (first receiver).
+	bSym isNil ifTrue: [^nil].
+	block:: first message arguments first.
+	(kindOf: block) = #block ifFalse: [^nil].
+	blkStmts:: block body statements.
+	(blkStmts isNil or: [(blkStmts size = 1) not]) ifTrue: [^nil].
+	(isReturnOf: (blkStmts first) slot: bSym) ifFalse: [^nil].
+	(writeRHSOf: second slot: bSym) isNil ifTrue: [^nil].
+	(isReturnOf: third slot: bSym) ifFalse: [^nil].
+	^{#ok. bSym. second}
+)
+analyzeCombinedReturn: stmts ^ <Array | nil> = (
+	| ret expr bSym trueBlk falseBlk fStmts tStmts |
+	ret:: stmts first.
+	(kindOf: ret) = #return ifFalse: [^nil].
+	expr:: ret expression.
+	(kindOf: expr) = #unresolvedSend ifFalse: [^nil].
+	expr message selector = #ifTrue:ifFalse: ifFalse: [^nil].
+	expr message arguments size = 2 ifFalse: [^nil].
+	bSym:: nilTestSlotOf: (expr receiver).
+	bSym isNil ifTrue: [^nil].
+	trueBlk:: expr message arguments first.
+	falseBlk:: expr message arguments at: 2.
+	((kindOf: trueBlk) = #block and: [(kindOf: falseBlk) = #block]) ifFalse: [^nil].
+	(blockHasTemps: trueBlk) ifTrue: [^{#skip. #initNotSingleExpression}].
+	fStmts:: falseBlk body statements.
+	(fStmts isNil or: [(fStmts size = 1) not]) ifTrue: [^nil].
+	(readNameOf: (fStmts first)) = bSym ifFalse: [^nil].
+	tStmts:: trueBlk body statements.
+	tStmts isNil ifTrue: [^nil].
+	tStmts size = 1 ifTrue:
+		[(writeRHSOf: (tStmts first) slot: bSym) isNil ifTrue: [^{#skip. #initNotSingleExpression}].
+		 ^{#ok. bSym. tStmts first}].
+	tStmts size = 2 ifTrue:
+		[(((writeRHSOf: (tStmts first) slot: bSym) isNil) not and: [(readNameOf: (tStmts at: 2)) = bSym])
+			ifTrue: [^{#ok. bSym. tStmts first}].
+		 ^{#skip. #initNotSingleExpression}].
+	^{#skip. #initNotSingleExpression}
+)
+kindOf: node ^ <Symbol> = (
+	node isNil ifTrue: [^#none].
+	^node apply: nodeKindTool
+)
+isImplicitReceiver: node ^ <Boolean> = (
+	(kindOf: node) = #variable ifFalse: [^false].
+	^node name = #'@here'
+)
+readNameOf: node ^ <Symbol> = (
+	(* The slot symbol if node is a bare implicit-receiver read; nil otherwise. *)
+	(kindOf: node) = #unresolvedSend ifFalse: [^nil].
+	(isImplicitReceiver: node receiver) ifFalse: [^nil].
+	node message arguments isEmpty ifFalse: [^nil].
+	^node message selector
+)
+isNilLiteralNode: node ^ <Boolean> = (
+	^(readNameOf: node) = #nil
+)
+nilTestSlotOf: node ^ <Symbol> = (
+	(* The slot symbol if node is a nil-test (isNil / =nil / nil= / ==nil / nil==); nil otherwise. *)
+	| sel args rcv rn an |
+	(kindOf: node) = #unresolvedSend ifFalse: [^nil].
+	rcv:: node receiver.
+	sel:: node message selector.
+	args:: node message arguments.
+	(sel = #isNil and: [args isEmpty]) ifTrue: [^readNameOf: rcv].
+	((sel = #= or: [sel = #==]) and: [args size = 1]) ifTrue:
+		[rn:: readNameOf: rcv.
+		 an:: readNameOf: (args first).
+		 ((rn isNil) not and: [(rn = #nil) not and: [isNilLiteralNode: (args first)]]) ifTrue: [^rn].
+		 ((isNilLiteralNode: rcv) and: [(an isNil) not and: [(an = #nil) not]]) ifTrue: [^an]].
+	^nil
+)
+blockHasTemps: block ^ <Boolean> = (
+	(* True if the block declares any temporaries. Such a block does real work
+	   beyond the assignment (its temps'' initializers), and the assignment RHS may
+	   reference those temps — so the init is not a single self-contained expression. *)
+	| t |
+	t:: block body temporaries.
+	t isNil ifTrue: [^false].
+	^t isEmpty not
+)
+initSourceOf: assignNode in: src ^ <String> = (
+	(* The verbatim source of the RHS of a setter send `B:: e`, taken from the
+	   assignment''s own span via the `::` delimiter. This is robust where node
+	   positions are not: a CascadedSendAST''s start points at its LAST message, so
+	   src[rhs start..rhs end] would yield only the cascade tail (e.g. ''yourself''). *)
+	| s e p |
+	s:: assignNode start.
+	e:: assignNode end.
+	p:: s.
+	[(p < e) and: [((src at: p) = 58 and: [(src at: p + 1) = 58]) not]] whileTrue: [p:: p + 1].
+	p:: p + 2.
+	[(p <= e) and: [isSpaceByte: (src at: p)]] whileTrue: [p:: p + 1].
+	^src copyFrom: p to: e
+)
+isSpaceByte: b ^ <Boolean> = (
+	^(b = 32) or: [(b = 9) or: [(b = 10) or: [b = 13]]]
+)
+writeRHSOf: node slot: bSym ^ <Object> = (
+	(* The RHS expression node if node is `bSym:: e`; nil otherwise. *)
+	| args |
+	(kindOf: node) = #setterSend ifFalse: [^nil].
+	(isImplicitReceiver: node receiver) ifFalse: [^nil].
+	args:: node message arguments.
+	args size = 1 ifFalse: [^nil].
+	(node message selector asString = (bSym asString, ':')) ifFalse: [^nil].
+	^args first
+)
+isReturnOf: node slot: bSym ^ <Boolean> = (
+	(kindOf: node) = #return ifFalse: [^false].
+	^(readNameOf: node expression) = bSym
+)
+headerSlotNamed: bSym in: header ^ <Object> = (
+	| slots |
+	slots:: header slots.
+	slots isNil ifTrue: [^nil].
+	slots do: [:sd | sd name = bSym ifTrue: [^sd]].
+	^nil
+)
+slotHasRealInitializer: sd ^ <Boolean> = (
+	| init |
+	init:: sd initializer.
+	init isNil ifTrue: [^false].
+	(isNilLiteralNode: init) ifTrue: [^false].
+	^true
+)
+countRefsOf: bSym in: src
+	classStart: cs classEnd: ce
+	methodStart: ms methodEnd: me
+	slotStart: ss slotEnd: se ^ <Array> = (
+	(* Conservative whole-word textual scan of the class span for references to
+	   bSym outside the accessor method and the slot declaration. Returns
+	   {readElsewhere <Boolean>. writePositions <List[Integer]>}. An occurrence
+	   immediately followed by `::` is a write (its start position is collected, so
+	   a mutable conversion can rewrite it to the lazy slot''s setter); any other
+	   occurrence is a read. *)
+	| bStr len read writes p hi |
+	bStr:: bSym asString.
+	len:: bStr size.
+	read:: false.
+	writes:: List new.
+	hi:: ce.
+	src size < hi ifTrue: [hi:: src size].
+	p:: cs.
+	[p + len - 1 <= hi] whileTrue:
+		[((src copyFrom: p to: p + len - 1) = bStr) ifTrue:
+			[| beforeOk afterByte afterOk |
+			 beforeOk:: (p = 1) or: [(isIdentByte: (src at: p - 1)) not].
+			 afterByte:: (p + len <= src size) ifTrue: [src at: p + len] ifFalse: [0].
+			 afterOk:: (afterByte = 0) or: [(isIdentByte: afterByte) not].
+			 (beforeOk and: [afterOk]) ifTrue:
+				[| inM inS |
+				 inM:: (p >= ms) and: [p <= me].
+				 inS:: (p >= ss) and: [p <= se].
+				 (inM or: [inS]) ifFalse:
+					[((afterByte = 58) and: [(p + len + 1 <= src size) and: [(src at: p + len + 1) = 58]])
+						ifTrue: [writes add: p]
+						ifFalse: [read:: true]]]].
+		 p:: p + 1].
+	^{read. writes}
+)
+isIdentByte: b ^ <Boolean> = (
+	(b >= 48 and: [b <= 57]) ifTrue: [^true].
+	(b >= 65 and: [b <= 90]) ifTrue: [^true].
+	(b >= 97 and: [b <= 122]) ifTrue: [^true].
+	^b = 95
+)
+firstByte: b in: s ^ <Integer> = (
+	1 to: s size do: [:i | (s at: i) = b ifTrue: [^i]].
+	^0
+)
+lastByte: b in: s ^ <Integer> = (
+	s size to: 1 by: -1 do: [:i | (s at: i) = b ifTrue: [^i]].
+	^0
+)
+firstByteFrom: b in: s startingAt: k ^ <Integer> = (
+	k to: s size do: [:i | (s at: i) = b ifTrue: [^i]].
+	^0
+)
+slotTrueEnd: sd from: src ^ <Integer> = (
+	(* The real source end of a (no-initializer) header slot: the closing '>' of
+	   its type if typed, else the end of its name. The parser''s sd end is
+	   unreliable (it points at the token after the slot). *)
+	| t typeEnd gt |
+	t:: sd type.
+	t isNil ifTrue: [^sd slotDecl end].
+	typeEnd:: t end.
+	gt:: firstByteFrom: 62 in: src startingAt: typeEnd.
+	gt = 0 ifTrue: [^typeEnd].
+	^gt
+)
+classRawEnd: classAST ^ <Integer> = (
+	(* Max source end over the class''s members and nested classes. The parser
+	   leaves ClassDeclarationAST end at 0, so reconstruct a bound here. *)
+	| a b |
+	a:: sideRawEnd: classAST instanceSide.
+	b:: sideRawEnd: classAST classSide.
+	a > b ifTrue: [^a].
+	^b
+)
+sideRawEnd: side ^ <Integer> = (
+	| mx |
+	side isNil ifTrue: [^0].
+	mx:: 0.
+	side methods isNil ifFalse: [side methods do: [:m | m end > mx ifTrue: [mx:: m end]]].
+	side lazySlots isNil ifFalse: [side lazySlots do: [:s | s end > mx ifTrue: [mx:: s end]]].
+	side nestedClasses isNil ifFalse:
+		[side nestedClasses do: [:nc | | e | e:: classRawEnd: nc. e > mx ifTrue: [mx:: e]]].
+	^mx
+)
+slotTypeText: sd endingAt: se from: src ^ <String> = (
+	(* The bracketed type `<...>` of a (no-initializer) header slot, or '' if untyped. *)
+	| s lt gt |
+	s:: src copyFrom: sd start to: se.
+	lt:: firstByte: 60 in: s.
+	lt = 0 ifTrue: [^''].
+	gt:: lastByte: 62 in: s.
+	gt <= lt ifTrue: [^''].
+	^s copyFrom: lt to: gt
+)
+methodReturnTypeText: m from: src ^ <String> = (
+	(* The bracketed return type `<...>` from a unary accessor header, or ''. *)
+	| bodyOpen hdr lt gt |
+	bodyOpen:: firstByteFrom: 40 in: src startingAt: m start.
+	bodyOpen = 0 ifTrue: [^''].
+	hdr:: src copyFrom: m start to: bodyOpen - 1.
+	lt:: firstByte: 60 in: hdr.
+	lt = 0 ifTrue: [^''].
+	gt:: lastByte: 62 in: hdr.
+	gt <= lt ifTrue: [^''].
+	^hdr copyFrom: lt to: gt
+)
+firstCommentIn: src from: a to: b ^ <String> = (
+	(* The first (* ... *) comment (nesting-aware) wholly within [a, b], or nil. *)
+	| p |
+	p:: a.
+	[p < b] whileTrue:
+		[((src at: p) = 40 and: [(src at: p + 1) = 42]) ifTrue:
+			[| open depth |
+			 open:: p.
+			 depth:: 1.
+			 p:: p + 2.
+			 [(depth > 0) and: [p <= b]] whileTrue:
+				[((p + 1 <= b) and: [(src at: p) = 40 and: [(src at: p + 1) = 42]])
+					ifTrue: [depth:: depth + 1. p:: p + 2]
+					ifFalse:
+						[((p + 1 <= b) and: [(src at: p) = 42 and: [(src at: p + 1) = 41]])
+							ifTrue: [depth:: depth - 1. p:: p + 2]
+							ifFalse: [p:: p + 1]]].
+			 depth = 0 ifTrue: [^src copyFrom: open to: p - 1].
+			 ^nil].
+		 p:: p + 1].
+	^nil
+)
+methodCommentOf: m src: src firstStmtStart: fs ^ <String> = (
+	| bodyOpen |
+	bodyOpen:: firstByteFrom: 40 in: src startingAt: m start.
+	bodyOpen = 0 ifTrue: [^nil].
+	bodyOpen >= fs ifTrue: [^nil].
+	^firstCommentIn: src from: bodyOpen + 1 to: fs - 1
+)
+slotTrailingCommentInfo: sd endingAt: se src: src ^ <Array> = (
+	(* {commentText. commentEndPos} for a same-line (* *) trailing the slot, or nil. *)
+	| p c |
+	p:: se + 1.
+	[(p <= src size) and: [((src at: p) = 32) or: [(src at: p) = 9]]] whileTrue: [p:: p + 1].
+	((p + 1 <= src size) and: [(src at: p) = 40 and: [(src at: p + 1) = 42]]) ifFalse: [^nil].
+	c:: firstCommentIn: src from: p to: src size.
+	c isNil ifTrue: [^nil].
+	^{c. (p + c size) - 1}
+)
+buildLazyForSelector: sel modifier: am typeText: tt initSrc: initSrc
+	methodComment: mc slotComment: sc mutable: mutable ^ <String> = (
+	| s modText assign |
+	s:: ''.
+	(mc isNil) ifFalse: [s:: s, mc, String lf].
+	(sc isNil) ifFalse: [s:: s, sc, String lf].
+	am = #public
+		ifTrue: [modText:: 'public ']
+		ifFalse: [am = #private ifTrue: [modText:: 'private '] ifFalse: [modText:: '']].
+	s:: s, 'lazy ', modText, sel asString.
+	(tt isEmpty) ifFalse: [s:: s, ' ', tt].
+	assign:: mutable ifTrue: [' ::= '] ifFalse: [' = '].
+	s:: s, assign, initSrc, '.'.
+	^s
+)
+slotNameDeclaredInNested: bSym <Symbol> in: classAST ^ <Boolean> = (
+	(* True if any nested class (recursively, either side) declares a header slot
+	   named bSym. A mutable conversion renames external `bSym:: x` writes to the
+	   generated setter, but a same-named slot in a nested class is a DIFFERENT slot
+	   — the whole-class textual scan can''t tell them apart, so renaming would
+	   corrupt the nested class. Exclude these (#slotNameShadowed) to stay safe. *)
+	(sideHasNestedSlot: bSym in: classAST instanceSide) ifTrue: [^true].
+	^sideHasNestedSlot: bSym in: classAST classSide
+)
+sideHasNestedSlot: bSym <Symbol> in: side ^ <Boolean> = (
+	side isNil ifTrue: [^false].
+	side nestedClasses isNil ifTrue: [^false].
+	side nestedClasses do: [:nc |
+		(headerSlotNamed: bSym in: nc header) isNil ifFalse: [^true].
+		(slotNameDeclaredInNested: bSym in: nc) ifTrue: [^true]].
+	^false
+)
+hasExplicitSetterFor: sel <Symbol> in: classAST ^ <Boolean> = (
+	(* True if the class declares a method named `sel:` (the accessor name plus a
+	   colon) on either side — that hand-written setter would clash with the one a
+	   `lazy n ::= e` slot generates. *)
+	| setterSel |
+	setterSel:: (sel asString, ':') asSymbol.
+	(sideDeclaresSelector: setterSel in: classAST instanceSide) ifTrue: [^true].
+	^sideDeclaresSelector: setterSel in: classAST classSide
+)
+sideDeclaresSelector: sel <Symbol> in: side ^ <Boolean> = (
+	side isNil ifTrue: [^false].
+	side methods isNil ifTrue: [^false].
+	side methods do: [:mm | mm selector = sel ifTrue: [^true]].
+	^false
+)
+isEagerInit: writes <List[Integer]> in: classAST src: src ^ <Boolean> = (
+	(* True if any external write to the backing slot sits in a method whose
+	   selector is invoked from the instance initializer''s init expressions — i.e.
+	   the slot is populated at construction, so it is eager rather than lazy. *)
+	| initSrc |
+	initSrc:: initExprsSource: classAST in: src.
+	initSrc isEmpty ifTrue: [^false].
+	writes do: [:p |
+		| sel |
+		sel:: enclosingMethodSelectorAt: p in: classAST.
+		sel isNil ifFalse:
+			[((initSrc indexOf: (firstKeyword: sel)) > 0) ifTrue: [^true]]].
+	^false
+)
+enclosingMethodSelectorAt: pos <Integer> in: classAST ^ <Symbol> = (
+	| sel |
+	sel:: methodSelectorContaining: pos in: classAST instanceSide.
+	sel isNil ifFalse: [^sel].
+	^methodSelectorContaining: pos in: classAST classSide
+)
+methodSelectorContaining: pos <Integer> in: side ^ <Symbol> = (
+	side isNil ifTrue: [^nil].
+	side methods isNil ifTrue: [^nil].
+	side methods do: [:mm | ((pos >= mm start) and: [pos <= mm end]) ifTrue: [^mm selector]].
+	^nil
+)
+initExprsSource: classAST in: src ^ <String> = (
+	(* Verbatim source spanning the class''s instance-initializer init expressions
+	   (between the slot bar and the header''s close paren), or '' if there are none. *)
+	| inits |
+	inits:: classAST header initExprs.
+	(inits isNil or: [inits isEmpty]) ifTrue: [^''].
+	^src copyFrom: inits first start to: inits last end
+)
+firstKeyword: sel <Symbol> ^ <String> = (
+	(* The selector''s first keyword as it appears in a send: up to and including the
+	   first colon for keyword selectors (foo:bar: -> 'foo:'), else the whole unary
+	   selector. *)
+	| s i |
+	s:: sel asString.
+	i:: firstByte: 58 in: s.
+	i = 0 ifTrue: [^s].
+	^s copyFrom: 1 to: i
+)
+applyEdits: edits to: src ^ <String> = (
+	(* Apply non-overlapping {start. end. replacement} edits, highest start first. *)
+	| arr result |
+	arr:: edits.
+	1 to: arr size do:
+		[:i | | maxIdx |
+		 maxIdx:: i.
+		 i + 1 to: arr size do:
+			[:j | ((arr at: j) at: 1) > ((arr at: maxIdx) at: 1) ifTrue: [maxIdx:: j]].
+		 maxIdx = i ifFalse:
+			[| tmp | tmp:: arr at: i. arr at: i put: (arr at: maxIdx). arr at: maxIdx put: tmp]].
+	result:: src.
+	arr do:
+		[:e | | s en rep |
+		 s:: e at: 1.
+		 en:: e at: 2.
+		 rep:: e at: 3.
+		 result:: (result copyFrom: 1 to: s - 1), rep, (result copyFrom: en + 1 to: result size)].
+	^result
+)
+) : (
+)

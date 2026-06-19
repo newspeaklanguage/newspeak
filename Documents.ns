@@ -1855,6 +1855,72 @@ public freshDocumentFromDOM: dom <Alien[Node]> registry: registry <Map[String, B
   doc maxAmpletCount: (amplets at: 'length').
   ^doc
 )
+public loadedDocumentFromDOM: dom <Alien[Node]> registry: registry <Map[String, Blob]> into: namespace <NamespaceSubject> named: n <String> ^ <Document> = (
+  (* Build or refresh the document being loaded, honouring the invariant
+     that a document's class has exactly one instance.
+
+     Division of labour, now that the atomic installer correctly updates
+     nested classes (see MirrorsForPrimordialSoup AtomicInstaller /
+     MutableNestedClassGroup>>addFromSource:):
+
+       - CODE is handled entirely by the install. classOfHTMLDocument:
+         (re)installs the per-document class; the install migrates the
+         existing instance in place to the new definition, so its methods
+         update and its identity is preserved (Root bindings and
+         transclusions, which resolve Root[name] -> that instance, stay
+         connected).
+
+       - INSTANCE STATE is handled here. The install touches only the
+         class, never the instance's `contents` (HTML body), mediaRegistry
+         or maxAmpletCount, so those must be applied to the instance
+         explicitly.
+
+     allInstances of the class is therefore 0 or 1:
+       0 -> first load: create the instance, set its state, bind it in the
+            namespace.
+       1 -> already loaded: apply body/media/count to THAT instance in
+            place. Do NOT create a second instance or rebind Root — either
+            would orphan the existing instance (open views/transclusions
+            still point at it) and break the one-instance invariant, even
+            though the install already fixed its code.
+     Body is set with the quiet `contents:` setter (NOT mutateContentsTo:),
+     so the refresh rides the load's updateGUI: rather than the
+     contentsChanged duct — whose selective refresh reuses cached amplet
+     fragments and would leave embedded presenters stale.
+     (Caveat: reusing the instance does not re-run its initializer, so a
+     brand-new slot added across a reload starts nil rather than its
+     initializer value. Layout migration is handled by the install; only
+     re-initialization of genuinely new slots is skipped.) *)
+  |
+  amplets = dom getElementsByClassName: #ampleforth.
+  count <Integer> = amplets at: 'length'.
+  cls = classOfHTMLDocument: dom.
+  body <String> = textOfHTMLDocument: dom.
+  existing <Document> ::= nil.
+  instanceCount <Integer> ::= 0.
+  fresh <Document>
+  |
+  (* Assign ids to the amplets (in case they didn't have any) *)
+  1 to: count do: [:index <Integer> |
+    (amplets at: index - 1) setAttribute: #ampletId to: index printString].
+  (ClassMirror reflecting: cls) allInstances do: [:inst <Document> |
+    instanceCount:: instanceCount + 1.
+    existing:: inst].
+  instanceCount > 1 ifTrue: [
+    Error signal: 'Document class ', n, ' has ', instanceCount printString,
+      ' instances; the one-instance-per-document invariant is broken'].
+  existing isNil ifFalse: [
+    (* Identity-preserving refresh of the sole existing instance. *)
+    existing mediaRegistry: registry.
+    existing maxAmpletCount: count.
+    existing contents: body.
+    ^existing].
+  fresh:: cls contents: body.
+  fresh mediaRegistry: registry.
+  fresh maxAmpletCount: count.
+  namespace model at: n put: fresh.
+  ^fresh
+)
 loadImagesFrom: imageFolder <JSZip>
 dom: dom <JSHTMLElement>
 documentName: n <String> 
@@ -1973,10 +2039,10 @@ public loadDocument: jsz <JSZip> named: n <String> into: namespace <NamespaceSub
          loadImagesFrom: imageFolder dom: dom documentName: n registry: mediaRegistry ifSuccess: [
            loadVideosFrom: videoFolder dom: dom documentName: n registry: mediaRegistry ifSuccess: [
              loadAudiosFrom: audioFolder dom: dom documentName: n registry: mediaRegistry ifSuccess: [
-                 (* Create a regular doc from the revised DOM, and give it a chance to load docu-app specific content *)
-                 doc:: ide documents freshDocumentFromDOM: dom registry: mediaRegistry.
-                 namespace model at: n put: doc.
-                 doc loadContentsUsingFolder: contents ifSuccess: successBlock ifFail: failureBlock. 
+                 (* Build/refresh the doc honouring one-instance-per-document (identity
+                    preserved on reload), then let it load docu-app specific content. *)
+                 doc:: ide documents loadedDocumentFromDOM: dom registry: mediaRegistry into: namespace named: n.
+                 doc loadContentsUsingFolder: contents ifSuccess: successBlock ifFail: failureBlock.
                  nil. 
              ]  ifFailure: [:ex | failureBlock value:  'Error audio folder: ', ex printString]. nil.
            ] ifFailure: [:ex | failureBlock value:  'Error video folder: ', ex printString]. nil.

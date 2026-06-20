@@ -286,10 +286,7 @@ public startChat = (
 	].
 	[js localStorage setItem: 'ns_ai_active_chat_doc' to: docName]
 		on: Exception do: [:e | ].
-	doc:: ChatDocument
-		named: docName
-		providerName: providerName
-		modelName: modelName.
+	doc:: createChatNamed: docName provider: providerName model: modelName.
 	Root at: docName asSymbol put: doc.
 	sharedChatSubject_slot:: doc chatSubject.
 	ide browsing updateCurrentDisplay.
@@ -652,6 +649,30 @@ respondToSwitchToChat: doc <ChatDocument> = (
 	makeCurrentChat: doc.
 	updateGUI: []
 )
+) : (
+)
+public class ChatControlsPresenter onSubject: doc <Document> = Presenter onSubject: doc (
+(*
+ Renders a chat document's control row (New Chat + chat switcher). Lives in
+ AI_IDE_Support so the rendering is single-sourced across every chat document;
+ a chat doc's `chatControls` amplet just forwards here (^ide aiSupport
+ chatControlsFor: self). Selecting a chat navigates to that chat's document
+ view — under the clone-template design each chat IS its own document, so
+ switching = showing that document.
+*)
+) (
+definition = (
+	^row: {
+		button: 'New Chat' action: [openNewChatSetup].
+		mediumBlank.
+		label: 'Chats:'.
+		smallBlank.
+		dropDownMenu: [menuWithLabelsAndActions: chatSwitchMenuActions].
+		filler.
+	}
+)
+public isKindOfChatControlsPresenter ^ <Boolean> = ( ^true )
+isMyKind: other ^ <Boolean> = ( ^other isKindOfChatControlsPresenter )
 ) : (
 )
 public class ChatDocument named: n <String>
@@ -1274,10 +1295,7 @@ public defaultChatDocumentOrCreate ^ <ChatDocument | UndefinedObject> = (
 	].
 	key:: apiKeyForProviderOrNil: 'anthropic'.
 	key isNil ifTrue: [^nil].
-	doc:: ChatDocument
-		named: activeName
-		providerName: 'anthropic'
-		modelName: 'claude-sonnet-4-6'.
+	doc:: createChatNamed: activeName provider: 'anthropic' model: 'claude-sonnet-4-6'.
 	Root at: activeName asSymbol put: doc.
 	^doc
 )
@@ -1739,6 +1757,288 @@ makeCurrentChat: doc <ChatDocument> ^ <IDEChatDocumentSubject> = (
 	   (it sets sharedChatSubject_slot and the localStorage key); this is the
 	   intention-revealing entry point used by the presenter chat switcher. *)
 	^doc chatSubject
+)
+(* === Clone-template chat documents (new design) ===
+   A chat is a clone of ChatDocument_Template: a plain Document subclass that
+   carries per-chat state slots + thin forwarders, with the actual logic here.
+   These `…For: doc` methods are the forwarder targets. (Additive — they are
+   only reached from the new template's forwarders; the legacy ChatDocument
+   class is untouched until the new path is verified.) *)
+public chatControlsFor: doc <Document> ^ <Presenter> = (
+	^ChatControlsPresenter onSubject: doc
+)
+public thinkingPickerFor: doc <Document> ^ <Presenter> = (
+	^ChatStatusPresenter onSubject: (chatSubjectFor: doc)
+)
+public inputEditorFor: doc <Document> ^ <Presenter> = (
+	^ChatInputPresenter onSubject: (chatSubjectFor: doc)
+)
+public chatSubjectFor: doc <Document> ^ <IDEChatDocumentSubject> = (
+	(* Build/cache the doc's IDEChatDocumentSubject (and its Session) on the
+	   doc's chatSubjectSlot, and make it the current shared chat + localStorage
+	   default — the clone-template counterpart of old ChatDocument>>chatSubject. *)
+	doc maxAmpletCount < 3 ifTrue: [doc maxAmpletCount: 3].
+	doc chatSubjectSlot isNil ifTrue: [
+		doc chatSubjectSlot: (IDEChatDocumentSubject onChatDocument: doc session: (createFreshSessionFor: doc))
+	].
+	sharedChatSubject_slot:: doc chatSubjectSlot.
+	[js localStorage setItem: 'ns_ai_active_chat_doc' to: doc name]
+		on: Exception do: [:e | ].
+	^doc chatSubjectSlot
+)
+createFreshSessionFor: doc <Document> ^ <Session> = (
+	(* Build a Session from the chat doc's stored provider/model (read from its
+	   HTML so they round-trip through save/load). Mirrors old
+	   ChatDocument>>createFreshSession. *)
+	| pn mn cls key provider session |
+	pn:: chatProviderOf: doc.
+	mn:: chatModelOf: doc.
+	key:: pn = 'openai-compat'
+		ifTrue: [(apiKeyForProviderOrNil: pn) isNil ifTrue: [''] ifFalse: [apiKeyForProvider: pn]]
+		ifFalse: [apiKeyForProvider: pn].
+	cls:: providerClassFor: pn.
+	provider:: pn = 'openai-compat'
+		ifTrue: [cls apiKey: key model: mn baseUrl: (baseUrlForProvider: pn)]
+		ifFalse: [cls apiKey: key model: mn].
+	session:: Session provider: provider tools: (toolsForProvider: provider).
+	session systemPrompt: newspeakSystemPrompt.
+	^session
+)
+chatProviderOf: doc <Document> ^ <String> = (
+	^chatMetaOf: doc attr: 'data-chat-provider' ifAbsent: 'anthropic'
+)
+chatModelOf: doc <Document> ^ <String> = (
+	^chatMetaOf: doc attr: 'data-chat-model' ifAbsent: 'claude-sonnet-4-6'
+)
+chatMetaOf: doc <Document> attr: attr <String> ifAbsent: default <String> ^ <String> = (
+	(* Read a data- attribute off the chat doc's self_ampleforth wrapper.
+	   provider/model live there so they survive save/load like any HTML. *)
+	| container wrappers wrapper v |
+	container:: parseAmpletContainer: doc contents.
+	wrappers:: container getElementsByClassName: 'self_ampleforth'.
+	(wrappers at: 'length') = 0 ifTrue: [^default].
+	wrapper:: wrappers at: 0.
+	(wrapper hasAttribute: attr) ifFalse: [^default].
+	v:: wrapper getAttribute: attr.
+	(v isNil or: [v isEmpty]) ifTrue: [^default].
+	^v
+)
+public appendSection: text <String> role: role <String> into: doc <Document> = (
+	(* Relocation of old ChatDocument>>insertTurnSection:role:, parameterized
+	   on the chat doc. Builds a chat-turn <div> and inserts it just before the
+	   modelMachineryGap, then writes contents back via doc mutateContentsTo:. *)
+	| container <Alien> thinking <Alien | UndefinedObject>
+	  gap <Alien> jsDoc <Alien>
+	  section <Alien> labelCol <Alien> textCol <Alien> parent <Alien>
+	  labelEl <Alien> textSpan <Alien>
+	  labelText <String> bg <String> border <String> fontStyle <String> |
+	container:: parseAmpletContainer: doc contents.
+	thinking:: findChatStructuralAmplet: 'thinkingOrModelPicker' in: container.
+	thinking isNil ifTrue: [
+		Error signal: 'Chat document is missing its structural amplets; cannot append turn'
+	].
+	gap:: ensureModelMachineryGap: container beforeThinking: thinking.
+	jsDoc:: js global at: 'document'.
+	section:: jsDoc createElement: 'div'.
+	section setAttribute: 'class' to: 'chat-turn'.
+	section setAttribute: 'data-role' to: role.
+	section setAttribute: 'contenteditable' to: 'false'.
+	role = 'user'
+		ifTrue: [
+			labelText:: 'You'.
+			bg:: aiColors userTurnBackground.
+			border:: aiColors userTurnBorder.
+			fontStyle:: 'italic'.
+		]
+		ifFalse: [
+			role = 'assistant'
+				ifTrue: [
+					labelText:: 'Assistant'.
+					bg:: aiColors assistantTurnBackground.
+					border:: aiColors assistantTurnBorder.
+					fontStyle:: 'normal'.
+				]
+				ifFalse: [
+					labelText:: 'Error'.
+					bg:: aiColors errorTurnBackground.
+					border:: aiColors errorTurnBorder.
+					fontStyle:: 'normal'.
+				]
+		].
+	section setAttribute: 'style' to:
+		'display:flex; flex-direction:row; align-items:flex-start; border:1px solid ', border,
+		'; border-radius:6px; padding:8px 12px; margin:12px 0; background-color:', bg, ';'.
+	labelCol:: jsDoc createElement: 'div'.
+	labelCol setAttribute: 'style' to:
+		'min-width:5em; max-width:5em; padding-right:1em; text-align:right; flex-shrink:0;'.
+	labelEl:: jsDoc createElement: 'strong'.
+	labelEl at: 'textContent' put: labelText.
+	labelCol appendChild: labelEl.
+	textCol:: jsDoc createElement: 'div'.
+	textCol setAttribute: 'style' to: 'flex:1; min-width:0;'.
+	textSpan:: jsDoc createElement: 'span'.
+	textSpan setAttribute: 'style' to: 'white-space:pre-wrap; font-style:', fontStyle, ';'.
+	textSpan at: 'textContent' put: text.
+	textCol appendChild: textSpan.
+	section appendChild: labelCol.
+	section appendChild: textCol.
+	parent:: gap at: 'parentNode'.
+	parent insertBefore: section before: gap.
+	doc mutateContentsTo: (container at: 'innerHTML')
+)
+public appendChangesetAmplet: id <String> into: doc <Document> = (
+	(* Relocation of old ChatDocument>>appendChangesetAmpletFor:. Inserts a
+	   `changesetPresenterFor: 'csN'` amplet before the model-machinery gap;
+	   the doc's forwarder re-routes that expression back here on render. *)
+	| container thinking gap jsDoc amplet ampletId parent expr |
+	container:: parseAmpletContainer: doc contents.
+	thinking:: findChatStructuralAmplet: 'thinkingOrModelPicker' in: container.
+	thinking isNil ifTrue: [
+		Error signal: 'Chat document is missing its structural amplets; cannot append amplet'
+	].
+	gap:: ensureModelMachineryGap: container beforeThinking: thinking.
+	jsDoc:: js global at: 'document'.
+	doc maxAmpletCount: doc maxAmpletCount + 1.
+	ampletId:: doc maxAmpletCount printString.
+	expr:: 'changesetPresenterFor: ''', id, ''''.
+	amplet:: jsDoc createElement: 'div'.
+	amplet setAttribute: 'class' to: 'ampleforth'.
+	amplet setAttribute: 'ampletId' to: ampletId.
+	amplet setAttribute: 'name' to: expr.
+	amplet setAttribute: 'contenteditable' to: 'false'.
+	amplet setAttribute: 'style' to: 'display:block; margin:8px 0;'.
+	parent:: gap at: 'parentNode'.
+	parent insertBefore: amplet before: gap.
+	doc mutateContentsTo: (container at: 'innerHTML')
+)
+public forgetCachedChangesetSubject: id <String> for: doc <Document> = (
+	doc changesetSubjectsById removeKey: id ifAbsent: []
+)
+public changesetPresenter: id <String> for: doc <Document> ^ <Object> = (
+	(* Relocation of old ChatDocument>>changesetPresenterFor:. Returns a
+	   ChangesetPresenter on the doc-cached ChangesetSubject for `id`, or a
+	   stable banner when the proposal is no longer pending. *)
+	| records subject |
+	records:: proposedChangesets at: id ifAbsent: [nil].
+	records isNil ifTrue: [
+		doc changesetSubjectsById removeKey: id ifAbsent: [].
+		^(label: 'Changeset ', id, ' is no longer pending.') italic
+	].
+	subject:: doc changesetSubjectsById at: id ifAbsent: [
+		| strategy s |
+		strategy:: AIInstallStrategy
+			onRecords: records
+			changesetId: id
+			onApplied: [:csId :recCount |
+				appendSection:
+					('Applied changeset ', csId, ' (',
+					recCount printString,
+					(recCount = 1
+						ifTrue: [' record).']
+						ifFalse: [' records).']))
+					role: 'assistant'
+					into: doc]
+			onCanceled: [
+				forgetCachedChangesetSubject: id for: doc.
+				doc mutateContentsTo: doc contents]
+			onComputed: [
+				doc mutateContentsTo: doc contents].
+		s:: ChangesetSubject
+			onLiveNamespace: Root
+			title: 'Apply changeset ', id
+			strategy: strategy.
+		s autoExpand: true.
+		doc changesetSubjectsById at: id put: s.
+		s].
+	^ChangesetPresenter onSubject: subject
+)
+public clearConversationFor: doc <Document> = (
+	doc chatSubjectSlot isNil ifFalse: [doc chatSubjectSlot session clearHistory]
+)
+public invalidateChatAmpletCachesOn: editor = (
+	(* Relocation of old ChatDocument>>invalidateAmpletCachesOn:. Drops every
+	   cached amplet fragment/expression except the doc-identity entry so the
+	   structural amplets re-evaluate (their state lives on the chat subject). *)
+	| keysToRemove <List> |
+	keysToRemove:: List new.
+	editor fragmentMapping keysAndValuesDo: [:k :v |
+		k = 'AmpleforthTargetDocument' ifFalse: [keysToRemove add: k]].
+	keysToRemove do: [:k | editor fragmentMapping removeKey: k].
+	keysToRemove:: List new.
+	editor expressionMapping keysAndValuesDo: [:k :v | keysToRemove add: k].
+	keysToRemove do: [:k | editor expressionMapping removeKey: k]
+)
+public pendingChangesetIdsFor: doc <Document> ^ <List[String]> = (
+	(* Lazy-init the doc's pending-changeset list in the module (which has List
+	   in scope; a DocumentHolder-nested chat class may not). Stored on the
+	   doc's bare pendingChangesetIdsSlot. *)
+	doc pendingChangesetIdsSlot isNil ifTrue: [doc pendingChangesetIdsSlot: List new].
+	^doc pendingChangesetIdsSlot
+)
+public changesetSubjectsByIdFor: doc <Document> ^ <Map[String, Object]> = (
+	doc changesetSubjectsByIdSlot isNil ifTrue: [doc changesetSubjectsByIdSlot: Map new].
+	^doc changesetSubjectsByIdSlot
+)
+chatTemplateClassBody ^ <String> = (
+	(* The shared class body every chat document carries (the "template"). It
+	   holds only per-chat state slots + thin forwarders to the `…For: doc`
+	   module methods above, so the real chat logic is single-sourced here and
+	   evolves for all chats (old saved ones included). Emitted into the
+	   `classBody="…"` attribute of the document wrapper by createChatNamed:…,
+	   so it MUST contain no double-quote characters (single-quoted strings are
+	   doubled per Newspeak literal rules). `ide` resolves lexically to
+	   DocumentHolder's ide slot (= webIDE) where these per-doc classes nest. *)
+	^'(
+|
+	public chatSubjectSlot ::= nil.
+	public pendingChangesetIdsSlot ::= nil.
+	public changesetSubjectsByIdSlot ::= nil.
+|
+) (
+public isKindOfChatDocument ^ <Boolean> = ( ^true )
+public chatSubject = ( ^ide aiSupport chatSubjectFor: self )
+public session = ( ^chatSubject session )
+public prepareForLiveViewRefresh: editor = ( ide aiSupport invalidateChatAmpletCachesOn: editor )
+public chatControls = ( ^ide aiSupport chatControlsFor: self )
+public thinkingOrModelPicker = ( ^ide aiSupport thinkingPickerFor: self )
+public userInputEditor = ( ^ide aiSupport inputEditorFor: self )
+public pendingChangesetIds = ( ^ide aiSupport pendingChangesetIdsFor: self )
+public changesetSubjectsById = ( ^ide aiSupport changesetSubjectsByIdFor: self )
+public appendUserSection: text = ( ide aiSupport appendSection: text role: ''user'' into: self )
+public appendAssistantSection: text = ( ide aiSupport appendSection: text role: ''assistant'' into: self )
+public appendErrorSection: text = ( ide aiSupport appendSection: text role: ''error'' into: self )
+public appendChangesetAmpletFor: id = ( ide aiSupport appendChangesetAmplet: id into: self )
+public forgetCachedChangesetSubjectFor: id = ( ide aiSupport forgetCachedChangesetSubject: id for: self )
+public changesetPresenterFor: id = ( ^ide aiSupport changesetPresenter: id for: self )
+public clearConversation = ( ide aiSupport clearConversationFor: self )
+)'
+)
+chatShellInnerHTMLForName: n <String> provider: pn <String> model: mn <String> ^ <String> = (
+	(* The chat document body (becomes `contents`): an editable self_ampleforth
+	   canvas carrying provider+model as data- attributes (so they round-trip
+	   through save/load with no custom load hook) plus the three structural
+	   amplets. Counterpart of old initialChatDocumentContents:. *)
+	^'<div class="self_ampleforth" contenteditable="true" data-chat-provider="', pn, '" data-chat-model="', mn, '" style="border: 2px solid blue; resize: horizontal; overflow: auto; overflow-wrap: break-word; width: 40em;" onkeyup="updateRawHTML()" ondragover="((e) => {e.preventDefault();})(event)"> <!-- self_ampleforth -->
+<h1>', n, '</h1>
+<div class="ampleforth" ampletId="1" name="chatControls" contenteditable="false"> </div>
+<div class="modelMachineryGap" style="display:block; min-height:3em; padding:0.5em; margin:0.5em 0;"> </div>
+<div class="ampleforth" ampletId="2" name="thinkingOrModelPicker" contenteditable="false"> </div>
+<div class="ampleforth" ampletId="3" name="userInputEditor" contenteditable="false" style="display:block; width:100%; min-height:4em; margin-top:0.5em;"> </div>
+</div>'
+)
+createChatNamed: n <String> provider: pn <String> model: mn <String> ^ <Document> = (
+	(* Create a chat as an ordinary per-document-class document (the
+	   clone-template realization): build the standard document wrapper with the
+	   chat template class body + the shell HTML, and hand it to the generic
+	   public creator. The result is a Document subclass nested in DocumentHolder
+	   — load-compatible by construction and listed like any document. Does NOT
+	   bind into a namespace; the caller binds where it wants. *)
+	| wrapper |
+	wrapper:: '<div class = "ampleforthDocumentClass" name = "', n,
+		'" classBody = "', chatTemplateClassBody,
+		'"></div><div class = "ampleforthDocumentBody" edition="2">',
+		(chatShellInnerHTMLForName: n provider: pn model: mn), '</div>'.
+	^ide documents freshDocumentWithContents: wrapper
 )
 classDeclarationNamed: name <String> ^ <ClassDeclarationMirror> = (
 	| cls |
@@ -2892,10 +3192,7 @@ createChatDocumentTool ^ <Tool> = (
 			provider:: (input includesKey: 'provider')
 				ifTrue: [input at: 'provider']
 				ifFalse: ['anthropic'].
-			doc:: ChatDocument
-				named: leaf
-				providerName: provider
-				modelName: (input at: 'model_name').
+			doc:: createChatNamed: leaf provider: provider model: (input at: 'model_name').
 			parent at: leaf asSymbol put: doc.
 			ide browsing updateCurrentDisplay.
 			'Created chat document ', name

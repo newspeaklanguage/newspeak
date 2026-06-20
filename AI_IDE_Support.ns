@@ -267,7 +267,7 @@ public startChat = (
 	   it as the active chat doc (localStorage + sharedChatSubject_slot),
 	   and return a DocumentSubject so navigation lands on the new doc.
 	   Returns nil on validation failure with errorMessage set. *)
-	| doc <ChatDocument> |
+	| doc <Document> |
 	apiKey isEmpty ifTrue: [
 		errorMessage:: 'Please enter an API key.'.
 		^nil
@@ -642,7 +642,7 @@ chatSwitcher = (
 		]
 	}
 )
-respondToSwitchToChat: doc <ChatDocument> = (
+respondToSwitchToChat: doc <Document> = (
 	(* Make doc the current shared chat (also the default for new presenters)
 	   and refresh: ensureSharedChat now returns doc's subject, so the page
 	   refresh reinstalls the inline chat toggle (ProgrammingPresenter>>
@@ -677,311 +677,7 @@ public isKindOfChatControlsPresenter ^ <Boolean> = ( ^true )
 isMyKind: other ^ <Boolean> = ( ^other isKindOfChatControlsPresenter )
 ) : (
 )
-public class ChatDocument named: n <String>
-                          providerName: pn <String>
-                          modelName: mn <String>
-	= Document named: n contents: (initialChatDocumentContents: n) (
-(*
- A persistent chat conversation rendered as an Ampleforth document.
- The body contains three structural amplets:
-   chatControls           a fixed row of buttons + chat picker
-   thinkingOrModelPicker  the status indicator (thinking / model picker)
-   userInputEditor        the message input
-
- Each chat turn (user, assistant, error) is materialised as a
- contenteditable="false" <div class="chat-turn"> inserted into the
- contents, just before the thinking amplet. This way "history accumulates
- above the input" exactly like a transcript.
-
- The Session backing the conversation is owned by chatSubject_slot
- (created lazily on first chatSubject send), built from providerName +
- modelName at session-creation time.
-*)
-|
-	public providerName <String> = pn.
-	public modelName <String> ::= mn.
-	chatSubject_slot.
-	(* List of changeset ids proposed during the in-flight assistant
-	   turn. Drained by IDEChatDocumentSubject>>markComplete, which
-	   appends one ampleforth amplet per id after the assistant section
-	   has been inserted. The amplets render via changesetPresenterFor:
-	   below. *)
-	public pendingChangesetIds <List[String]> = List new.
-	(* Cache of ChangesetSubject by changeset id. prepareForLiveViewRefresh:
-	   nukes the Ampleforth fragment cache on every refresh, so
-	   changesetPresenterFor: gets re-invoked per render. Without a
-	   stable subject the first render's synchronous compute calls
-	   refreshBlock → updateGUI → another render → fresh subject →
-	   compute → ... runaway. Caching the subject keeps changeset_slot
-	   populated so computeAsync: short-circuits on the second pass. *)
-	public changesetSubjectsById <Map[String, Object]> = Map new.
-|
-) (
-public isKindOfChatDocument ^ <Boolean> = ( ^true )
-public prepareForLiveViewRefresh: editor = (
-	(* Clear the editor's amplet fragmentMapping/expressionMapping caches
-	   before the live view refreshes. The TwoViewEditor caches each
-	   amplet's evaluated fragment by ampletId; for chat docs the
-	   structural amplets (chatControls, thinkingOrModelPicker,
-	   userInputEditor) evaluate to fragments whose state depends on the
-	   chat subject (e.g. ChatStatusPresenter's waiting flag), so reusing
-	   a cached fragment would freeze that state. The AmpleforthTarget-
-	   Document entry is preserved because it carries the doc identity,
-	   not an amplet result. The chat input's typed-but-unsent draft
-	   survives because it's bound to the chat subject's `draft` slot,
-	   not held in the recreated CodeMirror's UI state. *)
-	invalidateAmpletCachesOn: editor
-)
-public chatSubject ^ <IDEChatDocumentSubject> = (
-	(* Skip past the structural amplet ids (1..3) so AI-inserted amplets
-	   via add_amplet get fresh ids starting at 4. *)
-	maxAmpletCount < 3 ifTrue: [maxAmpletCount: 3].
-	chatSubject_slot isNil ifTrue: [
-		chatSubject_slot:: IDEChatDocumentSubject onChatDocument: self session: createFreshSession
-	].
-	(* Mark this doc as the active chat doc. The structural amplets call
-	   chatSubject on every render, so this implements "most recently viewed
-	   chat doc wins" for ephemeral brain-button chats (which pull
-	   sharedChatSubject_slot) and for the next-session default. *)
-	sharedChatSubject_slot:: chatSubject_slot.
-	[js localStorage setItem: 'ns_ai_active_chat_doc' to: name]
-		on: Exception do: [:e | ].
-	^chatSubject_slot
-)
-public session ^ <Session> = ( ^chatSubject session )
-createFreshSession ^ <Session> = (
-	(* Build a brand-new Session bound to a fresh Provider — used on first
-	   chatSubject access and on Clear. API key is read from localStorage
-	   under the per-provider key; missing key raises (which surfaces as a
-	   chat error rather than a silent empty conversation). For the
-	   OpenAI-compatible provider we additionally read the base URL from
-	   localStorage and use the 3-arg factory; other providers use the
-	   2-arg form. *)
-	| provider <Provider> session <Session> key <String> cls |
-	key:: providerName = 'openai-compat'
-		ifTrue: [(apiKeyForProviderOrNil: providerName) isNil
-					ifTrue: ['']
-					ifFalse: [apiKeyForProvider: providerName]]
-		ifFalse: [apiKeyForProvider: providerName].
-	cls:: providerClassFor: providerName.
-	provider:: providerName = 'openai-compat'
-		ifTrue: [cls apiKey: key model: modelName baseUrl: (baseUrlForProvider: providerName)]
-		ifFalse: [cls apiKey: key model: modelName].
-	session:: Session provider: provider tools: (toolsForProvider: provider).
-	session systemPrompt: newspeakSystemPrompt.
-	^session
-)
-public thinkingOrModelPicker = (
-	^ChatStatusPresenter onSubject: chatSubject
-)
-public userInputEditor = (
-	^ChatInputPresenter onSubject: chatSubject
-)
-public chatControls = (
-	^row: {
-		button: 'New Chat' action: [openNewChatSetup].
-		mediumBlank.
-		chatDocPicker.
-		filler.
-	}
-)
-chatDocPicker = (
-	(* Dropdown listing every ChatDocument in Root. Selecting one navigates
-	   the IDE to it, which makes it the active chat doc (via the chatSubject
-	   side-effect on render). Order: insertion order of Root, which is
-	   roughly creation order — fine for now. Enumeration + navigation are
-	   shared with the regular presenter's switcher via chatSwitchMenuActions. *)
-	^row: {
-		label: 'Chats:'.
-		smallBlank.
-		dropDownMenu: [
-			menuWithLabelsAndActions: chatSwitchMenuActions
-		]
-	}
-)
-public appendUserSection: text <String> = (
-	insertTurnSection: text role: 'user'
-)
-public appendAssistantSection: text <String> = (
-	insertTurnSection: text role: 'assistant'
-)
-public appendErrorSection: text <String> = (
-	insertTurnSection: text role: 'error'
-)
-public appendChangesetAmpletFor: id <String> = (
-	(* Insert a new ampleforth amplet just before the model machinery
-	   gap so it sits inline in the transcript at the point the
-	   assistant delivered the proposal, while leaving the picker /
-	   input editor on their own line below. The amplet's `name` is
-	   the source expression evaluated by evaluateFragment: — `self`
-	   is the ChatDocument, so `changesetPresenterFor: 'csN'`
-	   resolves directly to the method below. *)
-	| container thinking gap jsDoc amplet ampletId parent expr |
-	container:: parseAmpletContainer: contents.
-	thinking:: findChatStructuralAmplet: 'thinkingOrModelPicker' in: container.
-	thinking isNil ifTrue: [
-		Error signal: 'ChatDocument is missing its structural amplets; cannot append amplet'
-	].
-	gap:: ensureModelMachineryGap: container beforeThinking: thinking.
-	jsDoc:: js global at: 'document'.
-	maxAmpletCount: maxAmpletCount + 1.
-	ampletId:: maxAmpletCount printString.
-	expr:: 'changesetPresenterFor: ', (asAmpletTextLiteral: id).
-	amplet:: jsDoc createElement: 'div'.
-	amplet setAttribute: 'class' to: 'ampleforth'.
-	amplet setAttribute: 'ampletId' to: ampletId.
-	amplet setAttribute: 'name' to: expr.
-	amplet setAttribute: 'contenteditable' to: 'false'.
-	amplet setAttribute: 'style' to: 'display:block; margin:8px 0;'.
-	parent:: gap at: 'parentNode'.
-	parent insertBefore: amplet before: gap.
-	mutateContentsTo: (container at: 'innerHTML')
-)
-public forgetCachedChangesetSubjectFor: id <String> = (
-	(* AIInstallStrategy>>onCancel uses this when the user discards a
-	   proposal so the next amplet evaluation sees no cached subject
-	   and renders the no-longer-pending banner. *)
-	changesetSubjectsById removeKey: id ifAbsent: []
-)
-public changesetPresenterFor: id <String> ^ <Object> = (
-	(* Amplet entry-point: evaluated by evaluateFragment: when the
-	   ChatDocument re-renders. Returns a fresh ChangesetPresenter
-	   wrapping the cached ChangesetSubject for this id, so the
-	   computed changeset_slot persists across renders and
-	   computeAsync: short-circuits — without the cache, each render
-	   builds a new subject whose synchronous compute triggers
-	   updateGUI → another render → ... runaway memory.
-
-	   When the changeset is no longer pending (applied, discarded,
-	   or never staged under this id), drop any cached subject and
-	   render a stable italic banner. *)
-	| records subject |
-	records:: proposedChangesets at: id ifAbsent: [nil].
-	records isNil ifTrue: [
-		changesetSubjectsById removeKey: id ifAbsent: [].
-		^(label: 'Changeset ', id, ' is no longer pending.') italic
-	].
-	subject:: changesetSubjectsById at: id ifAbsent: [
-		| strategy s doc |
-		doc:: self.
-		strategy:: AIInstallStrategy
-			onRecords: records
-			changesetId: id
-			onApplied: [:csId :recCount |
-				doc appendAssistantSection:
-					'Applied changeset ', csId, ' (',
-					recCount printString,
-					(recCount = 1
-						ifTrue: [' record).']
-						ifFalse: [' records).'])]
-			onCanceled: [
-				doc forgetCachedChangesetSubjectFor: id.
-				doc mutateContentsTo: doc contents]
-			onComputed: [
-				(* The deferred simulator has populated
-				   changeset_slot and updateGUI:'d, but the chat
-				   doc's live view only re-evaluates amplets when
-				   contentsChanged fires. Tickle it. *)
-				doc mutateContentsTo: doc contents].
-		s:: ChangesetSubject
-			onLiveNamespace: Root
-			title: 'Apply changeset ', id
-			strategy: strategy.
-		(* AI proposals open fully expanded — for a one-method
-		   change the user shouldn't have to drill class → instance
-		   side → methods → selector to see the diff. *)
-		s autoExpand: true.
-		changesetSubjectsById at: id put: s.
-		s].
-	^ChangesetPresenter onSubject: subject
-)
-public clearConversation = (
-	chatSubject_slot isNil ifFalse: [chatSubject_slot session clearHistory]
-)
-insertTurnSection: text <String> role: role <String> = (
-	(* Build a chat-turn <div> matching the inline ChatPresenter's
-	   messageFragment: shape (same colours, same layout) and insert it
-	   into the document contents just *before* the modelMachineryGap
-	   — so chronological order is preserved as turns accumulate
-	   above the input and the gap keeps the picker/input on their
-	   own line. The new HTML is then written back via contents:,
-	   which re-parses and re-renders. *)
-	| container <Alien> thinking <Alien | UndefinedObject>
-	  gap <Alien> jsDoc <Alien>
-	  section <Alien> labelCol <Alien> textCol <Alien> parent <Alien>
-	  labelEl <Alien> textSpan <Alien>
-	  labelText <String> bg <String> border <String> fontStyle <String> |
-	container:: parseAmpletContainer: contents.
-	thinking:: findChatStructuralAmplet: 'thinkingOrModelPicker' in: container.
-	thinking isNil ifTrue: [
-		Error signal: 'ChatDocument is missing its structural amplets; cannot append turn'
-	].
-	gap:: ensureModelMachineryGap: container beforeThinking: thinking.
-	jsDoc:: js global at: 'document'.
-	section:: jsDoc createElement: 'div'.
-	section setAttribute: 'class' to: 'chat-turn'.
-	section setAttribute: 'data-role' to: role.
-	section setAttribute: 'contenteditable' to: 'false'.
-	role = 'user'
-		ifTrue: [
-			labelText:: 'You'.
-			bg:: aiColors userTurnBackground.
-			border:: aiColors userTurnBorder.
-			fontStyle:: 'italic'.
-		]
-		ifFalse: [
-			role = 'assistant'
-				ifTrue: [
-					labelText:: 'Assistant'.
-					bg:: aiColors assistantTurnBackground.
-					border:: aiColors assistantTurnBorder.
-					fontStyle:: 'normal'.
-				]
-				ifFalse: [
-					(* 'error' — error messages surfaced from markError: *)
-					labelText:: 'Error'.
-					bg:: aiColors errorTurnBackground.
-					border:: aiColors errorTurnBorder.
-					fontStyle:: 'normal'.
-				]
-		].
-	section setAttribute: 'style' to:
-		'display:flex; flex-direction:row; align-items:flex-start; border:1px solid ', border,
-		'; border-radius:6px; padding:8px 12px; margin:12px 0; background-color:', bg, ';'.
-	(* Margin column: speaker label, right-aligned, fixed width *)
-	labelCol:: jsDoc createElement: 'div'.
-	labelCol setAttribute: 'style' to:
-		'min-width:5em; max-width:5em; padding-right:1em; text-align:right; flex-shrink:0;'.
-	labelEl:: jsDoc createElement: 'strong'.
-	labelEl at: 'textContent' put: labelText.
-	labelCol appendChild: labelEl.
-	(* Text column: speech, roman or italic *)
-	textCol:: jsDoc createElement: 'div'.
-	textCol setAttribute: 'style' to: 'flex:1; min-width:0;'.
-	textSpan:: jsDoc createElement: 'span'.
-	textSpan setAttribute: 'style' to: 'white-space:pre-wrap; font-style:', fontStyle, ';'.
-	textSpan at: 'textContent' put: text.
-	textCol appendChild: textSpan.
-	section appendChild: labelCol.
-	section appendChild: textCol.
-	parent:: gap at: 'parentNode'.
-	parent insertBefore: section before: gap.
-	mutateContentsTo: (container at: 'innerHTML')
-)
-invalidateAmpletCachesOn: editor = (
-	| keysToRemove <List> |
-	keysToRemove:: List new.
-	editor fragmentMapping keysAndValuesDo: [:k :v |
-			k = 'AmpleforthTargetDocument' ifFalse: [ keysToRemove add: k ]
-		].
-	keysToRemove do: [:k | editor fragmentMapping removeKey: k ].
-	keysToRemove:: List new.
-	editor expressionMapping keysAndValuesDo: [:k :v | keysToRemove add: k ].
-	keysToRemove do: [:k | editor expressionMapping removeKey: k ]
-)
-) : (
-)
-public class IDEChatDocumentSubject onChatDocument: doc <ChatDocument> session: s <Session> = IDEChatSubject onModel: s (
+public class IDEChatDocumentSubject onChatDocument: doc <Document> session: s <Session> = IDEChatSubject onModel: s (
 (*
  Chat subject bound to a ChatDocument: instead of (or in addition to)
  the conversation living in the inline ChatPresenter view, each turn is
@@ -993,7 +689,7 @@ public class IDEChatDocumentSubject onChatDocument: doc <ChatDocument> session: 
  this round-trip rather than re-rendering history.
 *)
 |
-	public document <ChatDocument> = doc.
+	public document <Document> = doc.
 	lastTurnIndexBeforeSend <Integer>
 |
 ) (
@@ -1211,26 +907,6 @@ findChatStructuralAmplet: name <String> in: container <Object> ^ <Object | Undef
 	].
 	^nil
 )
-initialChatDocumentContents: n <String> ^ <String> = (
-	(* Initial HTML for a fresh ChatDocument. Three structural amplets:
-	   chatControls at top, thinkingOrModelPicker + userInputEditor at
-	   the bottom. Between the last content and the model machinery
-	   sits a non-amplet block-level gap (class modelMachineryGap)
-	   that guarantees the model picker / input editor wrap onto a
-	   new line regardless of what precedes them — Ampleforth's
-	   processChildren rewrites every amplet's style to
-	   `display:inline-flex` on each render, so two adjacent amplets
-	   would otherwise share a row. New turns and changeset amplets
-	   insert before this gap; ensureModelMachineryGap:in: lazily
-	   adds it to legacy chat docs that predate this layout. *)
-	^'<div class="self_ampleforth" contenteditable="true" style="border: 2px solid blue; resize: horizontal; overflow: auto; overflow-wrap: break-word; width: 40em;" onkeyup="updateRawHTML()" ondragover="((e) => {e.preventDefault();})(event)"> <!-- self_ampleforth -->
-<h1>', n, '</h1>
-<div class="ampleforth" ampletId="1" name="chatControls" contenteditable="false"> </div>
-<div class="modelMachineryGap" style="display:block; min-height:3em; padding:0.5em; margin:0.5em 0;"> </div>
-<div class="ampleforth" ampletId="2" name="thinkingOrModelPicker" contenteditable="false"> </div>
-<div class="ampleforth" ampletId="3" name="userInputEditor" contenteditable="false" style="display:block; width:100%; min-height:4em; margin-top:0.5em;"> </div>
-</div>'
-)
 providerClassFor: pn <String> = (
 	pn = 'anthropic' ifTrue: [^AnthropicProvider].
 	pn = 'gemini' ifTrue: [^GeminiProvider].
@@ -1281,7 +957,7 @@ baseUrlForProvider: pn <String> ^ <String> = (
 	].
 	^stored
 )
-public defaultChatDocumentOrCreate ^ <ChatDocument | UndefinedObject> = (
+public defaultChatDocumentOrCreate ^ <Document | UndefinedObject> = (
 	| activeName entry key doc |
 	activeName:: [js localStorage getItem: 'ns_ai_active_chat_doc']
 		on: Exception do: [:e | nil].
@@ -1721,10 +1397,11 @@ public ensureSharedChat = (
 	(* startChat goes through newChatSubjectFor:, which has already cached. *)
 	^sharedChatSubject_slot
 )
-chatDocumentsInRoot ^ <List[ChatDocument]> = (
-	(* Every ChatDocument currently in Root, in Root's insertion order
-	   (roughly creation order). Shared by ChatDocument>>chatDocPicker and
-	   the regular chat presenter's switcher so the two stay in sync. *)
+chatDocumentsInRoot ^ <List[Document]> = (
+	(* Every chat document currently in Root, in Root's insertion order
+	   (roughly creation order). A chat document is a Document answering
+	   isKindOfChatDocument. Used by ChatControlsPresenter and the regular
+	   chat presenter's switcher so the two stay in sync. *)
 	| docs |
 	docs:: List new.
 	Root keysAndValuesDo: [:k :v |
@@ -1751,7 +1428,7 @@ openNewChatSetup = (
 	   button and the regular presenter's New-chat button. *)
 	ide browsing navigateTo: (IDEChatSetupSubject onModel: AnthropicProvider)
 )
-makeCurrentChat: doc <ChatDocument> ^ <IDEChatDocumentSubject> = (
+makeCurrentChat: doc <Document> ^ <IDEChatDocumentSubject> = (
 	(* Make `doc` the current shared chat: its subject becomes what the
 	   inline chat region renders (ensureSharedChat) and the default chat for
 	   newly-opened presenters / the toolbar, and it is recorded as the active

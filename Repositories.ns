@@ -354,20 +354,6 @@ public invalidateHistoryCache = (
 	historyCache_slot:: nil.
 	pathHistoryCache_slot:: nil
 )
-(* Per-member history surface. The MemberHistoryPresenter (and via it
-   MemberRepoHistoryPresenter) asks for history along the per-member
-   draftPath scheme (<TopLevel>/.../<Enclosing>/method.<sel>.ns) that
-   DraftsRepo uses natively. Permanent Repositories store one file
-   per top-level class (<TopLevel>.ns -- see snapshotFiles, line 1050),
-   so the path-resolution side projects the draftPath down to its top-
-   level class file. git.log on that file finds candidate commits
-   (every commit that touched the class), then a per-member filter
-   pass excludes commits where THIS member's source is unchanged from
-   its parent -- so the list the user sees matches the per-member
-   precision DraftsRepo provides natively. The filter chains async
-   memberSourceAt: reads (fanned out via Promise.all) and is cached
-   into pathHistoryCache_slot under the original draftPath; revisits
-   hit the cached filtered list synchronously. *)
 topLevelClassFileFor: draftPath <String> ^ <String> = (
 	(* '<TopLevel>/Enclosing/method.foo.ns' -> '<TopLevel>.ns'.
 	   No slash -> already a top-level (e.g. 'header.ns' on a top-level
@@ -1734,11 +1720,9 @@ expandedLogRowFor: entry toggle: toggle = (
 	   doesn't care that the diff sources came from git blobs rather
 	   than HEAD-vs-live. *)
 	changesetSubject:: commitChangesetSubjects at: sha ifAbsentPut: [
-		ChangesetSubject
+		ChangesetSubject onModel: (CommitVsParentStrategy
 			onRepository: subject repository
-			strategy: (CommitVsParentStrategy
-				onRepository: subject repository
-				commit: entry)].
+			commit: entry)].
 	^column: {
 		row: {
 			(link: shortSha action: [toggle collapse]) color: actionLinkColor.
@@ -2070,7 +2054,7 @@ respondToCommit = (
 	| repo strategy |
 	repo:: subject repository.
 	strategy:: RepoCommitStrategy onRepository: repo.
-	enterSubject:: ChangesetSubject onRepository: repo strategy: strategy
+	enterSubject:: ChangesetSubject onModel: strategy
 )
 respondToShowRoundTripDiff = (
 	(* Self-consistency smoke test: for every class in the repo's
@@ -2740,11 +2724,6 @@ public class PhantomDeclMirror onBuilder: b = (
 public isKindOfClassDeclarationMirror = (^true)
 public asBuilder = (^phantomBuilder)
 public name = (^phantomBuilder name)
-(* Alias for `name`. ClassDeclarationMirror exposes both name and
-   simpleName as the unqualified class name; callers reach for
-   either, and qualifiedNameOf: in AI_IDE_Support uses simpleName.
-   Without this the brain icon ("Install Focus") on a phantom
-   class DNUs. *)
 public simpleName = (^phantomBuilder name)
 public source = (^phantomBuilder source)
 public header = (^phantomBuilder header)
@@ -2768,9 +2747,6 @@ public class PhantomSide onPhantom: p instanceSide: isInstance = (
 	private isInstanceSide = isInstance.
 |) (
 public isKindOfMixinMirror = (^true)
-(* True for the class side, false for the instance side -- matches
-   the live MixinMirror>>isMeta semantics. Used by AI install-focus
-   to label methods/slots as 'class' vs 'instance' side. *)
 public isMeta = (^isInstanceSide not)
 public asBuilder = (
 	(* Real side-specific MixinBuilder for install. *)
@@ -2794,53 +2770,22 @@ public size = (^0)
 public isEmpty = (^true)
 ) : (
 )
-phantomBuilderFromSource: src <String | Nil> = (
-	(* Safe parse of a .ns source into a ClassDeclarationBuilder.
-	   nil on error or nil input -- callers fall back to plain panes
-	   when this returns nil. *)
-	src isNil ifTrue: [^nil].
-	src isEmpty ifTrue: [^nil].
-	^[ClassDeclarationBuilder fromUnitSource: src]
-		on: Error do: [:e | nil]
-)
-findNestedBuilderIn: parentBuilder named: name <Symbol> = (
-	(* Walk a ClassDeclarationBuilder's instanceSide.nestedClasses
-	   for a nested ClassDeclarationBuilder with the given name.
-	   nil if parent is nil or no match. Used by every nested-class
-	   toggle to navigate the phantom tree -- mirrors what a live
-	   `decl instanceSide nestedClasses findMirrorNamed:` would do
-	   on the live side. *)
-	parentBuilder isNil ifTrue: [^nil].
-	^[parentBuilder instanceSide nestedClasses
-		detect: [:nb | nb name = name]
-		ifNone: [nil]]
-		on: Error do: [:e | nil]
-)
-public class ChangesetSubject onLiveNamespace: ns
-                                       title: t <String>
-                                    strategy: s <ApplyStrategy>
-	= ProgrammingSubject onModel: nil (
+public class ChangesetSubject onModel: strategy <ApplyStrategy>
+	= ProgrammingSubject onModel: strategy (
 (* Holds the state of a Changeset review session: the computed changeset,
    the user's draft commit message + author identity, expansion state for
    the diff tree, and submission-in-flight / error state.
 
-   `liveNamespace` is the namespace where the "current" / "post-change"
-   classes live (typically a Repository's namespace for VCS use, or Root
-   for AI-proposal install). The presenter resolves #changed classes
-   against it via subject liveNamespace at: name ifAbsent: [nil].
-   `titleString` is the dialog header text — the strategy supplies the
-   verb, the caller composes the suffix.
-   `strategy` is what drives Accept (RepoCommitStrategy for VCS commits,
+   The model is the `strategy` — an ApplyStrategy that drives Accept and
+   everything the presenter renders (RepoCommitStrategy for VCS commits,
    AIInstallStrategy for AI-proposal install, CommitVsParentStrategy for
-   read-only browsing of historical commits).
-
-   Construct via the legacy convenience `onRepository:strategy:` when
-   working from a repository; that derives the namespace and title from
-   the repo + strategy combo. *)
+   read-only browsing of historical commits). The strategy also owns the
+   two pieces of context the presenter needs beyond Accept behaviour:
+   `liveNamespace` (the namespace where post-change classes live; the
+   presenter resolves #changed classes against it) and `title` (the dialog
+   header). Keeping them on the strategy makes `onModel: strategy`
+   self-sufficient, so Subject equality/hash/refreshmentSubject work. *)
 |
-	public liveNamespace = ns.
-	public titleString <String> = t.
-	public strategy = s.
 	changeset_slot.
 	computeError_slot.
 	public messageDraft <String> ::= ''.
@@ -2870,9 +2815,9 @@ public class ChangesetSubject onLiveNamespace: ns
 public createPresenter ^ <Presenter> = (
 	^ChangesetPresenter onSubject: self
 )
-public title ^ <String> = (
-	^titleString
-)
+public strategy = (^model)
+public liveNamespace = (^model liveNamespace)
+public title ^ <String> = (^model title)
 public isKindOfChangesetSubject ^ <Boolean> = (^true)
 isMyKind: s <Subject> ^ <Boolean> = (^s isKindOfChangesetSubject)
 public changeset = (^changeset_slot)
@@ -2954,16 +2899,6 @@ public submit: refreshBlock <[]>
 			nil]
 )
 ) : (
-public onRepository: r <Repository> strategy: s <ApplyStrategy> = (
-	(* Legacy convenience for VCS callers: derive the liveNamespace
-	   and the title from the repository + strategy and forward to the
-	   primary factory. New non-repository callers (AI install,
-	   workspace staging, etc.) should construct via the primary
-	   onLiveNamespace:title:strategy: factory directly. *)
-	^self onLiveNamespace: r namespace
-	         title: s actionLabel, ' to ', r name asString
-	         strategy: s
-)
 )
 public class ChangesetPresenter onSubject: s <ChangesetSubject>
 	= ProgrammingPresenter onSubject: s (
@@ -4500,6 +4435,16 @@ public requiresApply ^ <Boolean> = (
 	   any submit affordance. *)
 	^true
 )
+public liveNamespace ^ <Object> = (
+	(* The namespace where the "current" / post-change classes live; the
+	   ChangesetPresenter resolves #changed classes against it. The strategy
+	   is the changeset subject's model, so it owns this. *)
+	subclassResponsibility
+)
+public title ^ <String> = (
+	(* Dialog header text. Default is the action label; subclasses enrich it. *)
+	^actionLabel
+)
 public validate: input <Map[Symbol, Object]> onError: errBlock <[:String]> ^ <Boolean> = (
 	(* Default: no validation. Subclasses override; on first error,
 	   call errBlock with the message string and return false. *)
@@ -4554,6 +4499,8 @@ public actionLabel = (^'Commit')
 public requiresMessage = (^true)
 public messagePrompt = (^'Commit message')
 public requiresAuthor = (^true)
+public liveNamespace = (^repository namespace)
+public title ^ <String> = (^actionLabel, ' to ', repository name asString)
 public validate: input onError: errBlock = (
 	| msg name email |
 	msg:: input at: #message ifAbsent: [''].
@@ -4608,6 +4555,8 @@ public class CommitVsParentStrategy onRepository: r <Repository> commit: entry =
 public actionLabel = (^'View')
 public requiresMessage = (^false)
 public requiresApply = (^false)
+public liveNamespace = (^repository namespace)
+public title ^ <String> = (^actionLabel, ' to ', repository name asString)
 public apply: changeset withInput: input = (
 	Error signal: 'CommitVsParentStrategy is read-only; apply: should never be reached'
 )
@@ -4628,10 +4577,61 @@ public cancelDestination = (
 )
 ) : (
 )
+public class StaleChangesetPresenter onSubject: s <StaleChangesetSubject> = Presenter onSubject: s (
+	(* Rendered when a proposed changeset is no longer pending — either it
+ was applied, cancelled, or the IDE was restarted. Displays a simple
+ italic banner with the changeset id. *)
+	
+) (
+isMyKind: f <Fragment> ^<Boolean> = (
+	^f isKindOfStaleChangesetPresenter
+)
+public isKindOfStaleChangesetPresenter ^<Boolean> = (
+	^true
+)
+definition = (
+	^(label: 'Changeset ' , subject titleString , ' is no longer pending.') italic
+)
+) : (
+)
+public class StaleChangesetSubject onModel: id <String> = (
+	|
+	public titleString <String> = id.
+	|) (
+isMyKind: s <Subject> ^<Boolean> = (
+	^s isKindOfStaleChangesetSubject
+)
+createPresenter = (
+	^StaleChangesetPresenter onSubject: self
+)
+) : (
+)
 lazy public LightningFSClass = global at: #LightningFS.
 lazy public gitFacade = global at: #git.
 lazy public gitHttpFacade = global at: #GitHttp.
 lazy public sourceMirrors = (Root at: #VCSSourceMirrors) usingPlatform: platformHolder vcs: nil ide: ide.
+phantomBuilderFromSource: src <String | Nil> = (
+	(* Safe parse of a .ns source into a ClassDeclarationBuilder.
+	   nil on error or nil input -- callers fall back to plain panes
+	   when this returns nil. *)
+	src isNil ifTrue: [^nil].
+	src isEmpty ifTrue: [^nil].
+	^[ClassDeclarationBuilder fromUnitSource: src]
+		on: Error do: [:e | nil]
+)
+findNestedBuilderIn: parentBuilder named: name <Symbol> = (
+	(* Walk a ClassDeclarationBuilder's instanceSide.nestedClasses
+	   for a nested ClassDeclarationBuilder with the given name.
+	   nil if parent is nil or no match. Used by every nested-class
+	   toggle to navigate the phantom tree -- mirrors what a live
+	   `decl instanceSide nestedClasses findMirrorNamed:` would do
+	   on the live side. *)
+	parentBuilder isNil ifTrue: [^nil].
+	^[parentBuilder instanceSide nestedClasses
+		detect: [:nb | nb name = name]
+		ifNone: [nil]]
+		on: Error do: [:e | nil]
+)
 public liveSnapshotOf: aClass <Behavior> ^ <Map[Symbol, Object]> = (
 	(* Per-member map for a live class, same shape as
 	   PerMemberExtractor produces from a parsed .ns source. *)
@@ -4652,6 +4652,22 @@ public extractedSnapshotFromSource: src <String> ^ <Map[Symbol, Object]> = (
 	| builder |
 	builder:: ClassDeclarationBuilder fromUnitSource: src.
 	^(PerMemberMirrorReader onMirror: builder) extract
+)
+public extractedSnapshotFromNestedSource: src <String> ^ <Map[Symbol, Object]> = (
+	(* Per-member snapshot of a NESTED-class declaration source. A nested
+	   class is NOT a top-level compilation unit, so it cannot go through
+	   extractedSnapshotFromSource: (which uses fromUnitSource: and requires
+	   the 'Newspeak'/'Root' unit header) — feeding it a bare nested
+	   declaration is a parse error ("'Newspeak'/'Root'/string/']' expected"),
+	   which is what made AI changeset rendering fail for new/replaced nested
+	   classes. Parse it the way normal nested-class installation does (the same
+	   API applyOneRecord: uses to install it): add it as a nested class to a
+	   throwaway enclosing builder, then snapshot the resulting nested
+	   declaration. PerMemberMirrorReader walks a builder just like a mirror. *)
+	| probe nestedBuilder |
+	probe:: ClassDeclarationBuilder fromSource: 'class NewspeakNestedProbe = () ()'.
+	nestedBuilder:: probe instanceSide nestedClasses addFromSource: src.
+	^(PerMemberMirrorReader onMirror: nestedBuilder) extract
 )
 public diffSnapshot: oldSnap <Map> to: newSnap <Map> ^ <Map[Symbol, Object]> = (
 	(* Pure: produce a per-member diff between two snapshots.

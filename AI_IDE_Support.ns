@@ -375,10 +375,7 @@ public changesetSubjectFor: id <String> ^ <Object | UndefinedObject> = (
 				subj forgetCachedChangesetSubjectFor: id.
 				ide browsing updateCurrentDisplay]
 			onComputed: [].
-		s:: ChangesetSubject
-			onLiveNamespace: Root
-			title: 'Apply changeset ', id
-			strategy: strategy.
+		s:: ChangesetSubject onModel: strategy.
 		s autoExpand: true.
 		changesetSubjectsById at: id put: s.
 		s]
@@ -804,6 +801,8 @@ public class AIInstallStrategy onRecords: recs <List>
 ) (
 public actionLabel ^ <String> = ( ^'Apply' )
 public requiresMessage ^ <Boolean> = ( ^false )
+public liveNamespace = ( ^Root )
+public title ^ <String> = ( ^'Apply changeset ', changesetId )
 public requiresAuthor ^ <Boolean> = ( ^false )
 public requiresApply ^ <Boolean> = ( ^true )
 public validate: input <Map> onError: errBlock <[:String]> ^ <Boolean> = ( ^true )
@@ -870,6 +869,8 @@ lazy public repositories = ide repositories.
 lazy public ApplyStrategy = repositories ApplyStrategy.
 lazy public ChangesetSubject = repositories ChangesetSubject.
 lazy public ChangesetPresenter = repositories ChangesetPresenter.
+lazy public StaleChangesetPresenter = repositories StaleChangesetPresenter.
+lazy public StaleChangesetSubject = repositories StaleChangesetSubject.
 ensureModelMachineryGap: container <Object> beforeThinking: thinking <Object> ^ <Object> = (
 	(* Find the block-level gap that sits between the chat content and
 	   the model machinery, creating one in-place if the doc was
@@ -1437,12 +1438,6 @@ makeCurrentChat: doc <Document> ^ <IDEChatDocumentSubject> = (
 	   intention-revealing entry point used by the presenter chat switcher. *)
 	^doc chatSubject
 )
-(* === Clone-template chat documents (new design) ===
-   A chat is a clone of ChatDocument_Template: a plain Document subclass that
-   carries per-chat state slots + thin forwarders, with the actual logic here.
-   These `…For: doc` methods are the forwarder targets. (Additive — they are
-   only reached from the new template's forwarders; the legacy ChatDocument
-   class is untouched until the new path is verified.) *)
 public chatControlsFor: doc <Document> ^ <Presenter> = (
 	^ChatControlsPresenter onSubject: doc
 )
@@ -1607,44 +1602,6 @@ public appendChangesetAmplet: id <String> into: doc <Document> = (
 )
 public forgetCachedChangesetSubject: id <String> for: doc <Document> = (
 	doc changesetSubjectsById removeKey: id ifAbsent: []
-)
-public changesetPresenter: id <String> for: doc <Document> ^ <Object> = (
-	(* Relocation of old ChatDocument>>changesetPresenterFor:. Returns a
-	   ChangesetPresenter on the doc-cached ChangesetSubject for `id`, or a
-	   stable banner when the proposal is no longer pending. *)
-	| records subject |
-	records:: proposedChangesets at: id ifAbsent: [nil].
-	records isNil ifTrue: [
-		doc changesetSubjectsById removeKey: id ifAbsent: [].
-		^(label: 'Changeset ', id, ' is no longer pending.') italic
-	].
-	subject:: doc changesetSubjectsById at: id ifAbsent: [
-		| strategy s |
-		strategy:: AIInstallStrategy
-			onRecords: records
-			changesetId: id
-			onApplied: [:csId :recCount |
-				appendSection:
-					('Applied changeset ', csId, ' (',
-					recCount printString,
-					(recCount = 1
-						ifTrue: [' record).']
-						ifFalse: [' records).']))
-					role: 'assistant'
-					into: doc]
-			onCanceled: [
-				forgetCachedChangesetSubject: id for: doc.
-				doc mutateContentsTo: doc contents]
-			onComputed: [
-				doc mutateContentsTo: doc contents].
-		s:: ChangesetSubject
-			onLiveNamespace: Root
-			title: 'Apply changeset ', id
-			strategy: strategy.
-		s autoExpand: true.
-		doc changesetSubjectsById at: id put: s.
-		s].
-	^ChangesetPresenter onSubject: subject
 )
 public clearConversationFor: doc <Document> = (
 	doc chatSubjectSlot isNil ifFalse: [doc chatSubjectSlot session clearHistory]
@@ -2279,7 +2236,11 @@ applyRecordToSnapshot: r <Map> in: snapsByTop <Map> = (
 	].
 	kind = 'add_or_replace_nested_class' ifTrue: [
 		| newSnap nestedName |
-		newSnap:: repositories extractedSnapshotFromSource: (r at: 'source').
+		(* Nested source is a bare nested-class declaration, not a top-level
+		   unit — must be snapshotted via the nested-install parse path, not
+		   extractedSnapshotFromSource: (which expects the 'Newspeak'/'Root'
+		   unit header and would fail the changeset render). *)
+		newSnap:: repositories extractedSnapshotFromNestedSource: (r at: 'source').
 		nestedName:: (newSnap at: #name) asSymbol.
 		(target at: #nestedClasses) at: nestedName put: newSnap.
 		^self
@@ -4214,6 +4175,42 @@ getMemberSourceTool ^ <Tool> = (
 					].
 					result]
 		]
+)
+public changesetPresenter: id <String> for: doc <Document> ^<Object> = (
+	(* Relocation of old ChatDocument>>changesetPresenterFor:. Returns a
+	   ChangesetPresenter on the doc-cached ChangesetSubject for `id`, or a
+	   stable banner when the proposal is no longer pending. *)
+	
+	| records subject |
+	records:: proposedChangesets at: id ifAbsent: [ nil ].
+	records isNil ifTrue: [
+			doc changesetSubjectsById removeKey: id ifAbsent: [ ].
+			^StaleChangesetPresenter onSubject: (StaleChangesetSubject onModel: id)
+		].
+	subject:: doc changesetSubjectsById at: id
+		ifAbsent: [
+			| strategy s |
+			strategy:: AIInstallStrategy onRecords: records
+				changesetId: id
+				onApplied: [:csId :recCount |
+					appendSection: 'Applied changeset ' , csId , ' (' , recCount printString , (recCount = 1 ifTrue: [
+								' record).'
+							]
+							ifFalse: [ ' records).' ])
+						role: 'assistant'
+						into: doc
+				]
+				onCanceled: [
+					forgetCachedChangesetSubject: id for: doc.
+					doc mutateContentsTo: doc contents
+				]
+				onComputed: [ doc mutateContentsTo: doc contents ].
+			s:: ChangesetSubject onModel: strategy.
+			s autoExpand: true.
+			doc changesetSubjectsById at: id put: s.
+			s
+		].
+	^ChangesetPresenter onSubject: subject
 )
 ) : (
 )

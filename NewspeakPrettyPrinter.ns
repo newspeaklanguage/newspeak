@@ -515,9 +515,17 @@ visitClassHeader: node = (
 	emit: 'class '.
 	emit: node name.
 	(node typeParameters isNil not and: [node typeParameters isEmpty not]) ifTrue: [
-		emit: '<['.
-		printSeparatedList: node typeParameters with: ', ' do: [:tp | emit: tp].
-		emit: ']>'.
+		(* New bracket form [E <: Bound] (the legacy <[E]> form still parses). *)
+		| bounds |
+		bounds:: node typeParameterBounds.
+		emit: '['.
+		1 to: node typeParameters size do: [:i |
+			i = 1 ifFalse: [emit: ', '].
+			emit: (node typeParameters at: i).
+			(bounds isNil not and: [i <= bounds size and: [(bounds at: i) isNil not]]) ifTrue: [
+				emit: ' <: '. visitType: (bounds at: i)].
+		].
+		emit: ']'.
 	].
 	(node constructor isNil not and: [node constructor selector isNil not]) ifTrue: [
 		space.
@@ -745,31 +753,65 @@ visitMessagePattern: pattern = (
 	pattern returnType isNil ifFalse: [
 		emit: ' ^<'. visitType: pattern returnType. emit: '>'.
 	].
+	emitWhereClauseOf: pattern.
+)
+emitSelectorTypeParametersOf: pattern = (
+	(* selector type parameters, e.g. the [T] in `pick[T]:` / `echo[R]` *)
+	(pattern typeParameters isNil not and: [pattern typeParameters isEmpty not]) ifTrue: [
+		emit: '['.
+		printSeparatedList: pattern typeParameters with: ', ' do: [:tp | emit: tp].
+		emit: ']'.
+	].
 )
 emitSelectorPattern: pattern = (
 	| sel params kind |
 	sel:: pattern selector.
 	params:: pattern parameters isNil ifTrue: [List new] ifFalse: [pattern parameters].
 	kind:: kindOfSelector: sel.
-	kind = levelUnary ifTrue: [emit: sel. ^self].
+	kind = levelUnary ifTrue: [emit: sel. emitSelectorTypeParametersOf: pattern. ^self].
 	kind = levelBinary ifTrue: [
 		emit: sel. space.
 		params isEmpty ifFalse: [emitParameter: params first].
 		^self.
 	].
-	emitKeywordPattern: sel parameters: params.
+	emitKeywordPattern: sel parameters: params typeParamsOf: pattern.
 )
-emitKeywordPattern: sel parameters: params = (
-	| parts index |
+emitKeywordPattern: sel parameters: params typeParamsOf: pattern = (
+	| parts index hasTypeParams |
 	parts:: splitKeywordSelector: sel.
 	index:: 1.
+	hasTypeParams:: pattern typeParameters isNil not and: [pattern typeParameters isEmpty not].
 	parts keysAndValuesDo: [:i :kw |
 		i = 1 ifFalse: [space].
-		emit: kw.
+		(i = 1 and: [hasTypeParams])
+			ifTrue: [
+				emit: (kw copyFrom: 1 to: kw size - 1). (* keyword without ':' *)
+				emitSelectorTypeParametersOf: pattern.
+				emit: ':']
+			ifFalse: [emit: kw].
 		index <= params size ifTrue: [
 			space. emitParameter: (params at: index). index:: index + 1.
 		].
 	].
+)
+emitWhereClauseOf: pattern = (
+	(pattern inferenceClauses isNil or: [pattern inferenceClauses isEmpty]) ifTrue: [^self].
+	emit: ' where { '.
+	printSeparatedList: pattern inferenceClauses with: ', ' do: [:cl | emitInferenceClause: cl].
+	emit: ' }'.
+)
+emitInferenceClause: cl = (
+	emit: cl typeParameterName.
+	cl bound isNil ifFalse: [emit: ' <: '. visitType: cl bound].
+	emit: ' :: '.
+	emitInferenceExpr: cl expr.
+)
+emitInferenceExpr: e = (
+	e kind = #arg ifTrue: [emit: 'arg '. emit: e index printString. ^self].
+	e kind = #receiverType ifTrue: [emit: 'receiverType'. ^self].
+	e kind = #returnTypeOf ifTrue: [emit: 'returnType of ('. emitInferenceExpr: e subExpr. emit: ')'. ^self].
+	e kind = #argNOf ifTrue: [emit: 'arg '. emit: e index printString. emit: ' of ('. emitInferenceExpr: e subExpr. emit: ')'. ^self].
+	e kind = #messageOf ifTrue: [emit: e selector. emit: ' message of ('. emitInferenceExpr: e subExpr. emit: ')'. ^self].
 )
 splitKeywordSelector: sel = (
 	| parts start |
@@ -973,12 +1015,21 @@ visitSend: node = (
 	emitMessage: msg.
 )
 visitMessage: msg = ( emitMessage: msg )
+emitValueTypeArgumentsOf: msg = (
+	(* Emit explicit value-site type arguments, e.g. the [Integer] in `Box[Integer] new`,
+	   directly after the (unary) selector. nil/empty means none. *)
+	(msg typeArguments isNil not and: [msg typeArguments isEmpty not]) ifTrue: [
+		emit: '['.
+		printSeparatedList: msg typeArguments with: ', ' do: [:a | visitType: a].
+		emit: ']'.
+	].
+)
 emitMessage: msg = (
 	| sel kind args |
 	sel:: msg selector.
 	args:: msg arguments isNil ifTrue: [List new] ifFalse: [msg arguments].
 	kind:: kindOfSelector: sel.
-	kind = levelUnary ifTrue: [emit: sel. ^self].
+	kind = levelUnary ifTrue: [emit: sel. emitValueTypeArgumentsOf: msg. ^self].
 	kind = levelBinary ifTrue: [
 		emit: sel. space.
 		args isEmpty ifFalse: [
@@ -992,18 +1043,21 @@ emitMessage: msg = (
 		^self.
 	].
 	trySingleLine: [
-		emitKeywordSendInline: sel arguments: args.
+		emitKeywordSendInline: sel arguments: args typeArgsOf: msg.
 	] orMultiLine: [
-		emitKeywordSendMultiLine: sel arguments: args.
+		emitKeywordSendMultiLine: sel arguments: args typeArgsOf: msg.
 	].
 )
-emitKeywordSendInline: sel arguments: args = (
-	| parts index |
+emitKeywordSendInline: sel arguments: args typeArgsOf: msg = (
+	| parts index hasTA |
 	parts:: splitKeywordSelector: sel.
 	index:: 1.
+	hasTA:: msg typeArguments isNil not and: [msg typeArguments isEmpty not].
 	parts keysAndValuesDo: [:i :kw |
 		i = 1 ifFalse: [space].
-		emit: kw.
+		(i = 1 and: [hasTA])
+			ifTrue: [emit: (kw copyFrom: 1 to: kw size - 1). emitValueTypeArgumentsOf: msg. emit: ':']
+			ifFalse: [emit: kw].
 		index <= args size ifTrue: [
 			space.
 			printAtLevel: (args at: index) minLevel: levelBinary.
@@ -1011,14 +1065,17 @@ emitKeywordSendInline: sel arguments: args = (
 		].
 	].
 )
-emitKeywordSendMultiLine: sel arguments: args = (
-	| parts index |
+emitKeywordSendMultiLine: sel arguments: args typeArgsOf: msg = (
+	| parts index hasTA |
 	parts:: splitKeywordSelector: sel.
 	index:: 1.
+	hasTA:: msg typeArguments isNil not and: [msg typeArguments isEmpty not].
 	indented: [
 		parts keysAndValuesDo: [:i :kw |
 			i = 1 ifFalse: [newline].
-			emit: kw.
+			(i = 1 and: [hasTA])
+				ifTrue: [emit: (kw copyFrom: 1 to: kw size - 1). emitValueTypeArgumentsOf: msg. emit: ':']
+				ifFalse: [emit: kw].
 			index <= args size ifTrue: [
 				space.
 				printAtLevel: (args at: index) minLevel: levelBinary.

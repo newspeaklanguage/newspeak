@@ -112,6 +112,7 @@ private ImmutableSlotDefAST = astModule ImmutableSlotDefAST.
 private VarDeclAST = astModule VarDeclAST.
 
 private ClassMirror = p mirrors ClassMirror.
+private ClassDeclarationBuilder = p mirrors ClassDeclarationBuilder.
 
 private Scope = p mirrors compiler Scope.
 
@@ -339,6 +340,9 @@ public at: selector <Symbol> ^ <FunctionType> = (
 			baseFT range isKindOfErrorType
 				ifTrue: [typeArguments first]
 				ifFalse: [
+					(baseFT range isKindOfTypeVariable and: [baseFT range name = #Instance])
+					ifTrue: [GenericType generic: baseFT range bound typeArguments: typeArguments]
+					ifFalse: [
 					(* Handle GenericType range like Array[E] — substitute type params in its arguments *)
 					baseFT range isKindOfGenericType
 						ifTrue: [
@@ -358,7 +362,7 @@ public at: selector <Symbol> ^ <FunctionType> = (
 							].
 							GenericType generic: baseFT range generic typeArguments: substitutedArgs
 						]
-						ifFalse: [baseFT range]
+						ifFalse: [baseFT range]]
 				]
 		].
 
@@ -765,6 +769,15 @@ signatureForNestedClass: m <ClassDeclarationMirror> ^ <MessagePatternAST> = (
 		accessModifier: m accessModifier;
 		yourself
 )
+countColonsIn: selector <Symbol> ^ <Integer> = (
+	(* Count ':' in a keyword selector (= its argument count). String lacks
+	   occurrencesOf:, so iterate with indexOf:startingAt: (0 = not found). *)
+	| count <Integer> ::= 0. idx <Integer> ::= selector indexOf: ':'. |
+	[idx = 0] whileFalse: [
+		count:: count + 1.
+		idx:: selector indexOf: ':' startingAt: idx + 1].
+	^count
+)
 signatureForSyntheticPrimaryFactory: m <MethodMirror> withSelector: selector <Symbol> ^ <MessagePatternAST> = (
 	(* Synthetic primary factory methods have no source, so we create the signature programmatically *)
 	| mixin <MixinMirror> returnType <TypeIdAST> params <List> paramCount <Integer> |
@@ -777,7 +790,7 @@ signatureForSyntheticPrimaryFactory: m <MethodMirror> withSelector: selector <Sy
 	   - Binary selector (special chars): 1 parameter
 	   - Unary selector (alphanumeric): 0 parameters *)
 	paramCount:: (selector last = ':' last)
-		ifTrue: [selector occurrencesOf: ':']  (* keyword selector *)
+		ifTrue: [countColonsIn: selector]  (* keyword selector: one parameter per colon *)
 		ifFalse: [
 			| fc = selector first. |
 			((((fc >= 'a' first) and: [fc <= 'z' last]) or:
@@ -1264,7 +1277,11 @@ public typeIdNode: node <TypeIdAST> ^ <ObjectType> = (
 	  ] ensure: [resolvingSignatures remove: m].
 	  ^returnType
 	].
-      (* If m is nil or unrecognized type, return error type *)
+      (* If m is nil or unrecognized type, return error type. A reference to a known
+         factory type variable from the wrong (class) side is a scoping error. *)
+      (isFactoryTypeVarName: node name inScopeOf: surroundingClass) ifTrue: [
+        error: node name, ' is not defined' at: {node start. node end}
+      ].
       ^errorType
 )
 public unaryTypeOpNode: node <UnaryTypeOpAST> ^ <ObjectType> = (
@@ -1468,6 +1485,17 @@ currentMutableSlots ^ <Set[Symbol]> = (
 	mutableSlotsStack isEmpty ifTrue: [^Set new].
 	^mutableSlotsStack last
 )
+isMutableLocalSlot: slotName <Symbol> ^ <Boolean> = (
+	(* Walk enclosing scopes from innermost outward; at the NEAREST scope that declares
+	   slotName, answer whether it declares it mutable. This honors shadowing (an inner
+	   immutable binding hides an outer mutable one) while still letting an outer mutable
+	   local be assigned from within a nested block. scopeStack and mutableSlotsStack are
+	   pushed/popped together, so index i corresponds in both. *)
+	scopeStack size to: 1 by: -1 do: [:i <Integer> |
+		((scopeStack at: i) includesKeyLocal: slotName) ifTrue: [
+			^(mutableSlotsStack at: i) includes: slotName]].
+	^false
+)
 currentScope ^ <Scope> = (
 	^scopeStack last
 )
@@ -1504,6 +1532,12 @@ functionTypeOf: node <SendASTNode> receiverType: receiverType <ObjectType> ^ <Ms
 		error: selector, ' is defined, but is not accessible' at: {node start. node end}
 		] ifFalse: [
 		cachedType isKindOfErrorType ifTrue: [
+			(* isKindOfX predicates are supported on every object via doesNotUnderstand:, which
+			   answers false for an unary selector starting with isKindOf. So treat an undefined
+			   one as defined and returning Boolean, matching Object>>doesNotUnderstand:. *)
+			(node message arguments isEmpty and: [selector startsWith: 'isKindOf']) ifTrue: [
+				^FunctionType domain: {} range: (ObjectType forMixin: boolMixin)
+			].
 			error: selector, ' is not defined on type ', receiverType name at: {node start. node end}
 			].
 		].
@@ -1770,7 +1804,7 @@ public setterSendNode: node <SetterSendAST> ^ <Type> = (
 		localType:: typeOfLocal: slotName.
 		localType isNil ifFalse: [
 			(* Found a local variable - check if it's mutable *)
-			(currentMutableSlots includes: slotName) ifFalse: [
+			(isMutableLocalSlot: slotName) ifFalse: [
 				error: 'Cannot reassign immutable local slot ', slotName at: {node start. node end}.
 				^valueType
 			].
@@ -1925,6 +1959,30 @@ public typecheckMethodSource: src <String> ofClass: c <Class> ^ <Set[TypeError]>
 	m:: parser parseMethodDeclaration: src.
 	^typecheckMethod: m ofClass: c.
 )
+public typecheckClassSource: src <String> ^ <Set[TypeError]> = (
+	(* Build a whole class from a bare top-level class-declaration source and typecheck
+	   every member (class header, instance + class methods, lazy slots, and recursively
+	   nested classes), unioning the per-member error sets. Used by the generic-method
+	   tests, where the generic class and its call sites live in one source so that
+	   call-site type-argument inference can be checked end to end. *)
+	| tClass <Class> decl <ClassDeclarationMirror> all <Set[TypeError]> = Set new. |
+	tClass:: (ClassDeclarationBuilder fromSource: src) install applyToObject reflectee.
+	decl:: (ClassMirror reflecting: tClass) mixin declaration.
+	typecheckMembersOf: decl into: all.
+	^all
+)
+typecheckMembersOf: decl <ClassDeclarationMirror> into: all <Set[TypeError]> = (
+	| inst <MixinMirror> = decl instanceSide. cls <MixinMirror> = decl classSide. |
+	all addAll: (typecheckClassHeader: decl header source ofClass: inst).
+	inst methods do: [:m <MethodMirror> |
+		m source isNil ifFalse: [all addAll: (typecheckMethodSource: m source ofClass: inst)]].
+	cls methods do: [:m <MethodMirror> |
+		m source isNil ifFalse: [all addAll: (typecheckMethodSource: m source ofClass: cls)]].
+	inst lazySlots do: [:ls |
+		ls source isNil ifFalse: [all addAll: (typecheckLazySlot: ls source ofClass: inst)]].
+	inst nestedClasses do: [:nc <ClassDeclarationMirror> |
+		typecheckMembersOf: nc into: all].
+)
 public typecheckExpression: src <String> ofClass: c <Class | MixinMirror> ^ <Set[TypeError]> = (
 	(* Typecheck src as an expression evaluated in the scope of class c.
 	   Returns the set of TypeErrors produced; empty if the expression checks. *)
@@ -2006,7 +2064,7 @@ public typecheckClassHeader: src <String> ofClass: c <Class | MixinMirror> ^ <Se
 	^errorSet
 )
 public unresolvedSendNode: node <UnresolvedSendAST> ^ <ObjectType> = (
-	| functionType <FunctionType> domain <List[ObjectType]> argASTs <List[ExpressionAST]> args <List[ObjectType]> selector <Symbol> localType receiverType |
+	| functionType <FunctionType> domain <List[ObjectType]> argASTs <List[ExpressionAST]> args <List[ObjectType]> selector <Symbol> localType receiverType defResult whereResult factoryResult |
 
 (* Check if this is an unqualified send that could be a variable reference *)
 selector:: node message selector.
@@ -2040,17 +2098,252 @@ receiverType:: node receiver apply: self.
 	localType isNil ifFalse: [^localType]
 ].
 
-functionType:: functionTypeOf: node receiverType: receiverType.
-domain:: functionType domain.
 argASTs:: node message arguments.
 args:: node message apply: self.
+	(* Generic-method `def` inference — done BEFORE resolving the ordinary signature, whose
+	   domain would otherwise try to resolve the def variables and fail. Infer each <def E>
+	   parameter from its argument and produce the substituted/parameterized result.
+	   The `where`-clause path is tried first: it resolves the declared return type from the
+	   inference clauses AND applies any <def E> bindings, so a method carrying both composes.
+	   A method with only <def E> parameters falls through to the pure-def path. *)
+	whereResult:: whereInferResultFor: selector receiverType: receiverType args: args.
+	whereResult isNil ifFalse: [^whereResult].
+	defResult:: inferredDefResultFor: selector receiverType: receiverType args: args.
+	defResult isNil ifFalse: [^defResult].
+	(* Both-sites: a primary factory with selector type params (e.g. make[B]:) supplied
+	   explicitly — compose the instance type from the accessor args + the factory args. *)
+	factoryResult:: explicitFactoryResultFor: selector receiverType: receiverType node: node args: args.
+	factoryResult isNil ifFalse: [^factoryResult].
+functionType:: functionTypeOf: node receiverType: receiverType.
+domain:: functionType domain.
 1 to: args size do: [:i <Integer> |
 	(type: (args at: i) isSubtypeOf: (domain at: i)) ifFalse: [
 		error: 'Argument is not a subtype of corresponding formal'
 		at: {(argASTs at: i) start. (argASTs at: i) end}
 		]
 	].
+	(* Explicit value-site type arguments, e.g. Box[Integer]: parameterize the result
+	   (the class type) so subsequent factory/accessor sends substitute through it. *)
+	(node message typeArguments isNil not and: [node message typeArguments isEmpty not]) ifTrue: [
+		^GenericType
+			generic: functionType range
+			typeArguments: (node message typeArguments collect: [:ta <AST> | ta apply: typeBuilder])
+	].
+	(* Bare generic-class accessor (no explicit args): default each type parameter to its
+	   upper bound (Object until bounds are parsed). E.g. Box ⇒ Box[Object]. *)
+	(node message arguments isEmpty) ifTrue: [
+		| defaults |
+		defaults:: defaultTypeArgumentsForClassAccessor: functionType range.
+		defaults isNil ifFalse: [^GenericType generic: functionType range typeArguments: defaults].
+	].
 ^functionType range.
+)
+defaultTypeArgumentsForClassAccessor: classType <ObjectType> ^ <List[ObjectType] | Nil> = (
+	(* If classType is the metaclass of a generic class, answer the default type argument for
+	   each declared type parameter: its declared upper bound, or Object when none. An
+	   f-bounded parameter (whose bound mentions itself, e.g. E <: Cmp[E]) has NO implicit
+	   default and must be supplied — report that and use errorType. Answers nil when classType
+	   is not such a metaclass. *)
+	| header tps bounds result |
+	[(classType mixin isNil or: [classType mixin isMeta not]) ifTrue: [^nil].
+	 header:: parser parseClassHeader: classType mixin declaration header source.
+	] on: Error do: [:e | ^nil].
+	tps:: header typeParameters.
+	(tps isNil or: [tps isEmpty]) ifTrue: [^nil].
+	bounds:: header typeParameterBounds.
+	result:: List new.
+	1 to: tps size do: [:i |
+		| name bound |
+		name:: tps at: i.
+		bound:: (bounds isNil or: [i > bounds size]) ifTrue: [nil] ifFalse: [bounds at: i].
+		bound isNil
+			ifTrue: [result add: (ObjectType forMixin: objectMixin)]
+			ifFalse: [
+				(typeAST: bound mentionsName: name)
+					ifTrue: [
+						error: name, ' is f-bounded and must be supplied' at: {1. 1}.
+						result add: errorType.
+					]
+					ifFalse: [result add: (bound apply: typeBuilder)]
+			]
+	].
+	^result
+)
+typeAST: t mentionsName: name <Symbol> ^ <Boolean> = (
+	(* True if the type AST t mentions the (type-parameter) name — used to detect f-bounds. *)
+	t isNil ifTrue: [^false].
+	t isKindOfTypeIdAST ifTrue: [^t name = name].
+	t isKindOfParameterizedTypeAST ifTrue: [
+		(typeAST: t generic mentionsName: name) ifTrue: [^true].
+		t arguments do: [:a | (typeAST: a mentionsName: name) ifTrue: [^true]].
+		^false
+	].
+	t isKindOfUnaryTypeOpAST ifTrue: [^typeAST: t operand mentionsName: name].
+	^false
+)
+inferredDefResultFor: selector <Symbol> receiverType: receiverType <ObjectType> args: args <List[ObjectType]> ^ <ObjectType | Nil> = (
+	(* If the target method/factory declares <def E> parameters, infer each E from the
+	   corresponding argument type and answer the result type with those bindings applied
+	   (parameterizing the #Instance result for factories); otherwise nil so the caller
+	   falls through to the ordinary send rule. *)
+	| sig defVars bindings returnAST instanceSide |
+	sig:: signatureWithDefVarsFor: selector on: receiverType.
+	sig isNil ifTrue: [^nil].
+	defVars:: defVarsIn: sig.
+	defVars isEmpty ifTrue: [^nil].
+	bindings:: Map new.
+	defVars do: [:dv | dv last <= args size ifTrue: [bindings at: dv first put: (args at: dv last)]].
+	returnAST:: sig returnType.
+	(returnAST isNil or: [returnAST isKindOfTypeIdAST and: [returnAST name = #Instance]]) ifTrue: [
+		(* Factory: parameterize the instance with the inferred factory type variables. *)
+		instanceSide:: [receiverType mixin declaration instanceSide] on: Exception do: [:e | ^nil].
+		^GenericType
+			generic: (ObjectType forMixin: instanceSide)
+			typeArguments: (defVars collect: [:dv | bindings at: dv first ifAbsent: [ObjectType forMixin: objectMixin]])
+	].
+	^resolveReturnTypeAST: returnAST withDefVarBindings: bindings
+)
+signatureWithDefVarsFor: selector <Symbol> on: receiverType <ObjectType> ^ <MessagePatternAST | Nil> = (
+	(* The declared signature of selector on receiverType, IF its source mentions `def` (a cheap
+	   pre-filter so we do not parse every callee). Synthetic primary factories are recovered
+	   from the class header's factory pattern; ordinary methods from their own source. *)
+	| member src |
+	member:: [type: selector at: receiverType mixin] on: Exception do: [:e | ^nil].
+	(member isNil or: [member isKindOfMethodMirror not]) ifTrue: [^nil].
+	member isSynthetic
+		ifTrue: [src:: [member definingMixin declaration header source] on: Exception do: [:e | ^nil]]
+		ifFalse: [src:: member source].
+	(src isNil or: [(src includesSubstring: 'def') not and: [(src includesSubstring: 'where') not]]) ifTrue: [^nil].
+	member isSynthetic
+		ifTrue: [^[(parser parseClassHeader: src) constructor] on: Exception do: [:e | nil]]
+		ifFalse: [^[parser parseMethodHeader: src] on: Exception do: [:e | nil]]
+)
+explicitFactoryResultFor: selector <Symbol> receiverType: receiverType <ObjectType> node: node args: args <List[ObjectType]> ^ <ObjectType | Nil> = (
+	(* A primary-factory send carrying explicit selector type arguments, e.g.
+	   `Weird[String] make[Integer]: 3`. The instance type is the accessor type arguments
+	   (from the receiver) followed by the factory type arguments (from the send): here
+	   Weird[String, Integer]. Answers nil when this is not such a send. *)
+	| ta header ctor selTypeParams sendArgs accessorArgs bindings instanceSide |
+	ta:: node message typeArguments.
+	(ta isNil or: [ta isEmpty]) ifTrue: [^nil].
+	[(receiverType mixin isNil or: [receiverType mixin isMeta not]) ifTrue: [^nil].
+	 header:: parser parseClassHeader: receiverType mixin declaration header source.
+	] on: Exception do: [:e | ^nil].
+	ctor:: header constructor.
+	(ctor isNil or: [ctor selector ~= selector]) ifTrue: [^nil].
+	selTypeParams:: ctor typeParameters.
+	(selTypeParams isNil or: [selTypeParams isEmpty]) ifTrue: [^nil].
+	sendArgs:: ta collect: [:t <AST> | t apply: typeBuilder].
+	accessorArgs:: receiverType isKindOfGenericType ifTrue: [receiverType typeArguments] ifFalse: [List new].
+	bindings:: Map new.
+	1 to: selTypeParams size do: [:i | i <= sendArgs size ifTrue: [bindings at: (selTypeParams at: i) put: (sendArgs at: i)]].
+	(* check the factory parameters (the domain) against the supplied arguments *)
+	ctor parameters isNil ifFalse: [
+		1 to: ctor parameters size do: [:i |
+			i <= args size ifTrue: [
+				| pt formalType |
+				pt:: (ctor parameters at: i) type.
+				formalType:: pt isNil ifTrue: [errorType] ifFalse: [resolveReturnTypeAST: pt withDefVarBindings: bindings].
+				(type: (args at: i) isSubtypeOf: formalType) ifFalse: [
+					error: 'Argument is not a subtype of corresponding formal' at: {node start. node end}]]]].
+	instanceSide:: receiverType mixin declaration instanceSide.
+	^GenericType generic: (ObjectType forMixin: instanceSide) typeArguments: (accessorArgs, sendArgs)
+)
+whereInferResultFor: selector <Symbol> receiverType: receiverType <ObjectType> args: args <List[ObjectType]> ^ <ObjectType | Nil> = (
+	(* If the callee declares `where` inference clauses, infer each selector type parameter and
+	   answer the declared return type with those bindings applied; otherwise nil. *)
+	| sig clauses bindings |
+	sig:: signatureWithDefVarsFor: selector on: receiverType.
+	sig isNil ifTrue: [^nil].
+	clauses:: sig inferenceClauses.
+	(clauses isNil or: [clauses isEmpty]) ifTrue: [^nil].
+	bindings:: Map new.
+	(* <def E> bindings: each def parameter bound to its actual argument type, so a return type
+	   mentioning both a def variable and a where-clause variable resolves fully. *)
+	(defVarsIn: sig) do: [:dv | dv last <= args size ifTrue: [bindings at: dv first put: (args at: dv last)]].
+	clauses do: [:cl |
+		bindings at: cl typeParameterName put: (evalInferenceExpr: cl expr args: args receiverType: receiverType)].
+	^resolveReturnTypeAST: sig returnType withDefVarBindings: bindings
+)
+evalInferenceExpr: expr args: args <List[ObjectType]> receiverType: rt <ObjectType> ^ <ObjectType> = (
+	(* Evaluate a `where`-clause inference expression to a type. *)
+	expr isNil ifTrue: [^errorType].
+	expr kind = #arg ifTrue: [
+		(expr index < 1 or: [expr index > args size]) ifTrue: [^errorType].
+		^args at: expr index
+	].
+	expr kind = #receiverType ifTrue: [^rt].
+	expr kind = #returnTypeOf ifTrue: [
+		| ft = evalMessageOf: expr subExpr args: args receiverType: rt. |
+		ft isNil ifTrue: [^errorType].
+		^ft range
+	].
+	expr kind = #argNOf ifTrue: [
+		| ft = evalMessageOf: expr subExpr args: args receiverType: rt. |
+		(ft isNil or: [expr index < 1 or: [expr index > ft domain size]]) ifTrue: [^errorType].
+		^ft domain at: expr index
+	].
+	^errorType
+)
+evalMessageOf: expr args: args <List[ObjectType]> receiverType: rt <ObjectType> ^ <FunctionType | Nil> = (
+	(* expr is #messageOf: the FunctionType of `selector` on the type of its subExpr. *)
+	| t ft |
+	expr isNil ifTrue: [^nil].
+	t:: evalInferenceExpr: expr subExpr args: args receiverType: rt.
+	ft:: [t at: expr selector] on: Exception do: [:e | ^nil].
+	ft isKindOfErrorType ifTrue: [^nil].
+	^ft
+)
+validateInferenceClausesOf: pattern <MessagePatternAST> = (
+	(* Declaration-time check: `arg N` indices must be within the method's parameter count. *)
+	| clauses n |
+	clauses:: pattern inferenceClauses.
+	(clauses isNil or: [clauses isEmpty]) ifTrue: [^self].
+	n:: pattern parameters isNil ifTrue: [0] ifFalse: [pattern parameters size].
+	clauses do: [:cl | validateInferenceExpr: cl expr paramCount: n].
+)
+validateInferenceExpr: expr paramCount: n <Integer> = (
+	expr isNil ifTrue: [^self].
+	expr kind = #arg ifTrue: [
+		(expr index < 1 or: [expr index > n]) ifTrue: [
+			error: 'inference clause references argument ', expr index printString, ', but the method has ', n printString, ' arguments' at: {1. 1}
+		]
+	].
+	validateInferenceExpr: expr subExpr paramCount: n.
+)
+defVarsIn: sig <MessagePatternAST | Nil> ^ <List> = (
+	(* Answer {name. index} pairs for parameters annotated <def E>. *)
+	| result = List new. |
+	(sig isNil or: [sig parameters isNil]) ifTrue: [^result].
+	1 to: sig parameters size do: [:i |
+		| name |
+		name:: defVarNameIfDefType: (sig parameters at: i) type.
+		name isNil ifFalse: [result add: {name. i}]
+	].
+	^result
+)
+defVarNameIfDefType: t ^ <Symbol | Nil> = (
+	(* If t is the annotation `def E` (a UnaryTypeOpAST whose operand is the TypeId #def),
+	   answer E; otherwise nil. *)
+	t isNil ifTrue: [^nil].
+	t isKindOfUnaryTypeOpAST ifFalse: [^nil].
+	t operand isKindOfTypeIdAST ifFalse: [^nil].
+	t operand name = #def ifFalse: [^nil].
+	^t operator asSymbol
+)
+resolveReturnTypeAST: t withDefVarBindings: bindings <Map> ^ <ObjectType> = (
+	(* Resolve a return-type AST, replacing references to bound def variables (bare TypeIds
+	   whose name is a key in bindings) with their inferred types. *)
+	t isKindOfTypeIdAST ifTrue: [
+		(bindings includesKey: t name) ifTrue: [^bindings at: t name].
+		^t apply: typeBuilder
+	].
+	t isKindOfParameterizedTypeAST ifTrue: [
+		^GenericType
+			generic: (resolveReturnTypeAST: t generic withDefVarBindings: bindings)
+			typeArguments: (t arguments collect: [:a | resolveReturnTypeAST: a withDefVarBindings: bindings])
+	].
+	^t apply: typeBuilder
 )
 public varDeclNode: node = (
 	| resolvedType |
@@ -2121,10 +2414,42 @@ typeParameterNamed: name <Symbol> inScopeOf: mixin <MixinMirror> ^ <TypeParamete
 				]
 			]
 		 ].
+		 (* Factory type parameters (<def E> on the primary factory) are in scope on the
+		    instance side only; their index follows the accessor type parameters. *)
+		 current isMeta ifFalse: [
+			| accCount selTypeParams defVars |
+			accCount:: (nil = typeParams ifTrue: [0] ifFalse: [typeParams size]).
+			(* factory selector type parameters [B] on the primary factory, e.g. make[B]: *)
+			selTypeParams:: headerAst constructor isNil ifTrue: [nil] ifFalse: [headerAst constructor typeParameters].
+			nil ~= selTypeParams ifTrue: [
+				1 to: selTypeParams size do: [:j |
+					(selTypeParams at: j) = name ifTrue: [^TypeParameterType named: name index: accCount + j]]].
+			accCount:: accCount + (nil = selTypeParams ifTrue: [0] ifFalse: [selTypeParams size]).
+			(* <def E> factory vars follow the selector type params *)
+			defVars:: defVarsIn: headerAst constructor.
+			1 to: defVars size do: [:j |
+				(defVars at: j) first = name ifTrue: [
+					^TypeParameterType named: name index: accCount + j
+				]
+			]
+		 ].
 		] on: Error do: [:e | (* Skip classes whose headers can't be parsed *)].
 		current:: current enclosingMixin.
 	].
 	^nil
+)
+isFactoryTypeVarName: name <Symbol> inScopeOf: mixin <MixinMirror> ^ <Boolean> = (
+	(* True if name is a <def E> factory type variable of some enclosing class (so a
+	   reference to it from the class side, where it is out of scope, is a scoping error). *)
+	| current |
+	current:: mixin.
+	[current ~= nil] whileTrue: [
+		[(defVarsIn: (parser parseClassHeader: current declaration header source) constructor)
+			do: [:dv | dv first = name ifTrue: [^true]].
+		] on: Error do: [:e |].
+		current:: current enclosingMixin.
+	].
+	^false
 )
 type: selector <Symbol> at: mixin <MixinMirror>
   ^ <MixinMirror | MethodMirror | ClassDeclarationMirror | SlotDeclarationMirror | TypeVariable | Nil> = (
@@ -2189,6 +2514,7 @@ public typecheckMethod: m <MethodAST> ofClass: c <Class | MixinMirror> ^ <Set[Ty
 	currentTopLevelClass:: toplevelCandidate declaration.
 	errorSet:: Set new.
 	methodNode: m.
+	validateInferenceClausesOf: m pattern.
 	^errorSet
 )
 mixinOf: c <Class | MixinMirror> ^ <MixinMirror> = (

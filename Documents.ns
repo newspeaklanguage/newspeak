@@ -172,6 +172,10 @@ These maps are stored here so that they can be passed to newly created Amplefort
      would replace the live body on screen (killing caret/focus and
      racing keystrokes). The contentsChanged outlet checks this flag. *)
   public retired <Boolean> ::= false.
+  (* This presenter's outlet on the document's contentsChanged duct, captured so
+     it can be detached when the presenter is retired — keeps the duct's outlet
+     list bounded as generations turn over (M4 retire-time teardown). *)
+  contentsOutlet
   cm <CodeMirrorFragment>
   rawViewToggle <ToggleComposer>
   |
@@ -192,7 +196,19 @@ updateFromRawView = (
      CodeMirrors keep a stale painted viewport until told they are
      visible again, and unlike the navigation path (where the shell
      sends it) nothing else sends exposure here. *)
-  rendered content noticeExposure
+  rendered content noticeExposure.
+  (* The DOM now reflects subject text; record it so subsequent redundant
+     contentsChanged events (and freshly-spawned generations) recognise the live
+     view as current and skip a caret-destroying reparse. *)
+  stampLiveViewTextHash: subject text hash
+)
+public detachContentsOutlet = (
+  (* Remove this presenter's outlet from the document's contentsChanged duct.
+     Called when the presenter is retired so dead generations stop participating
+     and the duct's outlet list stays bounded (M4 retire-time teardown). *)
+  contentsOutlet isNil ifFalse: [
+    [contentsOutlet detachFromAll] on: Exception do: [:e | nil].
+    contentsOutlet:: nil]
 )
 public refresh = (
   (* External hook: re-render the live view from the current raw text.
@@ -218,14 +234,67 @@ public refresh = (
   updateFromRawView
 )
 updateVisualsFromSameKind: oldPresenter <Self> ^ <Alien[Element]> = (
-  | result <Alien[Element]> = super updateVisualsFromSameKind: oldPresenter. |
-  (* This presenter has adopted oldPresenter's DOM; oldPresenter's holder
-     still references the displayed nodes, so it must never refresh again
-     (see the `retired` slot comment). Exactly one generation per
-     presentation stays unretired: the latest. *)
+  | result <Alien[Element]> = super updateVisualsFromSameKind: oldPresenter. node |
   oldPresenter retired: true.
+  oldPresenter detachContentsOutlet.
+  (* Claim ownership of THIS presentation's shared live-view node. The framework's
+     reconciliation can be a "star" — every generation reconciled against the same
+     root, so `oldPresenter retired:` only ever retires that root and the live
+     SIBLING generations pile up, each with a live contentsChanged outlet that
+     reparses the shared node on every keystroke (caret clobbered). Rather than
+     try to retire those siblings (we cannot enumerate them, and storing a
+     presenter object on the node silently fails — only integers round-trip the
+     alien bridge), we stamp the node with our identityHash. The contentsChanged
+     handler then refreshes only when it is the node's current owner (see
+     `isLiveViewOwner`), so the newest generation wins and the siblings go quiet.
+     The node is per-presentation, so transclusions/multiple chats are independent.
+     Note: a missing JS property reads back as the undefined-Alien (NOT nil), so
+     reads are always gated by hasOwnProperty. *)
+  node:: [rendered visual] on: Exception do: [:e | nil].
+  node isNil ifFalse: [
+     [node at: #liveViewOwner put: self identityHash] on: Exception do: [:e | nil]].
   addUpdateHandler.
   ^result
+)
+isLiveViewOwner ^ <Boolean> = (
+  (* True iff this generation is the current owner of the shared live-view node
+     it last stamped in updateVisualsFromSameKind:. identityHash is an integer and
+     round-trips the alien bridge cleanly. A missing property reads back as the
+     undefined-Alien, so gate on hasOwnProperty first. *)
+  | node owner |
+  node:: [rendered visual] on: Exception do: [:e | nil].
+  node isNil ifTrue: [^true].
+  (* Unstamped node => no competing generation has claimed it (e.g. the sole
+     root generation, which never runs updateVisualsFromSameKind:). Treat self as
+     owner so a lone generation still refreshes on incoming turns. *)
+  ([node hasOwnProperty: #liveViewOwner] on: Exception do: [:e | false]) ifFalse: [^true].
+  owner:: [node at: #liveViewOwner] on: Exception do: [:e | nil].
+  ^owner = self identityHash
+)
+stampLiveViewTextHash: h <Integer> = (
+  (* Record on THIS presentation's shared live-view node the hash of the text the
+     DOM now reflects. Stamped (a) just before a hand edit mutates the document
+     (with the edit's text), so the resulting contentsChanged sees the DOM as
+     already-current and no generation reparses (caret preserved), and (b) after a
+     genuine rebuild in updateFromRawView (with the rendered text). The node is
+     per-presentation, so distinct chats / transclusions track independently.
+     Integers round-trip the alien bridge; a missing read is the undefined-Alien. *)
+  | node |
+  node:: [rendered visual] on: Exception do: [:e | nil].
+  node isNil ifFalse: [[node at: #liveViewTextHash put: h] on: Exception do: [:e | nil]]
+)
+liveViewShowsCurrentText ^ <Boolean> = (
+  (* True iff the shared live-view node's stamped text hash matches the document's
+     current text — i.e. the displayed DOM already reflects the document and a
+     refresh would only destroy the caret. Used to suppress redundant rebuilds
+     across generation turnover, independent of which generation produced the
+     change. Unstamped => unknown => treat as stale so the first render proceeds. *)
+  | node stored |
+  node:: [rendered visual] on: Exception do: [:e | nil].
+  node isNil ifTrue: [^false].
+  ([node hasOwnProperty: #liveViewTextHash] on: Exception do: [:e | false]) ifFalse: [^false].
+  stored:: [node at: #liveViewTextHash] on: Exception do: [:e | nil].
+  ^stored = subject text hash
 )
 jsDocument = (
   ^retainedPlatform js global at: #document
@@ -286,15 +355,14 @@ definition ^ <Fragment> = (
      DOM was adopted by a newer generation — see the `retired` slot) must
      never refresh: through adoption it still references displayed nodes,
      and its updateFromRawView would replace the live body mid-keystroke. *)
-  subject document contentsChanged => [:packet |
+  contentsOutlet isNil ifFalse: [[contentsOutlet detachFromAll] on: Exception do: [:e | nil]].
+  contentsOutlet:: subject document contentsChanged => [:packet |
       | doc origin |
       doc:: packet at: 1.
       origin:: packet at: 2.
-      (retired or: [origin == self]) ifFalse: [
-          [doc prepareForLiveViewRefresh: self.
-           refresh]
-            on: Exception do: [:e | nil]
-      ]
+      (((retired or: [origin == self]) or: [liveViewShowsCurrentText]) or: [isLiveViewOwner not]) ifFalse: [
+          [doc prepareForLiveViewRefresh: self. refresh]
+              on: Exception do: [:e | nil]]
   ].
   cm:: codeMirror: subject text.
   updateFromRawView.
@@ -687,9 +755,14 @@ ampletNamed: n <String> ^ <Alien[Element]> = (
 updater = (
   ^[ | newHTML = scrubbedLiveViewSource. |
     (* Note that the live view was edited *)
-    updatingFromLive: true.  
+    updatingFromLive: true.
+    (* Stamp the shared node with the edit's text hash BEFORE mutating the
+       document. The mutation publishes contentsChanged; with the hash already
+       matching subject text, every generation (including a freshly-spawned owner)
+       sees the DOM as current and skips its reparse — so the caret survives. *)
+    stampLiveViewTextHash: newHTML hash.
     (* Update the raw view based on the live view *)
-    cm text: newHTML. 
+    cm text: newHTML.
     (* Ensure Ampleforth fragment source is consistent with live view *)
     rendered content html: newHTML.
     nil]
@@ -720,10 +793,10 @@ public replaceSelectionUsing: fos <[:Alien[Selection]]> = (
 )
 addUpdateHandler   = (
   (* Add an update handler to the new live view. *)
-  (rendered content visual at: #firstChild) 
+  (rendered content visual at: #firstChild)
     at: #ondrop put:  dropHandler;
     at: #updateRawHTML put: updater;
-    at: #onpaste put: [:e <Alien[ClipboardEvent]> | 
+    at: #onpaste put: [:e <Alien[ClipboardEvent]> |
        (* note that a paste is happening; the view processing
            will happen later, and rely on this *)
         pasting:: true.

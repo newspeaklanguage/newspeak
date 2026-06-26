@@ -226,6 +226,23 @@ These maps are stored here so that they can be passed to newly created Amplefort
 					contentsOutlet:: nil
 				]
 		)
+		scheduleContentsOutletDetach = (
+			(* Defer detachContentsOutlet to a fresh JS task (setTimeout 0). This is
+	     called from inside the contentsChanged duct's send: dispatch; detaching
+	     synchronously would do `outlets remove:` while `outlets do:` is iterating
+	     by live index (List>>do: / remove: in CollectionsForPrimordialSoup), which
+	     skips sibling deliveries and can read a nil'd slot. Running after the frame
+	     unwinds makes the duct mutation safe. The generation is already marked
+	     retired, so it skips until the outlet is gone. *)
+
+			[ retainedPlatform js global setTimeout: [
+					detachContentsOutlet.
+					(* The block's value is marshalled back to JS by expatriateBlock:.
+			   Methods return self by default (no ^), and a presenter cannot cross
+			   the bridge — end with nil so the callback returns a marshallable value. *)
+					nil ] ]
+				on: Exception do: [:e | nil ]
+		)
 		public refresh = (
 			(* External hook: re-render the live view from the current raw text.
      Used by ChatDocument when its chat subject mutates contents
@@ -391,16 +408,28 @@ These maps are stored here so that they can be passed to newly created Amplefort
 					[ contentsOutlet detachFromAll ] on: Exception do: [:e | nil ]
 				].
 			contentsOutlet:: subject document contentsChanged => [:packet |
-				| doc origin |
+				| doc origin owner |
 				doc:: packet at: 1.
 				origin:: packet at: 2.
+				owner:: isLiveViewOwner.
 				(((retired or: [ origin == self ]) or: [ liveViewShowsCurrentText ]) or: [
-						isLiveViewOwner not
+						owner not
 					]) ifFalse: [
 						[
 							doc prepareForLiveViewRefresh: self.
 							refresh
 						] on: Exception do: [:e | nil ]
+					].
+				(* Collapse the generation star: a live generation that is no longer the
+		   shared node's owner has been permanently superseded (ownership only
+		   advances to newer generations), so retire it and schedule removal of its
+		   now-dead contentsChanged outlet. Without this the obsolete siblings stay
+		   subscribed and fan out on every change (only to skip). The detach MUST be
+		   deferred (scheduleContentsOutletDetach) — we are inside the duct's send:
+		   dispatch and List>>do: iterates by live index while detach: shifts it. *)
+				(retired not and: [ owner not ]) ifTrue: [
+						retired:: true.
+						scheduleContentsOutletDetach
 					]
 			].
 			cm:: codeMirror: subject text.

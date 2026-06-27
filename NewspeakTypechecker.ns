@@ -1806,10 +1806,18 @@ type's classDeclaration. First check scope of mixin , otherwise climb the enclos
 		signature:: node pattern apply: self.
 		
 		(* Add parameters to scope using the already-resolved types from the signature,
-	   rather than re-applying the type builder which would report duplicate errors. *)
+	   rather than re-applying the type builder which would report duplicate errors.
+	   A parameter with no type annotation is itself an error (the signature already
+	   substituted errorType for it; report the missing annotation here). *)
 		params:: node pattern parameters.
-		1 to: params size
-			do: [:i | currentScope at: (params at: i) name put: (signature domain at: i) ].
+		1 to: params size do: [:i |
+				| p = params at: i. |
+				p type isNil ifTrue: [
+						error: 'Parameter ' , p name , ' has no type annotation'
+							at: {p start. p end. }
+					].
+				currentScope at: p name put: (signature domain at: i)
+			].
 		currentReturnType:: signature range.
 		node body apply: self.
 		popScope.
@@ -1890,13 +1898,20 @@ Otherwise, check the main namespace. *)
 		dependentDeclarations do: [:ds <Set[Declaration]> | ds remove: declaration ]
 	)
 	public returnStatNode: node ^<ObjectType> = (
-		| returnType <ObjectType> eType <ObjectType> |
+		| eType <ObjectType> |
 		eType:: node expression apply: self.
-		^(type: eType isSubtypeOf: currentReturnType) ifTrue: [ BottomType new ]
-			ifFalse: [
+		(type: eType isSubtypeOf: currentReturnType) ifFalse: [
 				error: 'Type of returned expression is not a subtype of declared return type'
 					at: {node start. node end. }
-			]
+			].
+
+		(* A return statement never completes normally, so its value type is always
+	   Bottom (a subtype of everything) regardless of whether the returned
+	   expression matched. Returning the error result here instead -- as the prior
+	   code did on mismatch -- left a non-type as the statement's type, which then
+	   crashed any consumer of that type (e.g. the inferred value type of a closure
+	   whose body is a non-local return). *)
+		^BottomType new
 	)
 	returnTypeFor: node <MessagePatternAST> ^<TypeAST> = (
 		| returnType <TypeAST | Nil> |
@@ -1978,26 +1993,45 @@ Otherwise, check the main namespace. *)
 	)
 	public slotDefNode: node <SlotDefAST> ^<ObjectType> = (
 		| declaredType <ObjectType> initializerType <ObjectType> |
-		
-		(* Get the declared type of the slot. A missing annotation is itself a
-	   type error: without one, the initializer-vs-slot subtype check below
-	   degenerates to errorType >: anything and silently accepts garbage. *)
-		declaredType:: node type isNil ifTrue: [
-				error: 'Slot ' , node name , ' has no type annotation'
-					at: {node start. node end. }.
-				errorType
-			]
-			ifFalse: [ node type apply: typeBuilder ].
-		
-		(* Type check the initializer if present *)
-		node initializer isNil ifFalse: [
-				initializerType:: node initializer apply: self.
-				(type: initializerType isSubtypeOf: declaredType) ifFalse: [
-						error: 'Initializer type does not match slot type'
-							at: {node start. node end. }
-					]
+
+		(* An explicit reference to an internal underscore name (e.g. _Array,
+		   _Object) in user code is not accessible -- the public names (Array,
+		   Object) must be used. Reject it here, where user-written slot/local
+		   annotations are resolved, without disturbing typeIdNode:, through which
+		   the kernel's own internal signatures are legitimately resolved. *)
+		(node type isKindOfTypeIdAST and: [ node type name asString startsWith: '_' ]) ifTrue: [
+				error: node type name , ' is not defined' at: {node start. node end. }.
+				^currentScope at: node name put: errorType
 			].
 		
+		(* Determine the slot's type. With an explicit annotation, resolve and use it,
+	   checking any initializer against it. With no annotation, infer the type from
+	   the initializer (e.g. a method-body local `x = expr`). A lazy slot, or one
+	   with no initializer to infer from, still requires an explicit annotation --
+	   otherwise the initializer-vs-slot subtype check degenerates to errorType >:
+	   anything and silently accepts garbage. *)
+		node type isNil
+			ifTrue: [
+				(node isLazy not and: [ node initializer isNil not ])
+					ifTrue: [ declaredType:: node initializer apply: self ]
+					ifFalse: [
+						error: 'Slot ' , node name , ' has no type annotation'
+							at: {node start. node end. }.
+						declaredType:: errorType.
+						node initializer isNil ifFalse: [ node initializer apply: self ]
+					]
+			]
+			ifFalse: [
+				declaredType:: node type apply: typeBuilder.
+				node initializer isNil ifFalse: [
+						initializerType:: node initializer apply: self.
+						(type: initializerType isSubtypeOf: declaredType) ifFalse: [
+								error: 'Initializer type does not match slot type'
+									at: {node start. node end. }
+							]
+					]
+			].
+
 		(* Add the slot to the current scope *)
 		currentScope at: node name put: declaredType.
 		
@@ -2612,7 +2646,18 @@ Otherwise, check the main namespace. *)
 				error: 'Local ' , node name , ' has no type annotation'
 					at: {node start. node end. }.
 				^currentScope at: node name put: errorType
-			]
+			].
+
+		(* An explicit reference to an internal underscore name (e.g. _Array, _Object)
+	   in user code is not accessible -- the public names (Array, Object) must be
+	   used. Reject it here, where user-written local/slot annotations are resolved,
+	   without disturbing typeIdNode:, through which the kernel's own internal
+	   signatures are legitimately resolved. *)
+		(node type isKindOfTypeIdAST and: [ node type name asString startsWith: '_' ]) ifTrue: [
+				error: node type name , ' is not defined' at: {node start. node end. }.
+				^currentScope at: node name put: errorType
+			].
+		node type isNil
 			ifFalse: [
 				resolvedType:: node type apply: typeBuilder.
 				resolvedType isNil ifTrue: [

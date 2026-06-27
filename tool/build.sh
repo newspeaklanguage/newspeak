@@ -71,7 +71,9 @@ cd ${NEWSPEAK} || exit 1
 IDE_SHA=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)
 IDE_DATE=$(git show -s --format=%cs HEAD 2>/dev/null || echo unknown)
 VM_SHA=$(git -C ${PRIMORDIALSOUP} rev-parse --short HEAD 2>/dev/null || echo unknown)
-test -n "$(git status --porcelain 2>/dev/null)" && DIRTY=' (dirty)' || DIRTY=''
+# Tracked changes only (--untracked-files=no): scratch .md/.zip/etc. left in the
+# tree shouldn't flag a build as dirty -- only uncommitted edits to tracked files do.
+test -n "$(git status --porcelain --untracked-files=no 2>/dev/null)" && DIRTY=' (dirty)' || DIRTY=''
 BUILT=$(date -u +%Y-%m-%dT%H:%MZ)
 cat > BuildInfo.ns <<NSEOF
 Newspeak3

@@ -115,10 +115,13 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 	   IDE evaluator pane just like the workspace case. *)
 		focusEvaluatorSubject_slot
 		
-		(* Single shared chat subject, lazily created on first use (e.g. when the
-	   user clicks any brain button). Once created, all brain buttons reuse it
-	   so the conversation continues as the user navigates. *)
-		sharedChatSubject_slot
+		(* The chat the brain button / inline region / toolbar currently *target*
+	   — NOT "the only one". Multiple chat docs coexist live, each with its own
+	   subject on its own `chatSubjectSlot`; this slot only records which one is
+	   the current target. It moves only on deliberate selection (makeCurrentChat:,
+	   the switcher) or new-chat creation (startChat) — never on render — so
+	   rendering/transcluding other chat docs never steals the target (M1). *)
+		currentChatSubject_slot
 		
 		(* AI-proposed code changes staged for atomic install. Keyed by
 	   changeset id (e.g. "cs1"); the value is a List of change records
@@ -274,7 +277,7 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 		)
 		public startChat = (
 			(* Persist key, create the ChatDocument in Root under docName, install
-	   it as the active chat doc (localStorage + sharedChatSubject_slot),
+	   it as the active chat doc (localStorage + currentChatSubject_slot),
 	   and return a DocumentSubject so navigation lands on the new doc.
 	   Returns nil on validation failure with errorMessage set. *)
 			
@@ -301,7 +304,7 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 				do: [:e | ].
 			doc:: createChatNamed: docName provider: providerName model: modelName.
 			Root at: docName asSymbol put: doc.
-			sharedChatSubject_slot:: doc chatSubject.
+			currentChatSubject_slot:: doc chatSubject.
 			ide browsing updateCurrentDisplay.
 			^ide documents DocumentSubject onModel: doc
 		)
@@ -312,7 +315,7 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 			
 			| chat <IDEChatSubject> |
 			chat:: IDEChatSubject onModel: session.
-			sharedChatSubject_slot:: chat.
+			currentChatSubject_slot:: chat.
 			^chat
 		)
 		public isKindOfIDEChatSetupSubject ^<Boolean> = (
@@ -577,9 +580,19 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 	public class IDEChatPresenter onSubject: s <IDEChatSubject> = BaseChatPresenter onSubject: s (
 		(* Inline (non-document) chat presenter. Used for embedded chats (brain
  button → ephemeral region under the current page). ChatDocument-backed
- chats render through DocumentPresenter instead. *)
-		
+ chats render through DocumentPresenter instead.
+
+ onSwitchHandler: optional [:Document] block. When set (by a brain region that
+ embeds this presenter), the chat switcher retargets THAT region's chat locally
+ instead of moving the global current — so switching one brain region does not
+ switch every other one. Re-injected on each region render, so it need not
+ survive this presenter's own regeneration. *)
+
+		| onSwitchHandler_slot |
 	) (
+		public onSwitchHandler: aBlock <[:Document]> = (
+			onSwitchHandler_slot:: aBlock
+		)
 		respondToInspectPresenter = (
 			enterSubject: (ide browsing ObjectSubject onModel: (ObjectMirror reflecting: self))
 		)
@@ -658,12 +671,14 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 					]. }
 		)
 		respondToSwitchToChat: doc <Document> = (
-			(* Make doc the current shared chat (also the default for new presenters)
-	   and refresh: ensureSharedChat now returns doc's subject, so the page
-	   refresh reinstalls the inline chat toggle (ProgrammingPresenter>>
-	   updateVisualsFromSameKind:) with a fresh presenter on the selected
-	   conversation. No navigation — the user stays on the current page. *)
-			
+			(* Switch this chat region to `doc`. If embedded in a brain region
+	   (onSwitchHandler set), retarget only THAT region's chat — local, no effect
+	   on other regions or the global current. Otherwise (standalone) fall back to
+	   moving the global current and refreshing this presenter, as before. No
+	   navigation either way — the user stays on the current page. *)
+
+			onSwitchHandler_slot isNil
+				ifFalse: [ ^onSwitchHandler_slot value: doc ].
 			makeCurrentChat: doc.
 			updateGUI: [ ]
 		)
@@ -1374,9 +1389,9 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 		^activeChatDocPrefix , computeFocusOnly
 	)
 	activeChatDocPrefix ^<String> = (
-		sharedChatSubject_slot isNil ifTrue: [ ^'' ].
-		sharedChatSubject_slot isKindOfIDEChatDocumentSubject ifFalse: [ ^'' ].
-		^'Active chat document: ' , sharedChatSubject_slot document name , '. '
+		currentChatSubject_slot isNil ifTrue: [ ^'' ].
+		currentChatSubject_slot isKindOfIDEChatDocumentSubject ifFalse: [ ^'' ].
+		^'Active chat document: ' , currentChatSubject_slot document name , '. '
 	)
 	computeFocusOnly ^<String> = (
 		currentFocusBlock isNil ifTrue: [ ^'(no focus set)' ].
@@ -1404,10 +1419,10 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 	   Distinct from ensureSharedChat, which the per-presenter brain
 	   buttons use to render an ephemeral inline ChatPresenter region.
 	   Both reach the same underlying conversation (the Session backing
-	   sharedChatSubject_slot); the difference is presentation.
+	   currentChatSubject_slot); the difference is presentation.
 
 	   Resolution order:
-	     1. If sharedChatSubject_slot is an IDEChatDocumentSubject —
+	     1. If currentChatSubject_slot is an IDEChatDocumentSubject —
 	        the common case after any prior chat-doc visit or startChat
 	        — return a DocumentSubject on its document.
 	     2. Legacy fallback: if it's some other (non-doc-bound) chat
@@ -1418,7 +1433,7 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 	        setup subject so the user can configure. *)
 		
 		| subj setup chatDocOrSetup |
-		subj:: sharedChatSubject_slot.
+		subj:: currentChatSubject_slot.
 		subj isKindOfIDEChatDocumentSubject ifTrue: [
 				^ide documents DocumentSubject onModel: subj document
 			].
@@ -1431,23 +1446,34 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 	)
 	public ensureSharedChat = (
 		(* Return whatever subject the brain-button should navigate to next:
-	   - If we already have a sharedChatSubject (cached from a prior chat
-	     creation or doc visit), reuse it — keeps a single rolling
+	   - If a chat is already current, reuse it — keeps a single rolling
 	     conversation across brain clicks.
-	   - Otherwise we need a configured provider. If the Anthropic API key
-	     is still empty, return the setup Subject so the user can enter
-	     it; if a key is stored, fall through to startChat which builds
-	     the doc + subject. *)
-		
-		| setup <IDEChatSetupSubject> chat |
-		sharedChatSubject_slot isNil ifFalse: [ ^sharedChatSubject_slot ].
+	   - Else restore the last chat from the reload hint if it still exists, and
+	     make it current. (Building a chat subject no longer retargets on render —
+	     M1 — so without this the brain button would create a fresh chat on every
+	     reload instead of resuming the last one.)
+	   - Otherwise we need a configured provider. If the Anthropic API key is still
+	     empty, return the setup Subject; if a key is stored, fall through to
+	     startChat which builds the doc + subject. *)
+
+		| activeName entry setup <IDEChatSetupSubject> chat |
+		currentChatSubject_slot isNil ifFalse: [ ^currentChatSubject_slot ].
+		activeName:: [ js localStorage getItem: 'ns_ai_active_chat_doc' ] on: Exception
+			do: [:e | nil ].
+		activeName isNil ifFalse: [
+				entry:: Root at: activeName asSymbol ifAbsent: [ nil ].
+				(entry isNil not and: [
+						[ entry isKindOfChatDocument ] on: Exception do: [:e | false ]]) ifTrue: [
+						^makeCurrentChat: entry
+					]
+			].
 		setup:: IDEChatSetupSubject onModel: AnthropicProvider.
 		setup apiKey isEmpty ifTrue: [ ^setup ].
 		chat:: setup startChat.
 		chat isNil ifTrue: [ ^setup ].
-		
+
 		(* startChat goes through newChatSubjectFor:, which has already cached. *)
-		^sharedChatSubject_slot
+		^currentChatSubject_slot
 	)
 	chatDocumentsInRoot ^<List[Document]> = (
 		(* Every chat document currently in Root, in Root's insertion order
@@ -1473,6 +1499,9 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 		
 		^chatDocumentsInRoot collect: [:doc |
 				{doc name. [
+					(* Explicit switch → make the selected chat current (render no longer
+				   retargets — M1), then navigate to its full document view. *)
+					makeCurrentChat: doc.
 					ide browsing navigateTo: (ide documents DocumentSubject onModel: doc)
 				]. }
 			]
@@ -1486,14 +1515,19 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 		ide browsing navigateTo: (IDEChatSetupSubject onModel: AnthropicProvider)
 	)
 	makeCurrentChat: doc <Document> ^<IDEChatDocumentSubject> = (
-		(* Make `doc` the current shared chat: its subject becomes what the
-	   inline chat region renders (ensureSharedChat) and the default chat for
-	   newly-opened presenters / the toolbar, and it is recorded as the active
-	   chat doc in localStorage. `doc chatSubject` already performs all three
-	   (it sets sharedChatSubject_slot and the localStorage key); this is the
-	   intention-revealing entry point used by the presenter chat switcher. *)
-		
-		^doc chatSubject
+		(* Deliberately make `doc` the current targeted chat: its subject becomes
+	   what the inline chat region (ensureSharedChat) and the toolbar default to,
+	   and it is recorded as the default-on-reload chat doc in localStorage. This is
+	   the ONLY render-independent retarget (used by the presenter chat switcher);
+	   building the subject (chatSubjectFor:) no longer retargets, so other live
+	   chats are left alone. *)
+
+		| subject |
+		subject:: doc chatSubject.
+		currentChatSubject_slot:: subject.
+		[ js localStorage setItem: 'ns_ai_active_chat_doc' to: doc name ] on: Exception
+			do: [:e | ].
+		^subject
 	)
 	public chatControlsFor: doc <Document> ^<Presenter> = (
 		^ChatControlsPresenter onSubject: doc
@@ -1506,17 +1540,17 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 	)
 	public chatSubjectFor: doc <Document> ^<IDEChatDocumentSubject> = (
 		(* Build/cache the doc's IDEChatDocumentSubject (and its Session) on the
-	   doc's chatSubjectSlot, and make it the current shared chat + localStorage
-	   default — the clone-template counterpart of old ChatDocument>>chatSubject. *)
-		
+	   doc's chatSubjectSlot, and return it. This is the RENDER path (called by
+	   thinkingPickerFor:/inputEditorFor: every time a chat doc's amplets render),
+	   so it must NOT retarget the current chat or touch localStorage — otherwise
+	   transcluding/rendering one chat doc would steal "current" from another live
+	   chat. Retargeting is deliberate only: makeCurrentChat: / startChat (M1). *)
+
 		doc maxAmpletCount < 3 ifTrue: [ doc maxAmpletCount: 3 ].
 		doc chatSubjectSlot isNil ifTrue: [
 				doc chatSubjectSlot: (IDEChatDocumentSubject onChatDocument: doc
 						session: (createFreshSessionFor: doc))
 			].
-		sharedChatSubject_slot:: doc chatSubjectSlot.
-		[ js localStorage setItem: 'ns_ai_active_chat_doc' to: doc name ] on: Exception
-			do: [:e | ].
 		^doc chatSubjectSlot
 	)
 	createFreshSessionFor: doc <Document> ^<Session> = (
@@ -1993,7 +2027,7 @@ public clearConversation = ( ide aiSupport clearConversationFor: self )
 	   each markComplete override drains its own list. *)
 		
 		| subj |
-		subj:: sharedChatSubject_slot.
+		subj:: currentChatSubject_slot.
 		subj isNil ifTrue: [ ^self ].
 		
 		(* Always populate the subject-level queue (inherited by both

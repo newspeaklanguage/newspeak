@@ -44,10 +44,23 @@ shared singleton/module-global state.
   `updateVisualsFromSameKind:` carries `regionChat` across refresh. New-Chat left
   as-is (navigates to setup, becomes global current). Each brain region is now an
   independent session.
-- **M2 — Per-chat tools, focus, and changeset id-space** (hybrid isolation). Move
-  `currentFocusBlock`/`currentFocusValidator` (module-global today, `AI_IDE_Support`
-  ~line 79) and `activeChatHolder`/`changeset id-space` into per-session context, so
-  concurrent sessions don't read each other's focus. (This is followups-#3.)
+- **M2a — Per-chat focus — DONE (2026-06-27).** New `ChatFocus` class (block +
+  validator + docLabel + `description`); each chat owns one, threaded
+  `chatSubjectFor:` → `createFreshSessionFor:focus:` → `toolsForProvider:focus:`
+  (so `current_focus` reads the calling session's focus) and onto the
+  `IDEChatDocumentSubject` (so it can be written). `captureFocusInto:` snapshots the
+  module-global staged focus into a chat. Focus follows navigation via
+  `ProgrammingPresenter>>noticeExposure`: when a presenter with an open brain region
+  is **exposed** (navigated-to/shown — nesting-agnostic, fires on exposure NOT
+  repaint), it re-asserts its `focusAction_slot` and captures into its `regionChat`.
+  This beat two dead ends: click-only capture (didn't follow navigation) and
+  capture-on-every-render (a live workspace pane repainted constantly and dominated).
+  The module global `currentFocusBlock`/`Validator` stay only as the brain-click
+  staging source. `currentFocusDescription`/`computeFocusOnly` now dead (left for
+  cleanup).
+- **M2b — Per-chat changeset id-space** (still TODO). Move `nextChangesetIdNum` +
+  `proposedChangesets` per-chat; route `enqueuePendingChangesetId:` to the proposing
+  session. Object registry stays shared (hybrid).
 - **M3 — Broadcast system changes to all *other* open chats** (inject notice +
   handle staleness). Previously deferred.
 

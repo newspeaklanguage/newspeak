@@ -58,9 +58,15 @@ shared singleton/module-global state.
   The module global `currentFocusBlock`/`Validator` stay only as the brain-click
   staging source. `currentFocusDescription`/`computeFocusOnly` now dead (left for
   cleanup).
-- **M2b — Per-chat changeset id-space** (still TODO). Move `nextChangesetIdNum` +
-  `proposedChangesets` per-chat; route `enqueuePendingChangesetId:` to the proposing
-  session. Object registry stays shared (hybrid).
+- **M2b — Per-chat changeset routing — DONE (2026-06-27).** Reframed: the id-space
+  is already collision-safe (global `nextChangesetIdNum` → unique ids; global
+  `proposedChangesets` keyed by them), so the real bug was *attribution* — a
+  changeset proposed during one session was enqueued onto whatever chat was
+  CURRENT. Fix: `ChatFocus` carries its `chatDoc`; `proposeChangesToolForFocus:`
+  (per-session, like `current_focus`) enqueues via `proposingChatFor: focus` →
+  `focus chatDoc chatSubjectSlot` instead of `currentChatSubject_slot`.
+  `enqueuePendingChangesetId:id forChat:` now takes the target chat. Id-space and
+  object registry stay shared (hybrid).
 - **M3 — Broadcast system changes to all *other* open chats** (inject notice +
   handle staleness). Previously deferred.
 

@@ -335,9 +335,16 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 		|
 			block
 			validator
+			chatDoc_slot = doc.
 			docLabel = doc isNil ifTrue: [ '' ] ifFalse: [ 'Active chat document: ' , doc name , '. ' ].
 		|
 	) (
+		public chatDoc ^<Document | UndefinedObject> = (
+			(* The chat document this focus/session belongs to (nil for doc-less
+		   sessions). Lets a per-session tool route to ITS chat — e.g. propose_changes
+		   enqueues the changeset onto the proposing chat, not the global current (M2b). *)
+			^chatDoc_slot
+		)
 		public installBlock: b validator: v = (
 			block:: b.
 			validator:: v
@@ -2077,30 +2084,37 @@ public clearConversation = ( ide aiSupport clearConversationFor: self )
 			].
 		Error signal: 'Unknown change kind: ' , kind
 	)
-	enqueuePendingChangesetId: id <String> = (
-		(* Stage id for the next markComplete. The same id has to surface
-	   in both presenter flavours of the chat — the doc view (amplets
-	   inserted into the chat doc HTML by IDEChatDocumentSubject>>
-	   markComplete) and the inline view (per-message-index map
-	   populated by IDEChatSubject>>markComplete and read by
-	   IDEChatPresenter>>messagesArea). Push to BOTH queues so a
-	   doc-backed chat displayed inline still shows the proposals;
-	   each markComplete override drains its own list. *)
-		
-		| subj |
-		subj:: currentChatSubject_slot.
+	enqueuePendingChangesetId: id <String> forChat: subj = (
+		(* Stage id for the next markComplete of `subj` — the chat whose session
+	   PROPOSED the changeset, NOT the global current chat, so a proposal made
+	   during one session does not surface in whichever chat happens to be current
+	   (M2b). The same id has to surface in both presenter flavours of the chat —
+	   the doc view (amplets inserted into the chat doc HTML by
+	   IDEChatDocumentSubject>>markComplete) and the inline view (per-message-index
+	   map populated by IDEChatSubject>>markComplete and read by
+	   IDEChatPresenter>>messagesArea). Push to BOTH queues so a doc-backed chat
+	   displayed inline still shows the proposals; each markComplete override drains
+	   its own list. *)
+
 		subj isNil ifTrue: [ ^self ].
-		
+
 		(* Always populate the subject-level queue (inherited by both
 	   inline and doc-backed subjects) — that's what the inline
 	   presenter reads. *)
 		subj isKindOfIDEChatSubject ifTrue: [ subj pendingChangesetIds add: id ].
-		
+
 		(* And, for doc-backed subjects, also populate the document-level
 	   queue so the existing amplet pipeline keeps working. *)
 		subj isKindOfIDEChatDocumentSubject ifTrue: [
 				subj document pendingChangesetIds add: id
 			]
+	)
+	proposingChatFor: focus <ChatFocus> ^<Object | UndefinedObject> = (
+		(* The chat subject that owns `focus`'s session — the proposing chat. Falls
+	   back to the global current for doc-less sessions (focus has no chatDoc). By
+	   the time a tool fires, the doc's chatSubjectSlot is set (M2b). *)
+		focus chatDoc isNil ifTrue: [ ^currentChatSubject_slot ].
+		^focus chatDoc chatSubjectSlot
 	)
 	summarizeChangesetId: id <String> records: records <List> ^<String> = (
 		(* Short, structured-y summary returned to the model as the tool
@@ -2645,7 +2659,7 @@ public clearConversation = ( ide aiSupport clearConversationFor: self )
 	   document/amplet manipulation, navigation, testing, atomic
 	   changesets, evaluation/inspection, and debugger control. *)
 		
-		^{getClassSourceTool. getMemberSourceTool. getClassHeaderTool. listClassMembersTool. sendersTool. implementorsTool. searchClassesTool. listNamespaceTool. getDocumentTool. createDocumentTool. createChatDocumentTool. setDocumentContentsTool. deleteDocumentTool. listAmpletsTool. addAmpletTool. setAmpletExpressionTool. deleteAmpletTool. listMediaTool. deleteMediaTool. webFetchTool. (currentFocusToolForFocus: focus). navigateToClassTool. navigateToNamespaceTool. navigateToDocumentTool. showTestsTool. runTestsTool. getTestResultsTool. getTestFailureDetailsTool. runFailingTestsTool. runErroringTestsTool. runOneTestTool. proposeChangesTool. applyChangesetTool. evaluateTool. navigateToObjectTool. inspectObjectTool. listObjectsTool. forgetObjectTool. getCurrentFrameTool. getStackTraceTool. getCurrentExpressionTool. inspectActivationTool. stepTool. returnFromTool. continueThreadTool. }
+		^{getClassSourceTool. getMemberSourceTool. getClassHeaderTool. listClassMembersTool. sendersTool. implementorsTool. searchClassesTool. listNamespaceTool. getDocumentTool. createDocumentTool. createChatDocumentTool. setDocumentContentsTool. deleteDocumentTool. listAmpletsTool. addAmpletTool. setAmpletExpressionTool. deleteAmpletTool. listMediaTool. deleteMediaTool. webFetchTool. (currentFocusToolForFocus: focus). navigateToClassTool. navigateToNamespaceTool. navigateToDocumentTool. showTestsTool. runTestsTool. getTestResultsTool. getTestFailureDetailsTool. runFailingTestsTool. runErroringTestsTool. runOneTestTool. (proposeChangesToolForFocus: focus). applyChangesetTool. evaluateTool. navigateToObjectTool. inspectObjectTool. listObjectsTool. forgetObjectTool. getCurrentFrameTool. getStackTraceTool. getCurrentExpressionTool. inspectActivationTool. stepTool. returnFromTool. continueThreadTool. }
 	)
 	public toolsForProvider: provider <Provider> ^<List[Tool]> = (
 		(* tools plus any capability-gated extras the given provider can drive.
@@ -3505,7 +3519,7 @@ The Tester instance is captured for subsequent calls to get_test_results, run_fa
 				'Re-ran [' , testName , ']. Call get_test_results for the new outcome.'
 			]
 	)
-	proposeChangesTool ^<Tool> = (
+	proposeChangesToolForFocus: focus <ChatFocus> ^<Tool> = (
 		^Tool name: 'propose_changes'
 			description: 'Stage a set of code edits for atomic installation. Does NOT install. Returns a short summary plus a changeset id; the IDE renders the proposal as a structured diff inline in the chat. Wait for explicit user approval ("apply", "ok", "go ahead") before calling apply_changeset — or, if the user clicks the inline Apply button themselves, you will see a follow-up assistant note saying the changeset was applied. If the user wants something different, refine the changes and call propose_changes again.
 
@@ -3534,7 +3548,7 @@ Top-level class DELETION is not supported by this tool (different mechanism, not
 				records isEmpty ifTrue: [ Error signal: 'No changes provided' ].
 				id:: freshChangesetId.
 				proposedChangesets at: id put: records.
-				enqueuePendingChangesetId: id.
+				enqueuePendingChangesetId: id forChat: (proposingChatFor: focus).
 				summarizeChangesetId: id records: records
 			]
 	)

@@ -325,6 +325,44 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 			^other isKindOfIDEChatSetupSubject
 		)
 	) : ()
+	public class ChatFocus onDoc: doc <Document | UndefinedObject> = Object new (
+		(* Per-chat brain-button focus (M2a). Each chat (session) owns one; the
+	   current_focus tool built for that session reads THIS focus, so concurrent
+	   sessions never share focus. docLabel names the host chat document and is
+	   constant for the chat; block/validator are the brain-button snapshot,
+	   captured by captureFocusInto: when a brain opens/targets this chat. *)
+
+		|
+			block
+			validator
+			docLabel = doc isNil ifTrue: [ '' ] ifFalse: [ 'Active chat document: ' , doc name , '. ' ].
+		|
+	) (
+		public installBlock: b validator: v = (
+			block:: b.
+			validator:: v
+		)
+		public clear = (
+			block:: nil.
+			validator:: nil
+		)
+		public description ^<String> = (
+			^docLabel , focusPart
+		)
+		focusPart ^<String> = (
+			(* Mirrors the old module-global computeFocusOnly: validate the focused
+		   entity still exists, then render; drop a stale focus. *)
+			block isNil ifTrue: [ ^'(no focus set)' ].
+			validator isNil ifFalse: [
+					([ validator value ] on: Error do: [:e | false ]) ifFalse: [
+							clear.
+							^'(no focus set)'
+						]
+				].
+			^[ block value ] on: Error
+				do: [:e | '(focus block raised: ' , e messageText , ')' ]
+		)
+	) : ()
 	public class IDEChatSubject onModel: session <Session> = BaseChatSubject onModel: session (
 		(* IDE-aware chat subject; returns an IDE presenter so Inspect Presenter works.
 
@@ -704,7 +742,7 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 			^other isKindOfChatControlsPresenter
 		)
 	) : ()
-	public class IDEChatDocumentSubject onChatDocument: doc <Document> session: s <Session> = IDEChatSubject onModel: s (
+	public class IDEChatDocumentSubject onChatDocument: doc <Document> session: s <Session> focus: f <ChatFocus> = IDEChatSubject onModel: s (
 		(* Chat subject bound to a ChatDocument: instead of (or in addition to)
  the conversation living in the inline ChatPresenter view, each turn is
  appended as an HTML section into the document's contents and the live
@@ -717,10 +755,16 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 		|
 			public document <Document> = doc.
 			lastTurnIndexBeforeSend <Integer>
+			chatFocus_slot <ChatFocus> = f.
 		|
 	) (
 		public isKindOfIDEChatDocumentSubject ^<Boolean> = (
 			^true
+		)
+		public focus ^<ChatFocus> = (
+			(* This chat's per-session brain-button focus (M2a). Read by its
+		   current_focus tool; written by captureFocusInto: on a brain click. *)
+			^chatFocus_slot
 		)
 		public sendText: text <String> ^<Alien[Promise] | UndefinedObject> = (
 			| promise <Alien[Promise] | UndefinedObject> |
@@ -1368,6 +1412,19 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 		focusSha_slot:: nil.
 		focusHistoricalSource_slot:: nil
 	)
+	public captureFocusInto: chatSubject = (
+		(* Snapshot the module-global live focus (just set by the brain button's
+	   setClassFocusOn:/setMethodFocusOn:/etc.) into chatSubject's per-chat
+	   ChatFocus, so this chat's current_focus reports it regardless of later brain
+	   clicks elsewhere (M2a). The module global stays only as the click-staging
+	   source. Guarded: only doc-chat subjects carry a ChatFocus. *)
+
+		([ chatSubject isKindOfIDEChatDocumentSubject ] on: Exception do: [:e | false ])
+			ifTrue: [
+				chatSubject focus installBlock: currentFocusBlock
+					validator: currentFocusValidator
+			]
+	)
 	public activeChatHolder = (
 		^activeChatHolder_slot
 	)
@@ -1548,15 +1605,19 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 
 		doc maxAmpletCount < 3 ifTrue: [ doc maxAmpletCount: 3 ].
 		doc chatSubjectSlot isNil ifTrue: [
+				| fh |
+				fh:: ChatFocus onDoc: doc.
 				doc chatSubjectSlot: (IDEChatDocumentSubject onChatDocument: doc
-						session: (createFreshSessionFor: doc))
+						session: (createFreshSessionFor: doc focus: fh)
+						focus: fh)
 			].
 		^doc chatSubjectSlot
 	)
-	createFreshSessionFor: doc <Document> ^<Session> = (
+	createFreshSessionFor: doc <Document> focus: focus <ChatFocus> ^<Session> = (
 		(* Build a Session from the chat doc's stored provider/model (read from its
-	   HTML so they round-trip through save/load). Mirrors old
-	   ChatDocument>>createFreshSession. *)
+	   HTML so they round-trip through save/load). The session's tools report
+	   `focus` for current_focus — the per-chat focus shared with this doc's
+	   IDEChatDocumentSubject (M2a). Mirrors old ChatDocument>>createFreshSession. *)
 		
 		| pn mn cls key provider session |
 		pn:: chatProviderOf: doc.
@@ -1571,7 +1632,7 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 				cls apiKey: key model: mn baseUrl: (baseUrlForProvider: pn)
 			]
 			ifFalse: [ cls apiKey: key model: mn ].
-		session:: Session provider: provider tools: (toolsForProvider: provider).
+		session:: Session provider: provider tools: (toolsForProvider: provider focus: focus).
 		session systemPrompt: newspeakSystemPrompt.
 		^session
 	)
@@ -2576,7 +2637,7 @@ public clearConversation = ( ide aiSupport clearConversationFor: self )
 				Error signal: 'No such object id: ' , id , '. Use list_objects to see registered ids.'
 			]
 	)
-	public tools ^<List> = (
+	toolsWithFocus: focus <ChatFocus> ^<List> = (
 		(* The full IDE tool catalogue handed to every Session built through
 	   this module. Each tool's individual factory below carries its own
 	   description, JSON-Schema, and handler closure; this list just
@@ -2584,7 +2645,7 @@ public clearConversation = ( ide aiSupport clearConversationFor: self )
 	   document/amplet manipulation, navigation, testing, atomic
 	   changesets, evaluation/inspection, and debugger control. *)
 		
-		^{getClassSourceTool. getMemberSourceTool. getClassHeaderTool. listClassMembersTool. sendersTool. implementorsTool. searchClassesTool. listNamespaceTool. getDocumentTool. createDocumentTool. createChatDocumentTool. setDocumentContentsTool. deleteDocumentTool. listAmpletsTool. addAmpletTool. setAmpletExpressionTool. deleteAmpletTool. listMediaTool. deleteMediaTool. webFetchTool. currentFocusTool. navigateToClassTool. navigateToNamespaceTool. navigateToDocumentTool. showTestsTool. runTestsTool. getTestResultsTool. getTestFailureDetailsTool. runFailingTestsTool. runErroringTestsTool. runOneTestTool. proposeChangesTool. applyChangesetTool. evaluateTool. navigateToObjectTool. inspectObjectTool. listObjectsTool. forgetObjectTool. getCurrentFrameTool. getStackTraceTool. getCurrentExpressionTool. inspectActivationTool. stepTool. returnFromTool. continueThreadTool. }
+		^{getClassSourceTool. getMemberSourceTool. getClassHeaderTool. listClassMembersTool. sendersTool. implementorsTool. searchClassesTool. listNamespaceTool. getDocumentTool. createDocumentTool. createChatDocumentTool. setDocumentContentsTool. deleteDocumentTool. listAmpletsTool. addAmpletTool. setAmpletExpressionTool. deleteAmpletTool. listMediaTool. deleteMediaTool. webFetchTool. (currentFocusToolForFocus: focus). navigateToClassTool. navigateToNamespaceTool. navigateToDocumentTool. showTestsTool. runTestsTool. getTestResultsTool. getTestFailureDetailsTool. runFailingTestsTool. runErroringTestsTool. runOneTestTool. proposeChangesTool. applyChangesetTool. evaluateTool. navigateToObjectTool. inspectObjectTool. listObjectsTool. forgetObjectTool. getCurrentFrameTool. getStackTraceTool. getCurrentExpressionTool. inspectActivationTool. stepTool. returnFromTool. continueThreadTool. }
 	)
 	public toolsForProvider: provider <Provider> ^<List[Tool]> = (
 		(* tools plus any capability-gated extras the given provider can drive.
@@ -2592,9 +2653,16 @@ public clearConversation = ( ide aiSupport clearConversationFor: self )
 	   blocks in tool_result.content; only providers whose
 	   supportsFileUploads is true get it offered. *)
 		
+		^toolsForProvider: provider focus: (ChatFocus onDoc: nil)
+	)
+	public toolsForProvider: provider <Provider> focus: focus <ChatFocus> ^<List[Tool]> = (
+		(* As toolsForProvider:, but the current_focus tool reports `focus` — the
+	   per-chat focus owned by the session's chat — so concurrent sessions don't
+	   share focus (M2a). *)
+
 		| result <List[Tool]> |
 		result:: List new.
-		tools do: [:t <Tool> | result add: t ].
+		(toolsWithFocus: focus) do: [:t <Tool> | result add: t ].
 		provider supportsFileUploads ifTrue: [ result add: uploadFileTool ].
 		^result
 	)
@@ -2728,11 +2796,11 @@ public clearConversation = ( ide aiSupport clearConversationFor: self )
 				result
 			]
 	)
-	currentFocusTool ^<Tool> = (
+	currentFocusToolForFocus: focus <ChatFocus> ^<Tool> = (
 		^Tool name: 'current_focus'
 			description: 'Return a description of the current IDE context. Two parts, concatenated: (a) "Active chat document: X. " — the ChatDocument hosting this conversation, when one is active (omitted otherwise); (b) the brain-button focus the user has pointed at — class, method, namespace, document, evaluator — or "(no focus set)" if none. The two are orthogonal: the user can be in chat doc Foo while asking about method Bar by clicking its brain. Call this first whenever the user refers to "this", "here", or names a member without a class.'
 			inputSchema: '{"type":"object","properties":{}}'
-			handler: [:input | currentFocusDescription ]
+			handler: [:input | focus description ]
 	)
 	webFetchTool ^<Tool> = (
 		^Tool name: 'web_fetch'

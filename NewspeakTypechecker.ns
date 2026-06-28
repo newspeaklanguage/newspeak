@@ -115,13 +115,13 @@ Use and distribution of this software is subject to the terms of the attached so
 		(* module variables *)
 		parser <NewspeakParsing Parser> = p mirrors compiler parser.
 		namespace <Map[Symbol, Object]> = ns.
-		trail <Map[SubtypeQuery, Boolean]> = Map new.
+		trail <Map[SubtypeQuery, Boolean]> ::= Map new.
 		scopeStack <List[Scope]> = List new.
 		mutableSlotsStack <List[Set[Symbol]]> = List new.
 		typeBuilder <TypeBuilder>
 		currentClass <MixinMirror>
 		currentTopLevelClass <ClassDeclarationMirror>
-		currentDeclaration <Symbol>
+		currentDeclaration <Declaration>
 		currentReturnType <ObjectType>
 		errorSet <Set>
 		kernelMixin <MixinMirror> = (ClassMirror reflecting: (namespace at: #KernelForPrimordialSoup)) mixin.
@@ -139,29 +139,21 @@ Use and distribution of this software is subject to the terms of the attached so
 		errorType <ErrorType> = ErrorType new.
 		accessErrorType <AccessErrorType> = AccessErrorType new.
 		bottom <BottomType> = BottomType new.
-		dependentDeclarations <Map[Query, Set[Declaration]]> = Map new.
-		queriesOfDeclaration <Map[Declaration, Set[Query]]> = Map new.
-		dependentQueries <Map[Declaration, Set[Query]]> = Map new.
-		cachedTypes <Map[Query, Type]> = Map new.
-		superclassTable <Map[Mixin, Mixin]> = Map new.
+		dependentDeclarations <Map[Query, Set[Declaration]]> ::= Map new.
+		queriesOfDeclaration <Map[Declaration, Set[Query]]> ::= Map new.
+		dependentQueries <Map[Declaration, Set[Query]]> ::= Map new.
+		namespaceDependents <Map[Symbol, Set[Declaration]]> ::= Map new.
+		cachedTypes <Map[Query, Type]> ::= Map new.
+		superclassTable <Map[Mixin, Mixin]> ::= Map new.
+		typeBuilderCache <Map[MixinMirror, TypeBuilder]> ::= Map new.
+		public cacheHits <Integer> ::= 0.
+		public cacheMisses <Integer> ::= 0.
 		cycle = Object new.
 		resolvingSignatures <Set[MethodMirror]> = Set new.
 	|
-	superclassTable at: klassMixin put: objectMixin.
-	
-	(* Pre-populate superclass table for built-in types to avoid cycle detection *)
-	superclassTable at: objectMixin put: nil.
-	superclassTable at: nilMixin put: objectMixin.
-	superclassTable at: boolMixin put: objectMixin.
-	superclassTable at: numberMixin put: objectMixin.
-	superclassTable at: integerMixin put: numberMixin.
-	superclassTable at: floatMixin put: numberMixin.
-	superclassTable at: stringMixin put: objectMixin.
-	superclassTable at: collectionMixin put: objectMixin.
-	
 	(* Initialize arrayMixin - find _Array in KernelForPrimordialSoup's nested classes *)
 	arrayMixin:: (kernelMixin nestedClasses findMirrorNamed: #_Array) instanceSide.
-	superclassTable at: arrayMixin put: collectionMixin.
+	seedBuiltinSuperclasses.
 ) (
 	class AccessErrorType new = ErrorType new (
 		(* A special type for access errors. These need to be reported whenever they come up, so they need to be preserved in caches.
@@ -958,10 +950,54 @@ gets instantiated. *)
 	) : ()
 	class Query new = Object new (
 		(* Abstract class. The root of the query hierrachy. *)
-		
+
 	) (
 		public invalidate = (
 			subclassResponsibility
+		)
+	) : ()
+	class Declaration path: p <List[Symbol]> side: sd <Symbol> kind: k <Symbol> name: nm <Symbol> = Object new (
+		(* A structural, mirror-independent identity for a typecheckable declaration:
+	the top-level-rooted simple-name path of its enclosing class, the side
+	(#instance | #class), the kind (#method | #lazySlot | #classHeader |
+	#expression | #absent), and the member name. Used to key dependency tracking
+	so that an edit -- which on the psoup VM preserves mixin/class identity via
+	become: but produces fresh method objects -- can still map back to the
+	pre-edit dependency edges. Pure value object: equal Declarations are
+	interchangeable as Map keys. *)
+
+		|
+			public path <List[Symbol]> = p.
+			public side <Symbol> = sd.
+			public kind <Symbol> = k.
+			public name <Symbol> = nm.
+		|
+	) (
+		public = o = (
+			o isKindOfDeclaration ifFalse: [ ^false ].
+			(side = o side and: [ kind = o kind and: [ name = o name ] ]) ifFalse: [ ^false ].
+
+			(* Compare paths element-wise rather than relying on List>>= *)
+			path size = o path size ifFalse: [ ^false ].
+			1 to: path size do: [:i <Integer> |
+					(path at: i) = (o path at: i) ifFalse: [ ^false ]
+				].
+			^true
+		)
+		public hash ^<Integer> = (
+			| h <Integer> |
+			h:: side hash bitXor: (kind hash bitXor: (name hash bitXor: class hash)).
+			path do: [:e <Symbol> | h:: h bitXor: e hash ].
+			^h
+		)
+		public isKindOfDeclaration ^<Boolean> = (
+			^true
+		)
+		public printOn: s = (
+			s nextPutAll: 'Declaration('.
+			path do: [:e <Symbol> | s nextPutAll: e asString; nextPutAll: ' ' ].
+			s nextPutAll: side asString; nextPutAll: ' '; nextPutAll: kind asString;
+				nextPutAll: ' '; nextPutAll: name asString; nextPutAll: ')'
 		)
 	) : ()
 	class SelfType forMixin: m <MixinMirror> = PseudoType forMixin: m (
@@ -1011,7 +1047,7 @@ specialized as it is here. *)
 			^(type hash bitXor: selector hash) bitXor: class hash
 		)
 		public invalidate = (
-			cachedTypes removeKey: self
+			cachedTypes removeKey: self ifAbsent: [ ]
 		)
 		public isKindOfSignatureQuery ^<Boolean> = (
 			^true
@@ -1090,7 +1126,7 @@ specialized as it is here. *)
 			^(subtype hash bitXor: supertype hash) bitXor: class hash
 		)
 		public invalidate = (
-			trail removeKey: self
+			trail removeKey: self ifAbsent: [ ]
 		)
 		public isKindOfSubtypeQuery ^<Boolean> = (
 			^true
@@ -1570,27 +1606,92 @@ for the current class, not the superclass *)
 	currentScope ^<Scope> = (
 		^scopeStack last
 	)
-	declarationsForSignatureQuery: q <SignatureQuery> ^<List[Mirror]> = (
-		| result <Mirror> truncated <Symbol> |
-		^{localMember: q selector in: q type mixin. }
+	cacheableSignature: t <Type> ^<Boolean> = (
+		(* Error and access-error signature results must not be cached: an undefined
+	selector may become defined after an edit (its absence is tracked precisely via
+	#absent dependencies, not via a cached negative), and the cycle guard returns
+	errorType transiently. AccessErrorType is a subclass of ErrorType, so the one
+	test covers both. *)
+
+		^t isKindOfErrorType not
 	)
-	declarationsForSubtypeQuery: q <SubtypeQuery> ^<List[MixinMirror]> = (
-		| sub = q subtype. sup = q supertype. subMixin supMixin |
-		
-		(* Handle case where subtype/supertype might not have mixin - return empty list *)
-		[ (subMixin:: sub mixin) isNil ] on: Exception
-			do: [:ex |
-				'Error getting sub mixin: ' out.
-				sub class name out.
-				^{}
+	public clearQueryState = (
+		(* Drop all memoized query results and dependency edges -- a full reset of the
+	incremental state, leaving the structure caches reseeded. Not used on the normal
+	per-check path (results persist and are pruned by invalidateDeclaration:); this
+	is the escape hatch for a from-scratch re-typecheck. *)
+
+		cachedTypes:: Map new.
+		trail:: Map new.
+		dependentDeclarations:: Map new.
+		dependentQueries:: Map new.
+		queriesOfDeclaration:: Map new.
+		namespaceDependents:: Map new.
+		flushClassStructureCaches
+	)
+	public resetCacheStats = (
+		cacheHits:: 0.
+		cacheMisses:: 0
+	)
+	declarationsForSignatureQuery: q <SignatureQuery> ^<List[Declaration]> = (
+		(* The declarations a signature lookup (T, selector) depends on. If the
+	selector resolves (local or inherited), it depends on the single declaration
+	that defines it -- editing that member changes the answer. If it does NOT
+	resolve, the (errorType) answer depends on the *absence* of the selector along
+	the whole lookup chain: adding the selector to T or any ancestor must
+	invalidate, so we return an #absent declaration per class on the chain. Types
+	with no mixin (closures-as-values aside, unions, pseudo types) contribute no
+	structural dependency. *)
+
+		| t = q type. sel = q selector. mixin <MixinMirror | Nil> defining <MixinMirror | Nil> |
+		[ mixin:: t mixin ] on: Exception do: [:ex | ^{} ].
+		mixin isNil ifTrue: [ ^{} ].
+		defining:: definingMixinOfMember: sel in: mixin.
+		defining isNil ifTrue: [ ^absenceDeclarationsFor: sel from: mixin ].
+		^{declarationFor: defining kind: (kindForMember: (localMember: sel in: defining)) name: sel. }
+	)
+	definingMixinOfMember: selector <Symbol> in: mixin <MixinMirror> ^<MixinMirror | Nil> = (
+		(* The mixin in which selector is actually defined, walking local then up the
+	superclass chain; nil if undefined. *)
+
+		| current <MixinMirror> |
+		current:: mixin.
+		[ current ~= nil ] whileTrue: [
+				(localMember: selector in: current) ~= nil ifTrue: [ ^current ].
+				current:: superclassOf: current
 			].
-		[ (supMixin:: sup mixin) isNil ] on: Exception
-			do: [:ex |
-				'Error getting sup mixin: ' out.
-				sup class name out.
-				^{}
+		^nil
+	)
+	absenceDeclarationsFor: selector <Symbol> from: mixin <MixinMirror> ^<List[Declaration]> = (
+		| result <List[Declaration]> current <MixinMirror> |
+		result:: List new.
+		current:: mixin.
+		[ current ~= nil ] whileTrue: [
+				result add: (declarationFor: current kind: #absent name: selector).
+				current:: superclassOf: current
 			].
-		^{subMixin. supMixin. }
+		^result
+	)
+	kindForMember: m <Mirror> ^<Symbol> = (
+		m isKindOfLazySlotMirror ifTrue: [ ^#lazySlot ].
+		^#method
+	)
+	declarationsForSubtypeQuery: q <SubtypeQuery> ^<List[Declaration]> = (
+		(* A subtype test S <: T depends on the class headers (superclass chains) of
+	both ends. Returning #classHeader declarations for both mixins lets a header
+	edit invalidate the cached relation. Types with no mixin contribute nothing. *)
+
+		| sub = q subtype. sup = q supertype. subMixin <MixinMirror | Nil> supMixin <MixinMirror | Nil> result <List[Declaration]> |
+		result:: List new.
+		[ subMixin:: sub mixin ] on: Exception do: [:ex | subMixin:: nil ].
+		[ supMixin:: sup mixin ] on: Exception do: [:ex | supMixin:: nil ].
+		subMixin isNil ifFalse: [
+				result add: (declarationFor: subMixin kind: #classHeader name: subMixin name asSymbol)
+			].
+		supMixin isNil ifFalse: [
+				result add: (declarationFor: supMixin kind: #classHeader name: supMixin name asSymbol)
+			].
+		^result
 	)
 	error: msg <String> at: location <Pair[Integer]> = (
 		errorSet add: (TypeError message: msg start: location first end: location last)
@@ -1600,18 +1701,28 @@ for the current class, not the superclass *)
 		
 		| query <Query> cachedType <Type> selector <Symbol> |
 		selector:: node message selector.
-		
+
 		(* If receiver is already an error type, don't report cascading errors *)
 		receiverType isKindOfErrorType ifTrue: [ ^errorType ].
-		cachedType:: receiverType at: selector.
-		
-		(* disable query system for initial testing *)
-		
-		(* query:: SignatureQuery type: receiverType selector: selector.
-	registerDependenciesOfQuery: query.
-	cachedType:: cachedTypes at: query ifAbsent: [
-		cachedTypes at: query put: (receiverType at: selector).
-		]. *)
+
+		(* Signature query cache. The result of looking up selector in receiverType is
+	a pure function of the program, so it is memoized in cachedTypes keyed by the
+	(receiverType, selector) SignatureQuery, and persists across checks. Each lookup
+	registers the current declaration's dependency on the query, so an edit can
+	invalidate exactly the affected entries (invalidateDeclaration:). Error/access-
+	error results are NOT cached (cacheableSignature:) -- an undefined selector may
+	become defined after an edit (its absence is tracked via #absent dependencies),
+	and cycle-breaking returns errorType transiently. *)
+		query:: SignatureQuery type: receiverType selector: selector.
+		registerDependenciesOfQuery: query.
+		(cachedTypes includesKey: query)
+			ifTrue: [ cacheHits:: cacheHits + 1 ]
+			ifFalse: [ cacheMisses:: cacheMisses + 1 ].
+		cachedType:: cachedTypes at: query ifAbsent: [
+				| computed <Type> = receiverType at: selector. |
+				(cacheableSignature: computed) ifTrue: [ cachedTypes at: query put: computed ].
+				computed
+			].
 		cachedType isKindOfAccessErrorType ifTrue: [
 				error: selector , ' is defined, but is not accessible'
 					at: {node start. node end. }
@@ -1720,22 +1831,73 @@ using #localNonPrivateMember:in: as the building block. *)
 		(isPublic: result) ifTrue: [ ^result ].
 		^nil
 	)
+	seedBuiltinSuperclasses = (
+		(* Pre-populate the superclass table for built-in kernel types (their
+	superclass cannot be inferred the way user classes' can). Called at startup and
+	after a wholesale superclassTable flush. *)
+
+		superclassTable at: klassMixin put: objectMixin.
+		superclassTable at: objectMixin put: nil.
+		superclassTable at: nilMixin put: objectMixin.
+		superclassTable at: boolMixin put: objectMixin.
+		superclassTable at: numberMixin put: objectMixin.
+		superclassTable at: integerMixin put: numberMixin.
+		superclassTable at: floatMixin put: numberMixin.
+		superclassTable at: stringMixin put: objectMixin.
+		superclassTable at: collectionMixin put: objectMixin.
+		superclassTable at: arrayMixin put: collectionMixin
+	)
+	flushClassStructureCaches = (
+		(* A class header / superclass change can alter subtype relations and
+	inherited-member lookups program-wide. Conservatively drop the superclass and
+	TypeBuilder caches (both rebuild lazily); the built-in superclass seeds are
+	restored. v1 is wholesale; per-class flushing is a later precision upgrade. *)
+
+		superclassTable:: Map new.
+		seedBuiltinSuperclasses.
+		typeBuilderCache:: Map new
+	)
+	public declarationForMember: selector <Symbol> kind: kind <Symbol> ofClass: c <Class | MixinMirror> ^<Declaration> = (
+		(* Build the structural Declaration for a member, the same way the typecheck
+	entry points do. Used by clients (the IDE, tests) to name a member for
+	invalidateDeclaration: -- e.g. on Accept of an edited method/slot/header. *)
+
+		^declarationFor: (mixinOf: c) kind: kind name: selector
+	)
 	public invalidateDeclaration: declaration <Declaration> ^<Set[Declaration]> = (
 		(* To be called when declaration has changed.
 (a) Wipe clean the set of queries declaration depends on, because they were derived from an old version.
-(b) Invalidate all queries that depended on the old declaration and return the declarations that depend on them. *)
-		
+(b) Invalidate all queries that depended on the old declaration and return the declarations that depend on them.
+(c) For a class-header change, also flush the superclass/TypeBuilder structure caches. *)
+
+		declaration kind = #classHeader ifTrue: [ flushClassStructureCaches ].
 		removeDependenciesOf: declaration.
 		^invalidateDependenciesOn: declaration
+	)
+	public invalidateNamespaceName: name <Symbol> ^<Set[Declaration]> = (
+		(* To be called when a top-level class named `name` is added, removed, or
+	renamed in the namespace. Every declaration whose typecheck resolved `name`
+	through the namespace must be re-checked; invalidate each (clearing its queries
+	and cascading to its dependents) and return the full affected set. A header
+	change anywhere also means inherited-member/subtype relations may shift, so the
+	structure caches are flushed once up front. *)
+
+		| affected <Set[Declaration]> = Set new. |
+		flushClassStructureCaches.
+		(namespaceDependents removeKey: name ifAbsent: [ Set new ]) do: [:d <Declaration> |
+				affected add: d.
+				affected addAll: (invalidateDeclaration: d)
+			].
+		^affected
 	)
 	invalidateDependenciesOn: declaration <Declaration> ^<Set[Declaration]> = (
 		(* Will invalidate all queries that depended on the declaration. *)
 		
 		| queries <Set[Query]> invalidDeclarations <Set[Declaration]> = Set new. |
-		queries:: dependentQueries at: declaration.
+		queries:: dependentQueries at: declaration ifAbsent: [ ^invalidDeclarations ].
 		queries do: [:q <Query> |
 				q invalidate.
-				invalidDeclarations addAll: (dependentDeclarations at: q)
+				invalidDeclarations addAll: (dependentDeclarations at: q ifAbsent: [ Set new ])
 			].
 		^invalidDeclarations
 	)
@@ -1879,23 +2041,52 @@ Otherwise, check the main namespace. *)
 		scopeStack addLast: scope.
 		mutableSlotsStack addLast: Set new
 	)
+	pathOfMixin: m <MixinMirror> ^<List[Symbol]> = (
+		(* The top-level-rooted chain of simple names from the enclosing top-level
+	class down to m. Same walk as ObjectType>>path, on an arbitrary mixin. *)
+
+		| result <List[Symbol]> current <MixinMirror> |
+		result:: List new.
+		current:: m.
+		[ current enclosingMixin ~= nil ] whileTrue: [
+				result addFirst: current name asSymbol.
+				current:: current enclosingMixin
+			].
+		result addFirst: current name asSymbol.
+		^result
+	)
+	sideOf: m <MixinMirror> ^<Symbol> = (
+		^m isMeta ifTrue: [ #class ] ifFalse: [ #instance ]
+	)
+	declarationFor: m <MixinMirror> kind: k <Symbol> name: nm <Symbol> ^<Declaration> = (
+		^Declaration path: (pathOfMixin: m) side: (sideOf: m) kind: k name: nm
+	)
 	registerDependenciesOfQuery: q <Query> = (
+		(* Record, in both directions, that the current declaration's typecheck used q:
+	   q -> currentDeclaration (which declarations need q), currentDeclaration -> q
+	   (which queries this declaration used, so they can be wiped on re-check), and
+	   for each declaration q itself depends on, declaration -> q (so editing any of
+	   them invalidates q). currentDeclaration is a structural Declaration, so these
+	   edges survive the reinstall that follows an edit. *)
+
 		(dependentDeclarations at: q
 			ifAbsent: [ dependentDeclarations at: q put: Set new ]) add: currentDeclaration.
-		
-		(* BOGUS, since currentDeclaration is just a symbol *)
-		q declarations do: [:d |
+		q declarations do: [:d <Declaration> |
 				(dependentQueries at: d ifAbsent: [ dependentQueries at: d put: Set new ]) add: q
 			].
 		(queriesOfDeclaration at: currentDeclaration
 			ifAbsent: [ queriesOfDeclaration at: currentDeclaration put: Set new ]) add: q
-		(* BOGUS, again since currentDeclaration is just a symbol *)
-		
 	)
-	removeDependenciesOf: declaration = (
-		(* Wipe clean the set of queries  declaration depends on *)
-		
-		dependentDeclarations do: [:ds <Set[Declaration]> | ds remove: declaration ]
+	removeDependenciesOf: declaration <Declaration> = (
+		(* Wipe the record of which queries this declaration used in its last
+	   typecheck (it is about to be re-checked and will rebuild them), and drop the
+	   declaration from each of those queries' dependent sets. dependentQueries --
+	   which declarations a query refers to -- is left alone; it is rebuilt as
+	   declarations re-typecheck. *)
+
+		(queriesOfDeclaration removeKey: declaration ifAbsent: [ Set new ]) do: [:q <Query> |
+				(dependentDeclarations at: q ifAbsent: [ Set new ]) remove: declaration ifAbsent: [ ]
+			]
 	)
 	public returnStatNode: node ^<ObjectType> = (
 		| eType <ObjectType> |
@@ -1927,7 +2118,7 @@ Otherwise, check the main namespace. *)
 	)
 	setClass: klass <MixinMirror> = (
 		currentClass:: klass.
-		typeBuilder:: TypeBuilder forTypesIn: klass
+		typeBuilder:: typeBuilderFor: klass
 	)
 	public setterSendNode: node <SetterSendAST> ^<Type> = (
 		| valueType <ObjectType> receiverType <ObjectType> selector <Symbol> setterType slotName <Symbol> localType |
@@ -2125,9 +2316,16 @@ Otherwise, check the main namespace. *)
 		^trail at: query ifAbsent: [ trail at: query put: (sub subtypeOf: sup) ]
 	)
 	typeBuilderFor: klass <MixinMirror> ^<TypeBuilder> = (
-		(* really need to cache this somewhere *)
-		
-		^TypeBuilder forTypesIn: klass
+		(* Cached per mixin. A TypeBuilder holds only its surroundingClass, so it is
+	safe to reuse for a given mixin. Mixin identity is preserved across reinstall
+	(become:), so cache entries survive edits; #classHeader invalidation flushes
+	the affected entries (see invalidateClassHeaderCachesFor:). *)
+
+		^typeBuilderCache at: klass ifAbsent: [
+				| tb <TypeBuilder> = TypeBuilder forTypesIn: klass. |
+				typeBuilderCache at: klass put: tb.
+				tb
+			]
 	)
 	typeOfHere ^<ObjectType> = (
 		^HereType forMixin: currentClass
@@ -2192,8 +2390,8 @@ Otherwise, check the main namespace. *)
 		| expr <ExpressionAST> toplevelCandidate <MixinMirror> ::= mixinOf: c. |
 		expr:: parser parseExpression: src.
 		currentClass:: toplevelCandidate.
-		typeBuilder:: TypeBuilder forTypesIn: toplevelCandidate.
-		currentDeclaration:: #'<expression>'.
+		typeBuilder:: typeBuilderFor: toplevelCandidate.
+		currentDeclaration:: declarationFor: currentClass kind: #expression name: #'<expression>'.
 		[ nil ~= toplevelCandidate enclosingMixin ] whileTrue: [
 				toplevelCandidate:: toplevelCandidate enclosingMixin
 			].
@@ -2212,8 +2410,8 @@ Otherwise, check the main namespace. *)
 		| slot <SlotDefAST> toplevelCandidate <MixinMirror> ::= mixinOf: c. |
 		slot:: parser parseLazySlotDeclaration: src.
 		currentClass:: toplevelCandidate.
-		typeBuilder:: TypeBuilder forTypesIn: toplevelCandidate.
-		currentDeclaration:: slot name.
+		typeBuilder:: typeBuilderFor: toplevelCandidate.
+		currentDeclaration:: declarationFor: currentClass kind: #lazySlot name: slot name.
 		[ nil ~= toplevelCandidate enclosingMixin ] whileTrue: [
 				toplevelCandidate:: toplevelCandidate enclosingMixin
 			].
@@ -2233,8 +2431,8 @@ Otherwise, check the main namespace. *)
 		header:: parser parseClassHeader: src.
 		klassMirror:: mixinOf: c.
 		currentClass:: klassMirror.
-		typeBuilder:: TypeBuilder forTypesIn: klassMirror.
-		currentDeclaration:: header name.
+		typeBuilder:: typeBuilderFor: klassMirror.
+		currentDeclaration:: declarationFor: currentClass kind: #classHeader name: header name.
 		toplevelCandidate:: klassMirror.
 		[ nil ~= toplevelCandidate enclosingMixin ] whileTrue: [
 				toplevelCandidate:: toplevelCandidate enclosingMixin
@@ -2827,6 +3025,13 @@ Otherwise, check the main namespace. *)
 		tpType:: typeParameterNamed: selector inScopeOf: mixin.
 		tpType ~= nil ifTrue: [ ^tpType ].
 		
+		(* Record that this declaration's typecheck depends on whether `selector`
+	   resolves through the namespace, so a top-level add/remove/rename of that name
+	   (invalidateNamespaceName:) re-checks this declaration -- whether or not it is
+	   currently found (an add must invalidate a prior not-found result too). *)
+		(namespaceDependents at: selector
+			ifAbsent: [ namespaceDependents at: selector put: Set new ]) add: currentDeclaration.
+
 		(* Try to find in namespace - first conflict namespace, then main namespace *)
 		namespaceResult:: currentConflictNamespace at: selector
 			ifAbsent: [ namespace at: selector ifAbsent: [ nil ] ].
@@ -2846,8 +3051,8 @@ Otherwise, check the main namespace. *)
 	public typecheckMethod: m <MethodAST> ofClass: c <Class | MixinMirror> ^<Set[TypeError]> = (
 		| toplevelCandidate <MixinMirror> ::= mixinOf: c. |
 		currentClass:: toplevelCandidate.
-		typeBuilder:: TypeBuilder forTypesIn: toplevelCandidate.
-		currentDeclaration:: m selector.
+		typeBuilder:: typeBuilderFor: toplevelCandidate.
+		currentDeclaration:: declarationFor: currentClass kind: #method name: m selector.
 		[ nil ~= toplevelCandidate enclosingMixin ] whileTrue: [
 				toplevelCandidate:: toplevelCandidate enclosingMixin
 			].

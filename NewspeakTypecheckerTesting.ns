@@ -6,7 +6,10 @@ class NewspeakTypecheckerTesting usingPlatform: p <Platform> testing: tc namespa
 	|
 		private TestContext <Minitest TestContext class> = minitest TestContext.
 		private Set = p collections Set.
+		private List = p collections List.
 		private ObjectMirror = p mirrors ObjectMirror.
+		private ClassDeclarationBuilder = p mirrors ClassDeclarationBuilder.
+		private installer = p mirrors installer.
 		
 		(* module variables *)
 		private namespace <Namespacing Namespace> = ns.
@@ -2973,6 +2976,227 @@ public class PublicN1 = (
 				description: 'Local variable without annotation should produce an error'.
 			assert: [ assertErrorSet: eset containsMessageWith: 'has no type annotation' ]
 				description: 'Error should name the missing local annotation'
+		)
+		public testSignatureCacheHitsWithinCheck = (
+			(* A repeated identical send within one method check should hit the
+		   signature cache: the first lookup of (closureType, value) misses, the
+		   second hits. Proves the re-enabled SignatureQuery cache memoizes.
+		   clearQueryState first so the initial miss is deterministic regardless of
+		   what the shared typechecker cached in earlier tests. *)
+
+			typechecker clearQueryState.
+			typechecker resetCacheStats.
+			typechecker typecheckMethodSource: 'test ^ <Integer> = (| c <[Integer]> = [1]. | c value. ^c value)'
+				ofClass: TestClass1.
+			assert: [ typechecker cacheMisses > 0 ]
+				description: 'first signature lookup should miss the cache'.
+			assert: [ typechecker cacheHits > 0 ]
+				description: 'repeated identical send should hit the signature cache'
+		)
+		incrementalProbeSource = (
+			(* A method on TestClass1 whose body depends on InheritanceBase>>publicMethod
+		   (a public cross-object send). *)
+
+			^'probe: obj <InheritanceBase> ^ <String> = (^obj publicMethod)'
+		)
+		public testSignatureCachePersistsAcrossChecks = (
+			(* With per-check clearing gone, re-checking an unchanged method reuses the
+		   signatures cached by the first check -- the core incremental win. *)
+
+			typechecker typecheckMethodSource: incrementalProbeSource ofClass: TestClass1.
+			typechecker resetCacheStats.
+			typechecker typecheckMethodSource: incrementalProbeSource ofClass: TestClass1.
+			assert: [ typechecker cacheHits > 0 ]
+				description: 'unchanged re-check should hit the persistent signature cache'
+		)
+		public testSignatureDependencyInvalidation = (
+			(* Editing InheritanceBase>>publicMethod must invalidate its dependent
+		   (probe:) and drop the cached (InheritanceBase, publicMethod) signature so
+		   the next check recomputes it. *)
+
+			| probeDecl <Object> baseMethodDecl <Object> affected <Set> |
+			typechecker typecheckMethodSource: incrementalProbeSource ofClass: TestClass1.
+			probeDecl:: typechecker declarationForMember: #'probe:' kind: #method ofClass: TestClass1.
+			baseMethodDecl:: typechecker declarationForMember: #publicMethod kind: #method
+				ofClass: InheritanceBase.
+			affected:: typechecker invalidateDeclaration: baseMethodDecl.
+			assert: [ affected includes: probeDecl ]
+				description: 'invalidating publicMethod should report dependent probe: for re-check'.
+			typechecker resetCacheStats.
+			typechecker typecheckMethodSource: incrementalProbeSource ofClass: TestClass1.
+			assert: [ typechecker cacheMisses > 0 ]
+				description: 'after invalidation the publicMethod signature is recomputed (miss)'
+		)
+		public testInvalidationIsTargeted = (
+			(* Invalidating an unrelated declaration must not drop probe:'s cached
+		   dependencies -- no over-invalidation. *)
+
+			| unrelated <Object> |
+			typechecker typecheckMethodSource: incrementalProbeSource ofClass: TestClass1.
+			unrelated:: typechecker declarationForMember: #subclassMethod kind: #method
+				ofClass: TestClass2.
+			typechecker invalidateDeclaration: unrelated.
+			typechecker resetCacheStats.
+			typechecker typecheckMethodSource: incrementalProbeSource ofClass: TestClass1.
+			assert: [ typechecker cacheHits > 0 ]
+				description: 'unrelated invalidation must leave probe''s cached deps intact'
+		)
+		public testFullResetClearsCache = (
+			(* clearQueryState is the from-scratch escape hatch: after it, the signature
+		   cache is cold and the next check recomputes. *)
+
+			typechecker typecheckMethodSource: incrementalProbeSource ofClass: TestClass1.
+			typechecker clearQueryState.
+			typechecker resetCacheStats.
+			typechecker typecheckMethodSource: incrementalProbeSource ofClass: TestClass1.
+			assert: [ typechecker cacheMisses > 0 ]
+				description: 'after a full reset the signature cache is cold (recompute)'
+		)
+		public testNamespaceNameInvalidation = (
+			(* A declaration that resolves a top-level class name through the namespace
+		   must be re-checked when that name is added/removed/renamed. *)
+
+			| src <String> probeDecl <Object> affected <Set> |
+			src:: 'probeNS: m <NewspeakASTs MethodAST> ^ <NewspeakASTs MethodAST> = (^m)'.
+			typechecker typecheckMethodSource: src ofClass: TestClass1.
+			probeDecl:: typechecker declarationForMember: #'probeNS:' kind: #method ofClass: TestClass1.
+			affected:: typechecker invalidateNamespaceName: #NewspeakASTs.
+			assert: [ affected includes: probeDecl ]
+				description: 'changing a referenced top-level class should invalidate referencing decls'
+		)
+
+		(* ===== End-to-end incremental scenarios =====
+	   These install a real top-level class via the mirror builder, then EDIT it by
+	   re-installing modified source. Re-install goes through AtomicInstaller, which
+	   become:-updates the existing class -- preserving mixin/class identity exactly
+	   as an IDE Accept does -- so cached queries keyed by that mixin go stale until
+	   invalidated. Each scenario also re-checks from scratch (clearQueryState) and
+	   asserts the incremental result equals it. *)
+
+		installClass: src <String> named: nm <Symbol> ^<Object> = (
+			(* Build + (re)install a top-level class in the typechecker's namespace. The
+		   first install adds a fresh class; re-installing a same-named class goes
+		   through the AtomicInstaller (installer install:into:), which become:-updates
+		   the existing class in place -- preserving mixin/class identity exactly as an
+		   IDE Accept does. So the namespace entry keeps its identity across edits and
+		   cached queries keyed by that mixin go stale until invalidated. *)
+
+			| builder = ClassDeclarationBuilder fromSource: src. |
+			(namespace at: nm ifAbsent: [ nil ]) isNil
+				ifTrue: [ namespace at: nm put: builder install applyToObject reflectee ]
+				ifFalse: [ installer install: {builder. } into: namespace ].
+			^namespace at: nm
+		)
+		errorSet: a <Set> equivalentTo: b <Set> ^<Boolean> = (
+			(* Two error sets are equivalent if they carry the same messages. Used to
+		   assert incremental == from-scratch. *)
+
+			a size = b size ifFalse: [ ^false ].
+			a do: [:ea |
+					(b detect: [:eb | eb message = ea message ] ifNone: [ nil ]) isNil ifTrue: [ ^false ]
+				].
+			^true
+		)
+		incrBV1 = (
+			^'class IncrB new = Object new () (public foo ^ <Integer> = (^1)) : ()'
+		)
+		incrBFooString = (
+			^'class IncrB new = Object new () (public foo ^ <String> = (^''x'')) : ()'
+		)
+		useIncrFooSource = (
+			(* Returns <Integer>; clean iff IncrB>>foo exists and returns Integer. The
+		   receiver is typed <IncrB> (resolved via the namespace) so x foo is a
+		   SignatureQuery dependency on IncrB>>foo. *)
+
+			^'useIncrB: x <IncrB> ^ <Integer> = (^x foo)'
+		)
+		fooMethodDecl = (
+			^typechecker declarationForMember: #foo kind: #method ofClass: (namespace at: #IncrB)
+		)
+		public testIncrementalSignatureChangePassToError = (
+			(* foo: Integer -> String. The dependent useIncrB must flip clean -> error. *)
+
+			| src <String> rStale <Set> rInc <Set> rFresh <Set> |
+			src:: useIncrFooSource.
+			installClass: incrBV1 named: #IncrB.
+			assert: [ (typechecker typecheckMethodSource: src ofClass: TestClass1) isEmpty ]
+				description: 'baseline: foo returns Integer, useIncrB is clean'.
+			installClass: incrBFooString named: #IncrB.
+			rStale:: typechecker typecheckMethodSource: src ofClass: TestClass1.
+			assert: [ rStale isEmpty ]
+				description: 'without invalidation the stale signature cache still reports clean'.
+			typechecker invalidateDeclaration: fooMethodDecl.
+			rInc:: typechecker typecheckMethodSource: src ofClass: TestClass1.
+			assert: [ rInc isEmpty not ]
+				description: 'after invalidation, returning String breaks the <Integer> dependent'.
+			typechecker clearQueryState.
+			rFresh:: typechecker typecheckMethodSource: src ofClass: TestClass1.
+			assert: [ errorSet: rInc equivalentTo: rFresh ]
+				description: 'incremental result must equal a from-scratch re-check'
+		)
+		public testIncrementalSignatureChangeErrorToPass = (
+			(* foo: String -> Integer. The dependent must flip error -> clean. *)
+
+			| src <String> rInc <Set> rFresh <Set> |
+			src:: useIncrFooSource.
+			installClass: incrBFooString named: #IncrB.
+			assert: [ (typechecker typecheckMethodSource: src ofClass: TestClass1) isEmpty not ]
+				description: 'baseline: foo returns String, useIncrB errors'.
+			installClass: incrBV1 named: #IncrB.
+			typechecker invalidateDeclaration: fooMethodDecl.
+			rInc:: typechecker typecheckMethodSource: src ofClass: TestClass1.
+			assert: [ rInc isEmpty ]
+				description: 'after invalidation, foo returning Integer makes the dependent clean'.
+			typechecker clearQueryState.
+			rFresh:: typechecker typecheckMethodSource: src ofClass: TestClass1.
+			assert: [ errorSet: rInc equivalentTo: rFresh ]
+				description: 'incremental result must equal a from-scratch re-check'
+		)
+		public testIncrementalRemoveNeededMethod = (
+			(* Removing foo (replacing it with an unrelated method) must make the
+		   dependent error, after invalidating foo. *)
+
+			| src <String> affected <Set> rInc <Set> rFresh <Set> useDecl <Object> |
+			src:: useIncrFooSource.
+			installClass: incrBV1 named: #IncrB.
+			typechecker typecheckMethodSource: src ofClass: TestClass1.
+			useDecl:: typechecker declarationForMember: #'useIncrB:' kind: #method ofClass: TestClass1.
+			installClass: 'class IncrB new = Object new () (public other ^ <Integer> = (^9)) : ()'
+				named: #IncrB.
+			affected:: typechecker invalidateDeclaration: fooMethodDecl.
+			assert: [ affected includes: useDecl ]
+				description: 'removing foo should report its dependent for re-check'.
+			rInc:: typechecker typecheckMethodSource: src ofClass: TestClass1.
+			assert: [ rInc isEmpty not ]
+				description: 'after removing foo, useIncrB errors (foo not defined)'.
+			typechecker clearQueryState.
+			rFresh:: typechecker typecheckMethodSource: src ofClass: TestClass1.
+			assert: [ errorSet: rInc equivalentTo: rFresh ]
+				description: 'incremental result must equal a from-scratch re-check'
+		)
+		public testIncrementalAddMissingMethod = (
+			(* The #absent path: a dependent that referenced a not-yet-defined foo must
+		   be reported for re-check when foo is added, and then check clean. *)
+
+			| src <String> useDecl <Object> absentDecl <Object> affected <Set> rInc <Set> rFresh <Set> |
+			src:: useIncrFooSource.
+			installClass: 'class IncrB new = Object new () (public bar ^ <Integer> = (^2)) : ()'
+				named: #IncrB.
+			assert: [ (typechecker typecheckMethodSource: src ofClass: TestClass1) isEmpty not ]
+				description: 'baseline: foo undefined, useIncrB errors'.
+			useDecl:: typechecker declarationForMember: #'useIncrB:' kind: #method ofClass: TestClass1.
+			installClass: incrBV1 named: #IncrB.
+			absentDecl:: typechecker declarationForMember: #foo kind: #absent ofClass: (namespace at: #IncrB).
+			affected:: typechecker invalidateDeclaration: absentDecl.
+			assert: [ affected includes: useDecl ]
+				description: 'adding foo should report the dependent that needed it (absence dep)'.
+			rInc:: typechecker typecheckMethodSource: src ofClass: TestClass1.
+			assert: [ rInc isEmpty ]
+				description: 'after adding foo, useIncrB is clean'.
+			typechecker clearQueryState.
+			rFresh:: typechecker typecheckMethodSource: src ofClass: TestClass1.
+			assert: [ errorSet: rInc equivalentTo: rFresh ]
+				description: 'incremental result must equal a from-scratch re-check'
 		)
 	) : (
 		TEST_CONTEXT = (

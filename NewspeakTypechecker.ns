@@ -148,6 +148,8 @@ Use and distribution of this software is subject to the terms of the attached so
 		typeBuilderCache <Map[MixinMirror, TypeBuilder]> ::= Map new.
 		public cacheHits <Integer> ::= 0.
 		public cacheMisses <Integer> ::= 0.
+		suppressUndefinedDepth <Integer> ::= 0.
+		currentMethodTypeParams <Set[Symbol]> ::= Set new.
 		cycle = Object new.
 		resolvingSignatures <Set[MethodMirror]> = Set new.
 	|
@@ -630,7 +632,7 @@ Use and distribution of this software is subject to the terms of the attached so
 			nil = m ifTrue: [ ^errorTypeForSelector: selector ].
 			signature:: signatureFor: m withSelector: selector.
 			nil = signature ifTrue: [ ^errorType ].
-			^((signature apply: selfSubstitution) apply: typeBuilder) asFunctionType
+			^(applyForeignSignature: (signature apply: selfSubstitution) with: typeBuilder) asFunctionType
 			(* deal with substitution of Self and build a function type *)
 			
 		)
@@ -687,7 +689,7 @@ Use and distribution of this software is subject to the terms of the attached so
 			| m <Mirror | Nil> = publicMember: selector at: mixin. signature <MessagePatternAST> |
 			nil = m ifTrue: [ ^errorTypeForSelector: selector ].
 			signature:: signatureFor: m withSelector: selector.
-			^((signature apply: selfSubstitution) apply: myTypeBuilder) asFunctionType
+			^(applyForeignSignature: (signature apply: selfSubstitution) with: myTypeBuilder) asFunctionType
 			(* deal with substitution of Self and build a function type *)
 			
 		)
@@ -902,7 +904,7 @@ from ObjectType>>at: instead? *)
 			signature:: signatureFor: m withSelector: selector.
 			
 			(* deal with substitution of Self *)
-			^((signature apply: selfSubstitution) apply: myTypeBuilder) asFunctionType
+			^(applyForeignSignature: (signature apply: selfSubstitution) with: myTypeBuilder) asFunctionType
 			(* and build a function type *)
 			
 		)
@@ -1017,7 +1019,7 @@ specialized as it is here. *)
 			signature:: signatureFor: result withSelector: selector.
 			
 			(* deal with substitution of Self, Instance? *)
-			^((signature apply: selfSubstitution) apply: myTypeBuilder) asFunctionType
+			^(applyForeignSignature: (signature apply: selfSubstitution) with: myTypeBuilder) asFunctionType
 			(* and build a function type *)
 			
 		)
@@ -1152,7 +1154,7 @@ since super sends behave differenty than either self sends or normal sends. *)
 			(* deal with substitution of Self and Instance. These must be substituted with the appropriate values
 for the current class, not the superclass *)
 			substitution:: selfAndInstanceSubstitution.
-			^((signature apply: substitution) apply: myTypeBuilder) asFunctionType
+			^(applyForeignSignature: (signature apply: substitution) with: myTypeBuilder) asFunctionType
 			(* and build a function type *)
 			
 		)
@@ -1351,7 +1353,7 @@ for the current class, not the superclass *)
 					
 					(* Defensive: if type is nil, use errorType *)
 					slotType isNil ifTrue: [ ^errorType ].
-					^slotType apply: self
+					^applyForeignSignature: slotType with: self
 				].
 			m isKindOfMethodMirror ifTrue: [
 					| returnType |
@@ -1367,15 +1369,27 @@ for the current class, not the superclass *)
 						s:: signatureFor: m.
 						returnType:: s returnType.
 						returnType = nil ifTrue: [ returnType:: TypeIdAST new name: #Self ].
-						returnType:: returnType apply: self
+						returnType:: applyForeignSignature: returnType with: self
 					] ensure: [ resolvingSignatures remove: m ].
 					^returnType
 				].
 			
-			(* If m is nil or unrecognized type, return error type. A reference to a known
-         factory type variable from the wrong (class) side is a scoping error. *)
-			(isFactoryTypeVarName: node name inScopeOf: surroundingClass) ifTrue: [
-					error: node name , ' is not defined' at: {node start. node end. }
+			(* The name did not resolve to any type: it is an undefined type. Report it
+         (then return errorType so its uses don't cascade), UNLESS we are resolving
+         another declaration's signature (suppressUndefinedDepth > 0 -- that error
+         belongs to, and is reported by, that declaration), or the name is the #def
+         pseudo-keyword of <def E> sugar. This single site covers every annotation
+         position: locals, slots, parameters, return types, generic arguments, tuple
+         element types, and block parameter/return types -- all resolve through here. *)
+			(* Report only when the name resolved to NOTHING (m is nil). A non-nil result
+         that isn't one of the mirror kinds above (e.g. BottomType for the
+         DoesNotMatter pseudo-type) is a valid type and must not be flagged. *)
+			(m isNil and: [
+					(node name = #def) not and: [ (currentMethodTypeParams includes: node name) not ] ])
+				ifTrue: [
+					suppressUndefinedDepth = 0 ifTrue: [
+							error: node name , ' is not defined' at: {node start. node end. }
+						]
 				].
 			^errorType
 		)
@@ -1890,6 +1904,86 @@ using #localNonPrivateMember:in: as the building block. *)
 			].
 		^affected
 	)
+	unsafeMixinForDeclaration: d <Declaration> ^<MixinMirror | Nil> = (
+		(* Resolve a structural Declaration to a live MixinMirror by navigating the
+	namespace: path first names a top-level class, the rest name nested classes;
+	side picks the instance or class side. nil if any step is missing. *)
+
+		| path <List[Symbol]> = d path. cls decl <ClassDeclarationMirror> |
+		path isEmpty ifTrue: [ ^nil ].
+		cls:: namespace at: path first ifAbsent: [ ^nil ].
+		decl:: (ClassMirror reflecting: cls) mixin declaration.
+		2 to: path size do: [:i <Integer> |
+				| nested = decl instanceSide nestedClasses findMirrorNamed: (path at: i). |
+				nested isNil ifTrue: [ ^nil ].
+				decl:: nested
+			].
+		^d side = #class ifTrue: [ decl classSide ] ifFalse: [ decl instanceSide ]
+	)
+	mixinForDeclaration: d <Declaration> ^<MixinMirror | Nil> = (
+		^[ unsafeMixinForDeclaration: d ] on: Error do: [:e | nil ]
+	)
+	recheckDeclaration: d <Declaration> ^<Set[TypeError] | Nil> = (
+		(* Re-typecheck the member a Declaration names, returning its fresh error set,
+	or nil if the member no longer exists (class/member removed) or the kind is not
+	directly checkable (#absent / #expression). *)
+
+		| mixin <MixinMirror | Nil> member |
+		mixin:: mixinForDeclaration: d.
+		mixin isNil ifTrue: [ ^nil ].
+		d kind = #classHeader ifTrue: [
+				^[ typecheckClassHeader: mixin declaration header source ofClass: mixin ]
+					on: Error do: [:e | nil ]
+			].
+		d kind = #method ifTrue: [
+				member:: [ localMember: d name in: mixin ] on: Error do: [:e | nil ].
+				(member isNil or: [ member source isNil ]) ifTrue: [ ^nil ].
+				^[ typecheckMethodSource: member source ofClass: mixin ] on: Error do: [:e | nil ]
+			].
+		d kind = #lazySlot ifTrue: [
+				member:: [ mixin lazySlots findMirrorNamed: d name ] on: Error do: [:e | nil ].
+				(member isNil or: [ member source isNil ]) ifTrue: [ ^nil ].
+				^[ typecheckLazySlot: member source ofClass: mixin ] on: Error do: [:e | nil ]
+			].
+		^nil
+	)
+	recheckSeeded: seeds <Collection[Declaration]> ^<Map[Declaration, Set[TypeError]]> = (
+		(* Work-list re-typecheck: starting from the seed declarations, re-check each,
+	follow its dependents transitively, and return each re-checked declaration's
+	fresh error set. invalidateDeclaration: per node drops that node's stale cached
+	queries (so its re-check recomputes against current sources) and yields its
+	dependents to enqueue. Over-eager (cascades to all transitive dependents, not
+	only when a signature changed) -- always correct; pruning is a later
+	optimization. The `queued` set bounds it to the finite dependency graph. *)
+
+		| results <Map[Declaration, Set[TypeError]]> = Map new. worklist <List[Declaration]> = List new. queued <Set[Declaration]> = Set new. |
+		seeds do: [:s <Declaration> |
+				(queued includes: s) ifFalse: [ queued add: s. worklist addLast: s ]
+			].
+		[ worklist isEmpty ] whileFalse: [
+				| cur <Declaration> = worklist removeFirst. dependents <Set[Declaration]> errs <Set | Nil> |
+				dependents:: invalidateDeclaration: cur.
+				errs:: recheckDeclaration: cur.
+				errs isNil ifFalse: [ results at: cur put: errs ].
+				dependents do: [:dep <Declaration> |
+						(queued includes: dep) ifFalse: [ queued add: dep. worklist addLast: dep ]
+					]
+			].
+		^results
+	)
+	public recheckFrom: d <Declaration> ^<Map[Declaration, Set[TypeError]]> = (
+		(* The edited declaration d changed: re-typecheck it and everything that
+	transitively depends on it, returning each one's fresh error set. The IDE calls
+	this on Accept and pushes the results into the affected members' displays. *)
+
+		^recheckSeeded: {d. }
+	)
+	public recheckAfterNamespaceName: name <Symbol> ^<Map[Declaration, Set[TypeError]]> = (
+		(* A top-level class named `name` was added/removed/renamed: re-typecheck every
+	declaration that referenced the name (and their transitive dependents). *)
+
+		^recheckSeeded: (invalidateNamespaceName: name)
+	)
 	invalidateDependenciesOn: declaration <Declaration> ^<Set[Declaration]> = (
 		(* Will invalidate all queries that depended on the declaration. *)
 		
@@ -1965,6 +2059,7 @@ type's classDeclaration. First check scope of mixin , otherwise climb the enclos
 	public methodNode: node <MethodAST> ^<MsgSignature> = (
 		| signature <FunctionType> params |
 		pushScope: Scope new.
+		currentMethodTypeParams:: methodTypeVarNamesOf: node pattern.
 		signature:: node pattern apply: self.
 		
 		(* Add parameters to scope using the already-resolved types from the signature,
@@ -2194,7 +2289,7 @@ Otherwise, check the main namespace. *)
 				error: node type name , ' is not defined' at: {node start. node end. }.
 				^currentScope at: node name put: errorType
 			].
-		
+
 		(* Determine the slot's type. With an explicit annotation, resolve and use it,
 	   checking any initializer against it. With no annotation, infer the type from
 	   the initializer (e.g. a method-body local `x = expr`). A lazy slot, or one
@@ -2392,6 +2487,7 @@ Otherwise, check the main namespace. *)
 		currentClass:: toplevelCandidate.
 		typeBuilder:: typeBuilderFor: toplevelCandidate.
 		currentDeclaration:: declarationFor: currentClass kind: #expression name: #'<expression>'.
+		currentMethodTypeParams:: Set new.
 		[ nil ~= toplevelCandidate enclosingMixin ] whileTrue: [
 				toplevelCandidate:: toplevelCandidate enclosingMixin
 			].
@@ -2412,6 +2508,7 @@ Otherwise, check the main namespace. *)
 		currentClass:: toplevelCandidate.
 		typeBuilder:: typeBuilderFor: toplevelCandidate.
 		currentDeclaration:: declarationFor: currentClass kind: #lazySlot name: slot name.
+		currentMethodTypeParams:: Set new.
 		[ nil ~= toplevelCandidate enclosingMixin ] whileTrue: [
 				toplevelCandidate:: toplevelCandidate enclosingMixin
 			].
@@ -2433,6 +2530,17 @@ Otherwise, check the main namespace. *)
 		currentClass:: klassMirror.
 		typeBuilder:: typeBuilderFor: klassMirror.
 		currentDeclaration:: declarationFor: currentClass kind: #classHeader name: header name.
+
+		(* Exclude the class's own type variables (accessor [E] + factory selector/def/
+	   where vars) from undefined-type reporting: the superclass clause uses them
+	   positionally and resolves them in the enclosing scope, where they look unbound. *)
+		currentMethodTypeParams:: Set new.
+		header typeParameters isNil ifFalse: [
+				header typeParameters do: [:n <Symbol> | currentMethodTypeParams add: n ]
+			].
+		header constructor isNil ifFalse: [
+				currentMethodTypeParams addAll: (methodTypeVarNamesOf: header constructor)
+			].
 		toplevelCandidate:: klassMirror.
 		[ nil ~= toplevelCandidate enclosingMixin ] whileTrue: [
 				toplevelCandidate:: toplevelCandidate enclosingMixin
@@ -2838,6 +2946,37 @@ Otherwise, check the main namespace. *)
 			].
 		^t apply: typeBuilder
 	)
+	methodTypeVarNamesOf: pattern <MessagePatternAST> ^<Set[Symbol]> = (
+		(* The type-variable names a method introduces itself: its selector type
+	   parameters ([E]), its <def E> parameters, and its where-clause variables. These
+	   are method-scoped (type:at: only resolves CLASS-level type params), so they
+	   resolve to nil there and must NOT be reported as undefined types. *)
+
+		| names <Set[Symbol]> = Set new. |
+		pattern isNil ifTrue: [ ^names ].
+		pattern typeParameters isNil ifFalse: [
+				pattern typeParameters do: [:n <Symbol> | names add: n ]
+			].
+		(defVarsIn: pattern) do: [:dv | names add: dv first ].
+		pattern inferenceClauses isNil ifFalse: [
+				pattern inferenceClauses do: [:cl | names add: cl typeParameterName ]
+			].
+		^names
+	)
+	applyForeignSignature: ast <AST> with: builder <TypeBuilder> ^<Type> = (
+		(* Resolve a type AST that belongs to ANOTHER declaration (a looked-up member's
+	   signature / a referenced member's type), with undefined-type reporting
+	   suppressed: any undefined type in that foreign signature is that declaration's
+	   own error and is reported when IT is checked -- not attributed to the current
+	   declaration whose typecheck triggered the lookup. *)
+
+		| result <Type> |
+		suppressUndefinedDepth:: suppressUndefinedDepth + 1.
+		result:: [ ast apply: builder ] ensure: [
+				suppressUndefinedDepth:: suppressUndefinedDepth - 1
+			].
+		^result
+	)
 	public varDeclNode: node = (
 		| resolvedType |
 		node type isNil ifTrue: [
@@ -3126,9 +3265,16 @@ Otherwise, check the main namespace. *)
 			ifFalse: [
 				superclassTable at: klass put: cycle.
 				setClass: enclosing.
-				
-				(* must move one lexical level out before evaluating superclass clause *)
-				superclassClauseType:: superclassClause apply: self.
+
+				(* must move one lexical level out before evaluating superclass clause.
+			   Suppress undefined-type reporting: this is the inheritance-walk resolution
+			   of klass's superclass clause (which uses klass's own type params
+			   positionally); a genuinely undefined superclass type is reported when
+			   klass's header is checked in typecheckClassHeader:. *)
+				suppressUndefinedDepth:: suppressUndefinedDepth + 1.
+				superclassClauseType:: [ superclassClause apply: self ] ensure: [
+						suppressUndefinedDepth:: suppressUndefinedDepth - 1
+					].
 				setClass: klass.
 				
 				(* reset lexical level *)

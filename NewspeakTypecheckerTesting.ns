@@ -2003,6 +2003,7 @@ class NewspeakTypecheckerTesting usingPlatform: p <Platform> testing: tc namespa
 			
 			| innerClass = NLRTestOuter new NLRTestMiddle new NLRTestInner. eset = typechecker typecheckMethodSource: 'test ^ <Number> = (| nestedClosure <[[DoesNotMatter]]> = [[^100]]. | nestedClosure value value. ^999)'
 				ofClass: innerClass. |
+			'#### NLRNC ####' out. eset do: [:e | e out]. '#### NLRNCEND' out.
 			assert: [ eset isEmpty ] description: 'NLR from nested closure should work'
 		)
 		public testCreateNumberTuple = (
@@ -2156,6 +2157,58 @@ class NewspeakTypecheckerTesting usingPlatform: p <Platform> testing: tc namespa
 				description: '_Object should not be accessible: expected 1 error'.
 			assert: [ assertErrorSet: eset containsMessageWith: 'is not defined' ]
 				description: '_Object should produce a not-defined error'
+		)
+		public testUndefinedTypeInLocalAnnotationReported = (
+			(* An undefined type in a local/slot annotation must be reported, not
+		   silently swallowed by errorType. *)
+
+			| eset = typechecker typecheckMethodSource: 'test = (| x <Bogus> | ^x)'
+				ofClass: TestClass1. |
+			assert: [ eset isEmpty not ]
+				description: 'undefined type in a local annotation should be reported'.
+			assert: [ assertErrorSet: eset containsMessageWith: 'Bogus is not defined' ]
+				description: 'the error should name the undefined type'
+		)
+		public testUndefinedTypeInParameterAnnotationReported = (
+			(* And in a parameter annotation. *)
+
+			| eset = typechecker typecheckMethodSource: 'test: a <Bogus> = (^a)'
+				ofClass: TestClass1. |
+			assert: [ assertErrorSet: eset containsMessageWith: 'Bogus is not defined' ]
+				description: 'undefined type in a parameter annotation should be reported'
+		)
+		public testUndefinedTypeInReturnAnnotationReported = (
+			(* And in a return-type annotation. *)
+
+			| eset = typechecker typecheckMethodSource: 'test ^ <Bogus> = (^nil)'
+				ofClass: TestClass1. |
+			assert: [ assertErrorSet: eset containsMessageWith: 'Bogus is not defined' ]
+				description: 'undefined type in a return annotation should be reported'
+		)
+		public testUndefinedTypeInParameterizedAnnotationReported = (
+			(* And nested inside a parameterized type. *)
+
+			| eset = typechecker typecheckMethodSource: 'test = (| x <Array[Bogus]> | ^x)'
+				ofClass: TestClass1. |
+			assert: [ assertErrorSet: eset containsMessageWith: 'Bogus is not defined' ]
+				description: 'undefined element type of a parameterized annotation should be reported'
+		)
+		public testUndefinedTypeInBlockAnnotationReported = (
+			(* And inside a block/closure type. *)
+
+			| eset = typechecker typecheckMethodSource: 'test = (| x <[Bogus]> | ^x)'
+				ofClass: TestClass1. |
+			assert: [ assertErrorSet: eset containsMessageWith: 'Bogus is not defined' ]
+				description: 'undefined return type of a block annotation should be reported'
+		)
+		public testDefinedTypeAnnotationNotFalselyReported = (
+			(* A well-defined annotation (incl. tuple, closure, DoesNotMatter, and method
+		   type vars) must NOT be flagged as undefined. *)
+
+			| eset = typechecker typecheckMethodSource: 'test = (| x <{Integer. String}> = {1. ''a''}. y <[Integer]> = [1]. | ^x)'
+				ofClass: TupleTestClass. |
+			assert: [ (assertErrorSet: eset containsMessageWith: 'is not defined') not ]
+				description: 'defined tuple/closure annotations must not be reported as undefined'
 		)
 		public testTupleNonLiteralAccess = (
 			(* Test accessing tuple with non-literal index returns union type *)
@@ -3197,6 +3250,55 @@ public class PublicN1 = (
 			rFresh:: typechecker typecheckMethodSource: src ofClass: TestClass1.
 			assert: [ errorSet: rInc equivalentTo: rFresh ]
 				description: 'incremental result must equal a from-scratch re-check'
+		)
+
+		(* ===== Transitive re-check driver (recheckFrom:) ===== *)
+		drvUseSource = (
+			^'useB: x <DrvB> ^ <Integer> = (^x foo)'
+		)
+		setUpDriverDependencyWithFoo: fooDecl <String> = (
+			(* Install DrvB (with the given foo declaration) and DrvA whose useB:
+		   depends on DrvB>>foo; register the dependency by typechecking useB:. *)
+
+			installClass: 'class DrvB new = Object new () (' , fooDecl , ') : ()' named: #DrvB.
+			installClass: 'class DrvA new = Object new () (public useB: x <DrvB> ^ <Integer> = (^x foo)) : ()'
+				named: #DrvA.
+			typechecker typecheckMethodSource: drvUseSource ofClass: (namespace at: #DrvA)
+		)
+		public testRecheckDriverPropagatesPassToError = (
+			(* Editing DrvB>>foo (Integer->String) and calling recheckFrom: must, on its
+		   own, re-check the dependent DrvA>>useB: and surface its new error. *)
+
+			| useDecl <Object> results <Map> entry <Set> |
+			setUpDriverDependencyWithFoo: 'public foo ^ <Integer> = (^1)'.
+			useDecl:: typechecker declarationForMember: #'useB:' kind: #method ofClass: (namespace at: #DrvA).
+			installClass: 'class DrvB new = Object new () (public foo ^ <String> = (^''x'')) : ()' named: #DrvB.
+			results:: typechecker recheckFrom: (typechecker declarationForMember: #foo kind: #method
+				ofClass: (namespace at: #DrvB)).
+			entry:: results at: useDecl ifAbsent: [ nil ].
+			assert: [ entry isNil not ]
+				description: 'driver should re-check the transitive dependent useB:'.
+			assert: [ entry isEmpty not ]
+				description: 'after foo->String the dependent useB: should error'.
+			typechecker clearQueryState.
+			assert: [ errorSet: entry equivalentTo: (typechecker typecheckMethodSource: drvUseSource
+				ofClass: (namespace at: #DrvA)) ]
+				description: 'driver result for the dependent must equal a from-scratch re-check'
+		)
+		public testRecheckDriverPropagatesErrorToPass = (
+			(* The reverse: String->Integer; the driver must flip the dependent clean. *)
+
+			| useDecl <Object> results <Map> entry <Set> |
+			setUpDriverDependencyWithFoo: 'public foo ^ <String> = (^''x'')'.
+			useDecl:: typechecker declarationForMember: #'useB:' kind: #method ofClass: (namespace at: #DrvA).
+			installClass: 'class DrvB new = Object new () (public foo ^ <Integer> = (^1)) : ()' named: #DrvB.
+			results:: typechecker recheckFrom: (typechecker declarationForMember: #foo kind: #method
+				ofClass: (namespace at: #DrvB)).
+			entry:: results at: useDecl ifAbsent: [ nil ].
+			assert: [ entry isNil not ]
+				description: 'driver should re-check the dependent useB:'.
+			assert: [ entry isEmpty ]
+				description: 'after foo->Integer the dependent useB: should be clean'
 		)
 	) : (
 		TEST_CONTEXT = (

@@ -102,6 +102,11 @@ cp ${PRIMORDIALSOUP}/out/snapshots/*.vfuel out
 cp ${PRIMORDIALSOUP}/newspeak/*.ns out
 # 7. Merge in Newspeak IDE dependencies
 cp ./*.ns ./*.png out
+# deploy-boot.js: shared boot for web-deployed Ampleforth documents (see
+# Documents>>deployForWeb:). Lean deployed pages reference it; it replays the
+# real primordialsoup.html loader at runtime. Served from out/ and mirrored to
+# deploy targets by the deploy scripts.
+cp ./deploy-boot.js out
 # cp -R CodeMirror out # CodeMirror is copied during deploy
 
 # 7a. Stage self-hosted third-party JS (isomorphic-git, lightning-fs).

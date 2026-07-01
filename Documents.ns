@@ -1175,6 +1175,14 @@ bothered writing code for mortals like you to use?</p>'
 		navButtonLabel: label <String> ^<String> = (
 			^'<span style="font-family: serif; font-size: 18px; font-weight: bold; color: #777777;">' , label , '</span>'
 		)
+		webTransclusion: name <String> title: t <String> lazily: lz <Boolean> content: liveContent <Fragment> ^<Fragment> = (
+			(* Wrap a live transclusion fragment (a toggle for lazy, an inline
+     transclude for eager) as a deploy-aware WebTransclusionFragment: the web
+     deploy emits a link (lazy) or inlines the child (eager), while the fragment
+     renders normally live. A document's post/section methods use this. *)
+
+			^webTransclusionFragmentTranscluding: name content: liveContent lazily: lz titled: t
+		)
 		public addContentsUsingFolder: folder = (
 			(* Docu-apps that have specific data representations they need to be able to save should do this here. By default, do nothing *)
 			
@@ -1507,11 +1515,19 @@ bothered writing code for mortals like you to use?</p>'
 				]. }. }
 		)
 		docMenu ^<Menu> = (
-			^menuWithLabelsAndActions: {{'Pretty Print Selection'. [
+			^menuWithLabelsAndActions: {{'Deploy for Web'. [ respondToDeployForWeb ]. }. #separator. {'Pretty Print Selection'. [
 					respondToPrettyPrintSelection
 				]. }. #separator. {'Inspect Document Object'. [ respondToInspectDocument ]. }. {'Inspect Presenter'. [
 					respondToInspectPresenter
 				]. }. #separator. {'Delete'. [ respondToDelete ]. }. }
+		)
+		respondToDeployForWeb = (
+			(* Download a lean, crawlable web page for this document (it references
+       the shared deploy-boot.js and loads <name>.zip live). See
+       Documents>>deployForWeb:. The document's zip is produced by the normal
+       save. *)
+
+			outer Documents deployForWeb: subject document
 		)
 		respondToPrettyPrintSelection = (
 			(* Pretty-print the selection in the document's raw editor and
@@ -2303,30 +2319,59 @@ bothered writing code for mortals like you to use?</p>'
 			send
 	)
 	public staticProseFor: doc <Document> ^<String> = (
-		(* Web-deploy: the document's crawlable static prose. Parse the saved
-     contents, replace each amplet with its deploy-aware static form (a
-     NavBarFragment -> <a> links; other amplets -> empty), and return the
-     self_ampleforth inner HTML (editor wrapper removed). Transclusion
-     dispatch (webPost link/inline) is Increment B. *)
+		^staticProseFor: doc inlineStack: Set new lazyChildren: List new
+	)
+	staticProseFor: doc <Document> inlineStack: stack <Set[String]> lazyChildren: children <List[String]> ^<String> = (
+		(* The document's crawlable static prose. Replace each amplet with its
+     deploy-aware static form (NavBarFragment -> <a> links; WebTransclusionFragment
+     -> a link for a lazy transclusion, or the child's inlined prose for an eager
+     one; anything else -> empty), and return the self_ampleforth inner HTML with
+     the editor wrapper stripped. `stack` guards against eager transclusion
+     cycles; `children` collects lazily-linked child names for recursive deploy. *)
 
 		| dom = DOMParser new parseFromString: doc contents mimeType: 'text/html'.
 		amplets = List new. live = dom getElementsByClassName: 'ampleforth'.
 		proseHolders = dom getElementsByClassName: 'self_ampleforth'. |
 		0 to: (live at: 'length') - 1 do: [:i | amplets add: (live at: i) ].
 		amplets do: [:amplet |
-			amplet at: 'outerHTML' put: (deployStaticFormOfAmplet: (amplet getAttribute: 'name') in: doc) ].
+			amplet at: 'outerHTML' put: (deployStaticFormOfAmplet: (amplet getAttribute: 'name') in: doc inlineStack: stack lazyChildren: children) ].
 		^(proseHolders at: 'length') > 0
 			ifTrue: [ (proseHolders at: 0) at: 'innerHTML' ]
 			ifFalse: [ (dom at: 'body') at: 'innerHTML' ]
 	)
-	deployStaticFormOfAmplet: expr <String> in: doc <Document> ^<String> = (
+	deployStaticFormOfAmplet: expr <String> in: doc <Document> inlineStack: stack <Set[String]> lazyChildren: children <List[String]> ^<String> = (
 		(* Static HTML for one amplet: evaluate its expression against the
-     document and, if the result is a deploy-aware fragment, ask for its
-     static form. Non-deploy-aware amplets (buttons, widgets) have none. *)
+     document and dispatch on the deploy-aware fragment kind. *)
 
 		| frag = [ (doc evaluate: expr) result reflectee ] on: Error do: [:e | nil ]. |
-		(frag isNil not and: [ frag isKindOfNavBarFragment ]) ifTrue: [ ^navBarStaticHtml: frag navItems ].
+		frag isNil ifTrue: [ ^'' ].
+		frag isKindOfNavBarFragment ifTrue: [ ^navBarStaticHtml: frag navItems ].
+		frag isKindOfWebTransclusionFragment ifTrue: [ ^deployWebTransclusion: frag inlineStack: stack lazyChildren: children ].
 		^''
+	)
+	deployWebTransclusion: frag <Fragment> inlineStack: stack <Set[String]> lazyChildren: children <List[String]> ^<String> = (
+		(* Lazy transclusion (or an eager one that would cycle) -> a link to
+     <name>.html + register the child for recursive deploy. Eager and acyclic
+     -> inline the child's static prose (recurse). A not-yet-loaded eager child
+     falls back to a link. *)
+
+		| name = frag transcludedDocName. child |
+		(frag lazyTransclusion or: [ stack includes: name ]) ifTrue: [
+				(children includes: name) ifFalse: [ children add: name ].
+				^'<a href="' , name , '.html">' , frag transclusionTitle , '</a>'
+			].
+		child:: ide namespacing Root at: name ifAbsent: [ nil ].
+		child isNil ifTrue: [
+				(children includes: name) ifFalse: [ children add: name ].
+				^'<a href="' , name , '.html">' , frag transclusionTitle , '</a>'
+			].
+		^staticProseFor: child inlineStack: (setFrom: stack with: name) lazyChildren: children
+	)
+	setFrom: aSet <Set[String]> with: name <String> ^<Set[String]> = (
+		| s = Set new. |
+		s addAll: aSet.
+		s add: name.
+		^s
 	)
 	navBarStaticHtml: items <List> ^<String> = (
 		| html <String> ::= '<nav>'. |
@@ -2336,23 +2381,35 @@ bothered writing code for mortals like you to use?</p>'
 		^html , '</nav>'
 	)
 	public deployPageFor: doc <Document> ^<String> = (
-		(* A lean, crawlable deploy page for doc: the static prose in
-     #ampleforth-ssr, the document name for deploy-boot.js, and a single
-     <script src="deploy-boot.js">. deploy-boot.js (a shared asset) reads the
-     name, boots AmpleforthViewer against <name>.zip, and removes the fallback
-     once live. No boot boilerplate is copied into the page. *)
+		^deployPageFor: doc lazyChildren: List new
+	)
+	deployPageFor: doc <Document> lazyChildren: children <List[String]> ^<String> = (
+		(* A lean, crawlable deploy page for doc: static prose in #ampleforth-ssr,
+     the document name for deploy-boot.js, and a single <script src=
+     "deploy-boot.js">. `children` collects lazily-linked child names. *)
 
 		^'<!DOCTYPE html><html><head><meta charset="utf-8"/><title>' , doc name ,
 			'</title></head><body data-ampleforth-doc="' , doc name ,
-			'"><div id="ampleforth-ssr">' , (staticProseFor: doc) ,
+			'"><div id="ampleforth-ssr">' , (staticProseFor: doc inlineStack: Set new lazyChildren: children) ,
 			'</div><script src="deploy-boot.js"></script></body></html>'
 	)
 	public deployForWeb: doc <Document> = (
-		(* Download the lean deploy page for doc as <name>.html. The document's
-     <name>.zip is produced by the normal save; deploy-boot.js is a shared
-     static asset served alongside. Recursion over lazily transcluded children
-     arrives with the web-transclusion construct (Increment B). *)
+		(* Deploy doc, and recursively any lazily-transcluded children already
+     loaded in Root, each as its own lean <name>.html download. Zips come from
+     the normal save; deploy-boot.js is a shared asset. (Loading not-yet-loaded
+     lazy children before deploying them is a follow-up.) *)
 
-		ide webFiles downloadFileName: doc name , '.html' fromString: (deployPageFor: doc)
+		deployDocument: doc alreadyDeployed: Set new
+	)
+	deployDocument: doc <Document> alreadyDeployed: deployed <Set[String]> = (
+		| children page |
+		(deployed includes: doc name) ifTrue: [ ^self ].
+		deployed add: doc name.
+		children:: List new.
+		page:: deployPageFor: doc lazyChildren: children.
+		ide webFiles downloadFileName: doc name , '.html' fromString: page.
+		children do: [:name |
+			| child = ide namespacing Root at: name ifAbsent: [ nil ]. |
+			child isNil ifFalse: [ deployDocument: child alreadyDeployed: deployed ] ]
 	)
 ) : ()

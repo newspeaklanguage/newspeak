@@ -67,8 +67,19 @@ shared singleton/module-global state.
   `focus chatDoc chatSubjectSlot` instead of `currentChatSubject_slot`.
   `enqueuePendingChangesetId:id forChat:` now takes the target chat. Id-space and
   object registry stay shared (hybrid).
-- **M3 — Broadcast system changes to all *other* open chats** (inject notice +
-  handle staleness). Previously deferred.
+- **M3 — Broadcast system changes to other open chats — DONE (2026-07-02).** When
+  a changeset is applied (`applyChangesetRecords:` via the AI `apply_changeset` tool
+  or the inline Apply button's `onApplied:`), `broadcastChangeAppliedBy:records:`
+  tells every OTHER open chat (chat docs in Root with a built `chatSubjectSlot`,
+  excluding the applier) via `Session>>addSystemNotice:`. The notice (summary of
+  touched classes) rides the recipient's NEXT turn's **system prompt**
+  (`effectiveSystemPrompt`, folded in at the completion, cleared after the turn) —
+  model context only, not a visible bubble. Diffs still don't live-update
+  (staleness left as-is). Gotchas hit: Hopscotch Subjects DNU on `~~` (use `~=`);
+  and side-work triggered from an apply path must be fully `on: Exception do:`
+  wrapped or a failure aborts the apply (`resolveFn` never fires → UI shows a failed
+  apply). The `AIChats` namespace precursor was **deferred** (option A) — M3 works
+  fine off the existing `chatDocumentsInRoot` Root scan.
 
 ---
 

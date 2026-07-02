@@ -437,7 +437,10 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 					subj:: self.
 					strategy:: AIInstallStrategy onRecords: records
 						changesetId: id
-						onApplied: [ ]
+						onApplied: [:csId <String> :recCount <Integer> |
+							(* M3: notify other open chats that the codebase changed. *)
+							broadcastChangeAppliedBy: subj records: records
+						]
 						onCanceled: [
 							subj forgetCachedChangesetSubjectFor: id.
 							ide browsing updateCurrentDisplay
@@ -2086,6 +2089,45 @@ public clearConversation = ( ide aiSupport clearConversationFor: self )
 		focus chatDoc isNil ifTrue: [ ^currentChatSubject_slot ].
 		^focus chatDoc chatSubjectSlot
 	)
+	broadcastChangeAppliedBy: applier <Object | UndefinedObject> records: records <List> = (
+		(* M3: tell every OTHER open chat (one with a live session) that the codebase
+	   changed, so its AI re-reads instead of trusting cached source. The applier
+	   already knows, so it is skipped. The notice rides each recipient's NEXT-turn
+	   system prompt (Session>>addSystemNotice:) — model context only, not a visible
+	   chat bubble. Diffs are not live-updated (changeset staleness is left as-is). *)
+
+		| desc |
+		desc:: changeSummaryFor: records.
+		chatDocumentsInRoot do: [:doc |
+				(* Each doc fully guarded: a broadcast failure must NEVER break the
+			   apply that triggered it. NB: Hopscotch Subjects don't understand ~~,
+			   so identity-exclusion of the applier uses ~= (they define =). *)
+				[
+					| subj |
+					subj:: doc chatSubjectSlot.
+					(subj isNil not and: [ subj ~= applier ]) ifTrue: [
+							subj session addSystemNotice: 'Another AI session just changed the codebase ('
+								, desc
+								, '). Anything you read earlier may be stale — re-read any class or member you rely on before acting.'
+						]
+				] on: Exception do: [:e | nil ]
+			]
+	)
+	changeSummaryFor: records <List> ^<String> = (
+		(* Distinct top-level/target class names touched by a changeset, for the
+	   broadcast notice. Best-effort: skip records without a class_name. *)
+
+		| names |
+		names:: List new.
+		records do: [:r |
+				| n |
+				n:: [ r at: 'class_name' ] on: Exception do: [:e | nil ].
+				(n isNil not and: [ (names includes: n) not ]) ifTrue: [ names add: n ]
+			].
+		names isEmpty ifTrue: [ ^'unspecified changes' ].
+		^names inject: 'classes: ' into: [:acc :n |
+				acc = 'classes: ' ifTrue: [ acc , n ] ifFalse: [ acc , ', ' , n ] ]
+	)
 	summarizeChangesetId: id <String> records: records <List> ^<String> = (
 		(* Short, structured-y summary returned to the model as the tool
 	   result. The user sees the proper structured diff in the chat doc
@@ -2629,7 +2671,7 @@ public clearConversation = ( ide aiSupport clearConversationFor: self )
 	   document/amplet manipulation, navigation, testing, atomic
 	   changesets, evaluation/inspection, and debugger control. *)
 		
-		^{getClassSourceTool. getMemberSourceTool. getClassHeaderTool. listClassMembersTool. sendersTool. implementorsTool. searchClassesTool. listNamespaceTool. getDocumentTool. createDocumentTool. createChatDocumentTool. setDocumentContentsTool. deleteDocumentTool. listAmpletsTool. addAmpletTool. setAmpletExpressionTool. deleteAmpletTool. listMediaTool. deleteMediaTool. webFetchTool. (currentFocusToolForFocus: focus). navigateToClassTool. navigateToNamespaceTool. navigateToDocumentTool. showTestsTool. runTestsTool. getTestResultsTool. getTestFailureDetailsTool. runFailingTestsTool. runErroringTestsTool. runOneTestTool. (proposeChangesToolForFocus: focus). applyChangesetTool. evaluateTool. navigateToObjectTool. inspectObjectTool. listObjectsTool. forgetObjectTool. getCurrentFrameTool. getStackTraceTool. getCurrentExpressionTool. inspectActivationTool. stepTool. returnFromTool. continueThreadTool. }
+		^{getClassSourceTool. getMemberSourceTool. getClassHeaderTool. listClassMembersTool. sendersTool. implementorsTool. searchClassesTool. listNamespaceTool. getDocumentTool. createDocumentTool. createChatDocumentTool. setDocumentContentsTool. deleteDocumentTool. listAmpletsTool. addAmpletTool. setAmpletExpressionTool. deleteAmpletTool. listMediaTool. deleteMediaTool. webFetchTool. (currentFocusToolForFocus: focus). navigateToClassTool. navigateToNamespaceTool. navigateToDocumentTool. showTestsTool. runTestsTool. getTestResultsTool. getTestFailureDetailsTool. runFailingTestsTool. runErroringTestsTool. runOneTestTool. (proposeChangesToolForFocus: focus). (applyChangesetToolForFocus: focus). evaluateTool. navigateToObjectTool. inspectObjectTool. listObjectsTool. forgetObjectTool. getCurrentFrameTool. getStackTraceTool. getCurrentExpressionTool. inspectActivationTool. stepTool. returnFromTool. continueThreadTool. }
 	)
 	public toolsForProvider: provider <Provider> ^<List[Tool]> = (
 		(* tools plus any capability-gated extras the given provider can drive.
@@ -3522,7 +3564,7 @@ Top-level class DELETION is not supported by this tool (different mechanism, not
 				summarizeChangesetId: id records: records
 			]
 	)
-	applyChangesetTool ^<Tool> = (
+	applyChangesetToolForFocus: focus <ChatFocus> ^<Tool> = (
 		^Tool name: 'apply_changeset'
 			description: 'Atomically install a previously proposed changeset. Call this only after the user has reviewed the diff returned by propose_changes and explicitly approved. On success returns "Applied changeset <id>". On failure the atomic install rolls back, so no partial state is left in the running system.'
 			inputSchema: '{"type":"object","properties":{"id":{"type":"string","description":"The changeset id returned by propose_changes"}},"required":["id"]}'
@@ -3535,6 +3577,8 @@ Top-level class DELETION is not supported by this tool (different mechanism, not
 					].
 				applyChangesetRecords: records.
 				proposedChangesets removeKey: id.
+				(* M3: notify the OTHER open chats; this session is the applier. *)
+				broadcastChangeAppliedBy: (proposingChatFor: focus) records: records.
 				'Applied changeset ' , id
 			]
 	)
@@ -4303,7 +4347,9 @@ When the user asks about an entity in their system, use the IDE tools to look it
 								]
 								ifFalse: [ ' records).' ])
 							role: 'assistant'
-							into: doc
+							into: doc.
+						(* M3: notify other open chats that the codebase changed. *)
+						broadcastChangeAppliedBy: doc chatSubjectSlot records: records
 					]
 					onCanceled: [
 						forgetCachedChangesetSubject: id for: doc.

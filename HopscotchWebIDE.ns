@@ -16,7 +16,8 @@ class HopscotchWebIDE packageUsing: manifest = Object new (
 		private NewspeakColorization = manifest NewspeakColorization.
 		private NewspeakGrammar = manifest NewspeakGrammar.
 		private NewspeakASTs = manifest NewspeakASTs.
-		private NewspeakParsing = manifest NewspeakParsing.
+                private NewspeakParsing = manifest NewspeakParsing.
+                private NewspeakPredictiveParsing = manifest NewspeakPredictiveParsing.
 		private NewspeakTypechecker = manifest NewspeakTypechecker.
 		private NewspeakPrettyPrinter = manifest NewspeakPrettyPrinter.
 		private Documents = manifest Documents.
@@ -64,8 +65,6 @@ class HopscotchWebIDE packageUsing: manifest = Object new (
 		private standardIconNames <Set[String]>
 	|
 ) (
-	
-	(* manifest codemirror. *)
 	class HopscotchImagePaths packageUsing: manifest = Object new (
 		(* We expect the manifest to store paths that can be converted into usable obejcts at runtime. Eventually these should become Resource objects with more general properties. *)
 		
@@ -168,7 +167,7 @@ class HopscotchWebIDE packageUsing: manifest = Object new (
 			private Promise = p js global at: 'Promise'.
 			public images = p hopscotch images.
 			public buildVersion = BuildInfo version.
-
+			
 			(* HopscotchImages usingPlatform: p *)
 			public browsing = Browsing usingPlatform: p ide: self.
 			public debugging = Debugging usingPlatform: p ide: self.
@@ -221,25 +220,46 @@ class HopscotchWebIDE packageUsing: manifest = Object new (
 		lazy public drafts = (VCSIsomorphicGitBackendProvider usingPlatform: platformHolder) DraftsRepo storeNamed: 'newspeak-ide-drafts'
 			dir: '/drafts'.
 		lazy public typechecker = makeTypechecker.
-		
-		(* Construct a NewspeakTypechecker using a snapshot of the IDE Root
-	   namespace, filtered to behaviors (the typechecker only ever
-	   reflects on classes; Root also holds documents, forms, etc.). *)
-		
-		(* Returns a freshly-constructed typechecker. Menu actions call this
-	   per click; the lazy typechecker slot is reserved for the eventual
-	   incremental-invalidation flow. *)
 		lazy public prettyPrinter = makePrettyPrinter.
 		makeTypechecker = (
-			| asts filteredNs |
-			asts:: NewspeakASTs usingPlatform: platformHolder.
-			filteredNs:: Map new.
-			namespacing Root keysAndValuesDo: [:k :v |
-					v isKindOfBehavior ifTrue: [ filteredNs at: k put: v ]
-				].
+			(* Pass the LIVE Root namespace (not a filtered snapshot) so the persistent
+		   `typechecker` slot stays in sync as classes are added/removed/renamed. The
+		   typechecker only ever looks names up by key and guards non-behaviour entries
+		   (documents, forms) in type:at:, so they are harmless. *)
+			
+			| asts = NewspeakASTs usingPlatform: platformHolder. |
 			^NewspeakTypechecker usingPlatform: platformHolder
 				ast: asts
-				namespace: filteredNs
+				namespace: namespacing Root
+		)
+		public resetTypechecker = (
+			(* Full from-scratch reset of the persistent typechecker's incremental state
+		   (caches + dependency edges); the live Root namespace is unchanged. Escape
+		   hatch for a clean re-typecheck. *)
+			
+			typechecker clearQueryState
+		)
+		public reportRecheckFrom: declaration onSubject: subject = (
+			(* After an edit, drive an incremental re-check from `declaration` and report
+		   results on the edited member's subject: its own type errors, plus a count of
+		   any errors that surfaced in dependent members. Robust -- a re-check glitch
+		   never breaks Accept. *)
+			
+			[
+				| results <Map> own <Set> dependentErrors <Integer> |
+				results:: typechecker recheckFrom: declaration.
+				own:: results at: declaration ifAbsent: [ Set new ].
+				own do: [:e |
+						subject typeErrorMessages add: 'Type error: ' , e message , ' [' , e start printString , '-' , e end printString , ']'
+					].
+				dependentErrors:: 0.
+				results keysAndValuesDo: [:d :errs |
+						d = declaration ifFalse: [ dependentErrors:: dependentErrors + errs size ]
+					].
+				dependentErrors > 0 ifTrue: [
+						subject typeErrorMessages add: dependentErrors printString , ' new type error(s) in dependent member(s) -- re-typecheck them to see details'
+					]
+			] on: Error do: [:e <Exception> | ]
 		)
 		public freshTypechecker
 		(* Build the shared NewspeakPrettyPrinter instance used by the
@@ -248,19 +268,6 @@ class HopscotchWebIDE packageUsing: manifest = Object new (
 	   parsing, and metadata-parsing instances. *)
 		 = (
 			^makeTypechecker
-		)
-		makePrettyPrinter = (
-			| asts parsing md cp |
-			asts:: NewspeakASTs usingPlatform: platformHolder.
-			parsing:: NewspeakParsing usingPlatform: platformHolder
-				grammar: grammar
-				asts: asts.
-			cp:: parsing CommonParser new.
-			md:: MetadataParsing usingPlatform: platformHolder.
-			^NewspeakPrettyPrinter usingPlatform: platformHolder
-				ast: asts
-				parser: cp
-				metadata: md
 		)
 		public prettyPrintMethodOr: src <String> ^<String> = (
 			^[ prettyPrinter prettyPrintMethod: src ] on: Error do: [:e | src ]
@@ -318,7 +325,7 @@ class HopscotchWebIDE packageUsing: manifest = Object new (
 			builders do: [:b <ClassDeclarationBuilder> |
 					
 					(* Add each changed module to the backup *)
-					lastBackup at: b name put: (browsing compilationUnitFromSource: b source)
+					lastBackup at: b name put: (browsing compilationUnitFromSource: b source forClassNamed: b name)
 				].
 			
 			(* Save new backup in local storage *)
@@ -727,6 +734,7 @@ class HopscotchWebIDE packageUsing: manifest = Object new (
 				put: (populateIconNamespace: namespacing freshNamespace);
 				at: runtimeClass mixin name put: runtimeClass reflectee;
 				at: 'Browsing' put: Browsing;
+				at: 'BuildInfo' put: BuildInfo;
 				at: 'Minitest' put: Minitest;
 				at: 'MinitestUI' put: MinitestUI;
 				at: 'Namespacing' put: Namespacing;
@@ -817,7 +825,7 @@ class HopscotchWebIDE packageUsing: manifest = Object new (
 	   the at:put: cascade in populateNamespaceUsingPlatform: when
 	   that list changes. *)
 			
-			^{'AccessModifierTesting'. 'AccessModifierTestingConfiguration'. 'AI_IDE_Support'. 'AIAccess'. 'ActivationMirrorTesting'. 'ActivationMirrorTestingConfiguration'. 'ActorsForJS'. 'AliensForJS'. 'Browsing'. 'Collections'. 'CombinatorialParsing'. 'Debugging'. 'DeploymentManager'. 'DocumentHolder'. 'Documents'. 'HopscotchWebIDE'. 'JSTesting'. 'JSTestingConfiguration'. 'JavascriptGeneration'. 'KernelForJS'. 'KernelTests'. 'KernelTestsConfiguration'. 'MemoryHoleTesting'. 'MemoryHoleTestingConfiguration'. 'MetadataParsing'. 'Minitest'. 'MinitestTests'. 'MinitestTestsConfiguration'. 'MinitestUI'. 'MirrorBuilderTesting'. 'MirrorBuilderTestingConfiguration'. 'MirrorGroups'. 'MirrorTesting'. 'MirrorTestingConfiguration'. 'MirrorTestingModel'. 'MirrorsForJS'. 'Namespacing'. 'NewspeakASTs'. 'NewspeakColorization'. 'NewspeakCompilation'. 'NewspeakGrammar'. 'NewspeakParsing'. 'NewspeakPrettyPrinter'. 'NewspeakPrettyPrinterTesting'. 'NewspeakPrettyPrinterTestingConfiguration'. 'NewspeakTypechecker'. 'NewspeakTypecheckerTesting'. 'NewspeakTypecheckerTestingConfiguration'. 'Repositories'. 'RuntimeForHopscotchForHTML'. 'RuntimeForJS'. 'RuntimeForJSWithMirrorBuilders'. 'Streams'. 'VCSCore'. 'VCSDiffing'. 'VCSIsomorphicGitBackendProvider'. 'VCSLib'. 'VCSSourceMirrors'. 'WebFiles'. 'WorkspaceHolder'. 'WorkspaceManager'. }
+			^{'AccessModifierTesting'. 'AccessModifierTestingConfiguration'. 'AI_IDE_Support'. 'AIAccess'. 'ActivationMirrorTesting'. 'ActivationMirrorTestingConfiguration'. 'ActorsForJS'. 'AliensForJS'. 'Browsing'. 'BuildInfo'. 'Collections'. 'CombinatorialParsing'. 'Debugging'. 'DeploymentManager'. 'DocumentHolder'. 'Documents'. 'HopscotchWebIDE'. 'JSTesting'. 'JSTestingConfiguration'. 'JavascriptGeneration'. 'KernelForJS'. 'KernelTests'. 'KernelTestsConfiguration'. 'MemoryHoleTesting'. 'MemoryHoleTestingConfiguration'. 'MetadataParsing'. 'Minitest'. 'MinitestTests'. 'MinitestTestsConfiguration'. 'MinitestUI'. 'MirrorBuilderTesting'. 'MirrorBuilderTestingConfiguration'. 'MirrorGroups'. 'MirrorTesting'. 'MirrorTestingConfiguration'. 'MirrorTestingModel'. 'MirrorsForJS'. 'Namespacing'. 'NewspeakASTs'. 'NewspeakColorization'. 'NewspeakCompilation'. 'NewspeakGrammar'. 'NewspeakParsing'. 'NewspeakPrettyPrinter'. 'NewspeakPrettyPrinterTesting'. 'NewspeakPrettyPrinterTestingConfiguration'. 'NewspeakTypechecker'. 'NewspeakTypecheckerTesting'. 'NewspeakTypecheckerTestingConfiguration'. 'Repositories'. 'RuntimeForHopscotchForHTML'. 'RuntimeForJS'. 'RuntimeForJSWithMirrorBuilders'. 'Streams'. 'VCSCore'. 'VCSDiffing'. 'VCSIsomorphicGitBackendProvider'. 'VCSLib'. 'VCSSourceMirrors'. 'WebFiles'. 'WorkspaceHolder'. 'WorkspaceManager'. }
 		)
 		primordialSoupBootstrapClassNames ^<Array[String]> = (
 			(* Classes registered in Root above that also live as top-level
@@ -858,6 +866,19 @@ class HopscotchWebIDE packageUsing: manifest = Object new (
 				at: 'saveImage' put: images saveImage;
 				at: 'sectionImage' put: images sectionImage;
 				yourself
+		)
+		makePrettyPrinter = (
+			| asts predictiveParsing cp md |
+			asts:: NewspeakASTs usingPlatform: platformHolder.
+			predictiveParsing:: NewspeakPredictiveParsing usingPlatform: platformHolder
+				asts: asts.
+			cp:: predictiveParsing CommonParser new.
+			md:: MetadataParsing usingPlatform: platformHolder
+				scannerClass: predictiveParsing Scanner.
+			^NewspeakPrettyPrinter usingPlatform: platformHolder
+				ast: asts
+				parser: cp
+				metadata: md
 		)
 	) : ()
 	topLevelClassOf: om <ObjectMirror> ^<ClassMirror> = (

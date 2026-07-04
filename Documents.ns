@@ -70,7 +70,6 @@ Copyright Gilad Bracha 2022-2025 *)
 		private JSArray = p js global at: 'Array'.
 		private JSPromise = p js global at: 'Promise'.
 		private JSString = p js global at: 'String'.
-		private JSZip = p js global at: 'JSZip'.
 		private URL = p js global at: 'URL'.
 		private ide = webIDE.
 		private retainedPlatform = p.
@@ -1260,6 +1259,25 @@ bothered writing code for mortals like you to use?</p>'
 		link: uri <String> = (
 			^html: '<a href="' , uri , '" contenteditable="false" target="_blank" rel="noopener noreferrer"> ' , uri , ' </a>'
 		)
+		ampleforthLink: docName <String> labeled: label <String> ^<Fragment> = (
+			(* An inline hyperlink from one document to another. Live: opens the named
+		   document as a top-level presenter in this same AmpleforthViewer instance
+		   (loading it from the server if not already present) -- no page reload and no
+		   runtime re-boot. Deploy: the web deploy emits a crawlable
+		   <a href="docName.html">label</a> (see deployStaticFormOfAmplet:). This
+		   centralizes link policy, so posts carry no deployment details -- an author
+		   just writes: ampleforthLink: 'SomeDoc' labeled: 'the visible text'. *)
+
+			^link: label action: [
+				ide documents loadFromServerNamed: docName
+					ifSuccess: [:d | ide browsing Utilities enterSubject: (ide documents DocumentSubject onModel: d) ]
+					ifFailure: [:m | nil ] ]
+		)
+		ampleforthLink: docName <String> ^<Fragment> = (
+			(* Link labelled with the target document's own name. *)
+
+			^ampleforthLink: docName labeled: docName
+		)
 		public transclone: documentName <Symbol> as: newName <Symbol> = (
 			^transclude: ((ide namespacing Root at: documentName) cloneNamed: newName) name
 		)
@@ -1528,12 +1546,15 @@ bothered writing code for mortals like you to use?</p>'
 				]. }. #separator. {'Delete'. [ respondToDelete ]. }. }
 		)
 		respondToDeployForWeb = (
-			(* Download a lean, crawlable web page for this document (it references
-       the shared deploy-boot.js and loads <name>.zip live). See
-       Documents>>deployForWeb:. The document's zip is produced by the normal
-       save. *)
+			(* Two-step to beat Chrome's transient-activation limit: build the deploy
+       bundle now (slow - it zips every reachable document), then offer a Save
+       button whose click provides fresh activation to write the finished blob. *)
 
-			outer Documents deployForWeb: subject document
+			outer Documents deployForWeb: subject document whenReady: [:blob :fileName |
+					enterSubject: (ide browsing InteractionSubject confirm: fileName , ' is ready. Save it?'
+						yesLabel: 'Save'
+						onYes: [ ide webFiles downloadFileName: fileName blob: blob ]
+						returnTo: subject) ]
 		)
 		respondToPrettyPrintSelection = (
 			(* Pretty-print the selection in the document's raw editor and
@@ -1721,28 +1742,64 @@ bothered writing code for mortals like you to use?</p>'
 						contents: (iconNamespace at: iconName) decode
 				]
 		)
-		processObjectsFromDom: dom usingFolder: folder = (
-			| docs <JSZip> = folder addFolder: 'documents'. classes <JSZip> = folder addFolder: 'classes'. icons <JSZip> = folder addFolder: 'icons'. imported <List> = dependenciesUsing: dom. importedClasses <List[Class]> = imported select: [:o |
+		processObjectsFromDom: dom usingFolder: folder ancestors: ancestors <Set[String]> = (
+			(* Embed class dependencies (detected textually - classes are message sends,
+     never bare string literals) and EAGERLY-transcluded documents (detected by
+     evaluating amplets and inspecting fragments, so nav links and lazy
+     transclusions - whose target names also appear as strings in amplet text -
+     are NOT mis-embedded). Eager cycles are broken by `ancestors`. *)
+
+			| docs <JSZip> = folder addFolder: 'documents'. classes <JSZip> = folder addFolder: 'classes'. importedClasses <List[Class]> = (dependenciesUsing: dom) select: [:o |
 					o isKindOfClass
-				]. importedDocuments <List[Document]> = imported select: [:o |
-					o isKindOfDocument
-				]. importedNamespaces <List[Namespace]> = imported select: [:o |
-					o isKindOfNamespace
 				]. |
 			
-			(* For each non-standard class in the main document, save it in zip folder 'classes'. *)
+			(* class dependencies *)
 			importedClasses do: [:c <Class> |
 					classes file: c name , '.ns'
 						contents: (ClassSubject onDeclaration: (ClassMirror reflecting: c) mixin declaration) compilationUnitSource
 				].
 			
-			(* for each transcluded document in the main document, save it in zip folder 'documents'.' *)
-			importedDocuments do: [:d <Document> |
-					docs file: d name , '.zip'
-						contents: (DocumentSubject onModel: d) createFolder asBlob
-				]
-			(* processIcons: (importedNamespaces at: #Icons) fromDom: dom usingFolder: icons. *)
-			
+			(* eagerly-transcluded documents: recursively; a loaded target is embedded
+     fresh (captures edits), an unopened one via the server's saved zip; a target
+     already up the ancestor chain (an eager cycle) is skipped. *)
+			(eagerTransclusionsOf: document) do: [:dn <String> |
+					(ancestors includes: dn) ifFalse: [
+							| d <Document> = ide namespacing Root at: dn ifAbsent: [ nil ]. |
+							d isNil
+								ifFalse: [
+									| deeper <Set[String]> = Set new. |
+									deeper addAll: ancestors.
+									deeper add: dn.
+									docs file: dn , '.zip'
+										contents: ((DocumentSubject onModel: d) createFolderWithAncestors: deeper) asBlob ]
+								ifTrue: [ docs file: dn , '.zip' contents: (fetchServerZipNamed: dn) ] ] ]
+		)
+		eagerTransclusionsOf: doc <Document> ^<List[String]> = (
+			(* Names of documents doc EAGERLY transcludes (transclude:), found by
+     evaluating its amplets and inspecting the resulting fragments - accurate for
+     indirect/composite amplets (postToggle:, row:{transclude:…}). Fragments are
+     built fresh and never rendered (no `visual`), so displayed widgets that may
+     hold state are not touched. *)
+
+			| dom <Alien[Node]> = DOMParser new parseFromString: doc contents mimeType: 'text/html'. amplets = dom getElementsByClassName: 'ampleforth'. result <List[String]> = List new. |
+			0 to: (amplets at: 'length') - 1 do: [:i <Integer> |
+					| frag = [ (doc evaluate: ((amplets at: i) getAttribute: 'name')) result reflectee ] on: Error do: [:e | nil ]. |
+					collectEagerTransclusionsOf: frag into: result ].
+			^result
+		)
+		collectEagerTransclusionsOf: frag into: result <List[String]> = (
+			frag isNil ifTrue: [ ^self ].
+			(frag isKindOfWebTransclusionFragment and: [ frag lazyTransclusion not ]) ifTrue: [
+					| dn <String> = frag transcludedDocName asString. |
+					(result includes: dn) ifFalse: [ result add: dn ].
+					^self ].
+			[ frag childrenDo: [:c <Fragment> | collectEagerTransclusionsOf: c into: result ] ] on: Error do: [:e | ]
+		)
+		fetchServerZipNamed: dn <String> ^<Alien[Promise]> = (
+			(* The server's saved <dn>.zip as a promise (embedded as JSZip promise
+     content) - used to embed an eager dependency that isn't loaded in Root. *)
+
+			^(retainedPlatform js global fetch: dn , '.zip') then: [:r | r blob]
 		)
 		dependenciesUsing: dom ^<List> = (
 			(* Obtain all non-standard entries in the root namespace. *)
@@ -1817,26 +1874,21 @@ bothered writing code for mortals like you to use?</p>'
 			importCandidates remove: c name ifAbsent: [ ]
 		)
 		public createFolder ^<Folder> = (
-			(* This method creates an in-memory zip folder representing the current document. See the class comment for details of the persistent representation *)
-			
-			| folder <Folder> = 
-			(* Create a zip folder *)
-			ide webFiles Folder named: name. innerFolder = 
-			(* add contents subfolder *)
-			folder addFolder: 'contents'. dom = 
-			(* Copy the DOM so we can modify it before saving *)
-			DOMParser new parseFromString: document contents mimeType: 'text/html'. |
-			
-			(* add media to folder *)
+			| ancestors <Set[String]> = Set new. |
+			ancestors add: name.
+			^createFolderWithAncestors: ancestors
+		)
+		public createFolderWithAncestors: ancestors <Set[String]> ^<Folder> = (
+			(* In-memory zip folder for this document. Embeds classes and the documents
+     this one EAGERLY transcludes (recursively); lazy transclusions and nav links
+     are NOT embedded (they load / link at runtime). `ancestors` is the chain of
+     doc names currently being embedded, so an eager cycle degrades to a non-embed
+     rather than recurring forever. *)
+
+			| folder <Folder> = ide webFiles Folder named: name. innerFolder = folder addFolder: 'contents'. dom = DOMParser new parseFromString: document contents mimeType: 'text/html'. |
 			processMediaFromDom: dom usingFolder: folder.
-			
-			(* process objects accessed from the IDE root namespace, such as classes and transcluded documents *)
-			processObjectsFromDom: dom usingFolder: folder.
-			
-			(* add contents if any *)
+			processObjectsFromDom: dom usingFolder: folder ancestors: ancestors.
 			model addContentsUsingFolder: innerFolder.
-			
-			(* add main document to folder; we do this last, so service methods can update the copied dom first *)
 			folder addTextFile: name , '.html' contents: (savedHTMLFor: dom).
 			^folder
 		)
@@ -1880,6 +1932,118 @@ bothered writing code for mortals like you to use?</p>'
 			^other isKindOfDummySubject
 		)
 	) : ()
+	class WebSiteDeployer forRoot: rootDoc <Document> whenReady: readyBlock <[:Object :String]> = Object new (
+		(* Builds deploy.<root>.zip: a self-contained website bundle. Walks the root
+     document's lazy-transclusion and nav links, loading any doc not already in
+     Root (recording an error if it is absent from the server too), and bundles
+     each doc's page (<name>.html) + zip (<name>.zip), plus index.html and
+     deploy-boot.js. A loaded doc is zipped from memory (freshest); an unloaded
+     one is fetched from the server. Runtime assets (viewer vfuel, primordialsoup,
+     vendored libs) are NOT bundled - they are a one-time server setup. Fully
+     async: downloads deploy.<root>.zip once everything settles. *)
+
+		|
+			root = rootDoc.
+			ready = readyBlock.
+			bundle = JSZip new.
+			seen = Set new.
+			errors = List new.
+			outstanding ::= 0.
+			finalized ::= false.
+		|
+	) (
+		public deploy = (
+			('Deploying ' , root name asString , ' …') out.
+			bundle file: 'deploy-boot.js' contents: ((retainedPlatform js global fetch: 'deploy-boot.js') then: [:r | r text]).
+			seen add: root name asString.
+			addToBundle: root named: root name asString asIndex: true.
+			checkDone
+		)
+		addToBundle: doc <Document> named: name <String> asIndex: isRoot <Boolean> = (
+			(* Add doc's page + zip and recurse. The zip is added as PROMISE content
+       (createFolder asBlob) so JSZip resolves it during generateAsync - the same
+       pattern createFolder uses for media/nested docs. No explicit then: of ours
+       can throw into a turn. Guarded so one bad doc is reported, not fatal. *)
+
+			('  + ' , name) out.
+			[
+				| children = List new. page |
+				page:: deployPageFor: doc lazyChildren: children.
+				bundle file: name , '.html' contents: page.
+				isRoot ifTrue: [ bundle file: 'index.html' contents: page ].
+				bundle file: name , '.zip' contents: (DocumentSubject onModel: doc) createFolder asBlob.
+				('    added ' , name , ' (' , children size printString , ' link[s])') out.
+				children do: [:childName | ensureChild: childName ]
+			] on: Exception do: [:e |
+				('  ERROR building ' , name , ': ' , e printString) out.
+				errors add: name , ': ' , e printString ]
+		)
+		ensureChild: name = (
+			(* Deploy the named child once. Reserve the (string) key BEFORE any async
+       load so a name referenced from several pages is never scheduled twice. *)
+
+			| key = name asString. child |
+			(seen includes: key) ifTrue: [ ^self ].
+			seen add: key.
+			child:: Root at: name ifAbsent: [ nil ].
+			child isNil
+				ifFalse: [ addToBundle: child named: key asIndex: false ]
+				ifTrue: [
+					('    fetch: ' , key) out.
+					outstanding:: outstanding + 1.
+					loadFromServerNamed: name
+						ifSuccess: [:d |
+							addToBundle: d named: key asIndex: false.
+							opDone.
+							nil ]
+						ifFailure: [:msg |
+							('    fetch FAIL ' , key , ': ' , msg) out.
+							errors add: key , ': ' , msg.
+							opDone.
+							nil ] ]
+		)
+		opDone = (
+			outstanding:: outstanding - 1.
+			checkDone
+		)
+		checkDone = (
+			(* All loads settled - the bundle now holds every page + a zip promise;
+       generateAsync resolves the promises and we download. *)
+
+			(outstanding = 0 and: [ finalized not ]) ifTrue: [
+				finalized:: true.
+				generateAndReady ]
+		)
+		generateAndReady = (
+			(* Generate the bundle blob, then hand it to `ready`. The blob is fully
+       built here (the slow part); the caller writes it under a fresh user
+       gesture so Chrome's download-activation window is not exhausted. *)
+
+			| opts = JSObject new. |
+			('Generating deploy.' , root name asString , '.zip (' , seen size printString , ' doc[s]) …') out.
+			opts at: #type put: #blob.
+			(bundle generateAsync: opts)
+				then: [:blob |
+					('deploy.' , root name asString , '.zip ready (' , seen size printString , ' doc[s])') out.
+					reportErrors.
+					[ ready value: blob value: 'deploy.' , root name asString , '.zip' ]
+						on: Exception do: [:e | ('deploy ready-callback failed: ' , e printString) out ].
+					nil ]
+				onError: [:ex |
+					('deploy failed (generate): ' , ex printString) out.
+					reportErrors.
+					nil ]
+		)
+		reportErrors = (
+			errors isEmpty ifFalse: [ errors do: [:e | ('deploy warning: ' , e) out ] ]
+		)
+	) : ()
+	(* Resolve JSZip on first use, not at module-construction time. Under the
+	   deployed AmpleforthViewer, jszip.min.js is loaded by deploy-boot.js's async
+	   script replay, which can lose the race against the WASM boot; an eager slot
+	   would then pin nil and every `JSZip loadAsync:` would fail with a DNU. A lazy
+	   slot defers the lookup to first use (and caches the result). *)
+	lazy public JSZip = retainedPlatform js global at: 'JSZip'.
 	dummySubject ^<Subject> = (
 		^DummySubject new
 	)
@@ -2039,8 +2203,11 @@ bothered writing code for mortals like you to use?</p>'
 			do: [:j <Integer> |
 				| node <JSHTMLMediaElement> = nodes at: j. path <String> = retainedPlatform js global decodeURI: (node at: #src). n <String> = path copyFrom: (path lastIndexOf: '/'
 						startingAt: path size) + 1
-					to: path size. |
-				node at: #src put: (URL createObjectURL: (mediaRegistry at: n))
+					to: path size.
+				blob = mediaRegistry at: n ifAbsent: [ nil ]. |
+				(* A media node whose blob is absent (empty/broken src, or a name not in
+			   the registry) is left as-is rather than crashing the whole load/deploy. *)
+				blob isNil ifFalse: [ node at: #src put: (URL createObjectURL: blob) ]
 			]
 	)
 	public freshDocumentFromDOM: dom <Alien[Node]> registry: registry <Map[String, Blob]> ^<Document> = (
@@ -2337,10 +2504,18 @@ bothered writing code for mortals like you to use?</p>'
 
 		| dom = DOMParser new parseFromString: doc contents mimeType: 'text/html'.
 		amplets = List new. live = dom getElementsByClassName: 'ampleforth'.
-		proseHolders = dom getElementsByClassName: 'self_ampleforth'. |
+		proseHolders = dom getElementsByClassName: 'self_ampleforth'.
+		scripts = dom getElementsByTagName: 'script'. |
 		0 to: (live at: 'length') - 1 do: [:i | amplets add: (live at: i) ].
 		amplets do: [:amplet |
 			amplet at: 'outerHTML' put: (deployStaticFormOfAmplet: (amplet getAttribute: 'name') in: doc inlineStack: stack lazyChildren: children) ].
+		(* Drop dead <script> elements from the crawlable prose. Blog posts carry a
+	   leftover `document.querySelector('p')` snippet that is inert in the static
+	   page and, when the editor mangled its trailing tags, throws a console
+	   SyntaxError (Unexpected token '<'). Stripping them keeps the page clean. *)
+		[ (scripts at: #length) > 0 ] whileTrue: [
+				| s = scripts at: 0. |
+				(s at: #parentNode) removeChild: s ].
 		^(proseHolders at: 'length') > 0
 			ifTrue: [ (proseHolders at: 0) at: 'innerHTML' ]
 			ifFalse: [ (dom at: 'body') at: 'innerHTML' ]
@@ -2349,8 +2524,31 @@ bothered writing code for mortals like you to use?</p>'
 		(* Static HTML for one amplet: evaluate its expression against the document
      and render the resulting fragment tree. *)
 
-		| frag = [ (doc evaluate: expr) result reflectee ] on: Error do: [:e | nil ]. |
+		| docName = ampleforthLinkTargetOf: expr. frag = [ (doc evaluate: expr) result reflectee ] on: Error do: [:e | nil ]. label |
+		docName isNil ifFalse: [
+				label:: (frag isNil not and: [ frag isKindOfHyperlinkFragment ]) ifTrue: [ frag label ] ifFalse: [ docName ].
+				(children includes: docName) ifFalse: [ children add: docName ].
+				^'<a href="' , docName , '.html">' , (htmlEscape: label) , '</a>' ].
 		^deployStaticFormOfFragment: frag inlineStack: stack lazyChildren: children
+	)
+	ampleforthLinkTargetOf: expr <String> ^<String | Nil> = (
+		(* The target document name of an `ampleforthLink:` amplet -- its first
+	   argument, which may be a string literal 'Doc' or a symbol #Doc -- or nil if
+	   expr is not such a link. The label is the SECOND argument, so a quoted label
+	   never masquerades as the target even when the target is a #symbol. *)
+
+		| selEnd hash quote space |
+		(expr startsWith: 'ampleforthLink:') ifFalse: [ ^nil ].
+		selEnd:: 'ampleforthLink:' size.
+		hash:: expr indexOf: '#' startingAt: selEnd + 1.
+		quote:: expr indexOf: '''' startingAt: selEnd + 1.
+		(hash > 0 and: [ quote = 0 or: [ hash < quote ] ]) ifTrue: [
+				space:: expr indexOf: ' ' startingAt: hash + 1.
+				^space = 0
+					ifTrue: [ expr copyFrom: hash + 1 to: expr size ]
+					ifFalse: [ expr copyFrom: hash + 1 to: space - 1 ] ].
+		quote = 0 ifTrue: [ ^nil ].
+		^expr copyFrom: quote + 1 to: (expr indexOf: '''' startingAt: quote + 1) - 1
 	)
 	deployStaticFormOfFragment: frag <Fragment> inlineStack: stack <Set[String]> lazyChildren: children <List[String]> ^<String> = (
 		(* Render one fragment to static HTML. Recognized deploy-aware fragments
@@ -2361,8 +2559,11 @@ bothered writing code for mortals like you to use?</p>'
 
 		| html ::= ''. |
 		frag isNil ifTrue: [ ^'' ].
-		frag isKindOfNavBarFragment ifTrue: [ ^navBarStaticHtml: frag navItems ].
+		frag isKindOfNavBarFragment ifTrue: [ ^navBarStaticHtml: frag navItems collectingInto: children ].
 		frag isKindOfWebTransclusionFragment ifTrue: [ ^deployWebTransclusion: frag inlineStack: stack lazyChildren: children ].
+		frag isKindOfClassPresenter ifTrue: [ ^newspeakCodeBlockFrom: [ frag subject compilationUnitSource ] ].
+		frag isKindOfMethodPresenter ifTrue: [ ^newspeakCodeBlockFrom: [ frag subject source ] ].
+		frag isKindOfToggleComposer ifTrue: [ ^[ deployStaticFormOfFragment: frag expandedFragment inlineStack: stack lazyChildren: children ] on: Error do: [:e | '' ] ].
 		[ frag childrenDo: [:child | html:: html , (deployStaticFormOfFragment: child inlineStack: stack lazyChildren: children) ] ]
 			on: Error do: [:e | ].
 		^html
@@ -2385,16 +2586,35 @@ bothered writing code for mortals like you to use?</p>'
 			].
 		^staticProseFor: child inlineStack: (setFrom: stack with: name) lazyChildren: children
 	)
+	newspeakCodeBlockFrom: sourceBlock <[String]> ^<String> = (
+		(* Static form of a live code widget (class or method presenter): the
+     Newspeak source it displays, in a <pre> so it stays visible to a reader
+     (matching the live widget) and readable by a crawler / AI. Guarded: a
+     widget whose source can't be read contributes nothing rather than aborting
+     the page. *)
+
+		| src <String> = [ sourceBlock value ] on: Error do: [:e | nil ]. |
+		src isNil ifTrue: [ ^'' ].
+		^'<pre class="newspeak-source">' , (htmlEscape: src) , '</pre>'
+	)
+	htmlEscape: s <String> ^<String> = (
+		| t <String> ::= s. |
+		t:: (JSString new: t) replaceAll: '&' with: '&amp;'.
+		t:: (JSString new: t) replaceAll: '<' with: '&lt;'.
+		t:: (JSString new: t) replaceAll: '>' with: '&gt;'.
+		^t
+	)
 	setFrom: aSet <Set[String]> with: name <String> ^<Set[String]> = (
 		| s = Set new. |
 		s addAll: aSet.
 		s add: name.
 		^s
 	)
-	navBarStaticHtml: items <List> ^<String> = (
+	navBarStaticHtml: items <List> collectingInto: children <List[String]> ^<String> = (
 		| html <String> ::= '<nav>'. |
 		items do: [:item |
 			| label = item at: 1. target = item at: 2. external = item at: 3. |
+			external ifFalse: [ (children includes: target) ifFalse: [ children add: target ] ].
 			html:: html , '<a href="' , (external ifTrue: [ target ] ifFalse: [ target , '.html' ]) , '"' , (external ifTrue: [ ' target="_blank" rel="noopener noreferrer"' ] ifFalse: [ '' ]) , '>' , label , '</a> ' ].
 		^html , '</nav>'
 	)
@@ -2411,23 +2631,15 @@ bothered writing code for mortals like you to use?</p>'
 			'"><div id="ampleforth-ssr">' , (staticProseFor: doc inlineStack: Set new lazyChildren: children) ,
 			'</div><script src="deploy-boot.js"></script></body></html>'
 	)
-	public deployForWeb: doc <Document> = (
-		(* Deploy doc, and recursively any lazily-transcluded children already
-     loaded in Root, each as its own lean <name>.html download. Zips come from
-     the normal save; deploy-boot.js is a shared asset. (Loading not-yet-loaded
-     lazy children before deploying them is a follow-up.) *)
+	public deployForWeb: doc <Document> whenReady: readyBlock <[:Object :String]> = (
+		(* Build deploy.<doc>.zip: a self-contained website bundle of doc and every
+     document reachable via its lazy transclusions and nav links (loading any
+     not already in memory; error if absent from the server), plus deploy-boot.js.
+     Runtime assets are a one-time server setup, not bundled. Async and possibly
+     slow (it zips every reachable document); when the blob is ready it is passed
+     to readyBlock with the filename, so the file write can happen under a fresh
+     user gesture. *)
 
-		deployDocument: doc alreadyDeployed: Set new
-	)
-	deployDocument: doc <Document> alreadyDeployed: deployed <Set[String]> = (
-		| children page |
-		(deployed includes: doc name) ifTrue: [ ^self ].
-		deployed add: doc name.
-		children:: List new.
-		page:: deployPageFor: doc lazyChildren: children.
-		ide webFiles downloadFileName: doc name , '.html' fromString: page.
-		children do: [:name |
-			| child = ide namespacing Root at: name ifAbsent: [ nil ]. |
-			child isNil ifFalse: [ deployDocument: child alreadyDeployed: deployed ] ]
+		(WebSiteDeployer forRoot: doc whenReady: readyBlock) deploy
 	)
 ) : ()

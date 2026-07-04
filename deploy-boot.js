@@ -35,10 +35,18 @@
     obs.observe(document.body, { childList: true });
   }
 
-  // Replay the standard loader's <script>/<link>/<style> in document order.
+  // Replay the standard loader's <script>/<link>/<style>. IMPORTANT: load
+  // primordialsoup.js (the WASM runtime) LAST. It boots as soon as it loads and
+  // immediately runs main: -> loadFromServerNamed: -> JSZip loadAsync:, so every
+  // vendor lib it reaches for (jszip, isomorphic-git, ...) must already be present.
+  // Replaying in document order raced the WASM boot against jszip.min.js (loaded
+  // later in the chain), intermittently DNU-ing on an undefined JSZip. Deferring
+  // primordialsoup.js to the end guarantees the libs are loaded before boot.
   fetch('primordialsoup.html').then(function (r) { return r.text(); }).then(function (html) {
     var loaded = new DOMParser().parseFromString(html, 'text/html');
     var nodes = Array.prototype.slice.call(loaded.querySelectorAll('script, link, style'));
+    var boot = nodes.filter(function (n) { return n.tagName === 'SCRIPT' && (n.getAttribute('src') || '').indexOf('primordialsoup.js') !== -1; });
+    nodes = nodes.filter(function (n) { return boot.indexOf(n) === -1; }).concat(boot);
     (function next(i) {
       if (i >= nodes.length) return;
       var src = nodes[i];

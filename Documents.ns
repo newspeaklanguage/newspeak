@@ -70,7 +70,6 @@ Copyright Gilad Bracha 2022-2025 *)
 		private JSArray = p js global at: 'Array'.
 		private JSPromise = p js global at: 'Promise'.
 		private JSString = p js global at: 'String'.
-		private JSZip = p js global at: 'JSZip'.
 		private URL = p js global at: 'URL'.
 		private ide = webIDE.
 		private retainedPlatform = p.
@@ -1260,6 +1259,25 @@ bothered writing code for mortals like you to use?</p>'
 		link: uri <String> = (
 			^html: '<a href="' , uri , '" contenteditable="false" target="_blank" rel="noopener noreferrer"> ' , uri , ' </a>'
 		)
+		ampleforthLink: docName <String> labeled: label <String> ^<Fragment> = (
+			(* An inline hyperlink from one document to another. Live: opens the named
+		   document as a top-level presenter in this same AmpleforthViewer instance
+		   (loading it from the server if not already present) -- no page reload and no
+		   runtime re-boot. Deploy: the web deploy emits a crawlable
+		   <a href="docName.html">label</a> (see deployStaticFormOfAmplet:). This
+		   centralizes link policy, so posts carry no deployment details -- an author
+		   just writes: ampleforthLink: 'SomeDoc' labeled: 'the visible text'. *)
+
+			^link: label action: [
+				ide documents loadFromServerNamed: docName
+					ifSuccess: [:d | ide browsing Utilities enterSubject: (ide documents DocumentSubject onModel: d) ]
+					ifFailure: [:m | nil ] ]
+		)
+		ampleforthLink: docName <String> ^<Fragment> = (
+			(* Link labelled with the target document's own name. *)
+
+			^ampleforthLink: docName labeled: docName
+		)
 		public transclone: documentName <Symbol> as: newName <Symbol> = (
 			^transclude: ((ide namespacing Root at: documentName) cloneNamed: newName) name
 		)
@@ -2020,6 +2038,12 @@ bothered writing code for mortals like you to use?</p>'
 			errors isEmpty ifFalse: [ errors do: [:e | ('deploy warning: ' , e) out ] ]
 		)
 	) : ()
+	(* Resolve JSZip on first use, not at module-construction time. Under the
+	   deployed AmpleforthViewer, jszip.min.js is loaded by deploy-boot.js's async
+	   script replay, which can lose the race against the WASM boot; an eager slot
+	   would then pin nil and every `JSZip loadAsync:` would fail with a DNU. A lazy
+	   slot defers the lookup to first use (and caches the result). *)
+	lazy public JSZip = retainedPlatform js global at: 'JSZip'.
 	dummySubject ^<Subject> = (
 		^DummySubject new
 	)
@@ -2179,8 +2203,11 @@ bothered writing code for mortals like you to use?</p>'
 			do: [:j <Integer> |
 				| node <JSHTMLMediaElement> = nodes at: j. path <String> = retainedPlatform js global decodeURI: (node at: #src). n <String> = path copyFrom: (path lastIndexOf: '/'
 						startingAt: path size) + 1
-					to: path size. |
-				node at: #src put: (URL createObjectURL: (mediaRegistry at: n))
+					to: path size.
+				blob = mediaRegistry at: n ifAbsent: [ nil ]. |
+				(* A media node whose blob is absent (empty/broken src, or a name not in
+			   the registry) is left as-is rather than crashing the whole load/deploy. *)
+				blob isNil ifFalse: [ node at: #src put: (URL createObjectURL: blob) ]
 			]
 	)
 	public freshDocumentFromDOM: dom <Alien[Node]> registry: registry <Map[String, Blob]> ^<Document> = (
@@ -2477,10 +2504,18 @@ bothered writing code for mortals like you to use?</p>'
 
 		| dom = DOMParser new parseFromString: doc contents mimeType: 'text/html'.
 		amplets = List new. live = dom getElementsByClassName: 'ampleforth'.
-		proseHolders = dom getElementsByClassName: 'self_ampleforth'. |
+		proseHolders = dom getElementsByClassName: 'self_ampleforth'.
+		scripts = dom getElementsByTagName: 'script'. |
 		0 to: (live at: 'length') - 1 do: [:i | amplets add: (live at: i) ].
 		amplets do: [:amplet |
 			amplet at: 'outerHTML' put: (deployStaticFormOfAmplet: (amplet getAttribute: 'name') in: doc inlineStack: stack lazyChildren: children) ].
+		(* Drop dead <script> elements from the crawlable prose. Blog posts carry a
+	   leftover `document.querySelector('p')` snippet that is inert in the static
+	   page and, when the editor mangled its trailing tags, throws a console
+	   SyntaxError (Unexpected token '<'). Stripping them keeps the page clean. *)
+		[ (scripts at: #length) > 0 ] whileTrue: [
+				| s = scripts at: 0. |
+				(s at: #parentNode) removeChild: s ].
 		^(proseHolders at: 'length') > 0
 			ifTrue: [ (proseHolders at: 0) at: 'innerHTML' ]
 			ifFalse: [ (dom at: 'body') at: 'innerHTML' ]
@@ -2489,8 +2524,31 @@ bothered writing code for mortals like you to use?</p>'
 		(* Static HTML for one amplet: evaluate its expression against the document
      and render the resulting fragment tree. *)
 
-		| frag = [ (doc evaluate: expr) result reflectee ] on: Error do: [:e | nil ]. |
+		| docName = ampleforthLinkTargetOf: expr. frag = [ (doc evaluate: expr) result reflectee ] on: Error do: [:e | nil ]. label |
+		docName isNil ifFalse: [
+				label:: (frag isNil not and: [ frag isKindOfHyperlinkFragment ]) ifTrue: [ frag label ] ifFalse: [ docName ].
+				(children includes: docName) ifFalse: [ children add: docName ].
+				^'<a href="' , docName , '.html">' , (htmlEscape: label) , '</a>' ].
 		^deployStaticFormOfFragment: frag inlineStack: stack lazyChildren: children
+	)
+	ampleforthLinkTargetOf: expr <String> ^<String | Nil> = (
+		(* The target document name of an `ampleforthLink:` amplet -- its first
+	   argument, which may be a string literal 'Doc' or a symbol #Doc -- or nil if
+	   expr is not such a link. The label is the SECOND argument, so a quoted label
+	   never masquerades as the target even when the target is a #symbol. *)
+
+		| selEnd hash quote space |
+		(expr startsWith: 'ampleforthLink:') ifFalse: [ ^nil ].
+		selEnd:: 'ampleforthLink:' size.
+		hash:: expr indexOf: '#' startingAt: selEnd + 1.
+		quote:: expr indexOf: '''' startingAt: selEnd + 1.
+		(hash > 0 and: [ quote = 0 or: [ hash < quote ] ]) ifTrue: [
+				space:: expr indexOf: ' ' startingAt: hash + 1.
+				^space = 0
+					ifTrue: [ expr copyFrom: hash + 1 to: expr size ]
+					ifFalse: [ expr copyFrom: hash + 1 to: space - 1 ] ].
+		quote = 0 ifTrue: [ ^nil ].
+		^expr copyFrom: quote + 1 to: (expr indexOf: '''' startingAt: quote + 1) - 1
 	)
 	deployStaticFormOfFragment: frag <Fragment> inlineStack: stack <Set[String]> lazyChildren: children <List[String]> ^<String> = (
 		(* Render one fragment to static HTML. Recognized deploy-aware fragments

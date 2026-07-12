@@ -47,7 +47,7 @@ Copyright Google Inc. 2014 - 2017 *)
 			^#protected
 		)
 		public classComment ^<String> = (
-			^(compilation parser classHeader parseString: source) classComment
+			^(compilation parser parseClassHeader: source) classComment
 		)
 		public source ^<String> = (
 			subclassResponsibility
@@ -173,15 +173,9 @@ Still lacking are facilities for correctly adding slots (and hence nested classe
 	   the qualifiedName. *)
 			
 			| deployRtm |
-			('[deploy-mixin] cdir=' , cdir qualifiedName , ' isTopLevel?' , ((cdir qualifiedName indexOf: '`') = 0) printString) out.
 			(cdir qualifiedName indexOf: '`') > 0 ifTrue: [ ^self ].
 			deployRtm:: _js propertyOf: (_js ident: 'mixins')
 				at: (vmmirror mangleSelector: cdir qualifiedName).
-			('[deploy-mixin] deployRtm undef?' , (_js operator: '==='
-				with: deployRtm
-				and: (_js ident: 'undefined')) printString , ' equalsExisting?' , (_js operator: '==='
-				with: deployRtm
-				and: (_js propertyOf: prvtExistingMixin at: (_js literal: 'runtimeMixin'))) printString) out.
 			(_js operator: '===' with: deployRtm and: (_js ident: 'undefined')) ifTrue: [
 					^self
 				].
@@ -190,17 +184,9 @@ Still lacking are facilities for correctly adding slots (and hence nested classe
 				and: (_js propertyOf: prvtExistingMixin at: (_js literal: 'runtimeMixin'))) ifTrue: [
 					^self
 				].
-			('[deploy-mixin] recursing into deployRtm; deployRtm.$Workspace1$ apps=' , (_js propertyOf: (_js propertyOf: deployRtm
-					at: (_js literal: '$WorkspaceManager$Workspace1'))
-				at: (_js literal: 'applications')) size printString , ' nested-id=' , (identityHashOf: (_js propertyOf: deployRtm
-					at: (_js literal: '$WorkspaceManager$Workspace1'))) printString) out.
 			updateMixin: (Mixin fromRuntimeMixin: deployRtm)
 				from: newRuntimeMixin
-				by: cdir.
-			('[deploy-mixin] AFTER updateMixin: deployRtm.$Workspace1$ apps=' , (_js propertyOf: (_js propertyOf: deployRtm
-					at: (_js literal: '$WorkspaceManager$Workspace1'))
-				at: (_js literal: 'applications')) size printString , ' nested-id=' , (identityHashOf: (_js propertyOf: deployRtm
-					at: (_js literal: '$WorkspaceManager$Workspace1'))) printString) out
+				by: cdir
 		)
 		public name ^<Symbol> = (
 			^subclassResponsibility
@@ -232,10 +218,6 @@ Still lacking are facilities for correctly adding slots (and hence nested classe
 			| newRuntimeMetamixin <MJRM> = _js propertyOf: newRuntimeMixin
 				at: (_js literal: 'meta'). applications <Array[JRC]> = _js propertyOf: oldRuntimeMixin
 				at: (_js literal: 'applications'). |
-			('[updApps] cdir=' , classDeclIR qualifiedName , ' oldRtmName=' , (_js propertyOf: oldRuntimeMixin
-				at: (_js literal: 'name')) printString , ' appCount=' , applications size printString , ' instanceMethods=' , (classDeclIR instanceSide methods collect: [:m |
-					m name
-				]) printString) out.
 			
 			(* TODO: handle deletes *)
 			
@@ -295,9 +277,25 @@ Still lacking are facilities for correctly adding slots (and hence nested classe
 			(* TODO: handle deletes
 	go thru old methods and see if they exist in new methods, if not add them to deleted list? and remove from old. *)
 			
-			| newMethods <List[IntermediateMethod]> = classDeclIR instanceSide methods. |
+			| newMethods <List[IntermediateMethod]> = classDeclIR instanceSide methods. nestedKeys <Map[Symbol, Boolean]> = Map new. |
 			deletedInstanceMethods:: List new.
-			
+
+			(* For each nested class the compiler emits a synthetic slot whose
+	   fully-qualified name mangles to the SAME JS property key the enclosing
+	   mixin uses to hold the nested mixin OBJECT (Newspeak2JSCompilation:
+	   849 vs 1580). Copying that key from the freshly-eval''d mixin would
+	   overwrite the LIVE nested mixin -- and its populated applications array
+	   -- with a fresh empty one, orphaning the live nested class so its
+	   instances never receive edited methods. Collect the keys so the copy
+	   loop below can preserve existing live wiring; the nested recursion in
+	   updateMixin: updates the live nested mixin in place. (The simple-name
+	   lazy accessor closes over its own mixin; existing enclosing instances
+	   cache their nested class in an instance slot and never re-run it, so
+	   leaving it copied is harmless for the edit case.) *)
+			classDeclIR instanceSide nestedClasses do: [:nc <IntermediateClassDeclaration> |
+					nestedKeys at: (compilation names manglePublic: nc qualifiedName) put: true
+				].
+
 			(* (_js propertyOf: oldRuntimeMixin at: #methods) forEach: [:m <MM> |
 		(newMethods anySatisfy: [:im <IntermediateMethod> |
 			im name = (compilation names manglePublic: (_js propertyOf: m at: #name))
@@ -307,17 +305,27 @@ Still lacking are facilities for correctly adding slots (and hence nested classe
 			(* remove from old; need to add delete support to JavascriptGeneration; not critical *)
 			].
 		]. *)
-			
+
 			(* TODO: copy nested classes also? *)
-			
+
 			(* TODO: copy new metadata *)
 			newMethods do: [:ea <IntermediateMethod> |
 					| jsName <String> |
-					
+
 					(* insert modified or new instance methods into mixin *)
 					jsName:: compilation names manglePublic: ea name.
-					_js assign: (_js propertyOf: oldRuntimeMixin at: jsName)
-						toBe: (_js propertyOf: newRuntimeMixin at: jsName)
+
+					(* Preserve a live nested-class object/accessor: only (re)assign a
+			   nested-class key when the enclosing mixin does not already hold
+			   it (i.e. a genuinely new nested class). *)
+					((nestedKeys includesKey: jsName) and: [
+							_js operator: '!=='
+								with: (_js propertyOf: oldRuntimeMixin at: jsName)
+								and: (_js ident: 'undefined') ])
+						ifFalse: [
+								_js assign: (_js propertyOf: oldRuntimeMixin at: jsName)
+									toBe: (_js propertyOf: newRuntimeMixin at: jsName)
+							]
 				].
 			{#name. #header. #slots. #methods. #nestedClasses. } do: [:jsName |
 					_js assign: (_js propertyOf: oldRuntimeMixin at: jsName)
@@ -373,13 +381,6 @@ Still lacking are facilities for correctly adding slots (and hence nested classe
 						at: (vmmirror mangleSelector: nestedCdir qualifiedName).
 					newNestedRtm:: _js propertyOf: newRuntimeMixin
 						at: (vmmirror mangleSelector: nestedCdir qualifiedName).
-					(nestedCdir qualifiedName endsWith: 'Workspace1') ifTrue: [
-							('[recurse-pre nested] outerName=' , (_js propertyOf: oldRuntimeMixin
-								at: (_js literal: 'name')) printString , ' outer-id=' , (identityHashOf: oldRuntimeMixin) printString , ' propName=' , (vmmirror mangleSelector: nestedCdir qualifiedName) , ' oldNestedApps=' , (_js propertyOf: oldNestedRtm
-								at: (_js literal: 'applications')) size printString , ' oldNested-id=' , (identityHashOf: oldNestedRtm) printString , ' newNestedApps=' , (_js propertyOf: newNestedRtm
-								at: (_js literal: 'applications')) size printString , ' oldNestedName=' , (_js propertyOf: oldNestedRtm
-								at: (_js literal: 'name')) printString) out
-						].
 					((_js operator: '!==' with: oldNestedRtm and: (_js ident: 'undefined')) and: [
 							_js operator: '!==' with: newNestedRtm and: (_js ident: 'undefined')
 						]) ifTrue: [
@@ -676,12 +677,12 @@ Still lacking are facilities for correctly adding slots (and hence nested classe
 			(* Foo factory = SuperFoo superFactory *)
 			
 			| headerAst |
-			headerAst:: compilation parser classHeader parseString: source.
+			headerAst:: compilation parser parseClassHeader: source.
 			^source copyFrom: headerAst start to: headerAst superConstructorCall end
 		)
 		public primaryFactorySelector ^<Symbol> = (
 			| headerAst |
-			headerAst:: compilation parser classHeader parseString: source.
+			headerAst:: compilation parser parseClassHeader: source.
 			^headerAst constructor selector
 		)
 		public selectors ^<List[Symbol]> = (
@@ -1304,6 +1305,28 @@ on the data to decide what action to take. *)
 		public performPublic: selector with: arguments = (
 			^(Message selector: selector arguments: arguments) sendTo: reflectee
 		)
+		public sendSuspended: selector with: arguments <List[Object]> ^<ThreadMirror> = (
+			(* Invoke [selector] on the reflectee with [arguments] (raw objects,
+		   not mirrors) and return a ThreadMirror for the activation. The JS
+		   platform has no thread suspension/debugging, so this is a best-effort
+		   eager send mirroring evaluate:with:: a fulfilled ThreadMirror on
+		   success, or a broken one carrying the raised exception. The thread's
+		   suspendedActivation is set to this receiver mirror so the exemplar
+		   evaluator can evaluate expressions with self = the receiver. *)
+
+			| state result thread |
+			[
+				result:: (Message selector: selector arguments: arguments) sendTo: reflectee.
+				state:: #fulfilled
+			] on: Error
+				do: [:e |
+					result:: e.
+					state:: #broken
+				].
+			thread:: ThreadMirror state: state result: (ObjectMirror reflecting: result).
+			thread suspendedActivation: self.
+			^thread
+		)
 		public printString = (
 			^'ObjectMirror on ' , reflectee printString
 		)
@@ -1354,7 +1377,7 @@ on the data to decide what action to take. *)
 			| header headerSource headerAst |
 			header:: definingMixin declaration header.
 			headerSource:: header source.
-			headerAst:: compilation parser classHeader parseString: headerSource.
+			headerAst:: compilation parser parseClassHeader: headerSource.
 			headerAst slots do: [:slotAst |
 					slotAst name = name ifTrue: [
 							^headerSource copyFrom: slotAst start to: slotAst end
@@ -1371,8 +1394,9 @@ on the data to decide what action to take. *)
 	) : ()
 	class ThreadMirror state: s result: r = Object new (
 		|
-			state = s.
+			public state = s.
 			public result <ObjectMirror | nil> = r.
+			suspendedActivation_slot
 		|
 	) (
 		public isBroken ^<Boolean> = (
@@ -1399,6 +1423,22 @@ on the data to decide what action to take. *)
 		public = other = (
 			other isKindOfThreadMirror ifFalse: [ ^false ].
 			^state = other state and: [ result = other result ]
+		)
+		public suspendedActivation = (
+			(* The context the exemplar evaluator evaluates expressions in. Set by
+		   ObjectMirror>>sendSuspended:with: to the receiver's mirror, giving
+		   self-scope only (the JS platform has no live frame, so no method
+		   parameters/temporaries). nil for threads from a plain evaluate:. *)
+
+			^suspendedActivation_slot
+		)
+		public suspendedActivation: a = (
+			suspendedActivation_slot:: a
+		)
+		public terminate = (
+			(* JS has no threads to terminate; no-op for API compatibility. *)
+
+			^self
 		)
 	) : ()
 	public class LazySlotMirror reflecting: m <Symbol> in: em <MixinMirror> = Object new (

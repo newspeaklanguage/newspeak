@@ -94,6 +94,8 @@ Still lacking are facilities for correctly adding slots (and hence nested classe
 			public enclosingClass <ClassDeclarationBuilder> = enclosing.
 			deletedInstanceMethods <List[Symbol]>
 			deletedClassMethods <List[Symbol]>
+			(* Header source staged via [header source:], awaiting install. nil when the header is unchanged. *)
+			public pendingHeaderSource <String>
 		|
 	) (
 		lazy public classSide <MixinBuilder> = computeClassSide.
@@ -129,6 +131,17 @@ Still lacking are facilities for correctly adding slots (and hence nested classe
 		)
 		declarationData = (
 			subclassResponsibility
+		)
+		public headerSourceForBuilding ^<String> = (
+			(* The header source that [install] (via [source] reconstruction /
+	   computeClassDeclIR) will compile: a header staged by
+	   [header source:] if there is one, otherwise the current header. *)
+
+			nil = pendingHeaderSource ifFalse: [ ^pendingHeaderSource ].
+			^originalHeaderSource
+		)
+		originalHeaderSource ^<String> = (
+			^subclassResponsibility
 		)
 		public install ^<ClassDeclarationMirror> = (
 			| writer sb <StringBuilder> src <String> runtimeMixin <JRM> cdir <IntermediateClassDeclaration> |
@@ -174,7 +187,7 @@ Still lacking are facilities for correctly adding slots (and hence nested classe
 			
 			| deployRtm |
 			(cdir qualifiedName indexOf: '`') > 0 ifTrue: [ ^self ].
-			deployRtm:: _js propertyOf: (_js ident: 'mixins')
+			deployRtm:: vmmirror ownPropertyOf: (_js ident: 'mixins')
 				at: (vmmirror mangleSelector: cdir qualifiedName).
 			(_js operator: '===' with: deployRtm and: (_js ident: 'undefined')) ifTrue: [
 					^self
@@ -201,6 +214,14 @@ Still lacking are facilities for correctly adding slots (and hence nested classe
 			| sb = StringBuilder new. |
 			sb add: header source.
 			sb writeln: ' ( '.
+			(* Lazy slots MUST be emitted (their generated methods are synthetic
+	   and thus absent from the methods group); losing them here once caused
+	   live lazy caches to be schema-change-deleted. Recommended member
+	   order (matches the pretty printer): lazy slots, then classes, then
+	   methods. *)
+			instanceSide lazySlots do: [:ea <LazySlotMirror | LazySlotBuilder> |
+					nil = ea source ifFalse: [ sb writeln: ea source ]
+				].
 			instanceSide nestedClasses do: [:ea <ClassDeclarationMirror | ClassDeclarationBuilder> |
 					sb writeln: ea source
 				].
@@ -213,6 +234,104 @@ Still lacking are facilities for correctly adding slots (and hence nested classe
 				].
 			sb writeln: ' )'.
 			^sb asString
+		)
+		schemaChangeFor: oldRuntimeMixin <JRM> withOldSlotNames: oldSlotNames <Array[String]> by: classDeclIR <IntermediateClassDeclaration> = (
+			(* Detect a slot-layout change and, if there is one, have the vmmirror
+	   rebuild basicNew for every affected runtime class (the mixin''s
+	   applications and their transitive subclasses) and reshape all live
+	   instances in place (added slots initialized to nil, removed slots
+	   deleted; identity preserved, so nothing else needs fixing).
+
+	   Must run AFTER the mixin''s metadata and methods have been updated in
+	   place: the vmmirror reads each class''s CURRENT slot metadata through
+	   its class object''s mixin. The slot lists include synthetic slots
+	   (nested-class caches, lazy-slot backing slots), so adding a nested
+	   class also reshapes existing enclosing instances correctly. *)
+
+			| newSlotNames <List[String]> added <List[String]> removed <List[String]> |
+			newSlotNames:: classDeclIR instanceSide slots collect: [:s | s name ].
+			added:: newSlotNames reject: [:n | oldSlotNames includes: n ].
+			removed:: oldSlotNames reject: [:n | newSlotNames includes: n ].
+			(added isEmpty and: [ removed isEmpty ]) ifTrue: [ ^self ].
+			vmmirror performSchemaChangeFor: oldRuntimeMixin
+				adding: added asArray
+				removing: removed asArray
+
+			(* The accessors of removed slots are retired by the general member
+	   diff in retireDeletedMembersOf:...by: — they are present in the old
+	   method metadata and absent from the faithfully reconstructed new
+	   declaration. *)
+		)
+		slotNamesOf: rtm <JRM> ^<Array[String]> = (
+			(* The slot names recorded in [rtm]''s SM metadata. Defensive: a
+	   mixin-like object without a [slots] property yields the empty array,
+	   which degrades the schema-change diff to adds-only (benign: adds are
+	   guarded by hasOwnProperty on each instance) instead of crashing. *)
+
+			| raw |
+			raw:: _js propertyOf: rtm at: (_js literal: 'slots').
+			(_js operator: '===' with: raw and: (_js ident: 'undefined')) ifTrue: [ ^{} ].
+			^raw collect: [:sm | _js propertyOf: sm at: (_js literal: 'name') ]
+		)
+		methodNamesOf: rtm <JRM | MJRM> ^<Array[String]> = (
+			(* The method names recorded in [rtm]''s MM metadata, synthetic
+	   methods included — accessors and lazy slot machinery participate in
+	   the member-deletion diff. Same defensive guard as slotNamesOf:. *)
+
+			| raw |
+			raw:: _js propertyOf: rtm at: (_js literal: 'methods').
+			(_js operator: '===' with: raw and: (_js ident: 'undefined')) ifTrue: [ ^{} ].
+			^raw collect: [:mm | _js propertyOf: mm at: (_js literal: 'name') ]
+		)
+		nestedClassNamesOf: rtm <JRM> ^<Array[String]> = (
+			(* The qualified nested class names recorded in [rtm]''s metadata.
+	   Same defensive guard as slotNamesOf:. *)
+
+			| raw |
+			raw:: _js propertyOf: rtm at: (_js literal: 'nestedClasses').
+			(_js operator: '===' with: raw and: (_js ident: 'undefined')) ifTrue: [ ^{} ].
+			^raw
+		)
+		retireDeletedMembersOf: oldRuntimeMixin <JRM> withOldMethodNames: oldMethodNames <Array[String]> oldClassMethodNames: oldClassMethodNames <Array[String]> oldNestedClassNames: oldNestedClassNames <Array[String]> by: classDeclIR <IntermediateClassDeclaration> = (
+			(* Retire members that are present in the pre-update metadata but
+	   absent from the (faithfully reconstructed) new declaration, so sends
+	   of them fail as proper Newspeak DNUs rather than running stale
+	   functions. One uniform diff covers:
+	   - deleted ordinary methods, on both sides;
+	   - the synthetic accessors of deleted slots;
+	   - the three synthetic methods of a deleted lazy slot (its backing
+	     slot is removed from instances by the schema-change slot diff);
+	   - deleted NESTED CLASSES: the qualified class name mangles to the
+	     very property key that holds the nested mixin object on the live
+	     mixin and the accessor on the runtime classes, so retiring it as a
+	     method removes the class from the runtime; the per-instance cache
+	     slot again rides the slot diff. Instances of a deleted nested
+	     class keep functioning against their now-orphaned runtime class.
+	   Symmetry of the diff is guaranteed because both sides'' member sets
+	   derive from equivalent compiles: the old metadata from the previous
+	   install (or the deploy), the new from the reconstructed source. *)
+
+			| newMethodNames <List[Symbol]> newClassMethodNames <List[Symbol]> newNestedNames <List[String]> deletedMethods <List[String]> deletedClassMethods <List[String]> |
+			newMethodNames:: classDeclIR instanceSide methods collect: [:m | m name ].
+			newNestedNames:: classDeclIR instanceSide nestedClasses collect: [:nc | nc qualifiedName ].
+			deletedMethods:: List new.
+			oldMethodNames do: [:n |
+					(newMethodNames includes: n) ifFalse: [ deletedMethods add: n ]
+				].
+			oldNestedClassNames do: [:qn |
+					(newNestedNames includes: qn) ifFalse: [ deletedMethods add: qn ]
+				].
+			deletedMethods isEmpty ifFalse: [
+					vmmirror deleteMethods: deletedMethods asArray from: oldRuntimeMixin
+				].
+			newClassMethodNames:: classDeclIR classSide methods collect: [:m | m name ].
+			deletedClassMethods:: List new.
+			oldClassMethodNames do: [:n |
+					(newClassMethodNames includes: n) ifFalse: [ deletedClassMethods add: n ]
+				].
+			deletedClassMethods isEmpty ifFalse: [
+					vmmirror deleteClassMethods: deletedClassMethods asArray from: oldRuntimeMixin
+				]
 		)
 		updateApplicationsOf: oldRuntimeMixin <JRM> from: newRuntimeMixin <JRM> by: classDeclIR <IntermediateClassDeclaration> = (
 			| newRuntimeMetamixin <MJRM> = _js propertyOf: newRuntimeMixin
@@ -320,14 +439,19 @@ Still lacking are facilities for correctly adding slots (and hence nested classe
 			   it (i.e. a genuinely new nested class). *)
 					((nestedKeys includesKey: jsName) and: [
 							_js operator: '!=='
-								with: (_js propertyOf: oldRuntimeMixin at: jsName)
+								with: (vmmirror ownPropertyOf: oldRuntimeMixin at: jsName)
 								and: (_js ident: 'undefined') ])
 						ifFalse: [
 								_js assign: (_js propertyOf: oldRuntimeMixin at: jsName)
 									toBe: (_js propertyOf: newRuntimeMixin at: jsName)
 							]
 				].
-			{#name. #header. #slots. #methods. #nestedClasses. } do: [:jsName |
+			(* [invoke] is copied so that FUTURE applications of the live mixin are
+	   built by the freshly compiled constructor: it bakes in the new slot
+	   layout (basicNew) and reads methods from the new mixin object. Already
+	   existing applications are patched separately by updateApplicationsOf:
+	   (methods) and schemaChangeFor:withOldSlotNames:by: (slots). *)
+			{#name. #header. #slots. #lazySlots. #methods. #nestedClasses. #invoke. } do: [:jsName |
 					_js assign: (_js propertyOf: oldRuntimeMixin at: jsName)
 						toBe: (_js propertyOf: newRuntimeMixin at: jsName)
 				]
@@ -349,7 +473,7 @@ Still lacking are facilities for correctly adding slots (and hence nested classe
 					_js assign: (_js propertyOf: oldRuntimeMetamixin at: jsName)
 						toBe: (_js propertyOf: newRuntimeMetamixin at: jsName)
 				].
-			{#slots. #methods. #nestedClasses. } do: [:jsName <Symbol> |
+			{#slots. #methods. #nestedClasses. #invoke. } do: [:jsName <Symbol> |
 					_js assign: (_js propertyOf: oldRuntimeMetamixin at: jsName)
 						toBe: (_js propertyOf: newRuntimeMetamixin at: jsName)
 				]
@@ -358,10 +482,17 @@ Still lacking are facilities for correctly adding slots (and hence nested classe
 			| deletedInstanceMethods <List[Symbol]> deletedClassMethods <List[Symbol]> oldRuntimeMixin <JRM> = _js propertyOf: oldMixin
 				at: (_js literal: 'runtimeMixin'). oldRuntimeMetamixin <MJRM> = _js propertyOf: oldRuntimeMixin
 				at: (_js literal: 'meta'). newRuntimeMetamixin <MJRM> = _js propertyOf: newRuntimeMixin
-				at: (_js literal: 'meta'). |
-			
-			(* TODO: handle deletes *)
-			
+				at: (_js literal: 'meta').
+				(* Capture the pre-update member names now: updateInstanceMixin: /
+		   updateMetaMixin: are about to overwrite the live mixin''s metadata
+		   with the new declaration''s. The diffs against the (faithfully
+		   reconstructed) new declaration drive schema change and member
+		   retirement below. *)
+				oldSlotNames <Array[String]> = slotNamesOf: oldRuntimeMixin.
+				oldMethodNames <Array[String]> = methodNamesOf: oldRuntimeMixin.
+				oldClassMethodNames <Array[String]> = methodNamesOf: oldRuntimeMetamixin.
+				oldNestedClassNames <Array[String]> = nestedClassNamesOf: oldRuntimeMixin. |
+
 			(* TODO: copy new metadata *)
 			deletedInstanceMethods:: updateInstanceMixin: oldRuntimeMixin
 				from: newRuntimeMixin
@@ -370,6 +501,12 @@ Still lacking are facilities for correctly adding slots (and hence nested classe
 				from: newRuntimeMetamixin
 				by: classDeclIR.
 			updateApplicationsOf: oldRuntimeMixin from: newRuntimeMixin by: classDeclIR.
+			schemaChangeFor: oldRuntimeMixin withOldSlotNames: oldSlotNames by: classDeclIR.
+			retireDeletedMembersOf: oldRuntimeMixin
+				withOldMethodNames: oldMethodNames
+				oldClassMethodNames: oldClassMethodNames
+				oldNestedClassNames: oldNestedClassNames
+				by: classDeclIR.
 			
 			(* Recurse into nested classes. With no [become:] primitive on JS,
 	   the only way to propagate method changes from a freshly-emitted
@@ -377,9 +514,9 @@ Still lacking are facilities for correctly adding slots (and hence nested classe
 	   is to run the same copy at each nesting level. *)
 			classDeclIR instanceSide nestedClasses do: [:nestedCdir <IntermediateClassDeclaration> |
 					| oldNestedRtm newNestedRtm |
-					oldNestedRtm:: _js propertyOf: oldRuntimeMixin
+					oldNestedRtm:: vmmirror ownPropertyOf: oldRuntimeMixin
 						at: (vmmirror mangleSelector: nestedCdir qualifiedName).
-					newNestedRtm:: _js propertyOf: newRuntimeMixin
+					newNestedRtm:: vmmirror ownPropertyOf: newRuntimeMixin
 						at: (vmmirror mangleSelector: nestedCdir qualifiedName).
 					((_js operator: '!==' with: oldNestedRtm and: (_js ident: 'undefined')) and: [
 							_js operator: '!==' with: newNestedRtm and: (_js ident: 'undefined')
@@ -428,8 +565,15 @@ Still lacking are facilities for correctly adding slots (and hence nested classe
 					newSourceIndex:: newSourceIndex + 1
 				].
 			
-			(* Update global sources array with any changed or new source code *)
-			instanceSide methods do: [:m <MethodBuilder> |
+			(* Update global sources array with any changed or new source code.
+	   Iterate the IR method lists (like updateSourceIndicesOfNewRuntimeMixin:
+	   does), NOT the builder groups: the builder groups exclude synthetic
+	   methods, so lazy slot declarations added or edited at runtime would
+	   leave their MM entries pointing at indices whose text was never
+	   written — and the next source reconstruction would silently lose the
+	   declaration. IR lazy methods carry the declaration as their source;
+	   cache-slot accessors carry nil and are skipped, as at deploy time. *)
+			cdir instanceSide methods do: [:m <IntermediateMethod> |
 					| sourceIndex <Integer> |
 					sourceIndex:: instanceMethodSourceIndices at: m name.
 					m source ~= nil ifTrue: [
@@ -437,7 +581,7 @@ Still lacking are facilities for correctly adding slots (and hence nested classe
 								toBe: m source
 						]
 				].
-			classSide methods do: [:m <MethodBuilder> |
+			cdir classSide methods do: [:m <IntermediateMethod> |
 					| sourceIndex <Integer> |
 					sourceIndex:: classMethodSourceIndices at: m name.
 					m source ~= nil ifTrue: [
@@ -460,9 +604,16 @@ Still lacking are facilities for correctly adding slots (and hence nested classe
 								at: (_js literal: 'name')))
 				].
 			
-			(* Update class header source index *)
+			(* Update class header source index — and write the (possibly edited)
+	   header text at that index. Method sources are updated by the loops
+	   above; the header text was never written before (header edits used
+	   to be impossible on this platform), so an edited header installed
+	   correctly but kept displaying its old source. *)
 			_js assign: (_js propertyOf: runtimeMixin at: (_js literal: 'header'))
 				toBe: (_js propertyOf: existingMixin at: (_js literal: 'header')).
+			_js assign: (_js propertyOf: (_js ident: 'sources')
+					at: (_js propertyOf: existingMixin at: (_js literal: 'header')))
+				toBe: cdir headerSource.
 			
 			(* Recurse into nested mixins. Each nested mixin in [runtimeMixin]
 	   was freshly emitted with COMPILER-LOCAL source indices that don't
@@ -473,7 +624,7 @@ Still lacking are facilities for correctly adding slots (and hence nested classe
 	   recurses further). *)
 			cdir instanceSide nestedClasses do: [:nestedCdir <IntermediateClassDeclaration> |
 					| nestedRtm |
-					nestedRtm:: _js propertyOf: runtimeMixin
+					nestedRtm:: vmmirror ownPropertyOf: runtimeMixin
 						at: (vmmirror mangleSelector: nestedCdir qualifiedName).
 					(_js operator: '!==' with: nestedRtm and: (_js ident: 'undefined')) ifTrue: [
 							updateSourceIndicesOfNewRuntimeMixin: nestedRtm from: nestedCdir
@@ -552,7 +703,7 @@ Still lacking are facilities for correctly adding slots (and hence nested classe
 	     unrelated source string. *)
 			cdir instanceSide nestedClasses do: [:nestedCdir <IntermediateClassDeclaration> |
 					| nestedRtm |
-					nestedRtm:: _js propertyOf: runtimeMixin
+					nestedRtm:: vmmirror ownPropertyOf: runtimeMixin
 						at: (vmmirror mangleSelector: nestedCdir qualifiedName).
 					(_js operator: '!==' with: nestedRtm and: (_js ident: 'undefined')) ifTrue: [
 							updateSourceIndicesOfNewRuntimeMixin: nestedRtm from: nestedCdir
@@ -634,6 +785,10 @@ Still lacking are facilities for correctly adding slots (and hence nested classe
 			| sb = StringBuilder new. |
 			sb add: header source.
 			sb writeln: ' ( '.
+			(* Lazy slots must be emitted; see ClassDeclarationBuilder>>source. *)
+			instanceSide lazySlots do: [:ea <LazySlotMirror> |
+					nil = ea source ifFalse: [ sb writeln: ea source ]
+				].
 			instanceSide nestedClasses do: [:ea | sb writeln: ea source ].
 			instanceSide methods do: [:ea | sb writeln: ea source ].
 			sb writeln: ' ) : ( '.
@@ -716,6 +871,9 @@ Still lacking are facilities for correctly adding slots (and hence nested classe
 			other isKindOfClassMirror ifFalse: [ ^false ].
 			^_js operator: '===' with: reflectee and: other reflectee
 		)
+		public allInstances ^<Array> = (
+			^class allInstancesOf: reflectee
+		)
 		public allSuperclasses ^<List[ClassMirror]> = (
 			| klass <Class> superclasses <List[Class]> |
 			superclasses:: List new.
@@ -779,7 +937,13 @@ Still lacking are facilities for correctly adding slots (and hence nested classe
 		public lazySlots ^<MirrorGroup[LazySlotMirror]> = (
 			^computeMirrorGroup: [:r <MixinMirror> | r lazySlots ]
 		)
-	) : ()
+	) : (
+		public allInstancesOf: b <Behavior> ^<Array> = (
+			(* All (exact) instances of behavior b, found via the object table maintained by the vmmirror. Same API as MirrorsForPrimordialSoup, where this is primitive 96. *)
+
+			^vmmirror allInstancesOf: b
+		)
+	)
 	class IRBasedClassDeclarationBuilder fromIR: ir <IntermediateClassDeclaration> existingMixin: m <Mixin> within: enclosing <ClassDeclarationBuilder> = ClassDeclarationBuilder forExistingMixin: m
 		within: enclosing (
 		|
@@ -810,8 +974,11 @@ Still lacking are facilities for correctly adding slots (and hence nested classe
 		declarationData = (
 			^prvtIR
 		)
-		public header ^<ClassHeaderMirror> = (
-			^SourceBasedClassHeaderMirror from: prvtIR headerSource
+		public header ^<ClassHeaderBuilder> = (
+			^ClassHeaderBuilder onDeclarationBuilder: self
+		)
+		originalHeaderSource ^<String> = (
+			^prvtIR headerSource
 		)
 		public name ^<Symbol> = (
 			^compilation names fullyQualifiedNameToSimple: qualifiedName
@@ -914,8 +1081,11 @@ Still lacking are facilities for correctly adding slots (and hence nested classe
 		declarationData ^<ClassDeclarationMirror> = (
 			^mixinMirror declaration
 		)
-		public header ^<ClassHeaderMirror> = (
-			^declarationData header
+		public header ^<ClassHeaderBuilder> = (
+			^ClassHeaderBuilder onDeclarationBuilder: self
+		)
+		originalHeaderSource ^<String> = (
+			^declarationData header source
 		)
 		public name ^<Symbol> = (
 			^declarationData name
@@ -947,7 +1117,10 @@ on the data to decide what action to take. *)
 						ea isSynthetic
 					]) collect: [:ea | MethodBuilder reflecting: ea in: self source: ea source ])
 				within: self.
-			public lazySlots <LazyMutableSlotGroup> = LazyMutableSlotGroup group: List new
+			public lazySlots <LazyMutableSlotGroup> = LazyMutableSlotGroup group: (dataSource lazySlots collect: [:ea <IntermediateLazySlot | LazySlotMirror> |
+						ea isKindOfLazySlotMirror ifTrue: [ ea ]
+							ifFalse: [ LazySlotBuilder reflecting: ea in: self ]
+					])
 				within: self.
 			public nestedClasses <MutableNestedClassGroup> = MutableNestedClassGroup group: (dataSource nestedClasses collect: [:ea <IntermediateClassDeclaration | ClassDeclarationMirror> |
 						nestedClassBuilderFor: ea within: em
@@ -983,7 +1156,7 @@ on the data to decide what action to take. *)
 			(_js operator: '===' with: runtimeMixin and: (_js ident: 'undefined')) ifTrue: [
 					^nil
 				].
-			nested:: _js propertyOf: runtimeMixin
+			nested:: vmmirror ownPropertyOf: runtimeMixin
 				at: (compilation names manglePublic: name).
 			(_js operator: '===' with: nested and: (_js ident: 'undefined')) ifTrue: [
 					^nil
@@ -1077,7 +1250,7 @@ on the data to decide what action to take. *)
 			rtm:: _js propertyOf: reflectee at: (_js literal: 'runtimeMixin').
 			raw:: (_js propertyOf: rtm at: (_js literal: 'nestedClasses')) collect: [:each |
 					| nestedMixin |
-					nestedMixin:: _js propertyOf: rtm at: (vmmirror mangleSelector: each).
+					nestedMixin:: vmmirror ownPropertyOf: rtm at: (vmmirror mangleSelector: each).
 					(_js operator: '===' with: nestedMixin and: (_js ident: 'undefined')) ifTrue: [
 							nil
 						]
@@ -1106,17 +1279,24 @@ on the data to decide what action to take. *)
 			^ImmutableMirrorGroup group: raw
 		)
 		public lazySlots = (
-			| results = List new. |
-			
-			(* (* Go thru raw slots *)
-	mixin _slots do:
-		[:slotDescriptor | | slotName = slotDescriptor at: 1.  i = slotName indexOf: '`cacheSlot'. |
-          (* select slots whose name ends with `cachedSlot *)
-          (i ~= 0 and: [slotName size - 9 = i]) ifTrue: [
-             (* and create a mirror for them *)
-			  results add: (LazySlotMirror reflecting: (slotName copyFrom: 1 to: i -1) in: self)
-              ]
-       ]. *)
+			(* Lazy slot mirrors, built from the runtime mixin''s [lazySlots]
+	   metadata (SM records by name; the declaration source lives in the
+	   MM entry of the synthetic main method — see
+	   LazySlotMirror>>mainMethod). Meta runtime mixins carry no
+	   [lazySlots] property, hence the undefined guard. *)
+
+			| results = List new. raw |
+			raw:: _js propertyOf: (_js propertyOf: reflectee
+					at: (_js literal: 'runtimeMixin'))
+				at: (_js literal: 'lazySlots').
+			(_js operator: '===' with: raw and: (_js ident: 'undefined')) ifTrue: [
+					^ImmutableMirrorGroup group: results
+				].
+			raw do: [:sm |
+					results add: (LazySlotMirror reflecting: (_js propertyOf: sm
+							at: (_js literal: 'name'))
+						in: self)
+				].
 			^ImmutableMirrorGroup group: results
 		)
 		public enclosingMixin ^<MixinMirror | nil> = (
@@ -1211,7 +1391,12 @@ on the data to decide what action to take. *)
 	   ([within: nil] for the compile step); install resolves naming. *)
 			
 			| ir newCDB |
-			ir:: compiler compileClassSource: src within: nil.
+			(* [src] is a bare class declaration; with [within: nil] the compiler
+	   parses a COMPILATION UNIT, so prepend the unit header exactly as
+	   class-side fromSource: does. Without it the parse failed with
+	   ParserError ''class expected'' (which Message>>sendTo: then
+	   masked as an MNU, before its 2026-07-14 fix). *)
+			ir:: compiler compileClassSource: 'Newspeak3 ''Uncategorized'' ' , src within: nil.
 			newCDB:: IRBasedClassDeclarationBuilder fromIR: ir
 				existingMixin: nil
 				within: definingMixin declaration.
@@ -1282,6 +1467,32 @@ on the data to decide what action to take. *)
 			(* Wrong for bilingual objects. *)
 			^ClassMirror reflecting: (_js propertyOf: reflectee
 					at: (_js literal: 'newspeakClass'))
+		)
+		public getLazySlot: name ^<ObjectMirror> = (
+			(* The cached value of the lazy slot [name] on the reflectee, as on
+	   psoup (name-based; the argument is the lazy slot''s name, not a
+	   mirror). Defensive where getSlot: halts: the reflectee may not have
+	   the cache property at all — e.g. the object presenter asks a CLASS
+	   object about its instance side''s lazy slots — in which case the
+	   answer is a mirror on nil (never initialized). *)
+
+			| cacheName mangledName raw |
+			cacheName:: compilation IntermediateLazySlot slotNameForLazySlotNamed: name.
+			mangledName:: vmmirror mangleSelector: cacheName , '`slot'.
+			raw:: _js propertyOf: reflectee at: mangledName.
+			(_js operator: '===' with: raw and: (_js ident: 'undefined')) ifTrue: [
+					^ObjectMirror reflecting: nil
+				].
+			^ObjectMirror reflecting: raw
+		)
+		public setLazySlot: name to: value = (
+			(* Set the cached value of the lazy slot [name] on the reflectee, as
+	   on psoup. *)
+
+			| cacheName mangledName |
+			cacheName:: compilation IntermediateLazySlot slotNameForLazySlotNamed: name.
+			mangledName:: vmmirror mangleSelector: cacheName , '`slot'.
+			_js assign: (_js propertyOf: reflectee at: mangledName) toBe: value
 		)
 		public getSlot: selector = (
 			| mangledName = vmmirror mangleSelector: selector , '`slot'. raw = _js propertyOf: reflectee
@@ -1392,6 +1603,43 @@ on the data to decide what action to take. *)
 		|
 	) (
 	) : ()
+	class ClassHeaderBuilder onDeclarationBuilder: b <ClassDeclarationBuilder> = AbstractClassHeaderMirror new (
+		(* The header facet of a ClassDeclarationBuilder, mirroring the psoup
+   ClassHeaderBuilder API (MirrorsForPrimordialSoup). [source:] stages a new
+   header on the declaration builder; the change takes effect when the builder
+   is installed, which recompiles the whole class from its reconstructed
+   source. If the new header changes the slot layout, installation flows into
+   the schema-change path (live instances reshaped, basicNews rebuilt). *)
+		|
+			public declarationBuilder <ClassDeclarationBuilder> = b.
+		|
+	) (
+		public name = (
+			^declarationBuilder name
+		)
+		public preamble ^<String> = (
+			(* Foo factory = SuperFoo superFactory *)
+
+			| headerAst |
+			headerAst:: compilation parser parseClassHeader: source.
+			^source copyFrom: headerAst start to: headerAst superConstructorCall end
+		)
+		public source ^<String> = (
+			^declarationBuilder headerSourceForBuilding
+		)
+		public source: newHeader <String> = (
+			(* Parse now so a syntactically invalid header is rejected at accept
+	   time rather than corrupting the builder. Renames must go through a
+	   dedicated rename operation, as in the psoup mirrors. *)
+
+			| headerAst |
+			headerAst:: compilation parser parseClassHeader: newHeader.
+			name = headerAst name ifFalse: [
+					^Error signal: 'Class name must not be changed in a header edit (expected ' , name , ', got ' , headerAst name , ')'
+				].
+			declarationBuilder pendingHeaderSource: newHeader
+		)
+	) : ()
 	class ThreadMirror state: s result: r = Object new (
 		|
 			public state = s.
@@ -1493,12 +1741,26 @@ c. If the slot is mutable, there will be a third method, which is an ordinary se
 			^reflectee = other name
 		)
 		public mainMethod ^<MethodMirror | nil> = (
-			(* On-demand lookup. Returns nil if MixinMirror>>methods doesn't surface
-	   a method whose name equals the lazy slot's name (which is the case
-	   today — lazy slot init / getter methods are not yet exposed via the
-	   methods group). Tier 2 work pins this down. *)
-			
-			enclosingMixinMirror methods do: [:m | m name = reflectee ifTrue: [ ^m ] ].
+			(* Look the main method up DIRECTLY in the runtime mixin''s method
+	   metadata: lazy slot methods are synthetic, so MixinMirror>>methods
+	   (which filters out synthetics) never surfaces them. The MM entry''s
+	   source is the COMPLETE lazy slot declaration (the compiler derives
+	   method source from AST positions, and the synthetic lazy methods
+	   copy their positions from the declaration), which is what makes
+	   faithful source reconstruction of classes with lazy slots possible. *)
+
+			| mms |
+			mms:: _js propertyOf: (_js propertyOf: enclosingMixinMirror reflectee
+					at: (_js literal: 'runtimeMixin'))
+				at: (_js literal: 'methods').
+			mms do: [:mm |
+					(_js propertyOf: mm at: (_js literal: 'name')) = reflectee ifTrue: [
+							^MethodMirror name: (_js propertyOf: mm at: (_js literal: 'name'))
+								accessModifier: (_js propertyOf: mm at: (_js literal: 'accessModifier'))
+								mixin: enclosingMixinMirror
+								source: (_js propertyOf: mm at: (_js literal: 'source'))
+						]
+				].
 			^nil
 		)
 		public source ^<String | nil> = (
@@ -1511,10 +1773,91 @@ c. If the slot is mutable, there will be a third method, which is an ordinary se
 			nil = mm ifTrue: [ ^#public ].
 			^mm accessModifier
 		)
+		parseMetadata ^<MetadataParser> = (
+			| src <String> = source copyFrom: 1
+				to: (source indexOf: '=' startingAt: 1) - 1. metadataParser <MetadataParser> = metadataParsing MetadataParser onSource: src. |
+			metadataParser gatherMetadataBackwards.
+			^metadataParser
+		)
+		public metadata ^<Map[String, String]> = (
+			(* Defensive: a lazy slot whose declaration source is unavailable
+	   (or was lost by a pre-fidelity install) has no metadata rather than
+	   crashing the presenters that ask. *)
+
+			| src = source. |
+			nil = src ifTrue: [ ^Map new ].
+			(_js operator: '===' with: src and: (_js ident: 'undefined')) ifTrue: [ ^Map new ].
+			^parseMetadata metadata
+		)
+		public initMethodName = (
+			^compilation IntermediateLazySlot initMethodNameForLazySlotNamed: name
+		)
+		public initMethod ^<MethodMirror | nil> = (
+			(* The synthetic init method (the lazy initializer expression), looked
+	   up directly in the metadata like mainMethod. Public because browsing
+	   code sends it cross-object (psoup got away with private via its
+	   different dispatch). *)
+
+			| mms wanted |
+			wanted:: initMethodName.
+			mms:: _js propertyOf: (_js propertyOf: enclosingMixinMirror reflectee
+					at: (_js literal: 'runtimeMixin'))
+				at: (_js literal: 'methods').
+			mms do: [:mm |
+					(_js propertyOf: mm at: (_js literal: 'name')) = wanted ifTrue: [
+							^MethodMirror name: (_js propertyOf: mm at: (_js literal: 'name'))
+								accessModifier: (_js propertyOf: mm at: (_js literal: 'accessModifier'))
+								mixin: enclosingMixinMirror
+								source: (_js propertyOf: mm at: (_js literal: 'source'))
+						]
+				].
+			^nil
+		)
+		cacheSlotName ^<Symbol> = (
+			^compilation IntermediateLazySlot slotNameForLazySlotNamed: name
+		)
+		public cachedValueFor: anObjectMirror <ObjectMirror> ^<ObjectMirror> = (
+			^anObjectMirror getSlot: cacheSlotName
+		)
+		public setCachedValueFor: anObjectMirror <ObjectMirror> to: newValue <Object> ^<ObjectMirror> = (
+			^anObjectMirror setSlot: cacheSlotName to: newValue
+		)
+		public isMutable ^<Boolean> = (
+			(* From the enclosing runtime mixin''s lazySlots SM metadata. *)
+
+			| raw |
+			raw:: _js propertyOf: (_js propertyOf: enclosingMixinMirror reflectee
+					at: (_js literal: 'runtimeMixin'))
+				at: (_js literal: 'lazySlots').
+			(_js operator: '===' with: raw and: (_js ident: 'undefined')) ifTrue: [ ^false ].
+			raw do: [:sm |
+					(_js propertyOf: sm at: (_js literal: 'name')) = reflectee ifTrue: [
+							^_js propertyOf: sm at: (_js literal: 'isMutable')
+						]
+				].
+			^false
+		)
 	) : ()
 	class LazyMutableSlotGroup group: ms <List[Mirror]> within: mb <MixinBuilder> = MutableMirrorGroup group: ms
 		within: mb (
 	) (
+		public addFromSource: source <String> ^<LazySlotBuilder> = (
+			(* Compile a lazy slot declaration and add (or replace) its builder,
+	   mirroring the psoup LazySlotBuilder addFromSource: flow. The runtime
+	   effect happens at install: the reconstructed source (which includes
+	   the group''s lazy declarations) is recompiled, the schema-change slot
+	   diff adds the backing slot to live instances, and the method copy
+	   installs the accessors. Without this override the send fell through
+	   to ImmutableMirrorGroup and raised. *)
+
+			| iSlot <IntermediateLazySlot> newBuilder <LazySlotBuilder> |
+			iSlot:: compiler compileLazySlotSource: source within: definingMixin.
+			(* TODO: check for name conflicts, as the psoup version does *)
+			newBuilder:: LazySlotBuilder reflecting: iSlot in: definingMixin.
+			removeMirrorNamed: iSlot name.
+			addMirror: newBuilder.
+			^newBuilder
+		)
 	) : ()
 	public class ActivationMirror reflecting: activation thread: thr = Object new (
 		(* :bogus: This constructor should not be public.  Also, this class has no real implementation yet. It's just here for API compatibility so we can bring up the IDE, even though debugging won't work for now. *)
@@ -1558,6 +1901,23 @@ c. If the slot is mutable, there will be a third method, which is an ordinary se
 	) (
 		
 		(* reflectees at: self put: c. *)
+		public source ^<String | nil> = (
+			(* Closure source requires closure metadata wiring in the code
+	   generator (debugger track); nil = unavailable, which the browsing
+	   code treats as a displayable absence. *)
+
+			^nil
+		)
+		public definingMethod ^<MethodMirror | nil> = (
+			(* See [source]. *)
+
+			^nil
+		)
+		public receiver ^<ObjectMirror> = (
+			(* Best effort: without activation metadata the receiver is unknown. *)
+
+			^ObjectMirror reflecting: nil
+		)
 		public isKindOfClosureMirror ^<Boolean> = (
 			^true
 		)

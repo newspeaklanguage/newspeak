@@ -123,7 +123,7 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 		Set = platform collections Set.
 		StringBuilder = platform kernel StringBuilder.
 		ObjectMirror = platform mirrors ObjectMirror.
-		Parser = parsing Parser.
+		CommonParser = parsing CommonParser.
 		javascriptGeneration = generation.
 		JavascriptWriter = javascriptGeneration Writer.
 		_js = javascriptGeneration factory.
@@ -145,7 +145,7 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 		TupleAST = asts TupleAST.
 		VarDeclAST = asts VarDeclAST.
 		VariableAST = asts VariableAST.
-		public parser = Parser new.
+		public parser = CommonParser new.
 		cachedCompilations = Map new.
 		sourcesList ::= List new.
 	|
@@ -795,7 +795,7 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 			buildIncrementalScopeFor: enclosing.
 			
 			(* Parse as a code body *)
-			body:: parser doItExpression parseString: expression.
+			body:: parser parseExpression: expression.
 			
 			(* Ensure last statement is a return statement *)
 			body statements isEmpty ifFalse: [
@@ -836,7 +836,7 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 			currentScope:: Scope new.
 			currentDepth:: 0.
 			buildIncrementalScopeFor: enclosing.
-			tree:: parser methodDecl parseString: source.
+			tree:: parser parseMethodDeclaration: source.
 			currentMixinUID: enclosing declaration qualifiedName.
 			^methodNode: tree
 		)
@@ -1392,11 +1392,11 @@ This accessor will lazily generate the nested class when its enclosing instance 
 			currentScope:: Scope new.
 			currentDepth:: 0.
 			tree:: nil = enclosingIR ifTrue: [
-					parser compilationUnit parseString: source
+					parser parseCompilationUnit: source
 				]
 				ifFalse: [
 					buildIncrementalScopeFor: enclosingIR builder.
-					parser classDecl parseString: source
+					parser parseClassDeclaration: source
 				].
 			toScope: currentScope addClass: tree.
 			
@@ -1797,6 +1797,23 @@ app.$main$args$(vmmirror.platform, [])'
 			^_js script: {_js literal: 'use strict'. _js var: 'nil'
 					value: (_js literal: 'patch me with nil'). _js var: 'currentActor'. _js var: 'theGlobalObject'
 					value: (_js ident: 'this'). _js verbatim: 'function SM(n,am,m,s){this.name=n; this.accessModifier = am; this.isMutable=m; this.isSynthetic=s; }'. _js verbatim: 'function MM(n,am,sy,src){this.name=n; this.accessModifier = am; this.isSynthetic=sy; this.source=src; }'. _js verbatim: 'function dnuCatcher(s){ return function() {
+if (this === undefined || this === null || typeof this.dnu !== "function") {
+	// The receiver is a raw JS value (an exception object, a DOM value, ...)
+	// with no Newspeak doesNotUnderstand: machinery. Raise a proper, catchable
+	// Newspeak Error naming the selector and receiver instead of dying with
+	// the opaque TypeError [this.dnu is not a function] - which, when it
+	// happens inside an on:do: handler that is itself reporting an error,
+	// masks the original failure entirely.
+	var description;
+	// For JS Error receivers (the common case: an exception caught by an
+	// on:do: handler being sent printString), include the stack so the
+	// ORIGINAL failure site survives into this message.
+	try {
+		description = (this !== undefined && this !== null && typeof this.stack === "string")
+			? this.stack : String(this);
+	} catch (ignored) { description = "a JS object"; }
+	return vmmirror.kernel.$Error().$signal$("JS object does not understand " + vmmirror.$unmangleSelector$(s) + " -- receiver: " + description);
+}
 return this.dnu(vmmirror.kernel.$Message().$mangledSelector$arguments$(s, Array.prototype.slice.call(arguments)));
 } }'. _js var: 'mixins'
 					value: runtimeMixinNamespace. vmmirror. namespace. compiler dnuHandlers. main. }
@@ -1809,13 +1826,33 @@ return this.dnu(vmmirror.kernel.$Message().$mangledSelector$arguments$(s, Array.
 		)
 		private vmmirror = (
 			^_js verbatim: '
+// The object table. Every Newspeak object allocated via basicNew is entered into
+// the table as a WeakRef, and stores its table index in the synthetic property
+// objectIndex. The table is the basis for allInstances (and, later, become:).
+// A FinalizationRegistry clears the table entry of a collected object and recycles
+// its index via a free list, so the table does not grow without bound.
+// Note: JS-native values (strings, numbers, literal arrays, closures) do not pass
+// through basicNew and are therefore not in the table.
+var objectTable = [];
+var objectTableFreeList = [];
+var objectTableRegistry = new FinalizationRegistry(function(index){
+	objectTable[index] = undefined;
+	objectTableFreeList.push(index);
+});
+function registerObject(o){
+	var index = objectTableFreeList.length > 0 ? objectTableFreeList.pop() : objectTable.length;
+	objectTable[index] = new WeakRef(o);
+	objectTableRegistry.register(o, index);
+	o.objectIndex = index;
+}
+
 var vmmirror = new function(){
 
 	this.ImplementationBase$slot = new function(){
 		this.debug = "ImplementationBase";
 		this.$runtimeClass$slot = new function(){
 			this.debug = "Runtime class for ImplementationBase";
-			this.basicNew = function(){ this.hashCode = 0; };
+			this.basicNew = function(){ this.hashCode = 0; registerObject(this); };
 			this.$instance$initializer = function(){};
 			this._$instance$initializer = function(){};
 			this.toString = function(){ return this.$printString(); }
@@ -1990,6 +2027,224 @@ var vmmirror = new function(){
 
 	this.applyTopLevelMixin = function(runtimeMixin){
 		return this.$applyMixin$toSuperclass$withEnclosingObjects$(runtimeMixin, this.kernel._$Object(), [nil]);
+	};
+
+	this.$ownPropertyOf$at$ = function(holder, key){
+		// Property lookup WITHOUT consulting the prototype chain. The deploy
+		// installs a dnuCatcher on Object.prototype for every sent selector,
+		// so [holder[key] !== undefined] is unreliable for selector-shaped
+		// (mangled) keys: a missing key can appear present, bound to an
+		// inherited dnuCatcher function. (Discovered when updateMixin: tried
+		// to treat such an inherited catcher as a deploy-time runtime mixin
+		// and crashed assigning the function objects read-only [name].) The
+		// reflective install paths use this for all mangled-key probes of
+		// namespace and mixin objects.
+		return Object.prototype.hasOwnProperty.call(holder, key) ? holder[key] : undefined;
+	};
+
+	this.$allInstancesOf$ = function(behavior){
+		// Scan the object table for exact instances of the Newspeak class [behavior].
+		// An instances prototype is its runtime class, so the class check is a single
+		// identity comparison. Dead entries encountered during the scan are pruned
+		// eagerly rather than waiting for the FinalizationRegistry.
+		var runtimeClass = behavior.runtimeClass;
+		var result = [];
+		for (var index = 0; index < objectTable.length; index++){
+			var ref = objectTable[index];
+			if (ref === undefined) continue;
+			var o = ref.deref();
+			if (o === undefined) {
+				objectTable[index] = undefined;
+				objectTableFreeList.push(index);
+				continue;
+			}
+			if (Object.getPrototypeOf(o) === runtimeClass) result.push(o);
+		}
+		return result;
+	};
+
+	this.$reshapeInstancesOfRuntimeClass$to$adding$removing$ = function(oldRuntimeClass, newRuntimeClass, addedSlotNames, removedSlotNames){
+		// Reshape-in-place schema change: every live exact instance of
+		// [oldRuntimeClass] is migrated to [newRuntimeClass]. Object identity is
+		// preserved, so no references need fixing anywhere - not in slots, native
+		// containers, closures, expats, or the stack. Retained slots keep their
+		// values automatically because slots are named properties; added slots are
+		// initialized to nil; removed slots are deleted. Slot names arrive
+		// unmangled. If old and new runtime class are the same object (the
+		// in-place mixin update path), the prototype is left alone and only the
+		// slot properties change. Answers the number of instances reshaped.
+		var addedKeys = [];
+		for (var a = 0; a < addedSlotNames.length; a++)
+			addedKeys.push(this.$mangleSelector$(addedSlotNames[a]) + "$slot");
+		var removedKeys = [];
+		for (var r = 0; r < removedSlotNames.length; r++)
+			removedKeys.push(this.$mangleSelector$(removedSlotNames[r]) + "$slot");
+		var count = 0;
+		for (var index = 0; index < objectTable.length; index++){
+			var ref = objectTable[index];
+			if (ref === undefined) continue;
+			var o = ref.deref();
+			if (o === undefined) {
+				objectTable[index] = undefined;
+				objectTableFreeList.push(index);
+				continue;
+			}
+			if (Object.getPrototypeOf(o) !== oldRuntimeClass) continue;
+			if (oldRuntimeClass !== newRuntimeClass) Object.setPrototypeOf(o, newRuntimeClass);
+			for (var i = 0; i < addedKeys.length; i++)
+				if (!Object.prototype.hasOwnProperty.call(o, addedKeys[i])) o[addedKeys[i]] = nil;
+			for (var k = 0; k < removedKeys.length; k++)
+				delete o[removedKeys[k]];
+			count++;
+		}
+		return count;
+	};
+
+	this.$rebuildBasicNewFor$ = function(runtimeClass){
+		// REGENERATE [runtimeClass].basicNew from its mixins CURRENT slot
+		// metadata - a canonical single function each time, rather than
+		// wrapping the old one with the diff (rejected: layers of cruft).
+		// This is sound because the reflective install keeps the metadata
+		// faithful: since 2026-07-13 the builders emit lazy slot declarations
+		// in source reconstruction, so the SM slot list IS the full layout.
+		// The slot list is reached through the Newspeak class object
+		// (newspeakClass.$mixin$slot.runtimeMixin.slots). The super basicNew
+		// is fetched at CALL time, so rebuild order is irrelevant and later
+		// rebuilds up the chain propagate automatically; removed slots simply
+		// do not appear in the regenerated initializer. Answers false -
+		// leaving the current basicNew in place - when the metadata is
+		// unreachable (no class object / mixin wiring, e.g. kernel bootstrap
+		// corners).
+		var newspeakClass = runtimeClass.newspeakClass;
+		if (newspeakClass === null || newspeakClass === undefined) return false;
+		var nsMixin = newspeakClass.$mixin$slot;
+		if (nsMixin === null || nsMixin === undefined || nsMixin === nil) return false;
+		var runtimeMixin = nsMixin.runtimeMixin;
+		if (runtimeMixin === null || runtimeMixin === undefined) return false;
+		var slotMetadata = runtimeMixin.slots;
+		if (slotMetadata === undefined) return false;
+		var keys = [];
+		for (var i = 0; i < slotMetadata.length; i++)
+			keys.push(this.$mangleSelector$(slotMetadata[i].name) + "$slot");
+		var basicNew = function(){
+			Object.getPrototypeOf(runtimeClass).basicNew.call(this);
+			for (var k = 0; k < keys.length; k++) this[keys[k]] = nil;
+		};
+		basicNew.prototype = runtimeClass;
+		runtimeClass.basicNew = basicNew;
+		// Preserve the devtools-naming property the compiled constructor set
+		// (this[qualifiedName] = basicNew); recover the name from debug.
+		if (typeof runtimeClass.debug === "string" && runtimeClass.debug.indexOf("Runtime class for ") === 0)
+			runtimeClass[runtimeClass.debug.substring(18)] = basicNew;
+		return true;
+	};
+
+	this.$deleteMethods$from$ = function(selectors, liveRuntimeMixin){
+		// Delete the (mangled public and protected) method properties for
+		// [selectors] from [liveRuntimeMixin] and every runtime class applied
+		// from it, so subsequent sends fall through to the doesNotUnderstand:
+		// machinery instead of running stale functions. Subclass runtime
+		// classes see these methods only through the prototype chain, so
+		// deleting on the applications suffices. Deleting an absent key is a
+		// harmless no-op. This is the retirement half of member deletion: the
+		// general diff in MirrorsForJS covers plain methods, the synthetic
+		// accessors of removed slots, the three synthetic methods of removed
+		// lazy slots, and - via the qualified class name, which mangles to
+		// the very property key holding the nested mixin object and its
+		// accessor - removed nested classes.
+		var keys = [];
+		for (var i = 0; i < selectors.length; i++){
+			var mangled = this.$mangleSelector$(selectors[i]);
+			keys.push(mangled, "_" + mangled);
+		}
+		// Diagnostic: member retirement is destructive; log what goes. Cheap
+		// (fires only on actual deletions) and has already caught one
+		// mis-computed diff. Keep until the reflective install stabilizes.
+		if (typeof console !== "undefined")
+			console.log("NS2JS deleteMethods", keys, "mixin:", liveRuntimeMixin.debug, "applications:", liveRuntimeMixin.applications.length);
+		for (var k = 0; k < keys.length; k++){
+			delete liveRuntimeMixin[keys[k]];
+			for (var a = 0; a < liveRuntimeMixin.applications.length; a++)
+				delete liveRuntimeMixin.applications[a][keys[k]];
+		}
+		return keys.length;
+	};
+
+	this.$deleteClassMethods$from$ = function(selectors, liveRuntimeMixin){
+		// Class-side counterpart of $deleteMethods$from$: deletes from the
+		// live META mixin and from every applications RUNTIME METACLASS
+		// (runtime metaclasses are not tracked in any applications array of
+		// their own; they are reached as each applications [meta]).
+		var keys = [];
+		for (var i = 0; i < selectors.length; i++){
+			var mangled = this.$mangleSelector$(selectors[i]);
+			keys.push(mangled, "_" + mangled);
+		}
+		var metamixin = liveRuntimeMixin.meta;
+		for (var k = 0; k < keys.length; k++){
+			if (metamixin !== undefined && metamixin !== null) delete metamixin[keys[k]];
+			for (var a = 0; a < liveRuntimeMixin.applications.length; a++){
+				var meta = liveRuntimeMixin.applications[a].meta;
+				if (meta !== undefined && meta !== null) delete meta[keys[k]];
+			}
+		}
+		return keys.length;
+	};
+
+	this.$performSchemaChangeFor$adding$removing$ = function(liveRuntimeMixin, addedSlotNames, removedSlotNames){
+		// Schema change for [liveRuntimeMixin], whose methods and metadata have
+		// already been updated in place by the reflective install. A layout
+		// change affects every runtime class whose instances carry the mixins
+		// slots: the mixins applications and, transitively, all runtime classes
+		// below them (slot layout is inherited through the basicNew chain).
+		// One pass over the object table does both halves of the job:
+		//  - every affected runtime class (discovered via its Newspeak class
+		//    object, which lives in the table) gets its basicNew rebuilt so
+		//    FUTURE instances have the new layout;
+		//  - every affected EXISTING instance is reshaped in place: added slots
+		//    initialized to nil, removed slots deleted. Identity is preserved,
+		//    so no references need fixing anywhere.
+		// Answers the number of instances reshaped.
+		var roots = liveRuntimeMixin.applications;
+		if (roots.length === 0) return 0;
+		function isAffected(rc){
+			for (var r = 0; r < roots.length; r++)
+				if (roots[r] === rc || roots[r].isPrototypeOf(rc)) return true;
+			return false;
+		}
+		var addedKeys = [];
+		for (var a = 0; a < addedSlotNames.length; a++)
+			addedKeys.push(this.$mangleSelector$(addedSlotNames[a]) + "$slot");
+		var removedKeys = [];
+		for (var d = 0; d < removedSlotNames.length; d++)
+			removedKeys.push(this.$mangleSelector$(removedSlotNames[d]) + "$slot");
+		var seenRuntimeClasses = new Set();
+		var count = 0;
+		for (var index = 0; index < objectTable.length; index++){
+			var ref = objectTable[index];
+			if (ref === undefined) continue;
+			var o = ref.deref();
+			if (o === undefined) {
+				objectTable[index] = undefined;
+				objectTableFreeList.push(index);
+				continue;
+			}
+			if (Object.prototype.hasOwnProperty.call(o, "runtimeClass")){
+				var rc = o.runtimeClass;
+				if (rc !== null && rc !== undefined && !seenRuntimeClasses.has(rc) && isAffected(rc)){
+					seenRuntimeClasses.add(rc);
+					this.$rebuildBasicNewFor$(rc);
+				}
+			}
+			if (isAffected(Object.getPrototypeOf(o))){
+				for (var i = 0; i < addedKeys.length; i++)
+					if (!Object.prototype.hasOwnProperty.call(o, addedKeys[i])) o[addedKeys[i]] = nil;
+				for (var k = 0; k < removedKeys.length; k++)
+					delete o[removedKeys[k]];
+				count++;
+			}
+		}
+		return count;
 	};
 
 	this.$applyMixin$toSuperclass$withEnclosingObjects$ = function(runtimeMixin, newspeakSuperclass, enclosingObjects){

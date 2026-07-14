@@ -24,6 +24,14 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 		public asArray = (
 			^self
 		)
+		public copy = (
+			(* A shallow copy, as on psoup. *)
+
+			^_js call: (_js propertyOf: (_js propertyOf: self
+						at: (_js literal: 'slice'))
+					at: (_js literal: 'call'))
+				with: {self. _js literal: 0. }
+		)
 		public asOrderedCollection = (
 			^platform collections List withAll: self
 		)
@@ -588,6 +596,25 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 	) : ()
 	public class Closure uninstantiable = Object new (
 	) (
+		public repeat = (
+			(* Evaluate the receiver forever; exits only via non-local return or
+	   exception, as on psoup. *)
+
+			[ true ] whileTrue: [ value ]
+		)
+		public whileTrue = (
+			(* Zero-argument variant: evaluate the receiver until it answers false. *)
+
+			[ value ] whileTrue: [ ]
+		)
+		public whileFalse = (
+			(* Zero-argument variant: evaluate the receiver until it answers true. *)
+
+			[ value ] whileFalse: [ ]
+		)
+		public printString = (
+			^'a Closure'
+		)
 		public cull: a1 = (
 			^_js call: (_js ident: 'this') with: {a1. }
 		)
@@ -674,6 +701,16 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 			_js verbatim: 'this.trace = new Error().stack'.
 			_js throw: self
 		)
+		public pass = (
+			(* Resignal to the NEXT enclosing handler, psoup-style. Approximation:
+	   rethrow the same exception object. The on:do: handler runs after its
+	   JS try block has exited, so the rethrow propagates outward and cannot
+	   be recaught by the handler that invoked pass. Full handler-stack
+	   semantics (resume:, retry, return:) arrive with the resumable
+	   exception work on the debugger track. *)
+
+			_js throw: self
+		)
 		public signal: message = (
 			(* squeak compatibility for Minitest *)
 			
@@ -734,28 +771,21 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 			^vmmirror unmangleSelector: mangledSelector
 		)
 		public sendTo: receiver = (
-			(* If the receiver doesn't have the method, route straight to DNU
-     (no exception path, so no false-positive log). If the method
-     exists but throws, log the real exception to the console before
-     dispatching DNU — without this, internal errors get masked as
-     a DNU on the original selector and lose all useful context.
-     Disable by deleting the console.error line if too noisy. *)
-			
+			(* DNU only on genuine lookup failure. If the method IS found, any
+     exception it raises must propagate untouched to the surrounding
+     on:do: machinery — the previous version caught such exceptions and
+     converted them into a DNU on the original selector, masking real
+     errors (e.g. a ParserError inside compileClassSource:within: was
+     reported as MessageNotUnderstood: compileClassSource:within:). *)
+
 			| f |
 			f:: _js propertyOf: receiver at: mangledSelector.
-			(_js operator: '===' with: f and: (_js ident: 'undefined')) ifTrue: [
+			((_js prefixOperator: 'typeof ' on: f) == 'function') ifFalse: [
 					^_js call: (_js propertyOf: receiver at: (_js literal: 'dnu'))
 						with: {self. }
 				].
-			_js try: (_js block: {_js return: (_js call: (_js propertyOf: f
-								at: (_js literal: 'apply'))
-							with: {receiver. arguments. }). })
-				catch: (_js ident: 'e')
-				with: (_js block: {_js call: (_js propertyOf: (_js ident: 'console')
-							at: (_js literal: 'error'))
-						with: {_js literal: 'Message sendTo: caught while invoking '. mangledSelector. _js literal: ' on receiver:'. receiver. _js ident: 'e'. }. _js return: (_js call: (_js propertyOf: receiver
-								at: (_js literal: 'dnu'))
-							with: {self. }). })
+			^_js call: (_js propertyOf: f at: (_js literal: 'apply'))
+				with: {receiver. arguments. }
 		)
 	) : (
 		mangle: selector = (
@@ -931,6 +961,31 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 		public between: min and: max = (
 			^self <= max and: [ self >= min ]
 		)
+		public & other = (
+			(* psoup Integer synonym for bitAnd:. *)
+
+			^bitAnd: other
+		)
+		public | other = (
+			(* psoup Integer synonym for bitOr:. *)
+
+			^bitOr: other
+		)
+		public gcd: other = (
+			| a ::= self abs. b ::= other abs. t |
+			[ b = 0 ] whileFalse: [
+					t:: b.
+					b:: a \\ b.
+					a:: t
+				].
+			^a
+		)
+		public isFinite = (
+			^_js call: (_js ident: 'isFinite') with: {self. }
+		)
+		public isInfinite = (
+			^(isFinite or: [ isNaN ]) not
+		)
 		public bitAnd: other = (
 			^_js operator: '&' with: self and: other
 		)
@@ -1065,6 +1120,9 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 	)
 	public class Object new = ImplementationBase new (
 	) (
+		public subclassResponsibility = (
+			^Error signal: 'Subclass responsibility'
+		)
 		public = other = (
 			^_js operator: '===' with: self and: other
 		)
@@ -1693,10 +1751,80 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 		)
 	) : ()
 	public class WeakArray new = Object new (
+		(* An array whose elements are held weakly, as on psoup: a collected
+	   element reads as nil. Backed by an ordinary array holding WeakRefs
+	   (nil elements are stored as nil directly). *)
+		|
+			refs = _js verbatim: '[]'.
+		|
 	) (
-	) : ()
+		public size = (
+			^_js propertyOf: refs at: (_js literal: 'length')
+		)
+		public isEmpty = (
+			^size = 0
+		)
+		public at: index = (
+			| ref raw |
+			ref:: refs at: index.
+			nil = ref ifTrue: [ ^nil ].
+			raw:: _js call: (_js propertyOf: (_js propertyOf: ref
+						at: (_js literal: 'deref'))
+					at: (_js literal: 'call'))
+				with: {ref. }.
+			(_js operator: '===' with: raw and: (_js ident: 'undefined')) ifTrue: [ ^nil ].
+			^raw
+		)
+		public at: index put: value = (
+			nil = value ifTrue: [ refs at: index put: nil ]
+				ifFalse: [ refs at: index put: (_js new: (_js ident: 'WeakRef') with: {value. }) ].
+			^value
+		)
+		public do: aBlock = (
+			1 to: size do: [:i | aBlock value: (at: i) ]
+		)
+		public copyWith: extra = (
+			| c = WeakArray new: size + 1. |
+			1 to: size do: [:i | c at: i put: (at: i) ].
+			c at: size + 1 put: extra.
+			^c
+		)
+		public isKindOfWeakArray = (
+			^true
+		)
+	) : (
+		public new: size = (
+			| wa = self new. |
+			size to: 1 by: -1 do: [:i | wa at: i put: nil ].
+			^wa
+		)
+	)
 	public class WeakMap new = Object new (
+		(* An object-keyed map that does not keep its keys alive, over the
+	   native JS WeakMap, matching the psoup WeakMap protocol. *)
+		|
+			map = _js verbatim: 'new WeakMap()'.
+		|
 	) (
+		public at: key = (
+			| raw |
+			raw:: _js call: (_js propertyOf: (_js propertyOf: map
+						at: (_js literal: 'get'))
+					at: (_js literal: 'call'))
+				with: {map. key. }.
+			(_js operator: '===' with: raw and: (_js ident: 'undefined')) ifTrue: [ ^nil ].
+			^raw
+		)
+		public at: key put: value = (
+			_js call: (_js propertyOf: (_js propertyOf: map
+						at: (_js literal: 'set'))
+					at: (_js literal: 'call'))
+				with: {map. key. value. }.
+			^value
+		)
+		public isKindOfWeakMap = (
+			^true
+		)
 	) : ()
 	public Error = (
 		(* Squeak compatibility *)

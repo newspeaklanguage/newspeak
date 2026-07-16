@@ -1,0 +1,673 @@
+Newspeak3
+'Root'
+class BytecodeSimulatorForJS usingPlatform: platform simulation: simulation = (
+	(* The V5 Simulator execution machine for the JS platform: steps the MM bytecode records emitted by dual compilation, over live NS2JS runtime objects. Ported from the upstream Simulator (upstream-V5Simulator-338f0bb3.ns.txt) per the machine mapping in CODEGEN_V5_PORT_PLAN_2026-07-14.md section 5 step 5.
+
+UNDER CONSTRUCTION, first working slice: ordinary, self and super sends over the runtime-mixin metadata with upstream's access-modifier rules; local and non-local returns; closures created and activated in simulation; and the full-speed escape - a method found without a bytecode record (a _js-intrinsic body, an edited class) is invoked as its compiled JS function, so simulation seamlessly degrades to real execution method by method. Real closures receiving value in simulation resolve to their _js-intrinsic methods and therefore escape automatically; simulated closures are intercepted before lookup.
+
+Not yet ported, failing with descriptive errors: eventual sends, the unwind-protection walk (ensure:/ifCurtailed: interception by method identity), aboutToReturn:/cannotReturn: reification, and simulated closures escaping to full-speed code. Not yet wired into any runtime. *)
+
+	|
+		private List = platform collections List.
+		private InstructionStream = simulation InstructionStream.
+		private Message = platform kernel Message.
+	|
+) (
+	public class SimulatedClosure in: definingActivation_ initialBCI: initialBCI_ numArgs: numArgs_ numCopied: numCopied_ = (
+		(* The reification of a block created DURING simulation (upstream: VM primitive 145). Deliberately not interchangeable with real closures yet: passing one to full-speed code is an unported seam. *)
+
+		|
+			public definingActivation <SimulatedActivation> = definingActivation_.
+			public initialBCI <Integer> = initialBCI_.
+			public numArgs <Integer> = numArgs_.
+
+			(* A real sized JS array: List new: n is an EMPTY list of capacity n, so indexed stores into it fail. *)
+			public copied = _js call: (_js ident: 'Array') with: {numCopied_. }.
+		|
+	) (
+		public isKindOfSimulatedClosure ^<Boolean> = (
+			^true
+		)
+	) : ()
+	public class Simulator new = InstructionStream new (
+		|
+			public activation <SimulatedActivation>
+		|
+	) (
+		activate: simulatedMethod receiver: newReceiver arguments: arguments = (
+			| newActivation |
+			nil = simulatedMethod record ifTrue: [
+					^escape: simulatedMethod selector
+						accessModifier: simulatedMethod accessModifier
+						receiver: newReceiver
+						arguments: arguments
+				].
+			newActivation:: SimulatedActivation new.
+			newActivation sender: activation.
+			newActivation method: simulatedMethod.
+			newActivation receiver: newReceiver.
+			newActivation size: simulatedMethod numTemps.
+			1 to: arguments size do: [:index |
+					newActivation tempAt: index put: (arguments at: index)
+				].
+			activation:: newActivation
+		)
+		activateClosure: closure arguments: arguments = (
+			| newActivation |
+			newActivation:: SimulatedActivation new.
+			newActivation sender: activation.
+			newActivation bci: closure initialBCI.
+			newActivation method: closure definingActivation method.
+			newActivation closure: closure.
+			newActivation receiver: closure definingActivation receiver.
+			arguments size = closure numArgs ifFalse: [
+					^simulatorLimitation: 'closure arity mismatch'
+				].
+			arguments do: [:argument | newActivation push: argument ].
+			1 to: closure copied size do: [:index |
+					newActivation push: (closure copied at: index)
+				].
+			activation:: newActivation
+		)
+		public bci = (
+			^activation bci
+		)
+		public bci: value = (
+			activation bci: value
+		)
+		behaviorOf: obj = (
+			(* The runtime class of any value: its JS prototype. Primitives box (their patched prototypes carry the kernel methods); the chain top normalizes to nil. *)
+
+			| proto = _js call: (_js ident: 'Object.getPrototypeOf') with: {obj. }. |
+			(_js operator: '===' with: proto and: (_js ident: 'null')) ifTrue: [ ^nil ].
+			^proto
+		)
+		dispatchOrdinary: selector receiver: messageReceiver arguments: arguments = (
+			(* Upstream ordinarySend: lookup: public finds, protected on the receiver class means DNU for an ordinary send. Interception of simulated closures happens before lookup, since they are not instances of the real Closure class. *)
+
+			| receiverBehavior lookupBehavior found |
+			(isSimulatedClosure: messageReceiver) ifTrue: [
+					(isValueSelector: selector arity: arguments size) ifTrue: [
+							^activateClosure: messageReceiver arguments: arguments
+						]
+				].
+			(true = messageReceiver or: [ false = messageReceiver ]) ifTrue: [
+					(booleanControl: selector on: messageReceiver arguments: arguments) ifTrue: [ ^self ]
+				].
+			receiverBehavior:: behaviorOf: messageReceiver.
+			lookupBehavior:: receiverBehavior.
+			[ nil = lookupBehavior ] whileFalse: [
+					found:: methodFor: selector in: lookupBehavior.
+					nil = found ifFalse: [
+							(#public = found accessModifier) ifTrue: [
+									^activate: found receiver: messageReceiver arguments: arguments
+								].
+							(#protected = found accessModifier) ifTrue: [
+									^escapeDnu: selector receiver: messageReceiver arguments: arguments
+								]
+						].
+					lookupBehavior:: behaviorOf: lookupBehavior
+				].
+			^escapeDnu: selector receiver: messageReceiver arguments: arguments
+		)
+		booleanControl: selector on: aBoolean arguments: arguments ^<Boolean> = (
+			(* The boolean control protocol, interpreted in-simulator. On psoup these are ordinary bytecode methods the upstream Simulator steps; on the JS platform they are _js-intrinsic (JS-only), and escaping them would pass simulated closures into full-speed code. Answers whether the selector was handled. *)
+
+			selector = #and: ifTrue: [
+					aBoolean
+						ifTrue: [ valueInSimulation: (arguments at: 1) ]
+						ifFalse: [ activation push: false ].
+					^true
+				].
+			selector = #or: ifTrue: [
+					aBoolean
+						ifTrue: [ activation push: true ]
+						ifFalse: [ valueInSimulation: (arguments at: 1) ].
+					^true
+				].
+			selector = #ifTrue: ifTrue: [
+					aBoolean
+						ifTrue: [ valueInSimulation: (arguments at: 1) ]
+						ifFalse: [ activation push: nil ].
+					^true
+				].
+			selector = #ifFalse: ifTrue: [
+					aBoolean
+						ifTrue: [ activation push: nil ]
+						ifFalse: [ valueInSimulation: (arguments at: 1) ].
+					^true
+				].
+			selector = #ifTrue:ifFalse: ifTrue: [
+					valueInSimulation: (arguments at: (aBoolean ifTrue: [ 1 ] ifFalse: [ 2 ])).
+					^true
+				].
+			selector = #ifFalse:ifTrue: ifTrue: [
+					valueInSimulation: (arguments at: (aBoolean ifTrue: [ 2 ] ifFalse: [ 1 ])).
+					^true
+				].
+			^false
+		)
+		valueInSimulation: valuable = (
+			(* Evaluate a niladic valuable so its result lands on the current simulated stack: simulated closures are activated (their return delivers the result); anything else is asked for value at full speed. *)
+
+			(isSimulatedClosure: valuable)
+				ifTrue: [ activateClosure: valuable arguments: (newArraySized: 0) ]
+				ifFalse: [
+					activation push: ((Message selector: #value arguments: (newArraySized: 0)) sendTo: valuable)
+				]
+		)
+		dup = (
+			activation push: activation top
+		)
+		escape: selector accessModifier: accessModifier receiver: receiver arguments: arguments = (
+			(* The full-speed escape: run a method that has no bytecode record as its compiled JS function and push the result. Public sends re-dispatch through the kernel Message (whose mangler is authoritative, binary selectors included); protected and private targets are fetched at the protected mangling on the receiver's prototype chain. Exceptions propagate through the normal signal path. *)
+
+			| message result |
+			message:: Message selector: selector arguments: arguments.
+			#public = accessModifier
+				ifTrue: [ result:: message sendTo: receiver ]
+				ifFalse: [
+					| f = _js propertyOf: receiver
+						at: '_' , message mangledSelector. |
+					result:: _js call: (_js propertyOf: f at: (_js literal: 'apply'))
+						with: {receiver. arguments. }
+				].
+			activation push: result
+		)
+		escapeDnu: selector receiver: receiver arguments: arguments = (
+			(* Lookup failed in simulation: real dispatch implements the same rules and raises the real doesNotUnderstand:, so delegate wholesale. *)
+
+			activation push: ((Message selector: selector arguments: arguments) sendTo: receiver)
+		)
+		eventualSend: selector numArgs: numArgs = (
+			simulatorLimitation: 'eventual sends are not yet simulated'
+		)
+		behavior: behavior hasSelector: selector = (
+			| mms |
+			mms:: runtimeMethodsOf: behavior.
+			nil = mms ifTrue: [ ^false ].
+			mms do: [:mm |
+					(_js propertyOf: mm at: (_js literal: 'name')) = selector ifTrue: [ ^true ]
+				].
+			^false
+		)
+		behaviorNamed: mixinName startingAt: startBehavior = (
+			| behavior rm |
+			behavior:: startBehavior.
+			[ nil = behavior ] whileFalse: [
+					rm:: runtimeMixinOf: behavior.
+					nil = rm ifFalse: [
+							(mixinNameOf: rm) = mixinName ifTrue: [ ^behavior ]
+						].
+					behavior:: behaviorOf: behavior
+				].
+			^simulatorLimitation: 'enclosing mixin application not found: ' , mixinName
+		)
+		enclosingMixinNameOf: qualifiedName = (
+			(* The parent in the nesting tree, by qualified name: everything before the last backquote; nil at top level. *)
+
+			| last |
+			last:: 0.
+			1 to: qualifiedName size do: [:i |
+					(qualifiedName copyFrom: i to: i) = '`' ifTrue: [ last:: i ]
+				].
+			last = 0 ifTrue: [ ^nil ].
+			^qualifiedName copyFrom: 1 to: last - 1
+		)
+		enclosingObjectOf: behavior = (
+			(* The depth-1 enclosing instance: the runtime class carries the enclosing-objects array at a per-class synthetic property, indexed from the immediate enclosing object outward (self is not in the array). *)
+
+			| prop = mangleQualified: 'enclosingObjects`' , (mixinNameOf: (runtimeMixinOf: behavior)). |
+			^(_js propertyOf: behavior at: prop) at: 1
+		)
+		enclosingMixinOf: runtimeMixin boundIn: receiver = (
+			(* The runtime mixins carry no parent pointer; recover the parent application from its qualified name on the enclosing receiver's class chain. *)
+
+			| parentName = enclosingMixinNameOf: (mixinNameOf: runtimeMixin). |
+			nil = parentName ifTrue: [ ^nil ].
+			^runtimeMixinOf: (behaviorNamed: parentName startingAt: (behaviorOf: receiver))
+		)
+		implicitReceiverSend: selector numArgs: numArgs = (
+			(* Upstream's outward walk: at each lexical level, if the level's declarations include the selector, the send binds there (lexical rules); past the top level it degrades to an ordinary protected send on the original receiver. *)
+
+			| arguments candidateReceiver candidateMixin candidateApp nextMixin |
+			arguments:: popArguments: numArgs.
+			candidateReceiver:: activation receiver.
+			candidateMixin:: activation method mixin.
+			[
+				candidateApp:: findApplicationOf: candidateMixin
+					startingAt: (behaviorOf: candidateReceiver).
+				(behavior: candidateApp hasSelector: selector) ifTrue: [
+						^sendLexical: selector
+							to: candidateReceiver
+							arguments: arguments
+							wrt: candidateMixin
+					].
+				nil = (enclosingMixinNameOf: (mixinNameOf: candidateMixin)) ifTrue: [
+						^sendProtected: selector
+							to: activation receiver
+							arguments: arguments
+							startingAt: (behaviorOf: activation receiver)
+					].
+				candidateReceiver:: enclosingObjectOf: candidateApp.
+				nextMixin:: enclosingMixinOf: candidateMixin boundIn: candidateReceiver.
+				candidateMixin:: nextMixin
+			] repeat
+		)
+		mangleQualified: name = (
+			(* names mangleSynthetic: semantics: a dollar prefix, with colons and backquotes becoming dollars. *)
+
+			| s |
+			s:: '$'.
+			1 to: name size do: [:i |
+					| c = name copyFrom: i to: i. |
+					(c = ':' or: [ c = '`' ])
+						ifTrue: [ s:: s , '$' ]
+						ifFalse: [ s:: s , c ]
+				].
+			^s
+		)
+		mixinNameOf: runtimeMixin = (
+			^_js propertyOf: runtimeMixin at: (_js literal: 'name')
+		)
+		isSimulatedClosure: obj = (
+			(* A structural probe would misfire on arbitrary objects via dnuCatchers; compare the runtime class directly. *)
+
+			^_js operator: '==='
+				with: (_js call: (_js ident: 'Object.getPrototypeOf') with: {obj. })
+				and: (_js call: (_js ident: 'Object.getPrototypeOf')
+					with: {SimulatedClosure in: nil initialBCI: 1 numArgs: 0 numCopied: 0. })
+		)
+		isValueSelector: selector arity: arity = (
+			selector = #value ifTrue: [ ^0 = arity ].
+			selector = #value: ifTrue: [ ^1 = arity ].
+			selector = #value:value: ifTrue: [ ^2 = arity ].
+			selector = #value:value:value: ifTrue: [ ^3 = arity ].
+			selector = #valueWithArguments: ifTrue: [ ^1 = arity ].
+			^false
+		)
+		jump: delta = (
+			activation bci: activation bci + delta
+		)
+		localToTemp: offset = (
+			^(nil = activation closure
+				ifTrue: [ activation method numArgs ]
+				ifFalse: [ activation closure numArgs ]) + offset + 1
+		)
+		public method = (
+			^activation method
+		)
+		methodFor: selector in: behavior = (
+			(* Find the MM entry for selector in the behavior's runtime mixin and wrap it with its provenance. Behaviors outside the Newspeak world (patched JS prototypes, the implementation base) have no newspeakClass and contribute nothing. *)
+
+			| mms |
+			mms:: runtimeMethodsOf: behavior.
+			nil = mms ifTrue: [ ^nil ].
+			mms do: [:mm |
+					(_js propertyOf: mm at: (_js literal: 'name')) = selector ifTrue: [
+							^SimulatedMethod record: (normalizeNull: (_js propertyOf: mm at: (_js literal: 'bytecode')))
+								mixin: (runtimeMixinOf: behavior)
+								selector: selector
+								accessModifier: (_js propertyOf: mm at: (_js literal: 'accessModifier'))
+						]
+				].
+			^nil
+		)
+		nonBooleanReceiver: nonBoolean = (
+			simulatorLimitation: 'branch on a non-boolean'
+		)
+		normalizeNull: value = (
+			(* Loose equality: JS null AND undefined both normalize to Newspeak nil. Undefined arises for absent properties (e.g. newspeakClass at the top of the runtime-class chain, ImplementationBase); strict === null let it through and the next property read exploded. *)
+
+			(_js operator: '==' with: value and: (_js ident: 'null')) ifTrue: [ ^nil ].
+			^value
+		)
+		ordinarySend: selector numArgs: numArgs = (
+			| arguments messageReceiver |
+			arguments:: popArguments: numArgs.
+			messageReceiver:: activation pop.
+			^dispatchOrdinary: selector receiver: messageReceiver arguments: arguments
+		)
+		outerSend: selector numArgs: numArgs depth: depth = (
+			| arguments receiver targetMixin count app |
+			arguments:: popArguments: numArgs.
+			receiver:: activation receiver.
+			targetMixin:: activation method mixin.
+			count:: 0.
+			[ count < depth ] whileTrue: [
+					count:: count + 1.
+					app:: findApplicationOf: targetMixin startingAt: (behaviorOf: receiver).
+					receiver:: enclosingObjectOf: app.
+					targetMixin:: enclosingMixinOf: targetMixin boundIn: receiver
+				].
+			^sendLexical: selector to: receiver arguments: arguments wrt: targetMixin
+		)
+		pop = (
+			activation pop
+		)
+		newArraySized: size = (
+			(* A real JS array (the runtime representation of Array), since these values flow into escaped full-speed code. Bare Array does not resolve on the JS platform. *)
+
+			^_js call: (_js ident: 'Array') with: {size. }
+		)
+		popArguments: numArgs = (
+			| arguments = newArraySized: numArgs. |
+			numArgs to: 1 by: -1 do: [:i | arguments at: i put: activation pop ].
+			^arguments
+		)
+		popIntoIndirectLocal: offset inVector: vectorOffset = (
+			| vector = activation tempAt: (localToTemp: vectorOffset). |
+			vector at: 1 + offset put: activation pop
+		)
+		popIntoLocal: offset = (
+			activation tempAt: (localToTemp: offset) put: activation pop
+		)
+		popJumpFalse: delta = (
+			| top = activation pop. |
+			true = top ifTrue: [ ^self ].
+			false = top ifTrue: [
+					activation bci: activation bci + delta.
+					^self
+				].
+			^nonBooleanReceiver: top
+		)
+		popJumpTrue: delta = (
+			| top = activation pop. |
+			true = top ifTrue: [
+					activation bci: activation bci + delta.
+					^self
+				].
+			false = top ifTrue: [ ^self ].
+			^nonBooleanReceiver: top
+		)
+		push: value = (
+			activation push: value
+		)
+		pushClosureNumCopied: numCopied numArgs: numArgs blockSize: blockSize = (
+			| newClosure |
+			newClosure:: SimulatedClosure in: activation
+				initialBCI: activation bci
+				numArgs: numArgs
+				numCopied: numCopied.
+			numCopied to: 1 by: -1 do: [:index |
+					newClosure copied at: index put: activation pop
+				].
+			activation push: newClosure.
+			activation bci: activation bci + blockSize
+		)
+		pushEnclosingObject: depth = (
+			| enclosingObject targetMixin count app |
+			enclosingObject:: activation receiver.
+			targetMixin:: activation method mixin.
+			count:: 0.
+			[ count < depth ] whileTrue: [
+					count:: count + 1.
+					app:: findApplicationOf: targetMixin startingAt: (behaviorOf: enclosingObject).
+					enclosingObject:: enclosingObjectOf: app.
+					targetMixin:: enclosingMixinOf: targetMixin boundIn: enclosingObject
+				].
+			activation push: enclosingObject
+		)
+		pushIndirectLocal: offset inVector: vectorOffset = (
+			| vector = activation tempAt: (localToTemp: vectorOffset). |
+			activation push: (vector at: 1 + offset)
+		)
+		pushLocal: offset = (
+			activation push: (activation tempAt: (localToTemp: offset))
+		)
+		pushMixin = (
+			activation push: activation method mixin
+		)
+		pushNewArray: size = (
+			activation push: (newArraySized: size)
+		)
+		pushNewArrayWithElements: size = (
+			| newArray = newArraySized: size. |
+			size to: 1 by: -1 do: [:index | newArray at: index put: activation pop ].
+			activation push: newArray
+		)
+		pushParameter: offset = (
+			| numArgs |
+			numArgs:: nil = activation closure
+				ifTrue: [ activation method numArgs ]
+				ifFalse: [ activation closure numArgs ].
+			activation push: (activation tempAt: numArgs - offset + 1)
+		)
+		pushReceiver = (
+			activation push: activation receiver
+		)
+		returnLocal: result = (
+			| sender = activation sender. |
+			nil = sender ifTrue: [ ^simulatorLimitation: 'return past the simulation root' ].
+			sender isDead ifTrue: [ ^simulatorLimitation: 'return to a dead activation' ].
+			activation terminate.
+			sender push: result.
+			activation:: sender
+		)
+		returnLocalReceiver = (
+			^returnLocal: activation receiver
+		)
+		returnLocalTop = (
+			^returnLocal: activation pop
+		)
+		returnNonLocal: result = (
+			(* Upstream's NLR minus the unwind-protection walk: ensure:/ifCurtailed: interception by method identity is an unported seam, so protected frames between here and home are skipped without running their unwind blocks. *)
+
+			| closure home sender zap next |
+			closure:: activation closure.
+			home:: closure definingActivation.
+			closure:: home closure.
+			[ nil = closure ] whileFalse: [
+					home:: closure definingActivation.
+					closure:: home closure
+				].
+			sender:: home sender.
+			(nil = sender or: [ sender isDead ]) ifTrue: [
+					^simulatorLimitation: 'non-local return to a dead or absent home sender'
+				].
+			zap:: activation.
+			[
+				next:: zap sender.
+				zap terminate.
+				zap:: next.
+				sameActivation: zap as: sender
+			] whileFalse.
+			sender push: result.
+			activation:: sender
+		)
+		returnNonLocalReceiver = (
+			^returnNonLocal: activation receiver
+		)
+		returnNonLocalTop = (
+			^returnNonLocal: activation pop
+		)
+		runtimeMethodsOf: behavior = (
+			| rm = runtimeMixinOf: behavior. |
+			nil = rm ifTrue: [ ^nil ].
+			^_js propertyOf: rm at: (_js literal: 'methods')
+		)
+		runtimeMixinOf: behavior = (
+			| nsClass |
+			nsClass:: normalizeNull: (_js propertyOf: behavior at: (_js literal: 'newspeakClass')).
+			nil = nsClass ifTrue: [ ^nil ].
+			^_js propertyOf: (_js propertyOf: nsClass at: (_js literal: '$mixin$slot'))
+				at: (_js literal: 'runtimeMixin')
+		)
+		sameActivation: a as: b = (
+			^_js operator: '===' with: a and: b
+		)
+		selfSend: selector numArgs: numArgs = (
+			^sendLexical: selector
+				to: activation receiver
+				arguments: (popArguments: numArgs)
+				wrt: activation method mixin
+		)
+		sendLexical: selector to: messageReceiver arguments: arguments wrt: runtimeMixin = (
+			| mixinApplication found |
+			mixinApplication:: findApplicationOf: runtimeMixin startingAt: (behaviorOf: messageReceiver).
+			found:: methodFor: selector in: mixinApplication.
+			nil = found ifFalse: [
+					(#private = found accessModifier) ifTrue: [
+							^activate: found receiver: messageReceiver arguments: arguments
+						]
+				].
+			^sendProtected: selector
+				to: messageReceiver
+				arguments: arguments
+				startingAt: (behaviorOf: messageReceiver)
+		)
+		findApplicationOf: runtimeMixin startingAt: startingBehavior = (
+			| behavior |
+			behavior:: startingBehavior.
+			[ nil = behavior ] whileFalse: [
+					(_js operator: '==='
+						with: (runtimeMixinOf: behavior)
+						and: runtimeMixin) ifTrue: [ ^behavior ].
+					behavior:: behaviorOf: behavior
+				].
+			^simulatorLimitation: 'mixin application not found on the receiver class chain'
+		)
+		sendProtected: selector to: messageReceiver arguments: arguments startingAt: startBehavior = (
+			| lookupBehavior found |
+			lookupBehavior:: startBehavior.
+			[ nil = lookupBehavior ] whileFalse: [
+					found:: methodFor: selector in: lookupBehavior.
+					nil = found ifFalse: [
+							(#private = found accessModifier) ifFalse: [
+									^activate: found receiver: messageReceiver arguments: arguments
+								]
+						].
+					lookupBehavior:: behaviorOf: lookupBehavior
+				].
+			^escapeDnu: selector receiver: messageReceiver arguments: arguments
+		)
+		public simulate: receiver send: selector with: arguments = (
+			(* The driver: dispatch the send in simulation and step until it returns, answering the result. The root sentinel activation collects it. *)
+
+			| root |
+			root:: SimulatedActivation new.
+			activation:: root.
+			dispatchOrdinary: selector receiver: receiver arguments: arguments.
+			[ sameActivation: activation as: root ] whileFalse: [ interpretNextInstruction ].
+			^root pop
+		)
+		simulatorLimitation: text = (
+			Error signal: 'Simulator limitation: ' , text
+		)
+		storeIntoIndirectLocal: offset inVector: vectorOffset = (
+			| vector = activation tempAt: (localToTemp: vectorOffset). |
+			vector at: 1 + offset put: activation top
+		)
+		storeIntoLocal: offset = (
+			activation tempAt: (localToTemp: offset) put: activation top
+		)
+		superSend: selector numArgs: numArgs = (
+			| arguments methodMixinApplication |
+			arguments:: popArguments: numArgs.
+			methodMixinApplication:: findApplicationOf: activation method mixin
+				startingAt: (behaviorOf: activation receiver).
+			^sendProtected: selector
+				to: activation receiver
+				arguments: arguments
+				startingAt: (behaviorOf: methodMixinApplication)
+		)
+		unusedBytecode = (
+			simulatorLimitation: 'unused bytecode'
+		)
+	) : ()
+	public class SimulatedActivation new = Object new (
+		(* One simulated frame: the upstream VM Activation, reified. Temps and the operand stack share one one-origin indexed area, upstream-style: parameters, then locals, then operands. *)
+
+		|
+			public sender <SimulatedActivation | nil>
+			public bci <Integer> ::= 1.
+			public method <SimulatedMethod>
+			public closure <SimulatedClosure | nil>
+			public receiver <Object>
+			public isDead <Boolean> ::= false.
+			protected frame <List> = List new.
+			protected stackPointer <Integer> ::= 0.
+		|
+	) (
+		public pop = (
+			| value |
+			stackPointer < 1 ifTrue: [
+					Error signal: 'Simulated operand stack underflow ' , describe
+				].
+			value:: frame at: stackPointer.
+			frame at: stackPointer put: nil.
+			stackPointer:: stackPointer - 1.
+			^value
+		)
+		public push: value = (
+			stackPointer:: stackPointer + 1.
+			stackPointer > frame size
+				ifTrue: [ frame add: value ]
+				ifFalse: [ frame at: stackPointer put: value ]
+		)
+		public size: numTemps <Integer> = (
+			(* Pre-establish the temp area, nil-filled, upstream Activation size: semantics. *)
+
+			[ frame size < numTemps ] whileTrue: [ frame add: nil ].
+			stackPointer:: numTemps
+		)
+		public tempAt: index <Integer> ^<Object> = (
+			(index between: 1 and: frame size) ifFalse: [
+					Error signal: 'Simulated temp index ' , index printString , ' out of range ' , describe
+				].
+			^frame at: index
+		)
+		public tempAt: index <Integer> put: value <Object> = (
+			(index between: 1 and: frame size) ifFalse: [
+					Error signal: 'Simulated temp index ' , index printString , ' out of range ' , describe
+				].
+			frame at: index put: value
+		)
+		public describe ^<String> = (
+			^'in ' , (nil = method ifTrue: [ '<root>' ] ifFalse: [ method selector ]) , ' at bci ' , bci printString , ' (frame ' , frame size printString , ', sp ' , stackPointer printString , ')'
+		)
+		public terminate = (
+			isDead:: true.
+			sender:: nil
+		)
+		public top ^<Object> = (
+			stackPointer < 1 ifTrue: [
+					Error signal: 'Simulated operand stack underflow ' , describe
+				].
+			^frame at: stackPointer
+		)
+	) : ()
+	public class SimulatedMethod record: r mixin: m selector: s accessModifier: am = Object new (
+		(* An MM bytecode record paired with its owning runtime mixin (records do not carry their mixin; it is captured at lookup time) under the decoder's method protocol: bytecode, literals. The record layout is [bytes, literals, numArgs, numLocals, maxStack, bciMap], per Newspeak2JSCompilation encodeBytecodeOf:. The record is nil for JS-only methods: activation of such a method is the full-speed escape. *)
+
+		|
+			public record = r.
+			public mixin = m.
+			public selector <Symbol> = s.
+			public accessModifier <Symbol> = am.
+		|
+	) (
+		public bytecode = (
+			^record at: 1
+		)
+		public literals = (
+			^record at: 2
+		)
+		public numArgs ^<Integer> = (
+			^record at: 3
+		)
+		public numLocals ^<Integer> = (
+			(* The compiler's maxLocals: parameters INCLUDED (psoup Method numTemps semantics). *)
+
+			^record at: 4
+		)
+		public maxStack ^<Integer> = (
+			^record at: 5
+		)
+		public numTemps ^<Integer> = (
+			(* numLocals already includes the parameters; adding numArgs again misshapes the frame. *)
+
+			^numLocals
+		)
+	) : ()
+) : ()

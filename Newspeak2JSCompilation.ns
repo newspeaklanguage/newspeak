@@ -1,6 +1,6 @@
 Newspeak3
 'Root'
-class Newspeak2JSCompilation usingPlatform: platform asts: asts parsing: parsing generation: generation = NewspeakCompilation usingPlatform: platform
+class Newspeak2JSCompilation usingPlatform: platform asts: asts parsing: parsing generation: generation bytecodeCompilation: bytecodeCompilation = NewspeakCompilation usingPlatform: platform
 	asts: asts (
 	(* This module provides a Newspeak-to-Javascript cross-compiler. It is a descendent of Newspeak2Javascript which takes care to generate code that is easier for V8 to optimize and which is easier to maintain because of a simpler bootstrapping story and strategy for including bits that need to be written directly in Javascript.
 
@@ -148,6 +148,9 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 		public parser = CommonParser new.
 		cachedCompilations = Map new.
 		sourcesList ::= List new.
+
+		(* The V5 bytecode compilation module instance for dual emission (see the bytecode section of the class comment), or nil to emit no bytecode. *)
+		bytecodeCompilation = bytecodeCompilation.
 	|
 ) (
 	
@@ -178,6 +181,12 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 			public supportDoesNotUnderstand ::= true.
 			public inlineOperators ::= true.
 			public enableIntrinsics ::= true.
+
+			(* When set, methods carrying the :literalmessage: primitive: pragma are rejected with a compile error, per the capability doctrine (primitives do not exist on the JS platform). Defaults to off because legacy psoup-platform sources that still carry pragmas (Namespacing, DeploymentManager, the psoup runtimes) are compiled by JS deploys today; flip once those are eradicated. The V5 bytecode path always rejects, so a pragma-carrying unit merely degrades to JS-only. *)
+			public rejectPragmas ::= false.
+			bytecodeCompiler = nil = bytecodeCompilation ifFalse: [
+					bytecodeCompilation Compiler new
+				].
 		|
 	) (
 		class PropertyCallAST new = MessageAST new (
@@ -400,9 +409,12 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 				scopeStack
 				public currentSelector
 				containsNonLocalReturn <Boolean>
-				
+
 				(* Set to false at the beginning of translating a method. The code that emits a non-local return sets this to true. The top-level code checks the value to see whether to emit a try-catch wrapper for an NLR. *)
 				methodIsPrivate <Boolean>
+
+				(* Set when the current method's body uses the _js compile-time intrinsic. Such bodies have no Newspeak semantics for a bytecode backend, so dual emission records them as JS-only. *)
+				public usesIntrinsics <Boolean>
 			|
 		) (
 			addCascadedSend: node to: statements = (
@@ -415,7 +427,8 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 			)
 			public beginNewTranslationCycle = (
 				scopeStack:: List new.
-				containsNonLocalReturn:: false
+				containsNonLocalReturn:: false.
+				usesIntrinsics:: false
 			)
 			public blockLocalReturnNode: node <BlockLocalReturnAST> = (
 				^_js return: (node expression apply: self)
@@ -664,6 +677,7 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 				^_js block: maybeCaptureReceiver , body statements
 			)
 			processIntrinsic: msg <MessageAST> = (
+				usesIntrinsics:: true.
 				^jsMirror perform: msg selector
 					with: (msg arguments collect: [:arg | processIntrinsicArg: arg ]) asArray
 					ifFail: [:e |
@@ -1062,20 +1076,23 @@ This accessor will lazily generate the nested class when its enclosing instance 
 				end: end
 		)
 		methodNode: aNode <MethodAST> ^<IntermediateMethod> = (
-			| tree <AST> jsTree |
+			| tree <AST> jsTree method <IntermediateMethod> |
+			rejectPragmasIn: aNode.
 			tree:: rewriter methodNode: aNode inScope: currentScope.
-			
+
 			(* rewrite ast *)
 			translator beginNewTranslationCycle.
 			jsTree:: tree apply: translator.
-			
+
 			(* final pass: visit rewritten ast *)
-			
+
 			(* pop scope? *)
-			^IntermediateMethod named: translator currentSelector
+			method:: IntermediateMethod named: translator currentSelector
 				accessModifier: aNode accessModifier
 				function: jsTree
-				source: ([ sourceForNode: aNode ] on: Error do: [ nil ])
+				source: ([ sourceForNode: aNode ] on: Error do: [ nil ]).
+			method usesIntrinsics: translator usesIntrinsics.
+			^method
 		)
 		popScope = (
 			currentScope:: currentScope parent
@@ -1403,7 +1420,63 @@ This accessor will lazily generate the nested class when its enclosing instance 
 			(* sentSelectors:: Set new. *)
 			intermediate:: nil = enclosingIR ifTrue: [ classNode: tree within: nil ]
 				ifFalse: [ compileNestedClassAST: tree into: enclosingIR ].
+			nil = enclosingIR ifTrue: [ attachBytecodeFrom: source to: intermediate ].
 			^intermediate
+		)
+		attachBytecodeFrom: source <String> to: intermediate <IntermediateClassDeclaration> = (
+			(* Dual emission: compile the same unit source with the V5 bytecode compiler and attach each bytecode method to the corresponding JS method (see the bytecode section of the class comment). Bytecode is an enhancement for the debugger and senders support: a failure here must never break the JS compile, so any exception leaves the affected methods JS-only. Nested compiles (enclosingIR not nil) do not get here: the bytecode compiler would need an incremental scope built from a bytecode-side intermediate mixin, which does not exist yet, so reflectively edited nested classes degrade to JS-only until recompiled as part of their unit. *)
+
+			nil = bytecodeCompiler ifTrue: [ ^self ].
+			[
+				pairBytecodeDeclaration: (bytecodeCompiler compileClassSource: source within: nil)
+					with: intermediate
+			]
+				on: Error
+				do: [:e | nil ]
+		)
+		pairBytecodeDeclaration: bytecodeDecl with: jsDecl <IntermediateClassDeclaration> = (
+			(* Both declarations were compiled from the same source, so their class trees are parallel; methods are matched by selector, nested classes by simple name. Synthetic methods (initializers, factories) intentionally fail to match: their two compilers synthesize different shapes. *)
+
+			pairBytecodeSide: bytecodeDecl instanceSide with: jsDecl instanceSide.
+			pairBytecodeSide: bytecodeDecl classSide with: jsDecl classSide.
+			jsDecl instanceSide nestedClasses do: [:jsNested |
+					bytecodeDecl instanceSide nestedClasses do: [:bcNested |
+							(qualifiedName: jsNested qualifiedName hasSimpleName: bcNested simpleName) ifTrue: [
+									pairBytecodeDeclaration: bcNested with: jsNested
+								]
+						]
+				]
+		)
+		qualifiedName: qualifiedName <String> hasSimpleName: simpleName <String> ^<Boolean> = (
+			(* The JS declarations carry backquote-qualified names; the bytecode declarations carry simple names. *)
+
+			qualifiedName = simpleName ifTrue: [ ^true ].
+			^qualifiedName endsWith: '`' , simpleName
+		)
+		pairBytecodeSide: bytecodeSide with: jsSide = (
+			jsSide methods do: [:jsMethod <IntermediateMethod> |
+					jsMethod usesIntrinsics ifFalse: [
+							bytecodeSide methods do: [:bcMethod |
+									bcMethod name = jsMethod name ifTrue: [
+											jsMethod bytecodeMethod: bcMethod
+										]
+								]
+						]
+				]
+		)
+		rejectPragmasIn: aNode <MethodAST> = (
+			(* On the JS platform, Smalltalk-style primitives do not exist and the pragma syntax is illegal: a module that needs the powers a primitive provided must import the relevant capability (currently the VMMirror) and use ordinary sends. Gated by the rejectPragmas setting until the legacy pragmas are gone. *)
+
+			| literalMsgs |
+			rejectPragmas ifFalse: [ ^self ].
+			literalMsgs:: aNode body literalMessages.
+			nil = literalMsgs ifFalse: [
+					literalMsgs do: [:messageAST |
+							messageAST selector = #primitive: ifTrue: [
+									Error signal: 'The primitive: pragma is illegal on the JS platform (in ' , aNode pattern selector , '); import a capability (VMMirror) instead'
+								]
+						]
+				]
 		)
 	) : ()
 	public class IntermediateClassDeclaration new = Object new (
@@ -1427,8 +1500,46 @@ This accessor will lazily generate the nested class when its enclosing instance 
 		classMethodsMetadata = (
 			^_js array: (classSide methods collect: [:method |
 						_js new: (_js ident: 'MM')
-							with: {_js literal: method name. _js literal: method accessModifier. _js literal: method isSynthetic. encodeSource: method source. }
+							with: {_js literal: method name. _js literal: method accessModifier. _js literal: method isSynthetic. encodeSource: method source. encodeBytecodeOf: method. }
 					])
+		)
+		encodeBytecodeOf: method <IntermediateMethod> = (
+			(* The V5 bytecode record for the MM metadata: a positional array [bytes, literals, numArgs, numLocals, maxStack, bciMap], or null for JS-only methods. bciMap is a flat [bci, start, end, ...] triple list of source ranges; note the offsets are relative to the UNIT source the bytecode compiler consumed, not to the method source stored in MM.source. Literals are emitted in their runtime representation (strings and numbers); a method with a literal that has no such representation (a fraction, an oversized integer) stays JS-only. *)
+
+			| bytecodeMethod literalNodes |
+			bytecodeMethod:: method bytecodeMethod.
+			nil = bytecodeMethod ifTrue: [ ^_js ident: 'null' ].
+			literalNodes:: List new.
+			bytecodeMethod literals do: [:literal |
+					(encodableBytecodeLiteral: literal) ifFalse: [ ^_js ident: 'null' ].
+					literalNodes add: (_js literal: literal)
+				].
+			^_js array: {
+				_js array: (bytecodeMethod bytes collect: [:b | _js literal: b ]).
+				_js array: literalNodes.
+				_js literal: bytecodeMethod argCount.
+				_js literal: bytecodeMethod maxLocals.
+				_js literal: bytecodeMethod maxStack.
+				encodeBciMapOf: bytecodeMethod.
+			}
+		)
+		encodableBytecodeLiteral: literal ^<Boolean> = (
+			literal isKindOfString ifTrue: [ ^true ].
+			literal isKindOfInteger ifTrue: [
+					^literal between: -9007199254740991 and: 9007199254740991
+				].
+			literal isKindOfFloat ifTrue: [ ^true ].
+			^false
+		)
+		encodeBciMapOf: bytecodeMethod = (
+			| entries = List new. |
+			nil = bytecodeMethod debugInfo ifTrue: [ ^_js array: entries ].
+			bytecodeMethod debugInfo bciSourceMapping keysAndValuesDo: [:bci :interval |
+					entries add: (_js literal: bci).
+					entries add: (_js literal: interval first).
+					entries add: (_js literal: interval last)
+				].
+			^_js array: entries
 		)
 		copyMethods: methods = (
 			| stmts = List new. |
@@ -1514,7 +1625,7 @@ This accessor will lazily generate the nested class when its enclosing instance 
 		methodsMetadata = (
 			^_js array: (instanceSide methods collect: [:method |
 						_js new: (_js ident: 'MM')
-							with: {_js literal: method name. _js literal: method accessModifier. _js literal: method isSynthetic. encodeSource: method source. }
+							with: {_js literal: method name. _js literal: method accessModifier. _js literal: method isSynthetic. encodeSource: method source. encodeBytecodeOf: method. }
 					])
 		)
 		nestedClassesMetadata = (
@@ -1619,6 +1730,10 @@ This accessor will lazily generate the nested class when its enclosing instance 
 			public isFactory ::= false.
 			public accessModifier <Symbol> = am.
 			public isLazySlotMethod <Boolean> ::= false.
+			public usesIntrinsics <Boolean> ::= false.
+
+			(* The V5 bytecode intermediate for the same method (an IntermediateMethod of the bytecode compilation module), or nil when the method is JS-only. *)
+			public bytecodeMethod
 		|
 	) (
 		public isPrivate ^<Boolean> = (
@@ -1796,7 +1911,7 @@ app.$main$args$(vmmirror.platform, [])'
 			sourcesList:: List new.
 			^_js script: {_js literal: 'use strict'. _js var: 'nil'
 					value: (_js literal: 'patch me with nil'). _js var: 'currentActor'. _js var: 'theGlobalObject'
-					value: (_js ident: 'this'). _js verbatim: 'function SM(n,am,m,s){this.name=n; this.accessModifier = am; this.isMutable=m; this.isSynthetic=s; }'. _js verbatim: 'function MM(n,am,sy,src){this.name=n; this.accessModifier = am; this.isSynthetic=sy; this.source=src; }'. _js verbatim: 'function dnuCatcher(s){ return function() {
+					value: (_js ident: 'this'). _js verbatim: 'function SM(n,am,m,s){this.name=n; this.accessModifier = am; this.isMutable=m; this.isSynthetic=s; }'. _js verbatim: 'function MM(n,am,sy,src,bc){this.name=n; this.accessModifier = am; this.isSynthetic=sy; this.source=src; this.bytecode = (bc === undefined) ? null : bc; }'. _js verbatim: 'function dnuCatcher(s){ return function() {
 if (this === undefined || this === null || typeof this.dnu !== "function") {
 	// The receiver is a raw JS value (an exception object, a DOM value, ...)
 	// with no Newspeak doesNotUnderstand: machinery. Raise a proper, catchable

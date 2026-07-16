@@ -1,0 +1,457 @@
+Newspeak3
+'Root'
+class Newspeak2V5BytecodeCompilation usingPlatform: platform asts: asts newspeakParser: ns3Parser intermediates: i = NewspeakBytecodeCompilation usingPlatform: platform asts: asts newspeakParser: ns3Parser intermediates: i (
+	(* The V5 bytecode specialization of NewspeakBytecodeCompilation: overrides the nested CodeGenerator with the V5 emitter and provides the V5 common-selector table. The shared pipeline (AST2ByteCodeCompiler, Rewriter, DebugInfo, the class-compilation flow) lives in the superclass module.
+
+The V5 instruction set is that of github.com/rmacnak/primordialsoup; the emitters below are ported verbatim from that repository's Newspeak2PrimordialSoupCompilation.ns at commit 338f0bb342a618f5608ab72ab1b1fae9b226e472, with the following deliberate deviations, each marked at its site:
+ - specialSelectors is an Array ordered by opcode (shared-pipeline protocol) rather than upstream's Map from selector to opcode; ordinarySend: computes the opcode from the index.
+ - halt/fail debugging traps are replaced by assert:message: with diagnostic messages.
+ - Closure arity is clamped at 7, not 15, until the upstream pushClosure 3-bit/4-bit arity decode disagreement is resolved (see BYTECODES_V5_SPEC_2026-07-13.md).
+ - blockReturnTop is a visitor-interface adapter, not an upstream method: V5 needs no distinct block-return instruction, so it maps onto returnLocalTop.
+ - The returnLocal:/returnNonLocal: constant-return forms are ported but not yet reached: the shared visitor deliberately forgoes upstream's static constant-return selection because V4's operand-stack accounting depends on the generic push-then-return path.
+
+This module serves the NS2JS toolchain: the debugger simulator steps V5 bytecode, and the per-method literal arrays double as the senders index. On the JS platform primitives do not exist (the VMMirror capability replaces them), so the primitive: pragma is rejected here rather than compiled.
+
+Copyright 2008 Cadence Design Systems, Inc.
+Copyright 2010 Gilad Bracha, Felix Geller and Ryan Macnak
+Copyright 2011 Matthias Kleine, Ryan Macnak and Cadence Design Systems
+Copyright 2012-2013 Gilad Bracha, Ryan Macnak and Cadence Design Systems
+   Licensed under the Apache License, Version 2.0 (the ''License''); you may not use this file except in compliance with the License.  You may obtain a copy of the License at  http://www.apache.org/licenses/LICENSE-2.0 *)
+
+) (
+	public class Compiler new = super Compiler new (
+	) (
+		class AST2ByteCodeCompiler new = super AST2ByteCodeCompiler new (
+		) (
+			class CodeGenerator new = super CodeGenerator new (
+			) (
+				public blockReturnTop = (
+					(* Visitor-interface adapter (not upstream): a local return of the top of stack from a block needs no distinct instruction in V5; the return is local to the block activation. *)
+
+					returnLocalTop
+				)
+				public createClosureOfArity: numArgs <Integer> copying: numCopied <Integer> length: jumpSize <Integer> = (
+					check: jumpSize between: 0 and: 65535.
+					check: numCopied between: 0 and: 15.
+
+					(* Deviation: upstream checks 0..15, but the upstream C++ interpreter decodes only 3 bits of arity where the emitter and Simulator use 4 (see BYTECODES_V5_SPEC_2026-07-13.md). Stay inside the range on which all upstream sources agree. *)
+					check: numArgs between: 0 and: 7.
+
+					decrementStackDepthBy: numCopied.
+					incrementStackDepthBy: 1.
+
+					code byte: 255;
+						byte: (numCopied << 4) | numArgs;
+						byte: (jumpSize & 255);
+						byte: jumpSize >> 8
+				)
+				public createEmptyArray: size <Integer> = (
+					incrementStackDepthBy: 1.
+					code byte: 222;
+						byte: size
+				)
+				public createFullArray: size <Integer> = (
+					decrementStackDepthBy: size.
+					incrementStackDepthBy: 1.
+					code byte: 223;
+						byte: size
+				)
+				public dup = (
+					code byte: 159.
+					incrementStackDepthBy: 1
+				)
+				public eventualSend: selector <Symbol> numArgs: numArgs <Integer> = (
+					| selectorIndex = indexForLiteral: selector. |
+					decrementStackDepthBy: numArgs + 1.
+
+					(* the receiver *)
+					incrementStackDepthBy: 1.
+
+					check: selectorIndex between: 0 and: 4095.
+					check: numArgs between: 0 and: 31.
+
+					code byte: 239;
+						byte: (selectorIndex & 255);
+						byte: (selectorIndex >> 8) | (numArgs << 4)
+				)
+				public implicitReceiverSend: selector <Symbol> numArgs: numArgs <Integer> = (
+					| selectorIndex = indexForLiteral: selector. |
+					check: selectorIndex between: 0 and: 4095.
+					check: numArgs between: 0 and: 31.
+
+					decrementStackDepthBy: numArgs.
+					incrementStackDepthBy: 1.
+
+					(selectorIndex <= 7 and: [ numArgs <= 1 ]) ifTrue: [
+							code byte: 96 + (numArgs << 3) + selectorIndex.
+							^self
+						].
+
+					code byte: 253;
+						byte: (selectorIndex & 255);
+						byte: (selectorIndex >> 8) | (numArgs << 4)
+				)
+				public indexForLiteral: literal <Value> ^<Integer> = (
+					^literalTable at: literal
+				)
+				public jumpBackTo: target <Integer> = (
+					| distance |
+					distance:: bci - target.
+					(distance between: 0 and: 14) ifTrue: [
+							code byte: 1 + distance.
+							^self
+						].
+
+					distance:: distance + 3.
+					check: distance between: 0 and: 65535.
+
+					code byte: 240;
+						byte: (distance & 255);
+						byte: distance >> 8
+				)
+				public jumpBy: distance <Integer> = (
+					check: distance between: 0 and: 65535.
+
+					code byte: 241;
+						byte: (distance & 255);
+						byte: distance >> 8
+				)
+				public jumpIf: bool <Boolean> by: distance <Integer> = (
+					check: distance between: 0 and: 65535.
+
+					decrementStackDepthBy: 1.
+
+					code byte: (bool ifTrue: [ 242 ] ifFalse: [ 243 ]);
+						byte: (distance & 255);
+						byte: distance >> 8
+				)
+				public ordinarySend: selector <Symbol> numArgs: numArgs <Integer> = (
+					| selectorIndex |
+					decrementStackDepthBy: numArgs + 1.
+
+					(* the receiver *)
+					incrementStackDepthBy: 1.
+
+					(* Deviation from upstream: specialSelectors is an Array ordered by opcode, so the opcode is 175 + the one-origin index, where upstream looks the opcode up in a Map. *)
+					(specialSelectors includes: selector) ifTrue: [
+							code byte: 175 + (specialSelectors indexOf: selector).
+							^self
+						].
+
+					selectorIndex:: indexForLiteral: selector.
+
+					check: selectorIndex between: 0 and: 4095.
+					check: numArgs between: 0 and: 31.
+
+					(selectorIndex <= 7 and: [ numArgs <= 1 ]) ifTrue: [
+							code byte: 64 + (numArgs << 3) + selectorIndex.
+							^self
+						].
+
+					code byte: 250;
+						byte: (selectorIndex & 255);
+						byte: (selectorIndex >> 8) | (numArgs << 4)
+				)
+				public outerSend: selector <Symbol> numArgs: numArgs <Integer> depth: depth <Integer> = (
+					| selectorIndex = indexForLiteral: selector. |
+					check: selectorIndex between: 0 and: 4095.
+					check: numArgs between: 0 and: 31.
+					check: depth between: 0 and: 255.
+
+					decrementStackDepthBy: numArgs.
+					incrementStackDepthBy: 1.
+
+					code byte: 254;
+						byte: (selectorIndex & 255);
+						byte: (selectorIndex >> 8) | (numArgs << 4);
+						byte: depth
+				)
+				public patchClosureJumpAt: blockBci <Integer> with: distance <Integer> = (
+					check: distance between: 0 and: 65535.
+					assert: [ (code byteAt: blockBci - 4) = 255 ]
+						message: 'Not really a closure?'.
+					code byteAt: blockBci - 2 put: (distance & 255).
+					code byteAt: blockBci - 1 put: distance >> 8
+				)
+				public patchJumpAt: jumpBci <Integer> with: distance <Integer> = (
+					check: distance between: 0 and: 65535.
+
+					assert: [ (code byteAt: jumpBci - 3) = 241 ] message: 'Not really a jump?'.
+					code byteAt: jumpBci - 2 put: (distance & 255).
+					code byteAt: jumpBci - 1 put: distance >> 8
+				)
+				public patchJumpIfAt: jumpBci <Integer> with: distance <Integer> = (
+					check: distance between: 0 and: 65535.
+
+					assert: [ (code byteAt: jumpBci - 3) between: 242 and: 243 ]
+						message: 'Not really a branch?'.
+					code byteAt: jumpBci - 2 put: (distance & 255).
+					code byteAt: jumpBci - 1 put: distance >> 8
+				)
+				public pop = (
+					code byte: 158.
+					decrementStackDepthBy: 1
+				)
+				public popIntoLocal: offset <Integer> = (
+					decrementStackDepthBy: 1.
+					offset <= 7 ifTrue: [
+							code byte: 128 + offset.
+							^self
+						].
+					code byte: 230;
+						byte: offset
+				)
+				public popIntoRemoteTemporary: index <Integer> inVector: vectorIndex <Integer> = (
+					check: index between: 0 and: 255.
+					check: vectorIndex between: 0 and: 255.
+
+					code byte: 246;
+						byte: index;
+						byte: vectorIndex - currentArgs.
+					decrementStackDepthBy: 1
+				)
+				public popIntoTemporary: index <Integer> = (
+					check: index between: 0 and: 63.
+					assert: [ index >= currentArgs ] message: 'Store into a parameter'.
+					popIntoLocal: index - currentArgs
+				)
+				public pushBoolean: value <Boolean> = (
+					code byte: (value ifTrue: [ 154 ] ifFalse: [ 153 ]).
+					incrementStackDepthBy: 1
+				)
+				public pushEnclosingObject: depth <Integer> = (
+					check: depth between: 0 and: 127.
+
+					depth = 0 ifTrue: [ ^pushSelf ].
+
+					incrementStackDepthBy: 1.
+					code byte: 233;
+						byte: depth
+				)
+				public pushInteger: n <Integer> = (
+					incrementStackDepthBy: 1.
+					n = -1 ifTrue: [
+							code byte: 160.
+							^self
+						].
+					n = 0 ifTrue: [
+							code byte: 161.
+							^self
+						].
+					n = 1 ifTrue: [
+							code byte: 162.
+							^self
+						].
+					n = 2 ifTrue: [
+							code byte: 163.
+							^self
+						].
+					code byte: 249;
+						byte: (n & 255);
+						byte: (n >> 8) & 255
+				)
+				public pushLiteral: value <Value> = (
+					^pushLiteralWithIndex: (indexForLiteral: value)
+				)
+				public pushLiteralVariable: association = (
+					(* V5 has no literal-variable bytecode. A GlobalAST reaches code generation only through V4's eventual-send lowering, which this module's Rewriter does not perform. *)
+
+					assert: [ false ] message: 'V5 has no literal-variable bytecode'
+				)
+				public pushLiteralWithIndex: index <Integer> = (
+					check: index between: 0 and: 65535.
+
+					incrementStackDepthBy: 1.
+
+					index < 8 ifTrue: [
+							code byte: 144 + index.
+							^self
+						].
+
+					code byte: 248;
+						byte: (index & 255);
+						byte: index >> 8
+				)
+				public pushLocal: offset <Integer> = (
+					incrementStackDepthBy: 1.
+					offset <= 7 ifTrue: [
+							code byte: 120 + offset.
+							^self
+						].
+					code byte: 229;
+						byte: offset
+				)
+				public pushMixin = (
+					code byte: 156.
+					incrementStackDepthBy: 1
+				)
+				public pushNil = (
+					code byte: 152.
+					incrementStackDepthBy: 1
+				)
+				public pushNumber: value <Number> = (
+					value isKindOfInteger ifTrue: [
+							(value between: -32768 and: 32767) ifTrue: [ ^pushInteger: value ]
+						].
+					^pushLiteral: value
+				)
+				public pushParameter: offset <Integer> = (
+					incrementStackDepthBy: 1.
+					offset <= 7 ifTrue: [
+							code byte: 112 + offset.
+							^self
+						].
+					code byte: 228;
+						byte: offset
+				)
+				public pushRemoteTemporary: index <Integer> inVector: vectorIndex <Integer> = (
+					check: index between: 0 and: 255.
+					check: vectorIndex between: 0 and: 255.
+
+					code byte: 245;
+						byte: index;
+						byte: vectorIndex - currentArgs.
+					incrementStackDepthBy: 1
+				)
+				public pushSelf = (
+					code byte: 155.
+					incrementStackDepthBy: 1
+				)
+				public pushTemporary: index <Integer> = (
+					check: index between: 0 and: 63.
+					index < currentArgs ifTrue: [ ^pushParameter: currentArgs - index ].
+					pushLocal: index - currentArgs
+				)
+				public returnLocal: value <Value> = (
+					nil = value ifTrue: [
+							code byte: 166.
+							^self
+						].
+					false = value ifTrue: [
+							code byte: 167.
+							^self
+						].
+					true = value ifTrue: [
+							code byte: 168.
+							^self
+						].
+					assert: [ false ] message: 'Not a constant-return value'
+				)
+				public returnLocalSelf = (
+					code byte: 169
+				)
+				public returnLocalTop = (
+					code byte: 170.
+					decrementStackDepthBy: 1
+				)
+				public returnNonLocal: value <Value> = (
+					nil = value ifTrue: [
+							code byte: 171.
+							^self
+						].
+					false = value ifTrue: [
+							code byte: 172.
+							^self
+						].
+					true = value ifTrue: [
+							code byte: 173.
+							^self
+						].
+					assert: [ false ] message: 'Not a constant-return value'
+				)
+				public returnNonLocalSelf = (
+					code byte: 174
+				)
+				public returnNonLocalTop = (
+					code byte: 175.
+					decrementStackDepthBy: 1
+				)
+				public selfSend: selector <Symbol> numArgs: numArgs <Integer> = (
+					| selectorIndex = indexForLiteral: selector. |
+					check: selectorIndex between: 0 and: 4095.
+					check: numArgs between: 0 and: 31.
+
+					decrementStackDepthBy: numArgs.
+					incrementStackDepthBy: 1.
+
+					(selectorIndex <= 7 and: [ numArgs <= 1 ]) ifTrue: [
+							code byte: 80 + (numArgs << 3) + selectorIndex.
+							^self
+						].
+
+					code byte: 251;
+						byte: (selectorIndex & 255);
+						byte: (selectorIndex >> 8) | (numArgs << 4)
+				)
+				public storeIntoLocal: offset <Integer> = (
+					offset <= 7 ifTrue: [
+							code byte: 136 + offset.
+							^self
+						].
+					code byte: 231;
+						byte: offset
+				)
+				public storeIntoRemoteTemporary: index <Integer> inVector: vectorIndex <Integer> = (
+					check: index between: 0 and: 255.
+					check: vectorIndex between: 0 and: 255.
+
+					code byte: 247;
+						byte: index;
+						byte: vectorIndex - currentArgs
+				)
+				public storeIntoTemporary: index <Integer> = (
+					check: index between: 0 and: 63.
+					assert: [ index >= currentArgs ] message: 'Store into a parameter'.
+					storeIntoLocal: index - currentArgs
+				)
+				public superSend: selector <Symbol> numArgs: numArgs <Integer> = (
+					| selectorIndex = indexForLiteral: selector. |
+					check: selectorIndex between: 0 and: 4095.
+					check: numArgs between: 0 and: 31.
+
+					decrementStackDepthBy: numArgs.
+					incrementStackDepthBy: 1.
+
+					code byte: 252;
+						byte: (selectorIndex & 255);
+						byte: (selectorIndex >> 8) | (numArgs << 4)
+				)
+			) : ()
+			processLiteralMessagesOf: node <MethodAST> = (
+				(* On the JS platform, Smalltalk-style primitives do not exist and the pragma syntax is illegal: a module that needs the powers a primitive provided must import the relevant capability (currently the VMMirror) and use ordinary sends. Reject rather than ignore, so stale pragmas surface immediately. *)
+
+				| bodyLitMessages |
+				bodyLitMessages:: node body literalMessages.
+				nil = bodyLitMessages ifFalse: [
+						bodyLitMessages do: [:messageAST |
+								messageAST selector = #primitive: ifTrue: [
+										assert: [ false ]
+											message: 'The primitive: pragma is illegal on the V5/JS compilation path; import a capability (VMMirror) instead'
+									]
+							]
+					]
+			)
+		) : ()
+		class Rewriter new = super Rewriter new (
+			(* V5 has an eventual-send instruction, so eventual sends survive rewriting intact (the isEventual flag on the message steers the AST2ByteCodeCompiler to eventualSend:numArgs:), where V4 lowers them to Processor eventualSendTo:selector:arguments:. *)
+
+		) (
+			processEventualSend: node <NormalSendAST> = (
+				(* Process it exactly like an ordinary send; messageNode: preserves the isEventual flag. *)
+
+				^processOrdinarySend: node
+			)
+		) : ()
+		computeSpecialSelectors ^<Array[Symbol]> = (
+			(* The V5 common-selector table, ordered by opcode: the send of the selector at one-origin index i is encoded as the single byte 175 + i (opcodes 176-207). *)
+
+			^{#+. #-. #*. #//. #\\. #<<. #>>. #&. #|. #<. #>. #<=. #>=. #=. #new. #new:. #at:. #at:put:. #size. #value. #value:. #value:value:. #name. #name:. #add:. #hash. #yourself. #,. #and:. #or:. #not. #basicNew. }
+		)
+	) : ()
+	check: value <Integer> between: min <Integer> and: max <Integer> = (
+		(* Range check for instruction encodings, following upstream. *)
+
+		assert: [ value >= min and: [ value <= max ] ]
+			message: 'Encoding out of range'
+	)
+) : ()

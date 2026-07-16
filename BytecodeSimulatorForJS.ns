@@ -5,7 +5,7 @@ class BytecodeSimulatorForJS usingPlatform: platform simulation: simulation = (
 
 UNDER CONSTRUCTION, first working slice: ordinary, self and super sends over the runtime-mixin metadata with upstream's access-modifier rules; local and non-local returns; closures created and activated in simulation; and the full-speed escape - a method found without a bytecode record (a _js-intrinsic body, an edited class) is invoked as its compiled JS function, so simulation seamlessly degrades to real execution method by method. Real closures receiving value in simulation resolve to their _js-intrinsic methods and therefore escape automatically; simulated closures are intercepted before lookup.
 
-Not yet ported, failing with descriptive errors: eventual sends, the unwind-protection walk (ensure:/ifCurtailed: interception by method identity), aboutToReturn:/cannotReturn: reification, and simulated closures escaping to full-speed code. Not yet wired into any runtime. *)
+Not yet ported, failing with descriptive errors: eventual sends, exception handling (on:do:), cannotReturn:/nonBooleanReceiver: reification, and simulated closures escaping to full-speed code. Unwind protection (ensure:/ifCurtailed:) IS ported: sends on simulated closures rewrite to the SimulationSupport surrogates, whose frames the non-local-return walk recognizes by method identity. Not yet wired into any runtime. *)
 
 	|
 		private List = platform collections List.
@@ -29,9 +29,56 @@ Not yet ported, failing with descriptive errors: eventual sends, the unwind-prot
 			^true
 		)
 	) : ()
+	public class SimulationSupport new = Object new (
+		(* Kernel-method surrogates the Simulator activates and recognizes BY METHOD IDENTITY - the capability-clean analogue of upstream's primitive-number markers (162 etc.). These are plain Newspeak, so dual emission gives them bytecode records: the Simulator rewrites closure-protocol sends on simulated closures into activations of these methods, their normal control flow is simply stepped, and the non-local-return walk recognizes run:ensure:/run:ifCurtailed: frames as unwind protection. The probe methods at the bottom exercise the machinery from a workspace. *)
+
+		|
+			public protectorRan <Boolean> ::= false.
+		|
+	) (
+		public loop: body = (
+			[ body value ] repeat
+		)
+		public probeEnsureNormal = (
+			protectorRan:: false.
+			^[ 7 ] ensure: [ protectorRan:: true ]
+		)
+		public probeNLRThroughEnsure = (
+			protectorRan:: false.
+			[ ^42 ] ensure: [ protectorRan:: true ].
+			^0
+		)
+		public repeatUntil: condition = (
+			[ condition value ] whileFalse.
+			^nil
+		)
+		public repeatWhile: condition = (
+			[ condition value ] whileTrue.
+			^nil
+		)
+		public run: body ensure: protector = (
+			| result |
+			result:: body value.
+			protector value.
+			^result
+		)
+		public run: body ifCurtailed: protector = (
+			^body value
+		)
+		public while: condition do: body = (
+			[ condition value ] whileTrue: [ body value ].
+			^nil
+		)
+		public whileNot: condition do: body = (
+			[ condition value ] whileFalse: [ body value ].
+			^nil
+		)
+	) : ()
 	public class Simulator new = InstructionStream new (
 		|
 			public activation <SimulatedActivation>
+			protected support = SimulationSupport new.
+			protected supportMixin = runtimeMixinOf: (behaviorOf: support).
 		|
 	) (
 		activate: simulatedMethod receiver: newReceiver arguments: arguments = (
@@ -89,6 +136,38 @@ Not yet ported, failing with descriptive errors: eventual sends, the unwind-prot
 			(isSimulatedClosure: messageReceiver) ifTrue: [
 					(isValueSelector: selector arity: arguments size) ifTrue: [
 							^activateClosure: messageReceiver arguments: arguments
+						].
+					selector = #ensure: ifTrue: [
+							^dispatchOrdinary: #run:ensure:
+								receiver: support
+								arguments: {messageReceiver. arguments at: 1. }
+						].
+					selector = #ifCurtailed: ifTrue: [
+							^dispatchOrdinary: #run:ifCurtailed:
+								receiver: support
+								arguments: {messageReceiver. arguments at: 1. }
+						].
+					selector = #whileTrue: ifTrue: [
+							^dispatchOrdinary: #while:do:
+								receiver: support
+								arguments: {messageReceiver. arguments at: 1. }
+						].
+					selector = #whileFalse: ifTrue: [
+							^dispatchOrdinary: #whileNot:do:
+								receiver: support
+								arguments: {messageReceiver. arguments at: 1. }
+						].
+					selector = #whileTrue ifTrue: [
+							^dispatchOrdinary: #repeatWhile: receiver: support arguments: {messageReceiver. }
+						].
+					selector = #whileFalse ifTrue: [
+							^dispatchOrdinary: #repeatUntil: receiver: support arguments: {messageReceiver. }
+						].
+					selector = #repeat ifTrue: [
+							^dispatchOrdinary: #loop: receiver: support arguments: {messageReceiver. }
+						].
+					selector = #on:do: ifTrue: [
+							^simulatorLimitation: 'exception handling (on:do:) is not yet simulated'
 						]
 				].
 			(true = messageReceiver or: [ false = messageReceiver ]) ifTrue: [
@@ -450,16 +529,56 @@ Not yet ported, failing with descriptive errors: eventual sends, the unwind-prot
 		returnLocalTop = (
 			^returnLocal: activation pop
 		)
-		returnNonLocal: result = (
-			(* Upstream's NLR minus the unwind-protection walk: ensure:/ifCurtailed: interception by method identity is an unported seam, so protected frames between here and home are skipped without running their unwind blocks. *)
+		aboutToReturn: result through: unwindFrame = (
+			(* An unwind-protect frame sits between the returning activation and its home: run the protector to completion, mark the frame so the re-walk passes it, then resume the non-local return. Upstream reaches this via Activation aboutToReturn:through:. *)
 
-			| closure home sender zap next |
+			unwindFrame unwindProtectorRan: true.
+			runToCompletion: (unwindFrame tempAt: 2).
+			^returnNonLocal: result
+		)
+		isUnwindProtectFrame: frame ^<Boolean> = (
+			(* Method identity: the frame runs one of the SimulationSupport unwind surrogates and its protector has not run yet. *)
+
+			nil = frame method ifTrue: [ ^false ].
+			frame unwindProtectorRan ifTrue: [ ^false ].
+			(_js operator: '===' with: frame method mixin and: supportMixin) ifFalse: [ ^false ].
+			^frame method selector = #run:ensure: or: [ frame method selector = #run:ifCurtailed: ]
+		)
+		runToCompletion: valuable = (
+			(* Evaluate a niladic valuable in a nested simulation loop, answering its value; used where the main loop's control state must be preserved around the evaluation (unwind protectors). *)
+
+			| saved sentinel |
+			(isSimulatedClosure: valuable) ifFalse: [
+					^(Message selector: #value arguments: (newArraySized: 0)) sendTo: valuable
+				].
+			saved:: activation.
+			sentinel:: SimulatedActivation new.
+			activation:: sentinel.
+			activateClosure: valuable arguments: (newArraySized: 0).
+			[ sameActivation: activation as: sentinel ] whileFalse: [ interpretNextInstruction ].
+			activation:: saved.
+			^sentinel pop
+		)
+		returnNonLocal: result = (
+			(* Upstream's NLR including the unwind-protection walk: frames running the SimulationSupport unwind surrogates are recognized by method identity and their protectors run before the return proceeds. *)
+
+			| closure home sender unwind zap next |
 			closure:: activation closure.
 			home:: closure definingActivation.
 			closure:: home closure.
 			[ nil = closure ] whileFalse: [
 					home:: closure definingActivation.
 					closure:: home closure
+				].
+			unwind:: activation sender.
+			[ sameActivation: unwind as: home ] whileFalse: [
+					nil = unwind ifTrue: [
+							^simulatorLimitation: 'non-local return past the simulation root'
+						].
+					(isUnwindProtectFrame: unwind) ifTrue: [
+							^aboutToReturn: result through: unwind
+						].
+					unwind:: unwind sender
 				].
 			sender:: home sender.
 			(nil = sender or: [ sender isDead ]) ifTrue: [
@@ -585,6 +704,7 @@ Not yet ported, failing with descriptive errors: eventual sends, the unwind-prot
 			public closure <SimulatedClosure | nil>
 			public receiver <Object>
 			public isDead <Boolean> ::= false.
+			public unwindProtectorRan <Boolean> ::= false.
 			protected frame <List> = List new.
 			protected stackPointer <Integer> ::= 0.
 		|

@@ -5,12 +5,13 @@ class BytecodeSimulatorForJS usingPlatform: platform simulation: simulation = (
 
 UNDER CONSTRUCTION, first working slice: ordinary, self and super sends over the runtime-mixin metadata with upstream's access-modifier rules; local and non-local returns; closures created and activated in simulation; and the full-speed escape - a method found without a bytecode record (a _js-intrinsic body, an edited class) is invoked as its compiled JS function, so simulation seamlessly degrades to real execution method by method. Real closures receiving value in simulation resolve to their _js-intrinsic methods and therefore escape automatically; simulated closures are intercepted before lookup.
 
-Not yet ported, failing with descriptive errors: eventual sends, exception handling (on:do:), cannotReturn:/nonBooleanReceiver: reification, and simulated closures escaping to full-speed code. Unwind protection (ensure:/ifCurtailed:) IS ported: sends on simulated closures rewrite to the SimulationSupport surrogates, whose frames the non-local-return walk recognizes by method identity. Not yet wired into any runtime. *)
+Not yet ported, failing with descriptive errors: eventual sends, cannotReturn:/nonBooleanReceiver: reification, and simulated closures escaping to full-speed code. Exception handling IS simulated: on:do: rewrites to the run:protectedBy:handler: surrogate; any signal (stepped code and full-speed escapes alike throw through the step loop, since simulated frames are data) routes to the nearest matching handler frame by method identity, running intervening unwind protectors first. A stepping driver is included: start:send:with:, step, stepOver, stepThrough, stackDo:, atEnd, result. Unwind protection (ensure:/ifCurtailed:) IS ported: sends on simulated closures rewrite to the SimulationSupport surrogates, whose frames the non-local-return walk recognizes by method identity. Not yet wired into any runtime. *)
 
 	|
 		private List = platform collections List.
 		private InstructionStream = simulation InstructionStream.
 		private Message = platform kernel Message.
+		private Exception = platform kernel Exception.
 	|
 ) (
 	public class SimulatedClosure in: definingActivation_ initialBCI: initialBCI_ numArgs: numArgs_ numCopied: numCopied_ = (
@@ -65,6 +66,25 @@ Not yet ported, failing with descriptive errors: eventual sends, exception handl
 		public run: body ifCurtailed: protector = (
 			^body value
 		)
+		public run: body protectedBy: exceptionClass handler: handler = (
+			(* The on:do: surrogate: its frame carries the exception class and handler in temps 2 and 3; the Simulator's signal machinery recognizes the frame by method identity and runs the handler itself, so this body only evaluates the protected block. *)
+
+			^body value
+		)
+		public probeCaughtSignal = (
+			^[ Error signal: 'boom' ] on: Exception do: [:e | 99 ]
+		)
+		public probeEnsureDuringUnwind = (
+			protectorRan:: false.
+			^[ [ Error signal: 'x' ] ensure: [ protectorRan:: true ] ]
+				on: Exception
+				do: [:e | 7 ]
+		)
+		public probeUncaught = (
+			(* The handler class never matches (Message is not in any exception's class chain), so the signal must propagate out of the simulation to the caller as a real exception. *)
+
+			^[ Error signal: 'escaped' ] on: Message do: [:e | 0 ]
+		)
 		public while: condition do: body = (
 			[ condition value ] whileTrue: [ body value ].
 			^nil
@@ -77,6 +97,7 @@ Not yet ported, failing with descriptive errors: eventual sends, exception handl
 	public class Simulator new = InstructionStream new (
 		|
 			public activation <SimulatedActivation>
+			protected root <SimulatedActivation>
 			protected support = SimulationSupport new.
 			protected supportMixin = runtimeMixinOf: (behaviorOf: support).
 		|
@@ -167,7 +188,9 @@ Not yet ported, failing with descriptive errors: eventual sends, exception handl
 							^dispatchOrdinary: #loop: receiver: support arguments: {messageReceiver. }
 						].
 					selector = #on:do: ifTrue: [
-							^simulatorLimitation: 'exception handling (on:do:) is not yet simulated'
+							^dispatchOrdinary: #run:protectedBy:handler:
+								receiver: support
+								arguments: {messageReceiver. arguments at: 1. arguments at: 2. }
 						]
 				].
 			(true = messageReceiver or: [ false = messageReceiver ]) ifTrue: [
@@ -555,7 +578,7 @@ Not yet ported, failing with descriptive errors: eventual sends, exception handl
 			sentinel:: SimulatedActivation new.
 			activation:: sentinel.
 			activateClosure: valuable arguments: (newArraySized: 0).
-			[ sameActivation: activation as: sentinel ] whileFalse: [ interpretNextInstruction ].
+			[ sameActivation: activation as: sentinel ] whileFalse: [ step ].
 			activation:: saved.
 			^sentinel pop
 		)
@@ -660,15 +683,160 @@ Not yet ported, failing with descriptive errors: eventual sends, exception handl
 				].
 			^escapeDnu: selector receiver: messageReceiver arguments: arguments
 		)
-		public simulate: receiver send: selector with: arguments = (
-			(* The driver: dispatch the send in simulation and step until it returns, answering the result. The root sentinel activation collects it. *)
+		public atEnd ^<Boolean> = (
+			^sameActivation: activation as: root
+		)
+		exceptionMatches: signaled class: exceptionClass ^<Boolean> = (
+			(* The kernel on:do: matching rule: walk the signaled object's class chain comparing identity; raw JS errors carry no newspeakClass and match as plain Exception. *)
 
-			| root |
+			| c |
+			c:: normalizeNull: (_js propertyOf: signaled at: (_js literal: 'newspeakClass')).
+			nil = c ifTrue: [ c:: Exception ].
+			[ nil = c ] whileFalse: [
+					(_js operator: '===' with: c and: exceptionClass) ifTrue: [ ^true ].
+					c:: c superclass
+				].
+			^false
+		)
+		handleSignal: signaled = (
+			(* A signal surfaced during a step (all stepped code and every full-speed escape throws through the step loop, since simulated frames are data, not JS frames). Find the nearest live handler frame below the current activation, run the intervening unwind protectors innermost-first, run the handler at full simulation, and return its result from the handler frame. No matching frame: rethrow to the real caller of the simulation. *)
+
+			| frame handler result sender zap next |
+			frame:: activation.
+			[ nil = frame ] whileFalse: [
+					(isLiveHandlerFrame: frame for: signaled) ifTrue: [
+							frame unwindProtectorRan: true.
+							runProtectorsFrom: activation to: frame.
+							handler:: frame tempAt: 3.
+							result:: runToCompletion: handler withArgument: signaled.
+							sender:: frame sender.
+							zap:: activation.
+							[ sameActivation: zap as: sender ] whileFalse: [
+									next:: zap sender.
+									zap terminate.
+									zap:: next
+								].
+							sender push: result.
+							activation:: sender.
+							^self
+						].
+					frame:: frame sender
+				].
+			_js throw: signaled
+		)
+		public home: frame ^<SimulatedActivation> = (
+			(* The method activation a block activation lexically belongs to; a method frame is its own home. *)
+
+			nil = frame closure ifTrue: [ ^frame ].
+			^home: frame closure definingActivation
+		)
+		isLiveHandlerFrame: frame for: signaled ^<Boolean> = (
+			nil = frame method ifTrue: [ ^false ].
+			frame unwindProtectorRan ifTrue: [ ^false ].
+			(_js operator: '===' with: frame method mixin and: supportMixin) ifFalse: [ ^false ].
+			frame method selector = #run:protectedBy:handler: ifFalse: [ ^false ].
+			^exceptionMatches: signaled class: (frame tempAt: 2)
+		)
+		public reached: goal ^<Boolean> = (
+			(* Upstream has:reachedOrSkipped:: true when the current activation IS the goal, or the goal is no longer on the sender chain (skipped via a non-local return or an unwind). *)
+
+			| a |
+			a:: activation.
+			(sameActivation: a as: goal) ifTrue: [ ^true ].
+			[ nil = a ] whileFalse: [
+					(sameActivation: a as: goal) ifTrue: [ ^false ].
+					a:: a sender
+				].
+			^true
+		)
+		public reachedHome: goal ^<Boolean> = (
+			(* Upstream has:reachedOrSkippedHome:: like reached:, but any activation whose home is the goal counts - stepping THROUGH a method lands in the blocks it activates. *)
+
+			| a |
+			a:: activation.
+			(sameActivation: (home: a) as: goal) ifTrue: [ ^true ].
+			[ nil = a ] whileFalse: [
+					(sameActivation: (home: a) as: goal) ifTrue: [ ^false ].
+					a:: a sender
+				].
+			^true
+		)
+		public result = (
+			^root pop
+		)
+		runProtectorsFrom: start to: handlerFrame = (
+			(* Run every not-yet-run unwind protector between the signaling activation and the handler frame, innermost first, marking each. *)
+
+			| frame |
+			frame:: start.
+			[ sameActivation: frame as: handlerFrame ] whileFalse: [
+					(isUnwindProtectFrame: frame) ifTrue: [
+							frame unwindProtectorRan: true.
+							runToCompletion: (frame tempAt: 2)
+						].
+					frame:: frame sender
+				]
+		)
+		runToCompletion: valuable withArgument: argument = (
+			| saved sentinel |
+			(isSimulatedClosure: valuable) ifFalse: [
+					^(Message selector: #value: arguments: {argument. }) sendTo: valuable
+				].
+			saved:: activation.
+			sentinel:: SimulatedActivation new.
+			activation:: sentinel.
+			activateClosure: valuable arguments: {argument. }.
+			[ sameActivation: activation as: sentinel ] whileFalse: [ step ].
+			activation:: saved.
+			^sentinel pop
+		)
+		public simulate: receiver send: selector with: arguments = (
+			(* Run a send in simulation to completion, answering the result. Equivalent to start:send:with: followed by stepping to the end. *)
+
+			start: receiver send: selector with: arguments.
+			[ atEnd ] whileFalse: [ step ].
+			^result
+		)
+		public stackDo: aBlock = (
+			(* The live simulated frames, innermost first, excluding the root sentinel. *)
+
+			| frame |
+			frame:: activation.
+			[ nil = frame or: [ sameActivation: frame as: root ] ] whileFalse: [
+					aBlock value: frame.
+					frame:: frame sender
+				]
+		)
+		public start: receiver send: selector with: arguments = (
+			(* Begin a debugging session: dispatch the send but do not step. Drive with step / stepOver / stepThrough; inspect with stackDo:; finish with atEnd / result. *)
+
 			root:: SimulatedActivation new.
 			activation:: root.
-			dispatchOrdinary: selector receiver: receiver arguments: arguments.
-			[ sameActivation: activation as: root ] whileFalse: [ interpretNextInstruction ].
-			^root pop
+			[ dispatchOrdinary: selector receiver: receiver arguments: arguments ]
+				on: Exception
+				do: [:e | handleSignal: e ]
+		)
+		public step = (
+			(* One instruction, with the signal machinery guarding it: any exception raised by stepped code or a full-speed escape is routed to the nearest simulated handler frame. *)
+
+			atEnd ifTrue: [ ^self ].
+			[ interpretNextInstruction ] on: Exception do: [:e | handleSignal: e ]
+		)
+		public stepOver = (
+			(* Execute the current instruction and whatever it activates, stopping when control is back in the current activation (or it was skipped by a non-local return). *)
+
+			| goal |
+			goal:: activation.
+			step.
+			[ atEnd or: [ reached: goal ] ] whileFalse: [ step ]
+		)
+		public stepThrough = (
+			(* Like stepOver, but stops inside blocks belonging to the current activation. *)
+
+			| goal |
+			goal:: home: activation.
+			step.
+			[ atEnd or: [ reachedHome: goal ] ] whileFalse: [ step ]
 		)
 		simulatorLimitation: text = (
 			Error signal: 'Simulator limitation: ' , text

@@ -3667,6 +3667,10 @@ depending on how they are used. *)
 		|
 			public base <Fragment> = b.
 			public control <Fragment> = c.
+
+			(* ResizeObserver that re-anchors the control to the base's border box
+	     whenever the base (or control) changes size. Held so it is not collected. *)
+			public resizeObserver <Alien>
 		|
 	) (
 		public isKindOfOverlayComposer ^<Boolean> = (
@@ -3704,6 +3708,43 @@ depending on how they are used. *)
 			cv at: 'onmouseenter' put: [:e <Alien[Event]> | (cv at: 'style') at: 'opacity' put: '1'. nil ].
 			cv at: 'onmouseleave' put: [:e <Alien[Event]> | (cv at: 'style') at: 'opacity' put: '0.75'. nil ]
 		)
+		positionControl = (
+			(* Anchor the control to the base's TRUE top-right corner. offsetLeft/Top/Width
+		   are measured relative to the position:relative container (the base's
+		   offsetParent), so they already include any margin the parsed base carries --
+		   which is exactly the gap the old static top/right could not account for. We
+		   place the control's right edge at the base's right edge and its top at the
+		   base's top, insetting by the same 6px/4px the static rule used. Best-effort:
+		   before the visual is attached (or with no ResizeObserver) the measurements are
+		   0 and the static top/right in styleControl: serves until the observer fires. *)
+			| b <Alien[HTMLElement]> = base visual. cv <Alien[HTMLElement]> = control visual. |
+			(b isNil or: [ cv isNil ]) ifTrue: [ ^self ].
+			[
+				| baseTop <Integer> baseRight <Integer> left <Integer> |
+				baseTop:: b at: 'offsetTop'.
+				baseRight:: (b at: 'offsetLeft') + (b at: 'offsetWidth').
+				left:: (baseRight - (cv at: 'offsetWidth')) - 6.
+				left < 0 ifTrue: [ left:: 0 ].
+				(cv at: 'style') at: 'top' put: (baseTop + 4) printString , 'px';
+					at: 'left' put: left printString , 'px';
+					at: 'right' put: 'auto'
+			] on: Exception do: [:e | nil ]
+		)
+		observeForReposition = (
+			(* Re-anchor whenever the base or control changes size (document widened in the
+		   source, control content changed, fonts loaded). ResizeObserver delivers an
+		   initial callback once each observed element has a layout box, so this also
+		   drives the FIRST accurate placement after the container is attached. Guarded
+		   so an unavailable ResizeObserver (old engine) degrades to the static rule. *)
+			[
+				resizeObserver:: (window at: 'ResizeObserver') new: [:entries :observer |
+						positionControl.
+						nil
+					].
+				resizeObserver observe: base visual.
+				resizeObserver observe: control visual
+			] on: Exception do: [:e | nil ]
+		)
 		createVisual ^<Alien[HTMLElement]> = (
 			| container <Alien[HTMLElement]> = document createElement: 'div'. |
 			styleContainer: container.
@@ -3712,6 +3753,8 @@ depending on how they are used. *)
 			container appendChild: base visual.
 			styleControl: control visual.
 			container appendChild: control visual.
+			observeForReposition.
+			positionControl.
 			^container
 		)
 		updateVisualsFromSameKind: oldFragment <OverlayComposer> ^<Alien[Element]> = (
@@ -3720,6 +3763,13 @@ depending on how they are used. *)
 			control parent: self.
 			control updateVisualsFrom: oldFragment control.
 			styleControl: control visual.
+
+			(* The visuals are reused; drop the old generation's observer and start a fresh
+		   one on this generation so its callback closes over the live fragment. *)
+			[ oldFragment resizeObserver isNil ifFalse: [ oldFragment resizeObserver disconnect ] ]
+				on: Exception do: [:e | nil ].
+			observeForReposition.
+			positionControl.
 			^oldFragment visual
 		)
 	) : ()
@@ -5613,6 +5663,9 @@ Ultimately, we aren't using this method because the navigation controls carry ov
 	public dropDownImage = (
 		^images dropDownImage
 	)
+	public editIcon = (
+		^images editIcon
+	)
 	public findImage = (
 		^images findImage
 	)
@@ -5707,12 +5760,16 @@ Ultimately, we aren't using this method because the navigation controls carry ov
 		blk value: fs value: pos
 	)
 	showMenu: menu <Alien[Div]> forShell: s <HopscotchShell> inVisual: v <Visual> = (
-		| vbr = v getBoundingClientRect. |
-		v appendChild: menu.
+		(* See showMenu:forFragment: -- portal the popup to <body> so a positioned /
+	   backdrop-filtered / overflow-clipped ancestor cannot clip it or trap its
+	   positioning, lift it above the app (z-index), then clamp it into the viewport
+	   so a trigger near an edge does not push part of the menu off-screen. *)
+		| vbr = v getBoundingClientRect. host <Alien[Node]> = document at: #body. |
+		host appendChild: menu.
 		(menu at: 'style') at: 'position' put: 'absolute';
-			at: 'left' put: ((window at: #scrollX) + (vbr at: 'left')) asString , 'px';
-			at: 'top' put: ((window at: #scrollY) + (vbr at: 'top')) asString , 'px';
-			at: 'width' put: (menu at: 'offsetWidth') asString , 'px'.
+			at: 'width' put: (menu at: 'offsetWidth') asString , 'px';
+			at: 'z-index' put: '1000'.
+		positionMenu: menu atTriggerRect: vbr.
 		menu at: 'tabIndex' put: 0.
 		menu at: 'onblur'
 			put: [:event |
@@ -5721,15 +5778,28 @@ Ultimately, we aren't using this method because the navigation controls carry ov
 			].
 		menu focus.
 		s activeMenu: menu.
-		s activeMenuParent: v
+		s activeMenuParent: host
 	)
 	showMenu: menu <Alien[Div]> forFragment: m <DropDownMenuFragment> = (
-		| s <HopscotchShell> = m shell. v <Visual> = m visual. vbr = v getBoundingClientRect. |
-		v appendChild: menu.
+		(* Portal the popup to <body> rather than nesting it inside the trigger. The
+	   trigger may sit inside a positioned / backdrop-filtered / overflow-clipped
+	   container (e.g. an OverlayComposer's control), any of which would clip the
+	   popup or trap its absolute positioning and saddle it with scrollbars. As a
+	   direct child of the static <body>, the popup's page-coordinate positioning
+	   (scroll + the trigger's client rect) resolves against the initial containing
+	   block -- exactly as it did for a trigger with no positioned ancestor.
+	   activeMenuParent tracks <body> so closeActiveMenu still removes it. *)
+		| s <HopscotchShell> = m shell. v <Visual> = m visual. vbr = v getBoundingClientRect.
+		host <Alien[Node]> = document at: #body. |
+		host appendChild: menu.
 		(menu at: 'style') at: 'position' put: 'absolute';
-			at: 'left' put: ((window at: #scrollX) + (vbr at: 'left')) asString , 'px';
-			at: 'top' put: ((window at: #scrollY) + (vbr at: 'top')) asString , 'px';
-			at: 'width' put: (menu at: 'offsetWidth') asString , 'px'.
+			at: 'width' put: (menu at: 'offsetWidth') asString , 'px';
+
+			(* Above any positioned/filtered UI it may overlap -- notably an
+	     OverlayComposer control (z-index 30) sitting right where the popup opens.
+	     As a <body> child a high z-index makes it top-most across the app. *)
+			at: 'z-index' put: '1000'.
+		positionMenu: menu atTriggerRect: vbr.
 		menu at: 'tabIndex' put: 0.
 		menu at: 'onblur'
 			put: [:event |
@@ -5738,7 +5808,23 @@ Ultimately, we aren't using this method because the navigation controls carry ov
 			].
 		menu focus.
 		s activeMenu: menu.
-		s activeMenuParent: v
+		s activeMenuParent: host
+	)
+	positionMenu: menu <Alien[Div]> atTriggerRect: vbr <Alien[DOMRect]> = (
+		(* Place the popup at the trigger's top-left (in page coordinates), but shifted
+	   just enough to stay inside the viewport when it would otherwise spill past the
+	   right or bottom edge -- e.g. a menu on a right-aligned top-level control whose
+	   trigger sits near the window edge. offsetWidth/Height are read after the popup
+	   is in the DOM and its width is fixed, so they are the real rendered size. *)
+		| margin <Integer> = 4. mw <Integer> = menu at: 'offsetWidth'. mh <Integer> = menu at: 'offsetHeight'.
+		vw <Integer> = window at: #innerWidth. vh <Integer> = window at: #innerHeight.
+		left ::= vbr at: 'left'. top ::= vbr at: 'top'. |
+		(left + mw) > vw ifTrue: [ left:: vw - mw - margin ].
+		left < margin ifTrue: [ left:: margin ].
+		(top + mh) > vh ifTrue: [ top:: vh - mh - margin ].
+		top < margin ifTrue: [ top:: margin ].
+		(menu at: 'style') at: 'left' put: ((window at: #scrollX) + left) asString , 'px';
+			at: 'top' put: ((window at: #scrollY) + top) asString , 'px'
 	)
 	clearCurrentMenu = (
 		currentHopscotchWindow activeMenuBlurred

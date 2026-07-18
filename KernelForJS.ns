@@ -83,7 +83,17 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 			^low
 		)
 		public collect: block = (
-			^_js call: (_js propertyOf: self at: (_js literal: 'map')) with: {block. }
+			(* Index loop, NOT native map: a block performing ^ returns the NLR sentinel (M4), which must propagate out of collect: -- map would store it as an ELEMENT and parsing-style NLR failure paths would corrupt the result instead of unwinding. *)
+			| i ::= 0. len ::= _js verbatim: 'this.length'. result r |
+			result:: _js new: (_js ident: 'Array') with: {len. }.
+			_js for: (_js verbatim: '')
+				while: (_js operator: '<' with: i and: len)
+				step: (_js postfixOperator: '++' on: i)
+				do: (_js block: {r:: _js call: block
+						with: {_js propertyOf: self at: i. }. _js if: (_js operator: '===' with: r and: (_js ident: 'NLRSentinel'))
+						then: (_js block: {_js return: r. }). _js assign: (_js propertyOf: result at: i)
+						toBe: r. }).
+			^result
 		)
 		public copyFrom: start to: end = (
 			^_js call: (_js propertyOf: self at: (_js literal: 'slice'))
@@ -158,7 +168,14 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 			i < r ifTrue: [ defaultSort: i to: r ]
 		)
 		public do: block = (
-			_js call: (_js propertyOf: self at: (_js literal: 'forEach')) with: {block. }
+			(* Index loop, NOT forEach: a block performing ^ returns the NLR sentinel (M4), which must break the loop and propagate out of do: -- native forEach would discard it and run every remaining element. *)
+			| i ::= 0. len ::= _js verbatim: 'this.length'. r |
+			_js for: (_js verbatim: '')
+				while: (_js operator: '<' with: i and: len)
+				step: (_js postfixOperator: '++' on: i)
+				do: (_js block: {r:: _js call: block
+						with: {_js propertyOf: self at: i. }. _js if: (_js operator: '===' with: r and: (_js ident: 'NLRSentinel'))
+						then: (_js block: {_js return: r. }). })
 		)
 		public do: block separatedBy: betweenBlock = (
 			| firstTime ::= true. |
@@ -203,8 +220,16 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 			^0
 		)
 		public inject: initialValue into: accumulator = (
-			^_js call: (_js propertyOf: self at: (_js literal: 'reduce'))
-				with: {accumulator. initialValue. }
+			(* Index loop, NOT native reduce: propagate an NLR sentinel (M4) out of the fold instead of feeding it back as the accumulator. *)
+			| i ::= 0. len ::= _js verbatim: 'this.length'. acc |
+			acc:: initialValue.
+			_js for: (_js verbatim: '')
+				while: (_js operator: '<' with: i and: len)
+				step: (_js postfixOperator: '++' on: i)
+				do: (_js block: {acc:: _js call: accumulator
+						with: {acc. _js propertyOf: self at: i. }. _js if: (_js operator: '===' with: acc and: (_js ident: 'NLRSentinel'))
+						then: (_js block: {_js return: acc. }). }).
+			^acc
 		)
 		public isEmpty = (
 			^0 == size
@@ -254,7 +279,18 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 				]
 		)
 		public select: block = (
-			^_js call: (_js propertyOf: self at: (_js literal: 'filter')) with: {block. }
+			(* Index loop, NOT native filter: propagate an NLR sentinel (M4); filter would coerce it to truthiness and lose the return. *)
+			| i ::= 0. len ::= _js verbatim: 'this.length'. result r |
+			result:: _js new: (_js ident: 'Array') with: {}.
+			_js for: (_js verbatim: '')
+				while: (_js operator: '<' with: i and: len)
+				step: (_js postfixOperator: '++' on: i)
+				do: (_js block: {r:: _js call: block
+						with: {_js propertyOf: self at: i. }. _js if: (_js operator: '===' with: r and: (_js ident: 'NLRSentinel'))
+						then: (_js block: {_js return: r. }). _js if: r
+						then: (_js block: {_js call: (_js propertyOf: result at: (_js literal: 'push'))
+								with: {_js propertyOf: self at: i. }. }). }).
+			^result
 		)
 		public size ^<Integer> = (
 			^_js propertyOf: self at: (_js literal: 'length')
@@ -468,7 +504,14 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 			^result
 		)
 		public do: block = (
-			_js call: (_js propertyOf: self at: (_js literal: 'forEach')) with: {block. }
+			(* Index loop, NOT forEach: propagate an NLR sentinel (M4) out of the loop. *)
+			| i ::= 0. len ::= _js verbatim: 'this.length'. r |
+			_js for: (_js verbatim: '')
+				while: (_js operator: '<' with: i and: len)
+				step: (_js postfixOperator: '++' on: i)
+				do: (_js block: {r:: _js call: block
+						with: {_js propertyOf: self at: i. }. _js if: (_js operator: '===' with: r and: (_js ident: 'NLRSentinel'))
+						then: (_js block: {_js return: r. }). })
 		)
 		public endsWith: suffix = (
 			| offset |
@@ -625,12 +668,13 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 			^_js call: (_js ident: 'this') with: {a1. a2. a3. }
 		)
 		public ensure: onUnwind = (
-			| result |
-			_js try: (_js block: {result:: self value. })
-				catch: (_js ident: 'e')
-				with: (_js block: {onUnwind value. _js throw: (_js ident: 'e'). }).
-			onUnwind value.
-			^result
+			(* Real try/finally, required by sentinel NLR (M4): a non-local return is a RETURN, not a throw, so a catch-based protector would be skipped. finally runs on return (sentinel or normal) and on throw alike.
+
+		The protector runs with NLRPayload saved and restored: if an INNER non-local return completes entirely within the protector, it uses and clears NLRPayload; without the restore, an in-flight outer NLR (whose sentinel is the current return value of the try) would resume with a dead payload. If the protector itself NLRs OUTWARD, the checked send below returns the sentinel from inside the finally -- JS's return-in-finally override -- which is exactly the newest-NLR-wins redirect semantics, and the restore is correctly skipped. *)
+			| saved |
+			_js try: (_js block: {_js return: self value. })
+				finally: (_js block: {saved:: _js ident: 'NLRPayload'. onUnwind value. _js assign: (_js ident: 'NLRPayload')
+						toBe: saved. })
 		)
 		public isKindOfClosure ^<Boolean> = (
 			^true
@@ -645,12 +689,9 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 			_js try: (_js block: {_js return: self value. })
 				catch: (_js ident: 'e')
 				with: (_js block: {
-					(* A non-local return passing through: not ours to catch (see the token marking in Newspeak2JSCompilation wrapBodyForNlrHandling:). *)
-					_js if: (_js operator: '==='
-							with: (_js propertyOf: (_js ident: 'e') at: (_js literal: 'nlrToken'))
-							and: (_js literal: true))
-						then: (_js block: {_js throw: (_js ident: 'e'). }). c:: _js propertyOf: (_js ident: 'e')
-						at: (_js literal: 'newspeakClass'). 
+					(* Under sentinel NLR (M4) a non-local return is a return, never a throw, so it structurally cannot arrive here -- no token check needed. *)
+					c:: _js propertyOf: (_js ident: 'e')
+						at: (_js literal: 'newspeakClass').
 					(* Raw JS errors (DOMException, TypeError, etc.) have no
 		   newspeakClass. Treat them as plain Exception so handlers
 		   that catch Exception / Error at the FFI boundary work. *)
@@ -1116,29 +1157,33 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 				with: {self. }
 		)
 		public timesRepeat: block = (
-			| i ::= 0. |
+			| i ::= 0. r |
 			_js for: (_js verbatim: '')
 				while: (_js operator: '<' with: i and: (_js ident: 'this'))
 				step: (_js postfixOperator: '++' on: i)
-				do: (_js block: {_js call: block with: {}. })
+				do: (_js block: {r:: _js call: block with: {}. _js if: (_js operator: '===' with: r and: (_js ident: 'NLRSentinel'))
+						then: (_js block: {_js return: r. }). })
 		)
 		public to: stop = (
 			^platform collections Interval from: self to: stop
 		)
 		public to: limit do: block = (
-			| i ::= self. |
+			(* The block result check propagates an NLR sentinel (M4) out of the loop; without it a ^ inside the block would neither break the loop nor unwind. *)
+			| i ::= self. r |
 			_js for: (_js verbatim: '')
 				while: (_js operator: '<=' with: i and: limit)
 				step: (_js postfixOperator: '++' on: i)
-				do: (_js block: {_js call: block with: {i. }. })
+				do: (_js block: {r:: _js call: block with: {i. }. _js if: (_js operator: '===' with: r and: (_js ident: 'NLRSentinel'))
+						then: (_js block: {_js return: r. }). })
 		)
 		public to: limit by: step do: block = (
-			| i ::= self. |
+			| i ::= self. r |
 			_js for: (_js verbatim: '')
 				while: (step > 0 ifTrue: [ _js operator: '<=' with: i and: limit ]
 					ifFalse: [ _js operator: '>=' with: i and: limit ])
 				step: (_js assign: i toBe: (_js operator: '+' with: i and: step))
-				do: (_js block: {_js call: block with: {i. }. })
+				do: (_js block: {r:: _js call: block with: {i. }. _js if: (_js operator: '===' with: r and: (_js ident: 'NLRSentinel'))
+						then: (_js block: {_js return: r. }). })
 		)
 		public truncated = (
 			^self > 0 ifTrue: [ self floor ] ifFalse: [ self ceiling ]
@@ -1572,13 +1617,14 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 				]
 		)
 		public do: action = (
-			| i ::= 0. len ::= _js verbatim: 'this.length'. |
+			| i ::= 0. len ::= _js verbatim: 'this.length'. r |
 			_js for: (_js verbatim: '')
 				while: (_js operator: '<' with: i and: len)
 				step: (_js postfixOperator: '++' on: i)
-				do: (_js block: {_js call: action
+				do: (_js block: {r:: _js call: action
 						with: {_js call: (_js propertyOf: self at: (_js literal: 'charCodeAt'))
-							with: {i. }. }. (* {_js propertyOf: self at: i} *) })
+							with: {i. }. }. (* {_js propertyOf: self at: i} *) _js if: (_js operator: '===' with: r and: (_js ident: 'NLRSentinel'))
+						then: (_js block: {_js return: r. }). })
 		)
 		public at: index <Integer> ^<Integer> = (
 			^_js call: (_js propertyOf: self at: (_js literal: 'charCodeAt'))

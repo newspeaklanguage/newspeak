@@ -13,8 +13,103 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 	|
 		vmmirror = vmm.
 		public platform
+
+		(* The dynamic exception-handler stack (innermost = top), a linked chain of HandlerEntry. Pushed by on:do:, popped by its ensure: (self-healing on every exit path: normal return, sentinel NLR, raw JS throw - the pops ride the finallys). The signal machinery DISABLES entries rather than removing them; removal belongs to the owning on:do: alone. See the Stage 2 design (NLR_DEBUGGER_DESIGN_2026-07-16.md par. 8). *)
+		topHandler
 	|
 ) (
+	class HandlerEntry on: c <Exception class> wrapper: w <[:Exception]> returner: r <[:Object]> = Object new (
+		(* One on:do: activation's registration. wrapper and returner are closures whose NLR home is the owning on:do: activation: invoking wrapper unwinds from the raise point to the on:do: with the handler's value (Smalltalk handler-completion semantics), invoking returner does the same with an explicit value (Exception>>return:). *)
+
+		|
+			public exceptionClass = c.
+			public wrapper = w.
+			public returner = r.
+			public disabled ::= false.
+			public prev
+		|
+	) (
+	) : ()
+	pushHandler: entry = (
+		entry prev: topHandler.
+		topHandler:: entry
+	)
+	removeHandler: entry = (
+		| h |
+		topHandler == entry ifTrue: [
+				topHandler:: entry prev.
+				^self
+			].
+		(* Defensive mid-stack unlink; in practice pops arrive innermost-first via the finallys. *)
+		h:: topHandler.
+		[ nil = h ] whileFalse: [
+				h prev == entry ifTrue: [
+						h prev: entry prev.
+						^self
+					].
+				h:: h prev
+			]
+	)
+	findHandlerFor: ex ^<HandlerEntry | nil> = (
+		| h |
+		h:: topHandler.
+		[ nil = h ] whileFalse: [
+				(h disabled not and: [ exception: ex matchesClass: h exceptionClass ]) ifTrue: [
+						^h
+					].
+				h:: h prev
+			].
+		^nil
+	)
+	exception: ex matchesClass: exceptionClass ^<Boolean> = (
+		| c |
+		c:: _js propertyOf: ex at: (_js literal: 'newspeakClass').
+		(_js operator: '==' with: c and: (_js ident: 'null')) ifTrue: [ c:: Exception ].
+		_js for: (_js verbatim: '')
+			while: (_js operator: '!==' with: c and: nil)
+			step: (_js verbatim: '')
+			do: (_js block: {_js if: (_js operator: '===' with: c and: exceptionClass)
+					then: (_js block: {_js return: (_js literal: true). }). c:: c superclass. }).
+		^false
+	)
+	disableThrough: match = (
+		| h |
+		h:: topHandler.
+		[ nil = h ] whileFalse: [
+				h disabled: true.
+				h == match ifTrue: [ ^self ].
+				h:: h prev
+			]
+	)
+	reenableThrough: match = (
+		(* Entries above the range (pushed by the handler's own dynamic extent, never disabled) are touched harmlessly; nested signals rebalance their own ranges before control can return here. *)
+
+		| h |
+		h:: topHandler.
+		[ nil = h ] whileFalse: [
+				h disabled: false.
+				h == match ifTrue: [ ^self ].
+				h:: h prev
+			]
+	)
+	describeRawError: e ^<String> = (
+		| s |
+		s:: _js propertyOf: e at: (_js literal: 'stack').
+		(_js operator: '==' with: s and: (_js ident: 'null')) ifTrue: [
+				^_js call: (_js ident: 'String') with: {e. }
+			].
+		^s
+	)
+	protectedBodyOf: body <[]> = (
+		(* Run an on:do: protected block. Newspeak signals never throw; what CAN arrive here as a JS throw is (a) a raw JS error from the host - convert it to a kernel Exception and SIGNAL it, so the handler stack (whose entries at and above this on:do: are still active) sees it with correct innermost-first matching, resumability included - or (b) an NS exception thrown by the unhandled-signal fallback, already past every matching opportunity: rethrow it onward. Each raw error is converted exactly once: the converted signal either finds a handler or is rethrown as an NS exception, case (b) at every outer level. *)
+
+		| c rawEx |
+		_js try: (_js block: {_js return: body value. })
+			catch: (_js ident: 'e')
+			with: (_js block: {c:: _js propertyOf: (_js ident: 'e')
+					at: (_js literal: 'newspeakClass'). _js if: (_js operator: '!=' with: c and: (_js ident: 'null'))
+					then: (_js block: {_js throw: (_js ident: 'e'). }). rawEx:: Exception new. rawEx messageText: (describeRawError: (_js ident: 'e')). _js return: rawEx signal. })
+	)
 	public class Array uninstantiable = Object new (
 	) (
 		public , otherSequence = (
@@ -673,8 +768,11 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 		The protector runs with NLRPayload saved and restored: if an INNER non-local return completes entirely within the protector, it uses and clears NLRPayload; without the restore, an in-flight outer NLR (whose sentinel is the current return value of the try) would resume with a dead payload. If the protector itself NLRs OUTWARD, the checked send below returns the sentinel from inside the finally -- JS's return-in-finally override -- which is exactly the newest-NLR-wins redirect semantics, and the restore is correctly skipped. *)
 			| saved |
 			_js try: (_js block: {_js return: self value. })
-				finally: (_js block: {saved:: _js ident: 'NLRPayload'. onUnwind value. _js assign: (_js ident: 'NLRPayload')
-						toBe: saved. })
+				finally: (_js block: {
+					(* During a Stage 3 reconstruction unwind the protectors are NOT run: they belong to the resumed (simulated) continuation, which runs them at the right time. *)
+					_js if: (_js prefixOperator: '!' on: (_js ident: 'NSReconstructing'))
+						then: (_js block: {saved:: _js ident: 'NLRPayload'. onUnwind value. _js assign: (_js ident: 'NLRPayload')
+								toBe: saved. }). })
 		)
 		public isKindOfClosure ^<Boolean> = (
 			^true
@@ -682,25 +780,15 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 		public numArgs ^<Integer> = (
 			^_js propertyOf: self at: (_js literal: 'length')
 		)
-		public on: errorClass do: handler = (
-			(* Perhaps we should match on mixin instead of class... *)
-			
-			| c |
-			_js try: (_js block: {_js return: self value. })
-				catch: (_js ident: 'e')
-				with: (_js block: {
-					(* Under sentinel NLR (M4) a non-local return is a return, never a throw, so it structurally cannot arrive here -- no token check needed. *)
-					c:: _js propertyOf: (_js ident: 'e')
-						at: (_js literal: 'newspeakClass').
-					(* Raw JS errors (DOMException, TypeError, etc.) have no
-		   newspeakClass. Treat them as plain Exception so handlers
-		   that catch Exception / Error at the FFI boundary work. *)
-					_js if: (_js operator: '===' with: c and: (_js ident: 'undefined'))
-						then: (_js block: {c:: Exception. }). _js for: (_js verbatim: '')
-						while: (_js operator: '!==' with: c and: nil)
-						step: (_js verbatim: '')
-						do: (_js block: {_js if: (_js operator: '===' with: c and: errorClass)
-								then: (_js block: {_js return: (handler value: (_js ident: 'e')). }). c:: c superclass. }). _js throw: (_js ident: 'e'). })
+		public on: exceptionClass do: handler = (
+			(* Resumable exceptions (Stage 2, design par. 8): register a handler entry whose wrapper and returner are NLR closures homed HERE, so a handler that completes normally (or Exception>>return:) unwinds from the raise point to this activation - through every intervening ensure: protector, on the M4 sentinel fabric - and its value becomes this expression's value. The entry is removed by the ensure: on every exit path. The signal machinery calls the handler AT THE RAISE POINT with the whole stack alive beneath it: resumption and, later, the debugger's post-mortem entry both depend on that. *)
+
+			| entry |
+			entry:: HandlerEntry on: exceptionClass
+				wrapper: [:ex | ^handler value: ex ]
+				returner: [:v | ^v ].
+			pushHandler: entry.
+			^[ protectedBodyOf: self ] ensure: [ removeHandler: entry ]
 		)
 		public value = (
 			^_js call: (_js ident: 'this') with: {}
@@ -735,31 +823,61 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 	public class Exception new = Object new (
 		|
 			public messageText
+			resumerSlot
+			returnerSlot
 		|
 	) (
-		
+
 		(* squeak compatibility for Minitest *)
 		public printString = (
 			nil = messageText ifTrue: [ ^super class name ].
 			^super class name , ': ' , messageText
 		)
 		public signal = (
+			(* Resumable exceptions (Stage 2, design par. 8): find the innermost enabled matching handler and CALL it at the raise point - no throw, the raise stack fully alive beneath the handler. The call returns here only via resume: (this method's own NLR closure delivers the resume value as signal's answer; code after signal continues). A handler that completes normally, or return:s, unwinds PAST this frame to its on:do: on the sentinel fabric. No matching handler: fall back to a JS throw - top-level catches and the simulator's escape guard consume those. *)
+
+			| match |
 			_js verbatim: 'this.trace = new Error().stack'.
-			_js throw: self
+			match:: findHandlerFor: self.
+			nil = match ifTrue: [
+					(* Unhandled. With a debug hook registered (a debug-capable image), engage the Stage 3 reconstruction unwind: the throw builds the shadow stack through the method catch-wrappers on its way to the boundary that presents the debugger. Without a hook, a plain throw for top-level catches. *)
+					_js if: (_js operator: '!==' with: (_js ident: 'NSDebugHook') and: (_js ident: 'null'))
+						then: (_js block: {_js assign: (_js ident: 'NSReconstructing')
+								toBe: (_js literal: true). }).
+					_js throw: self
+				].
+			resumerSlot:: [:v |
+					reenableThrough: match.
+					^v
+				].
+			returnerSlot:: match returner.
+			disableThrough: match.
+			^match wrapper value: self
+		)
+		public resume: v = (
+			(* Continue at the raise point: v becomes the value of the signal expression. A control transfer - code after resume: in the handler never runs. *)
+
+			^resumerSlot value: v
+		)
+		public resume = (
+			^resume: nil
+		)
+		public return: v = (
+			(* Unwind to the handler's on:do:, which answers v. *)
+
+			^returnerSlot value: v
+		)
+		public return = (
+			^return: nil
 		)
 		public pass = (
-			(* Resignal to the NEXT enclosing handler, psoup-style. Approximation:
-	   rethrow the same exception object. The on:do: handler runs after its
-	   JS try block has exited, so the rethrow propagates outward and cannot
-	   be recaught by the handler that invoked pass. Full handler-stack
-	   semantics (resume:, retry, return:) arrive with the resumable
-	   exception work on the debugger track. *)
+			(* Resignal to the next enclosing handler: the machinery disabled this exception's handler (and everything inner), so a fresh signal finds the next one out. The outer handler's resume:/return: rebind to ITS scopes. *)
 
-			_js throw: self
+			^self signal
 		)
 		public signal: message = (
 			(* squeak compatibility for Minitest *)
-			
+
 			messageText:: message.
 			^self signal
 		)

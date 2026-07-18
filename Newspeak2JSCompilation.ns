@@ -410,46 +410,115 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 				public currentSelector
 				containsNonLocalReturn <Boolean>
 
-				(* Set to false at the beginning of translating a method. The code that emits a non-local return sets this to true. The top-level code checks the value to see whether to emit a try-catch wrapper for an NLR. *)
+				(* Set to false at the beginning of translating a method. The code that emits a non-local return sets this to true. The top-level code checks the value to see whether the method is an NLR home frame: it gets the nlrMyId prologue and its depth-0 sends use the unwrapping sentinel check. *)
 				methodIsPrivate <Boolean>
 
 				(* Set when the current method's body uses the _js compile-time intrinsic. Such bodies have no Newspeak semantics for a bytecode backend, so dual emission records them as JS-only. *)
 				public usesIntrinsics <Boolean>
+
+				(* Sentinel-NLR linearization state (M4_SENTINEL_NLR_IMPL_PLAN_2026-07-17.md). statementBuffers is a stack of statement lists: codeBodyNode: pushes one per statement so send translations can hoist themselves out of expression positions -- every send becomes [var nlrTn = call; sentinel check] in the buffer and an identifier in the expression. Empty stack means a direct-expression context (superclass accessors): sends there compose nested and unchecked, as before. *)
+				statementBuffers
+				tempCounter <Integer>
+
+				(* Function-nesting depth within the method being translated. 0 = the method's own frame. Only depth-0 sends of a home method may use the unwrapping check form: a nested block returning tN.value would deliver the value to the block's caller, not the home. *)
+				closureDepth <Integer>
+
+				(* Tail-position check elision: when a return statement's expression IS a send (identity-compared here by the send visitors), that outermost send needs no sentinel check -- returning the sentinel IS propagation. Nested sends (receiver/argument positions) still check. Never set at depth 0 of a home method: there a sentinel targeted at this very frame must be unwrapped, not returned raw. *)
+				tailElisionNode <AST>
 			|
 		) (
 			addCascadedSend: node to: statements = (
+				| checked |
 				node isKindOfCascadedSendNode ifTrue: [
 						addCascadedSend: node previousSend to: statements
 					].
-				statements add: (_js call: (_js propertyOf: (_js ident: 'cascadeReceiver')
+				statementBuffers add: List new.
+				checked:: emitCheckedCall: (_js call: (_js propertyOf: (_js ident: 'cascadeReceiver')
 							at: (publicMessage: node message))
-						with: (node message arguments collect: [:each | each apply: self ]) asArray)
+						with: (node message arguments collect: [:each | each apply: self ]) asArray).
+				statementBuffers removeLast do: [:s | statements add: s ].
+				statements add: checked
 			)
 			public beginNewTranslationCycle = (
 				scopeStack:: List new.
 				containsNonLocalReturn:: false.
-				usesIntrinsics:: false
+				usesIntrinsics:: false.
+				statementBuffers:: List new.
+				tempCounter:: 0.
+				closureDepth:: 0.
+				tailElisionNode:: nil
+			)
+			emitStatement: statement = (
+				statementBuffers last add: statement
+			)
+			emitCheckedCall: callNode = (
+				(* Hoist a send out of expression position: bind its result to a fresh temp, emit the sentinel check, and answer the temp as the expression. In a direct-expression context (no buffer -- superclass accessors) leave the call in place, unchecked: nothing there can receive an in-flight sentinel record as its own result. *)
+				| tName |
+				statementBuffers isEmpty ifTrue: [ ^callNode ].
+				tName:: nextTempName.
+				emitStatement: (_js var: tName value: callNode).
+				emitStatement: (sentinelCheckFor: tName).
+				^_js ident: tName
+			)
+			emitCheckedCall: callNode unlessTail: sendNode <AST> = (
+				(* Tail elision: when this very send is a return statement's whole expression (and the frame is not an unwrapping home frame -- tailElisionNode is never set for those), return the raw call: the emitted `return <call>` propagates a sentinel by construction. *)
+				sendNode == tailElisionNode ifTrue: [ ^callNode ].
+				^emitCheckedCall: callNode
+			)
+			nextTempName = (
+				tempCounter:: tempCounter + 1.
+				^'nlrT' , tempCounter printString
+			)
+			nlrHomeIdName = (
+				^'nlrMyId'
+			)
+			sentinelCheckFor: tName <String> = (
+				(* The per-send M4 check. The compare is against NLRSentinel -- a CONST, never reassigned, so V8 embeds it as a constant in optimized code (comparing against the mutable payload pointer instead costs a context load per send: measured 2-5x on send-dense code, 2026-07-17). The record travels in NLRPayload. Propagate form everywhere; the unwrapping form only at depth 0 of a home method: on a homeId match the home captures the value BEFORE clearing the payload and returns it; a mismatch propagates -- either way this frame returns. *)
+				| t cmp |
+				t:: _js ident: tName.
+				cmp:: _js operator: '===' with: t and: (_js ident: 'NLRSentinel').
+				(containsNonLocalReturn and: [ closureDepth = 0 ]) ifTrue: [
+						^_js if: cmp
+							then: (_js block: {_js if: (_js operator: '==='
+										with: (_js propertyOf: (_js ident: 'NLRPayload') at: (_js literal: 'homeId'))
+										and: (_js ident: nlrHomeIdName))
+									then: (_js block: {_js assign: t
+											toBe: (_js propertyOf: (_js ident: 'NLRPayload')
+												at: (_js literal: 'value')). _js assign: (_js ident: 'NLRPayload')
+											toBe: (_js ident: 'null'). _js return: t. }). _js return: t. })
+					].
+				^_js if: cmp then: (_js return: t)
 			)
 			public blockLocalReturnNode: node <BlockLocalReturnAST> = (
+				(* A block's tail send may always elide its check: block frames never unwrap, and the block's caller (a checked send site, a kernel value method, or a boundary wrapper) handles a returned sentinel. *)
+				tailElisionNode:: node expression.
 				^_js return: (node expression apply: self)
 			)
 			public blockNode: node <BlockAST> = (
+				| body |
+				closureDepth:: closureDepth + 1.
+				body:: node body apply: self.
+				closureDepth:: closureDepth - 1.
 				^_js functionOf: (node parameters collect: [:each |
 							self parameterDeclNode: each
 						]) asArray
-					body: (node body apply: self)
+					body: body
 			)
 			public boolNode: node <BoolAST> = (
 				^_js literal: node value
 			)
 			public cascadedSendNode: node <CascadedSendAST> = (
-				| statements |
+				(* The receiver translates in the enclosing frame's buffer BEFORE the IIFE body is built; the cascaded sends inside the IIFE are nested-function sends (propagate form); the IIFE call itself is a checked call in the enclosing frame. *)
+				| statements receiver |
+				receiver:: node receiver apply: self.
+				closureDepth:: closureDepth + 1.
 				statements:: List new.
 				addCascadedSend: node to: statements.
+				closureDepth:: closureDepth - 1.
 				statements at: statements size put: (_js return: statements last).
-				^_js call: (_js functionOf: {'cascadeReceiver'. }
+				^emitCheckedCall: (_js call: (_js functionOf: {'cascadeReceiver'. }
 						body: (_js block: statements))
-					with: {node receiver apply: self. }
+					with: {receiver. })
 			)
 			public characterNode: node <CharAST> = (
 				(* Javascript has no characters, only strings. *)
@@ -459,7 +528,14 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 			public codeBodyNode: node <CodeBodyAST> = (
 				| locals statements |
 				locals:: node temporaries collect: [:each | self temporaryDeclNode: each ].
-				statements:: node statements collect: [:each | each apply: self ].
+				statements:: List new.
+				node statements do: [:each |
+						| translated |
+						statementBuffers add: List new.
+						translated:: each apply: self.
+						statementBuffers removeLast do: [:s | statements add: s ].
+						statements add: translated
+					].
 				^_js block: (locals asArray , statements) asArray
 			)
 			public conditionalNode: node <ConditionalAST> = (
@@ -500,11 +576,33 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 					else: (hasElseClause ifTrue: [ node else apply: self ] ifFalse: [ nil ])
 			)
 			public inlinedOperatorNode: node <InlinedOperatorAST> = (
-				(* We are not modeling JS operator precedence, so just parenthesize everything. *)
-				
-				^_js operator: node message selector
-					with: (node receiver apply: self)
-					and: (node message arguments first apply: self)
+				(* We are not modeling JS operator precedence, so just parenthesize everything. Under M4 linearization the right operand of a short-circuit operator may hoist statements (a send in the operand); those must NOT run before the left operand is tested, so such cases become a temp + if. Strict operators just flush both operands' statements in order. *)
+
+				| left right rightBuffer tName condition |
+				left:: node receiver apply: self.
+				statementBuffers isEmpty ifTrue: [
+						^_js operator: node message selector
+							with: left
+							and: (node message arguments first apply: self)
+					].
+				statementBuffers add: List new.
+				right:: node message arguments first apply: self.
+				rightBuffer:: statementBuffers removeLast.
+				rightBuffer isEmpty ifTrue: [
+						^_js operator: node message selector with: left and: right
+					].
+				(node message selector = '&&' or: [ node message selector = '||' ]) ifFalse: [
+						rightBuffer do: [:s | emitStatement: s ].
+						^_js operator: node message selector with: left and: right
+					].
+				tName:: nextTempName.
+				emitStatement: (_js var: tName value: left).
+				condition:: node message selector = '&&' ifTrue: [ _js ident: tName ]
+					ifFalse: [ _js prefixOperator: '!' on: (_js ident: tName) ].
+				emitStatement: (_js if: condition
+					then: (_js block: (rightBuffer asArray , {_js assign: (_js ident: tName)
+							toBe: right. }) asArray)).
+				^_js ident: tName
 			)
 			public localReadNode: node <LocalReadAST> = (
 				^_js ident: (names mangleLocal: node name)
@@ -533,17 +631,18 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 				^jsParameters
 			)
 			public methodLocalReturnNode: node <MethodLocalReturnAST> = (
-				containsNonLocalReturn ifFalse: [
-						^_js return: (node expression apply: self)
-					].
-				^_js block: {_js var: 't' value: (node expression apply: self). _js assign: (_js ident: nlrName)
-						toBe: (_js ident: 'null'). _js return: (_js ident: 't'). }
+				(* No home-exit invalidation under sentinel NLR: activation ids are unique, a late sentinel from a stored block matches nothing and reaches an entry boundary (CannotReturn there). Tail elision must be assigned UNCONDITIONALLY: the two-pass translation revisits the same AST nodes, so a stale eligible marker from pass 1 must be overwritten when pass 2 knows this is a home frame. *)
+				tailElisionNode:: (containsNonLocalReturn and: [ closureDepth = 0 ])
+					ifTrue: [ nil ]
+					ifFalse: [ node expression ].
+				^_js return: (node expression apply: self)
 			)
 			public methodNode: node <MethodAST> ^<Node> = (
 				| translatedBody |
 				node body apply: self.
-				
-				(* Translate once to compute containsNonLocalReturn. Method-local returns that appear before the non-local return are incorrectly compiled. *)
+
+				(* Translate once to compute containsNonLocalReturn (pass 1 output is discarded; under M4 the flag selects the home prologue and the unwrapping check form for depth-0 sends). Reset the temp counter so pass 2 numbering is deterministic. *)
+				tempCounter:: 0.
 				translatedBody:: node body apply: self.
 				^_js functionOf: (node pattern apply: self) asArray
 					body: (containsNonLocalReturn ifTrue: [
@@ -553,12 +652,6 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 			)
 			public nilNode: node = (
 				^_js ident: 'nil'
-			)
-			nlrName = (
-				^'NLR'
-			)
-			nlrValuePropertyName = (
-				^'value'
 			)
 			public nonLocalReturnNode: node <NonlocalReturnAST> = (
 				^returnStatNode: node
@@ -574,9 +667,10 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 									]
 							]
 					].
-				^_js call: (_js propertyOf: (node receiver apply: self)
+				^emitCheckedCall: (_js call: (_js propertyOf: (node receiver apply: self)
 						at: (publicMessage: node message))
-					with: (node message arguments collect: [:each | each apply: self ]) asArray
+					with: (node message arguments collect: [:each | each apply: self ]) asArray)
+					unlessTail: node
 			)
 			public parameterDeclNode: node <ParameterAST> = (
 				^names mangleLocal: node name
@@ -613,15 +707,11 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 				^_js ident: selfName
 			)
 			public returnStatNode: node <ReturnAST> = (
+				(* M4 sentinel NLR: a block performing ^v writes a fresh {homeId, value} record into NLRPayload and RETURNS the const NLRSentinel -- no throw. The kernel's ensure: saves/restores NLRPayload around protectors, so an inner NLR completing during unwind cannot clobber an in-flight one. nlrMyId is captured lexically from the home method's prologue. *)
 				containsNonLocalReturn:: true.
-				^_js block: {_js var: 't' value: (node expression apply: self). _js if: (_js operator: '==='
-							with: (_js ident: nlrName)
-							and: (_js ident: 'null'))
-						then: (_js call: (_js propertyOf: (_js ident: selfName)
-								at: (_js literal: names privateCannotReturn))
-							with: {_js ident: selfName. _js ident: 't'. }). _js assign: (_js propertyOf: (_js ident: nlrName)
-							at: (_js literal: nlrValuePropertyName))
-						toBe: (_js ident: 't'). _js throw: (_js ident: nlrName). }
+				^_js block: {_js assign: (_js ident: 'NLRPayload')
+						toBe: (_js objectLiteralSlotNames: {_js ident: 'homeId'. _js ident: 'value'. }
+							values: {_js ident: nlrHomeIdName. node expression apply: self. }). _js return: (_js ident: 'NLRSentinel'). }
 			)
 			public schedulerNode: node <SchedulerAST> = (
 				^_js ident: 'currentActor'
@@ -638,11 +728,12 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 				args:: List new.
 				args add: (_js ident: 'self').
 				node message arguments do: [:each | args add: (each apply: self) ].
-				^_js call: (_js propertyOf: (_js propertyOf: (_js propertyOf: (_js ident: 'self')
+				^emitCheckedCall: (_js call: (_js propertyOf: (_js propertyOf: (_js propertyOf: (_js ident: 'self')
 								at: (_js literal: superSlotName))
 							at: (protectedMessage: node message))
 						at: (_js literal: 'call'))
-					with: args
+					with: args)
+					unlessTail: node
 			)
 			public symbolNode: node <SymbolAST> = (
 				^_js literal: node value
@@ -659,83 +750,103 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 				^_js var: (names mangleLocal: node name)
 			)
 			wrapBodyForNlrHandling: body <Block> = (
-				| nlrVarNode nlrParamName nlrParamNode |
-				nlrVarNode:: _js ident: nlrName.
-				nlrParamName:: nlrName , '_exception'.
-				nlrParamNode:: _js ident: nlrParamName.
-				^_js block: maybeCaptureReceiver , {_js var: nlrName
-						value: (_js new: (_js ident: 'Object') with: {}). 
-					(* Mark the token so on:do: can distinguish a passing non-local return from a raw JS exception and rethrow it (it has no newspeakClass, so it would otherwise match as a plain Exception and be eaten by any on: Exception do: between the block and its home). Interim fix until the sentinel-return NLR lands (NLR_DEBUGGER_DESIGN_2026-07-16.md). *)
-					_js assign: (_js propertyOf: (_js ident: nlrName)
-							at: (_js literal: 'nlrToken'))
-						toBe: (_js literal: true). _js try: body
-						catch: nlrParamName
-						with: (_js block: {_js if: (_js operator: '==='
-									with: nlrVarNode
-									and: nlrParamNode)
-								then: (_js return: (_js propertyOf: nlrParamNode
-										at: (_js literal: nlrValuePropertyName)))
-								else: (_js throw: nlrParamNode). }). }
+				(* M4 home-frame prologue: a per-activation id from a counter increment -- no allocation, no try/catch. The depth-0 sentinel checks unwrap against nlrMyId. *)
+				^_js block: maybeCaptureReceiver , {_js assign: (_js ident: 'nlrNextId')
+						toBe: (_js operator: '+' with: (_js ident: 'nlrNextId') and: (_js literal: 1)). _js var: nlrHomeIdName
+						value: (_js ident: 'nlrNextId'). } , body statements
 			)
 			wrapBodyNoNlrHandling: body <Block> = (
 				^_js block: maybeCaptureReceiver , body statements
 			)
 			processIntrinsic: msg <MessageAST> = (
 				usesIntrinsics:: true.
+				(msg selector = #block: and: [ msg arguments first isKindOfTupleNode ]) ifTrue: [
+						(* A _js block: tuple is a STATEMENT context: each element translates with its own buffer and any hoisted send statements splice in at the element's position. Without this, a send inside e.g. the protected block of a kernel try: would hoist OUT of the try and run unprotected. Argument tuples (call:with: etc.) keep the default behavior -- hoisting to the enclosing buffer correctly evaluates them before the construct. *)
+						^_js block: (processIntrinsicStatements: msg arguments first)
+					].
+				msg selector = #functionOf:body: ifTrue: [
+						(* The body of a _js functionOf: runs WHEN THE GENERATED FUNCTION IS CALLED, not where it is built: it must be a fresh statement context (its hoisted send statements stay inside the function -- without this, sends in an expression-shaped body execute EAGERLY in the enclosing method; AliensForJS expatriateBlock: ran every expatriated callback once at registration time) and a fresh closure level (never the enclosing home's unwrap form). *)
+						| params body buffered |
+						params:: processIntrinsicArg: msg arguments first.
+						closureDepth:: closureDepth + 1.
+						statementBuffers add: List new.
+						body:: processIntrinsicArg: (msg arguments at: 2).
+						closureDepth:: closureDepth - 1.
+						buffered:: statementBuffers removeLast.
+						buffered isEmpty ifTrue: [ ^_js functionOf: params body: body ].
+						^_js functionOf: params
+							body: (_js block: (buffered asArray , {body. }) asArray)
+					].
 				^jsMirror perform: msg selector
 					with: (msg arguments collect: [:arg | processIntrinsicArg: arg ]) asArray
 					ifFail: [:e |
 						('Failed to process an intrinsic during JS translation ' , e printString) out
 					]
 			)
+			processIntrinsicStatements: tuple <TupleAST> = (
+				| statements |
+				statements:: List new.
+				tuple elements do: [:each |
+						| translated |
+						statementBuffers add: List new.
+						translated:: processIntrinsicArg: each.
+						statementBuffers removeLast do: [:s | statements add: s ].
+						statements add: translated
+					].
+				^statements asArray
+			)
 			public loopNode: node <LoopAST> = (
-				(* prologue; while(cond==whileTrue) {body}; *)
-				
+				(* prologue; for(;;){ cond statements; if (break-cond) break; body } *)
+
 				| nodePrologue = node prologue. prologue = nodePrologue isNil ifTrue: [
 						_js block: {}
 					]
 					ifFalse: [ nodePrologue apply: self ]. cond = node condition apply: self. body = node body isNil ifTrue: [
 						_js block: {}
 					]
-					ifFalse: [ node body apply: self ]. condExpression ::= 
-				(* Split the condition is it isn't a single expression *)
+					ifFalse: [ node body apply: self ]. condExpression =
+				(* Split the condition if it isn't a single expression *)
 				cond statements last. condPrologue = (List withAll: cond statements) removeLast;
-					yourself. |
-				node isWhileTrue ifFalse: [
-						condExpression:: _js prefixOperator: '!' on: condExpression
-					].
-				
+					yourself. breakCondition |
+				(* The condition's non-final statements (under M4 linearization: every hoisted send in the condition) must re-run each iteration IN THE SAME SCOPE as the loop test. The old shape -- prologue copied both before the for and into the body -- breaks under let: the body copy only shadows, so the test never sees iteration N's values. Standard linearized shape instead: an unconditional for with the condition statements at the top of the body and an inverted-condition break. *)
+				breakCondition:: node isWhileTrue
+					ifTrue: [ _js prefixOperator: '!' on: condExpression ]
+					ifFalse: [ condExpression ].
+
 				(* Flatten prologue so its declarations are in scope for the loop *)
-				^_js block: prologue statements , condPrologue , {_js for: (_js verbatim: '')
-						while: condExpression
+				^_js block: prologue statements , {_js for: (_js verbatim: '')
+						while: (_js literal: true)
 						step: (_js verbatim: '')
-						do: (_js block: body statements , condPrologue). }
+						do: (_js block: condPrologue asArray , {_js if: breakCondition
+								then: (_js verbatim: 'break'). } , body statements). }
 			)
 			public outerSendNode: node <OuterSendAST> = (
 				| receiver = processOuterReceiverAtDepth: node depth. |
-				^processLexicalSend: node message to: receiver binding: node binding
+				^processLexicalSend: node message to: receiver binding: node binding tail: node
 			)
 			public implicitReceiverSendNode: node <ImplicitReceiverSendAST> = (
 				| receiver = processOuterReceiverAtDepth: node depth. |
-				^processLexicalSend: node message to: receiver binding: node binding
+				^processLexicalSend: node message to: receiver binding: node binding tail: node
 			)
-			processLexicalSend: message to: jsReceiver binding: binding = (
+			processLexicalSend: message to: jsReceiver binding: binding tail: sendNode <AST> = (
 				(binding isNil not and: [ binding ast accessModifier = #private ]) ifTrue: [
-						| definingMixinDepth = 
+						| definingMixinDepth =
 						(* Do early binding. *)
 						binding depth - 1. definingMixin = _js ident: '$' , definingMixinDepth printString. targetMethod = _js propertyOf: definingMixin
 							at: (publicMessage: message). |
-						^_js call: targetMethod
-							with: 
+						^emitCheckedCall: (_js call: targetMethod
+							with:
 							(* (_js propertyOf: targetMethod at: (_js literal: 'call')) *)
-							{jsReceiver. } , (message arguments collect: [:each | each apply: self ]) asArray
+							{jsReceiver. } , (message arguments collect: [:each | each apply: self ]) asArray)
+							unlessTail: sendNode
 					].
-				^_js call: (_js propertyOf: jsReceiver at: (protectedMessage: message))
-					with: (message arguments collect: [:each | each apply: self ]) asArray
+				^emitCheckedCall: (_js call: (_js propertyOf: jsReceiver at: (protectedMessage: message))
+					with: (message arguments collect: [:each | each apply: self ]) asArray)
+					unlessTail: sendNode
 			)
 			public selfSendNode: node <SelfSendAST> = (
 				| receiver = _js ident: selfName. |
-				^processLexicalSend: node message to: receiver binding: node binding
+				^processLexicalSend: node message to: receiver binding: node binding tail: node
 			)
 		) : ()
 		accessorForNestedClassNamed: simpleName <String> in: mixinName <String> superCall: superAccessor <Node> ^<String> = (
@@ -849,14 +960,25 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 			^methodNode: method
 		)
 		public compileMethodSource: source <String> within: enclosing <MixinMirror> ^<IntermediateMethod> = (
-			| tree <AST> jsTree <IntermediateMethod> |
+			| tree <AST> method <IntermediateMethod> |
 			setInput: source.
 			currentScope:: Scope new.
 			currentDepth:: 0.
 			buildIncrementalScopeFor: enclosing.
 			tree:: parser parseMethodDeclaration: source.
 			currentMixinUID: enclosing declaration qualifiedName.
-			^methodNode: tree
+			method:: methodNode: tree.
+			attachBytecodeToMethod: method from: source within: enclosing.
+			^method
+		)
+		attachBytecodeToMethod: method <IntermediateMethod> from: source <String> within: enclosing <MixinMirror> = (
+			(* Method-level dual emission, for reflective accepts: compile the same method source with the V5 compiler in the same mirror-derived scope (the bytecode module's buildIncrementalScopeFor: consumes the identical mirror protocol). Failure-tolerant like attachBytecodeFrom:to:: any problem leaves the method JS-only. *)
+
+			nil = bytecodeCompiler ifTrue: [ ^self ].
+			method usesIntrinsics ifTrue: [ ^self ].
+			[ method bytecodeMethod: (bytecodeCompiler compileMethodSource: source within: enclosing) ]
+				on: Error
+				do: [:e | nil ]
 		)
 		compileNestedClassAST: tree <ClassDeclarationAST | MixinApplicationClassAST> into: enclosingIR <IntermediateMixin> ^<IntermediateClassDeclaration> = (
 			^(compileNestedClasses: {tree. } within: enclosingIR) first
@@ -1123,9 +1245,15 @@ This accessor will lazily generate the nested class when its enclosing instance 
 				]) asArray.
 			ast:: _js functionOf: argNames
 				body: (_js block: {_js var: 't'
-						value: (_js verbatim: 'new this.nonMeta.basicNew()'). _js call: (_js propertyOf: (_js ident: 't')
+						value: (_js verbatim: 'new this.nonMeta.basicNew()'). _js var: 'nlrT1'
+						value: (_js call: (_js propertyOf: (_js ident: 't')
 							at: (_js literal: '$instance$initializer'))
-						with: (argNames collect: [:each | _js ident: each ]). _js return: (_js ident: 't'). }).
+						with: (argNames collect: [:each | _js ident: each ])).
+					(* A sentinel escaping an instance initializer (a stored block NLRing during initialization) must propagate, not be swallowed by returning t. *)
+					_js if: (_js operator: '==='
+							with: (_js ident: 'nlrT1')
+							and: (_js ident: 'NLRSentinel'))
+						then: (_js return: (_js ident: 'nlrT1')). _js return: (_js ident: 't'). }).
 			accessor:: IntermediateMethod named: aNode header constructor selector
 				accessModifier: #public
 				function: ast
@@ -1919,8 +2047,12 @@ app.$main$args$(vmmirror.platform, [])'
 			compiler sentSelectors: sentSelectors.
 			sourcesList:: List new.
 			^_js script: {_js literal: 'use strict'. _js var: 'nil'
-					value: (_js literal: 'patch me with nil'). _js var: 'currentActor'. _js var: 'theGlobalObject'
-					value: (_js ident: 'this'). _js verbatim: 'function SM(n,am,m,s){this.name=n; this.accessModifier = am; this.isMutable=m; this.isSynthetic=s; }'. _js verbatim: 'function MM(n,am,sy,src,bc){this.name=n; this.accessModifier = am; this.isSynthetic=sy; this.source=src; this.bytecode = (bc === undefined) ? null : bc; }'. _js verbatim: 'function dnuCatcher(s){ return function() {
+					value: (_js literal: 'patch me with nil'). _js var: 'currentActor'.
+				(* M4 sentinel NLR globals. NLRSentinel MUST be a const: every send compares its result against it, and a const lets V8 embed the value as a code constant (a mutable binding costs a context load per send -- measured 2-5x on send-dense benchmarks, 2026-07-17). NLRPayload carries the in-flight {homeId, value} record; nlrNextId numbers home activations. *)
+				_js verbatim: 'const NLRSentinel = {NLRSentinel: true};'. _js var: 'NLRPayload'
+					value: (_js ident: 'null'). _js var: 'nlrNextId'
+					value: (_js literal: 0). _js var: 'theGlobalObject'
+					value: (_js ident: 'this')._js verbatim: 'function SM(n,am,m,s){this.name=n; this.accessModifier = am; this.isMutable=m; this.isSynthetic=s; }'. _js verbatim: 'function MM(n,am,sy,src,bc){this.name=n; this.accessModifier = am; this.isSynthetic=sy; this.source=src; this.bytecode = (bc === undefined) ? null : bc; }'. _js verbatim: 'function dnuCatcher(s){ return function() {
 if (this === undefined || this === null || typeof this.dnu !== "function") {
 	// The receiver is a raw JS value (an exception object, a DOM value, ...)
 	// with no Newspeak doesNotUnderstand: machinery. Raise a proper, catchable

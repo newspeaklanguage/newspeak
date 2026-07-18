@@ -28,14 +28,25 @@ Copyright Google Inc. 2014 - 2017 *)
 		private generation = Future computing: [
 				r JavascriptGeneration usingPlatform: p
 			].
+		(* The V5 bytecode-emission module for dual emission in reflective compiles: freshly accepted methods get bytecode records (debuggable, senders-visible) and expression doIts become simulable. Absence-tolerant: images without the bytecode modules degrade to JS-only reflective compiles, exactly the old behavior. *)
+		private bytecodeCompilationModule = Future computing: [
+				[
+					r BytecodeCompilation usingPlatform: p
+						asts: asts
+						newspeakParser: parsing
+						intermediates: (r BytecodeIntermediates usingPlatform: p
+							internalKernel: CompileOnlyInternalKernel new)
+				]
+					on: Exception
+					do: [:e | nil ]
+			].
 		private compilation = Future computing: [
 				r Compilation usingPlatform: p
 					asts: asts
 					parsing: parsing
 					generation: generation
-					bytecodeCompilation: nil
+					bytecodeCompilation: bytecodeCompilationModule
 			].
-		(* bytecodeCompilation: nil — reflective installs in the deployed IDE do not yet refresh bytecode records (edited classes degrade to JS-only). Enabling this requires packaging NewspeakBytecodeCompilation, Newspeak2V5BytecodeCompilation and IntermediatesForPrimordialSoup into the deployed image and binding them in the runtime module. *)
 		public compiler = Future computing: [ compilation Compiler new ].
 
 		(* The V5 decoder module, for bytecode-driven mirror services (selectors for senders support; later the debugger simulator). Tolerant of runtimes without the binding: those degrade to empty selector lists. *)
@@ -44,7 +55,18 @@ Copyright Google Inc. 2014 - 2017 *)
 					on: Exception
 					do: [:e | nil ]
 			].
+
+		(* The execution simulator module, for the debugger: simulated threads with stepping over the MM bytecode records. Tolerant of runtimes without the binding: debugSuspended: then degrades to the eager sendSuspended:. *)
+		private simulatorModule = Future computing: [
+				[
+					nil = simulation ifTrue: [ nil ]
+						ifFalse: [ r BytecodeSimulatorForJS usingPlatform: p simulation: simulation ]
+				]
+					on: Exception
+					do: [:e | nil ]
+			].
 		private Exception = p kernel Exception.
+		private Interval = p collections Interval.
 	|
 ) (
 	class AbstractClassHeaderMirror new = Object new (
@@ -1454,7 +1476,7 @@ on the data to decide what action to take. *)
 			^_js operator: '===' with: reflectee and: other reflectee
 		)
 		private compileExpression: expression <String> with: rawScope <Map[Symbol, Object]> ^<JS[Function]> = (
-			| compiler ir dnuHandlers writer sb src func |
+			| compiler ir dnuHandlers writer sb src func chain params wrapper |
 			compiler:: compilation Compiler new.
 			ir:: compiler compileExpressionSource: expression
 				inMixin: getClass mixin
@@ -1470,7 +1492,33 @@ on the data to decide what action to take. *)
 			sb:: StringBuilder new.
 			writer generateSourceFor: ir function on: sb.
 			src:: sb asString.
-			^_js call: (_js ident: 'eval') with: {'(' , src , ')'. }
+
+			(* The emitted code references $0..$K - the enclosing-chain mixin objects - for PRIVATE members of enclosing classes (the compiler's early-bound fast path). Inside a full module compile those are the mixin-definition IIFE variables; an eval'd doIt has no such scope, and worse, a bare eval here is a DIRECT eval capturing THIS method's own $-variables - the MirrorsForJS mixins, the wrong objects entirely (symptom: 'JS object does not understand ide' from a workspace doIt referencing an enclosing module's private slot). Bind them explicitly: wrap the function in an outer function taking $0..$K and apply it to the reflectee's actual enclosing-chain runtime mixins, outermost first. *)
+			chain:: enclosingRuntimeMixinChain.
+			params:: ''.
+			1 to: chain size do: [:i |
+					params:: params , (1 = i ifTrue: [ '' ] ifFalse: [ ',' ]) , '$' , (i - 1) printString
+				].
+			wrapper:: _js call: (_js ident: 'eval')
+				with: {'(function(' , params , '){ return (' , src , ') })'. }.
+			^_js call: (_js propertyOf: wrapper at: (_js literal: 'apply'))
+				with: {_js ident: 'null'. chain asArray. }
+		)
+		private enclosingRuntimeMixinChain ^<List> = (
+			(* The runtime mixin objects of the reflectee's class and its lexically enclosing classes, outermost first: the values for the $0..$K bindings in an eval'd doIt. *)
+
+			| inner m result |
+			inner:: List new.
+			m:: getClass mixin.
+			[ nil = m ] whileFalse: [
+					inner add: (_js propertyOf: m reflectee at: (_js literal: 'runtimeMixin')).
+					m:: nil = m declaration enclosingClass
+						ifTrue: [ nil ]
+						ifFalse: [ m declaration enclosingClass instanceSide ]
+				].
+			result:: List new.
+			inner size to: 1 by: -1 do: [:i | result add: (inner at: i) ].
+			^result
 		)
 		public evaluate: expression <String> ^<ThreadMirror> = (
 			^self evaluate: expression with: Map new
@@ -1545,6 +1593,42 @@ on the data to decide what action to take. *)
 		)
 		public performPublic: selector with: arguments = (
 			^(Message selector: selector arguments: arguments) sendTo: reflectee
+		)
+		public debugSuspended: selector with: arguments <List[Object]> ^<ThreadMirror> = (
+			(* Begin the send under the bytecode simulator, suspended before the first instruction: a steppable thread whose activation mirrors drive the Debugging UI. Falls back to the eager sendSuspended: when the simulator is unavailable. *)
+
+			^ActivationMirror debug: reflectee send: selector with: arguments
+		)
+		public evaluateSuspended: expression <String> ^<ThreadMirror> = (
+			^evaluateSuspended: expression with: Map new
+		)
+		public evaluateSuspended: expression <String> with: scope <Map[Symbol, ObjectMirror]> ^<ThreadMirror> = (
+			(* psoup API: compile the expression with the V5 bytecode compiler and begin it under the simulator, suspended - a steppable thread for the debugger. The doIt method is activated psoup-style with receiver = the reflectee and arguments {ctxt. scope.} (ctxt nil at object scope). Falls back to the eager evaluate: when the bytecode modules or the simulator are unavailable, or the expression defeats the V5 compiler. *)
+
+			| bcc rawScope im simMethod sim |
+			bcc:: bytecodeCompilationModule.
+			(nil = bcc or: [ nil = simulatorModule ]) ifTrue: [
+					^evaluate: expression with: scope
+				].
+			rawScope:: Map new.
+			scope keysAndValuesDo: [:key :value | rawScope at: key put: value reflectee ].
+			^[
+				im:: bcc Compiler new compileExpressionSource: expression
+					debugMapper: nil
+					withScope: rawScope
+					inMixin: getClass mixin.
+				sim:: simulatorModule Simulator new.
+				simMethod:: simulatorModule SimulatedMethod record: (bytecodeRecordFor: im)
+					mixin: (sim runtimeMixinForDebugOf: reflectee)
+					selector: #DoIt
+					accessModifier: #public.
+				simMethod sourceText: expression.
+				simMethod debugInfo: im debugInfo.
+				sim startMethod: simMethod receiver: reflectee arguments: {nil. rawScope. }.
+				ThreadMirror onSimulated: (simulatorModule SimulatedThread over: sim)
+			]
+				on: Exception
+				do: [:e | evaluate: expression with: scope ]
 		)
 		public sendSuspended: selector with: arguments <List[Object]> ^<ThreadMirror> = (
 			(* Invoke [selector] on the reflectee with [arguments] (raw objects,
@@ -1671,12 +1755,51 @@ on the data to decide what action to take. *)
 		)
 	) : ()
 	class ThreadMirror state: s result: r = Object new (
+		(* Two kinds of thread. EAGER (legacy): state/result fixed at construction, from evaluate:/sendSuspended: -- the computation already ran at full speed. SIMULATED: wraps a live SimulatedThread (see class-side onSimulated:); state/result/suspendedActivation track the thread as it is stepped, and resume/terminate drive it. DEFERRED (see class-side deferred:): a not-yet-run closure; resume runs it at full speed -- the psoup invokeSuspended:-then-resume idiom without simulation. *)
+
 		|
-			public state = s.
-			public result <ObjectMirror | nil> = r.
+			protected state_slot ::= s.
+			protected result_slot <ObjectMirror | nil> ::= r.
 			suspendedActivation_slot
+			protected simThread ::= nil.
+			protected deferredClosure ::= nil.
 		|
 	) (
+		public state = (
+			nil = simThread ifFalse: [ ^simThread state ].
+			^state_slot
+		)
+		public result ^<ObjectMirror | nil> = (
+			nil = simThread ifFalse: [ ^ObjectMirror reflecting: simThread result ].
+			^result_slot
+		)
+		public simulatedThread = (
+			^simThread
+		)
+		public simulatedThread: st = (
+			simThread:: st
+		)
+		public beDeferred: c = (
+			deferredClosure:: c.
+			state_slot:: #suspended
+		)
+		public resume = (
+			nil = simThread ifFalse: [
+					simThread resume.
+					^self
+				].
+			nil = deferredClosure ifTrue: [ ^self ].
+			[
+				result_slot:: ObjectMirror reflecting: deferredClosure value.
+				state_slot:: #fulfilled
+			] on: Error
+				do: [:e |
+					result_slot:: ObjectMirror reflecting: e.
+					state_slot:: #broken
+				].
+			deferredClosure:: nil.
+			^self
+		)
 		public isBroken ^<Boolean> = (
 			^state = #broken
 		)
@@ -1696,29 +1819,55 @@ on the data to decide what action to take. *)
 			^state = #terminated
 		)
 		public hash ^<Integer> = (
-			^state hash bitXor: class hash
+			(* MUST NOT depend on state/result: those mutate as a simulated thread is stepped, and this hash reaches presenter-registry map keys via Presenter hash -> Subject hash -> model hash. A time-varying key hash corrupts the maps (duplicate entries; shouldNotHappen in growTable - seen 2026-07-18). Simulated threads hash by the underlying thread's identity; eager/deferred threads by class (their fields are settled by the time they serve as keys, but class hash is unconditionally safe). *)
+
+			nil = simThread ifFalse: [ ^(identityHashOf: simThread) bitXor: class hash ].
+			^class hash
 		)
 		public = other = (
 			other isKindOfThreadMirror ifFalse: [ ^false ].
+			nil = simThread ifFalse: [ ^simThread == other simulatedThread ].
+			nil = other simulatedThread ifFalse: [ ^false ].
 			^state = other state and: [ result = other result ]
 		)
 		public suspendedActivation = (
-			(* The context the exemplar evaluator evaluates expressions in. Set by
-		   ObjectMirror>>sendSuspended:with: to the receiver's mirror, giving
-		   self-scope only (the JS platform has no live frame, so no method
-		   parameters/temporaries). nil for threads from a plain evaluate:. *)
+			(* SIMULATED threads: the innermost live simulated frame, wrapped -- the debugger's entry into the stack. EAGER threads: the context the exemplar evaluator evaluates expressions in (set by ObjectMirror>>sendSuspended:with: to the receiver's mirror -- self-scope only); nil for threads from a plain evaluate:. *)
 
+			| a |
+			nil = simThread ifFalse: [
+					a:: simThread suspendedActivation.
+					nil = a ifTrue: [ ^nil ].
+					^ActivationMirror reflecting: a thread: simThread
+				].
 			^suspendedActivation_slot
 		)
 		public suspendedActivation: a = (
 			suspendedActivation_slot:: a
 		)
 		public terminate = (
-			(* JS has no threads to terminate; no-op for API compatibility. *)
-
+			nil = simThread ifFalse: [
+					simThread terminate.
+					^self
+				].
+			(* Eager threads already ran; nothing to terminate. *)
 			^self
 		)
-	) : ()
+	) : (
+		public onSimulated: aSimulatedThread ^<ThreadMirror> = (
+			| tm |
+			tm:: state: nil result: nil.
+			tm simulatedThread: aSimulatedThread.
+			^tm
+		)
+		public deferred: aClosure ^<ThreadMirror> = (
+			(* A thread that has not run yet: resume runs the closure at full speed. Serves the psoup invokeSuspended:-then-resume idiom (run tests, run app) without simulation; a broken result carries the exception but no frames (Stage 3 adds those). *)
+
+			| tm |
+			tm:: state: #suspended result: nil.
+			tm beDeferred: aClosure.
+			^tm
+		)
+	)
 	public class LazySlotMirror reflecting: m <Symbol> in: em <MixinMirror> = Object new (
 		(* The mirror for a particular lazy slot. Every lazy slot consist of an underlying storage location (the cache) and 2-3 methods:
 
@@ -1897,15 +2046,295 @@ c. If the slot is mutable, there will be a third method, which is an ordinary se
 		)
 	) : ()
 	public class ActivationMirror reflecting: activation thread: thr = Object new (
-		(* :bogus: This constructor should not be public.  Also, this class has no real implementation yet. It's just here for API compatibility so we can bring up the IDE, even though debugging won't work for now. *)
-		
+		(* A mirror on one SimulatedActivation of a SimulatedThread, presenting the psoup ActivationMirror API the Debugging UI consumes (sender, receiver, method, sourceRange, slots, stepping, restart, return:). Stepping and stack surgery delegate to the thread; the UI refreshes its activation chain from the thread mirror afterwards. *)
+
 		|
-			private reflectee <Activation> = activation.
-			private thread <Thread> = thr.
+			private reflectee <SimulatedActivation> = activation.
+			private thread <SimulatedThread> = thr.
 		|
 	) (
+		public = other ^<Boolean> = (
+			other isKindOfActivationMirror ifFalse: [ ^false ].
+			^reflectee == other reflectedActivation
+		)
+		public hash ^<Integer> = (
+			^(identityHashOf: reflectee) bitXor: class hash
+		)
+		public isKindOfActivationMirror ^<Boolean> = (
+			^true
+		)
+		public reflectedActivation ^<SimulatedActivation> = (
+			^reflectee
+		)
+		public closure ^<ObjectMirror | nil> = (
+			nil = reflectee closure ifTrue: [ ^nil ].
+			^ObjectMirror reflecting: reflectee closure
+		)
+		public enclosingActivation ^<ActivationMirror | nil> = (
+			| outerFrame = reflectee outerContext. |
+			nil = outerFrame ifTrue: [ ^nil ].
+			^ActivationMirror reflecting: outerFrame thread: thread
+		)
+		public receiver ^<ObjectMirror> = (
+			^ObjectMirror reflecting: reflectee receiver
+		)
+		public sender ^<ActivationMirror | nil> = (
+			(* Hide the simulation root sentinel, psoup-style. *)
+
+			| s = reflectee sender. |
+			nil = s ifTrue: [ ^nil ].
+			s == thread simulator rootActivation ifTrue: [ ^nil ].
+			nil = s method ifTrue: [ ^nil ].
+			^ActivationMirror reflecting: s thread: thread
+		)
+		public threadMirror ^<ThreadMirror> = (
+			^ThreadMirror onSimulated: thread
+		)
+		definingClassMirror ^<ClassMirror | nil> = (
+			(* The NS class whose mixin defines the frame's method: locate the runtime-mixin application on the receiver's class chain and surface its newspeakClass. *)
+
+			| behavior nsClass |
+			behavior:: thread simulator applicationOf: reflectee method mixin
+				startingAt: (classOfReflectee: reflectee receiver).
+			nil = behavior ifTrue: [ ^nil ].
+			nsClass:: normalizeUndefined: (_js propertyOf: behavior at: (_js literal: 'newspeakClass')).
+			nil = nsClass ifTrue: [ ^nil ].
+			^ClassMirror reflecting: nsClass
+		)
+		classOfReflectee: obj = (
+			^_js call: (_js propertyOf: (_js ident: 'Object')
+					at: (_js literal: 'getPrototypeOf'))
+				with: {obj. }
+		)
+		normalizeUndefined: v = (
+			(_js operator: '==' with: v and: (_js ident: 'null')) ifTrue: [ ^nil ].
+			^v
+		)
+		public method ^<MethodMirror> = (
+			(* The proper MethodMirror when the defining mixin is reachable; otherwise a FrameMethodMirror carrying what the frame knows. NB: the regular MethodMirror's source: parameter is a sources-array INDEX, not text - passing text (or nil) there yields sources[garbage] = raw JS undefined, which once crashed the debugger UI's CodeMirror. *)
+
+			| cm found |
+			cm:: definingClassMirror.
+			nil = cm ifFalse: [
+					found:: [ cm mixin methods findMirrorNamed: reflectee method selector ]
+						on: Exception
+						do: [:e | nil ].
+					nil = found ifFalse: [ ^found ]
+				].
+			^FrameMethodMirror name: reflectee method selector
+				accessModifier: reflectee method accessModifier
+				mixin: (nil = cm ifTrue: [ nil ] ifFalse: [ cm mixin ])
+				sourceText: (thread simulator sourceOf: reflectee)
+		)
+		public sourceRange ^<Interval | nil> = (
+			| range = thread simulator sourceRangeOf: reflectee. |
+			nil = range ifTrue: [ ^nil ].
+			^Interval from: (range at: 1) to: (range at: 2)
+		)
+		public slots ^<List[LocalSlotMirror]> = (
+			(* Named local variables via the V5 DebugInfo mapper, psoup-style: lazily recompile the method source with the bytecode compiler in the defining mixin's scope and read values through the mapper (the SimulatedActivation satisfies the mapper's context protocol: bci, closure, outerContext, size, tempAt:). Positional temps when the recompile is unavailable. *)
+
+			| mapper result |
+			mapper:: debugInfoMapper.
+			nil = mapper ifTrue: [ ^positionalSlots ].
+			^[
+				result:: List new.
+				mapper localNames do: [:localName |
+						result add: (LocalSlotMirror name: localName
+								value: (ObjectMirror reflecting: (mapper getValueOf: localName)))
+					].
+				result
+			]
+				on: Exception
+				do: [:e | positionalSlots ]
+		)
+		positionalSlots ^<List[LocalSlotMirror]> = (
+			| result = List new. |
+			1 to: reflectee size do: [:i |
+					result add: (LocalSlotMirror name: 't' , i printString
+							value: (ObjectMirror reflecting: (reflectee tempAt: i)))
+				].
+			^result
+		)
+		debugInfoMapper = (
+			(* A DebugMapper over this frame, or nil. A runtime-compiled method (a doIt) carries its DebugInfo directly; otherwise recompile the frame's method source with the V5 compiler within the defining mixin (both compilers parse the same text, so bcis and local layouts agree with the frame's record). *)
+
+			| bcc cm src |
+			nil = reflectee method debugInfo ifFalse: [
+					^[ reflectee method debugInfo mapperForContext: reflectee ]
+						on: Exception
+						do: [:e | nil ]
+				].
+			bcc:: bytecodeCompilationModule.
+			nil = bcc ifTrue: [ ^nil ].
+			cm:: definingClassMirror.
+			nil = cm ifTrue: [ ^nil ].
+			src:: thread simulator sourceOf: reflectee.
+			nil = src ifTrue: [ ^nil ].
+			^[
+				((bcc Compiler new compileMethodSource: src within: cm mixin) debugInfo)
+					mapperForContext: reflectee
+			]
+				on: Exception
+				do: [:e | nil ]
+		)
+		public evaluateSuspended: expression <String> ^<ThreadMirror> = (
+			(* psoup API: a suspended, steppable thread evaluating the expression in the FRAME's scope - the expression is V5-compiled with this frame's debug mapper (so its locals resolve to tempAt:/outerContext accesses on the frame) and activated with ctxt = the frame. Receiver-scope fallback when the bytecode stack is unavailable. *)
+
+			| mapper bcc im simMethod sim |
+			bcc:: bytecodeCompilationModule.
+			mapper:: nil = bcc ifTrue: [ nil ] ifFalse: [ debugInfoMapper ].
+			nil = mapper ifTrue: [
+					^(ObjectMirror reflecting: reflectee receiver) evaluateSuspended: expression
+				].
+			^[
+				im:: bcc Compiler new compileExpressionSource: expression
+					debugMapper: mapper
+					withScope: Map new
+					inMixin: (method definingMixin).
+				simMethod:: simulatorModule SimulatedMethod record: (bytecodeRecordFor: im)
+					mixin: reflectee method mixin
+					selector: #DoIt
+					accessModifier: #public.
+				simMethod sourceText: expression.
+				simMethod debugInfo: im debugInfo.
+				sim:: simulatorModule Simulator new.
+				sim startMethod: simMethod receiver: reflectee receiver arguments: {reflectee. Map new. }.
+				ThreadMirror onSimulated: (simulatorModule SimulatedThread over: sim)
+			]
+				on: Exception
+				do: [:e | (ObjectMirror reflecting: reflectee receiver) evaluateSuspended: expression ]
+		)
+		public evaluate: expression <String> ^<ThreadMirror> = (
+			(* psoup semantics: evaluateSuspended + resume. *)
+
+			^(evaluateSuspended: expression) resume
+		)
+		public isUncontinuable ^<Boolean> = (
+			^reflectee isDead
+		)
+		public restart ^<ThreadMirror> = (
+			thread restart: reflectee withLookup: false.
+			^threadMirror
+		)
+		public restartWithLookup ^<ThreadMirror> = (
+			thread restart: reflectee withLookup: true.
+			^threadMirror
+		)
+		public return: result <ObjectMirror> ^<ThreadMirror> = (
+			thread return: result reflectee from: reflectee.
+			^threadMirror
+		)
+		public stepInto ^<ThreadMirror> = (
+			thread stepInto: reflectee.
+			^threadMirror
+		)
+		public stepOut ^<ThreadMirror> = (
+			thread stepOut: reflectee.
+			^threadMirror
+		)
+		public stepOver ^<ThreadMirror> = (
+			thread stepOver: reflectee.
+			^threadMirror
+		)
+		public stepThrough ^<ThreadMirror> = (
+			thread stepThrough: reflectee.
+			^threadMirror
+		)
+	) : (
+		public debug: receiver send: selector with: arguments <List> ^<ThreadMirror> = (
+			(* The Stage-1 debugger entry: begin the send under the simulator, suspended before the first instruction; step with the returned thread's activation mirrors. Degrades to an eager sendSuspended: when the simulator module is not packaged. *)
+
+			| sim simThread |
+			nil = simulatorModule ifTrue: [
+					^(ObjectMirror reflecting: receiver) sendSuspended: selector with: arguments
+				].
+			sim:: simulatorModule Simulator new.
+			sim start: receiver send: selector with: arguments asArray.
+			simThread:: simulatorModule SimulatedThread over: sim.
+			^ThreadMirror onSimulated: simThread
+		)
+		public invokeSuspended: closure <[]> ^<ThreadMirror> = (
+			(* API-compatible with psoup: answer a suspended thread that runs the closure when resumed. On JS the run is at full speed (closures are opaque compiled functions -- they cannot be entered in simulation), so a broken outcome carries the exception but no frames until Stage 3's lazy shadow stack. For steppable debugging use ObjectMirror debugSuspended:with:. *)
+
+			^ThreadMirror deferred: closure
+		)
+		public threadForBrokenActivation: a reason: e ^<ThreadMirror> = (
+			(* A broken thread over an existing simulated stack (a's thread), presenting the frames at the raise point. When [a] is not a simulated activation (eager evaluation paths), degrade to a frameless broken thread. *)
+
+			(nil = a or: [ (a isKindOfActivationMirror) not ]) ifTrue: [
+					^ThreadMirror state: #broken result: (ObjectMirror reflecting: e)
+				].
+			^a threadMirror
+		)
+	)
+
+	bytecodeRecordFor: im ^<Array> = (
+		(* The runtime bytecode-record array for a freshly V5-compiled intermediate method, in the MM-record layout the simulator consumes: [bytes, literals, numArgs, numLocals, maxStack, bciMap, sourceStart] (see Newspeak2JSCompilation encodeBytecodeOf:, whose deploy-time encoding this mirrors at runtime). Module-level: reached by here-sends from ObjectMirror (debugExpression:) and ActivationMirror (frame evaluate:). *)
+
+		| bciMap |
+		bciMap:: List new.
+		nil = im debugInfo ifFalse: [
+				im debugInfo bciSourceMapping keysAndValuesDo: [:bci :interval |
+						bciMap add: bci; add: interval first; add: interval last
+					]
+			].
+		^{im bytes asArray. im literals asArray. im argCount. im maxLocals. im maxStack. bciMap asArray. 0. }
+	)
+	class CompileOnlyInternalKernel new = Object new (
+		(* Satisfies IntermediatesForPrimordialSoup's imports for compile-only use of the bytecode compilation pipeline: the dual-emission path reads bytes and literals off IntermediateMethods and never assembles a psoup Method, so the Method and MethodMetadata bindings are never used. (Same stub as DeploymentManager's.) *)
+
+	) (
+		public Method = (
+			^nil
+		)
+		public MethodMetadata = (
+			^nil
+		)
 	) : ()
-	
+	class FrameMethodMirror name: n <Symbol> accessModifier: a <Symbol> mixin: m <MixinMirror | nil> sourceText: s <String | nil> = Object new (
+		(* A method mirror for a simulated frame whose method has no browsable MethodMirror: a runtime-compiled doIt, or a frame whose defining mixin could not be located. Carries source TEXT directly (possibly nil - the UI shows its absence marker), unlike the regular MethodMirror whose source: parameter is an index into the deployed sources array. *)
+
+		|
+			public name <Symbol> = n.
+			public accessModifier <Symbol> = a.
+			public definingMixin <MixinMirror | nil> = m.
+			public source <String | nil> = s.
+		|
+	) (
+		public isKindOfMethodMirror ^<Boolean> = (
+			^true
+		)
+		public isSynthetic ^<Boolean> = (
+			^true
+		)
+		public simpleName ^<Symbol> = (
+			^name
+		)
+		public selectors ^<List[Symbol]> = (
+			^List new
+		)
+		public hash ^<Integer> = (
+			^name hash bitXor: class hash
+		)
+		public = other ^<Boolean> = (
+			other isKindOfMethodMirror ifFalse: [ ^false ].
+			^name = other name and: [ definingMixin = other definingMixin ]
+		)
+	) : ()
+	public class LocalSlotMirror name: n <String> value: v <ObjectMirror> = Object new (
+		(* A named local (parameter or temporary) of an activation, psoup API. *)
+
+		|
+			public name <String> = n.
+			public value <ObjectMirror> = v.
+		|
+	) (
+		public isKindOfLocalSlotMirror ^<Boolean> = (
+			^true
+		)
+	) : ()
+
 	(* reflectees at: self put: activation *)
 	public class AtomicInstallWrapper new = Object new (
 		(* :TODO :Bogus *)

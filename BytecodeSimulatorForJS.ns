@@ -5,7 +5,9 @@ class BytecodeSimulatorForJS usingPlatform: platform simulation: simulation = (
 
 UNDER CONSTRUCTION, first working slice: ordinary, self and super sends over the runtime-mixin metadata with upstream's access-modifier rules; local and non-local returns; closures created and activated in simulation; and the full-speed escape - a method found without a bytecode record (a _js-intrinsic body, an edited class) is invoked as its compiled JS function, so simulation seamlessly degrades to real execution method by method. Real closures receiving value in simulation resolve to their _js-intrinsic methods and therefore escape automatically; simulated closures are intercepted before lookup.
 
-Not yet ported, failing with descriptive errors: eventual sends, cannotReturn:/nonBooleanReceiver: reification, and simulated closures escaping to full-speed code. Exception handling IS simulated: on:do: rewrites to the run:protectedBy:handler: surrogate; any signal (stepped code and full-speed escapes alike throw through the step loop, since simulated frames are data) routes to the nearest matching handler frame by method identity, running intervening unwind protectors first. A stepping driver is included: start:send:with:, step, stepOver, stepThrough, stackDo:, atEnd, result. Unwind protection (ensure:/ifCurtailed:) IS ported: sends on simulated closures rewrite to the SimulationSupport surrogates, whose frames the non-local-return walk recognizes by method identity. Not yet wired into any runtime. *)
+Not yet ported, failing with descriptive errors: eventual sends, cannotReturn:/nonBooleanReceiver: reification, and simulated closures escaping to full-speed code.
+
+Sentinel NLR (M4) interplay: a sentinel record surfacing from a full-speed escape cannot target any simulated frame (activation ids are JS-frame ids), and it propagates out of the simulation AUTOMATICALLY -- the simulator is itself M4-compiled, so the checked send at each escape site (Message sendTo: and friends) returns the record straight out of escape:, step, and the driver loop to the simulation's real caller, which propagates it onward. KNOWN GAP: simulated unwind-protect frames (SimulationSupport surrogates) pending on the simulated stack do NOT run their protectors during such a flythrough; the abandoned simulated frames are heap data and simply become garbage. Accepted for now; revisit if a real scenario hits it. Exception handling IS simulated: on:do: rewrites to the run:protectedBy:handler: surrogate; any signal (stepped code and full-speed escapes alike throw through the step loop, since simulated frames are data) routes to the nearest matching handler frame by method identity, running intervening unwind protectors first. A stepping driver is included: start:send:with:, step, stepOver, stepThrough, stackDo:, atEnd, result. Unwind protection (ensure:/ifCurtailed:) IS ported: sends on simulated closures rewrite to the SimulationSupport surrogates, whose frames the non-local-return walk recognizes by method identity. Not yet wired into any runtime. *)
 
 	|
 		private List = platform collections List.
@@ -105,10 +107,7 @@ Not yet ported, failing with descriptive errors: eventual sends, cannotReturn:/n
 		activate: simulatedMethod receiver: newReceiver arguments: arguments = (
 			| newActivation |
 			nil = simulatedMethod record ifTrue: [
-					^escape: simulatedMethod selector
-						accessModifier: simulatedMethod accessModifier
-						receiver: newReceiver
-						arguments: arguments
+					^escape: simulatedMethod receiver: newReceiver arguments: arguments
 				].
 			newActivation:: SimulatedActivation new.
 			newActivation sender: activation.
@@ -261,25 +260,52 @@ Not yet ported, failing with descriptive errors: eventual sends, cannotReturn:/n
 		dup = (
 			activation push: activation top
 		)
-		escape: selector accessModifier: accessModifier receiver: receiver arguments: arguments = (
-			(* The full-speed escape: run a method that has no bytecode record as its compiled JS function and push the result. Public sends re-dispatch through the kernel Message (whose mangler is authoritative, binary selectors included); protected and private targets are fetched at the protected mangling on the receiver's prototype chain. Exceptions propagate through the normal signal path. *)
+		escape: simulatedMethod <SimulatedMethod> receiver: receiver arguments: arguments = (
+			(* The full-speed escape: run a method that has no bytecode record as its compiled JS function and push the result. Public sends re-dispatch through the kernel Message (whose mangler is authoritative, binary selectors included); protected targets are fetched at the protected mangling on the receiver's prototype chain. PRIVATE members are NOT installed on prototypes at all: they live as functions on the DEFINING MIXIN object, taking the receiver as their first parameter (the compiler's early-bound $N[...](self) convention) -- fetching them off the receiver DNUs (bug seen 2026-07-18: an enclosing module's private slot accessor, record-less because synthetic, broke stepping through Workspace>>platform). Exceptions propagate through the normal signal path. Simulated closures crossing INTO full speed are wrapped in re-entrant shells (fullSpeedValue:) so the escaped code can invoke them like any closure. *)
 
-			| message result |
-			message:: Message selector: selector arguments: arguments.
-			#public = accessModifier
-				ifTrue: [ result:: message sendTo: receiver ]
+			| message shelled result |
+			shelled:: arguments collect: [:a | fullSpeedValue: a ].
+			message:: Message selector: simulatedMethod selector arguments: shelled.
+			#public = simulatedMethod accessModifier
+				ifTrue: [ result:: message sendTo: (fullSpeedValue: receiver) ]
 				ifFalse: [
-					| f = _js propertyOf: receiver
-						at: '_' , message mangledSelector. |
-					result:: _js call: (_js propertyOf: f at: (_js literal: 'apply'))
-						with: {receiver. arguments. }
+					#private = simulatedMethod accessModifier
+						ifTrue: [
+							| f = _js propertyOf: simulatedMethod mixin
+								at: message mangledSelector. |
+							result:: _js call: (_js propertyOf: f at: (_js literal: 'apply'))
+								with: {_js ident: 'null'. {receiver. } , shelled. }
+						]
+						ifFalse: [
+							| f = _js propertyOf: receiver
+								at: '_' , message mangledSelector. |
+							result:: _js call: (_js propertyOf: f at: (_js literal: 'apply'))
+								with: {receiver. shelled. }
+						]
 				].
 			activation push: result
 		)
 		escapeDnu: selector receiver: receiver arguments: arguments = (
 			(* Lookup failed in simulation: real dispatch implements the same rules and raises the real doesNotUnderstand:, so delegate wholesale. *)
 
-			activation push: ((Message selector: selector arguments: arguments) sendTo: receiver)
+			activation push: ((Message selector: selector arguments: (arguments collect: [:a | fullSpeedValue: a ])) sendTo: receiver)
+		)
+		public fullSpeedValue: value = (
+			(* A value crossing from simulation into full-speed code: simulated closures become re-entrant shells (real compiled closures that re-enter simulation when invoked); everything else passes through. *)
+
+			(isSimulatedClosure: value) ifTrue: [ ^shellFor: value ].
+			^value
+		)
+		shellFor: simClosure <SimulatedClosure> = (
+			(* The simulated-closure-to-full-speed wrapper: a REAL closure of matching arity whose invocation runs the simulated closure in a nested simulation loop. The shell is a compiled JS function, so escaped code (kernel iteration, aliens, event handlers) can call it like any closure. *)
+
+			| n = simClosure numArgs. |
+			0 = n ifTrue: [ ^[ runToCompletion: simClosure withArguments: {} ] ].
+			1 = n ifTrue: [ ^[:a | runToCompletion: simClosure withArguments: {a. } ] ].
+			2 = n ifTrue: [ ^[:a :b | runToCompletion: simClosure withArguments: {a. b. } ] ].
+			3 = n ifTrue: [ ^[:a :b :c | runToCompletion: simClosure withArguments: {a. b. c. } ] ].
+			4 = n ifTrue: [ ^[:a :b :c :d | runToCompletion: simClosure withArguments: {a. b. c. d. } ] ].
+			^simulatorLimitation: 'simulated-closure shell arity above 4'
 		)
 		eventualSend: selector numArgs: numArgs = (
 			simulatorLimitation: 'eventual sends are not yet simulated'
@@ -370,7 +396,19 @@ Not yet ported, failing with descriptive errors: eventual sends, cannotReturn:/n
 			^s
 		)
 		mixinNameOf: runtimeMixin = (
-			^_js propertyOf: runtimeMixin at: (_js literal: 'name')
+			(* Guarded: a runtime mixin without a name (mis-wired reflective structures) must surface as a descriptive limitation, not a TypeError deep in the enclosing walk. *)
+
+			| n |
+			n:: normalizeNull: (_js propertyOf: runtimeMixin at: (_js literal: 'name')).
+			nil = n ifTrue: [
+					simulatorLimitation: 'runtime mixin without a name in the lexical walk'
+				].
+			^n
+		)
+		public runtimeMixinForDebugOf: obj = (
+			(* The runtime mixin of obj's own class, exactly as the interpreter derives it -- the correct mixin for a doIt method compiled in obj's class scope (more robust than reading runtimeMixin off the NS Mixin object, which can be mis-wired for reflectively created classes). *)
+
+			^runtimeMixinOf: (behaviorOf: obj)
 		)
 		isSimulatedClosure: obj = (
 			(* A structural probe would misfire on arbitrary objects via dnuCatchers; compare the runtime class directly. *)
@@ -764,7 +802,9 @@ Not yet ported, failing with descriptive errors: eventual sends, cannotReturn:/n
 			^true
 		)
 		public result = (
-			^root pop
+			(* The final value of a completed simulation. A simulated closure escaping as the result is shelled: the caller lives at full speed. *)
+
+			^fullSpeedValue: root pop
 		)
 		runProtectorsFrom: start to: handlerFrame = (
 			(* Run every not-yet-run unwind protector between the signaling activation and the handler frame, innermost first, marking each. *)
@@ -792,6 +832,33 @@ Not yet ported, failing with descriptive errors: eventual sends, cannotReturn:/n
 			activation:: saved.
 			^sentinel pop
 		)
+		public runToCompletion: simClosure withArguments: arguments = (
+			(* Run a simulated closure with the given arguments in a nested simulation loop, preserving the outer loop's control state; re-entrant (used by the full-speed shells, possibly after the owning thread finished). *)
+
+			| saved sentinel |
+			saved:: activation.
+			sentinel:: SimulatedActivation new.
+			activation:: sentinel.
+			activateClosure: simClosure arguments: arguments.
+			[ sameActivation: activation as: sentinel ] whileFalse: [ step ].
+			activation:: saved.
+			^sentinel pop
+		)
+		public rootActivation ^<SimulatedActivation> = (
+			(* Public access for SimulatedThread (cross-object sends need public). *)
+
+			^root
+		)
+		public isProtectorFrame: frame ^<Boolean> = (
+			(* Public access for SimulatedThread's unwind checks. *)
+
+			^isUnwindProtectFrame: frame
+		)
+		public applicationOf: runtimeMixin startingAt: behavior = (
+			(* Public access for the activation mirrors: the runtime class on the behavior's chain applying the given runtime mixin (whose newspeakClass identifies the defining NS class for a frame's method). *)
+
+			^findApplicationOf: runtimeMixin startingAt: behavior
+		)
 		public simulate: receiver send: selector with: arguments = (
 			(* Run a send in simulation to completion, answering the result. Equivalent to start:send:with: followed by stepping to the end. *)
 
@@ -800,10 +867,11 @@ Not yet ported, failing with descriptive errors: eventual sends, cannotReturn:/n
 			^result
 		)
 		public sourceOf: frame ^<String | nil> = (
-			(* The source text of the frame's method, from the deployed sources array via the MM source index. *)
+			(* The source text of the frame's method: direct text when the method carries it (runtime-compiled doIts), else the deployed sources array via the MM source index. *)
 
 			| idx |
 			nil = frame method ifTrue: [ ^nil ].
+			nil = frame method sourceText ifFalse: [ ^frame method sourceText ].
 			nil = frame method metadata ifTrue: [ ^nil ].
 			idx:: _js propertyOf: frame method metadata at: (_js literal: 'source').
 			0 = idx ifTrue: [ ^nil ].
@@ -846,6 +914,15 @@ Not yet ported, failing with descriptive errors: eventual sends, cannotReturn:/n
 			root:: SimulatedActivation new.
 			activation:: root.
 			[ dispatchOrdinary: selector receiver: receiver arguments: arguments ]
+				on: Exception
+				do: [:e | handleSignal: e ]
+		)
+		public startMethod: simulatedMethod <SimulatedMethod> receiver: receiver arguments: arguments = (
+			(* Begin a debugging session at an EXPLICIT method - a compiled expression (doIt) that is installed nowhere and so cannot be reached by dispatch. Same driving protocol as start:send:with:. *)
+
+			root:: SimulatedActivation new.
+			activation:: root.
+			[ activate: simulatedMethod receiver: receiver arguments: arguments ]
 				on: Exception
 				do: [:e | handleSignal: e ]
 		)
@@ -893,6 +970,153 @@ Not yet ported, failing with descriptive errors: eventual sends, cannotReturn:/n
 		)
 		unusedBytecode = (
 			simulatorLimitation: 'unused bytecode'
+		)
+	) : ()
+	public class SimulatedThread over: sim <Simulator> = Object new (
+		(* A suspended/steppable computation over one Simulator: the psoup Thread (MirrorsForPrimordialSoup) ported onto the JS simulator. States: #suspended (frames live, steppable), #broken (an unhandled signal; frames live at the raise point), #fulfilled (completed; result holds the value), #terminated. Where psoup's resume jumps to full speed via a primitive, resuming here runs the simulator to completion (psoup's resumeSlowly) - the only kind of resume compiled JS frames allow, and the right one for a debugging session. *)
+
+		|
+			public state ::= #suspended.
+			public result
+			public simulator <Simulator> = sim.
+		|
+	) (
+		public isKindOfSimulatedThread ^<Boolean> = (
+			^true
+		)
+		public suspendedActivation ^<SimulatedActivation | nil> = (
+			(#suspended = state or: [ #broken = state ]) ifFalse: [ ^nil ].
+			^simulator activation
+		)
+		hasSuspended: a <SimulatedActivation> ^<Boolean> = (
+			| s |
+			s:: suspendedActivation.
+			[ nil = s ] whileFalse: [
+					s == a ifTrue: [ ^true ].
+					s:: s sender
+				].
+			^false
+		)
+		isBottom: a <SimulatedActivation> ^<Boolean> = (
+			nil = a sender ifTrue: [ ^true ].
+			^a sender == simulator rootActivation
+		)
+		guard: a <SimulatedActivation> = (
+			(hasSuspended: a) ifFalse: [ Error signal: 'Activation is not in thread' ]
+		)
+		stepUntil: predicate <[:SimulatedActivation | Boolean]> = (
+			(* Step (at least once) until the predicate holds at the current activation, the simulation completes, or an unhandled signal escapes. Faithful to psoup Thread stepUntil: except for the guard: psoup steps a BROKEN thread by resuming the raise point (its exceptions are resumable); until Stage 2 brings that to the JS platform, stepping a broken or finished thread is a graceful no-op -- the UI's step buttons stay live on the displayed frames, and raising here would crash the button action (seen 2026-07-18). restart: or return:from: re-suspend a broken thread for real stepping. *)
+
+			#suspended = state ifFalse: [ ^self ].
+			state:: #running.
+			[
+				[
+					simulator step.
+					simulator atEnd or: [ predicate value: simulator activation ]
+				] whileFalse
+			] on: Exception do: [:e |
+					(* An unhandled signal escaped the simulation: the simulator's activation still stands at the raise point - exactly the stack the debugger wants. Raw JS errors (TypeError etc.) have no Newspeak protocol and crash the result display; wrap them. *)
+					state:: #broken.
+					result:: normalizeBrokenReason: e.
+					^self
+				].
+			simulator atEnd
+				ifTrue: [
+					state:: #fulfilled.
+					result:: simulator result
+				]
+				ifFalse: [ state:: #suspended ]
+		)
+		normalizeBrokenReason: e = (
+			(* Newspeak exceptions pass through; raw JS errors (no newspeakClass) are wrapped in a kernel Exception whose text carries the JS stack, so the debugger's result display can print them. *)
+
+			| c text wrapped |
+			c:: _js propertyOf: e at: (_js literal: 'newspeakClass').
+			(_js operator: '==' with: c and: (_js ident: 'null')) ifFalse: [ ^e ].
+			text:: _js propertyOf: e at: (_js literal: 'stack').
+			(_js operator: '==' with: text and: (_js ident: 'null')) ifTrue: [
+					text:: 'a raw JS error'
+				].
+			wrapped:: Exception new.
+			wrapped messageText: text.
+			^wrapped
+		)
+		public resume = (
+			stepUntil: [:top | false ]
+		)
+		public stepInto: a <SimulatedActivation> = (
+			guard: a.
+			stepUntil: [:top | true ]
+		)
+		public stepOver: a <SimulatedActivation> = (
+			guard: a.
+			stepUntil: [:top | simulator reached: a ]
+		)
+		public stepOut: a <SimulatedActivation> = (
+			| goal |
+			guard: a.
+			(isBottom: a) ifTrue: [ ^resume ].
+			goal:: a sender.
+			stepUntil: [:top | simulator reached: goal ]
+		)
+		public stepThrough: a <SimulatedActivation> = (
+			| goal |
+			guard: a.
+			goal:: simulator home: a.
+			stepUntil: [:top | simulator reachedHome: goal ]
+		)
+		unwindTo: target <SimulatedActivation> = (
+			(* Discard frames from the suspended activation down to (but excluding) target. psoup parity: refuses to cross a pending unwind protector. *)
+
+			| unwind sender |
+			unwind:: suspendedActivation.
+			[ unwind == target ] whileFalse: [
+					(simulator isProtectorFrame: unwind) ifTrue: [
+							^Error signal: 'Unwinding across an unwind-protect frame is not yet supported'
+						].
+					unwind:: unwind sender
+				].
+			unwind:: suspendedActivation.
+			[ unwind == target ] whileFalse: [
+					sender:: unwind sender.
+					unwind terminate.
+					unwind:: sender
+				].
+			simulator activation: target
+		)
+		public return: returnValue from: a <SimulatedActivation> = (
+			guard: a.
+			(isBottom: a) ifTrue: [
+					unwindTo: a.
+					a terminate.
+					simulator activation: simulator rootActivation.
+					result:: returnValue.
+					state:: #fulfilled.
+					^self
+				].
+			unwindTo: a sender.
+			simulator activation push: returnValue.
+			state:: #suspended
+		)
+		public restart: a <SimulatedActivation> withLookup: doLookup <Boolean> = (
+			guard: a.
+			doLookup ifTrue: [
+					^Error signal: 'restartWithLookup is not yet supported on the JS platform'
+				].
+			unwindTo: a.
+			a resetForRestart.
+			state:: #suspended
+		)
+		public terminate = (
+			| bottom |
+			nil = suspendedActivation ifTrue: [ ^Error signal: 'Nothing to terminate' ].
+			bottom:: suspendedActivation.
+			[ isBottom: bottom ] whileFalse: [ bottom:: bottom sender ].
+			unwindTo: bottom.
+			bottom terminate.
+			simulator activation: simulator rootActivation.
+			state:: #terminated.
+			result:: nil
 		)
 	) : ()
 	public class SimulatedActivation new = Object new (
@@ -947,6 +1171,35 @@ Not yet ported, failing with descriptive errors: eventual sends, cannotReturn:/n
 		public describe ^<String> = (
 			^'in ' , (nil = method ifTrue: [ '<root>' ] ifFalse: [ method selector ]) , ' at bci ' , bci printString , ' (frame ' , frame size printString , ', sp ' , stackPointer printString , ')'
 		)
+		public outerContext ^<SimulatedActivation | nil> = (
+			(* The lexically enclosing activation, for block frames; nil for method frames. Part of the DebugMapper context protocol (NewspeakBytecodeCompilation DebugInfo). *)
+
+			nil = closure ifTrue: [ ^nil ].
+			^closure definingActivation
+		)
+		public size ^<Integer> = (
+			(* Current extent of the temp/operand area; DebugMapper context protocol. *)
+
+			^stackPointer
+		)
+		public resetForRestart = (
+			(* Reset this frame to its initial state, psoup Thread restart:withMethod: semantics: arguments (and, for closures, re-pushed copied values) survive; locals are cleared; the operand stack is emptied. *)
+
+			| numArgs |
+			nil = closure
+				ifTrue: [
+					numArgs:: method numArgs.
+					bci:: 1.
+					numArgs + 1 to: frame size do: [:i | frame at: i put: nil ].
+					stackPointer:: method numTemps
+				]
+				ifFalse: [
+					bci:: closure initialBCI.
+					closure numArgs + 1 to: frame size do: [:i | frame at: i put: nil ].
+					stackPointer:: closure numArgs.
+					1 to: closure copied size do: [:i | push: (closure copied at: i) ]
+				]
+		)
 		public terminate = (
 			isDead:: true.
 			sender:: nil
@@ -969,6 +1222,12 @@ Not yet ported, failing with descriptive errors: eventual sends, cannotReturn:/n
 
 			(* The MM metadata entry itself, for the source index. *)
 			public metadata
+
+			(* Direct source text for methods with no MM entry (runtime-compiled doIts). *)
+			public sourceText
+
+			(* The V5 DebugInfo computed when this method was compiled at runtime (doIts): local names and bci mappings without recompilation, psoup-style (psoup stores DebugInfo as the doIt method's metadata). *)
+			public debugInfo
 		|
 	) (
 		public bytecode = (

@@ -184,6 +184,9 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 
 			(* When set, methods carrying the :literalmessage: primitive: pragma are rejected with a compile error, per the capability doctrine (primitives do not exist on the JS platform). Defaults to off because legacy psoup-platform sources that still carry pragmas (Namespacing, DeploymentManager, the psoup runtimes) are compiled by JS deploys today; flip once those are eradicated. The V5 bytecode path always rejects, so a pragma-carrying unit merely degrades to JS-only. *)
 			public rejectPragmas ::= false.
+
+			(* Stage 3 lazy shadow stack: when set, every method body is wrapped in try { ... } catch (e) { NSShadowPush(...); throw e; } so a reconstruction unwind can capture the failed stack (method identity, receiver, arguments; temporaries deferred -- they are block-scoped inside the body and invisible to the catch). Default off until the tax is measured on a real deploy (a microbench says try/catch is free on modern V8). *)
+			public emitShadowFrames ::= false.
 			bytecodeCompiler = nil = bytecodeCompilation ifFalse: [
 					bytecodeCompilation Compiler new
 				].
@@ -638,17 +641,36 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 				^_js return: (node expression apply: self)
 			)
 			public methodNode: node <MethodAST> ^<Node> = (
-				| translatedBody |
+				| translatedBody jsParams wrappedBody |
 				node body apply: self.
 
-				(* Translate once to compute containsNonLocalReturn (pass 1 output is discarded; under M4 the flag selects the home prologue and the unwrapping check form for depth-0 sends). Reset the temp counter so pass 2 numbering is deterministic. *)
+				(* Translate once to compute containsNonLocalReturn (pass 1 output is discarded; under M4 the flag selects the home prologue and the unwrapping check form for depth-0 sends). Reset the temp counter so pass 2 numbering is deterministic. The PATTERN must be applied before the body wrap: messagePatternNode: sets methodIsPrivate (and currentSelector), which maybeCaptureReceiver reads. *)
 				tempCounter:: 0.
 				translatedBody:: node body apply: self.
-				^_js functionOf: (node pattern apply: self) asArray
-					body: (containsNonLocalReturn ifTrue: [
-							wrapBodyForNlrHandling: translatedBody
-						]
-						ifFalse: [ wrapBodyNoNlrHandling: translatedBody ])
+				jsParams:: (node pattern apply: self) asArray.
+				wrappedBody:: containsNonLocalReturn
+					ifTrue: [ wrapBodyForNlrHandling: translatedBody ]
+					ifFalse: [ wrapBodyNoNlrHandling: translatedBody ].
+				emitShadowFrames ifTrue: [
+						wrappedBody:: shadowWrap: wrappedBody methodNode: node
+					].
+				^_js functionOf: jsParams body: wrappedBody
+			)
+			shadowWrap: body <Block> methodNode: node <MethodAST> = (
+				(* Stage 3: try { <body> } catch (e) { NSShadowPush(e, mixin, selector, receiver, [args]); throw e; }. The receiver in the catch is `this` (or the explicit self parameter of a private method: the body's own `let self = this` is block-scoped inside the try and invisible here). Captures method identity, receiver and arguments at unwind time; declared temporaries are likewise block-scoped and deferred. *)
+
+				| isPrivate receiverRef argRefs |
+				isPrivate:: node accessModifier = #private.
+				receiverRef:: isPrivate
+					ifTrue: [ _js ident: selfName ]
+					ifFalse: [ _js ident: 'this' ].
+				argRefs:: node pattern parameters collect: [:each |
+						_js ident: (names mangleLocal: each name)
+					].
+				^_js block: {_js try: body
+						catch: 'nsShadowErr'
+						with: (_js block: {_js call: (_js ident: 'NSShadowPush')
+								with: {_js ident: 'nsShadowErr'. _js literal: currentMixinUID. _js literal: node pattern selector. receiverRef. _js array: argRefs asArray. }. _js throw: (_js ident: 'nsShadowErr'). }). }
 			)
 			public nilNode: node = (
 				^_js ident: 'nil'
@@ -2051,7 +2073,17 @@ app.$main$args$(vmmirror.platform, [])'
 				(* M4 sentinel NLR globals. NLRSentinel MUST be a const: every send compares its result against it, and a const lets V8 embed the value as a code constant (a mutable binding costs a context load per send -- measured 2-5x on send-dense benchmarks, 2026-07-17). NLRPayload carries the in-flight {homeId, value} record; nlrNextId numbers home activations. *)
 				_js verbatim: 'const NLRSentinel = {NLRSentinel: true};'. _js var: 'NLRPayload'
 					value: (_js ident: 'null'). _js var: 'nlrNextId'
-					value: (_js literal: 0). _js var: 'theGlobalObject'
+					value: (_js literal: 0).
+				(* Stage 3 lazy shadow stack (design par. 7): built only DURING a reconstruction unwind (NSReconstructing, set by the unhandled-signal path when a debug hook is registered). Method catch-wrappers call NSShadowPush as the reconstruction token unwinds them, innermost first; a boundary hands NSShadowFrames to NSDebugHook for transplant into the simulator. Ordinary exception flow never builds frames. *)
+				_js verbatim: 'var NSShadowFrames = [];
+var NSShadowError = null;
+var NSReconstructing = false;
+var NSDebugHook = null;
+function NSShadowPush(e, mixinName, selector, receiver, args){
+	if (!NSReconstructing) return;
+	if (NSShadowError !== e) { NSShadowError = e; NSShadowFrames = []; }
+	NSShadowFrames.push({mixin: mixinName, selector: selector, receiver: receiver, args: args});
+}'. _js var: 'theGlobalObject'
 					value: (_js ident: 'this')._js verbatim: 'function SM(n,am,m,s){this.name=n; this.accessModifier = am; this.isMutable=m; this.isSynthetic=s; }'. _js verbatim: 'function MM(n,am,sy,src,bc){this.name=n; this.accessModifier = am; this.isSynthetic=sy; this.source=src; this.bytecode = (bc === undefined) ? null : bc; }'. _js verbatim: 'function dnuCatcher(s){ return function() {
 if (this === undefined || this === null || typeof this.dnu !== "function") {
 	// The receiver is a raw JS value (an exception object, a DOM value, ...)

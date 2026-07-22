@@ -67,6 +67,7 @@ Copyright Google Inc. 2014 - 2017 *)
 			].
 		private Exception = p kernel Exception.
 		private Interval = p collections Interval.
+		private kernelModule = p kernel.
 	|
 ) (
 	class AbstractClassHeaderMirror new = Object new (
@@ -1524,19 +1525,35 @@ on the data to decide what action to take. *)
 			^self evaluate: expression with: Map new
 		)
 		public evaluate: expression <String> with: scope <Map[Symbol, ObjectMirror]> ^<ThreadMirror> = (
-			| rawScope func state result |
+			(* Compile and run the expression at full speed, with THIS activation as the thread boundary. The handler chain is CUT for the dynamic extent of the run: an evaluation is logically its own thread - psoup runs it as one - so handlers installed by the surrounding UI stack must not catch exceptions signaled inside it. An unhandled signal inside the evaluation then engages the Stage 3 reconstruction unwind (when the IDE armed the debug hook): the throw builds the shadow stack through the method catch-wrappers and is caught HERE at the boundary, transplanted into a broken simulated thread presenting the frames AT the raise point - the debugger opens at the failing method, not on a finished thread holding only the exception. Raw JS errors arrive without reconstruction and degrade to a frameless broken thread with a printable reason.
+
+		The doIt is invoked RAW, so the call is also a sentinel blind spot: a non-local return homed outside the evaluation arrives as an in-flight sentinel that must keep propagating raw - and must never touch [result] (capturing it once reported a broken thread holding the raw sentinel, unprintable, poisoning the results list - 2026-07-18). *)
+
+			| rawScope func state result callResult savedChain |
 			rawScope:: Map new.
 			scope keysAndValuesDo: [:key :value | rawScope at: key put: value reflectee ].
 			func:: compileExpression: expression with: scope.
-			[
-				result:: _js call: (_js propertyOf: func at: (_js literal: 'call'))
-					with: {reflectee. rawScope. }.
-				state:: #fulfilled
-			] on: Error
-				do: [:e |
-					result:: e.
-					state:: #broken
-				].
+			savedChain:: kernelModule handlerChainCut.
+			_js try: (_js block: {
+					callResult:: _js call: (_js propertyOf: func at: (_js literal: 'call'))
+						with: {reflectee. rawScope. }.
+					_js if: (_js operator: '===' with: callResult and: (_js ident: 'NLRSentinel'))
+						then: (_js block: {kernelModule handlerChainRestore: savedChain. _js return: callResult. }).
+					result:: callResult.
+					state:: #fulfilled. })
+				catch: 'nsEvalErr'
+				with: (_js block: {
+					kernelModule handlerChainRestore: savedChain.
+					_js if: (_js ident: 'NSReconstructing')
+						then: (_js block: {_js assign: (_js ident: 'NSReconstructing')
+								toBe: (_js literal: false). _js return: (ActivationMirror threadForShadowFrames: (_js ident: 'NSShadowFrames')
+								exception: (_js ident: 'nsEvalErr')
+								doItSource: expression
+								receiver: reflectee
+								scope: rawScope). }).
+					result:: brokenEvalReasonFor: (_js ident: 'nsEvalErr').
+					state:: #broken. }).
+			kernelModule handlerChainRestore: savedChain.
 			^ThreadMirror state: state result: (ObjectMirror reflecting: result)
 		)
 		public getClass = (
@@ -2091,13 +2108,11 @@ c. If the slot is mutable, there will be a third method, which is an ordinary se
 			^ThreadMirror onSimulated: thread
 		)
 		definingClassMirror ^<ClassMirror | nil> = (
-			(* The NS class whose mixin defines the frame's method: locate the runtime-mixin application on the receiver's class chain and surface its newspeakClass. *)
+			(* The NS class whose mixin defines the frame's method. The simulator query is non-raising and covers flat-patched primitive receivers (their runtime chain materializes no applications) via the NS class chain - displaying a transplanted frame must never fail on an unresolvable mixin. *)
 
-			| behavior nsClass |
-			behavior:: thread simulator applicationOf: reflectee method mixin
+			| nsClass |
+			nsClass:: thread simulator newspeakClassApplying: reflectee method mixin
 				startingAt: (classOfReflectee: reflectee receiver).
-			nil = behavior ifTrue: [ ^nil ].
-			nsClass:: normalizeUndefined: (_js propertyOf: behavior at: (_js literal: 'newspeakClass')).
 			nil = nsClass ifTrue: [ ^nil ].
 			^ClassMirror reflecting: nsClass
 		)
@@ -2267,8 +2282,265 @@ c. If the slot is mutable, there will be a third method, which is an ordinary se
 				].
 			^a threadMirror
 		)
+		public threadForShadowFrames: rawFrames exception: ex ^<ThreadMirror> = (
+			^threadForShadowFrames: rawFrames exception: ex doItSource: nil receiver: nil scope: nil
+		)
+		public threadForShadowFrames: rawFrames exception: ex doItSource: expression <String | nil> receiver: rcvr scope: rawScope <Map | nil> ^<ThreadMirror> = (
+			(* Stage 3 transplant: the raw shadow-frame records built during a reconstruction unwind (innermost first: {mixin, selector, receiver, args}) become a BROKEN simulated thread the Debugging UI presents like any other. Frames are restart-quality (receiver and arguments captured at unwind, locals cleared, bci 1): inspect everything, evaluate in frame scope, restart any frame to re-execute it. Unresolvable frames (edited away, record-less) are skipped. Degrades to a frameless broken thread without the simulator.
+
+		With a doItSource (the evaluate:with: reconstruction boundary): the doIt itself is compiled fresh with the V5 pipeline - exactly as evaluateSuspended: does - and appended as the OUTERMOST frame. The doIt is installed nowhere, so shadow-record resolution can never find it; without this the evaluation's own frame, usually the one the user cares about, is missing, and Continue has nothing meaningful to restart. *)
+
+			| sim count frameRec simMethod act innermost prev simThread doItFrame prevSelector calleeSel siteRaw site b blkRaw blk doItMethod doItRecordFramed isDoIt recSelector |
+			nil = simulatorModule ifTrue: [
+					^ThreadMirror state: #broken result: (ObjectMirror reflecting: ex)
+				].
+			sim:: simulatorModule Simulator new.
+			doItMethod:: nil.
+			doItRecordFramed:: false.
+			nil = expression ifFalse: [
+					doItMethod:: [ doItSimMethodFor: expression receiver: rcvr scope: rawScope in: sim ]
+						on: Exception
+						do: [:compileError | nil ]
+				].
+			count:: _js propertyOf: rawFrames at: (_js literal: 'length').
+			innermost:: nil.
+			prev:: nil.
+			prevSelector:: nil.
+			1 to: count do: [:i |
+					frameRec:: _js propertyOf: rawFrames at: (i - 1).
+					recSelector:: _js propertyOf: frameRec at: (_js literal: 'selector').
+					simMethod:: sim transplantMethodMixinNamed: (_js propertyOf: frameRec at: (_js literal: 'mixin'))
+						selector: recSelector
+						receiver: (_js propertyOf: frameRec at: (_js literal: 'receiver')).
+
+					(* The doIt and its blocks are homed in a synthetic method installed nowhere - unresolvable by name. Their records carry the compiler's synthetic selector: mount them on the freshly V5-compiled doIt method (same bare expression source, so the source coordinates agree). *)
+					isDoIt:: false.
+					(nil = simMethod and: [ (nil = doItMethod) not ]) ifTrue: [
+							'DoItWith:' = recSelector ifTrue: [
+									simMethod:: doItMethod.
+									isDoIt:: true
+								]
+						].
+					nil = simMethod ifFalse: [
+							(* A block record (blk = the block's source start) is a CLOSURE activation of the home method: same compilation unit, but its captured args are the BLOCK's parameters - they must not be mounted into the home method's argument slots, where the slot mapper would present them under the wrong names. A doIt method record mounts the canonical psoup activation (receiver = the evaluation receiver, arguments {ctxt. scope.}). *)
+							blkRaw:: _js propertyOf: frameRec at: (_js literal: 'blk').
+							blk:: (_js operator: '==' with: blkRaw and: (_js ident: 'null'))
+								ifTrue: [ 0 ]
+								ifFalse: [ blkRaw ].
+							act:: sim transplantFrameFor: simMethod
+								receiver: (isDoIt
+									ifTrue: [ rcvr ]
+									ifFalse: [ _js propertyOf: frameRec at: (_js literal: 'receiver') ])
+								arguments: (blk > 0
+									ifTrue: [ {} ]
+									ifFalse: [
+										isDoIt
+											ifTrue: [ {nil. rawScope. } ]
+											ifFalse: [ _js propertyOf: frameRec at: (_js literal: 'args') ]
+									]).
+							(isDoIt and: [ 0 = blk ]) ifTrue: [ doItRecordFramed:: true ].
+
+							(* Display bci: where this frame invoked its callee - the ADJACENT RAW record's method, whether or not that record itself resolved to a frame. Stored site for instrumented multi-site selectors, static derivation for single-site ones; a block frame with neither falls back to the block's first mapped instruction; bci 1 otherwise. *)
+							calleeSel:: calleeSelectorFor: prevSelector exception: ex.
+							b:: 0.
+							nil = calleeSel ifFalse: [
+									siteRaw:: _js propertyOf: frameRec at: (_js literal: 'site').
+									site:: (_js operator: '==' with: siteRaw and: (_js ident: 'null'))
+										ifTrue: [ 0 ]
+										ifFalse: [ siteRaw ].
+									b:: sim transplantBciFor: simMethod callee: calleeSel site: site
+								].
+							(0 = b and: [ blk > 0 ]) ifTrue: [
+									b:: sim bciAtOrAfterSourceStart: blk in: simMethod
+								].
+							0 = b ifFalse: [ act bci: b ].
+							restoreLocalsOf: act from: frameRec method: simMethod in: sim.
+							nil = innermost ifTrue: [ innermost:: act ].
+							nil = prev ifFalse: [ prev sender: act ].
+							prev:: act
+						].
+					prevSelector:: recSelector
+				].
+
+			(* The doIt method frame normally mounts from its own record above; this append covers captures that lost it (e.g. truncated record chains). *)
+			(nil = doItMethod or: [ doItRecordFramed ]) ifFalse: [
+					doItFrame:: sim transplantFrameFor: doItMethod receiver: rcvr arguments: {nil. rawScope. }.
+					calleeSel:: calleeSelectorFor: prevSelector exception: ex.
+					nil = calleeSel ifFalse: [
+							b:: sim transplantBciFor: doItMethod callee: calleeSel site: 0.
+							0 = b ifFalse: [ doItFrame bci: b ]
+						].
+					nil = innermost ifTrue: [ innermost:: doItFrame ].
+					nil = prev ifFalse: [ prev sender: doItFrame ].
+					prev:: doItFrame
+				].
+			nil = innermost ifTrue: [
+					^ThreadMirror state: #broken result: (ObjectMirror reflecting: ex)
+				].
+
+			(* Continue restarts the OUTERMOST frame: give it its statement-level entry point. *)
+			nil = prev ifFalse: [
+					prev restartBci: ([ statementRestartBciFor: prev in: sim ]
+						on: Exception
+						do: [:noStatement | 1 ])
+				].
+			sim adoptBrokenStack: innermost.
+			simThread:: simulatorModule SimulatedThread over: sim.
+			simThread state: #broken.
+			simThread result: ex.
+			^ThreadMirror onSimulated: simThread
+		)
+		restoreLocalsOf: act from: frameRec method: simMethod in: sim = (
+			(* Best-effort restore of the frame's captured locals (statement-level restart + slot inspection): the shadow record's values matched by SOURCE NAME against the V5 local layout, obtained from the method's own debugInfo (doIts) or by recompiling the method source in its defining mixin's scope. DIRECT locals only: a closure-captured local lives in a remote vector on the V5 side while the JS capture holds the plain value - restoring it raw would corrupt the vector slot, so those stay nil. Any failure leaves the frame as it was. *)
+
+			| names vals di lvs limit n v |
+			names:: _js propertyOf: frameRec at: (_js literal: 'localNames').
+			(_js operator: '==' with: names and: (_js ident: 'null')) ifTrue: [ ^self ].
+			vals:: _js propertyOf: frameRec at: (_js literal: 'locals').
+			(_js operator: '==' with: vals and: (_js ident: 'null')) ifTrue: [ ^self ].
+			[
+				di:: transplantDebugInfoFor: simMethod of: act in: sim.
+				nil = di ifTrue: [ ^self ].
+				lvs:: di localVariables.
+				limit:: _js propertyOf: names at: (_js literal: 'length').
+				1 to: limit do: [:i |
+						n:: _js propertyOf: names at: i - 1.
+						v:: _js propertyOf: vals at: i - 1.
+						lvs do: [:lv |
+								(lv name = n and: [ 0 = lv contextDepth and: [ nil = lv remoteVector ] ]) ifTrue: [
+										(* zeroOriginOffset is COMBINED-space (params included): DebugMapper getValueOf: reads tempAt: offset + 1 directly - write exactly where the mapper reads. (The bytecode pushLocal space is locals-only and adds numArgs; that is a different coordinate system.) *)
+										act tempAt: lv zeroOriginOffset + 1 put: v
+									]
+							]
+					]
+			]
+				on: Exception
+				do: [:restoreFailed | nil ]
+		)
+		transplantDebugInfoFor: simMethod of: act in: sim ^<DebugInfo | nil> = (
+			(* The V5 DebugInfo describing simMethod's local layout: carried directly by runtime-compiled doIts, recompiled from source for deployed methods (same text, both compilers, so layouts agree). nil-tolerant throughout. *)
+
+			| src nsClass |
+			nil = simMethod debugInfo ifFalse: [ ^simMethod debugInfo ].
+			nil = bytecodeCompilationModule ifTrue: [ ^nil ].
+			src:: sim sourceOf: act.
+			nil = src ifTrue: [ ^nil ].
+			nsClass:: sim newspeakClassApplying: simMethod mixin
+				startingAt: (_js call: (_js propertyOf: (_js ident: 'Object')
+						at: (_js literal: 'getPrototypeOf'))
+					with: {act receiver. }).
+			nil = nsClass ifTrue: [ ^nil ].
+			^(bytecodeCompilationModule Compiler new compileMethodSource: src
+				within: (ClassMirror reflecting: nsClass) mixin) debugInfo
+		)
+		statementRestartBciFor: act in: sim ^<Integer> = (
+			(* The bci of the top-level statement containing the frame's display bci - the sound Continue entry point (empty operand stack, no live control flow at top-level statement boundaries, locals restored to their at-failure values). 1 whenever anything is unresolvable: Continue then degrades to a full restart. *)
+
+			(* Coordinates: everything stays in RAW parser coordinates - bciMap interval starts ARE parser node starts. A doIt's map came from a standalone parse of the same bare expression (sourceStart 0), so map values align with a fresh parse at bias 0; a deployed method's map came from the class-source parse (values minus sourceStart are zero-anchored at the method start), so the fresh standalone parse's own origin - the parsed declaration's start - is subtracted as bias. *)
+
+			| simMethod src root stmts bias failStart stmt map i entryBci bestBci best s candidates |
+			simMethod:: act method.
+			nil = simMethod ifTrue: [ ^1 ].
+			nil = simMethod record ifTrue: [ ^1 ].
+			src:: sim sourceOf: act.
+			nil = src ifTrue: [ ^1 ].
+			#DoIt = simMethod selector
+				ifTrue: [
+					root:: parsing CommonParser new parseExpression: src.
+					stmts:: root statements.
+					bias:: 0
+				]
+				ifFalse: [
+					root:: parsing CommonParser new parseMethodDeclaration: src.
+					stmts:: root body statements.
+					bias:: root start
+				].
+			map:: simMethod bciMap.
+
+			(* The raw source start of the frame's current position: the nearest mapped entry at or before the display bci. *)
+			failStart:: nil.
+			bestBci:: -1.
+			i:: 1.
+			[ i + 2 <= map size ] whileTrue: [
+					entryBci:: map at: i.
+					(entryBci <= act bci and: [ entryBci > bestBci ]) ifTrue: [
+							bestBci:: entryBci.
+							failStart:: (map at: i + 1) - simMethod sourceStart
+						].
+					i:: i + 3
+				].
+			nil = failStart ifTrue: [ ^1 ].
+			stmt:: nil.
+			stmts do: [:each |
+					(* Parenthesize the arithmetic INSIDE the comparisons: Newspeak binary operators are uniform-precedence left-associative, so a bare `failStart <= each end - bias` is `(failStart <= each end) - bias` - a boolean minus a number, silently coerced by JS and then DNUing on ifTrue: (found 2026-07-22). *)
+					((each start - bias) <= failStart and: [ failStart <= (each end - bias) ]) ifTrue: [ stmt:: each ]
+				].
+			nil = stmt ifTrue: [ ^1 ].
+
+			(* All mapped bcis of the failing statement; the simulator derives the sound entry - the start of the push-run into the earliest method-level one - since the map marks only sends and stores, never a statement's first instruction. *)
+			candidates:: List new.
+			i:: 1.
+			[ i + 2 <= map size ] whileTrue: [
+					s:: (map at: i + 1) - simMethod sourceStart.
+					(s >= (stmt start - bias) and: [ s <= (stmt end - bias) ]) ifTrue: [
+							candidates add: (map at: i)
+						].
+					i:: i + 3
+				].
+			candidates isEmpty ifTrue: [ ^1 ].
+			best:: sim statementEntryAmong: candidates in: simMethod.
+			0 = best ifTrue: [ ^1 ].
+			^best
+		)
+		calleeSelectorFor: rawCalleeSelector <String | nil> exception: ex ^<String | nil> = (
+			(* The selector to look for in the CALLER's bytecode when deriving a transplant frame's bci. A doesNotUnderstand: callee means the source-level send was the MNU's own message: dNU is invoked by the DNU catcher machinery, so its selector never appears at the call site. Any probe failure keeps the raw selector. *)
+
+			nil = rawCalleeSelector ifTrue: [ ^nil ].
+			'doesNotUnderstand:' = rawCalleeSelector ifFalse: [ ^rawCalleeSelector ].
+			^[ ex message selector ] on: Exception do: [:probeFailed | rawCalleeSelector ]
+		)
+		doItSimMethodFor: expression <String> receiver: rcvr scope: rawScope <Map> in: sim ^<SimulatedMethod | nil> = (
+			(* The V5-compiled doIt of a failed evaluation, ready for restart-quality frames (the method record's own frame and its blocks' frames alike). Compiled from the same bare expression the JS doIt was, so shadow-record source coordinates agree. nil when the bytecode pipeline is unavailable; a compile failure raises to the caller's backstop. *)
+
+			| bcc im simMethod |
+			bcc:: bytecodeCompilationModule.
+			nil = bcc ifTrue: [ ^nil ].
+			im:: bcc Compiler new compileExpressionSource: expression
+				debugMapper: nil
+				withScope: rawScope
+				inMixin: (ObjectMirror reflecting: rcvr) getClass mixin.
+			simMethod:: simulatorModule SimulatedMethod record: (bytecodeRecordFor: im)
+				mixin: (sim runtimeMixinForDebugOf: rcvr)
+				selector: #DoIt
+				accessModifier: #public.
+			simMethod sourceText: expression.
+			simMethod debugInfo: im debugInfo.
+			^simMethod
+		)
 	)
 
+	public installDebugHook: presenter <[:ThreadMirror]> = (
+		(* Arm the Stage 3 debugger: an unhandled signal then reconstructs the failed stack and this hook presents it. NSDebugHook is called from the boundary catch with RAW (exception, shadowFrames); a Newspeak closure IS a plain JS function, so it is assigned directly and receives the raw arguments. All failures are swallowed here (and again at the boundary): the debugger must never worsen the original failure. *)
+
+		| hook |
+		hook:: [:ex :frames |
+				[ presenter value: (ActivationMirror threadForShadowFrames: frames exception: ex) ]
+					on: Exception
+					do: [:e | nil ].
+				nil
+			].
+		_js assign: (_js ident: 'NSDebugHook') toBe: hook
+	)
+	brokenEvalReasonFor: rawErr = (
+		(* The exception object a broken thread presents. NS exceptions (newspeakClass set - the same raw-vs-NS test as the kernel's protectedBodyOf:) pass through; a raw JS error - which reaches the evaluation boundary only without a reconstruction unwind - wraps into a kernel Exception carrying its JS description, so the results list can print it. Module-level: reached by here-sends from ObjectMirror. *)
+
+		| c ex |
+		c:: _js propertyOf: rawErr at: (_js literal: 'newspeakClass').
+		(_js operator: '!=' with: c and: (_js ident: 'null')) ifTrue: [ ^rawErr ].
+		ex:: Exception new.
+		ex messageText: (kernelModule describeRawError: rawErr).
+		^ex
+	)
 	bytecodeRecordFor: im ^<Array> = (
 		(* The runtime bytecode-record array for a freshly V5-compiled intermediate method, in the MM-record layout the simulator consumes: [bytes, literals, numArgs, numLocals, maxStack, bciMap, sourceStart] (see Newspeak2JSCompilation encodeBytecodeOf:, whose deploy-time encoding this mirrors at runtime). Module-level: reached by here-sends from ObjectMirror (debugExpression:) and ActivationMirror (frame evaluate:). *)
 

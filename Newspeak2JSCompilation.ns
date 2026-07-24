@@ -185,8 +185,11 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 			(* When set, methods carrying the :literalmessage: primitive: pragma are rejected with a compile error, per the capability doctrine (primitives do not exist on the JS platform). Defaults to off because legacy psoup-platform sources that still carry pragmas (Namespacing, DeploymentManager, the psoup runtimes) are compiled by JS deploys today; flip once those are eradicated. The V5 bytecode path always rejects, so a pragma-carrying unit merely degrades to JS-only. *)
 			public rejectPragmas ::= false.
 
-			(* Stage 3 lazy shadow stack: when set, every method body is wrapped in try { ... } catch (e) { NSShadowPush(...); throw e; } so a reconstruction unwind can capture the failed stack (method identity, receiver, arguments; temporaries deferred -- they are block-scoped inside the body and invisible to the catch). Default off until the tax is measured on a real deploy (a microbench says try/catch is free on modern V8). *)
-			public emitShadowFrames ::= false.
+			(* Stage 3 lazy shadow stack: when set, every method body is wrapped in try { ... } catch (e) { NSShadowPush(...); throw e; } so a reconstruction unwind can capture the failed stack (method identity, receiver, arguments; temporaries deferred -- they are block-scoped inside the body and invisible to the catch). Default ON per the working-system-first direction (a microbench says try/catch is free on modern V8; the flag exists for the benchmark comparison and for the future debug-support deployment axis). *)
+			public emitShadowFrames ::= true.
+
+			(* Send-site tracking for shadow-frame bci accuracy (measured 2026-07-20: two-thirds of methods are wholly unambiguous and pay nothing). A selector sent ONCE in a method needs no runtime help: the display derives the call site from the callee frame's selector. Only selectors sent 2+ times in a method (blocks included: their code shares the method's bytecode) are instrumented: the method's wrapper declares a frame-local site slot (outside the try, so the catch can see it), and each such send stores its message's source offset - the identical coordinate the V5 DebugInfo maps (addDebugInfo: node message), so the display joins it against the bciMap exactly. Requires emitShadowFrames; no effect without it. *)
+			public emitSendSites ::= true.
 			bytecodeCompiler = nil = bytecodeCompilation ifFalse: [
 					bytecodeCompilation Compiler new
 				].
@@ -428,17 +431,29 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 
 				(* Tail-position check elision: when a return statement's expression IS a send (identity-compared here by the send visitors), that outermost send needs no sentinel check -- returning the sentinel IS propagation. Nested sends (receiver/argument positions) still check. Never set at depth 0 of a home method: there a sentinel targeted at this very frame must be unwrapped, not returned raw. *)
 				tailElisionNode <AST>
+
+				(* Send-site instrumentation state, managed entirely by methodNode:. Pass 1 counts every emitted send's selector into sendSiteCounts; between passes the selectors sent 2+ times become sendSiteAmbiguous; pass 2 emits a site store before each of their sends. Both nil outside a method translation (DoIts, initializers, superclass accessors): noteSendSiteOf: is then a no-op, so no store can ever reference an undeclared site slot. *)
+				sendSiteCounts <Map[Symbol, Integer]>
+				sendSiteAmbiguous <Map[Symbol, Boolean]>
+
+				(* The selector of the method being translated, for the BLOCK shadow wrappers (currentSelector is set by the pattern apply, which runs after the body passes). nil outside a method translation: blocks in DoIts and direct-expression contexts are not wrapped. *)
+				shadowSelector <Symbol>
+
+				(* The method's own CodeBodyAST while shadow frames are on: ITS temp declarations hoist into the wrapper scope - the only place the catch can read them for locals capture - and codeBodyNode: must not redeclare them (an inner let would shadow the wrapper's and the catch would capture stale nils). Initializers are unaffected: they desugar into leading assignment statements. Block and inlined-block bodies keep their own block-scoped declarations. *)
+				hoistTempsFrom <CodeBodyAST>
 			|
 		) (
 			addCascadedSend: node to: statements = (
-				| checked |
+				| checked callNode |
 				node isKindOfCascadedSendNode ifTrue: [
 						addCascadedSend: node previousSend to: statements
 					].
 				statementBuffers add: List new.
-				checked:: emitCheckedCall: (_js call: (_js propertyOf: (_js ident: 'cascadeReceiver')
-							at: (publicMessage: node message))
-						with: (node message arguments collect: [:each | each apply: self ]) asArray).
+				callNode:: _js call: (_js propertyOf: (_js ident: 'cascadeReceiver')
+						at: (publicMessage: node message))
+					with: (node message arguments collect: [:each | each apply: self ]) asArray.
+				noteSendSiteOf: node message.
+				checked:: emitCheckedCall: callNode.
 				statementBuffers removeLast do: [:s | statements add: s ].
 				statements add: checked
 			)
@@ -472,6 +487,17 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 				tempCounter:: tempCounter + 1.
 				^'nlrT' , tempCounter printString
 			)
+			noteSendSiteOf: message <MessageAST> = (
+				(* Count this send (pass 1) and, in pass 2, emit the site store for ambiguous selectors. Called by every send visitor AFTER receiver and arguments have translated (their hoisted statements are already in the buffer), IMMEDIATELY before the call is emitted: nested sends inside arguments each store before their own calls, so at any throw the slot holds the site of the innermost call actually in flight. The stored value is message start - the source coordinate the V5 DebugInfo maps for this same send. No-op outside a method translation and in direct-expression contexts. *)
+
+				nil = sendSiteCounts ifTrue: [ ^self ].
+				sendSiteCounts at: message selector
+					put: (sendSiteCounts at: message selector ifAbsent: [ 0 ]) + 1.
+				nil = sendSiteAmbiguous ifTrue: [ ^self ].
+				statementBuffers isEmpty ifTrue: [ ^self ].
+				(sendSiteAmbiguous at: message selector ifAbsent: [ false ]) ifFalse: [ ^self ].
+				emitStatement: (_js assign: (_js ident: 'nsSite') toBe: (_js literal: message start))
+			)
 			nlrHomeIdName = (
 				^'nlrMyId'
 			)
@@ -498,14 +524,32 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 				^_js return: (node expression apply: self)
 			)
 			public blockNode: node <BlockAST> = (
-				| body |
+				| body params |
 				closureDepth:: closureDepth + 1.
 				body:: node body apply: self.
 				closureDepth:: closureDepth - 1.
-				^_js functionOf: (node parameters collect: [:each |
+				params:: (node parameters collect: [:each |
 							self parameterDeclNode: each
-						]) asArray
-					body: body
+						]) asArray.
+				(emitShadowFrames and: [ (nil = shadowSelector) not ]) ifTrue: [
+						body:: blockShadowWrap: body blockNode: node params: params
+					].
+				^_js functionOf: params body: body
+			)
+			blockShadowWrap: body <Block> blockNode: node <BlockAST> params: params <Array[String]> = (
+				(* Stage 3 for CLOSURES: a block body runs in its INVOKER's dynamic extent, so the home method's try/catch never sees a throw inside it - without this wrapper, block activations are invisible to the reconstruction unwind (and gone entirely when the home frame already returned). The record carries the home method's identity (the block's bytecode lives in the home's compilation unit), the home receiver - selfName, captured lexically; a block's own `this` is the closure function - the frame-local site slot when the method has one, and the block's source start as the block marker, which also positions the frame inside the block when send-level derivation finds nothing. Only genuine closures pass through here: inlined control-structure blocks are rewritten away before translation. *)
+
+				| siteRef argRefs |
+				siteRef:: (nil = sendSiteAmbiguous
+					ifTrue: [ false ]
+					ifFalse: [ sendSiteAmbiguous size > 0 ])
+						ifTrue: [ _js ident: 'nsSite' ]
+						ifFalse: [ _js literal: 0 ].
+				argRefs:: params collect: [:p | _js ident: p ].
+				^_js block: {_js try: body
+						catch: 'nsShadowErr'
+						with: (_js block: {_js call: (_js ident: 'NSShadowPush')
+								with: {_js ident: 'nsShadowErr'. _js literal: currentMixinUID. _js literal: shadowSelector. _js ident: selfName. _js array: argRefs asArray. siteRef. _js literal: node start. }. _js throw: (_js ident: 'nsShadowErr'). }). }
 			)
 			public boolNode: node <BoolAST> = (
 				^_js literal: node value
@@ -530,7 +574,9 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 			)
 			public codeBodyNode: node <CodeBodyAST> = (
 				| locals statements |
-				locals:: node temporaries collect: [:each | self temporaryDeclNode: each ].
+				locals:: node == hoistTempsFrom
+					ifTrue: [ List new ]
+					ifFalse: [ node temporaries collect: [:each | self temporaryDeclNode: each ] ].
 				statements:: List new.
 				node statements do: [:each |
 						| translated |
@@ -642,9 +688,19 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 			)
 			public methodNode: node <MethodAST> ^<Node> = (
 				| translatedBody jsParams wrappedBody |
+				sendSiteCounts:: Map new.
+				sendSiteAmbiguous:: nil.
+				shadowSelector:: node pattern selector.
+				hoistTempsFrom:: emitShadowFrames ifTrue: [ node body ] ifFalse: [ nil ].
 				node body apply: self.
 
-				(* Translate once to compute containsNonLocalReturn (pass 1 output is discarded; under M4 the flag selects the home prologue and the unwrapping check form for depth-0 sends). Reset the temp counter so pass 2 numbering is deterministic. The PATTERN must be applied before the body wrap: messagePatternNode: sets methodIsPrivate (and currentSelector), which maybeCaptureReceiver reads. *)
+				(* Translate once to compute containsNonLocalReturn (pass 1 output is discarded; under M4 the flag selects the home prologue and the unwrapping check form for depth-0 sends). Pass 1 also counted the send selectors: the 2+ ones become the ambiguous set pass 2 instruments (the set must be SNAPSHOT here - counts keep accumulating in pass 2, which would promote every single-site selector to 2). Reset the temp counter so pass 2 numbering is deterministic. The PATTERN must be applied before the body wrap: messagePatternNode: sets methodIsPrivate (and currentSelector), which maybeCaptureReceiver reads. *)
+				(emitSendSites and: [ emitShadowFrames ]) ifTrue: [
+						sendSiteAmbiguous:: Map new.
+						sendSiteCounts keysAndValuesDo: [:sel :count |
+								count >= 2 ifTrue: [ sendSiteAmbiguous at: sel put: true ]
+							]
+					].
 				tempCounter:: 0.
 				translatedBody:: node body apply: self.
 				jsParams:: (node pattern apply: self) asArray.
@@ -654,12 +710,16 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 				emitShadowFrames ifTrue: [
 						wrappedBody:: shadowWrap: wrappedBody methodNode: node
 					].
+				sendSiteCounts:: nil.
+				sendSiteAmbiguous:: nil.
+				shadowSelector:: nil.
+				hoistTempsFrom:: nil.
 				^_js functionOf: jsParams body: wrappedBody
 			)
 			shadowWrap: body <Block> methodNode: node <MethodAST> = (
-				(* Stage 3: try { <body> } catch (e) { NSShadowPush(e, mixin, selector, receiver, [args]); throw e; }. The receiver in the catch is `this` (or the explicit self parameter of a private method: the body's own `let self = this` is block-scoped inside the try and invisible here). Captures method identity, receiver and arguments at unwind time; declared temporaries are likewise block-scoped and deferred. *)
+				(* Stage 3: try { <body> } catch (e) { NSShadowPush(e, mixin, selector, receiver, [args], site); throw e; }. The receiver in the catch is `this` (or the explicit self parameter of a private method: the body's own `let self = this` is block-scoped inside the try and invisible here). Captures method identity, receiver and arguments at unwind time; declared temporaries are likewise block-scoped and deferred. When the method has ambiguous send sites, the site slot is declared HERE - outside the try, the only place the catch can read - and the push passes it; otherwise the push passes literal 0 and no slot exists. *)
 
-				| isPrivate receiverRef argRefs |
+				| isPrivate receiverRef argRefs sitesActive siteRef temps pushArgs prologue inner |
 				isPrivate:: node accessModifier = #private.
 				receiverRef:: isPrivate
 					ifTrue: [ _js ident: selfName ]
@@ -667,10 +727,27 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 				argRefs:: node pattern parameters collect: [:each |
 						_js ident: (names mangleLocal: each name)
 					].
-				^_js block: {_js try: body
-						catch: 'nsShadowErr'
-						with: (_js block: {_js call: (_js ident: 'NSShadowPush')
-								with: {_js ident: 'nsShadowErr'. _js literal: currentMixinUID. _js literal: node pattern selector. receiverRef. _js array: argRefs asArray. }. _js throw: (_js ident: 'nsShadowErr'). }). }
+				sitesActive:: nil = sendSiteAmbiguous
+					ifTrue: [ false ]
+					ifFalse: [ sendSiteAmbiguous size > 0 ].
+				siteRef:: sitesActive
+					ifTrue: [ _js ident: 'nsSite' ]
+					ifFalse: [ _js literal: 0 ].
+				temps:: node body temporaries.
+				pushArgs:: {_js ident: 'nsShadowErr'. _js literal: currentMixinUID. _js literal: node pattern selector. receiverRef. _js array: argRefs asArray. siteRef. }.
+				temps isEmpty ifFalse: [
+						(* Locals capture (statement-level restart): source names and current values of the hoisted temps; blk = 0 pads the position. *)
+						pushArgs:: pushArgs , {_js literal: 0. _js array: (temps collect: [:each | _js literal: each name ]) asArray. _js array: (temps collect: [:each | _js ident: (names mangleLocal: each name) ]) asArray. }
+					].
+				inner:: _js try: body
+					catch: 'nsShadowErr'
+					with: (_js block: {_js call: (_js ident: 'NSShadowPush')
+							with: pushArgs asArray. _js throw: (_js ident: 'nsShadowErr'). }).
+				prologue:: List new.
+				temps do: [:each | prologue add: (self temporaryDeclNode: each) ].
+				sitesActive ifTrue: [ prologue add: (_js var: 'nsSite' value: (_js literal: 0)) ].
+				prologue isEmpty ifTrue: [ ^_js block: {inner. } ].
+				^_js block: (prologue asArray , {inner. }) asArray
 			)
 			public nilNode: node = (
 				^_js ident: 'nil'
@@ -682,6 +759,7 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 				^_js literal: node value
 			)
 			public ordinarySendNode: node <OrdinarySendAST> = (
+				| callNode |
 				enableIntrinsics ifTrue: [
 						node receiver isKindOfImplicitReceiverSendNode ifTrue: [
 								node receiver message selector = '_js' ifTrue: [
@@ -689,10 +767,11 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 									]
 							]
 					].
-				^emitCheckedCall: (_js call: (_js propertyOf: (node receiver apply: self)
+				callNode:: _js call: (_js propertyOf: (node receiver apply: self)
 						at: (publicMessage: node message))
-					with: (node message arguments collect: [:each | each apply: self ]) asArray)
-					unlessTail: node
+					with: (node message arguments collect: [:each | each apply: self ]) asArray.
+				noteSendSiteOf: node message.
+				^emitCheckedCall: callNode unlessTail: node
 			)
 			public parameterDeclNode: node <ParameterAST> = (
 				^names mangleLocal: node name
@@ -745,17 +824,18 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 				^_js literal: node value
 			)
 			public superSendNode: node <SuperSendAST> = (
-				| superSlotName args |
+				| superSlotName args callNode |
 				superSlotName:: names mangleSlot: 'super`' , currentMixinUID.
 				args:: List new.
 				args add: (_js ident: 'self').
 				node message arguments do: [:each | args add: (each apply: self) ].
-				^emitCheckedCall: (_js call: (_js propertyOf: (_js propertyOf: (_js propertyOf: (_js ident: 'self')
-								at: (_js literal: superSlotName))
-							at: (protectedMessage: node message))
-						at: (_js literal: 'call'))
-					with: args)
-					unlessTail: node
+				callNode:: _js call: (_js propertyOf: (_js propertyOf: (_js propertyOf: (_js ident: 'self')
+							at: (_js literal: superSlotName))
+						at: (protectedMessage: node message))
+					at: (_js literal: 'call'))
+					with: args.
+				noteSendSiteOf: node message.
+				^emitCheckedCall: callNode unlessTail: node
 			)
 			public symbolNode: node <SymbolAST> = (
 				^_js literal: node value
@@ -851,20 +931,23 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 				^processLexicalSend: node message to: receiver binding: node binding tail: node
 			)
 			processLexicalSend: message to: jsReceiver binding: binding tail: sendNode <AST> = (
+				| callNode |
 				(binding isNil not and: [ binding ast accessModifier = #private ]) ifTrue: [
 						| definingMixinDepth =
 						(* Do early binding. *)
 						binding depth - 1. definingMixin = _js ident: '$' , definingMixinDepth printString. targetMethod = _js propertyOf: definingMixin
 							at: (publicMessage: message). |
-						^emitCheckedCall: (_js call: targetMethod
+						callNode:: _js call: targetMethod
 							with:
 							(* (_js propertyOf: targetMethod at: (_js literal: 'call')) *)
-							{jsReceiver. } , (message arguments collect: [:each | each apply: self ]) asArray)
-							unlessTail: sendNode
+							{jsReceiver. } , (message arguments collect: [:each | each apply: self ]) asArray.
+						noteSendSiteOf: message.
+						^emitCheckedCall: callNode unlessTail: sendNode
 					].
-				^emitCheckedCall: (_js call: (_js propertyOf: jsReceiver at: (protectedMessage: message))
-					with: (message arguments collect: [:each | each apply: self ]) asArray)
-					unlessTail: sendNode
+				callNode:: _js call: (_js propertyOf: jsReceiver at: (protectedMessage: message))
+					with: (message arguments collect: [:each | each apply: self ]) asArray.
+				noteSendSiteOf: message.
+				^emitCheckedCall: callNode unlessTail: sendNode
 			)
 			public selfSendNode: node <SelfSendAST> = (
 				| receiver = _js ident: selfName. |
@@ -2079,12 +2162,46 @@ app.$main$args$(vmmirror.platform, [])'
 var NSShadowError = null;
 var NSReconstructing = false;
 var NSDebugHook = null;
-function NSShadowPush(e, mixinName, selector, receiver, args){
+function NSShadowPush(e, mixinName, selector, receiver, args, site, blk, localNames, locals){
 	if (!NSReconstructing) return;
 	if (NSShadowError !== e) { NSShadowError = e; NSShadowFrames = []; }
-	NSShadowFrames.push({mixin: mixinName, selector: selector, receiver: receiver, args: args});
+	NSShadowFrames.push({mixin: mixinName, selector: selector, receiver: receiver, args: args, site: site|0, blk: blk|0, localNames: localNames || null, locals: locals || null});
 }'. _js var: 'theGlobalObject'
-					value: (_js ident: 'this')._js verbatim: 'function SM(n,am,m,s){this.name=n; this.accessModifier = am; this.isMutable=m; this.isSynthetic=s; }'. _js verbatim: 'function MM(n,am,sy,src,bc){this.name=n; this.accessModifier = am; this.isSynthetic=sy; this.source=src; this.bytecode = (bc === undefined) ? null : bc; }'. _js verbatim: 'function dnuCatcher(s){ return function() {
+					value: (_js ident: 'this').
+				(* Platform helper parity: JS functions the psoup deployment injects via primordialsoup''s --post-js (meta/custom-post.js) and that Newspeak code reaches as window globals (e.g. WebFiles.ns: `window safeDownloadBlob: n blob: b`). The psoup copy is CANONICAL - mirror changes here and there together; custom-post.js carries the matching cross-reference. Declared as top-level classic-script functions, so they land on window. *)
+				_js verbatim: 'async function safeDownloadBlob(fileName, fileBlob) {
+	// Mirrored from primordialsoup/meta/custom-post.js (canonical) - keep in sync.
+	// Save a Blob via showSaveFilePicker (FSAA) when available, else the <a download> fallback.
+	if (''showSaveFilePicker'' in window) {
+		try {
+			const fileHandle = await window.showSaveFilePicker({ suggestedName: fileName });
+			const writableStream = await fileHandle.createWritable();
+			try {
+				await writableStream.write(fileBlob);
+			} finally {
+				await writableStream.close();
+			}
+			return { success: true, method: ''FSAA'' };
+		} catch (error) {
+			console.error(''FSAA Download failed (may be user cancelled):'', error);
+			if (error.name === ''AbortError'') {
+				return { success: true, method: ''FSAA'', message: ''User cancelled save.'' };
+			}
+			return { success: false, method: ''FSAA'', error: error.name || ''UnknownError'' };
+		}
+	} else {
+		console.warn(''FSAA not supported. Falling back to standard download.'');
+		const url = URL.createObjectURL(fileBlob);
+		const a = document.createElement(''a'');
+		a.href = url;
+		a.download = fileName;
+		document.body.appendChild(a);
+		a.click();
+		document.body.removeChild(a);
+		URL.revokeObjectURL(url);
+		return { success: true, method: ''Standard'', message: ''Standard download started (may be renamed by browser).'' };
+	}
+}'. _js verbatim: 'function SM(n,am,m,s){this.name=n; this.accessModifier = am; this.isMutable=m; this.isSynthetic=s; }'. _js verbatim: 'function MM(n,am,sy,src,bc){this.name=n; this.accessModifier = am; this.isSynthetic=sy; this.source=src; this.bytecode = (bc === undefined) ? null : bc; }'. _js verbatim: 'function dnuCatcher(s){ return function() {
 if (this === undefined || this === null || typeof this.dnu !== "function") {
 	// The receiver is a raw JS value (an exception object, a DOM value, ...)
 	// with no Newspeak doesNotUnderstand: machinery. Raise a proper, catchable

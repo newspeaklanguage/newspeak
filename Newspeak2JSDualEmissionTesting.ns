@@ -119,9 +119,13 @@ lazy: x with: y = ( ^x and: [ y foo ] )
 )'
 		)
 		nlrGeneratedText ^<String> = (
-			| sb |
+			(* Compiled WITHOUT shadow frames: these tests pin the NLR emission shapes, and the Stage 3 wrapper (default on) adds its own try/catch/throw noise. *)
+
+			| plainCompiler sb |
+			plainCompiler:: jsCompilation Compiler new.
+			plainCompiler emitShadowFrames: false.
 			sb:: StringBuilder new.
-			generation Writer new generateSourceFor: (compiler compileClassSource: nlrSampleSource within: nil) runtimeMixin
+			generation Writer new generateSourceFor: (plainCompiler compileClassSource: nlrSampleSource within: nil) runtimeMixin
 				on: sb.
 			^sb asString
 		)
@@ -201,18 +205,80 @@ count: c = ( | n ::= 0. | [ c hasMore ] whileTrue: [ n:: n + 1 ]. ^n )
 			assert: (string: nlrGeneratedText contains: 'nlrT2 = nlrT1')
 		)
 		public testShadowFrameWrapperEmission = (
-			(* Stage 3: with emitShadowFrames on, every method body is wrapped in try/catch calling NSShadowPush with method identity, receiver and args, then rethrowing. Off by default: the plain sample must not mention NSShadowPush. *)
+			(* Stage 3: with emitShadowFrames (the default), every method body is wrapped in try/catch calling NSShadowPush with method identity, receiver and args, then rethrowing. With the flag off (the NLR-shape samples), no wrapper. *)
 
-			| shadowCompiler sb generated |
-			shadowCompiler:: jsCompilation Compiler new.
-			shadowCompiler emitShadowFrames: true.
+			| sb generated |
 			sb:: StringBuilder new.
-			generation Writer new generateSourceFor: (shadowCompiler compileClassSource: sampleSource within: nil) runtimeMixin
+			generation Writer new generateSourceFor: (compiler compileClassSource: sampleSource within: nil) runtimeMixin
 				on: sb.
 			generated:: sb asString.
 			assert: (string: generated contains: 'NSShadowPush(nsShadowErr, "DualSample", "add:to:", this, [').
 			assert: (string: generated contains: 'throw nsShadowErr').
 			deny: (string: nlrGeneratedText contains: 'NSShadowPush')
+		)
+		siteSampleSource ^<String> = (
+			^'Newspeak3 ''Uncategorized'' class SiteSample = ( ) (
+twice: x with: y = ( x foo. y foo. ^x bar )
+once: x = ( ^x foo )
+)'
+		)
+		public testSendSiteInstrumentationShapes = (
+			(* Send-site tracking (default on): a method with a selector sent twice declares the frame-local site slot outside the try (the catch must see it), stores the message source offset before each ambiguous send, and passes the slot to NSShadowPush; a method whose selectors are all single-site gets no slot and passes literal 0 - the display derives its call sites statically. *)
+
+			| sb generated |
+			sb:: StringBuilder new.
+			generation Writer new generateSourceFor: (compiler compileClassSource: siteSampleSource within: nil) runtimeMixin
+				on: sb.
+			generated:: sb asString.
+			assert: (string: generated contains: 'let nsSite = 0').
+			(* the two foo stores: in this sample the first foo message sits in the 74-75 character range and the second in 80-81, so their stores start with 7 and 8 whichever position base the ASTs use; bar is single-site and stores nothing *)
+			assert: (string: generated contains: 'nsSite = 7').
+			assert: (string: generated contains: 'nsSite = 8').
+			assert: (string: generated contains: '], nsSite)').
+			assert: (string: generated contains: '"once:", this, [$x], 0)')
+		)
+		public testSendSiteFlagOffIsClean = (
+			(* emitSendSites: false must leave no trace: no slot, no stores, NSShadowPush site argument is literal 0. *)
+
+			| plainCompiler sb |
+			plainCompiler:: jsCompilation Compiler new.
+			plainCompiler emitSendSites: false.
+			sb:: StringBuilder new.
+			generation Writer new generateSourceFor: (plainCompiler compileClassSource: siteSampleSource within: nil) runtimeMixin
+				on: sb.
+			deny: (string: sb asString contains: 'nsSite')
+		)
+		public testBlockShadowWrapEmission = (
+			(* Stage 3 closure wrappers: a genuine block body gets its own try/catch pushing a record with the home method's identity, the home receiver (self - a block's own `this` is the closure function), the block's parameters, the site slot or 0, and the block's source start as 7th argument. Inlined control-structure blocks are rewritten away before translation and must NOT be wrapped: a method whose only blocks are inlined carries no block-style push (recognizable by the `self` receiver in a public method). *)
+
+			| source sb generated |
+			source:: 'Newspeak3 ''Uncategorized'' class BlkSample = ( ) (
+run: c = ( ^c collect: [:e | e squared ] )
+guard: x = ( x isNil ifTrue: [ ^1 ]. ^2 )
+)'.
+			sb:: StringBuilder new.
+			generation Writer new generateSourceFor: (compiler compileClassSource: source within: nil) runtimeMixin
+				on: sb.
+			generated:: sb asString.
+			assert: (string: generated contains: '"run:", self, [$e], 0, ').
+			assert: (string: generated contains: '"run:", this, [$c], 0)').
+			deny: (string: generated contains: '"guard:", self, ')
+		)
+		public testTempHoistingAndLocalsCapture = (
+			(* Statement-level restart support: a method with declared temps hoists their `let $t = nil` declarations into the wrapper scope (so the catch can read them) and NSShadowPush receives source names and current values as trailing arguments (after a 0 padding the block position). A method without temps keeps the shorter push. *)
+
+			| source sb generated |
+			source:: 'Newspeak3 ''Uncategorized'' class HoistSample = ( ) (
+hold: x = ( | t | t:: x foo. ^t bar )
+plain: x = ( ^x foo )
+)'.
+			sb:: StringBuilder new.
+			generation Writer new generateSourceFor: (compiler compileClassSource: source within: nil) runtimeMixin
+				on: sb.
+			generated:: sb asString.
+			assert: (string: generated contains: 'let $t = nil').
+			assert: (string: generated contains: ', 0, 0, ["t"], [$t])').
+			assert: (string: generated contains: '"plain:", this, [$x], 0)')
 		)
 		public testWithoutBytecodeCompilationNoRecords = (
 			(* bytecodeCompilation: nil must be a clean no-op: same compile, no bytecode intermediates. *)

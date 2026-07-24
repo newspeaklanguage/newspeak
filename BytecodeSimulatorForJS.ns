@@ -864,10 +864,104 @@ Sentinel NLR (M4) interplay: a sentinel record surfacing from a full-speed escap
 
 			^isUnwindProtectFrame: frame
 		)
+		public newspeakClassApplying: runtimeMixin startingAt: startBehavior ^<NSClass | nil> = (
+			(* Presentation support (ActivationMirror definingClassMirror): the NS class whose runtime class on [startBehavior]'s chain applies [runtimeMixin]. Falls back to the newspeakClass superclass chain for receivers whose prototypes carry the kernel FLAT (primitives - no materialized applications). Answers nil rather than raising: displaying a transplanted frame must never fail on an unresolvable mixin. *)
+
+			| b nsClass rm |
+			b:: startBehavior.
+			[ nil = b ] whileFalse: [
+					(_js operator: '===' with: (runtimeMixinOf: b) and: runtimeMixin) ifTrue: [
+							^normalizeNull: (_js propertyOf: b at: (_js literal: 'newspeakClass'))
+						].
+					b:: behaviorOf: b
+				].
+			nil = startBehavior ifTrue: [ ^nil ].
+			nsClass:: normalizeNull: (_js propertyOf: startBehavior at: (_js literal: 'newspeakClass')).
+			[ nil = nsClass ] whileFalse: [
+					rm:: normalizeNull: (_js propertyOf: (_js propertyOf: nsClass at: (_js literal: '$mixin$slot'))
+							at: (_js literal: 'runtimeMixin')).
+					(_js operator: '===' with: rm and: runtimeMixin) ifTrue: [ ^nsClass ].
+					nsClass:: nsClass superclass
+				].
+			^nil
+		)
 		public applicationOf: runtimeMixin startingAt: behavior = (
 			(* Public access for the activation mirrors: the runtime class on the behavior's chain applying the given runtime mixin (whose newspeakClass identifies the defining NS class for a frame's method). *)
 
 			^findApplicationOf: runtimeMixin startingAt: behavior
+		)
+		public transplantMethodMixinNamed: mixinName selector: selector receiver: receiver ^<SimulatedMethod | nil> = (
+			(* Stage 3 transplant: the simulated method for a shadow frame - the named mixin's application located on the receiver's class chain, its MM record wrapped. Primitive receivers (numbers, strings, raw arrays) take the class-chain fallback: their kernel methods are patched FLAT onto the JS prototypes, so the named mixin application is never materialized as a prototype. nil when unresolvable (mixin not found, method edited away, or record-less): the transplant skips such frames. *)
+
+			| found |
+			found:: [ methodFor: selector
+					in: (behaviorNamed: mixinName startingAt: (behaviorOf: receiver)) ]
+				on: Exception
+				do: [:e | nil ].
+			nil = found ifTrue: [
+					found:: [ transplantViaClassChainNamed: mixinName selector: selector receiver: receiver ]
+						on: Exception
+						do: [:e | nil ]
+				].
+			(nil = found or: [ nil = found record ]) ifTrue: [ ^nil ].
+			^found
+		)
+		transplantViaClassChainNamed: mixinName selector: selector receiver: receiver ^<SimulatedMethod | nil> = (
+			(* The transplant fallback for receivers whose JS prototype chain does not materialize the named mixin application (kernel patched flat onto primitive prototypes). The NS class objects still carry the true hierarchy: walk the receiver's newspeakClass superclass chain to the mixin with the given name and read the MM entry off the mixin itself. *)
+
+			| nsClass rm mms found |
+			nsClass:: normalizeNull: (_js propertyOf: (behaviorOf: receiver)
+					at: (_js literal: 'newspeakClass')).
+			[ nil = nsClass ] whileFalse: [
+					rm:: normalizeNull: (_js propertyOf: (_js propertyOf: nsClass at: (_js literal: '$mixin$slot'))
+							at: (_js literal: 'runtimeMixin')).
+					nil = rm ifFalse: [
+							(normalizeNull: (_js propertyOf: rm at: (_js literal: 'name'))) = mixinName ifTrue: [
+									mms:: normalizeNull: (_js propertyOf: rm at: (_js literal: 'methods')).
+									nil = mms ifTrue: [ ^nil ].
+									mms do: [:mm |
+											(_js propertyOf: mm at: (_js literal: 'name')) = selector ifTrue: [
+													found:: SimulatedMethod record: (normalizeNull: (_js propertyOf: mm at: (_js literal: 'bytecode')))
+														mixin: rm
+														selector: selector
+														accessModifier: (_js propertyOf: mm at: (_js literal: 'accessModifier')).
+													found metadata: mm.
+													^found
+												]
+										].
+									^nil
+								]
+						].
+					nsClass:: nsClass superclass
+				].
+			^nil
+		)
+		public transplantFrameFor: simMethod <SimulatedMethod> receiver: receiver arguments: rawArgs <JSArray> ^<SimulatedActivation> = (
+			(* A restart-quality frame from shadow-stack capture: receiver and arguments as caught at unwind time, locals nil, bci 1 (exactly psoup restart:withMethod: state). Sender linking and adoption are the caller's business. *)
+
+			| a n limit i0 |
+			a:: SimulatedActivation new.
+			a method: simMethod.
+			a receiver: receiver.
+			a size: simMethod numTemps.
+			n:: simMethod numArgs.
+			limit:: _js propertyOf: rawArgs at: (_js literal: 'length').
+			limit < n ifTrue: [ n:: limit ].
+			1 to: n do: [:i |
+					i0:: i - 1.
+					a tempAt: i put: (_js propertyOf: rawArgs at: i0)
+				].
+			^a
+		)
+		public adoptBrokenStack: innermost <SimulatedActivation> = (
+			(* Adopt a transplanted stack: a fresh root sentinel beneath the bottom frame, the innermost as the current activation. The owning SimulatedThread presents it broken; restart:/return:from: re-suspend it for stepping. *)
+
+			| bottom |
+			root:: SimulatedActivation new.
+			bottom:: innermost.
+			[ nil = bottom sender ] whileFalse: [ bottom:: bottom sender ].
+			bottom sender: root.
+			activation:: innermost
 		)
 		public simulate: receiver send: selector with: arguments = (
 			(* Run a send in simulation to completion, answering the result. Equivalent to start:send:with: followed by stepping to the end. *)
@@ -886,6 +980,157 @@ Sentinel NLR (M4) interplay: a sentinel record surfacing from a full-speed escap
 			idx:: _js propertyOf: frame method metadata at: (_js literal: 'source').
 			0 = idx ifTrue: [ ^nil ].
 			^_js propertyOf: (_js ident: 'sources') at: idx
+		)
+		ordinarySendSitesOf: m <SimulatedMethod> ^<List> = (
+			(* {bci. selector.} pairs for the ordinary-family sends (ordinary/self/implicit short and ext, super, outer) in the method's V5 bytecode, blocks included (their code shares the method's bytes). Common-selector, eventual and branch pseudo-sends are excluded - the same scope as the compiler's send-site instrumentation. bci = one-based offset of the instruction's first byte, the bciMap coordinate. *)
+
+			| bytes lits n sites i op raw idx len |
+			bytes:: m bytecode.
+			lits:: m literals.
+			n:: _js propertyOf: bytes at: (_js literal: 'length').
+			sites:: List new.
+			i:: 0.
+			[ i < n ] whileTrue: [
+					op:: _js propertyOf: bytes at: i.
+					raw:: nil.
+					(op >= 64 and: [ op <= 111 ]) ifTrue: [
+							raw:: _js propertyOf: lits at: (op bitAnd: 7)
+						].
+					(op >= 250 and: [ op <= 254 ]) ifTrue: [
+							idx:: (_js propertyOf: bytes at: i + 1) + (((_js propertyOf: bytes at: i + 2) bitAnd: 15) * 256).
+							raw:: _js propertyOf: lits at: idx
+						].
+					(_js operator: '==' with: raw and: (_js ident: 'null')) ifFalse: [
+							sites add: {i + 1. raw. }
+						].
+					len:: op <= 215 ifTrue: [ 1 ] ifFalse: [
+							op <= 237 ifTrue: [ 2 ] ifFalse: [ op <= 253 ifTrue: [ 3 ] ifFalse: [ 4 ] ]
+						].
+					i:: i + len
+				].
+			^sites
+		)
+		bciAtSourceStart: offset in: m <SimulatedMethod> ^<Integer> = (
+			(* The bci of the bciMap entry whose source interval starts exactly at [offset] - the coordinate the compiler's site stores carry (message start, the same position the V5 DebugInfo maps). 0 when absent. *)
+
+			| map i |
+			map:: m bciMap.
+			i:: 1.
+			[ i + 2 <= map size ] whileTrue: [
+					offset = (map at: i + 1) ifTrue: [ ^map at: i ].
+					i:: i + 3
+				].
+			^0
+		)
+		public bciAtOrAfterSourceStart: offset in: m <SimulatedMethod> ^<Integer> = (
+			(* The earliest bciMap entry whose source interval starts at or after [offset]: positions a BLOCK frame at the block's first mapped instruction when send-level derivation found nothing (the block marker is the block's source start; its body's entries are the first ones at or beyond it). 0 when none. *)
+
+			| map i s best bestStart |
+			nil = m ifTrue: [ ^0 ].
+			nil = m record ifTrue: [ ^0 ].
+			map:: m bciMap.
+			best:: 0.
+			bestStart:: nil.
+			i:: 1.
+			[ i + 2 <= map size ] whileTrue: [
+					s:: map at: i + 1.
+					(s >= offset and: [ nil = bestStart or: [ s < bestStart ] ]) ifTrue: [
+							bestStart:: s.
+							best:: map at: i
+						].
+					i:: i + 3
+				].
+			^best
+		)
+		public statementEntryAmong: candidateBcis <List[Integer]> in: m <SimulatedMethod> ^<Integer> = (
+			(* The sound statement-restart entry point: candidateBcis are the mapped (send/store) bcis of the failing statement; the entry is the start of the maximal run of pure single-push instructions leading into the earliest candidate that is a METHOD-LEVEL instruction (closure bodies are inline in the bytes but skipped at method level). Entering there with an empty operand stack re-builds exactly the operands that first send/store consumes. 0 = no sound entry: the method uses remote-temp vectors (their frame slots are nil on a transplant, and only the skipped prologue creates them), no candidate is method-level, or a non-push precedes unexpectedly with no run at all - the caller then degrades to a full restart. *)
+
+			| bytes n boundaries i op bodyLen len fMapped runStart j b |
+			nil = m ifTrue: [ ^0 ].
+			nil = m record ifTrue: [ ^0 ].
+			bytes:: m bytecode.
+			n:: _js propertyOf: bytes at: (_js literal: 'length').
+			boundaries:: List new.
+			i:: 0.
+			[ i < n ] whileTrue: [
+					boundaries add: i + 1.
+					op:: _js propertyOf: bytes at: i.
+					(op >= 245 and: [ op <= 247 ]) ifTrue: [ ^0 ].
+					op = 255
+						ifTrue: [
+							bodyLen:: (_js propertyOf: bytes at: i + 2) + ((_js propertyOf: bytes at: i + 3) * 256).
+							i:: i + 4 + bodyLen
+						]
+						ifFalse: [
+							len:: op <= 215 ifTrue: [ 1 ] ifFalse: [
+									op <= 237 ifTrue: [ 2 ] ifFalse: [ op <= 253 ifTrue: [ 3 ] ifFalse: [ 4 ] ]
+								].
+							i:: i + len
+						]
+				].
+			fMapped:: nil.
+			candidateBcis do: [:c |
+					(boundaries includes: c) ifTrue: [
+							(nil = fMapped or: [ c < fMapped ]) ifTrue: [ fMapped:: c ]
+						]
+				].
+			nil = fMapped ifTrue: [ ^0 ].
+			runStart:: fMapped.
+			j:: boundaries size.
+			[ j >= 1 and: [ (boundaries at: j) >= fMapped ] ] whileTrue: [ j:: j - 1 ].
+			[ j >= 1 ] whileTrue: [
+					b:: boundaries at: j.
+					op:: _js propertyOf: bytes at: b - 1.
+					(isPurePushOpcode: op copiedNibble: (b < n ifTrue: [ _js propertyOf: bytes at: b ] ifFalse: [ 0 ]))
+						ifTrue: [ runStart:: b ]
+						ifFalse: [ ^runStart ].
+					j:: j - 1
+				].
+			^runStart
+		)
+		isPurePushOpcode: op copiedNibble: byte2 ^<Boolean> = (
+			(* Instructions that push exactly one value and consume none, safe inside a statement-entry run: parameter/local/literal/constant pushes, wide forms, enclosing-object push, and a closure with NO copied values (numCopied is the high nibble of its second byte; copied values would pop operands the run did not produce). *)
+
+			(op >= 112 and: [ op <= 127 ]) ifTrue: [ ^true ].
+			(op >= 144 and: [ op <= 156 ]) ifTrue: [ ^true ].
+			(op >= 160 and: [ op <= 163 ]) ifTrue: [ ^true ].
+			op = 222 ifTrue: [ ^true ].
+			op = 228 ifTrue: [ ^true ].
+			op = 229 ifTrue: [ ^true ].
+			op = 233 ifTrue: [ ^true ].
+			op = 248 ifTrue: [ ^true ].
+			op = 249 ifTrue: [ ^true ].
+			op = 255 ifTrue: [ ^(byte2 bitAnd: 240) = 0 ].
+			^false
+		)
+		public transplantBciFor: m <SimulatedMethod> callee: calleeSelector <String | nil> site: siteOffset <Integer> ^<Integer> = (
+			(* The display bci for a restart-quality transplant frame: where in this method the callee below it was invoked. A stored site (multi-site selectors) is trusted only when it maps to a bci that IS a send of the callee's selector - the slot may be stale when the throw did not cross an instrumented send. Otherwise a selector sent exactly once in the bytecode resolves statically at no runtime cost. 0 = no derivation (the frame presents at bci 1, restart quality). *)
+
+			| sends siteBci match count |
+			nil = m ifTrue: [ ^0 ].
+			nil = m record ifTrue: [ ^0 ].
+			nil = calleeSelector ifTrue: [ ^0 ].
+			sends:: ordinarySendSitesOf: m.
+			0 = siteOffset ifFalse: [
+					siteBci:: bciAtSourceStart: siteOffset in: m.
+					0 = siteBci ifFalse: [
+							sends do: [:pair |
+									(siteBci = (pair at: 1) and: [ calleeSelector = (pair at: 2) ]) ifTrue: [
+											^siteBci
+										]
+								]
+						]
+				].
+			match:: 0.
+			count:: 0.
+			sends do: [:pair |
+					calleeSelector = (pair at: 2) ifTrue: [
+							count:: count + 1.
+							match:: pair at: 1
+						]
+				].
+			1 = count ifTrue: [ ^match ].
+			^0
 		)
 		public sourceRangeOf: frame = (
 			(* The method-relative {start. end.} character range of the frame's current position: the mapped entry at the frame's bci, or the nearest preceding one (only sends and stores are mapped). nil when the frame has no bytecode or nothing precedes. *)
@@ -923,24 +1168,28 @@ Sentinel NLR (M4) interplay: a sentinel record surfacing from a full-speed escap
 
 			root:: SimulatedActivation new.
 			activation:: root.
-			[ dispatchOrdinary: selector receiver: receiver arguments: arguments ]
-				on: Exception
-				do: [:e | handleSignal: e ]
+			guarded: [ dispatchOrdinary: selector receiver: receiver arguments: arguments ]
 		)
 		public startMethod: simulatedMethod <SimulatedMethod> receiver: receiver arguments: arguments = (
 			(* Begin a debugging session at an EXPLICIT method - a compiled expression (doIt) that is installed nowhere and so cannot be reached by dispatch. Same driving protocol as start:send:with:. *)
 
 			root:: SimulatedActivation new.
 			activation:: root.
-			[ activate: simulatedMethod receiver: receiver arguments: arguments ]
-				on: Exception
-				do: [:e | handleSignal: e ]
+			guarded: [ activate: simulatedMethod receiver: receiver arguments: arguments ]
+		)
+		guarded: aBlock = (
+			(* The signal guard around simulation driving. BOTH layers are required since Stage 2. The on:do: catches exceptions SIGNALED at full speed inside escapes (Stage 2 matching: the handler runs at the raise point and unwinds here). The raw catch takes what on:do: can no longer see: NS exceptions THROWN rather than signaled - the simulator's own signal interception (see activate:) and the kernel's unhandled-signal fallback - which protectedBodyOf: deliberately rethrows past every on:do: as already past every matching opportunity. Before Stage 2 the plain on:do: caught those throws too; after it they sailed through to the expatriate boundary as uncaught console errors (probeCaughtSignal, 2026-07-18). The raw catch clears the Stage 3 reconstruction state: a signal unhandled at FULL SPEED below a simulation belongs to the SIMULATED handler frames handleSignal: walks, not to the debugger boundary. *)
+
+			_js try: (_js block: {_js return: ([ aBlock value ] on: Exception do: [:e | handleSignal: e ]). })
+				catch: 'nsSimErr'
+				with: (_js block: {_js assign: (_js ident: 'NSReconstructing')
+						toBe: (_js literal: false). handleSignal: (_js ident: 'nsSimErr'). })
 		)
 		public step = (
 			(* One instruction, with the signal machinery guarding it: any exception raised by stepped code or a full-speed escape is routed to the nearest simulated handler frame. *)
 
 			atEnd ifTrue: [ ^self ].
-			[ interpretNextInstruction ] on: Exception do: [:e | handleSignal: e ]
+			guarded: [ interpretNextInstruction ]
 		)
 		public stepOver = (
 			(* Execute the current instruction and whatever it activates, stopping when control is back in the current activation (or it was skipped by a non-local return). *)
@@ -1019,17 +1268,18 @@ Sentinel NLR (M4) interplay: a sentinel record surfacing from a full-speed escap
 
 			#suspended = state ifFalse: [ ^self ].
 			state:: #running.
-			[
-				[
-					simulator step.
-					simulator atEnd or: [ predicate value: simulator activation ]
-				] whileFalse
-			] on: Exception do: [:e |
-					(* An unhandled signal escaped the simulation: the simulator's activation still stands at the raise point - exactly the stack the debugger wants. Raw JS errors (TypeError etc.) have no Newspeak protocol and crash the result display; wrap them. *)
+			(* The escape hatch is a RAW catch, not on:do:: an unhandled signal leaves handleSignal: as a raw JS throw, and since Stage 2 protectedBodyOf: rethrows thrown NS exceptions past every on:do: (already past every matching opportunity) - a kernel on:do: here never fires, leaving the thread stuck at #running while the throw escaped to the UI. The simulator's activation still stands at the raise point - exactly the stack the debugger wants. Reconstruction state is cleared defensively (a hook-armed unhandled signal sets it before throwing); raw JS errors (TypeError etc.) have no Newspeak protocol and crash the result display, so the reason is normalized. *)
+			_js try: (_js block: {
+					[
+						simulator step.
+						simulator atEnd or: [ predicate value: simulator activation ]
+					] whileFalse. })
+				catch: 'nsRunErr'
+				with: (_js block: {
+					_js assign: (_js ident: 'NSReconstructing') toBe: (_js literal: false).
 					state:: #broken.
-					result:: normalizeBrokenReason: e.
-					^self
-				].
+					result:: normalizeBrokenReason: (_js ident: 'nsRunErr').
+					_js return: self. }).
 			simulator atEnd
 				ifTrue: [
 					state:: #fulfilled.
@@ -1052,6 +1302,18 @@ Sentinel NLR (M4) interplay: a sentinel record surfacing from a full-speed escap
 			^wrapped
 		)
 		public resume = (
+			(* Continue. psoup resumes a broken thread at the raise point (its exceptions are VM-resumable); a JS broken stack is a restart-quality transplant whose continuation is gone, so Continue on a broken thread means: re-run the outermost frame FROM ITS FAILING STATEMENT - locals restored from the shadow capture, earlier statements' effects preserved - degrading to a full re-run from the method start when no statement was resolved. An explicit user action, typically after fixing the failure's cause; the failing statement's own side effects repeat. *)
+
+			| bottom |
+			#broken = state ifTrue: [
+					bottom:: suspendedActivation.
+					nil = bottom ifTrue: [ ^self ].
+					[ isBottom: bottom ] whileFalse: [ bottom:: bottom sender ].
+					guard: bottom.
+					unwindTo: bottom.
+					bottom resetForStatementRestart.
+					state:: #suspended
+				].
 			stepUntil: [:top | false ]
 		)
 		public stepInto: a <SimulatedActivation> = (
@@ -1142,6 +1404,9 @@ Sentinel NLR (M4) interplay: a sentinel record surfacing from a full-speed escap
 			public unwindProtectorRan <Boolean> ::= false.
 			protected frame <List> = List new.
 			protected stackPointer <Integer> ::= 0.
+
+			(* Statement-level restart support (transplanted frames): the bci of the top-level statement containing the failure, computed at transplant from the parsed source. 1 = unresolved: Continue then degrades to a full restart from the method start. *)
+			public restartBci <Integer> ::= 1.
 		|
 	) (
 		public pop = (
@@ -1191,6 +1456,13 @@ Sentinel NLR (M4) interplay: a sentinel record surfacing from a full-speed escap
 			(* Current extent of the temp/operand area; DebugMapper context protocol. *)
 
 			^stackPointer
+		)
+		public resetForStatementRestart = (
+			(* Re-enter at the failing statement's start with the locals AS CAPTURED (restored at transplant) and an empty operand stack - top-level statement boundaries hold no operands and no live control-flow context, so entry there is sound. Without a resolved statement (restartBci 1), or for a closure frame, degrade to the full restart (locals cleared): re-running from the method start must see nil locals, and the initializer statements will re-run. *)
+
+			(1 = restartBci or: [ (nil = closure) not ]) ifTrue: [ ^resetForRestart ].
+			bci:: restartBci.
+			stackPointer:: method numTemps
 		)
 		public resetForRestart = (
 			(* Reset this frame to its initial state, psoup Thread restart:withMethod: semantics: arguments (and, for closures, re-pushed copied values) survive; locals are cleared; the operand stack is emptied. *)

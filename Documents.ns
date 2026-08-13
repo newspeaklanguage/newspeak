@@ -1000,7 +1000,7 @@ Common usages (like embedding a workspace or an object presenter) are supported 
 			(* All external media used by the document are stored in a map keyed by the media's path *)
 			public mediaRegistry <Map[String, Blob]> ::= Map new.
 			public lastMediaAmplet <MediaCreatorFragment>
-
+			
 			(* Wiring into the live fragment tree: AmpleforthFragment>>processChildren sets this to the fragment presenting the document, making #shell - and hence navigation from document code - work. *)
 			public parent <Fragment>
 		|
@@ -1016,8 +1016,9 @@ Common usages (like embedding a workspace or an object presenter) are supported 
 			^retainedPlatform
 		)
 		public shell = (
-			^parent isNil
-				ifTrue: [ Error signal: 'Document ' , name , ' is not installed in a shell' ]
+			^parent isNil ifTrue: [
+					Error signal: 'Document ' , name , ' is not installed in a shell'
+				]
 				ifFalse: [ parent shell ]
 		)
 		public evaluate: expr <String> ^<ThreadMirror> = (
@@ -1031,12 +1032,12 @@ Common usages (like embedding a workspace or an object presenter) are supported 
 		)
 		public = other ^<Boolean> = (
 			(* Documents are equal iff they have the same name and contents; the viewer/editor update logic relies on this. *)
-
+			
 			^name = other name and: [ contents = other contents ]
 		)
 		public selfReferenceFragment ^<Fragment> = (
 			(* The recursive-self-embedding catch: shown when a document attempts to embed itself (an amplet naming AmpleforthTargetDocument, or an expression evaluating to the document - typically a method returning self by mistake). Sent by AmpleforthFragment>>recomputeAmplet: and by evaluateFragment: below. *)
-
+			
 			^hyperrealError
 		)
 		hyperrealError = (
@@ -2024,14 +2025,17 @@ bothered writing code for mortals like you to use?</p>'
 		)
 		processObjectsFromDom: dom usingFolder: folder ancestors: ancestors <Set[String]> = (
 			(* Embed class dependencies (detected textually - classes are message sends,
-     never bare string literals) and EAGERLY-transcluded documents (detected by
-     evaluating amplets and inspecting fragments, so nav links and lazy
-     transclusions - whose target names also appear as strings in amplet text -
-     are NOT mis-embedded). Eager cycles are broken by `ancestors`. *)
+     never bare string literals) and the documents this one depends on. Documents
+     are found two ways, because there are two ways to depend on one: EAGERLY
+     transcluded ones by evaluating amplets and inspecting the resulting fragments
+     (so nav links and lazy transclusions - whose target names also appear as
+     strings in amplet text - are NOT mis-embedded), and ones the class's own code
+     names, e.g. a Telescreen deck's master slide. Eager cycles are broken by
+     `ancestors`. *)
 			
 			| docs <JSZip> = folder addFolder: 'documents'. classes <JSZip> = folder addFolder: 'classes'. importedClasses <List[Class]> = (dependenciesUsing: dom) select: [:o |
 					o isKindOfClass
-				]. |
+				]. embeddedDocs <List[String]> = eagerTransclusionsOf: document. |
 			
 			(* class dependencies *)
 			importedClasses do: [:c <Class> |
@@ -2039,10 +2043,14 @@ bothered writing code for mortals like you to use?</p>'
 						contents: (ClassSubject onDeclaration: (ClassMirror reflecting: c) mixin declaration) compilationUnitSource
 				].
 			
-			(* eagerly-transcluded documents: recursively; a loaded target is embedded
-     fresh (captures edits), an unopened one via the server's saved zip; a target
-     already up the ancestor chain (an eager cycle) is skipped. *)
-			(eagerTransclusionsOf: document) do: [:dn <String> |
+			(* eagerly-transcluded documents, plus documents named by the class's own code;
+     recursively. A loaded target is embedded fresh (captures edits), an unopened
+     one via the server's saved zip; a target already up the ancestor chain (an
+     eager cycle) is skipped. *)
+			(codeReferencedDocumentsUsing: dom) do: [:dn <String> |
+					(embeddedDocs includes: dn) ifFalse: [ embeddedDocs add: dn ]
+				].
+			embeddedDocs do: [:dn <String> |
 					(ancestors includes: dn) ifFalse: [
 							| d <Document> = ide namespacing Root at: dn ifAbsent: [ nil ]. |
 							d isNil ifFalse: [
@@ -2055,6 +2063,47 @@ bothered writing code for mortals like you to use?</p>'
 								ifTrue: [ docs file: dn , '.zip' contents: (fetchServerZipNamed: dn) ]
 						]
 				]
+		)
+		codeReferencedDocumentsUsing: dom ^<List[String]> = (
+			(* Names of documents this document's own CODE names - as opposed to ones its
+     amplets build fragments for. The Telescreen master slide is the motivating
+     case: a deck reaches it with `^Root at: #NewspeakMasterSlide` from a classBody
+     method, so it is a genuine dependency that eagerTransclusionsOf: cannot see,
+     because no fragment ever mentions it.
+
+     Amplet expressions are deliberately NOT consulted here (unlike
+     gatherMessagesOf:into:using:, which does look at them when hunting for class
+     imports). Nav-link and lazy-transclusion targets appear only in amplet text,
+     and embedding those was the imprecision that evaluating fragments was
+     introduced to remove. *)
+			
+			| candidates <Set[String]> = Set new. |
+			gatherCodeMessagesOf: document mirror getClass mixin declaration
+				into: candidates.
+			^(ide namespacing Root keys select: [:k <String> |
+					(candidates includes: k) and: [
+							(ide standardPreludeMessages includes: k) not
+						]
+				]) select: [:k <String> | (ide namespacing Root at: k) isKindOfDocument ]
+		)
+		gatherCodeMessagesOf: c <ClassDeclarationMirror> into: importCandidates <Set[String]> = (
+			(* Selectors and symbol literals occurring in c's own code, recursively through
+     nested classes. c's own name is removed to prevent self-embedding. *)
+			
+			importCandidates addAll: c header selectors.
+			c instanceSide methods do: [:mm <MethodMirror> |
+					importCandidates addAll: mm symbols
+				].
+			c classSide methods do: [:mm <MethodMirror> |
+					importCandidates addAll: mm symbols
+				].
+			c instanceSide lazySlots do: [:ls <LazySlotMirror> |
+					importCandidates addAll: ls symbols
+				].
+			c instanceSide nestedClasses do: [:nc <ClassDeclarationMirror> |
+					gatherCodeMessagesOf: nc into: importCandidates
+				].
+			importCandidates remove: c name ifAbsent: [ ]
 		)
 		eagerTransclusionsOf: doc <Document> ^<List[String]> = (
 			(* Names of documents doc EAGERLY transcludes (transclude:), found by
@@ -2081,11 +2130,24 @@ bothered writing code for mortals like you to use?</p>'
 					(result includes: dn) ifFalse: [ result add: dn ].
 					^self
 				].
+			
+			(* A toggle caches its two forms only when rendered, and the fragments walked
+     here are built fresh and never rendered - so childrenDo: would answer nothing
+     and anything transcluded inside the toggle would go unsaved. Force both
+     definitions instead, the way deployStaticFormOfFragment: does. Each form is
+     guarded separately so a failure in one still leaves the other collected. *)
+			frag isKindOfToggleComposer ifTrue: [
+					[ collectEagerTransclusionsOf: frag collapsedFragment into: result ] on: Error
+						do: [:e | noteWalkFailure: e on: frag while: 'collapsed form' ].
+					[ collectEagerTransclusionsOf: frag expandedFragment into: result ] on: Error
+						do: [:e | noteWalkFailure: e on: frag while: 'expanded form' ].
+					^self
+				].
 			[
 				frag childrenDo: [:c <Fragment> |
 						collectEagerTransclusionsOf: c into: result
 					]
-			] on: Error do: [:e | ]
+			] on: Error do: [:e | noteWalkFailure: e on: frag while: 'children' ]
 		)
 		fetchServerZipNamed: dn <String> ^<Alien[Promise]> = (
 			(* The server's saved <dn>.zip as a promise (embedded as JSZip promise
@@ -2866,6 +2928,22 @@ bothered writing code for mortals like you to use?</p>'
 		quote = 0 ifTrue: [ ^nil ].
 		^expr copyFrom: quote + 1 to: (expr indexOf: '''' startingAt: quote + 1) - 1
 	)
+	noteWalkFailure: e <Error> on: frag <Fragment> while: what <String> = (
+		(* Report a fragment subtree we could not walk. Both the save collector and the
+     deploy renderer swallow such failures so that one bad fragment cannot abort the
+     whole operation - but swallowing them silently means missing content with no
+     clue why (a fragment lacking #childrenDo:, for instance, now raises rather than
+     quietly doing nothing). Diagnostics must never themselves break a save, hence
+     the guard: printString can fail, and messageText is frequently nil, which would
+     raise on concatenation. *)
+		
+		[
+			('Ampleforth: skipped the ' , what , ' of ' , frag printString , ' - ' , e printString) out
+		] on: Exception
+			do: [:ignored |
+				'Ampleforth: skipped the ' , what , ' of a fragment (unprintable failure)' out
+			]
+	)
 	deployStaticFormOfFragment: frag <Fragment> inlineStack: stack <Set[String]> lazyChildren: children <List[String]> ^<String> = (
 		(* Render one fragment to static HTML. Recognized deploy-aware fragments
      emit their static form (nav -> links; transclusion -> a link or inlined
@@ -2892,7 +2970,11 @@ bothered writing code for mortals like you to use?</p>'
 					deployStaticFormOfFragment: frag expandedFragment
 						inlineStack: stack
 						lazyChildren: children
-				] on: Error do: [:e | '' ]
+				] on: Error
+					do: [:e |
+						noteWalkFailure: e on: frag while: 'expanded form'.
+						''
+					]
 			].
 		[
 			frag childrenDo: [:child |
@@ -2900,7 +2982,7 @@ bothered writing code for mortals like you to use?</p>'
 						inlineStack: stack
 						lazyChildren: children)
 				]
-		] on: Error do: [:e | ].
+		] on: Error do: [:e | noteWalkFailure: e on: frag while: 'children' ].
 		^html
 	)
 	deployWebTransclusion: frag <Fragment> inlineStack: stack <Set[String]> lazyChildren: children <List[String]> ^<String> = (

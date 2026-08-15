@@ -1751,6 +1751,33 @@ along with an implementation of isKindOfX:  public isKindOfX ^ <Boolean> = (true
 			
 			subclassResponsibility
 		)
+		public key ^<Object> = (
+			(* A stable identity for this fragment within a sequence, used by
+   SequenceComposer to match fragments across refreshes instead of relying on
+   position. Answer nil (the default) to opt out; a sequence whose elements do
+   not all answer distinct non-nil keys is reconciled positionally, exactly as
+   before.
+
+Keys must be stable across refreshes and comparable with #= and #hash. Presenter
+answers its subject, which qualifies: subjects are equal when they are of the
+same kind and have equal models, so a freshly computed presenter over an
+equivalent subject keys the same as the one it replaces. *)
+			
+			^nil
+		)
+		public mayDerealize ^<Boolean> = (
+			(* Answer whether this fragment tolerates having its visual discarded and
+   later recreated. Only LazySequenceComposer asks; it never discards a fragment
+   that answers false, nor one that answers true to #hasPendingChanges.
+
+Answer false when state lives in the visual and cannot be reconstructed from the
+subject or model. Such fragments are pinned: kept realized even when scrolled
+out of view. Pinning is cheap only if it is rare, so prefer moving the state into
+the subject where that is practical. *)
+			
+			childrenDo: [:each | each mayDerealize ifFalse: [ ^false ] ].
+			^true
+		)
 		public refresh = (
 			(* Fragments that dynamically retrieve their information should reimplement this to update their visuals accordingly. *)
 			
@@ -1777,12 +1804,27 @@ along with an implementation of isKindOfX:  public isKindOfX ^ <Boolean> = (true
 			^nil
 		)
 		public updateVisualsFrom: oldFragment <Fragment> = (
+			updateVisualsReusingFrom: oldFragment
+		)
+		public updateVisualsReusingFrom: oldFragment <Fragment> ^<Boolean> = (
+			(* As #updateVisualsFrom:, but answering whether the old fragment's visual
+   was reused rather than replaced.
+
+A composite that styles its children needs to know which happened: a reused
+visual already carries the geometry the composite last gave it, so only genuine
+differences need rewriting, whereas a replacement is a fresh node carrying none
+of it and must be styled in full. The answer has to come from here, because
+#isMyKind: decides it and #isMyKind: is protected - it is asked of self, never
+of a sibling. *)
+			
 			(isMyKind: oldFragment) ifTrue: [
 					visualX:: oldFragment hasVisual ifTrue: [
 							updateVisualsFromSameKind: oldFragment
-						]
-				]
-				ifFalse: [ replaceVisual: oldFragment visual with: visual ]
+						].
+					^true
+				].
+			replaceVisual: oldFragment visual with: visual.
+			^false
 		)
 		updateVisualsFromSameKind: oldFragment <Fragment> ^<Alien[Element]> = (
 			(* This method must never be called unless oldFragment hasVisual = true 
@@ -2456,6 +2498,322 @@ We guard against all of the above problems by obtaining the refreshmentPresenter
 			^oldVisual
 		)
 	) : ()
+	class LazySequenceComposer count: c <Integer> elementAt: eb <[:Integer | Fragment]> = Composer new (
+		(* A sequence that realizes only the elements near the viewport.
+
+An ordinary SequenceComposer is handed a List of fragments, so by the time it
+runs, every element already exists; it then builds a visual for each. Both costs
+are linear in the length of the sequence, and each element costs tens of calls
+across the alien bridge, which is why a few thousand rows is already painful.
+This composer is handed a COUNT and a BLOCK instead, and calls the block only
+for the indices it actually shows. Nothing is built for the rows you cannot see.
+
+The visual is a leading spacer, the realized rows, and a trailing spacer. The
+spacers stand in for the height of the unrealized rows, so the scrollbar
+behaves as though everything were present. When a spacer scrolls into view an
+IntersectionObserver fires, we read the container's geometry, and we move the
+realized window to wherever the user now is - geometry rather than incremental
+extension, so dragging the scrollbar the length of a huge sequence lands in one
+step instead of a hundred.
+
+Row height is measured from the first realized row that reports one, and assumed
+uniform, which suits the homogeneous sequences that motivate this (messages,
+methods, classes). Sequences with wildly varying row heights will have an
+inaccurate scrollbar; they are better served by an ordinary column until
+measurement of individual rows is implemented.
+
+Rows that size asynchronously - a CodeMirror, an image, anything awaited - may
+report no height at all when the visual is first built. Measurement is retried
+on every observer callback so such a column starts virtualizing as soon as any
+row can be measured, but a sequence whose rows may NEVER report a height on
+sight should be given one outright - preferably at construction, via
+#lazyColumnOfSize:rowHeight:elementAt:, or afterwards via #assumeRowHeight:.
+Without a height there is no window arithmetic to do, and the sequence stays at
+its bootstrap size - correct, but not virtualized.
+
+DERALIZATION AND STATE. Discarding a row destroys its visual, and Hopscotch
+deliberately keeps state in visuals - an open toggle, an unaccepted edit. So a
+row is discarded only if it answers false to #hasPendingChanges and true to
+#mayDerealize. A row that objects is PINNED: its fragment and its visual are
+retained, and only the DOM node is detached, which preserves everything the node
+holds. Pinning is only affordable because it is rare - the one method you are
+editing, the few toggles you opened. This yields the invariant that a fragment
+with pending changes is never discarded, which is what keeps #hasPendingChanges
+sound even though it can only walk the rows that are realized. *)
+		
+		|
+			public count <Integer> = c.
+			elementBlock <[:Integer | Fragment]> = eb.
+			public rows <List[Fragment]> ::= List new.
+			public pinnedIndices <List[Integer]> ::= List new.
+			public pinnedFragments <List[Fragment]> ::= List new.
+			public rowHeight <Integer> ::= 0.
+			public measured <Boolean> ::= false.
+			public firstShown <Integer> ::= 1.
+			public lastShown <Integer> ::= 0.
+			public overscanPixels <Integer> ::= 400.
+			bootstrapCount <Integer> ::= 30.
+			public leadingSpacer
+			public trailingSpacer
+			observer
+		|
+	) (
+		public childrenDo: aBlock = (
+			(* Realized rows in index order, then the pinned ones. Unrealized rows have
+   no fragment, hence no state for a walker to find. *)
+			
+			rows do: aBlock.
+			pinnedFragments do: aBlock
+		)
+		public isKindOfLazySequenceComposer ^<Boolean> = (
+			^true
+		)
+		isMyKind: f <Fragment> ^<Boolean> = (
+			^f isKindOfLazySequenceComposer
+		)
+		flexDirection ^<String> = (
+			subclassResponsibility
+		)
+		initialLast ^<Integer> = (
+			count < bootstrapCount ifTrue: [ ^count ].
+			^bootstrapCount
+		)
+		takePinnedAt: index <Integer> ^<Fragment> = (
+			(* Answer and un-pin the fragment pinned at index, or nil. The pinned lists
+   are rebuilt rather than mutated in place, which keeps us to collection
+   operations this file already relies on; they are tiny by construction. *)
+			
+			| keptIndices = List new. keptFragments = List new. found |
+			1 to: pinnedIndices size
+				do: [:i <Integer> |
+					(pinnedIndices at: i) = index ifTrue: [ found:: pinnedFragments at: i ]
+						ifFalse: [
+							keptIndices add: (pinnedIndices at: i).
+							keptFragments add: (pinnedFragments at: i)
+						]
+				].
+			pinnedIndices:: keptIndices.
+			pinnedFragments:: keptFragments.
+			^found
+		)
+		retire: fragment <Fragment> at: index <Integer> in: container <Alien[Element]> = (
+			(* Detach a row leaving the window. If it holds state that cannot be
+   reconstructed, keep the fragment and its visual alive - detached, so it costs
+   no layout - rather than discarding it. *)
+			
+			fragment hasVisual ifTrue: [ container removeChild: fragment visual ].
+			(fragment hasPendingChanges or: [ fragment mayDerealize not ]) ifTrue: [
+					pinnedIndices add: index.
+					pinnedFragments add: fragment
+				]
+		)
+		updateSpacersIn: container <Alien[Element]> = (
+			| before after |
+			before:: firstShown - 1 * rowHeight.
+			after:: count - lastShown * rowHeight.
+			after < 0 ifTrue: [ after:: 0 ].
+			(leadingSpacer at: 'style') at: 'height' put: before printString , 'px'.
+			(trailingSpacer at: 'style') at: 'height' put: after printString , 'px'
+		)
+		showWindowFrom: newFirst <Integer> to: newLast <Integer> in: container <Alien[Element]> = (
+			(* Move the realized window. Rows that survive keep their visuals exactly
+   where they are; only rows entering the window are inserted, and only rows
+   leaving it are detached. *)
+			
+			| newRows = List new. fresh = List new. anchor ::= trailingSpacer. |
+			(newFirst = firstShown and: [ newLast = lastShown ]) ifTrue: [ ^self ].
+			
+			(* Phase 1: assemble the new window, reusing what we can. *)
+			newFirst to: newLast
+				do: [:i <Integer> |
+					| recovered |
+					(i >= firstShown and: [ i <= lastShown ]) ifTrue: [
+							newRows add: (rows at: i - firstShown + 1).
+							fresh add: false
+						]
+						ifFalse: [
+							recovered:: takePinnedAt: i.
+							recovered isNil ifTrue: [
+									recovered:: elementBlock value: i.
+									recovered parent: self
+								].
+							newRows add: recovered.
+							fresh add: true
+						]
+				].
+			
+			(* Phase 2: detach rows the new window drops. *)
+			firstShown to: lastShown
+				do: [:i <Integer> |
+					(i < newFirst or: [ i > newLast ]) ifTrue: [
+							retire: (rows at: i - firstShown + 1) at: i in: container
+						]
+				].
+			
+			(* Phase 3: insert the arrivals, walking backwards so the row to our right
+    - already in place - anchors the insertion. *)
+			newLast to: newFirst
+				by: -1
+				do: [:i <Integer> |
+					| slot = i - newFirst + 1. |
+					(fresh at: slot) ifTrue: [
+							container insertBefore: (newRows at: slot) visual before: anchor
+						].
+					anchor:: (newRows at: slot) visual
+				].
+			rows:: newRows.
+			firstShown:: newFirst.
+			lastShown:: newLast.
+			updateSpacersIn: container
+		)
+		public assumeRowHeight: height <Integer> = (
+			(* Declare the row height instead of measuring it, for sequences whose rows
+   cannot be measured on sight - editors, images, anything that arrives or
+   sizes asynchronously. Measurement is a convenience; this is the escape
+   hatch when it cannot work. *)
+			
+			height > 0 ifTrue: [
+					rowHeight:: height.
+					measured:: true
+				]
+		)
+		measureRowHeightIn: container <Alien[Element]> = (
+			(* Take the height from the first realized row that HAS one, not from row 1.
+   A row can report zero height legitimately - a CodeMirror before it sizes
+   itself, an image before it loads - and taking row 1's zero as the answer
+   meant such a column never measured, never virtualized, and silently
+   degraded to a fixed bootstrap window forever. Leaving #measured false when
+   nothing has a height yet is deliberate: #refreshWindowIn: retries, so the
+   column starts virtualizing as soon as anything can be measured. *)
+			
+			| height ::= 0. |
+			rows do: [:each <Fragment> |
+					height = 0 ifTrue: [ height:: (each visual at: 'offsetHeight') asInteger ]
+				].
+			assumeRowHeight: height
+		)
+		refreshWindowIn: container <Alien[Element]> = (
+			| top viewportHeight offset ::= 0. bounds |
+			
+			(* Retry measurement rather than giving up on it. Every observer callback
+    is another chance for rows that had no height when the visual was first
+    built to have acquired one since. *)
+			measured ifFalse: [ measureRowHeightIn: container ].
+			measured ifFalse: [ ^self ].
+			top:: (container getBoundingClientRect at: 'top') asInteger.
+			viewportHeight:: (window at: 'innerHeight') asInteger.
+			offset:: 0 - top.
+			offset < 0 ifTrue: [ offset:: 0 ].
+			bounds:: sequencePlanning windowFor: offset
+				viewport: viewportHeight
+				rowHeight: rowHeight
+				count: count
+				overscan: overscanPixels.
+			showWindowFrom: (bounds at: 1) to: (bounds at: 2) in: container
+		)
+		installObserverOn: container <Alien[Element]> = (
+			(* Observe the spacers rather than listening for scroll events: no scroll
+    parent to discover, no work per scroll event, and it composes with whatever
+    ancestor happens to scroll. Guarded because IntersectionObserver may be
+    absent, in which case the bootstrap window is simply all we ever show. *)
+			
+			[
+				observer:: (window at: 'IntersectionObserver') new: [:entries :obs |
+						[ refreshWindowIn: container ] on: Exception do: [:e | nil ].
+						nil
+					].
+				observer observe: leadingSpacer.
+				observer observe: trailingSpacer
+			] on: Exception do: [:e | nil ]
+		)
+		public disconnectObserver = (
+			observer isNil ifFalse: [
+					[ observer disconnect ] on: Exception do: [:e | nil ].
+					observer:: nil
+				]
+		)
+		createVisual ^<Alien[HTMLElement]> = (
+			| container <Alien[HTMLElement]> |
+			container:: document createElement: 'div'.
+			container at: 'id' put: 'LazySequenceComposer';
+				at: 'contentEditable' put: 'false'.
+			(container at: 'style') at: 'display' put: 'flex';
+				at: 'flex-direction' put: flexDirection;
+				at: 'font-family' put: 'serif';
+				at: 'font-size' put: styleFontSizeText.
+			leadingSpacer:: document createElement: 'div'.
+			trailingSpacer:: document createElement: 'div'.
+			container appendChild: leadingSpacer.
+			container appendChild: trailingSpacer.
+			showWindowFrom: 1 to: initialLast in: container.
+			installObserverOn: container.
+			
+			(* Rows have no height until they are laid out, so the first measurement -
+    and the true window that follows from it - must wait for a frame. *)
+			deferAction: [
+					measureRowHeightIn: container.
+					refreshWindowIn: container
+				].
+			^container
+		)
+		updateVisualsFromSameKind: oldFragment <LazySequenceComposer> ^<Alien[Element]> = (
+			(* Adopt the old visual, its spacers and its window, then rebuild the rows
+   of that window from OUR element block, updating each against its predecessor.
+   Pinned fragments are adopted as they stand: they exist precisely because they
+   hold state the user has not committed, and that state must outlive a
+   repaint. *)
+			
+			| container = oldFragment visual. oldRows = oldFragment rows. newRows = List new. last |
+			leadingSpacer:: oldFragment leadingSpacer.
+			trailingSpacer:: oldFragment trailingSpacer.
+			rowHeight:: oldFragment rowHeight.
+			measured:: oldFragment measured.
+			overscanPixels:: oldFragment overscanPixels.
+			pinnedIndices:: oldFragment pinnedIndices.
+			pinnedFragments:: oldFragment pinnedFragments.
+			pinnedFragments do: [:each <Fragment> | each parent: self ].
+			firstShown:: oldFragment firstShown.
+			
+			(* The sequence may have shrunk under us. *)
+			last:: oldFragment lastShown.
+			last > count ifTrue: [ last:: count ].
+			lastShown:: last.
+			firstShown to: lastShown
+				do: [:i <Integer> |
+					| nu = elementBlock value: i. old = oldRows at: i - firstShown + 1. |
+					nu parent: self.
+					nu updateVisualsFrom: old.
+					newRows add: nu
+				].
+			rows:: newRows.
+			
+			(* Rows the shrunken sequence no longer has must leave the DOM. *)
+			lastShown + 1 to: oldFragment lastShown
+				do: [:i <Integer> |
+					| gone = oldRows at: i - firstShown + 1. |
+					gone hasVisual ifTrue: [ container removeChild: gone visual ]
+				].
+			updateSpacersIn: container.
+			
+			(* The old observer's callback would refresh the fragment we are replacing. *)
+			oldFragment disconnectObserver.
+			installObserverOn: container.
+			^container
+		)
+	) : ()
+	class LazyColumnComposer count: c <Integer> elementAt: eb <[:Integer | Fragment]> = LazySequenceComposer count: c
+		elementAt: eb (
+	) (
+		flexDirection ^<String> = (
+			^'column'
+		)
+		public isKindOfLazyColumnComposer ^<Boolean> = (
+			^true
+		)
+		isMyKind: f <Fragment> ^<Boolean> = (
+			^f isKindOfLazyColumnComposer
+		)
+	) : ()
 	class LeafFragment new = Fragment new (
 	) (
 		lazy public properties <Map[Symbol, Object]> = Map new.
@@ -3110,6 +3468,46 @@ Constraints on methods placed here:
 		column: definitions <List[Fragment]> ^<ColumnComposer> = (
 			^ColumnComposer definitions: definitions
 		)
+		lazyColumnOfSize: n <Integer> elementAt: elementBlock <[:Integer | Fragment]> ^<LazyColumnComposer> = (
+			(* A column that builds only the rows near the viewport. Takes a count and a
+   block from index to fragment rather than a list of fragments, because
+   materialising the list is itself linear in the length of the sequence and
+   would defeat the purpose. Use for sequences long enough that building every
+   row is the cost you are trying to avoid; #column: remains the right choice
+   for everything else. *)
+			
+			^LazyColumnComposer count: n elementAt: elementBlock
+		)
+		lazyColumnOf: elements <Sequence> elementAt: elementBlock <[:Object | Fragment]> ^<LazyColumnComposer> = (
+			(* As above, over an existing sequence. The sequence is only sent #size and
+   #at:, so a lazily computed sequence never has to produce the elements the
+   viewport does not reach. *)
+			
+			^LazyColumnComposer count: elements size
+				elementAt: [:i <Integer> | elementBlock value: (elements at: i) ]
+		)
+		lazyColumnOfSize: n <Integer> rowHeight: height <Integer> elementAt: elementBlock <[:Integer | Fragment]> ^<LazyColumnComposer> = (
+			(* As #lazyColumnOfSize:elementAt:, with the row height declared rather than
+   measured.
+
+Prefer this whenever the rows might not report a height on sight - editors,
+images, anything awaited. Such a column cannot measure itself, and a column that
+never measures never virtualizes: it stays at its bootstrap size, correct but
+not doing the one thing it exists to do. Declaring the height at construction
+removes that failure mode, where remembering to send #assumeRowHeight: afterwards
+merely documents it. *)
+			
+			| result = lazyColumnOfSize: n elementAt: elementBlock. |
+			result assumeRowHeight: height.
+			^result
+		)
+		lazyColumnOf: elements <Sequence> rowHeight: height <Integer> elementAt: elementBlock <[:Object | Fragment]> ^<LazyColumnComposer> = (
+			(* As above, over an existing sequence. *)
+			
+			| result = lazyColumnOf: elements elementAt: elementBlock. |
+			result assumeRowHeight: height.
+			^result
+		)
 		deferred: contentSource <[Fragment]> ^<Fragment> = (
 			^DeferredContentComposer initialContent: nothing contentSource: contentSource
 		)
@@ -3404,6 +3802,15 @@ depending on how they are used. *)
 			
 			^false
 		)
+		public key ^<Object> = (
+			(* A presenter's identity in a sequence is its subject. Subject equality is
+   by kind and model (see Subject), so this key survives the recomputation of
+   presenters that #updateGUI: forces, which is exactly what keyed
+   reconciliation needs. Presenters whose subjects do not compare usefully
+   should override this to answer nil, which restores positional matching. *)
+			
+			^subject
+		)
 		public listElementMetapresenter ^<Presenter> = (
 			(* A presenter that can represent the receiver in a list of presenters such as the History. *)
 			
@@ -3596,6 +4003,118 @@ depending on how they are used. *)
 			^visual
 		)
 	) : ()
+	public class SequencePlanning new = Object new (
+		(* The decisions behind the sequence composers, separated from the composers
+that act on them.
+
+Reconciling a refreshed sequence and choosing what a virtualized column should
+realize are both arithmetic - over keys in the first case, over offsets in the
+second - and neither needs a fragment, a visual or a document. Keeping them here
+rather than on the composers means they can be exercised directly, without a
+browser, which is why this class is public while the composers' own internals
+are not: what is exposed is the algorithm, not the composer's state.
+
+Stateless; composers reach a shared instance through the module's
+#sequencePlanning slot. *)
+		
+	) (
+		public reuseMapFrom: oldKeys <Sequence> to: newKeys <Sequence> ^<List[Integer]> = (
+			(* Answer a List as long as newKeys, whose i'th element is the index in
+   oldKeys of the element carrying the same key, or 0 when the key is new.
+   Answer nil to decline keyed reconciliation altogether, in which case the
+   caller matches positionally exactly as it always has. We decline when:
+
+  - any key on either side is nil (the opt-out), or
+  - either side repeats a key, since then a key does not identify one element
+    and two positions would claim the same visual, or
+  - the two sides share no key at all. Sharing nothing is the signature of keys
+    that are not in fact stable across refreshes; treating every element as new
+    would rebuild the whole sequence, which is strictly worse than the
+    positional path we would otherwise take. *)
+			
+			| index = Map new. seen = Set new. reuse = List new. shared ::= 0. |
+			oldKeys isEmpty ifTrue: [ ^nil ].
+			newKeys isEmpty ifTrue: [ ^nil ].
+			1 to: oldKeys size
+				do: [:i <Integer> |
+					| k = oldKeys at: i. |
+					k isNil ifTrue: [ ^nil ].
+					(index includesKey: k) ifTrue: [ ^nil ].
+					index at: k put: i
+				].
+			1 to: newKeys size
+				do: [:i <Integer> |
+					| k = newKeys at: i. |
+					k isNil ifTrue: [ ^nil ].
+					(seen includes: k) ifTrue: [ ^nil ].
+					seen add: k.
+					(index includesKey: k) ifTrue: [
+							shared:: shared + 1.
+							reuse add: (index at: k)
+						]
+						ifFalse: [ reuse add: 0 ]
+				].
+			shared = 0 ifTrue: [ ^nil ].
+			^reuse
+		)
+		public stationaryIndicesIn: reuseMap <List[Integer]> ^<Set[Integer]> = (
+			(* Given a reuse map, answer the set of new indices whose visuals need no
+   DOM move. Reused elements already sit in the container in their old relative
+   order, so any subset of them that is increasing in old-index is already in
+   the right relative order and can stay put; everything else must be inserted
+   at its proper place. Choosing the LONGEST such subset minimises insertions,
+   which is the whole point - an append, or an edit in place, then costs no
+   moves at all.
+
+This is the longest increasing subsequence of the reused positions, computed in
+n log n by the usual patience method: `tails at: len` holds the new-index whose
+old-index is the smallest possible tail of an increasing subsequence of length
+`len`, and `prevs` links each element to its predecessor so the winning
+subsequence can be recovered. *)
+			
+			| n = reuseMap size. tails = List new. prevs = List new. result = Set new. cursor ::= 0. |
+			1 to: n do: [:i <Integer> | prevs add: 0 ].
+			1 to: n
+				do: [:i <Integer> |
+					| v = reuseMap at: i. lo ::= 1. hi ::= tails size. pos ::= 1. |
+					v = 0 ifFalse: [
+							[ lo <= hi ] whileTrue: [
+									| mid = lo + hi // 2. |
+									(reuseMap at: (tails at: mid)) < v ifTrue: [ lo:: mid + 1 ]
+										ifFalse: [ hi:: mid - 1 ]
+								].
+							pos:: lo.
+							pos > 1 ifTrue: [ prevs at: i put: (tails at: pos - 1) ].
+							pos > tails size ifTrue: [ tails add: i ]
+								ifFalse: [ tails at: pos put: i ]
+						]
+				].
+			tails isEmpty ifTrue: [ ^result ].
+			cursor:: tails at: tails size.
+			[ cursor > 0 ] whileTrue: [
+					result add: cursor.
+					cursor:: prevs at: cursor
+				].
+			^result
+		)
+		public windowFor: offset <Integer> viewport: viewportHeight <Integer> rowHeight: height <Integer> count: n <Integer> overscan: overscan <Integer> ^<{Integer. Integer}> = (
+			(* Answer the inclusive index range a lazy sequence should realize, given
+   how far the sequence's top has scrolled above the viewport. An empty range
+   is {1. 0}, which is also the answer before a row height has been measured. *)
+			
+			| top bottom first last |
+			n = 0 ifTrue: [ ^{1. 0. } ].
+			height <= 0 ifTrue: [ ^{1. 0. } ].
+			top:: offset - overscan.
+			bottom:: offset + viewportHeight + overscan.
+			first:: top // height + 1.
+			last:: bottom // height + 1.
+			first < 1 ifTrue: [ first:: 1 ].
+			last > n ifTrue: [ last:: n ].
+			last < first ifTrue: [ ^{1. 0. } ].
+			^{first. last. }
+		)
+	) : ()
 	class SequenceComposer definitions: fs <List[Fragment]> = Composer new (
 		|
 			public definitions <List[Fragment]> = fs.
@@ -3649,6 +4168,51 @@ depending on how they are used. *)
 					(cell at: 'style') at: 'flex-basis' put: fragment size printString , 'px'
 				]
 		)
+		alignFragment: fragment <Fragment> from: oldFragment <Fragment> = (
+			(* The update-path counterpart of #alignFragment:. Every property that
+   #alignFragment: writes is derived from the fragment's own declared geometry,
+   so when the new fragment declares what the old one declared, the old visual -
+   which we are reusing - already carries the right values and the writes are
+   all no-ops. Skipping them matters: this runs once per element per refresh, so
+   the unconditional version costs four or five DOM property writes per row on
+   every repaint of an unchanged list, each one crossing the alien bridge. *)
+			
+			fragment expansibility = oldFragment expansibility ifFalse: [
+					^alignFragment: fragment
+				].
+			fragment compressibility = oldFragment compressibility ifFalse: [
+					^alignFragment: fragment
+				].
+			fragment size = oldFragment size ifFalse: [ ^alignFragment: fragment ]
+		)
+		keysOf: fragments <Sequence[Fragment]> ^<List> = (
+			| keys = List new. |
+			fragments do: [:each <Fragment> | keys add: each key ].
+			^keys
+		)
+		reuseMapFor: oldFragment <SequenceComposer> ^<List[Integer]> = (
+			(* Keyed reconciliation is an optimisation, and an optimisation must never
+   be able to take the interface down.
+
+Computing the reuse map sends #key to every element, and then #hash and #= to
+every key, as the planner indexes them. Those are arbitrary objects belonging to
+whoever built the sequence - a presenter answers its subject, a subject hashes
+its model - so this is user code all the way down, and any of it can be broken.
+It happened on 2026-08-15: `SlotModel>>hash` passed a block to #bitXor:, latent
+for years because nothing had ever sent #hash to a SlotModel until this method
+made slot models into Map keys, and the whole list died on the ArgumentError.
+
+Declining costs nothing but speed - positional matching is what this code did
+before keys existed - so a key that cannot be hashed or compared should demote
+its sequence, not destroy it. Note the trade: a broken #hash now degrades
+silently, so a sequence that has unexpectedly stopped reusing its visuals is
+worth suspecting its keys. *)
+			
+			^[
+				sequencePlanning reuseMapFrom: (keysOf: oldFragment definitions)
+					to: (keysOf: definitions)
+			] on: Exception do: [:e | nil ]
+		)
 		createVisual ^<Alien[HTMLElement]> = (
 			| container <Alien[HTMLElement]> |
 			container:: document createElement: 'div'.
@@ -3670,24 +4234,88 @@ depending on how they are used. *)
 				].
 			^container
 		)
-		updateVisualsFromSameKind: oldFragment <SequenceComposer> ^<Alien[Element]> = (
-			| size <Integer> = definitions size. oldVisual <Alien[Element]> = oldFragment visual. |
+		updateColorFrom: oldFragment <SequenceComposer> in: oldVisual <Alien[Element]> = (
+			color ~= oldFragment color ifTrue: [
+					color isNil ifFalse: [ color applyToStyle: (oldVisual at: 'style') ]
+				]
+		)
+		updateElement: def <Fragment> from: old <Fragment> = (
+			(* Update one element against its counterpart, styling it as cheaply as
+   correctness allows. When the kinds differ, #updateVisualsFrom: swaps in a
+   brand new visual, which carries none of our geometry and so must be styled in
+   full; otherwise the old visual is being reused and only genuine differences
+   need writing. *)
 			
-			(* We cannot, in general, know whether the elements of the sequence correlate
-    However, if the sequences have the same length they might. *)
+			def parent: self.
+			(def updateVisualsReusingFrom: old) ifTrue: [ alignFragment: def from: old ]
+				ifFalse: [ alignFragment: def ]
+		)
+		reconcileKeyed: reuseMap <List[Integer]> with: oldFragment <SequenceComposer> into: container <Alien[Element]> = (
+			(* Reconcile by key. Elements that persist keep their visuals wherever they
+   already are; only genuinely new elements, and the minimum number of moves
+   needed to restore order, touch the DOM. An unchanged sequence performs no
+   structural DOM work at all, and appending to a long sequence costs one
+   insertion rather than a full rebuild. *)
+			
+			| oldDefs = oldFragment definitions. n = definitions size. reused = Set new. needsPlacement ::= false. previous ::= 0. anchor ::= nil. stationary |
+			1 to: n
+				do: [:i <Integer> |
+					| def = definitions at: i. oldIndex = reuseMap at: i. |
+					oldIndex = 0 ifTrue: [
+							def parent: self.
+							needsPlacement:: true
+						]
+						ifFalse: [
+							reused add: oldIndex.
+							oldIndex < previous ifTrue: [ needsPlacement:: true ].
+							previous:: oldIndex.
+							updateElement: def from: (oldDefs at: oldIndex)
+						]
+				].
+			
+			(* Detach whatever no longer appears. Removing a child does not disturb the
+    position of its siblings, so this never forces a placement pass. *)
+			1 to: oldDefs size
+				do: [:i <Integer> |
+					| old = oldDefs at: i. |
+					((reused includes: i) not and: [ old hasVisual ]) ifTrue: [
+							container removeChild: old visual
+						]
+				].
+			needsPlacement ifFalse: [ ^self ].
+			stationary:: sequencePlanning stationaryIndicesIn: reuseMap.
+			
+			(* Walk backwards, so the element to our right - already in its final
+    position - serves as the anchor. A nil anchor appends, per insertBefore. *)
+			n to: 1
+				by: -1
+				do: [:i <Integer> |
+					| def = definitions at: i. |
+					((reuseMap at: i) > 0 and: [ stationary includes: i ]) ifFalse: [
+							container insertBefore: def visual before: anchor
+						].
+					anchor:: def visual
+				]
+		)
+		updateVisualsFromSameKind: oldFragment <SequenceComposer> ^<Alien[Element]> = (
+			| size <Integer> = definitions size. oldVisual <Alien[Element]> = oldFragment visual. reuseMap |
+			reuseMap:: reuseMapFor: oldFragment.
+			reuseMap isNil ifFalse: [
+					reconcileKeyed: reuseMap with: oldFragment into: oldVisual.
+					updateColorFrom: oldFragment in: oldVisual.
+					^oldVisual
+				].
+			
+			(* No usable keys. We cannot, in general, know whether the elements of the
+    sequence correlate. However, if the sequences have the same length they might. *)
 			size = oldFragment definitions size ifTrue: [
 					
 					(* Assume the common case: elements are in 1:1 correspondence. *)
 					1 to: size
 						do: [:i <Integer> |
-							| def = definitions at: i. |
-							def parent: self.
-							def updateVisualsFrom: (oldFragment definitions at: i).
-							alignFragment: def
+							updateElement: (definitions at: i) from: (oldFragment definitions at: i)
 						].
-					color ~= oldFragment color ifTrue: [
-							color isNil ifFalse: [ color applyToStyle: (oldVisual at: 'style') ]
-						].
+					updateColorFrom: oldFragment in: oldVisual.
 					^oldVisual
 				].
 			
@@ -4415,6 +5043,13 @@ the cursor position based on that. But so far that hasn't worked. And we have is
 			nil = collapsedPresenter ifFalse: [ aBlock value: collapsedPresenter ].
 			nil = expandedPresenter ifFalse: [ aBlock value: expandedPresenter ]
 		)
+		public key ^<Object> = (
+			(* A toggle's tag is its identity in a sequence. Note that the tag is empty
+   until set, so a run of untagged sibling toggles keys identically and the
+   keyed path correctly declines to guess among them. *)
+			
+			^tag
+		)
 		public collapse = (
 			isExpanded:: false.
 			installCollapsedPresenter
@@ -4552,15 +5187,30 @@ The #toggle method is public, and can be called by other parts of the system. If
    recursively, or we can patch the new one by updating the state of pre-existing definitions.
    We do the former so can preserve the existing DOM as much as possible, which is more efficient and helps preserve visual state like scrolling position. *)
 			
-			| contentMap = Map new. oldVisual = oldFragment visual. |
+			| contentMap = Map new. oldVisual = oldFragment visual. reuseMap |
+			
+			(* Tags are keys, so when they are usable the inherited keyed reconciler
+    does this better: it preserves the existing DOM instead of detaching and
+    reattaching every child, and it repositions only what actually moved. We
+    keep the older algorithm below for the cases the keyed path declines -
+    notably duplicate tags, which ToggleComposer produces by default since its
+    tag is initially empty. *)
+			reuseMap:: reuseMapFor: oldFragment.
+			reuseMap isNil ifFalse: [
+					reconcileKeyed: reuseMap with: oldFragment into: oldVisual.
+					^oldVisual
+				].
 			definitions do: [:e <Tagged> |
 					e parent: self.
 					contentMap at: e tag put: e
 				].
 			oldFragment definitions do: [:op <Tagged> |
 					(contentMap includesKey: op tag) ifTrue: [
-							(contentMap at: op tag) updateVisualsFrom: op.
-							alignFragment: op
+							| replacement = contentMap at: op tag. |
+							replacement updateVisualsFrom: op.
+							
+							(* Style the surviving fragment, not the one being replaced. *)
+							alignFragment: replacement from: op
 						]
 				].
 			
@@ -4883,6 +5533,9 @@ If none of the parents of a presenter accept a request, an error is signaled by 
 			public tag <Symbol> = t.
 		|
 	) (
+		public key ^<Object> = (
+			^tag
+		)
 	) : ()
 	public class WindowFragment openSubject: s <Subject> = Fragment new (
 		(* WIP: This fragment allows an entire HopscotchWindow to be embedded within the UI (i.e., nested windows). This in turn can be used to support a tiled window system, which is especially useful when running on the web, where browser restrictions do not allow multiple windows on shared state. *)
@@ -5674,6 +6327,7 @@ The picker is hidden while a request is in flight, to avoid switching in the mid
 	lazy private body = document at: 'body'.
 	lazy private history = window at: 'history'.
 	lazy private fontConfig = FontConfig new.
+	lazy private sequencePlanning = SequencePlanning new.
 	lazy public DOMParser = js global at: #DOMParser.
 	public CodeMirror = (
 		^window at: 'CodeMirror'

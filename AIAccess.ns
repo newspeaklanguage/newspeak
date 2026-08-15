@@ -198,6 +198,77 @@ class AIAccess usingPlatform: platform = Object new (
 			
 			subclassResponsibility
 		)
+		public pendingToolUseIdsIn: messages <List> ^<List[String]> = (
+			(* The ids of tool calls at the END of the history that were never
+	   answered by a tool_result. Non-empty exactly when a turn died
+	   between appendAssistantResponse: and addToolResults:toMessages:,
+	   which leaves the history in a shape most APIs reject (an
+	   assistant message announcing tool calls with no results
+	   following). See repairTrailingToolUseIn:.
+
+	   Only the trailing case is detected, because it is the only one
+	   that occurs: addToolResults:toMessages: folds a whole round's
+	   results in as a unit, so a partially-answered round is not
+	   reachable.
+
+	   Default: empty — a provider that does not override simply gets no
+	   repair, which is the pre-existing behaviour rather than a wrong
+	   one. GeminiProvider deliberately keeps the default: its tool-call
+	   ids are synthesised per round (toolUseBlocksFrom: mints 'gem-N'
+	   and remembers the function name under pendingCallNames) and are
+	   NOT recoverable from the stored message, whose functionCall parts
+	   carry only names. Repairing it would mean guessing at ids. *)
+			
+			^List new
+		)
+		public repairTrailingToolUseIn: messages <List> ^<Boolean> = (
+			(* Close off any unanswered trailing tool calls by synthesising an
+	   is_error tool_result for each, so the history is valid to send
+	   again. Answers whether anything was repaired.
+
+	   This is what makes a failed turn recoverable rather than
+	   terminal: without it, a turn that dies mid-tool-loop leaves a
+	   history that the API rejects on EVERY subsequent request, so the
+	   user's only escape is clearing the conversation. The synthesised
+	   result tells the model plainly that the call did not run, which
+	   is also what we want it to know — it can decide to call the tool
+	   again.
+
+	   Implemented once here in terms of the provider's own
+	   pendingToolUseIdsIn: / makeToolResult:... / addToolResults:...,
+	   so every provider that can identify its unanswered ids gets
+	   repair in its native message shape for free. *)
+			
+			| ids <List[String]> results <Alien[Array]> |
+			ids:: pendingToolUseIdsIn: messages.
+			ids isEmpty ifTrue: [ ^false ].
+			results:: createJSArray.
+			ids do: [:id <String> |
+					results push: (makeToolResult: id
+							textResult: 'Interrupted: this tool call was never executed, because the turn failed before the tool ran. No action was taken. Call the tool again if you still need its result.'
+							media: createJSArray
+							isError: true)
+				].
+			addToolResults: results toMessages: messages.
+			^true
+		)
+		public lastMessageRoleIn: messages <List> ^<String | UndefinedObject> = (
+			(* The role of the final history entry, normalized to 'user' /
+	   'assistant', or nil if unknown. Session uses it to tell a turn
+	   that died before the model answered (history ends with a user or
+	   tool-result message — re-drivable) from one that died after
+	   (history ends with an assistant message — already answered, so
+	   re-driving would ask the model to continue its own message).
+
+	   The default reads the 'role' field every provider's stored
+	   messages carry, translating Gemini's 'model' to 'assistant'. *)
+			
+			| role <String | UndefinedObject> |
+			messages isEmpty ifTrue: [ ^nil ].
+			role:: safeStringAt: (messages at: messages size) field: 'role'.
+			role = 'model' ifTrue: [ ^'assistant' ].
+			^role
+		)
 		safeAt: receiver <Object> field: field <String | Integer> = (
 			(* Defensive JS field access for *structural navigation*. JS
 	   `undefined` USUALLY maps to Newspeak `nil` in primordialsoup's
@@ -770,6 +841,30 @@ class AIAccess usingPlatform: platform = Object new (
 				].
 			^arr
 		)
+		public pendingToolUseIdsIn: messages <List> ^<List[String]> = (
+			(* Anthropic: unanswered calls show up as tool_use blocks in a
+	   trailing assistant message. Their ids are stored verbatim (see
+	   appendAssistantResponse:), so they can be answered exactly. *)
+			
+			| last <Alien> content len ids <List[String]> |
+			ids:: List new.
+			messages isEmpty ifTrue: [ ^ids ].
+			last:: messages at: messages size.
+			(safeStringAt: last field: 'role') = 'assistant' ifFalse: [ ^ids ].
+			content:: safeAt: last field: 'content'.
+			len:: safeAt: content field: 'length'.
+			len isNil ifTrue: [ ^ids ].
+			0 to: len - 1
+				do: [:i <Integer> |
+					| block id |
+					block:: safeAt: content field: i.
+					(safeStringAt: block field: 'type') = 'tool_use' ifTrue: [
+							id:: safeStringAt: block field: 'id'.
+							id isNil ifFalse: [ ids add: id ]
+						]
+				].
+			^ids
+		)
 		public addToolResults: results <Alien[Array]> toMessages: messages <List> = (
 			(* Anthropic carries the round's tool_result blocks inside a single
 	   user-role message whose content is the array of blocks. *)
@@ -845,23 +940,39 @@ class AIAccess usingPlatform: platform = Object new (
 	   (a user message added, an assistant turn appended, an error
 	   recorded). Used by chat UIs to refresh without polling. *)
 			public onUpdate <[Object] | UndefinedObject>
-
+			
 			(* One-shot system-context lines to fold into the NEXT turn's system
 		   prompt, then clear. Used to tell this session about out-of-band changes
 		   (e.g. another AI session edited the codebase) without polluting the
 		   visible message history. See addSystemNotice:/effectiveSystemPrompt. *)
 			pendingSystemNotices <List[String]> = List new.
+			
+			(* Watchdog budgets, in milliseconds. Nothing else on the API path
+		   bounds time: a fetch that never settles (dropped connection,
+		   sleeping laptop, proxy blackhole) used to leave the turn's promise
+		   pending forever, pinning the UI at "…thinking…" with no exit but
+		   reloading the page. See withWatchdog:ms:reason:.
+
+		   requestTimeoutMs covers one provider request; a tool-use turn makes
+		   several and each gets its own budget. toolTimeoutMs covers one
+		   round of tool execution — tools may legitimately be slow (a clone,
+		   a big search), hence the larger default. Set either to 0 to
+		   disable that watchdog. *)
+			public requestTimeoutMs <Integer> ::= 120000.
+			public toolTimeoutMs <Integer> ::= 180000.
 		|
 		toolList do: [:t <Tool> | toolMap at: t name put: t ].
 	) (
 		public addSystemNotice: line <String> = (
 			(* Queue a one-shot line to ride the next turn's system prompt. *)
+			
 			pendingSystemNotices add: line.
 			notifyUpdate
 		)
 		effectiveSystemPrompt ^<String> = (
 			(* systemPrompt plus any pending one-shot notices. Read each completion
 		   within a turn; the notices are cleared once the turn finishes. *)
+			
 			pendingSystemNotices isEmpty ifTrue: [ ^systemPrompt ].
 			^pendingSystemNotices inject: systemPrompt , String lf , 'IMPORTANT — out-of-band updates since your last turn:'
 				into: [:acc :line | acc , String lf , '- ' , line ]
@@ -1000,10 +1111,12 @@ class AIAccess usingPlatform: platform = Object new (
 	   document.documentElement on follow-up turns). See
 	   NEWSPEAK_JS_PROMISE_NOTES_2026-05-18.md for the deep dive. *)
 			
-			^(provider complete: (provider messagesAsRequestPayload: apiMessages)
-				system: effectiveSystemPrompt
-				tools: (provider buildToolsPayload: toolDefs)
-				maxTokens: maxTokens) then: [:response |
+			^(withWatchdog: (provider complete: (provider messagesAsRequestPayload: apiMessages)
+					system: effectiveSystemPrompt
+					tools: (provider buildToolsPayload: toolDefs)
+					maxTokens: maxTokens)
+				ms: effectiveRequestTimeoutMs
+				reason: (timeoutReason: 'The AI request' ms: effectiveRequestTimeoutMs)) then: [:response |
 					| stage <String> |
 					stage:: 'start of then'.
 					[
@@ -1025,7 +1138,9 @@ class AIAccess usingPlatform: platform = Object new (
 					   functionResponse parts), then recurse to send
 					   them back to the model. *)
 								stage:: 'Promise.all then'.
-								(JSPromise all: promises) then: [:results <Alien[Array]> |
+								(withWatchdog: (JSPromise all: promises)
+									ms: effectiveToolTimeoutMs
+									reason: (timeoutReason: 'Tool execution' ms: effectiveToolTimeoutMs)) then: [:results <Alien[Array]> |
 										| innerStage <String> |
 										innerStage:: 'addToolResults:toMessages:'.
 										[
@@ -1070,14 +1185,140 @@ class AIAccess usingPlatform: platform = Object new (
 			
 			onUpdate isNil ifFalse: [ onUpdate value ]
 		)
+		withWatchdog: promise <Alien[Promise]> ms: ms <Integer> reason: reason <String> ^<Alien[Promise]> = (
+			(* Race `promise` against a JS timer that rejects with `reason`, so a
+	   request that never settles becomes a visible error instead of a
+	   permanent hang. Answers a promise that settles however the race
+	   settles, with the timer cleared either way.
+
+	   The timer is deliberately a JS-side setTimeout rather than
+	   anything Newspeak-scheduled: that makes the watchdog independent
+	   of the alien bridge delivering a settlement at all, so it also
+	   catches the known failure mode where a rejection raised out of a
+	   then-closure is swallowed (see completeWithToolLoop's comment and
+	   NEWSPEAK_JS_PROMISE_NOTES_2026-05-18.md).
+
+	   Promise.withResolvers, not `new Promise(executor)` — the bridge
+	   passes nil for both executor arguments (see AI_IDE_Support
+	   pickFile). Clearing the timer on settle matters: a live timer
+	   holds a callback that would otherwise fire minutes later, and
+	   psoup keeps scheduling turns while timers are outstanding.
+	   Rejecting an already-settled race is harmless (a settled promise
+	   ignores later settlement), so a lost clearTimeout would be a
+	   waste, not a bug. *)
+			
+			| deferred <Alien> rejectFn <Alien> timerId contenders <Alien[Array]> |
+			ms <= 0 ifTrue: [ ^promise ].
+			deferred:: JSPromise withResolvers.
+			rejectFn:: deferred at: 'reject'.
+			timerId:: global setTimeout: [
+					rejectFn call: js undefined with: reason.
+					nil
+				]
+				with: ms.
+			contenders:: createJSArray.
+			contenders push: promise.
+			contenders push: (deferred at: 'promise').
+			^(JSPromise race: contenders) then: [:v |
+					global clearTimeout: timerId.
+					v
+				]
+				onError: [:err |
+					global clearTimeout: timerId.
+					JSPromise reject: err
+				]
+		)
+		effectiveRequestTimeoutMs ^<Integer> = (
+			(* Nil-tolerant read: a Session that predates these slots (schema
+	   migration on hot-load leaves new slots nil) still gets a
+	   watchdog rather than a DNU. *)
+			
+			requestTimeoutMs isNil ifTrue: [ ^120000 ].
+			^requestTimeoutMs
+		)
+		effectiveToolTimeoutMs ^<Integer> = (
+			toolTimeoutMs isNil ifTrue: [ ^180000 ].
+			^toolTimeoutMs
+		)
+		timeoutReason: what <String> ms: ms <Integer> ^<String> = (
+			^what , ' timed out after ' , (ms // 1000) printString , 's. The turn was abandoned; nothing further will arrive from it. Retry re-drives this turn from the last recorded message.'
+		)
+		public repairHistory ^<Boolean> = (
+			(* Make the history valid to send again after a failed turn, by
+	   answering any tool calls that were announced but never executed.
+	   Answers whether anything needed repair. Never raises: a repair
+	   that fails must not take down the send that called it. *)
+			
+			^[ provider repairTrailingToolUseIn: apiMessages ] on: Exception
+				do: [:e | false ]
+		)
+		public canRetry ^<Boolean> = (
+			(* There is something to re-drive exactly when the conversation is
+	   non-empty. *)
+			
+			^apiMessages isEmpty not
+		)
+		public retryLastTurn ^<Alien[Promise]> = (
+			(* Re-drive the current turn with no new user message — "pick up
+	   where it left off" after a failure. Tool results already recorded
+	   stay recorded; only the unfinished work runs again.
+
+	   Two cases after repair:
+	     - history ends with a user or tool-result message: the model
+	       never answered, so re-enter the tool loop.
+	     - history ends with an assistant message: the model DID answer
+	       and the turn died afterwards (e.g. while extracting text), so
+	       there is nothing to ask for. Resolve with the text we already
+	       have rather than sending an assistant message back as a
+	       prefill for the model to continue. *)
+			
+			| role <String | UndefinedObject> |
+			apiMessages isEmpty ifTrue: [
+					^JSPromise reject: 'Nothing to retry: this conversation has no messages yet.'
+				].
+			repairHistory.
+			notifyUpdate.
+			role:: [ provider lastMessageRoleIn: apiMessages ] on: Exception
+				do: [:e | nil ].
+			role = 'assistant' ifTrue: [ ^JSPromise resolve: lastAssistantText ].
+			^completeWithToolLoop then: [:responseText <String> |
+					pendingSystemNotices removeAll.
+					notifyUpdate.
+					responseText
+				]
+		)
+		lastAssistantText ^<String> = (
+			(* The most recent assistant text in the display projection, or ''.
+	   Used as retryLastTurn's value when the turn had in fact
+	   completed. *)
+			
+			| msgs <List> i <Integer> |
+			msgs:: [ displayMessages ] on: Exception do: [:e | List new ].
+			i:: msgs size.
+			[ i > 0 ] whileTrue: [
+					| m <Array> |
+					m:: msgs at: i.
+					(m at: 1) = 'assistant' ifTrue: [ ^m at: 2 ].
+					i:: i - 1
+				].
+			^''
+		)
 		public sendMessage: text <String> ^<Alien[Promise]> = (
 			(* User-facing entry: append the user's text to the history, drive
 	   the tool-loop, and return a Promise that resolves to the
-	   assistant's final text. *)
+	   assistant's final text.
+
+	   repairHistory first: if the previous turn died mid-tool-loop, the
+	   history ends with unanswered tool calls and appending a user
+	   message on top of that produces a request the API rejects — so
+	   without this, one failed turn would make every later turn fail
+	   too. *)
 			
+			repairHistory.
 			provider addUserText: text toMessages: apiMessages.
 			notifyUpdate.
 			^completeWithToolLoop then: [:responseText <String> |
+					
 					(* M3: one-shot system notices were folded into this turn's prompt;
 				   clear them so they don't repeat on later turns. *)
 					pendingSystemNotices removeAll.
@@ -1104,11 +1345,14 @@ class AIAccess usingPlatform: platform = Object new (
 			(* Like sendMessage: but also attaches document blocks to the user
 	   message. docs is a List of { filename <String>. content <String> }
 	   tuples, forwarded to the provider's addUserText:documents:toMessages:.
-	   sendMessage: is unchanged and remains the normal no-attachment path. *)
+	   sendMessage: is unchanged and remains the normal no-attachment path.
+	   Repairs an interrupted history first, exactly as sendMessage: does. *)
 			
+			repairHistory.
 			provider addUserText: text documents: docs toMessages: apiMessages.
 			notifyUpdate.
 			^completeWithToolLoop then: [:responseText <String> |
+					
 					(* M3: one-shot system notices were folded into this turn's prompt;
 				   clear them so they don't repeat on later turns. *)
 					pendingSystemNotices removeAll.
@@ -2035,6 +2279,28 @@ class AIAccess usingPlatform: platform = Object new (
 					arr push: obj
 				].
 			^arr
+		)
+		public pendingToolUseIdsIn: messages <List> ^<List[String]> = (
+			(* OpenAI-compatible: unanswered calls are the tool_calls of a
+	   trailing assistant message. appendAssistantResponse: stores the
+	   API's message verbatim, so the ids are the real ones the API
+	   expects to see echoed back as tool_call_id. *)
+			
+			| last <Alien> toolCalls len ids <List[String]> |
+			ids:: List new.
+			messages isEmpty ifTrue: [ ^ids ].
+			last:: messages at: messages size.
+			(safeStringAt: last field: 'role') = 'assistant' ifFalse: [ ^ids ].
+			toolCalls:: safeAt: last field: 'tool_calls'.
+			len:: safeAt: toolCalls field: 'length'.
+			len isNil ifTrue: [ ^ids ].
+			0 to: len - 1
+				do: [:i <Integer> |
+					| id |
+					id:: safeStringAt: (safeAt: toolCalls field: i) field: 'id'.
+					id isNil ifFalse: [ ids add: id ]
+				].
+			^ids
 		)
 		public addToolResults: results <Alien[Array]> toMessages: messages <List> = (
 			(* OpenAI emits each tool result as its own role:'tool' message.

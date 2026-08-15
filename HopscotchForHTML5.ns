@@ -5453,6 +5453,31 @@ If none of the parents of a presenter accept a request, an error is signaled by 
 			waiting:: false.
 			errorMessage:: msg
 		)
+		public canRetry ^<Boolean> = (
+			^session canRetry
+		)
+		public retryLastTurn ^<Alien[Promise] | UndefinedObject> = (
+			(* Re-drive the failed turn without adding a new user message. The
+	   caller wires markComplete / markError: onto the returned promise
+	   exactly as it does for sendText:. *)
+			
+			waiting:: true.
+			errorMessage:: nil.
+			^session retryLastTurn
+		)
+		public cancelWaiting = (
+			(* Release the UI latch on a turn that is not coming back, so the
+	   user gets the input editor and a Retry button instead of a
+	   permanent "…thinking…".
+
+	   This does not abort the request — nothing in the fetch path is
+	   cancellable — so a late settlement may still arrive and call
+	   markComplete, which is harmless and in fact welcome: the answer
+	   simply lands then. *)
+			
+			waiting:: false.
+			errorMessage:: 'Canceled. The request may still be running; if it answers, its reply will appear. Retry re-drives the turn from the last recorded message.'
+		)
 		public clearHistory = (
 			session clearHistory.
 			draft:: ''.
@@ -5484,20 +5509,61 @@ If none of the parents of a presenter accept a request, an error is signaled by 
 	) : ()
 	public class ChatStatusPresenter onSubject: s = Presenter onSubject: s (
 		(* The status block above the input editor. While a request is in flight
- (subject waiting = true) shows "…thinking…" and the current model;
- otherwise shows a model picker dropdown so the user can swap models
- between turns without losing history. The picker is intentionally
- hidden mid-flight to avoid switching providers/models inside a
- tool-use loop. *)
+ (subject waiting = true) shows "…thinking…", a Cancel button and the
+ current model; after a failed turn, a Retry button above the picker;
+ otherwise a model picker dropdown so the user can swap models between
+ turns without losing history. The picker is intentionally hidden
+ mid-flight to avoid switching providers/models inside a tool-use loop.
+
+ Cancel and Retry live here rather than in the transcript because this
+ one presenter serves BOTH chat surfaces — the inline ChatPresenter and
+ the chat-as-document path, whose thinkingOrModelPicker amplet renders
+ it (AI_IDE_Support thinkingPickerFor:). Putting the recovery controls
+ anywhere else would mean building them twice. *)
 		
 	) (
 		definition = (
 			subject waiting ifTrue: [
-					^column: {(label: '…thinking…') italic. (label: 'Model: ' , currentModelName) color: (Color r: 0.5
+					^column: {row: {(label: '…thinking…') italic. mediumBlank. button: 'Cancel'
+								action: [ respondToCancel ]. }. (label: 'Model: ' , currentModelName) color: (Color r: 0.5
 								g: 0.5
 								b: 0.5). }
 				].
+			(canRetryQuietly and: [ subject errorMessage isNil not ]) ifTrue: [
+					^column: {retryRow. modelPicker. }
+				].
 			^modelPicker
+		)
+		canRetryQuietly ^<Boolean> = (
+			(* Is there a turn worth re-driving? Guarded because definition must
+	   never raise: a subject whose session is in a bad state should
+	   still render its picker. A failure that happened before any
+	   message was recorded (e.g. a rejected API key on the very first
+	   send) has nothing to re-drive, so no button is offered. *)
+			
+			^[ subject canRetry ] on: Exception do: [:e | false ]
+		)
+		retryRow = (
+			(* Shown after a failed or canceled turn. The failure text itself is
+	   rendered by the transcript (inline) or appended as an error
+	   section (document), so this row is just the action. *)
+			
+			^row: {(label: 'That turn did not finish. ') color: aiColors errorText. button: 'Retry'
+					action: [ respondToRetry ]. filler. }
+		)
+		respondToRetry = (
+			(* Same promise wiring as ChatInputPresenter>>respondToSend: the
+	   subject's waiting flag is flipped by retryLastTurn and cleared
+	   only by markComplete / markError:. *)
+			
+			| promise <Alien[Promise] | UndefinedObject> |
+			updateGUI: [ promise:: subject retryLastTurn ].
+			promise isNil ifTrue: [ ^self ].
+			promise then: [:reply | updateGUI: [ subject markComplete ] ]
+				onError: [:err | updateGUI: [ subject markError: err printString ] ]
+		)
+		respondToCancel = (
+			updateGUI: [ subject cancelWaiting ]
 		)
 		currentModelName ^<String> = (
 			| provider |

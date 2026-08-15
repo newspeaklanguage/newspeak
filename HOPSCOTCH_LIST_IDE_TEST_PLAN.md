@@ -229,14 +229,14 @@ window advances. Fail — `measured=false`, `rowHeight=0`, window stuck at the
 bootstrap 30 — means the measurement retry has regressed and any such column
 silently stops virtualizing.
 
-**Precondition, and it is the whole check:** the column must be in a live,
-laid-out document, so that the label rows report a real height while the editor
-reports zero. Off-screen every row reports zero, the measurement cannot
-distinguish the cases, and the check has not run. Do **not** substitute
-`assumeRowHeight:` here — that bypasses measurement, which is the thing under
-test. Do **not** substitute reading the source and judging it correct: the
-defect this guards against was in code that read correctly. If the column cannot
-be laid out, report **NOT RUN**.
+**PASSED 2026-08-15**, on the third attempt, following
+`HOPSCOTCH_CHECK_3_9_INSTRUCTIONS.md`. Observed: gate held (row 1
+`offsetHeight` 0, row 2 16, so the column was genuinely laid out); control
+column measured `rowHeight=16`; subject column measured the same 16 despite its
+zero-height first row; after scrolling, window at `firstShown=142
+lastShown=244` with 105 children. Re-run via those instructions, not from this
+summary — the two earlier attempts both produced a false PASS from here, one by
+substituting `assumeRowHeight:` and one by reading the source.
 
 **3.7 Rows without state are genuinely discarded.**
 Same, with plain label rows: after scrolling away and back,

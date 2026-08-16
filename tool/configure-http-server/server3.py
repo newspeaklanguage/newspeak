@@ -19,6 +19,15 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
 Handler.extensions_map['.wasm'] = 'application/wasm'
 
-with socketserver.TCPServer(("", PORT), Handler) as httpd:
+# ThreadingTCPServer, not TCPServer: the single-threaded server handles one
+# connection at a time, and HTTP/1.1 keep-alive means each browser holds its
+# connection open. Testing Croquet collaboration needs several browsers at once,
+# which wedged the server completely -- every request timing out, so assets like
+# CodeMirror and images silently failed to load and apps hung on startup.
+class ThreadingHandler(socketserver.ThreadingTCPServer):
+    daemon_threads = True      # don't block exit on open keep-alive connections
+    allow_reuse_address = True # restart without waiting out TIME_WAIT
+
+with ThreadingHandler(("", PORT), Handler) as httpd:
     print ("Python3: server3.py serving at port", PORT)
     httpd.serve_forever()

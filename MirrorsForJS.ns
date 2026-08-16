@@ -142,7 +142,7 @@ Still lacking are facilities for correctly adding slots (and hence nested classe
 	('compiling class:', src) out. *)
 			
 			^nil = enclosingClass ifTrue: [
-					compiler compileClassSource: 'Newspeak3 ''Uncategorized'' ' , source
+					irForClassSource: 'Newspeak3 ''Uncategorized'' ' , source
 						within: nil
 				]
 				ifFalse: [
@@ -748,7 +748,7 @@ Still lacking are facilities for correctly adding slots (and hence nested classe
 			^self fromUnitSource: 'Newspeak3 ''Uncategorized'' ' , src
 		)
 		public fromUnitSource: src <String> ^<ClassDeclarationBuilder> = (
-			| ir <IntermediateMixin> = compiler compileClassSource: src within: nil. |
+			| ir <IntermediateMixin> = irForClassSource: src within: nil. |
 			
 			(* source indices will be BOGUS here *)
 			^IRBasedClassDeclarationBuilder fromIR: ir existingMixin: nil within: nil
@@ -1400,7 +1400,7 @@ on the data to decide what action to take. *)
 	) (
 		public addFromSource: s <String> ^<MethodBuilder> = (
 			| result <IntermediateMethod> newM <MethodBuilder> sourceIndex <Integer> |
-			result:: compiler compileMethodSource: s within: definingMixin.
+			result:: irForMethodSource: s within: definingMixin.
 			
 			(* TODO: check for name conflicts *)
 			newM:: MethodBuilder reflecting: result in: definingMixin source: s.
@@ -1449,7 +1449,7 @@ on the data to decide what action to take. *)
 	   class-side fromSource: does. Without it the parse failed with
 	   ParserError ''class expected'' (which Message>>sendTo: then
 	   masked as an MNU, before its 2026-07-14 fix). *)
-			ir:: compiler compileClassSource: 'Newspeak3 ''Uncategorized'' ' , src within: nil.
+			ir:: irForClassSource: 'Newspeak3 ''Uncategorized'' ' , src within: nil.
 			newCDB:: IRBasedClassDeclarationBuilder fromIR: ir
 				existingMixin: nil
 				within: definingMixin declaration.
@@ -1477,18 +1477,17 @@ on the data to decide what action to take. *)
 			^_js operator: '===' with: reflectee and: other reflectee
 		)
 		private compileExpression: expression <String> with: rawScope <Map[Symbol, Object]> ^<JS[Function]> = (
-			| compiler ir dnuHandlers writer sb src func chain params wrapper |
+			| compiler ir writer sb src chain params wrapper |
 			compiler:: compilation Compiler new.
 			ir:: compiler compileExpressionSource: expression
 				inMixin: getClass mixin
 				withScope: rawScope.
-			dnuHandlers:: compiler dnuHandlers.
-			writer:: generation Writer new.
-			sb:: StringBuilder new.
-			writer generateSourceFor: dnuHandlers on: sb.
-			src:: sb asString.
-			func:: _js call: (_js ident: 'eval') with: {'(' , src , ')'. }.
-			_js call: func with: {_js verbatim: 'Object.prototype'. }.
+
+			(* The expression may send selectors this image has never sent; registering
+	them installs their doesNotUnderstand: catchers. This used to generate, print
+	and eval an installDnuHandlersOn function to the same end - the registry does
+	it without the round trip through source. *)
+			registerSentSelectorsOf: compiler.
 			writer:: generation Writer new.
 			sb:: StringBuilder new.
 			writer generateSourceFor: ir function on: sb.
@@ -2711,11 +2710,50 @@ Mirror for the activation of a lazy slot. It takes care of computing the right s
 			^true
 		)
 	) : ()
+	public allSelectorsDo: action <[:String | Object]> = (
+		| selectors = vmmirror allSelectors. |
+
+		(* Every selector this image may send: the deploy's sent selectors plus
+		everything minted by reflective compiles since. Answers selectors and
+		nothing else, so - unlike psoup, which scans the heap for canonical
+		strings and must ask which of them are symbols - there is no
+		canonicality test to make here. *)
+		selectors do: [:sel <String> | action value: sel ]
+	)
+	irForClassSource: src <String> within: enclosing = (
+		| ir = compiler compileClassSource: src within: enclosing. |
+
+		(* Compile [src] and tell the runtime which selectors it sends. Every
+		reflective class compile goes through here, so the selector registry
+		cannot drift from the code the image is running. *)
+		registerSentSelectorsOf: compiler.
+		^ir
+	)
+	irForMethodSource: src <String> within: mixin = (
+		| ir = compiler compileMethodSource: src within: mixin. |
+
+		(* As irForClassSource:within:, for a single method. *)
+		registerSentSelectorsOf: compiler.
+		^ir
+	)
+	registerSentSelectorsOf: aCompiler = (
+		| mangled = aCompiler sentSelectors asArray collect: [:sel <String> |
+				compilation names manglePublic: sel
+			]. |
+
+		(* Register the selectors [aCompiler] compiled sends of. A selector
+		appearing for the first time in freshly accepted code otherwise has no
+		doesNotUnderstand: catcher on Object.prototype, so sending it to an
+		object that does not implement it dies with a raw JS TypeError instead
+		of answering doesNotUnderstand: - which in particular breaks the
+		isKindOfX protocols, since those rely on DNU answering false. *)
+		vmmirror registerSelectors: mangled on: (_js verbatim: 'Object.prototype')
+	)
 	classDeclIRFor: mixin within: enclosing = (
 		| source = 'Newspeak3 ''Uncategorized'' ' , (ClassDeclarationMirror reflecting: mixin) source. |
-		
+
 		(* ('compiling class:', source) out. *)
-		^compiler compileClassSource: source within: enclosing
+		^irForClassSource: source within: enclosing
 	)
 	classMixinOf: m <InstanceMixin> ^<ClassMixin | nil> = (
 		(* Sometimes we need to get the class side of a mixin. Since reflectee is not exposed by MixinMirror, we must rely

@@ -1149,38 +1149,26 @@ This accessor will lazily generate the nested class when its enclosing instance 
 			mixinMirror methods add: accessor
 		)
 		public dnuHandlers = (
-			(* We used to generate a separate function for each selector. Now we are recycling the same code for each selector and using the JS magic 'arguments' to handle the variable number of arguments in an attempt to reduce the amount of code the must be compiled at start-up (recall DNU handlers must be installed up front). *)
-			
 			| sortedSelectors = sentSelectors asArray sort: [:a :b |
 					string: a compare: b
 				]. mangledSelectors = _js array: (sortedSelectors collect: [:sel |
 						_js literal: (names manglePublic: sel)
-					]). catcher = _js call: (_js ident: 'dnuCatcher')
-				with: {_js ident: 'sel'. }. |
+					]). |
+
+			(* The selectors sent by this compilation, as a function handing them to the
+	runtime's selector registry. The registry installs a doesNotUnderstand:
+	catcher for each selector it has not seen and remembers it, so one call both
+	makes DNU work for these selectors and makes them visible to
+	MirrorsForJS>>allSelectorsDo:, which backs the IDE's selector search.
+
+	Emitted once per deploy, for the boot-time set; KernelForJS>>augmentPrototypes
+	calls it. Reflective compiles register directly instead - they have no reason
+	to generate, print and eval a function in order to pass an array. *)
 			^_js function: 'installDnuHandlersOn'
 				of: {_js ident: 'p'. }
-				body: (_js block: {_js call: (_js propertyOf: mangledSelectors
-							at: (_js literal: 'forEach'))
-						with: {_js functionOf: {'sel'. }
-							body: (_js block: {_js assign: (_js propertyOf: (_js ident: 'p')
-										at: (_js operator: '+'
-											with: (_js literal: '_')
-											and: (_js ident: 'sel')))
-									toBe: catcher. _js assign: (_js propertyOf: (_js ident: 'p')
-										at: (_js ident: 'sel'))
-									toBe: catcher. 
-								(* Make DNU handlers non-enumerable. *)
-								_js call: (_js propertyOf: (_js ident: 'Object')
-										at: (_js literal: 'defineProperty'))
-									with: {_js ident: 'p'. _js operator: '+'
-										with: (_js literal: '_')
-										and: (_js ident: 'sel'). _js objectLiteralSlotNames: {_js literal: 'enumerable'. }
-										values: {_js literal: false. }. }. _js call: (_js propertyOf: (_js ident: 'Object')
-										at: (_js literal: 'defineProperty'))
-									with: {_js ident: 'p'. _js ident: 'sel'. _js objectLiteralSlotNames: {_js literal: 'enumerable'. }
-										values: {_js literal: false. }. }. }). }. })
-			(* function() {  this.dnu(kernel.Message().selector$arguments$(selector, arguments) )  } *)
-			
+				body: (_js block: {_js call: (_js propertyOf: (_js ident: 'vmmirror')
+							at: (_js literal: '$registerSelectors$on$'))
+						with: {mangledSelectors. _js ident: 'p'. }. })
 		)
 		generateSlotAccessorsFor: mixinIR <MixinIR> = (
 			mixinIR slots do: [:slotIR |
@@ -2725,6 +2713,45 @@ var vmmirror = new function(){
 
 	this.$mangleSelector$ = function(s) {
 		return "$" + s.replace(/\:/g,"$").replace(/\`/g,"$");
+	};
+
+	// The selector registry: every selector this image may send. It is the single
+	// source of truth for two things that used to be handled separately and
+	// inconsistently - the doesNotUnderstand: catchers installed on
+	// Object.prototype, and the selector enumeration behind the IDE search
+	// (MirrorsForJS>>allSelectorsDo:).
+	//
+	// Seeded at boot from the deploy-time sent-selector set (installDnuHandlersOn,
+	// emitted by Newspeak2JSCompilation>>dnuHandlers) and extended by every
+	// reflective compile. A selector minted in a live session is therefore a
+	// first-class selector: sending it to an object that does not implement it
+	// answers doesNotUnderstand: instead of raising a raw TypeError, and searching
+	// for it finds it. Before the registry only workspace doIts extended the
+	// catcher table, so a selector introduced by accepting a method was invisible
+	// to both mechanisms.
+	//
+	// Null-prototype: the catchers live on Object.prototype, so an ordinary object
+	// literal would inherit a function for every selector-shaped key and make
+	// membership tests meaningless.
+	var selectorRegistry = Object.create(null);
+
+	this.$registerSelectors$on$ = function(mangledSelectors, p) {
+		for (var i = 0; i < mangledSelectors.length; i++) {
+			var sel = mangledSelectors[i];
+			if (selectorRegistry[sel] === true) continue;
+			selectorRegistry[sel] = true;
+			var catcher = dnuCatcher(sel);
+			p["_" + sel] = catcher;
+			p[sel] = catcher;
+			Object.defineProperty(p, "_" + sel, { enumerable: false });
+			Object.defineProperty(p, sel, { enumerable: false });
+		}
+	};
+
+	this.$allSelectors = function() {
+		var result = [];
+		for (var sel in selectorRegistry) result.push(this.$unmangleSelector$(sel));
+		return result;
 	};
 };
 '

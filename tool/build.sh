@@ -28,6 +28,14 @@ additionalNs="$*"
 cd ${PRIMORDIALSOUP} || exit 1
 ./build os=emscripten arch=wasm
 
+# 4-croquet. Build the Croquet variant of the VM: the same VM linked with
+# meta/croquet-post.js (Croquet model/view + session join) instead of
+# meta/custom-post.js, producing croquetpsoup.{html,js,wasm}. The script saves and
+# restores the standard build and SConstruct around itself, and refuses to emit a
+# croquetpsoup.js with no Croquet in it. MUST run after the standard build above,
+# which it relies on having produced the files it saves.
+./build-croquet.sh os=emscripten arch=wasm
+
 # 4a. Build NewspeakParser.vfuel for parse-validate.sh script
 ./out/ReleaseX64/primordialsoup \
   ./out/snapshots/WebCompiler.vfuel \
@@ -97,6 +105,7 @@ NSEOF
 #     copies in the newspeak repo. Deployments use the versions from the primordialsoup repo.
 mkdir -p out
 cp ${PRIMORDIALSOUP}/out/ReleaseEmscriptenWASM/primordialsoup.* out
+cp ${PRIMORDIALSOUP}/out/ReleaseEmscriptenWASM/croquetpsoup.* out
 cp ${PRIMORDIALSOUP}/out/snapshots/*.vfuel out
 # 6. Copy Psoup Newspeak code
 cp ${PRIMORDIALSOUP}/newspeak/*.ns out
@@ -168,6 +177,11 @@ ${PRIMORDIALSOUP}/out/ReleaseX64/primordialsoup \
     RuntimeForHopscotchForHTML HopscotchGestureDemo HopscotchGestureDemo.vfuel \
     RuntimeForHopscotchForHTML HopscotchDemo HopscotchDemo.vfuel \
     RuntimeForHopscotchForHTML Particles Particles.vfuel \
+    RuntimeForCroquet HopscotchWebIDE CroquetHopscotchWebIDE.vfuel \
+    RuntimeForCroquet AmpleforthViewer CroquetAmpleforthViewer.vfuel \
+    RuntimeForCroquet HopscotchFontDemo CroquetHopscotchFontDemo.vfuel \
+    RuntimeForCroquet HopscotchGestureDemo CroquetHopscotchGestureDemo.vfuel \
+    RuntimeForCroquet HopscotchDemo CroquetHopscotchDemo.vfuel \
     "$additionalNs"
 
 # Restore the committed BuildInfo.ns placeholder (it was stamped for this build

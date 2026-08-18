@@ -13,14 +13,14 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 	|
 		vmmirror = vmm.
 		public platform
-
+		
 		(* The dynamic exception-handler stack (innermost = top), a linked chain of HandlerEntry. Pushed by on:do:, popped by its ensure: (self-healing on every exit path: normal return, sentinel NLR, raw JS throw - the pops ride the finallys). The signal machinery DISABLES entries rather than removing them; removal belongs to the owning on:do: alone. See the Stage 2 design (NLR_DEBUGGER_DESIGN_2026-07-16.md par. 8). *)
 		topHandler
 	|
 ) (
-	class HandlerEntry on: c <Exception class> wrapper: w <[:Exception]> returner: r <[:Object]> = Object new (
+	class HandlerEntry on: c <Exception class> wrapper: w <[:Exception | Object]> returner: r <[:Object | Object]> = Object new (
 		(* One on:do: activation's registration. wrapper and returner are closures whose NLR home is the owning on:do: activation: invoking wrapper unwinds from the raise point to the on:do: with the handler's value (Smalltalk handler-completion semantics), invoking returner does the same with an explicit value (Exception>>return:). *)
-
+		
 		|
 			public exceptionClass = c.
 			public wrapper = w.
@@ -30,97 +30,6 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 		|
 	) (
 	) : ()
-	pushHandler: entry = (
-		entry prev: topHandler.
-		topHandler:: entry
-	)
-	public handlerChainCut = (
-		(* Evaluation-boundary support (MirrorsForJS evaluate:with:): an evaluation is logically its own thread - psoup runs it as one - so handlers installed by the surrounding stack must not catch exceptions signaled inside it; an unhandled signal there must reach the debugger, not a UI backstop. Answers the chain for the boundary to restore on every exit path; the wholesale restore also cleans up any entries the evaluated code leaked (a reconstruction unwind skips the ensure: pops). *)
-
-		| saved |
-		saved:: topHandler.
-		topHandler:: nil.
-		^saved
-	)
-	public handlerChainRestore: saved = (
-		topHandler:: saved
-	)
-	removeHandler: entry = (
-		| h |
-		topHandler == entry ifTrue: [
-				topHandler:: entry prev.
-				^self
-			].
-		(* Defensive mid-stack unlink; in practice pops arrive innermost-first via the finallys. *)
-		h:: topHandler.
-		[ nil = h ] whileFalse: [
-				h prev == entry ifTrue: [
-						h prev: entry prev.
-						^self
-					].
-				h:: h prev
-			]
-	)
-	findHandlerFor: ex ^<HandlerEntry | nil> = (
-		| h |
-		h:: topHandler.
-		[ nil = h ] whileFalse: [
-				(h disabled not and: [ exception: ex matchesClass: h exceptionClass ]) ifTrue: [
-						^h
-					].
-				h:: h prev
-			].
-		^nil
-	)
-	exception: ex matchesClass: exceptionClass ^<Boolean> = (
-		| c |
-		c:: _js propertyOf: ex at: (_js literal: 'newspeakClass').
-		(_js operator: '==' with: c and: (_js ident: 'null')) ifTrue: [ c:: Exception ].
-		_js for: (_js verbatim: '')
-			while: (_js operator: '!==' with: c and: nil)
-			step: (_js verbatim: '')
-			do: (_js block: {_js if: (_js operator: '===' with: c and: exceptionClass)
-					then: (_js block: {_js return: (_js literal: true). }). c:: c superclass. }).
-		^false
-	)
-	disableThrough: match = (
-		| h |
-		h:: topHandler.
-		[ nil = h ] whileFalse: [
-				h disabled: true.
-				h == match ifTrue: [ ^self ].
-				h:: h prev
-			]
-	)
-	reenableThrough: match = (
-		(* Entries above the range (pushed by the handler's own dynamic extent, never disabled) are touched harmlessly; nested signals rebalance their own ranges before control can return here. *)
-
-		| h |
-		h:: topHandler.
-		[ nil = h ] whileFalse: [
-				h disabled: false.
-				h == match ifTrue: [ ^self ].
-				h:: h prev
-			]
-	)
-	public describeRawError: e ^<String> = (
-		| s |
-		s:: _js propertyOf: e at: (_js literal: 'stack').
-		(_js operator: '==' with: s and: (_js ident: 'null')) ifTrue: [
-				^_js call: (_js ident: 'String') with: {e. }
-			].
-		^s
-	)
-	protectedBodyOf: body <[]> = (
-		(* Run an on:do: protected block. Newspeak signals never throw; what CAN arrive here as a JS throw is (a) a raw JS error from the host - convert it to a kernel Exception and SIGNAL it, so the handler stack (whose entries at and above this on:do: are still active) sees it with correct innermost-first matching, resumability included - or (b) an NS exception thrown by the unhandled-signal fallback, already past every matching opportunity: rethrow it onward. Each raw error is converted exactly once: the converted signal either finds a handler or is rethrown as an NS exception, case (b) at every outer level. *)
-
-		| c rawEx |
-		_js try: (_js block: {_js return: body value. })
-			catch: (_js ident: 'e')
-			with: (_js block: {c:: _js propertyOf: (_js ident: 'e')
-					at: (_js literal: 'newspeakClass'). _js if: (_js operator: '!=' with: c and: (_js ident: 'null'))
-					then: (_js block: {_js throw: (_js ident: 'e'). }). rawEx:: Exception new. rawEx messageText: (describeRawError: (_js ident: 'e')). _js return: rawEx signal. })
-	)
 	public class Array uninstantiable = Object new (
 	) (
 		public , otherSequence = (
@@ -132,9 +41,8 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 		)
 		public copy = (
 			(* A shallow copy, as on psoup. *)
-
-			^_js call: (_js propertyOf: (_js propertyOf: self
-						at: (_js literal: 'slice'))
+			
+			^_js call: (_js propertyOf: (_js propertyOf: self at: (_js literal: 'slice'))
 					at: (_js literal: 'call'))
 				with: {self. _js literal: 0. }
 		)
@@ -190,14 +98,17 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 		)
 		public collect: block = (
 			(* Index loop, NOT native map: a block performing ^ returns the NLR sentinel (M4), which must propagate out of collect: -- map would store it as an ELEMENT and parsing-style NLR failure paths would corrupt the result instead of unwinding. *)
+			
 			| i ::= 0. len ::= _js verbatim: 'this.length'. result r |
 			result:: _js new: (_js ident: 'Array') with: {len. }.
 			_js for: (_js verbatim: '')
 				while: (_js operator: '<' with: i and: len)
 				step: (_js postfixOperator: '++' on: i)
-				do: (_js block: {r:: _js call: block
-						with: {_js propertyOf: self at: i. }. _js if: (_js operator: '===' with: r and: (_js ident: 'NLRSentinel'))
-						then: (_js block: {_js return: r. }). _js assign: (_js propertyOf: result at: i)
+				do: (_js block: {r:: _js call: block with: {_js propertyOf: self at: i. }. _js if: (_js operator: '==='
+							with: r
+							and: (_js ident: 'NLRSentinel'))
+						then: (_js block: {_js return: r. }). _js assign: (_js propertyOf: result
+							at: i)
 						toBe: r. }).
 			^result
 		)
@@ -275,12 +186,14 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 		)
 		public do: block = (
 			(* Index loop, NOT forEach: a block performing ^ returns the NLR sentinel (M4), which must break the loop and propagate out of do: -- native forEach would discard it and run every remaining element. *)
+			
 			| i ::= 0. len ::= _js verbatim: 'this.length'. r |
 			_js for: (_js verbatim: '')
 				while: (_js operator: '<' with: i and: len)
 				step: (_js postfixOperator: '++' on: i)
-				do: (_js block: {r:: _js call: block
-						with: {_js propertyOf: self at: i. }. _js if: (_js operator: '===' with: r and: (_js ident: 'NLRSentinel'))
+				do: (_js block: {r:: _js call: block with: {_js propertyOf: self at: i. }. _js if: (_js operator: '==='
+							with: r
+							and: (_js ident: 'NLRSentinel'))
 						then: (_js block: {_js return: r. }). })
 		)
 		public do: block separatedBy: betweenBlock = (
@@ -327,13 +240,16 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 		)
 		public inject: initialValue into: accumulator = (
 			(* Index loop, NOT native reduce: propagate an NLR sentinel (M4) out of the fold instead of feeding it back as the accumulator. *)
+			
 			| i ::= 0. len ::= _js verbatim: 'this.length'. acc |
 			acc:: initialValue.
 			_js for: (_js verbatim: '')
 				while: (_js operator: '<' with: i and: len)
 				step: (_js postfixOperator: '++' on: i)
 				do: (_js block: {acc:: _js call: accumulator
-						with: {acc. _js propertyOf: self at: i. }. _js if: (_js operator: '===' with: acc and: (_js ident: 'NLRSentinel'))
+						with: {acc. _js propertyOf: self at: i. }. _js if: (_js operator: '==='
+							with: acc
+							and: (_js ident: 'NLRSentinel'))
 						then: (_js block: {_js return: acc. }). }).
 			^acc
 		)
@@ -386,15 +302,18 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 		)
 		public select: block = (
 			(* Index loop, NOT native filter: propagate an NLR sentinel (M4); filter would coerce it to truthiness and lose the return. *)
+			
 			| i ::= 0. len ::= _js verbatim: 'this.length'. result r |
 			result:: _js new: (_js ident: 'Array') with: {}.
 			_js for: (_js verbatim: '')
 				while: (_js operator: '<' with: i and: len)
 				step: (_js postfixOperator: '++' on: i)
-				do: (_js block: {r:: _js call: block
-						with: {_js propertyOf: self at: i. }. _js if: (_js operator: '===' with: r and: (_js ident: 'NLRSentinel'))
+				do: (_js block: {r:: _js call: block with: {_js propertyOf: self at: i. }. _js if: (_js operator: '==='
+							with: r
+							and: (_js ident: 'NLRSentinel'))
 						then: (_js block: {_js return: r. }). _js if: r
-						then: (_js block: {_js call: (_js propertyOf: result at: (_js literal: 'push'))
+						then: (_js block: {_js call: (_js propertyOf: result
+									at: (_js literal: 'push'))
 								with: {_js propertyOf: self at: i. }. }). }).
 			^result
 		)
@@ -611,12 +530,14 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 		)
 		public do: block = (
 			(* Index loop, NOT forEach: propagate an NLR sentinel (M4) out of the loop. *)
+			
 			| i ::= 0. len ::= _js verbatim: 'this.length'. r |
 			_js for: (_js verbatim: '')
 				while: (_js operator: '<' with: i and: len)
 				step: (_js postfixOperator: '++' on: i)
-				do: (_js block: {r:: _js call: block
-						with: {_js propertyOf: self at: i. }. _js if: (_js operator: '===' with: r and: (_js ident: 'NLRSentinel'))
+				do: (_js block: {r:: _js call: block with: {_js propertyOf: self at: i. }. _js if: (_js operator: '==='
+							with: r
+							and: (_js ident: 'NLRSentinel'))
 						then: (_js block: {_js return: r. }). })
 		)
 		public endsWith: suffix = (
@@ -748,17 +669,17 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 		public repeat = (
 			(* Evaluate the receiver forever; exits only via non-local return or
 	   exception, as on psoup. *)
-
+			
 			[ true ] whileTrue: [ value ]
 		)
 		public whileTrue = (
 			(* Zero-argument variant: evaluate the receiver until it answers false. *)
-
+			
 			[ value ] whileTrue: [ ]
 		)
 		public whileFalse = (
 			(* Zero-argument variant: evaluate the receiver until it answers true. *)
-
+			
 			[ value ] whileFalse: [ ]
 		)
 		public printString = (
@@ -777,6 +698,7 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 			(* Real try/finally, required by sentinel NLR (M4): a non-local return is a RETURN, not a throw, so a catch-based protector would be skipped. finally runs on return (sentinel or normal) and on throw alike.
 
 		The protector runs with NLRPayload saved and restored: if an INNER non-local return completes entirely within the protector, it uses and clears NLRPayload; without the restore, an in-flight outer NLR (whose sentinel is the current return value of the try) would resume with a dead payload. If the protector itself NLRs OUTWARD, the checked send below returns the sentinel from inside the finally -- JS's return-in-finally override -- which is exactly the newest-NLR-wins redirect semantics, and the restore is correctly skipped. *)
+			
 			| saved |
 			_js try: (_js block: {_js return: self value. })
 				finally: (_js block: {
@@ -793,7 +715,7 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 		)
 		public on: exceptionClass do: handler = (
 			(* Resumable exceptions (Stage 2, design par. 8): register a handler entry whose wrapper and returner are NLR closures homed HERE, so a handler that completes normally (or Exception>>return:) unwinds from the raise point to this activation - through every intervening ensure: protector, on the M4 sentinel fabric - and its value becomes this expression's value. The entry is removed by the ensure: on every exit path. The signal machinery calls the handler AT THE RAISE POINT with the whole stack alive beneath it: resumption and, later, the debugger's post-mortem entry both depend on that. *)
-
+			
 			| entry |
 			entry:: HandlerEntry on: exceptionClass
 				wrapper: [:ex | ^handler value: ex ]
@@ -838,7 +760,7 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 			returnerSlot
 		|
 	) (
-
+		
 		(* squeak compatibility for Minitest *)
 		public printString = (
 			nil = messageText ifTrue: [ ^super class name ].
@@ -846,28 +768,31 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 		)
 		public signal = (
 			(* Resumable exceptions (Stage 2, design par. 8): find the innermost enabled matching handler and CALL it at the raise point - no throw, the raise stack fully alive beneath the handler. The call returns here only via resume: (this method's own NLR closure delivers the resume value as signal's answer; code after signal continues). A handler that completes normally, or return:s, unwinds PAST this frame to its on:do: on the sentinel fabric. No matching handler: fall back to a JS throw - top-level catches and the simulator's escape guard consume those. *)
-
+			
 			| match |
 			_js verbatim: 'this.trace = new Error().stack'.
 			match:: findHandlerFor: self.
 			nil = match ifTrue: [
+					
 					(* Unhandled. With a debug hook registered (a debug-capable image), engage the Stage 3 reconstruction unwind: the throw builds the shadow stack through the method catch-wrappers on its way to the boundary that presents the debugger. Without a hook, a plain throw for top-level catches. *)
-					_js if: (_js operator: '!==' with: (_js ident: 'NSDebugHook') and: (_js ident: 'null'))
+					_js if: (_js operator: '!=='
+							with: (_js ident: 'NSDebugHook')
+							and: (_js ident: 'null'))
 						then: (_js block: {_js assign: (_js ident: 'NSReconstructing')
 								toBe: (_js literal: true). }).
 					_js throw: self
 				].
 			resumerSlot:: [:v |
-					reenableThrough: match.
-					^v
-				].
+				reenableThrough: match.
+				^v
+			].
 			returnerSlot:: match returner.
 			disableThrough: match.
 			^match wrapper value: self
 		)
 		public resume: v = (
 			(* Continue at the raise point: v becomes the value of the signal expression. A control transfer - code after resume: in the handler never runs. *)
-
+			
 			^resumerSlot value: v
 		)
 		public resume = (
@@ -875,7 +800,7 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 		)
 		public return: v = (
 			(* Unwind to the handler's on:do:, which answers v. *)
-
+			
 			^returnerSlot value: v
 		)
 		public return = (
@@ -883,12 +808,12 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 		)
 		public pass = (
 			(* Resignal to the next enclosing handler: the machinery disabled this exception's handler (and everything inner), so a fresh signal finds the next one out. The outer handler's resume:/return: rebind to ITS scopes. *)
-
+			
 			^self signal
 		)
 		public signal: message = (
 			(* squeak compatibility for Minitest *)
-
+			
 			messageText:: message.
 			^self signal
 		)
@@ -952,10 +877,10 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
      converted them into a DNU on the original selector, masking real
      errors (e.g. a ParserError inside compileClassSource:within: was
      reported as MessageNotUnderstood: compileClassSource:within:). *)
-
+			
 			| f |
 			f:: _js propertyOf: receiver at: mangledSelector.
-			((_js prefixOperator: 'typeof ' on: f) == 'function') ifFalse: [
+			(_js prefixOperator: 'typeof ' on: f) == 'function' ifFalse: [
 					^_js call: (_js propertyOf: receiver at: (_js literal: 'dnu'))
 						with: {self. }
 				].
@@ -964,28 +889,30 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 		)
 	) : (
 		isBinarySelector: selector = (
-			^('+-*/\<>~=@%|&?!,' indexOf: (selector copyFrom: selector size to: selector size)) ~= 0
+			^('+-*/\<>~=@%|&?!,' indexOf: (selector copyFrom: selector size
+					to: selector size)) ~= 0
 		)
 		mangle: selector = (
 			(* Must match the compiler's NameMangler _mangleSelector: exactly, binary selectors included (#- is $$minus, #<= is $$less$equal). The previous version handled only keyword, unary and qualified selectors, so a runtime-constructed Message for a binary selector could never find its target property and reported a spurious DNU. *)
-
+			
 			(isBinarySelector: selector) ifTrue: [
 					| s |
 					s:: '$'.
-					1 to: selector size do: [:i |
+					1 to: selector size
+						do: [:i |
 							s:: s , (manglingForSpecialCharacter: (selector copyFrom: i to: i))
 						].
 					^s
 				].
-			^(('$' , selector replaceAll: ":" with: "$") replaceAll:
+			^(('$' , selector replaceAll: ":" with: "$") replaceAll: 
 				(* Keyword *)
 				"`"
-				with: "$") replaceAll:
+				with: "$") replaceAll: 
 				(* Qualified *)
 				"."
 				with: "$"
 			(* limit temp *)
-
+			
 		)
 		manglingForSpecialCharacter: c = (
 			c = '+' ifTrue: [ ^'$plus' ].
@@ -1170,12 +1097,12 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 		)
 		public & other = (
 			(* psoup Integer synonym for bitAnd:. *)
-
+			
 			^bitAnd: other
 		)
 		public | other = (
 			(* psoup Integer synonym for bitOr:. *)
-
+			
 			^bitOr: other
 		)
 		public gcd: other = (
@@ -1290,7 +1217,9 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 			_js for: (_js verbatim: '')
 				while: (_js operator: '<' with: i and: (_js ident: 'this'))
 				step: (_js postfixOperator: '++' on: i)
-				do: (_js block: {r:: _js call: block with: {}. _js if: (_js operator: '===' with: r and: (_js ident: 'NLRSentinel'))
+				do: (_js block: {r:: _js call: block with: {}. _js if: (_js operator: '==='
+							with: r
+							and: (_js ident: 'NLRSentinel'))
 						then: (_js block: {_js return: r. }). })
 		)
 		public to: stop = (
@@ -1298,11 +1227,14 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 		)
 		public to: limit do: block = (
 			(* The block result check propagates an NLR sentinel (M4) out of the loop; without it a ^ inside the block would neither break the loop nor unwind. *)
+			
 			| i ::= self. r |
 			_js for: (_js verbatim: '')
 				while: (_js operator: '<=' with: i and: limit)
 				step: (_js postfixOperator: '++' on: i)
-				do: (_js block: {r:: _js call: block with: {i. }. _js if: (_js operator: '===' with: r and: (_js ident: 'NLRSentinel'))
+				do: (_js block: {r:: _js call: block with: {i. }. _js if: (_js operator: '==='
+							with: r
+							and: (_js ident: 'NLRSentinel'))
 						then: (_js block: {_js return: r. }). })
 		)
 		public to: limit by: step do: block = (
@@ -1311,7 +1243,9 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 				while: (step > 0 ifTrue: [ _js operator: '<=' with: i and: limit ]
 					ifFalse: [ _js operator: '>=' with: i and: limit ])
 				step: (_js assign: i toBe: (_js operator: '+' with: i and: step))
-				do: (_js block: {r:: _js call: block with: {i. }. _js if: (_js operator: '===' with: r and: (_js ident: 'NLRSentinel'))
+				do: (_js block: {r:: _js call: block with: {i. }. _js if: (_js operator: '==='
+							with: r
+							and: (_js ident: 'NLRSentinel'))
 						then: (_js block: {_js return: r. }). })
 		)
 		public truncated = (
@@ -1441,7 +1375,7 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 	   MutableHashedMap indexOf:tableMask: with [Cannot read properties of
 	   undefined (reading '$bitAnd$')]. MirrorsForJS identityHashOf: has always
 	   used the falsy test; this is the same idiom, and it re-rolls a random 0. *)
-
+			
 			_js verbatim: 'while(!this.hashCode) this.hashCode = Math.random() * 0x3FFFFFF | 0'.
 			^_js verbatim: 'this.hashCode'
 		)
@@ -1762,7 +1696,9 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 				step: (_js postfixOperator: '++' on: i)
 				do: (_js block: {r:: _js call: action
 						with: {_js call: (_js propertyOf: self at: (_js literal: 'charCodeAt'))
-							with: {i. }. }. (* {_js propertyOf: self at: i} *) _js if: (_js operator: '===' with: r and: (_js ident: 'NLRSentinel'))
+							with: {i. }. }. 
+					(* {_js propertyOf: self at: i} *)
+					_js if: (_js operator: '===' with: r and: (_js ident: 'NLRSentinel'))
 						then: (_js block: {_js return: r. }). })
 		)
 		public at: index <Integer> ^<Integer> = (
@@ -1976,6 +1912,7 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 		(* An array whose elements are held weakly, as on psoup: a collected
 	   element reads as nil. Backed by an ordinary array holding WeakRefs
 	   (nil elements are stored as nil directly). *)
+		
 		|
 			refs = _js verbatim: '[]'.
 		|
@@ -1999,7 +1936,9 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 		)
 		public at: index put: value = (
 			nil = value ifTrue: [ refs at: index put: nil ]
-				ifFalse: [ refs at: index put: (_js new: (_js ident: 'WeakRef') with: {value. }) ].
+				ifFalse: [
+					refs at: index put: (_js new: (_js ident: 'WeakRef') with: {value. })
+				].
 			^value
 		)
 		public do: aBlock = (
@@ -2024,6 +1963,7 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 	public class WeakMap new = Object new (
 		(* An object-keyed map that does not keep its keys alive, over the
 	   native JS WeakMap, matching the psoup WeakMap protocol. *)
+		
 		|
 			map = _js verbatim: 'new WeakMap()'.
 		|
@@ -2038,8 +1978,7 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 			^raw
 		)
 		public at: key put: value = (
-			_js call: (_js propertyOf: (_js propertyOf: map
-						at: (_js literal: 'set'))
+			_js call: (_js propertyOf: (_js propertyOf: map at: (_js literal: 'set'))
 					at: (_js literal: 'call'))
 				with: {map. key. value. }.
 			^value
@@ -2048,6 +1987,100 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 			^true
 		)
 	) : ()
+	pushHandler: entry = (
+		entry prev: topHandler.
+		topHandler:: entry
+	)
+	public handlerChainCut = (
+		(* Evaluation-boundary support (MirrorsForJS evaluate:with:): an evaluation is logically its own thread - psoup runs it as one - so handlers installed by the surrounding stack must not catch exceptions signaled inside it; an unhandled signal there must reach the debugger, not a UI backstop. Answers the chain for the boundary to restore on every exit path; the wholesale restore also cleans up any entries the evaluated code leaked (a reconstruction unwind skips the ensure: pops). *)
+		
+		| saved |
+		saved:: topHandler.
+		topHandler:: nil.
+		^saved
+	)
+	public handlerChainRestore: saved = (
+		topHandler:: saved
+	)
+	removeHandler: entry = (
+		| h |
+		topHandler == entry ifTrue: [
+				topHandler:: entry prev.
+				^self
+			].
+		
+		(* Defensive mid-stack unlink; in practice pops arrive innermost-first via the finallys. *)
+		h:: topHandler.
+		[ nil = h ] whileFalse: [
+				h prev == entry ifTrue: [
+						h prev: entry prev.
+						^self
+					].
+				h:: h prev
+			]
+	)
+	findHandlerFor: ex ^<HandlerEntry | nil> = (
+		| h |
+		h:: topHandler.
+		[ nil = h ] whileFalse: [
+				(h disabled not and: [ exception: ex matchesClass: h exceptionClass ]) ifTrue: [
+						^h
+					].
+				h:: h prev
+			].
+		^nil
+	)
+	exception: ex matchesClass: exceptionClass ^<Boolean> = (
+		| c |
+		c:: _js propertyOf: ex at: (_js literal: 'newspeakClass').
+		(_js operator: '==' with: c and: (_js ident: 'null')) ifTrue: [ c:: Exception ].
+		_js for: (_js verbatim: '')
+			while: (_js operator: '!==' with: c and: nil)
+			step: (_js verbatim: '')
+			do: (_js block: {_js if: (_js operator: '===' with: c and: exceptionClass)
+					then: (_js block: {_js return: (_js literal: true). }). c:: c superclass. }).
+		^false
+	)
+	disableThrough: match = (
+		| h |
+		h:: topHandler.
+		[ nil = h ] whileFalse: [
+				h disabled: true.
+				h == match ifTrue: [ ^self ].
+				h:: h prev
+			]
+	)
+	reenableThrough: match = (
+		(* Entries above the range (pushed by the handler's own dynamic extent, never disabled) are touched harmlessly; nested signals rebalance their own ranges before control can return here. *)
+		
+		| h |
+		h:: topHandler.
+		[ nil = h ] whileFalse: [
+				h disabled: false.
+				h == match ifTrue: [ ^self ].
+				h:: h prev
+			]
+	)
+	public describeRawError: e ^<String> = (
+		| s |
+		s:: _js propertyOf: e at: (_js literal: 'stack').
+		(_js operator: '==' with: s and: (_js ident: 'null')) ifTrue: [
+				^_js call: (_js ident: 'String') with: {e. }
+			].
+		^s
+	)
+	protectedBodyOf: body <[]> = (
+		(* Run an on:do: protected block. Newspeak signals never throw; what CAN arrive here as a JS throw is (a) a raw JS error from the host - convert it to a kernel Exception and SIGNAL it, so the handler stack (whose entries at and above this on:do: are still active) sees it with correct innermost-first matching, resumability included - or (b) an NS exception thrown by the unhandled-signal fallback, already past every matching opportunity: rethrow it onward. Each raw error is converted exactly once: the converted signal either finds a handler or is rethrown as an NS exception, case (b) at every outer level. *)
+		
+		| c rawEx |
+		_js try: (_js block: {_js return: body value. })
+			catch: (_js ident: 'e')
+			with: (_js block: {c:: _js propertyOf: (_js ident: 'e')
+					at: (_js literal: 'newspeakClass'). _js if: (_js operator: '!='
+						with: c
+						and: (_js ident: 'null'))
+					then: (_js block: {_js throw: (_js ident: 'e'). }). rawEx:: Exception new. rawEx messageText: (describeRawError: (_js ident: 'e')). _js return: rawEx signal. })
+	)
 	public Error = (
 		(* Squeak compatibility *)
 		

@@ -68,6 +68,16 @@ cd ${PRIMORDIALSOUP} || exit 1
   ${NEWSPEAK}/NewspeakRoundTripCheckApp.ns \
   RuntimeWithMirrorsForPrimordialSoup NewspeakRoundTripCheckApp ./out/snapshots/NewspeakRoundTripCheckApp.vfuel
 
+# 4e. Build NewspeakAttachmentDiffApp.vfuel for tool/attachment-diff.sh script
+./out/ReleaseX64/primordialsoup \
+  ./out/snapshots/WebCompiler.vfuel \
+  ./newspeak/*.ns \
+  ${NEWSPEAK}/NewspeakASTs.ns \
+  ${NEWSPEAK}/NewspeakPrettyPrinter.ns \
+  ${NEWSPEAK}/NewspeakRoundTripCheckApp.ns \
+  ${NEWSPEAK}/NewspeakAttachmentDiffApp.ns \
+  RuntimeWithMirrorsForPrimordialSoup NewspeakAttachmentDiffApp ./out/snapshots/NewspeakAttachmentDiffApp.vfuel
+
 # Back to 'newspeak'.
 cd ${NEWSPEAK} || exit 1
 

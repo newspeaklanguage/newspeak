@@ -10,7 +10,10 @@ class NewspeakRoundTripCheckApp packageUsing: manifest = Object new (
      3. parses the pretty-printed     → ast2
      4. structurally compares ast1 vs ast2 (positions excluded)
      5. scans both sources for all source comments and compares
-        the lists in order, after a per-comment trim
+        them as multisets, after a per-comment trim
+     6. works out which member owns each comment, in both, and
+        compares that — the check that catches a comment quietly
+        reattached to the wrong method
 
    Usage: NewspeakRoundTripCheckApp <file.ns> [file2.ns ...]
 
@@ -25,7 +28,7 @@ class NewspeakRoundTripCheckApp packageUsing: manifest = Object new (
 		private NewspeakPrettyPrinter = manifest NewspeakPrettyPrinter.
 	|
 ) (
-	class ASTComparator new = Object new (
+	public class ASTComparator new = Object new (
 		(* Visitor-based structural AST equality.
 
    Does NOT inherit from NewspeakASTs ASTTool — ASTTool is defined
@@ -478,8 +481,19 @@ class NewspeakRoundTripCheckApp packageUsing: manifest = Object new (
 		^String withAll: rs
 	)
 	scanAllCommentsFrom: src <String> using: platform <Platform> ^<List[String]> = (
+		(* The texts of every comment in src, in source order. See
+	   commentRecordsFrom:using: — this is that scan with the
+	   positions dropped. *)
+		
+		| texts |
+		texts:: platform collections List new.
+		(commentRecordsFrom: src using: platform) do: [:rec | texts add: (rec at: 2) ].
+		^texts
+	)
+	public commentRecordsFrom: src <String> using: platform <Platform> ^<List> = (
 		(* Walk src once, recognise Newspeak comments with nesting,
-	   return the trimmed interior text of each top-level comment.
+	   return a two-element entry { openerPos. trimmed interior text }
+	   for each top-level comment, in source order.
 	   Inner nested comments are folded into their enclosing outer
 	   comment's text — matches the printer's emit-verbatim
 	   behaviour.
@@ -516,8 +530,184 @@ class NewspeakRoundTripCheckApp packageUsing: manifest = Object new (
 	   placement) don't flag a mismatch. See collapseWhitespace:
 	   for the policy. *)
 		normalized:: platform collections List new.
-		comments do: [:c | normalized add: (collapseWhitespace: c using: platform) ].
+		comments do: [:c |
+				normalized add: {c at: 1. collapseWhitespace: (c at: 2) using: platform. }
+			].
 		^normalized
+	)
+	public attachmentsIn: src <String> ast: cls records: records <List> using: platform <Platform> ^<List> = (
+		(* Which member each comment in src belongs to, as a list of
+	   { ownerKey. text } entries.
+
+	   A member owns the comments written between the end of the
+	   member preceding it IN SOURCE ORDER and its own end: that is,
+	   its leading comments plus everything inside it. It is the same
+	   ownership rule the pretty printer prints by, computed here from
+	   scratch against the text, so a printer that emits a comment
+	   outside its owner's span shows up as an owner that changed.
+
+	   What this does NOT check is the rule itself: both sides agree
+	   that a comment before a member documents that member. What it
+	   checks is that printing preserves the pairing.
+
+	   Comments no member claims — a file prologue, text after the
+	   last member of a side — are keyed by where they sit, so those
+	   move detectably too. *)
+		
+		| claimed result |
+		claimed:: platform collections List new.
+		1 to: records size do: [:i | claimed add: false ].
+		result:: platform collections List new.
+		collectAttachmentsOf: cls
+			key: (classKeyOf: cls)
+			lowerBound: 1
+			records: records
+			claimed: claimed
+			into: result
+			using: platform.
+		1 to: records size
+			do: [:i |
+				(claimed at: i) ifFalse: [
+						result add: {'<unattached>'. (records at: i) at: 2. }
+					]
+			].
+		^result
+	)
+	collectAttachmentsOf: cls key: key <String> lowerBound: lo <Integer> records: records <List> claimed: claimed <List> into: result <List> using: platform <Platform> = (
+		(* A class declaration owns everything from its lower bound up to
+	   the '(' of its instance side: its own leading comments, any
+	   metadata in the header, the class comment, and the slot and
+	   initializer comments in the header body. Members of its sides
+	   own the rest, recursively. *)
+		
+		| ownHi |
+		ownHi:: (cls instanceSide isNil not and: [ cls instanceSide start > 0 ]) ifTrue: [
+				cls instanceSide start
+			]
+			ifFalse: [ cls end + 1 ].
+		claimFrom: lo
+			to: ownHi
+			key: key
+			records: records
+			claimed: claimed
+			into: result.
+		collectAttachmentsOfSide: cls instanceSide
+			key: key
+			records: records
+			claimed: claimed
+			into: result
+			using: platform.
+		collectAttachmentsOfSide: cls classSide
+			key: key , ' class'
+			records: records
+			claimed: claimed
+			into: result
+			using: platform
+	)
+	collectAttachmentsOfSide: side key: key <String> records: records <List> claimed: claimed <List> into: result <List> using: platform <Platform> = (
+		| entryPos maxEnd |
+		side isNil ifTrue: [ ^self ].
+		(side start isNil or: [ side start <= 0 ]) ifTrue: [ ^self ].
+		entryPos:: side start.
+		maxEnd:: entryPos.
+		membersOf: side
+			do: [:m |
+				(m start isNil not and: [ m start > 0 ]) ifTrue: [
+						| lo memberKey |
+						lo:: lowerBoundFor: m in: side default: entryPos.
+						memberKey:: key , '>>' , (memberNameOf: m).
+						m isKindOfClassDeclarationAST ifTrue: [
+								collectAttachmentsOf: m
+									key: memberKey
+									lowerBound: lo
+									records: records
+									claimed: claimed
+									into: result
+									using: platform
+							]
+							ifFalse: [
+								claimFrom: lo
+									to: m end + 1
+									key: memberKey
+									records: records
+									claimed: claimed
+									into: result
+							].
+						(m end isNil not and: [ m end > maxEnd ]) ifTrue: [ maxEnd:: m end ]
+					]
+			].
+		(side end isNil not and: [ side end > 0 ]) ifTrue: [
+				claimFrom: maxEnd
+					to: side end
+					key: key , '>><after last member>'
+					records: records
+					claimed: claimed
+					into: result
+			]
+	)
+	claimFrom: lo <Integer> to: hi <Integer> key: key <String> records: records <List> claimed: claimed <List> into: result <List> = (
+		(* Attribute every so-far-unclaimed comment whose opener is in
+	   [lo, hi) to key. Windows do not overlap, so the claimed flags
+	   are a safety net rather than a tie-breaker. *)
+		
+		1 to: records size
+			do: [:i |
+				| rec |
+				rec:: records at: i.
+				((claimed at: i) not and: [ (rec at: 1) >= lo and: [ (rec at: 1) < hi ] ]) ifTrue: [
+						claimed at: i put: true.
+						result add: {key. rec at: 2. }
+					]
+			]
+	)
+	lowerBoundFor: member in: side default: entryPos <Integer> ^<Integer> = (
+		(* Just past the end of the member preceding this one in source
+	   order. Members of a side do not overlap, so that is the
+	   greatest end among the members starting earlier. Mirrors
+	   NewspeakPrettyPrinter commentWindowLowerBoundFor:of:from:. *)
+		
+		| lo |
+		lo:: entryPos.
+		membersOf: side
+			do: [:other |
+				(other start isNil not and: [
+						other start > 0 and: [
+								other start < member start and: [
+										other end isNil not and: [ other end > lo ]
+									]
+							]
+					]) ifTrue: [ lo:: other end ]
+			].
+		^lo
+	)
+	membersOf: side do: block = (
+		side isNil ifTrue: [ ^self ].
+		side nestedClasses isNil ifFalse: [ side nestedClasses do: block ].
+		side lazySlots isNil ifFalse: [ side lazySlots do: block ].
+		side methods isNil ifFalse: [ side methods do: block ]
+	)
+	classKeyOf: cls ^<String> = (
+		(cls header isNil or: [ cls header name isNil ]) ifTrue: [
+				^'<anonymous class>'
+			].
+		^cls header name printString
+	)
+	memberNameOf: member ^<String> = (
+		(* A stable name for a class-body member: the class name, the
+	   method selector, or the slot name. Stable across reprinting is
+	   the whole point — positions are not. *)
+		
+		member isKindOfClassDeclarationAST ifTrue: [ ^classKeyOf: member ].
+		member isKindOfSlotDefAST ifTrue: [
+				(member slotDecl isNil or: [ member slotDecl name isNil ]) ifTrue: [
+						^'<slot>'
+					].
+				^member slotDecl name printString
+			].
+		(member pattern isNil or: [ member pattern selector isNil ]) ifTrue: [
+				^'<method>'
+			].
+		^member pattern selector printString
 	)
 	isCommentOpenAt: pos <Integer> in: src <String> size: size <Integer> ^<Boolean> = (
 		(* True iff the two chars at pos start a Newspeak comment.
@@ -554,9 +744,10 @@ class NewspeakRoundTripCheckApp packageUsing: manifest = Object new (
 	)
 	extractCommentFrom: startInterior <Integer> in: src <String> size: size <Integer> into: comments <List> ^<Integer> = (
 		(* startInterior is the first char after the opening marker.
-	   Walks to the matching close marker, records the trimmed
-	   interior text in comments, and returns the position just
-	   past the close marker. Handles nesting. *)
+	   Walks to the matching close marker, records a two-element
+	   { openerPos. trimmed interior text } entry in comments, and
+	   returns the position just past the close marker. Handles
+	   nesting. The opener is two chars before the interior. *)
 		
 		| pos depth |
 		pos:: startInterior.
@@ -570,7 +761,8 @@ class NewspeakRoundTripCheckApp packageUsing: manifest = Object new (
 						(isCommentCloseAt: pos in: src size: size) ifTrue: [
 								depth:: depth - 1.
 								depth = 0 ifTrue: [
-										comments add: (src copyFrom: startInterior to: pos - 1) withBlanksTrimmed.
+										comments add: {startInterior - 2. (src copyFrom: startInterior
+												to: pos - 1) withBlanksTrimmed. }.
 										pos:: pos + 2
 									]
 									ifFalse: [ pos:: pos + 2 ]
@@ -584,7 +776,9 @@ class NewspeakRoundTripCheckApp packageUsing: manifest = Object new (
 		(* Returns true iff src parses, pretty-prints, re-parses, and
 	     unconsumed = empty
 	   ∧ ast1 ≡ ast2
-	   ∧ comments1 = comments2.
+	   ∧ the comments of src and of the printed text are the same
+	     multiset
+	   ∧ every comment still belongs to the same member.
 
 	   The unconsumed-comments check is a white-box assertion
 	   exposed by the new pretty-printer comment-threading design:
@@ -592,10 +786,22 @@ class NewspeakRoundTripCheckApp packageUsing: manifest = Object new (
 	   unified emitter is a printer bug, and we want to catch it
 	   here even if the output-side comment scan happens to match.
 
-	   Order: unconsumed → AST → comment lists. We surface the
-	   printer-internal failure first since it's the most specific. *)
+	   The comment checks are deliberately NOT a sequence comparison.
+	   Printing puts a class body in canonical order — nested classes,
+	   lazy slots, methods — so a member and its comments legitimately
+	   change position relative to other members' comments. Comparing
+	   the sequence would flag that correct reordering, and, worse, a
+	   comment reattached to a different member leaves the sequence
+	   untouched and so passed the old check: printing MirrorsForJS.ns
+	   moved three comments onto unrelated methods and reported OK.
+	   What is invariant is the multiset (nothing lost or mutated) and
+	   the attachment (nothing reattached).
+
+	   Order: unconsumed → AST → comment multiset → attachment. Each
+	   is more specific than the next, so the first to fail is the
+	   most informative. *)
 		
-		| sourceText src2 ast1 ast2 asts md parser cp pp cmp astOK comments1 comments2 unconsumed |
+		| sourceText src2 ast1 ast2 asts md parser cp pp cmp astOK records1 records2 unconsumed |
 		[ sourceText:: readFileAsString: file ] on: Error
 			do: [:ex |
 				('FAIL: ' , file , ': could not read: ' , ex messageText) out.
@@ -634,52 +840,131 @@ class NewspeakRoundTripCheckApp packageUsing: manifest = Object new (
 			].
 		cmp:: ASTComparator new.
 		astOK:: cmp equivalent: ast1 to: ast2.
-		comments1:: scanAllCommentsFrom: sourceText using: platform.
-		comments2:: scanAllCommentsFrom: src2 using: platform.
+		records1:: commentRecordsFrom: sourceText using: platform.
+		records2:: commentRecordsFrom: src2 using: platform.
 		astOK ifFalse: [
 				('FAIL: ' , file , ': AST mismatch: ' , cmp mismatchReason) out.
 				^false
 			].
 		
-		(* Element-wise comment comparison. The first divergence is
-	   reported with a short excerpt so the user can see WHAT was
-	   dropped / mutated rather than just a count. *)
-		(commentReportDiffOn: file before: comments1 after: comments2) ifTrue: [
+		(* Content first, then attachment: a comment that was dropped is
+	   also a comment that lost its owner, and 'lost' is the more
+	   useful of the two reports. Each divergence is reported with a
+	   short excerpt so the user can see WHICH comment moved rather
+	   than just a count. *)
+		(commentReportDiffOn: file before: records1 after: records2 using: platform) ifTrue: [
 				^false
 			].
+		(attachmentReportDiffOn: file
+			before: (attachmentsIn: sourceText
+				ast: ast1
+				records: records1
+				using: platform)
+			after: (attachmentsIn: src2 ast: ast2 records: records2 using: platform)
+			using: platform) ifTrue: [ ^false ].
 		('OK: ' , file) out.
 		^true
 	)
-	commentReportDiffOn: file <String> before: comments1 <List[String]> after: comments2 <List[String]> ^<Boolean> = (
-		(* Compare two comment lists element-wise. Returns true and
-	   prints a FAIL line if they differ, false if they match. The
-	   return convention is inverted from the visitor pattern --
-	   true means "yes, there was a diff (and we reported it)" so
-	   the caller can `... ifTrue: [^false]` to fail the round-trip. *)
+	commentReportDiffOn: file <String> before: records1 <List> after: records2 <List> using: platform <Platform> ^<Boolean> = (
+		(* Compare the two comment multisets. Returns true and prints a
+	   FAIL line if they differ, false if they match. The return
+	   convention is inverted from the visitor pattern -- true means
+	   "yes, there was a diff (and we reported it)" so the caller can
+	   `... ifTrue: [^false]` to fail the round-trip.
+
+	   Multiset, not sequence: see checkRoundTrip:using:. A comment
+	   that changed text shows up as one lost and one added, which is
+	   what a mutation is from here. *)
 		
-		| n1 n2 minN |
-		n1:: comments1 size.
-		n2:: comments2 size.
-		minN:: n1 min: n2.
-		1 to: minN
-			do: [:i |
-				(comments1 at: i) = (comments2 at: i) ifFalse: [
-						('FAIL: ' , file , ': comment ' , i printString , ' changed:' , String lf , '  before: ' , (excerptOf: (comments1 at: i)) , String lf , '  after:  ' , (excerptOf: (comments2 at: i))) out.
-						^true
-					]
+		| before after lost gained |
+		before:: textsOf: records1 using: platform.
+		after:: textsOf: records2 using: platform.
+		lost:: unmatchedIn: before against: after using: platform.
+		gained:: unmatchedIn: after against: before using: platform.
+		lost isEmpty ifFalse: [
+				('FAIL: ' , file , ': lost ' , lost size printString , ' comment(s); first: ' , (excerptOf: lost first)) out.
+				^true
 			].
-		n1 = n2 ifFalse: [
-				n1 > n2 ifTrue: [
-						('FAIL: ' , file , ': lost ' , (n1 - n2) printString , ' comment(s); first dropped: ' , (excerptOf: (comments1 at: minN + 1))) out
-					]
-					ifFalse: [
-						('FAIL: ' , file , ': added ' , (n2 - n1) printString , ' comment(s); first added: ' , (excerptOf: (comments2 at: minN + 1))) out
-					].
+		gained isEmpty ifFalse: [
+				('FAIL: ' , file , ': added ' , gained size printString , ' comment(s); first: ' , (excerptOf: gained first)) out.
 				^true
 			].
 		^false
 	)
-	excerptOf: comment <String> ^<String> = (
+	attachmentReportDiffOn: file <String> before: attach1 <List> after: attach2 <List> using: platform <Platform> ^<Boolean> = (
+		(* Compare which member owns which comment. Same inverted return
+	   convention as commentReportDiffOn:. The comment multisets are
+	   known equal by the time this runs, so any difference here is a
+	   comment that changed owner, and both owners can be named. *)
+		
+		| moved text |
+		moved:: unmatchedPairsIn: attach1 against: attach2 using: platform.
+		moved isEmpty ifTrue: [ ^false ].
+		text:: moved first at: 2.
+		('FAIL: ' , file , ': ' , moved size printString , ' comment(s) changed owner; first moved from ' , (moved first at: 1) , ' to ' , (ownerOfText: text
+			in: attach2) , ':' , String lf , '  ' , (excerptOf: text)) out.
+		^true
+	)
+	public ownerOfText: text <String> in: attachments <List> ^<String> = (
+		attachments do: [:entry | (entry at: 2) = text ifTrue: [ ^entry at: 1 ] ].
+		^'<nowhere>'
+	)
+	public textsOf: records <List> using: platform <Platform> ^<List[String]> = (
+		| texts |
+		texts:: platform collections List new.
+		records do: [:rec | texts add: (rec at: 2) ].
+		^texts
+	)
+	public unmatchedIn: a <List[String]> against: b <List[String]> using: platform <Platform> ^<List[String]> = (
+		(* The elements of a that b has no unused copy of: multiset
+	   difference a - b, order preserved. Quadratic, on a few hundred
+	   comments per file. *)
+		
+		| used result |
+		used:: platform collections List new.
+		1 to: b size do: [:i | used add: false ].
+		result:: platform collections List new.
+		a do: [:e |
+				| i found |
+				i:: 1.
+				found:: false.
+				[ found not and: [ i <= b size ] ] whileTrue: [
+						((used at: i) not and: [ (b at: i) = e ]) ifTrue: [
+								found:: true.
+								used at: i put: true
+							]
+							ifFalse: [ i:: i + 1 ]
+					].
+				found ifFalse: [ result add: e ]
+			].
+		^result
+	)
+	public unmatchedPairsIn: a <List> against: b <List> using: platform <Platform> ^<List> = (
+		(* unmatchedIn:against: over { owner. text } entries, matching on
+	   both fields. *)
+		
+		| used result |
+		used:: platform collections List new.
+		1 to: b size do: [:i | used add: false ].
+		result:: platform collections List new.
+		a do: [:e |
+				| i found |
+				i:: 1.
+				found:: false.
+				[ found not and: [ i <= b size ] ] whileTrue: [
+						((used at: i) not and: [
+								((b at: i) at: 1) = (e at: 1) and: [ ((b at: i) at: 2) = (e at: 2) ]
+							]) ifTrue: [
+								found:: true.
+								used at: i put: true
+							]
+							ifFalse: [ i:: i + 1 ]
+					].
+				found ifFalse: [ result add: e ]
+			].
+		^result
+	)
+	public excerptOf: comment <String> ^<String> = (
 		(* Return at most the first 60 chars of the comment's first
 	   line, so a multi-line comment fits on one FAIL line. *)
 		

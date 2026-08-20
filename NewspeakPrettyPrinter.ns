@@ -71,6 +71,12 @@ Slots:
 			private tab <String> = String with: 9.
 			private lf <String> = String lf.
 			
+			(* Not all sources are LF-terminated: the squeak/ tree is CR-only.
+	   Anything that asks 'where does this line end' has to look for
+	   both, or it finds no break at all and treats the rest of the
+	   file as one line. *)
+			private cr <String> = String with: 13.
+			
 			(* Comment table. Built lazily on first emitCommentsUpTo: call
 	   from a single forward scan of source. Each entry is a List
 	   of three values: openerPos -- source position of the open
@@ -78,15 +84,29 @@ Slots:
 	   close marker; trimmedBody -- the comment text between them.
 	   Entries are sorted by openerPos.
 
-	   commentIdx is the index of the next entry the unified emitter
-	   should consider; consumedFlags is a parallel boolean list
-	   marking which entries have actually been emitted. The two
-	   indices serve different purposes: commentIdx is the cursor
-	   into the table -- advances monotonically except across a
-	   trySingleLine: rollback -- while consumedFlags decides whether
-	   a given entry's payload should be re-emitted on revisit. *)
+	   commentIdx is a memo, not a monotonic cursor: it is the index of
+	   the first entry whose openerPos is at-or-past commentIdxAnchor,
+	   so a scan that starts at-or-past the anchor can begin there
+	   instead of rescanning the table from 1. A memo is what's needed
+	   because emission does NOT walk the source monotonically: a class
+	   body is emitted in canonical order (nested classes, lazy slots,
+	   methods) while comments are indexed by source position, so the
+	   cursor jumps backwards at every member. consumedFlags -- a
+	   parallel boolean list marking which entries have been emitted --
+	   is what actually prevents double emission.
+
+	   commentWindowHi bounds emission from above. While a member is
+	   being printed it holds that member's end position, so no comment
+	   beyond the member can be dragged out and emitted with it. Without
+	   the bound, printing a member that sits late in the source flushes
+	   every comment before it -- including the comments of members that
+	   sit earlier in the source but later in canonical order, which is
+	   how comments used to end up attached to the wrong member. Nil
+	   means unbounded. *)
 			private commentTable <List | Nil>
 			private commentIdx <Integer> ::= 1.
+			private commentIdxAnchor <Integer> ::= 1.
+			private commentWindowHi <Integer | Nil>
 			private consumedFlags <List[Boolean] | Nil>
 		|
 	) (
@@ -265,14 +285,18 @@ Slots:
 	   past the width, roll the output back and run altBlock instead.
 	   commentIdx and consumedFlags must also be saved: comments
 	   emitted during a failed attempt would otherwise stay marked
-	   consumed after the output is reverted, silently dropping them. *)
+	   consumed after the output is reverted, silently dropping them.
+	   commentIdx travels with commentIdxAnchor -- the memo is the pair,
+	   and restoring one without the other leaves it claiming an index
+	   for a position it was not taken at. *)
 			
-			| startSize savedColumn savedCursor savedIndent broke savedCommentIdx savedConsumed |
+			| startSize savedColumn savedCursor savedIndent broke savedCommentIdx savedAnchor savedConsumed |
 			startSize:: output size.
 			savedColumn:: column.
 			savedCursor:: cursor.
 			savedIndent:: indentLevel.
 			savedCommentIdx:: commentIdx.
+			savedAnchor:: commentIdxAnchor.
 			savedConsumed:: consumedFlags isNil ifTrue: [ nil ]
 				ifFalse: [
 					| snap |
@@ -292,6 +316,7 @@ Slots:
 					cursor:: savedCursor.
 					indentLevel:: savedIndent.
 					commentIdx:: savedCommentIdx.
+					commentIdxAnchor:: savedAnchor.
 					savedConsumed isNil ifFalse: [
 							1 to: savedConsumed size
 								do: [:i | consumedFlags at: i put: (savedConsumed at: i) ]
@@ -423,32 +448,60 @@ Slots:
 		)
 		emitCommentsUpTo: pos <Integer> inline: isInline <Boolean> = (
 			(* Emit every unconsumed comment whose opener position is in
-	   [cursor, pos). isInline = true uses spaces and no newlines;
-	   isInline = false starts each comment on a new line and emits a
-	   trailing newline. Always advances cursor to pos so the next
-	   call's iteration starts from the right place; safe early
+	   [cursor, pos), clamped from above by commentWindowHi when a
+	   member is being printed. isInline = true uses spaces and no
+	   newlines; isInline = false starts each comment on a new line and
+	   emits a trailing newline. Always advances cursor to pos so the
+	   next call's iteration starts from the right place; safe early
 	   returns for the standard guards (no source, no position, pos
 	   not ahead of cursor). *)
 			
+			| idx limit |
 			source isNil ifTrue: [ ^self ].
 			pos isNil ifTrue: [ ^self ].
 			pos <= 0 ifTrue: [ ^self ].
 			pos <= cursor ifTrue: [ ^self ].
 			ensureCommentTable.
-			[
-				commentIdx <= commentTable size and: [
-						((commentTable at: commentIdx) at: 1) < pos
-					]
-			] whileTrue: [
+			limit:: clampToWindow: pos.
+			idx:: commentIndexFrom: cursor.
+			[ idx <= commentTable size and: [ ((commentTable at: idx) at: 1) < limit ] ] whileTrue: [
 					| rec |
-					rec:: commentTable at: commentIdx.
-					(consumedFlags at: commentIdx) ifFalse: [
+					rec:: commentTable at: idx.
+					(consumedFlags at: idx) ifFalse: [
 							emitCommentRecord: rec inline: isInline.
-							consumedFlags at: commentIdx put: true
+							consumedFlags at: idx put: true
 						].
-					commentIdx:: commentIdx + 1
+					idx:: idx + 1
 				].
+			memoCommentIndex: idx at: limit.
 			cursor:: pos
+		)
+		clampToWindow: pos <Integer> ^<Integer> = (
+			(* An emission bound of pos, reduced to the current member's
+	   window if one is in force. commentWindowHi is the member's last
+	   source position, so the exclusive bound is one past it. *)
+			
+			commentWindowHi isNil ifTrue: [ ^pos ].
+			^pos min: commentWindowHi + 1
+		)
+		commentIndexFrom: pos <Integer> ^<Integer> = (
+			(* Index of the first commentTable entry whose opener is at or
+	   past pos. Starts from the memo when pos is at-or-past the
+	   position the memo was taken at, and from the top of the table
+	   otherwise -- which is what makes a backwards cursor jump (each
+	   new member of a reordered class body) correct rather than
+	   merely fast. *)
+			
+			| idx |
+			idx:: pos < commentIdxAnchor ifTrue: [ 1 ] ifFalse: [ commentIdx ].
+			[ idx <= commentTable size and: [ ((commentTable at: idx) at: 1) < pos ] ] whileTrue: [
+					idx:: idx + 1
+				].
+			^idx
+		)
+		memoCommentIndex: idx <Integer> at: pos <Integer> = (
+			commentIdx:: idx.
+			commentIdxAnchor:: pos
 		)
 		emitCommentRecord: rec <List> inline: isInline <Boolean> = (
 			(* Block layout guards the leading newline with column = 0
@@ -468,6 +521,66 @@ Slots:
 					newline
 				]
 		)
+		lineBreakAtOrAfter: pos <Integer> ^<Integer> = (
+			(* Position of the first line break at or after pos, or one past
+	   the end of source when the last line has none. LF and CR both
+	   count -- the squeak/ sources are CR-only, and answering 'no
+	   break' for them would make the rest of the file one line. *)
+			
+			| lfPos crPos |
+			lfPos:: source indexOf: lf startingAt: pos.
+			crPos:: source indexOf: cr startingAt: pos.
+			lfPos = 0 ifTrue: [
+					crPos = 0 ifTrue: [ ^source size + 1 ].
+					^crPos
+				].
+			crPos = 0 ifTrue: [ ^lfPos ].
+			^lfPos min: crPos
+		)
+		emitTrailingCommentRecord: rec <List> = (
+			(* A comment that followed its construct on the same line, put
+	   back where it was. Leading space, and NO trailing one: the
+	   caller is about to end the line, and a trailing space would be
+	   trailing whitespace in canonical output. *)
+			
+			emit: ' (* '.
+			emit: (rec at: 3).
+			emit: ' *)'
+		)
+		emitTrailingCommentsAfter: node upTo: hardLimit = (
+			(* Comments written after node on node's own line -- 'slot <T>
+	   (* note *)' -- belong to node, not to whatever comes next. The
+	   general convention is that a comment attaches to the construct
+	   that FOLLOWS it, which is right for a comment on its own line
+	   and wrong for one at the end of a line: printing every slot's
+	   trailing comment as the next slot's leading comment shifts a
+	   whole slot bar's documentation down by one, so 'Must be slot 1'
+	   ends up labelling slot 2.
+
+	   Bounded by the end of node's line and, when the caller knows
+	   what comes next, by hardLimit -- so a one-line slot bar
+	   '| a. (* about b *) b. |' still gives that comment to b. *)
+			
+			| lineEnd limit idx |
+			source isNil ifTrue: [ ^self ].
+			(node isNil or: [ node end isNil or: [ node end <= 0 ] ]) ifTrue: [ ^self ].
+			ensureCommentTable.
+			lineEnd:: lineBreakAtOrAfter: node end.
+			limit:: hardLimit isNil ifTrue: [ lineEnd ]
+				ifFalse: [ lineEnd min: hardLimit ].
+			limit:: clampToWindow: limit.
+			limit <= cursor ifTrue: [ ^self ].
+			idx:: commentIndexFrom: cursor.
+			[ idx <= commentTable size and: [ ((commentTable at: idx) at: 1) < limit ] ] whileTrue: [
+					(consumedFlags at: idx) ifFalse: [
+							emitTrailingCommentRecord: (commentTable at: idx).
+							consumedFlags at: idx put: true
+						].
+					idx:: idx + 1
+				].
+			memoCommentIndex: idx at: limit.
+			cursor:: limit
+		)
 		emitCommentsBefore: node = (
 			(* Thin wrapper for callers that have an AST node in hand. *)
 			
@@ -482,19 +595,19 @@ Slots:
 	   comments contained in the spliced span are not later
 	   re-emitted by emitCommentsUpTo:. *)
 			
+			| idx limit |
 			source isNil ifTrue: [ ^self ].
 			pos isNil ifTrue: [ ^self ].
 			pos <= 0 ifTrue: [ ^self ].
 			pos <= cursor ifTrue: [ ^self ].
 			ensureCommentTable.
-			[
-				commentIdx <= commentTable size and: [
-						((commentTable at: commentIdx) at: 1) < pos
-					]
-			] whileTrue: [
-					consumedFlags at: commentIdx put: true.
-					commentIdx:: commentIdx + 1
+			limit:: clampToWindow: pos.
+			idx:: commentIndexFrom: cursor.
+			[ idx <= commentTable size and: [ ((commentTable at: idx) at: 1) < limit ] ] whileTrue: [
+					consumedFlags at: idx put: true.
+					idx:: idx + 1
 				].
+			memoCommentIndex: idx at: limit.
 			cursor:: pos
 		)
 		emitLeadingCommentsUpTo: pos <Integer> = (
@@ -759,10 +872,13 @@ Slots:
 									newline.
 									emit: bar.
 									indented: [
-											header slots do: [:slot |
+											header slots keysAndValuesDo: [:i :slot |
 													newline.
 													emitCommentsBefore: slot.
-													visitSlotInBar: slot
+													visitSlotInBar: slot.
+													emitTrailingCommentsAfter: slot
+														upTo: (i = header slots size ifTrue: [ header end ]
+															ifFalse: [ (header slots at: i + 1) start ])
 												]
 										].
 									newline.
@@ -772,10 +888,19 @@ Slots:
 									header initExprs do: [:expr |
 											newline.
 											printAtLevel: expr minLevel: levelCascade.
-											emit: '.'
+											emit: '.'.
+											emitTrailingCommentsAfter: expr upTo: header end
 										]
 								]
 						]
+				].
+			
+			(* Whatever is left between the last of the header's content and
+	   its closing ')'. It was written inside the header, so it is
+	   emitted inside the header: were it left for the next emitter,
+	   the first member of the instance side would adopt it. *)
+			(source isNil not and: [ header end isNil not and: [ header end > 0 ] ]) ifTrue: [
+					indented: [ emitCommentsUpTo: header end ]
 				]
 		)
 		visitSlotInBar: slot = (
@@ -835,31 +960,145 @@ Slots:
 				]
 		)
 		visitSide: side = (
+			(* Members are emitted in canonical order -- nested classes, then
+	   lazy slots, then methods -- which is NOT their source order:
+	   the parser bins them by kind as it goes (parseInstanceSide), so
+	   a method written between two nested classes comes back in the
+	   methods list and is printed after both.
+
+	   Comments, by contrast, are indexed by source position. Emitting
+	   them with a plain forward cursor therefore hands each member
+	   every comment written before it, which for a member printed out
+	   of order means the comments of members that have not been
+	   printed yet. That is how a method's own comment used to end up
+	   documenting an unrelated method ~175 lines away.
+
+	   So each member is printed inside its own comment window
+	   [predecessor's end, own end]: the comments written between the
+	   previous member IN SOURCE ORDER and this one (that is, this
+	   member's own leading comments) plus the comments inside it, and
+	   nothing else. Members carry the source spans this needs -- which
+	   is why NewspeakPredictiveParsing records an end for a class
+	   declaration and its sides. *)
+			
+			| entryPos |
 			side isNil ifTrue: [ ^self ].
+			
+			(* Windows start at the side's own '(' rather than at wherever
+	   the cursor happens to be, so nothing the class header left
+	   behind can be picked up as the first member's leading
+	   comment. *)
+			entryPos:: (side start isNil or: [ side start <= 0 ]) ifTrue: [ cursor ]
+				ifFalse: [ side start ].
 			indented: [
 					side nestedClasses isNil not ifTrue: [
 							side nestedClasses do: [:cls |
-									newline.
-									emitCommentsBefore: cls.
-									visitClassDeclaration: cls
+									emitMember: cls
+										of: side
+										from: entryPos
+										with: [:m | visitClassDeclaration: m ]
 								]
 						].
 					side lazySlots isNil not ifTrue: [
 							side lazySlots do: [:slot |
-									newline.
-									emitCommentsBefore: slot.
-									visitLazySlot: slot
+									emitMember: slot of: side from: entryPos with: [:m | visitLazySlot: m ]
 								]
 						].
 					side methods isNil not ifTrue: [
 							side methods do: [:m |
-									newline.
-									emitCommentsBefore: m.
-									visitMethod: m
+									emitMember: m of: side from: entryPos with: [:mm | visitMethod: mm ]
 								]
+						].
+					
+					(* Comments after the last member but still inside the side.
+			   No member owns them, so they are emitted here, where they
+			   were written, rather than surviving to be dumped at the
+			   end of the file by flushTrailingComments. *)
+					(side end isNil not and: [ side end > 0 ]) ifTrue: [
+							emitCommentsUpTo: side end
 						]
 				].
 			newline
+		)
+		emitMember: member of: side from: entryPos <Integer> with: visitBlock = (
+			(* Print one class-body member with the comment cursor positioned
+	   at the member's own window. Restores the enclosing window
+	   afterwards, and leaves the cursor at the member's end so the
+	   side's trailing drain sees everything the members did not
+	   claim.
+
+	   Members without usable source positions (no source attached, or
+	   a synthesized node) fall back to the old behaviour: there is no
+	   window to compute, and no reordering hazard either, since with
+	   no source there are no comments to misplace. *)
+			
+			| savedWindowHi |
+			(source isNil or: [ member start isNil or: [ member start <= 0 ] ]) ifTrue: [
+					newline.
+					emitCommentsBefore: member.
+					^visitBlock value: member
+				].
+			savedWindowHi:: commentWindowHi.
+			cursor:: commentWindowLowerBoundFor: member of: side from: entryPos.
+			commentWindowHi:: (member end isNil or: [ member end <= 0 ]) ifTrue: [ nil ]
+				ifFalse: [ member end ].
+			newline.
+			emitCommentsBefore: member.
+			visitBlock value: member.
+			
+			(* Anything still unclaimed inside the member. The visitors are
+	   expected to have emitted it all in its proper place; this is
+	   the backstop that turns a visitor gap into a displaced comment
+	   rather than a lost one, now that closing the window means the
+	   cursor moves past the member for good.
+
+	   The cursor is rewound to the member's start first, because a
+	   visitor gap is exactly the case where the cursor has already
+	   been advanced past the comment without consuming it --
+	   advanceCursorPast: does that after every statement, so a
+	   comment buried mid-statement ('els:: List(* [FilePattern] *)
+	   new.') would otherwise be behind the cursor and invisible here.
+	   consumedFlags makes the rescan idempotent. *)
+			(member end isNil not and: [ member end > 0 ]) ifTrue: [
+					cursor:: member start.
+					emitCommentsUpTo: member end + 1
+				].
+			commentWindowHi:: savedWindowHi.
+			(member end isNil not and: [ member end > cursor ]) ifTrue: [
+					cursor:: member end
+				]
+		)
+		commentWindowLowerBoundFor: member of: side from: entryPos <Integer> ^<Integer> = (
+			(* Where this member's leading comments start: just past the end
+	   of the member that precedes it in SOURCE order, or at the
+	   position the side began for the first one. Members of a side do
+	   not overlap, so the predecessor is the one with the greatest
+	   end among those starting earlier -- no sorting needed. A member
+	   whose end is missing contributes nothing, which is safe: it can
+	   only widen a window, never narrow one past a real boundary. *)
+			
+			| lo |
+			lo:: entryPos.
+			membersOf: side
+				do: [:other |
+					(other start isNil not and: [
+							other start > 0 and: [
+									other start < member start and: [
+											other end isNil not and: [ other end > lo ]
+										]
+								]
+						]) ifTrue: [ lo:: other end ]
+				].
+			^lo
+		)
+		membersOf: side do: block = (
+			(* Every member of a side, in bin order. Callers that care about
+	   source order sort or scan for themselves. *)
+			
+			side isNil ifTrue: [ ^self ].
+			side nestedClasses isNil ifFalse: [ side nestedClasses do: block ].
+			side lazySlots isNil ifFalse: [ side lazySlots do: block ].
+			side methods isNil ifFalse: [ side methods do: block ]
 		)
 		visitMethod: node = (
 			(* [accessModifier] selector params [^<retType>] = (
@@ -1126,6 +1365,19 @@ Slots:
 							stmt isKindOfReturnStatNode ifTrue: [ visitReturnStat: stmt ]
 								ifFalse: [ printAtLevel: stmt minLevel: levelCascade ].
 							i = stmts size ifFalse: [ emit: '.' ].
+							
+							(* Comments on this statement's line that the visitors
+				   did not place: one written after the statement, and
+				   one buried between its tokens where no following AST
+				   node claims it ('els:: List(* [FilePattern] *)
+				   new.'). Both belong to this statement rather than to
+				   the next one, and emitting them here also keeps them
+				   ahead of advanceCursorPast:, which is about to move
+				   the cursor beyond the statement whether or not they
+				   were consumed. *)
+							emitTrailingCommentsAfter: stmt
+								upTo: (i = stmts size ifTrue: [ bodyEnd ]
+									ifFalse: [ (stmts at: i + 1) start ]).
 							advanceCursorPast: stmt
 						].
 					
@@ -1167,7 +1419,18 @@ Slots:
 					emit: ' |'
 				].
 			(hasTemps or: [ hasStmts ]) ifTrue: [
-					emitBlockBody: body hasParams: hasParams
+					emitBlockBody: body hasParams: hasParams.
+					
+					(* Comments after the block's last statement, e.g.
+			   '[^self (* already running *)]'. Nothing follows them
+			   inside the block to attach them to, and the enclosing
+			   member's comment window ends at the member, so a comment
+			   left here would be dropped rather than merely displaced.
+			   Method bodies drain the same way (emitCodeBodyContents,
+			   emitTrailingCommentsUpTo:). *)
+					(node end isNil not and: [ node end > 0 ]) ifTrue: [
+							emitCommentsUpTo: node end inline: true
+						]
 				]
 				ifFalse: [
 					

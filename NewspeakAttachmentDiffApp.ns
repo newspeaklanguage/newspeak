@@ -1,0 +1,189 @@
+Newspeak3
+'NS2PrimordialSoup'
+class NewspeakAttachmentDiffApp packageUsing: manifest = Object new (
+	(* CLI app that compares comment-to-member attachment between two
+   versions of the same Newspeak source file.
+
+   Usage: NewspeakAttachmentDiffApp <old.ns> <new.ns> [<old2.ns> <new2.ns> ...]
+
+   Why it exists. The pretty printer used to reattach comments to the
+   wrong member when it put a class body in canonical order (see
+   PRETTY_PRINTER_COMMENT_ORPHANING_2026-08-16.md). That is fixed, but
+   files printed before the fix carry the damage in their committed
+   text, and damaged text is a FIXED POINT: printing it again
+   reproduces it, and the round-trip check confirms attachment was
+   preserved -- wrong owner and all. A corrupted file cannot diagnose
+   itself. The only witness is an older version of the same file.
+
+   So this tool takes two versions -- in practice `git show
+   <before>:F.ns` and the current F.ns -- and reports every comment
+   whose owner changed between them.
+
+   Two verdicts, because two situations:
+
+   PURE. The two versions have equivalent ASTs (positions excluded)
+   AND the same comment multiset. Nothing was edited and nothing was
+   lost, so the change was a pure reformat, and every attachment
+   change is printer damage. No judgement required, no false
+   positives.
+
+   MIXED. The versions differ in code or comment content, so real
+   authoring is mixed in with any reformatting. Reported findings are
+   restricted to comments whose text is UNCHANGED and whose original
+   owner still exists in the new version -- a comment nobody touched
+   that nonetheless changed owner. Those are candidates for a human to
+   confirm, not conclusions.
+
+   Attachment is computed by NewspeakRoundTripCheckApp, the same
+   analysis the round-trip gate uses, so the two tools cannot drift
+   apart in what they mean by "owns". *)
+	
+	|
+		private roundTrip = manifest NewspeakRoundTripCheckApp packageUsing: manifest.
+		private NewspeakASTs = manifest NewspeakASTs.
+		private NewspeakPredictiveParsing = manifest NewspeakPredictiveParsing.
+	|
+) (
+	decodeUtf8: bytes <List> ^<String> = (
+		^String withAll: bytes
+	)
+	compare: pathA <String> to: pathB <String> using: platform <Platform> ^<Boolean> = (
+		(* Answers whether anything was reported for this pair. Every
+	   outcome prints exactly one verdict line, so a driver can count
+	   lines by prefix: SAME, PURE, MIXED or ERROR. *)
+		
+		| srcA srcB astA astB parser cp recsA recsB attA attB moved pure |
+		srcA:: [ readFileAsString: pathA ] on: Error
+			do: [:ex |
+				('ERROR ' , pathB , ': could not read ' , pathA , ': ' , ex messageText) out.
+				^true
+			].
+		srcB:: [ readFileAsString: pathB ] on: Error
+			do: [:ex |
+				('ERROR ' , pathB , ': could not read: ' , ex messageText) out.
+				^true
+			].
+		parser:: NewspeakPredictiveParsing usingPlatform: platform
+			asts: (NewspeakASTs usingPlatform: platform).
+		cp:: parser CommonParser new.
+		astA:: [ cp parseCompilationUnit: srcA ] on: Error
+			do: [:ex |
+				('ERROR ' , pathB , ': old version does not parse: ' , ex messageText) out.
+				^true
+			].
+		astB:: [ cp parseCompilationUnit: srcB ] on: Error
+			do: [:ex |
+				('ERROR ' , pathB , ': new version does not parse: ' , ex messageText) out.
+				^true
+			].
+		recsA:: roundTrip commentRecordsFrom: srcA using: platform.
+		recsB:: roundTrip commentRecordsFrom: srcB using: platform.
+		attA:: roundTrip attachmentsIn: srcA ast: astA records: recsA using: platform.
+		attB:: roundTrip attachmentsIn: srcB ast: astB records: recsB using: platform.
+		moved:: roundTrip unmatchedPairsIn: attA against: attB using: platform.
+		moved isEmpty ifTrue: [
+				('SAME ' , pathB) out.
+				^false
+			].
+		pure:: isPureReformatFrom: astA
+			to: astB
+			records: recsA
+			and: recsB
+			using: platform.
+		pure ifTrue: [ ^reportPure: moved in: attB path: pathB ].
+		^reportMixed: moved in: attB records: recsB path: pathB using: platform
+	)
+	isPureReformatFrom: astA to: astB records: recsA and: recsB using: platform <Platform> ^<Boolean> = (
+		(* Same code, same comments: whatever else happened, nobody
+	   edited anything, so the file was only reformatted.
+
+	   The comment check is a multiset comparison in both directions --
+	   equal sizes would not rule out one comment being swapped for
+	   another. *)
+		
+		| textsA textsB |
+		(roundTrip ASTComparator new equivalent: astA to: astB) ifFalse: [ ^false ].
+		textsA:: roundTrip textsOf: recsA using: platform.
+		textsB:: roundTrip textsOf: recsB using: platform.
+		(roundTrip unmatchedIn: textsA against: textsB using: platform) isEmpty ifFalse: [
+				^false
+			].
+		^(roundTrip unmatchedIn: textsB against: textsA using: platform) isEmpty
+	)
+	reportPure: moved <List> in: attB <List> path: pathB <String> ^<Boolean> = (
+		('PURE ' , pathB , ': ' , moved size printString , ' comment(s) changed owner in a pure reformat') out.
+		moved do: [:entry |
+				| text |
+				text:: entry at: 2.
+				('  MOVED ' , (entry at: 1) , ' -> ' , (roundTrip ownerOfText: text in: attB) , ': ' , (roundTrip excerptOf: text)) out
+			].
+		^true
+	)
+	reportMixed: moved <List> in: attB <List> records: recsB <List> path: pathB <String> using: platform <Platform> ^<Boolean> = (
+		(* Filtered, because real editing is in the mix here. A finding
+	   survives only if the comment's text still exists untouched in
+	   the new version AND its old owner is still there to have kept
+	   it: a comment that moved because its owner was renamed, or
+	   because someone rewrote it, is authoring, not damage. *)
+		
+		| textsB candidates |
+		textsB:: roundTrip textsOf: recsB using: platform.
+		candidates:: platform collections List new.
+		moved do: [:entry |
+				((textsB includes: (entry at: 2)) and: [
+						ownerNamed: (entry at: 1) existsIn: attB
+					]) ifTrue: [ candidates add: entry ]
+			].
+		candidates isEmpty ifTrue: [
+				('SAME ' , pathB , ' (attachment differences all explained by edits)') out.
+				^false
+			].
+		('MIXED ' , pathB , ': ' , candidates size printString , ' candidate(s) -- edits present, needs review') out.
+		candidates do: [:entry |
+				| text |
+				text:: entry at: 2.
+				('  CAND ' , (entry at: 1) , ' -> ' , (roundTrip ownerOfText: text in: attB) , ': ' , (roundTrip excerptOf: text)) out
+			].
+		^true
+	)
+	ownerNamed: key <String> existsIn: attachments <List> ^<Boolean> = (
+		attachments do: [:entry | (entry at: 1) = key ifTrue: [ ^true ] ].
+		^false
+	)
+	public main: platform <Platform> args: args <List[String]> = (
+		(* Arguments are consecutive pairs: old, new, old, new. An odd
+	   count is a usage error rather than a silently ignored
+	   trailing file. *)
+		
+		| anyFindings ::= false. i ::= 1. |
+		(args size < 2 or: [ args size \\ 2 = 1 ]) ifTrue: [
+				'Usage: NewspeakAttachmentDiffApp <old.ns> <new.ns> [<old2.ns> <new2.ns> ...]' out.
+				^nil
+			].
+		[ i < args size ] whileTrue: [
+				[
+					(compare: (args at: i) to: (args at: i + 1) using: platform) ifTrue: [
+							anyFindings:: true
+						]
+				] on: Error
+					do: [:ex |
+						('ERROR ' , (args at: i + 1) , ': uncaught: ' , ex messageText) out.
+						anyFindings:: true
+					].
+				i:: i + 2
+			].
+		anyFindings ifTrue: [ ^1 ].
+		^nil
+	)
+	readFileAsBytes: filename <String> ^<List> = (
+		(* primordialsoup primitive 130 -- file read, as in the sibling
+	   CLI apps. *)
+		
+		(* :literalmessage: primitive: 130 *)
+		
+		halt
+	)
+	readFileAsString: path <String> ^<String> = (
+		^decodeUtf8: (readFileAsBytes: path)
+	)
+) : ()

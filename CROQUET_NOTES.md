@@ -49,7 +49,8 @@ short-circuits on `signServer === "none"`. **No key is needed or read.**
 | `pwd` | **yes** | Croquet | end-to-end encryption password; `Session.join` throws without it. Never sent to the server; any constant is fine locally. |
 | `appId` | yes | Croquet | application identifier, reverse-DNS by convention. Participates in the session id, so two appIds are two different sessions. |
 | `sessionId` | yes | Croquet | the session *name*. See the warning below. |
-| `apiKey` | **no** | nobody, when `reflector` is set | safe to omit entirely. `apiKey=none` works only because it is never read. |
+| `files` | **yes, for file handling** | Croquet | file-server base URL. See below. |
+| `apiKey` | **present, value ignored** | `Session.join` (presence only) | `Session.join` throws `no apiKey provided` if the option is absent, *before* the `reflector=` branch that ignores its value. So pass `apiKey=none`. Omitting it appears to work only in a browser where `getURIParam` finds an old value in localStorage; a fresh profile shows a blank page. |
 | `box` | alternative | Croquet | Croquet-in-a-Box; same key-skipping branch as `reflector` |
 | `debug` | optional | Croquet | e.g. `debug=session,snapshots` |
 
@@ -60,6 +61,40 @@ carries a stored **event history** that replays into every joining client (see
 §3.1 of the paper: our state is in the Newspeak heap, not the Croquet model, so
 we replay events rather than restore a snapshot). Stale sessions therefore
 resurrect old events and produce slow, divergent, browser-dependent startups.
+
+## The file server (`files=`)
+
+Drag-and-drop, file reading and snapshot upload all need one: Croquet events are
+too small to carry file payloads, so the data is stored on a file server and only a
+handle travels as an event (paper §3.2.1).
+
+There is a catch in how the client resolves it:
+
+```js
+uploadServer(t) {
+  if ("string" == typeof h.files) { ...return {url, apiKey: null} }
+  const {apiKey, signServer} = this.getBackend(t);
+  if ("none" === signServer && !pc.offline) throw Error("no file server configured");
+```
+
+The file server **is** the sign server — so the very `reflector=` branch that frees
+us from an API key also removes file storage, and any file operation fails with
+`no file server configured`. But `files=` is consulted *first*, so passing it
+restores file handling while staying keyless.
+
+`out/server3.py` implements it: `PUT` to store (creating intermediate
+directories), `GET` to retrieve, confined to `out/files/`. That is the whole
+protocol — nginx in croquet-in-a-box does it with `dav_methods PUT` plus
+`create_full_put_path`. Serving it from the same origin as the page means no CORS
+is required, though the headers are sent anyway. Add to the URL:
+
+```
+&files=http://localhost:8080/files
+```
+
+The alternative is croquet-in-a-box (`../croquet/server/croquet-in-a-box`), a
+Docker Compose bundle of reflector + web server + file server on port 8888, where
+`box=/` replaces both `reflector=` and `files=`.
 
 ## The reflector
 

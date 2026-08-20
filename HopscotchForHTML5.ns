@@ -1235,6 +1235,10 @@ support the Newspeak GUI. *)
 			public initialContent <Fragment> = ic.
 			contentSource <[Fragment]> = cs.
 			contentFragment <Fragment>
+			
+			(* Minted here, while construction order is still the same on every client;
+     the CONTENT is what arrives late. See #withFragmentScope:do:. *)
+			fragmentScope = newFragmentScope.
 		|
 	) (
 		public childrenDo: aBlock = (
@@ -1249,12 +1253,15 @@ support the Newspeak GUI. *)
 			initialVisual:: initialContent visual.
 			div appendChild: initialVisual.
 			deferAction: [
-					| deferredFragment = contentSource value. |
-					deferredFragment parent: self.
-					contentFragment:: deferredFragment.
-					
-					(* replace: new with: old due to stupid DOM argument ordering *)
-					div replaceChild: deferredFragment visual with: initialVisual
+					withFragmentScope: fragmentScope
+						do: [
+							| deferredFragment = contentSource value. |
+							deferredFragment parent: self.
+							contentFragment:: deferredFragment.
+							
+							(* replace: new with: old due to stupid DOM argument ordering *)
+							div replaceChild: deferredFragment visual with: initialVisual
+						]
 				].
 			^div
 		)
@@ -1277,13 +1284,16 @@ support the Newspeak GUI. *)
 		updateVisualsFromSameKind: oldFragment <Fragment> ^<Alien[Element]> = (
 			| oldVisual = oldFragment visual. |
 			deferAction: [
-					| deferredFragment = contentSource value. |
-					deferredFragment parent: self.
-					contentFragment:: deferredFragment.
-					
-					(* replace: new with: old due to stupid DOM argument ordering *)
-					oldVisual replaceChild: deferredFragment visual
-						replacing: (oldVisual at: 'firstChild')
+					withFragmentScope: fragmentScope
+						do: [
+							| deferredFragment = contentSource value. |
+							deferredFragment parent: self.
+							contentFragment:: deferredFragment.
+							
+							(* replace: new with: old due to stupid DOM argument ordering *)
+							oldVisual replaceChild: deferredFragment visual
+								replacing: (oldVisual at: 'firstChild')
+						]
 				].
 			^oldVisual
 		)
@@ -1292,14 +1302,26 @@ support the Newspeak GUI. *)
 		(* Like DeferredContentComposer, but the replacement content arrives
    asynchronously. `producer` is a closure that takes a one-argument `fill`
    callback; it starts its async work and, when the content is ready (possibly
-   several turns later), invokes `fill value: aFragment`. We then swap the
+   several turns later), invokes `fill value: [aFragment]`. We then swap the
    initial placeholder's visual for the new fragment's, reusing the same DOM
    surgery DeferredContentComposer performs. A plain fragment - no
-   subject/presenter pair. *)
+   subject/presenter pair.
+
+	   NOTE that fill takes a BLOCK answering the fragment, not the fragment itself.
+	   That is what lets the content be built inside a fragment-numbering scope: had
+	   the caller passed a finished fragment, it would already have been constructed -
+	   and numbered - while evaluating the argument, in whatever scope happened to be
+	   current. For Croquet that means the numbering skews whenever content arrives at
+	   different moments on different clients. See
+	   CROQUET_SCOPED_FRAGMENT_IDS_2026-08-18.md. *)
 		
 		|
 			initialContent <Fragment> = ic.
 			producer <[:Object | Object]> = pr.
+			
+			(* Minted while construction order still matches across clients; the CONTENT
+	     is what arrives late. See #withFragmentScope:do:. *)
+			fragmentScope = newFragmentScope.
 			public contentFragment <Fragment>
 			public holderVisual
 			public shownVisual
@@ -1323,8 +1345,8 @@ support the Newspeak GUI. *)
 					producer value: [:frag <Fragment> | fillWith: frag ]
 				]
 		)
-		fillWith: aFragment <Fragment> = (
-			| newVisual |
+		fillWith: contentBlock <[Fragment]> = (
+			| newVisual aFragment = withFragmentScope: fragmentScope do: contentBlock. |
 			aFragment parent: self.
 			contentFragment:: aFragment.
 			nil = holderVisual ifFalse: [
@@ -2557,6 +2579,10 @@ sound even though it can only walk the rows that are realized. *)
 		|
 			public count <Integer> = c.
 			elementBlock <[:Integer | Fragment]> = eb.
+			
+			(* Minted while construction order still matches across clients; which
+     ELEMENTS get realized is what varies. See #withFragmentScope:at:do:. *)
+			fragmentScope = newFragmentScope.
 			public rows <List[Fragment]> ::= List new.
 			public pinnedIndices <List[Integer]> ::= List new.
 			public pinnedFragments <List[Fragment]> ::= List new.
@@ -2647,7 +2673,9 @@ sound even though it can only walk the rows that are realized. *)
 						ifFalse: [
 							recovered:: takePinnedAt: i.
 							recovered isNil ifTrue: [
-									recovered:: elementBlock value: i.
+									recovered:: withFragmentScope: fragmentScope
+										at: i
+										do: [ elementBlock value: i ].
 									recovered parent: self
 								].
 							newRows add: recovered.
@@ -2793,7 +2821,7 @@ sound even though it can only walk the rows that are realized. *)
 			lastShown:: last.
 			firstShown to: lastShown
 				do: [:i <Integer> |
-					| nu = elementBlock value: i. old = oldRows at: i - firstShown + 1. |
+					| nu = withFragmentScope: fragmentScope at: i do: [ elementBlock value: i ]. old = oldRows at: i - firstShown + 1. |
 					nu parent: self.
 					nu updateVisualsFrom: old.
 					newRows add: nu
@@ -6418,9 +6446,20 @@ The picker is hidden while a request is in flight, to avoid switching in the mid
 		deferredContentQueue size = 1 ifTrue: [ nextFrameDo: [ nextDeferredAction ] ]
 	)
 	nextDeferredAction = (
+		(* Report rather than swallow. These actions run from a requestAnimationFrame
+     callback, so a failure here reaches JS rather than a Newspeak turn: nothing is
+     printed, the deferred content simply never appears, and a page that renders
+     nothing gives no clue why. Reporting must not itself break the queue, hence
+     the guard - printString can fail, and messageText is frequently nil, which
+     raises on concatenation. *)
+		
 		| action = deferredContentQueue removeFirst. |
 		deferredContentQueue size > 0 ifTrue: [ nextFrameDo: [ nextDeferredAction ] ].
-		action value
+		[ action value ] on: Error
+			do: [:e |
+				[ ('Deferred content failed: ' , e printString) out ] on: Exception
+					do: [:e2 | 'Deferred content failed (unprintable)' out ]
+			]
 	)
 	nextFrameDo: action <[Object]> = (
 		(* Our goal is to run the argument after images have been loaded and rendered. window.requestAnimationFrame runs the callback *before* the next frame. We register another callback in the callback so the first deferred action runs *after* the next frame. We register *that* callback in another RAF callback to let new images added from a deferred block load and render before the next deferred block runs. RAF is also a relatively new feature, so simply schedule a timer if it is not available. *)
@@ -6532,6 +6571,37 @@ The picker is hidden while a request is in flight, to avoid switching in the mid
 		(* return how far the top level display is scrolled *)
 		
 		^(body at: #parentNode) at: #scrollTop
+	)
+	newFragmentScope ^<Object> = (
+		(* A seam for HopscotchForCroquet; nothing here. See #withFragmentScope:do:. *)
+		
+		^nil
+	)
+	withFragmentScope: scope <Object> do: block <[X def]> ^<X> = (
+		(* A seam for HopscotchForCroquet, which gives every interactive fragment a
+     number, minted from a counter as the fragment is constructed, and uses that
+     number as the Croquet event address. Clients therefore agree on what an event
+     refers to only while they construct fragments in the same order.
+
+     Constructs that realize content at client-local moments - deferred and async
+     content, transclusions, and the lazy sequences - break that agreement: a
+     client that realizes different content, or the same content at a different
+     time, skews every subsequent number and thereafter receives events meant for
+     other widgets. Such a construct therefore wraps the realization of its content
+     in a scope, so the numbering inside cannot disturb the numbering outside.
+
+     Nothing here needs any of that, so these are no-ops; the cost is a block call.
+     See CROQUET_SCOPED_FRAGMENT_IDS_2026-08-18.md. *)
+		
+		^block value
+	)
+	withFragmentScope: scope <Object> at: index <Integer> do: block <[X def]> ^<X> = (
+		(* As above, for one element of a sequence. The index, not a counter, is what
+     makes the element's scope the same on every client: two clients realizing
+     different windows of the same sequence must still agree on the numbering
+     within any element they both realize. *)
+		
+		^block value
 	)
 	public Window ^<HopscotchWindow class> = (
 		^useSurroundingNavigation ifTrue: [ HopscotchWindow ]

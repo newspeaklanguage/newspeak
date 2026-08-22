@@ -112,6 +112,8 @@ starts it, installing dependencies on first run.
 - **For cross-device use**, run it on an internet-reachable host and point
   `reflector=` at it. No key, no account, no domain registration. Note `ws://`
   from an `https://` page is blocked — that needs `wss://` and a certificate.
+  Options and tradeoffs (Tailscale / plain-HTTP VPS / TLS via Caddy or
+  Cloudflare Tunnel) in `CROQUET_INTERNET_DEPLOYMENT_2026-08-20.md`.
 
 ## Serve with a threaded HTTP server
 
@@ -163,4 +165,15 @@ An override must repeat `public`; omitting it narrows access silently.
   diverge.
 - The AI chat stack has no overrides either; it probably wants
   `NonSyncingPresenter` rather than synchronizing.
+- **NS2JS integration: DONE 2026-08-20** (headless 3-browser verification;
+  interactive verification pending). `RuntimeForCroquetJS` + the deploy menu's
+  *as Croquet Web Page* produce a four-file app whose page gates boot on
+  `Session.join` and loads the **self-hosted patched Croquet client**
+  (`out/croquet.min.js`) — the stock client is unusable in an NS2JS realm
+  because its `$model`/`$class`/`$ref`/`$id`/`$value` serializer sentinels
+  collide with `$`-mangled selector catchers on `Object.prototype`. Full
+  record, including the three platform bugs found and the client build recipe:
+  `CROQUET_NS2JS_INTEGRATION_2026-08-20.md`. Editors/detour/file drop not yet
+  exercised on NS2JS; the Croquet IDE as a JS app stays blocked on the WeakRef
+  ceiling.
 - Offline work is out of scope by design (paper §7).

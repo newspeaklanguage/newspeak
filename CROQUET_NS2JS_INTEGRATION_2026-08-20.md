@@ -186,6 +186,95 @@ wrongly keeps showing Basic until a fresh session/reload.
 Verified post-fix: the Ozymandias flow shows the Document view on BOTH seeder
 and late joiner, byte-identical (`ozymandias-js-test.js`, all green).
 
+## The editor echo storm (found 2026-08-22 by Gilad, fixed)
+
+Typing fast in a large editor (Ozymandias raw view) with two browsers attached
+melted the session: `Sends to reflector at or above recommended limit`,
+disconnect, auto-rejoin, replay re-firing thousands of events, re-disconnect —
+an unending spiral (his session `143` is permanently poisoned; its stored
+history IS the storm).
+
+Mechanism, visible in the stack traces: the `reflecting` flag suppresses
+republishing only during the SYNCHRONOUS window of applying a remote event,
+but CodeMirror delivers some signals — `beforeSelectionChange` from a cursor
+adjustment above all — at the END of its operation/display update, after the
+flag is restored. So every applied remote change made the receiving client
+publish selection events: N-fold amplification of every keystroke (latent on
+psoup too; his psoup tests simply stayed under the reflector's ~20 msg/s
+budget). Once the rate limit tripped, replay-of-history re-fired the deferred
+echoes en masse — self-sustaining.
+
+Fixes:
+- **Origin-based echo suppression** (HopscotchForCroquet CodeMirrorFragment):
+  programmatic cursor/selection adjustments are tagged
+  `{origin: 'croquet'}` (`croquetOrigin`), and the publish hooks
+  (`respondToChange:`, `respondToBeforeChange:`,
+  `respondToBeforeSelectionChange:`) skip signals whose origin is `croquet`
+  or `setValue` (`isSyncOrigin:` — `setValue` covers both remote application
+  and reconciliation refreshes). Timing-independent, unlike the flag, which
+  remains as a second layer.
+- **Detached-view guards** in both glue copies (psoup `meta/croquet-post.js`,
+  spliced into both `croquetpsoup.js` copies, and
+  `DeploymentManager>>croquetSupportScript`): `nsPublish` drops with a warning
+  and `nsResolvePayload` throws cleanly when `theView.session` is gone,
+  instead of the `TypeError (reading 'data')` flood.
+
+Verified headlessly: 40 keystrokes with a second client attached produce
+exactly 121 events (40 × ~3, no amplification), no rate-limit warnings, and
+both editors converge to identical text; a deliberate over-rate burst now
+recovers after a single reconnect instead of spiraling.
+
+**Remaining, needs a design decision**: each keystroke publishes ~3 events
+(codeMirror_keydown + beforeChange + change, two carrying the FULL buffer
+text), so sustained typing over ~7 chars/second exceeds the reflector's
+20 msg/s recommendation by itself; the resulting reconnect now recovers
+cleanly but can drop the couple of keystrokes in flight (observed: 38/40 at
+8 cps). Candidate mitigations: stop publishing keydown per keypress, coalesce
+beforeChange+change into one event, or publish diffs rather than full text.
+Also unexplained: that reconnect rejoins under a DIFFERENT croquet session id
+(observed twice); both clients migrate together and stay consistent, but it
+deserves a follow-up.
+
+## The method-editor cascade on the JS platform (traced & fixed 2026-08-23)
+
+Clicking a method name in the inspector on the JS IDE collapsed into a broken
+debugger. Peeling it found FOUR stacked JS-platform discrepancies (psoup
+canonical throughout); all fixed:
+
+1. **Debugger activation walkers trusted suspendedActivation's type**
+   (Debugging.ns): canResume, includesActivation:, refreshActivationChain and
+   the lazy-slot adjuster now guard with isKindOfActivationMirror — walk only
+   as far as the chain consists of activations. (The JS eager thread's
+   suspendedActivation was an ObjectMirror; sending #sender to it took the
+   debugger down, and the debugger-on-debugger masked everything else.)
+2. **`sendSuspended:with:` broke the psoup contract** (MirrorsForJS): it ran
+   eagerly and stashed the receiver's ObjectMirror as suspendedActivation
+   (evaluator scope only). Now simulator-backed via debugSuspended:with: — a
+   thread genuinely suspended before the first instruction with a real
+   ActivationMirror carrying scope AND method identity; the eager body
+   remains as eagerSendSuspended:with:, the explicit fallback when the
+   simulator is not packaged.
+3. **`ClassMirror>>isMeta` lied** (MirrorsForJS → KernelForJS): it delegated
+   to the legacy kernel `Class` stand-in whose isMeta was unconditionally
+   true. Consequence: `classObjectScopeFor:` (Browsing) saw every instance's
+   class as "already a metaclass" and handed the INSTANCE as the receiver for
+   class-side exemplar sends — `version` sent to a BuildInfo instance, MNU.
+   psoup never surfaces the wrong send because its suspend executes nothing;
+   the JS simulator's entry does lookup and raised mid-render. Both isMetas
+   now use the runtime-structure convention (a meta mixin has no `.meta` of
+   its own — KernelForJS Mixin>>isMeta), the JS analogue of psoup
+   ClassMirror's `Metaclass = classOf: reflectee`. This also repairs
+   Debugging.ns:176's receiverClassMirror isMeta branch.
+4. Verified end-to-end after the fixes: inspector → class → method click
+   opens the method editor (CodeMirror with the method source), and typing
+   with two clients attached keeps cursor and text correct. Core suites and
+   both Croquet regression suites all green.
+
+Diagnostic technique worth keeping: hook console.error in the page and unwrap
+the Newspeak MNU's `$message$slot.$mangledSelector$slot` + `.trace` — turns
+"KernelForJS`MessageNotUnderstood" into selector, receiver constructor and
+the exact send site.
+
 ## Rebuild hygiene (lesson, 2026-08-21)
 
 Ad-hoc vfuel rebuilds (running the WebCompiler line without build.sh's step

@@ -96,6 +96,18 @@ The alternative is croquet-in-a-box (`../croquet/server/croquet-in-a-box`), a
 Docker Compose bundle of reflector + web server + file server on port 8888, where
 `box=/` replaces both `reflector=` and `files=`.
 
+**Cleaning out old sessions** — `tool/clean-croquet-sessions.sh`. Session state
+lives in three places: the reflector's memory (restart erases every session's
+replayable history — the only way to truly retire a session id whose stored
+history has gone bad), the file-server tree `out/files/apps/<appId>/<pid>/`
+(Data-API blobs: dropped files and, since the detour, every large-editor
+keystroke — grows without bound), and each browser's localStorage for the
+origin. The script reports (no args), prunes by age (`--prune [DAYS]`) or
+wholesale (`--all`), and can `--restart-reflector`; it refuses to prune under
+a live reflector unless combined with a restart or `--force`, and never
+touches `out/files/deploy`. Browser localStorage must be cleared in the
+browser itself.
+
 ## The reflector
 
 Apache-2.0, from `github.com/croquet/croquet`, checked out at `../croquet`

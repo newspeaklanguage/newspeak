@@ -860,7 +860,7 @@ This behavior is routed through the #userBack: method, which handles web browser
 				isStartingUp ifTrue: [
 						isStartingUp:: false.
 						
-						(* The replayed event handlers assume that all Newspeak processing for the turn has completed by the time they run (as it has in normal execution). A direct send honors that: replayEvents only ENQUEUES handler thunks on the dispatch chain, and promise thunks run after the current turn's synchronous processing. This used to be an eventual send (rootView <-: replay), which the JS platform's aliens do not understand - the resulting MessageNotUnderstood silently cost late joiners their entire catch-up there. *)
+						(* The replayed event handlers assume that all Newspeak processing for the turn has completed by the time they run (as it has in normal execution). A direct send honors that: replayEvents only ENQUEUES handler thunks on the dispatch chain, and promise thunks run after the current turn's synchronous processing. This used to be an eventual send (rootView <-: replay), which raised MessageNotUnderstood on the JS platform and silently cost late joiners their entire catch-up there. (That MNU turned out to be a since-fixed bug in ActorsForJS enqueueMessage: - master 4713887 - not a platform limitation; the direct send is kept because its turn-ordering argument stands on its own.) *)
 						rootView replay
 					]
 			)
@@ -1122,6 +1122,61 @@ A complication is that the file API is asynchronous, so we only have promises in
 				^type: t name: fn registry: mr width: '600px'
 			)
 		)
+		public class TimerFragment duration: seconds <Integer> = super TimerFragment duration: seconds (
+			(* Synchronized countdown. The base class decrements on a client-local
+	   schedule - free-running divergence in a lock-step system. Here no client
+	   schedules anything: every client publishes timer_start on realization (the
+	   model honors only the FIRST for a given fragment id), and the root model
+	   drives the ticks from its own future queue, so they pace on teatime -
+	   identical on every client, with no relative drift. Each tick is recorded
+	   in the model's event history, so late joiners replay the same tick stream.
+	   The countdown length travels in the start event and the model stops
+	   itself; nothing needs to publish a stop. *)
+			
+			|
+				fragmentId <String> = newTimerId.
+				scope_slot <String>
+			|
+			setupCroquetView.
+		) (
+			public scope ^<String> = (
+				scope_slot isNil ifTrue: [ scope_slot: 'nstimer_' , fragmentId ].
+				^scope_slot
+			)
+			subscribe: eventSpec <String> handler: blk <[CroquetEvent]> = (
+				subscribeFragment: fragmentId scope: scope eventSpec: eventSpec handler: blk
+			)
+			createVisual = (
+				(* As the base method, but WITHOUT the client-local schedule; ticks come
+	     from the model. *)
+				
+				| timer = (js global at: #document) createElement: 'div'. spec = (js global at: #Object) new. |
+				timer at: 'id' put: 'timer'.
+				timer at: #innerHTML put: duration.
+				spec at: #interval put: 1000;
+					at: #count put: duration.
+				publish: 'nstimer_'
+					event: #timer_start
+					data: (js global newspeakFragmentData: fragmentId data: spec).
+				^timer
+			)
+			updateVisualsFromSameKind: oldFragment <TimerFragment> ^<Alien[Element]> = (
+				(* Carry over identity and state; do NOT restart the schedule (the model
+	     owns it, and republishing start after completion would restart the
+	     countdown). *)
+				
+				scope_slot: oldFragment scope.
+				timeLeft:: oldFragment timeLeft.
+				^oldFragment visual
+			)
+			setupCroquetView = (
+				subscribe: #model_timer_tick
+					handler: [:remaining <Integer> |
+						timeLeft:: remaining.
+						visual at: #innerHTML put: remaining
+					]
+			)
+		) : ()
 		public class NonSyncingPresenter onSubject: s <Subject> = Presenter onSubject: s (
 			(* It is sometimes desirable to display information that is not-synchronized, but instead restricted on a client. This presenter is intended to support that.
 All methods that produce synchronizing fragments are overridden to provide the original, non-synchronizing fragments.
@@ -1222,8 +1277,139 @@ To produce a non-synchronizing part of the UI, subclass NonSyncingPresenter and 
 				^true
 			)
 		) : ()
+		lazy coordinatedFetchPending <Map[String, List]> = Map new.
+		lazy coordinatedFetchers <Map[String, [:[:Alien[ArrayBuffer] | Object] :[:String | Object] | Object]]> = Map new.
+		lazy coordinatedFetchSubscribed <Map[String, Boolean]> = Map new.
 		newImageButtonId ^<String> = (
 			^newIdFor: 'imageButton'
+		)
+		public coordinatedFetch: key <String> via: fetcher <[:[:Alien[ArrayBuffer] | Object] :[:String | Object] | Object]> ifSuccess: sb <[:Alien[ArrayBuffer] | Object]> ifFailure: fb <[:String | Object]> = (
+			(* Synchronized override of the once-per-session IO primitive (see the base
+	   method in HopscotchForHTML5). Every client wanting the bytes for key
+	   publishes a coordinatedFetch_request carrying its view id. The root model
+	   elects the FIRST requester - reflector ordering is the election - and
+	   answers model_coordinatedFetch_fetch naming the elected view; only that
+	   client runs its own stored fetcher block, stores the resulting bytes with
+	   the session Data API, and publishes coordinatedFetch_loaded with the
+	   handle. The model records only loaded answers in its event history, so
+	   every client - including late joiners replaying that history - consumes
+	   the SAME bytes, rather than re-running IO against a possibly changed
+	   source. A request arriving after the bytes are stored is answered with a
+	   fresh recorded loaded event; a fetch failure clears the model's entry (so
+	   a retry can re-elect) and broadcasts coordinatedFetch_failed, which is
+	   not recorded. *)
+			
+			(coordinatedFetchPending at: key ifAbsentPut: [ List new ]) add: {sb. fb. }.
+			coordinatedFetchers at: key put: fetcher.
+			subscribeCoordinatedFetchEventsFor: key.
+			publish: 'nscoordfetch_'
+				event: #coordinatedFetch_request
+				data: (js global newspeakFragmentData: (coordinatedFetchEventKeyFor: key)
+					data: (rootView at: #viewId))
+		)
+		coordinatedFetchEventKeyFor: key <String> ^<String> = (
+			(* Croquet rejects subscription scopes containing ':' (its internal
+	   scope:event separator), and the recorded fid must match the subscription
+	   scope suffix for replay lookup, so the key is sanitized ONCE here and used
+	   for ALL event traffic (the scope suffix and the fid). The raw key stays
+	   local: the pending list, the fetcher registry and the handler closures are
+	   keyed by it. Distinct raw keys that sanitize alike would collide in the
+	   model - do not choose keys differing only by ':' vs '.'. *)
+			
+			^((js global at: #String) new: key) replaceAll: ':' with: '.'
+		)
+		subscribeCoordinatedFetchEventsFor: key <String> = (
+			(* One-time per-key subscriptions for the coordinated fetch (see
+	   coordinatedFetch:via:ifSuccess:ifFailure:). The loaded event is RECORDED
+	   in the model's history, so its handler must go through subscribeFragment: -
+	   whose wrapper counts processed events to keep the replay cursor exact. The
+	   fetch and failed events are never recorded, so they must NOT be counted:
+	   they are subscribed directly via nsSubscribe. *)
+			
+			| scope = 'nscoordfetch_' , (coordinatedFetchEventKeyFor: key). |
+			(coordinatedFetchSubscribed at: key ifAbsent: [ false ]) ifTrue: [ ^self ].
+			coordinatedFetchSubscribed at: key put: true.
+			js global nsSubscribe: scope
+				eventSpec: #model_coordinatedFetch_fetch
+				handler: [:electedViewId |
+					electedViewId = (rootView at: #viewId) ifTrue: [
+							runCoordinatedFetcherFor: key
+						].
+					nil
+				].
+			js global nsSubscribe: scope
+				eventSpec: #model_coordinatedFetch_failed
+				handler: [:msg |
+					deliverCoordinatedFetchFailure: key message: msg.
+					nil
+				].
+			subscribeFragment: key
+				scope: scope
+				eventSpec: #model_coordinatedFetch_loaded
+				handler: [:handle | deliverCoordinatedFetchBytes: key handle: handle ]
+		)
+		runCoordinatedFetcherFor: key <String> = (
+			(* This client won the election: run the fetcher block it registered for
+	   this key, store the resulting bytes with the session Data API, and publish
+	   the handle for everyone; the model records it. Failures are broadcast so
+	   all waiting clients report them, and clear the model's entry so a retry
+	   can re-elect. *)
+			
+			| fetcher = coordinatedFetchers at: key ifAbsent: [ nil ]. eventKey = coordinatedFetchEventKeyFor: key. |
+			fetcher isNil ifTrue: [
+					^publish: 'nscoordfetch_'
+						event: #coordinatedFetch_failed
+						data: (js global newspeakFragmentData: eventKey
+							data: 'No fetcher registered for ' , key , ' on the elected client')
+				].
+			fetcher value: [:bytes |
+					(rootView storedData store: bytes) then: [:handle |
+							publish: 'nscoordfetch_'
+								event: #coordinatedFetch_loaded
+								data: (js global newspeakFragmentData: eventKey data: handle).
+							nil
+						]
+						onError: [:ex |
+							publish: 'nscoordfetch_'
+								event: #coordinatedFetch_failed
+								data: (js global newspeakFragmentData: eventKey
+									data: 'Storing ' , key , ' failed: ' , ex printString).
+							nil
+						]
+				]
+				value: [:msg |
+					publish: 'nscoordfetch_'
+						event: #coordinatedFetch_failed
+						data: (js global newspeakFragmentData: eventKey data: msg)
+				]
+		)
+		deliverCoordinatedFetchBytes: key <String> handle: h <Alien[CroquetHandle]> = (
+			(* A recorded loaded answer arrived. If no request is pending locally (a
+	   repeat answer to some other client's late request, or replay after this
+	   client already consumed the bytes) there is nothing to do - skip the
+	   fetch entirely. *)
+			
+			| pending = coordinatedFetchPending at: key ifAbsent: [ nil ]. |
+			pending isNil ifTrue: [ ^self ].
+			pending isEmpty ifTrue: [ ^self ].
+			coordinatedFetchPending at: key put: List new.
+			(rootView storedData fetch: h) then: [:bytes |
+					pending do: [:pair | (pair at: 1) value: bytes ].
+					nil
+				]
+				onError: [:ex |
+					pending do: [:pair |
+							(pair at: 2) value: 'Fetching stored bytes for ' , key , ' failed: ' , ex printString
+						].
+					nil
+				]
+		)
+		deliverCoordinatedFetchFailure: key <String> message: msg <String> = (
+			| pending = coordinatedFetchPending at: key ifAbsent: [ nil ]. |
+			pending isNil ifTrue: [ ^self ].
+			pending isEmpty ifTrue: [ ^self ].
+			coordinatedFetchPending at: key put: List new.
+			pending do: [:pair | (pair at: 2) value: msg ]
 		)
 		newRadioButtonId ^<String> = (
 			^newIdFor: 'radioButton'
@@ -1394,6 +1580,9 @@ The argument is of the form
 		newMediaCreatorId ^<String> = (
 			^newIdFor: 'mediaCreator'
 		)
+		newTimerId ^<String> = (
+			^newIdFor: 'timer'
+		)
 		public blobURIFor: file <Alien[File]> ^<String> = (
 			(* Make inherited method accessible to nested classes *)
 			
@@ -1406,6 +1595,19 @@ The argument is of the form
 		)
 		rootView ^<Alien[NewspeakCroquetView]> = (
 			^js global at: #theView
+		)
+		public syncRandom ^<Float> = (
+			(* A random number in [0, 1) from a deterministic PRNG replicated across
+	   all clients of the session (seeded from the session id; see nsSyncRandom
+	   in the croquet support script). DISCIPLINE: draw only inside synchronized
+	   event handlers (button actions, editor responses, tick handlers), which
+	   run in identical order on every client and under replay; a draw outside
+	   them - a local animation frame, a promise callback, hover feedback -
+	   advances the stream on one client only and desynchronizes every draw
+	   after it. For purely local, non-shared randomness use the browser's
+	   Math.random via js global instead. *)
+			
+			^(js global at: #nsSyncRandom) apply: nil
 		)
 		showMenu: menu <Alien[Div]> forShell: s <HopscotchShell> inVisual: v <Visual> = (
 			(* Make the inherited method visible to nested classes *)

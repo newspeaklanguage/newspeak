@@ -782,6 +782,34 @@ function nsContainsDataHandle(x, depth = 0) {
     return false;
 }
 
+/* Replicated randomness (see HopscotchForCroquet.ns Hopscotch>>syncRandom).
+   A mulberry32 PRNG seeded from the session id, so every client starts from
+   the same state. It stays replicated under one DISCIPLINE: draw from it only
+   inside synchronized (Croquet-dispatched) event handlers, which run in
+   identical order on every client and under replay. The Croquet model-side
+   Math.random patch is unavailable to us because our state mutates view-side
+   (see the architecture comment in HopscotchForCroquet.ns). */
+var nsSyncRandomState = 0;
+var nsSyncRandomSeeded = false;
+
+function nsSyncRandomSeed(sessionId) {
+    // FNV-1a over the session id string.
+    let h = 0x811c9dc5;
+    for (let i = 0; i < sessionId.length; i++) {
+	h ^= sessionId.charCodeAt(i);
+	h = Math.imul(h, 0x01000193) >>> 0;
+    }
+    nsSyncRandomState = h >>> 0;
+}
+
+function nsSyncRandom() {
+    nsSyncRandomState = (nsSyncRandomState + 0x6D2B79F5) >>> 0;
+    let z = nsSyncRandomState;
+    z = Math.imul(z ^ (z >>> 15), z | 1) >>> 0;
+    z = (z ^ (z + Math.imul(z ^ (z >>> 7), z | 61))) >>> 0;
+    return ((z ^ (z >>> 14)) >>> 0) / 4294967296;
+}
+
 var nsPublishChain = Promise.resolve();
 
 // The single outbound funnel: HopscotchForCroquet''s publish:event:data: calls
@@ -937,6 +965,29 @@ Only afterward is the snapshot state restored in the new model. Next a new root 
 	this.subscribe(''nsshell_'', ''shell_activeMenuBlurred'', this.shell_activeMenuBlurred);
 	this.subscribe(''nsfilechooser_'', ''fileChooser_click'', this.fileChooser_click);
 	this.subscribe(''nsmediacreator_'', ''mediaCreator_setFile'', this.mediaCreator_setFile);
+
+	// Coordinated once-per-session fetches (see HopscotchForCroquet.ns
+	// coordinatedFetch:via:ifSuccess:ifFailure:; Documents uses keys like
+	// ''document:<name>'' for transclusions). Maps fetch key ->
+	// {status: ''fetching''} or {status: ''loaded'', handle}. A plain object, so
+	// it snapshots without custom serializers. Like newspeakEvents, the reset
+	// here is the fresh-session default; a snapshot restore overwrites it.
+	this.coordinatedFetches = {};
+	this.subscribe(''nscoordfetch_'', ''coordinatedFetch_request'', this.coordinatedFetch_request);
+	this.subscribe(''nscoordfetch_'', ''coordinatedFetch_loaded'', this.coordinatedFetch_loaded);
+	this.subscribe(''nscoordfetch_'', ''coordinatedFetch_failed'', this.coordinatedFetch_failed);
+
+	// Synchronized timers (see HopscotchForCroquet.ns TimerFragment). Maps
+	// fragment id -> {remaining} while a countdown runs, then PERMANENTLY
+	// {status: ''done''} - completed entries must survive so that a fragment
+	// re-realization (late-joiner replay, document revisit) cannot restart
+	// the countdown. Ticks run on the model''s own future queue, so they
+	// pace on teatime - identically on every client - and each tick is
+	// recorded, so late joiners replay the same stream. Pending future
+	// messages ride in snapshots.
+	this.timers = {};
+	this.subscribe(''nstimer_'', ''timer_start'', this.timer_start);
+	this.subscribe(''nstimer_'', ''timer_stop'', this.timer_stop);
     }
     // same issues with scope for these methods
     mouseDown(fid){
@@ -1072,6 +1123,76 @@ Only afterward is the snapshot state restored in the new model. Next a new root 
     mediaCreator_setFile(nsOptions){
 	this.publishEventAndData(''nsmediacreator_'', ''model_mediaCreator_setFile'', nsOptions.data, nsOptions.fid);
     }
+    // Coordinated once-per-session fetches. Every client wanting the bytes
+    // for a key publishes a request carrying its view id; the FIRST request
+    // elects that view as the fetcher (reflector ordering is the election).
+    // Only loaded answers are recorded in newspeakEvents -- including repeat
+    // answers to late requests, so the per-client processed-event counting
+    // stays exact -- ensuring every client, and every late joiner replaying
+    // history, consumes the same stored bytes. The election and failure
+    // broadcasts are NOT recorded, and their Newspeak-side handlers are
+    // subscribed uncounted.
+    coordinatedFetch_request(nsOptions){
+	const name = nsOptions.fid;
+	const entry = this.coordinatedFetches.hasOwnProperty(name) ? this.coordinatedFetches[name] : null;
+	if (!entry) {
+	    this.coordinatedFetches[name] = {status: ''fetching''};
+	    this.publish(''nscoordfetch_'' + name, ''model_coordinatedFetch_fetch'', nsOptions.data);
+	} else if (entry.status === ''loaded'') {
+	    this.publishEventAndData(''nscoordfetch_'', ''model_coordinatedFetch_loaded'', entry.handle, name);
+	}
+	// status ''fetching'': an answer is already on its way; ignore.
+    }
+    coordinatedFetch_loaded(nsOptions){
+	this.coordinatedFetches[nsOptions.fid] = {status: ''loaded'', handle: nsOptions.data};
+	this.publishEventAndData(''nscoordfetch_'', ''model_coordinatedFetch_loaded'', nsOptions.data, nsOptions.fid);
+    }
+    coordinatedFetch_failed(nsOptions){
+	delete this.coordinatedFetches[nsOptions.fid];
+	this.publish(''nscoordfetch_'' + nsOptions.fid, ''model_coordinatedFetch_failed'', nsOptions.data);
+    }
+    // Synchronized timers. Every client publishes start on realizing a timer
+    // fragment; only the first registers (idempotent start). The count rides
+    // in the start event and the model stops itself, so recorded history is
+    // bounded per timer. The interval is clamped so a runaway caller cannot
+    // flood the recorded history with ticks.
+    timer_start(nsOptions){
+	const fid = nsOptions.fid;
+	if (this.timers.hasOwnProperty(fid)) {
+	    const t = this.timers[fid];
+	    // A start for a COMPLETED timer is a fragment re-realization -- a
+	    // late joiner''s replay, or a revisit of the containing document --
+	    // never a new user intent (realization is not a user event, so it
+	    // must be idempotent forever, not merely while running). Restarting
+	    // here made a late joiner''s replay restart everyone''s countdown.
+	    // Answer with a recorded final tick instead, so the new fragment''s
+	    // display converges to 0; an ACTIVE timer just ignores the repeat.
+	    if (t.status === ''done'') {
+		this.publishEventAndData(''nstimer_'', ''model_timer_tick'', 0, fid);
+	    }
+	    return;
+	}
+	const interval = Math.max(250, nsOptions.data.interval || 1000);
+	const count = Math.max(1, nsOptions.data.count || 1);
+	this.timers[fid] = {remaining: count};
+	this.future(interval).timer_tick(fid, interval);
+    }
+    timer_tick(fid, interval){
+	const t = this.timers.hasOwnProperty(fid) ? this.timers[fid] : null;
+	if (!t || t.status === ''done'') return; // stopped or completed
+	t.remaining -= 1;
+	this.publishEventAndData(''nstimer_'', ''model_timer_tick'', t.remaining, fid);
+	if (t.remaining > 0) {
+	    this.future(interval).timer_tick(fid, interval);
+	} else {
+	    this.timers[fid] = {status: ''done''};
+	}
+    }
+    timer_stop(nsOptions){
+	// Mark done rather than delete: a deleted entry would let a later
+	// re-realization (replay, document revisit) restart the countdown.
+	this.timers[nsOptions.fid] = {status: ''done''};
+    }
 }
 
 
@@ -1082,6 +1203,10 @@ class NewspeakCroquetView extends Croquet.View {
 	super(model);
 	console.log("croquet session id = " + this.sessionId);
 	localViewId = this.viewId;
+	// Seed once per client lifetime: this constructor ALSO runs on snapshot
+	// restores, and reseeding then would reset a stream handlers already drew
+	// from, breaking replication.
+	if (!nsSyncRandomSeeded) { nsSyncRandomSeeded = true; nsSyncRandomSeed(this.sessionId); }
 	this.presenter = presenter;
 	storeModelAndView(model, this);
 	replaySubscriptions();

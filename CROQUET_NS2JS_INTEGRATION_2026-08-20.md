@@ -67,15 +67,33 @@ parameter, where the two semantics coincide (audited).
 3. **`rootView <-: replay` never fires on NS2JS**
    (`HopscotchForCroquet.ns`, `HopscotchShell>>displayPresenter:`): the
    post-first-display replay trigger was an *eventual send* to a JS alien,
-   which the JS platform's aliens do not understand — an uncaught
-   MessageNotUnderstood on every client, invisible on the seeder (nothing to
-   replay) and fatal for joiners (catch-up never ran; the constructor-time
-   replay correctly no-ops with zero subscriptions). Now a direct
-   `rootView replay`: the handlers' all-Newspeak-processing-for-the-turn-done
-   assumption is honored by the dispatch chain itself (thunks run as
-   microtasks after the current turn, with 15s subscriber retries).
+   which raised an uncaught MessageNotUnderstood on every client, invisible
+   on the seeder (nothing to replay) and fatal for joiners (catch-up never
+   ran; the constructor-time replay correctly no-ops with zero
+   subscriptions). Now a direct `rootView replay`: the handlers'
+   all-Newspeak-processing-for-the-turn-done assumption is honored by the
+   dispatch chain itself (thunks run as microtasks after the current turn,
+   with 15s subscriber retries).
    **Note: this changes the psoup Croquet builds too** (direct call instead of
    eventual send) — psoup IDE sync deserves a retest.
+   **CORRECTED DIAGNOSIS (2026-08-25, master `4713887`)**: the MNU was NOT a
+   platform limitation. `ActorsForJS.ns` `DOMActor>>enqueueMessage:` had
+   `js call:` where `_js call:` was meant, so actor turn scheduling — hence
+   EVERY eventual send and NS-promise settlement on the JS runtime — raised
+   from the day it was written. The direct send stays (it is simpler and its
+   turn-ordering argument stands on its own), but do not design around
+   "eventual sends don't work on NS2JS": since `4713887` they do.
+   Measured, not just reasoned: the NS2JS session's `AsyncBridgeProbe`
+   (webide-ai-access worktree) probe 7 does an eventual send to an
+   unresolved NS promise, resolved from inside a JS setTimeout callback and
+   observed via `Promises when:fulfilled:` — exactly the `<-: replay` shape.
+   Before the fix it raised `MessageNotUnderstood: ActorsForJS\`DOMActor js`;
+   after, it passes. Re-verified 2026-08-26 on a deploy packaged from
+   CURRENT master (`4713887`) plus the in-flight determinism batch: probes
+   1-8 all PASS (eventual send, NS promise fulfil/break/derived-break/turn
+   semantics from JS callbacks, actors Timer, callback arg order); probe 9
+   (raise inside a JS `then:`) still hangs — that is the long-standing
+   raise-in-JS-callback hazard, unrelated to `4713887`.
 
 ## The self-hosted patched Croquet client
 

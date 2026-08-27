@@ -168,8 +168,13 @@ These maps are stored here so that they can be passed to newly created Amplefort
 			public expressionMapping <Map[Symbol, String]> = Map new.
 			rendered <HolderComposer> = holder: render.
 			
-			(* Is the user editing the live view? *)
-			updatingFromLive <Boolean> ::= false.
+			(* Count of live-view edits whose raw-view change event has not yet come
+     back through changeResponse. On the plain platform the change fires
+     synchronously, so this is 0 or 1; under Croquet each change returns as a
+     reflector echo (detoured when large), several can be in flight, and echo
+     and keystroke order interleave - hence a count, not a flag. See the
+     comment at changeResponse. *)
+			pendingLiveEdits <Integer> ::= 0.
 			
 			(* Did the user just paste into the live view? *)
 			pasting <Boolean> ::= false.
@@ -255,7 +260,7 @@ These maps are stored here so that they can be passed to newly created Amplefort
 			
 			(* Sync the raw view as well — updateFromRawView only rebuilds the
      live view, so without this a sibling presentation's raw pane keeps
-     stale text even as its live view updates. Setting updatingFromLive
+     stale text even as its live view updates. Bumping pendingLiveEdits
      suppresses changeResponse's redundant re-render of the live view
      (which updateFromRawView does below), and the equality guard in
      setText:from: prevents a republish loop. Skipped when the raw text
@@ -267,7 +272,7 @@ These maps are stored here so that they can be passed to newly created Amplefort
 			
 			(cm isNil not and: [ cm hasVisual ]) ifTrue: [
 					cm textBeingAccepted = subject text ifFalse: [
-							updatingFromLive: true.
+							pendingLiveEdits: pendingLiveEdits + 1.
 							cm text: subject text
 						]
 				].
@@ -440,19 +445,31 @@ These maps are stored here so that they can be passed to newly created Amplefort
 			updateFromRawView.
 			cm useEditControls: false.
 			
-			(* Reset updatingFromLive, in case the user edits the raw view next;
-                        The live view's handler(s) will programmatically update the rest *)
-			
-			(* set pasting back to its default, in case it was true *)
-			
-			(* The change is a result of editing the raw view by the user; update accordingly *)
+			(* A change with no pending live edit is a raw-view hand edit; rebuild the
+       live view. A change while live edits are pending is the raw view catching
+       up with the live view - skip the rebuild, or the caret dies. The pending
+       count matters under Croquet: change events return as reflector echoes,
+       and a large document's full-text payloads take the Data-API detour, so
+       echo N can arrive AFTER keystroke N+1 - a boolean here mis-accounted
+       exactly then (echo N consumed keystroke N+1's flag; echo N+1 rebuilt the
+       live view mid-typing, destroying focus). An echo whose text already
+       equals the document's is a settle point: consume ALL pending (so a
+       dropped echo - rate-limit disconnect - cannot leave a stale count that
+       would later suppress a genuine remote update) and skip the rebuild. *)
 			cm changeResponse: [:ed <CodeMirrorFragment> :event <Event> |
-					subject setText: ed textBeingAccepted from: self.
-					(updatingFromLive and: [ pasting not ]) ifTrue: [ updatingFromLive: false ]
-						ifFalse: [
-							updatingFromLive: false.
+					| incoming <String> = ed textBeingAccepted. settled <Boolean> = incoming = subject text. |
+					subject setText: incoming from: self.
+					pasting ifTrue: [
+							pendingLiveEdits: 0.
 							pasting:: false.
 							updateFromRawView
+						]
+						ifFalse: [
+							settled ifTrue: [ pendingLiveEdits: 0 ]
+								ifFalse: [
+									pendingLiveEdits > 0 ifTrue: [ pendingLiveEdits: pendingLiveEdits - 1 ]
+										ifFalse: [ updateFromRawView ]
+								]
 						]
 				];
 				acceptResponse: [:ed <CodeMirrorFragment> :event <Event> |
@@ -840,8 +857,10 @@ These maps are stored here so that they can be passed to newly created Amplefort
 			^[
 				| newHTML = scrubbedLiveViewSource. |
 				
-				(* Note that the live view was edited *)
-				updatingFromLive: true.
+				(* Note that the live view was edited: one more raw-view change event is
+       now owed to changeResponse (an echo under Croquet, synchronous on the
+       plain platform) and must not rebuild the live view when it arrives. *)
+				pendingLiveEdits: pendingLiveEdits + 1.
 				
 				(* Stamp the shared node with the edit's text hash BEFORE mutating the
        document. The mutation publishes contentsChanged; with the hash already

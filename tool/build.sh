@@ -126,6 +126,13 @@ cp ./*.ns ./*.png out
 # real primordialsoup.html loader at runtime. Served from out/ and mirrored to
 # deploy targets by the deploy scripts.
 cp ./deploy-boot.js out
+# TelescreenTemplate.zip: the presentation template new decks are cloned from.
+# The tracked copy here is canonical - it was NOT, until 2026-08-26, when the
+# copy actually in use lived in the untracked sibling web/docs and the tracked
+# one had drifted a year behind it (see 07fb60d). Copying it on every build keeps
+# out/ - and so every deployment served from it - in step with the repository,
+# rather than with whatever happened to be lying in docs/.
+cp ./TelescreenTemplate.zip out
 # cp -R CodeMirror out # CodeMirror is copied during deploy
 
 # 7a. Stage self-hosted third-party JS (isomorphic-git, lightning-fs).

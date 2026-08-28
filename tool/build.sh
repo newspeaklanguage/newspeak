@@ -116,6 +116,13 @@ NSEOF
 mkdir -p out
 cp ${PRIMORDIALSOUP}/out/ReleaseEmscriptenWASM/primordialsoup.* out
 cp ${PRIMORDIALSOUP}/out/ReleaseEmscriptenWASM/croquetpsoup.* out
+# The Croquet client library: the LOCAL build of the patched fork
+# (dev/web/croquet), which croquetpsoup.html and the JS deploys load as
+# croquet.min.js. Stock CDN builds lack the NS patches (serializer own-property
+# probes; files-server URL rebasing for cross-device fetches), so the staged
+# copy must come from the fork. Rebuild it there with
+#   packages/croquet/build.sh (or npm run build-prod-pub) when it changes.
+cp ${PRIMORDIALSOUP}/../croquet/packages/croquet/pub/croquet.min.js out
 cp ${PRIMORDIALSOUP}/out/snapshots/*.vfuel out
 # 6. Copy Psoup Newspeak code
 cp ${PRIMORDIALSOUP}/newspeak/*.ns out

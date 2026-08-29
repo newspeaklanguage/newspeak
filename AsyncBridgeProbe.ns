@@ -1,0 +1,321 @@
+Newspeak3
+'Newspeak'
+class AsyncBridgeProbe usingPlatform: platform = Object new (
+	(* Conformance probe for the async boundary between JavaScript and Newspeak.
+
+ It answers one question, on which a larger decision rests: can we express
+ asynchrony in Newspeak promises (platform actors) and confine JS promises to a
+ thin adapter, instead of letting JS promises spread through the system?
+
+ The crux is whether a Newspeak promise can be resolved from inside a JS
+ callback, since that is the only way a value ever crosses the boundary. The
+ callback runs as an expatriated block, which is exactly where this bridge is
+ known to misbehave: a raise unwinding out of a `then:` closure loses the
+ rejection, callbacks must return marshalable values, and psoup delivers the
+ LAST JS argument to every callback parameter while the JS runtime delivers the
+ true order.
+
+ RUN IT ON BOTH RUNTIMES. The point is the comparison: primordialsoup uses
+ Actors.ns, the JS deploy uses ActorsForJS.ns, and they are separate
+ implementations of the same protocol. A result from one says nothing about the
+ other, and anything we build has to work on both.
+
+   psoup / IDE:  (AsyncBridgeProbe usingPlatform: platform) runAllToConsole
+   JS deploy:    same expression from the deployed page's entry point
+
+ Probes report one line each, and the harness is deliberately paranoid about the
+ failure modes under investigation: a probe that never settles reports HANG
+ rather than hanging, and a probe that settles twice reports DOUBLE — a
+ duplicated settlement is as much a finding as a lost one.
+
+ Probes run concurrently and report as they land, so ordering between them is
+ not significant. One exception, and it is why probe 9 is last: it deliberately
+ raises out of a JS then-closure, the case documented to corrupt the alien
+ stack. If probes that already reported PASS start failing when 9 is enabled,
+ that itself is the answer about bridge corruption. *)
+	
+	|
+		private js = platform js.
+		private Resolver = platform actors Resolver.
+		private Promises = platform actors Promise.
+		private Timer = platform actors Timer.
+		private List = platform collections List.
+	|
+) (
+	class Probe name: n <String> deadline: ms <Integer> report: blk <[:String | Object]> = Object new (
+		(* One probe with a deadline and a single-settlement latch. Answers exactly
+   one report line, whatever happens — including nothing happening. *)
+		
+		|
+			public probeName <String> = n.
+			private deadlineMs <Integer> = ms.
+			private reportBlock <[:String | Object]> = blk.
+			settled <Boolean> ::= false.
+		|
+	) (
+		public arm = (
+			(* A JS-side timer, not a Newspeak one: the deadline must not depend on
+	   the machinery under test. *)
+			
+			global setTimeout: [
+					settled ifFalse: [
+							settle: 'HANG'
+								detail: 'no settlement within ' , deadlineMs printString , 'ms'
+						].
+					nil
+				]
+				with: deadlineMs
+		)
+		public fail: detail <String> = (
+			settle: 'FAIL' detail: detail
+		)
+		public pass: detail <String> = (
+			settle: 'PASS' detail: detail
+		)
+		public settle: outcome <String> detail: detail <String> = (
+			settled ifTrue: [
+					^reportBlock value: 'DOUBLE ' , probeName , ' — settled again: ' , outcome , ' ' , detail
+				].
+			settled:: true.
+			reportBlock value: outcome , ' ' , probeName , ' — ' , detail
+		)
+	) : ()
+	
+	(* Forced lazily, at module body rather than in the slot block: the JS side is
+ not safe to touch at snapshot-creation time, and an eagerly captured global
+ comes back undefined. *)
+	lazy private global = js global.
+	lazy private JSON = global at: #JSON.
+	lazy private JSPromise = global at: #Promise.
+	public runAll: report <[:String | Object]> = (
+		(* Every probe is independent and self-timing. Probe 9 runs last because it
+   may corrupt the bridge for anything after it. *)
+		
+		report value: '--- async bridge probe ---'.
+		probe1JSPromiseControl: report.
+		probe2FulfillFromJSCallback: report.
+		probe3BreakFromJSCallback: report.
+		probe4RaiseInWhenFulfilled: report.
+		probe5TurnSemantics: report.
+		probe6NewspeakTimer: report.
+		probe7EventualSendToPromise: report.
+		probe8CallbackArgumentOrder: report.
+		probe9RaiseInJSThen: report
+	)
+	public runAllToConsole = (
+		(* Console rather than Transcript: the same call has to work from the IDE and
+   from a deployed JS page. *)
+		
+		| console |
+		console:: global at: #console.
+		runAll: [:line <String> |
+				[ console log: line ] on: Exception do: [:e | nil ].
+				nil
+			]
+	)
+	probe1JSPromiseControl: report <[:String | Object]> = (
+		(* Control. If this fails, nothing below is interpretable — the JS side of
+   the bridge is broken, not the Newspeak side. *)
+		
+		| p |
+		p:: Probe name: '1 js-promise-control' deadline: 2000 report: report.
+		p arm.
+		(JSPromise resolve: 7) then: [:v |
+				v = 7 ifTrue: [ p pass: 'JS then: delivered 7' ]
+					ifFalse: [ p fail: 'JS then: delivered ' , v printString ].
+				nil
+			]
+	)
+	probe2FulfillFromJSCallback: report <[:String | Object]> = (
+		(* THE CRUX. A Newspeak promise fulfilled from inside a JS callback. If this
+   fails, the whole "confine JS promises to an adapter" plan is dead, because
+   this is the only way a value crosses the boundary. *)
+		
+		| p r |
+		p:: Probe name: '2 ns-fulfill-from-js-callback' deadline: 2000 report: report.
+		p arm.
+		r:: Resolver new.
+		Promises when: r promise
+			fulfilled: [:v |
+				v = 42 ifTrue: [ p pass: 'whenFulfilled: got 42' ]
+					ifFalse: [ p fail: 'whenFulfilled: got ' , v printString ].
+				nil
+			]
+			broken: [:e |
+				p fail: 'unexpectedly broken: ' , e printString.
+				nil
+			].
+		global setTimeout: [
+				[ r fulfill: 42 ] on: Exception
+					do: [:e |
+						p fail: 'fulfill: raised inside the JS callback: ' , e printString
+					].
+				nil
+			]
+			with: 10
+	)
+	probe3BreakFromJSCallback: report <[:String | Object]> = (
+		(* The error path across the same boundary. A lost rejection is the failure
+   that costs the most, because it presents as a hang. *)
+		
+		| p r |
+		p:: Probe name: '3 ns-break-from-js-callback' deadline: 2000 report: report.
+		p arm.
+		r:: Resolver new.
+		Promises when: r promise
+			fulfilled: [:v |
+				p fail: 'unexpectedly fulfilled with ' , v printString.
+				nil
+			]
+			broken: [:e |
+				p pass: 'broken: got ' , e printString.
+				nil
+			].
+		global setTimeout: [
+				[ r break: 'deliberate reason' ] on: Exception
+					do: [:e | p fail: 'break: raised inside the JS callback: ' , e printString ].
+				nil
+			]
+			with: 10
+	)
+	probe4RaiseInWhenFulfilled: report <[:String | Object]> = (
+		(* Does an exception raised in a whenFulfilled: block break the DERIVED
+   promise (the Newspeak-native answer), or vanish the way a raise out of a
+   JS then-closure does? This is the single biggest ergonomic difference
+   between the two idioms: if the derived promise breaks, ordinary
+   on:Exception discipline works and the "never raise in a then:" rule dies
+   with it. *)
+		
+		| p r derived |
+		p:: Probe name: '4 ns-raise-in-whenFulfilled' deadline: 2000 report: report.
+		p arm.
+		r:: Resolver new.
+		derived:: Promises when: r promise
+			fulfilled: [:v | Error signal: 'deliberate' ]
+			broken: [:e | nil ].
+		Promises when: derived
+			fulfilled: [:v |
+				p fail: 'derived promise fulfilled with ' , v printString , ' — the raise vanished'.
+				nil
+			]
+			broken: [:e |
+				p pass: 'derived promise broke with ' , e printString.
+				nil
+			].
+		global setTimeout: [
+				[ r fulfill: 1 ] on: Exception
+					do: [:e | p fail: 'fulfill: raised: ' , e printString ].
+				nil
+			]
+			with: 10
+	)
+	probe5TurnSemantics: report <[:String | Object]> = (
+		(* whenFulfilled: on an ALREADY-resolved promise must still run in a later
+   turn. If it runs synchronously, callers can be re-entered from inside
+   their own stack — the class of bug that produced runaway re-render in the
+   changeset presenter. *)
+		
+		| p r ranSynchronously |
+		p:: Probe name: '5 ns-turn-semantics' deadline: 2000 report: report.
+		p arm.
+		r:: Resolver new.
+		r fulfill: 'already'.
+		ranSynchronously:: true.
+		Promises when: r promise
+			fulfilled: [:v |
+				ranSynchronously ifTrue: [ p fail: 'whenFulfilled: ran synchronously' ]
+					ifFalse: [ p pass: 'whenFulfilled: deferred to a later turn' ].
+				nil
+			]
+			broken: [:e | nil ].
+		ranSynchronously:: false
+	)
+	probe6NewspeakTimer: report <[:String | Object]> = (
+		(* A Newspeak-native timer would let hostServices express deadlines without
+   reaching for setTimeout at all. Failure here is not fatal — it only means
+   the adapter keeps owning timers. *)
+		
+		| p |
+		p:: Probe name: '6 ns-timer' deadline: 2000 report: report.
+		p arm.
+		[
+			Timer __duration: 10
+				callback: [ p pass: 'platform actors Timer fired' ]
+				repeating: false
+		] on: Exception
+			do: [:e | p fail: 'Timer construction raised: ' , e printString ]
+	)
+	probe7EventualSendToPromise: report <[:String | Object]> = (
+		(* Promise pipelining: a message sent to a promise before it resolves should
+   be queued and delivered afterwards. This is the feature JS promises cannot
+   express, and the reason the tool loop might read better in this idiom. *)
+		
+		| p r pipelined |
+		p:: Probe name: '7 eventual-send-to-promise' deadline: 2000 report: report.
+		p arm.
+		r:: Resolver new.
+		pipelined:: [ r promise <-: size ] on: Exception
+			do: [:e |
+				p fail: 'eventual send raised at send time: ' , e printString.
+				nil
+			].
+		pipelined isNil ifFalse: [
+				Promises when: pipelined
+					fulfilled: [:n |
+						n = 5 ifTrue: [ p pass: 'pipelined send answered 5' ]
+							ifFalse: [ p fail: 'pipelined send answered ' , n printString ].
+						nil
+					]
+					broken: [:e |
+						p fail: 'pipelined send broke: ' , e printString.
+						nil
+					]
+			].
+		global setTimeout: [
+				[ r fulfill: 'hello' ] on: Exception do: [:e | nil ].
+				nil
+			]
+			with: 10
+	)
+	probe8CallbackArgumentOrder: report <[:String | Object]> = (
+		(* Documents, rather than judges, a known runtime difference: psoup delivers
+   the LAST JS argument to every callback parameter (peek-without-pop) while
+   the JS runtime delivers the true order. Any shared adapter must be written
+   to be correct under both. forEach is used because it passes
+   (element, index, array). *)
+		
+		| p arr |
+		p:: Probe name: '8 callback-argument-order' deadline: 2000 report: report.
+		p arm.
+		arr:: JSON parse: '[7]'.
+		[
+			arr forEach: [:element :index |
+					p pass: 'element=' , element printString , ' index=' , index printString , ' (psoup delivers the last arg to both; JS delivers true order)'.
+					nil
+				]
+		] on: Exception do: [:e | p fail: 'forEach raised: ' , e printString ]
+	)
+	probe9RaiseInJSThen: report <[:String | Object]> = (
+		(* LAST, deliberately. Raises a Newspeak exception out of a JS then-closure —
+   the case documented in AIAccess>>completeWithToolLoop as losing the
+   rejection and leaving garbage on the alien stack. Expected to FAIL or HANG
+   on psoup; the question is whether the JS runtime behaves differently, and
+   whether anything after it is affected. *)
+		
+		| p |
+		p:: Probe name: '9 js-raise-in-then (known hazard)'
+			deadline: 3000
+			report: report.
+		p arm.
+		((JSPromise resolve: 1) then: [:v |
+				Error signal: 'deliberate raise inside then:'
+			]) then: [:v |
+				p fail: 'downstream then: ran with ' , v printString , ' — the raise was swallowed'.
+				nil
+			]
+			onError: [:e |
+				p pass: 'raise surfaced as a rejection: ' , e printString.
+				nil
+			]
+	)
+) : ()

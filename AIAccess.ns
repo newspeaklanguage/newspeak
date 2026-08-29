@@ -198,6 +198,19 @@ class AIAccess usingPlatform: platform = Object new (
 			
 			subclassResponsibility
 		)
+		public enableServerWebToolsMaxUses: n <Integer> = (
+			(* Ask the provider to run web search/fetch on ITS OWN infrastructure
+	   rather than through our browser, declaring at most n uses per turn
+	   (n <= 0 disables). Server-side execution sidesteps CORS entirely:
+	   the fetch happens on the provider's servers, so no
+	   Access-Control-Allow-Origin header is needed from the target and
+	   no proxy has to be run or trusted.
+
+	   Default: a no-op, so a provider with no server-side web tools (or
+	   none wired up yet) is unaffected and callers need no type test. *)
+			
+			^self
+		)
 		public pendingToolUseIdsIn: messages <List> ^<List[String]> = (
 			(* The ids of tool calls at the END of the history that were never
 	   answered by a tool_result. Non-empty exactly when a turn died
@@ -268,43 +281,6 @@ class AIAccess usingPlatform: platform = Object new (
 			role:: safeStringAt: (messages at: messages size) field: 'role'.
 			role = 'model' ifTrue: [ ^'assistant' ].
 			^role
-		)
-		safeAt: receiver <Object> field: field <String | Integer> = (
-			(* Defensive JS field access for *structural navigation*. JS
-	   `undefined` USUALLY maps to Newspeak `nil` in primordialsoup's
-	   alien bridge, but not in every edge case (e.g. some object
-	   shapes where the at: dispatch raises rather than returns nil).
-	   Wrap every field access on response-tree nodes in this so a
-	   deviant shape produces nil rather than blowing up the chat
-	   session. Returns nil for missing fields or non-respondent
-	   receivers; otherwise returns the field value AS-IS — which may
-	   still be JS undefined for callers that read scalar leaves
-	   directly. For those, use safeStringAt:field: instead. *)
-			
-			receiver isNil ifTrue: [ ^nil ].
-			^[ receiver at: field ] on: Exception do: [:e | nil ]
-		)
-		safeStringAt: receiver <Object> field: field <String | Integer> ^<String | UndefinedObject> = (
-			(* Defensive String-field access. Like safeAt: but additionally
-	   filters out JS undefined / null / non-String values that the
-	   alien bridge sometimes passes through as values which fail
-	   isNil. Returns nil if the field is missing or not a String,
-	   otherwise the String value.
-
-	   Mechanism: a real String concatenated with the empty String
-	   returns itself. Anything else (JS undefined, JS null, numbers,
-	   objects) raises on `,` and is normalised to nil. Cheap, single
-	   alien round-trip, no type-class guessing.
-
-	   Use this at every leaf where you read a string field from an
-	   alien (response.parts[i].text, tool name, etc.) and intend to
-	   use it in a String context. *)
-			
-			| v |
-			receiver isNil ifTrue: [ ^nil ].
-			v:: [ receiver at: field ] on: Exception do: [:e | nil ].
-			v isNil ifTrue: [ ^nil ].
-			^[ v , '' ] on: Exception do: [:e | nil ]
 		)
 		public supportsFileUploads ^<Boolean> = (
 			(* Capability hint: does this provider accept image/PDF/document blocks
@@ -492,6 +468,14 @@ class AIAccess usingPlatform: platform = Object new (
 			public model <String> ::= mdl.
 			private apiUrl <String> = 'https://api.anthropic.com/v1/messages'.
 			private apiVersion <String> = '2023-06-01'.
+			
+			(* How many provider-run web searches/fetches a turn may make. 0
+	   disables them entirely, which is the default — see
+	   enableServerWebToolsMaxUses:. The tool DESCRIPTORS are not stored:
+	   they depend on the model, which is mutable (the picker can switch
+	   it mid-session), so they are computed per request in
+	   serverToolSpecs. *)
+			public serverWebToolUses <Integer> ::= 0.
 		|
 	) (
 		public staticFallbackModels ^<List[String]> = (
@@ -828,18 +812,101 @@ class AIAccess usingPlatform: platform = Object new (
 	   and input_schema (parsed JSON object). Returns nil if no tools, so
 	   the request body's 'tools' field is omitted. *)
 			
-			| arr <Alien[Array]> |
-			toolDefs isEmpty ifTrue: [ ^nil ].
+			| arr <Alien[Array]> specs <List[String]> shadowed <List[String]> |
+			specs:: serverToolSpecs.
+			(toolDefs isEmpty and: [ specs isEmpty ]) ifTrue: [ ^nil ].
 			arr:: createJSArray.
-			toolDefs do: [:t <Tool> |
-					| obj <Alien> |
-					obj:: createJSObject.
-					obj at: 'name' put: t name.
-					obj at: 'description' put: t description.
-					obj at: 'input_schema' put: (JSON parse: t inputSchema).
+			
+			(* Server tools first, collecting the names they claim. A server tool
+	   and one of ours can carry the SAME name — Anthropic's web_fetch vs
+	   our own — and the API rejects a tools array with duplicate names.
+	   The server one wins: it does the same job without being subject to
+	   the browser's CORS policy, so it is strictly better. Dropping the
+	   shadowed client tool here (rather than at the call site) keeps the
+	   rule where the collision is knowable. *)
+			shadowed:: List new.
+			specs do: [:spec <String> |
+					| obj <Alien> nm |
+					obj:: JSON parse: spec.
+					nm:: safeStringAt: obj field: 'name'.
+					nm isNil ifFalse: [ shadowed add: nm ].
 					arr push: obj
 				].
+			toolDefs do: [:t <Tool> |
+					| obj <Alien> |
+					(shadowed includes: t name) ifFalse: [
+							obj:: createJSObject.
+							obj at: 'name' put: t name.
+							obj at: 'description' put: t description.
+							obj at: 'input_schema' put: (JSON parse: t inputSchema).
+							arr push: obj
+						]
+				].
 			^arr
+		)
+		public enableServerWebToolsMaxUses: n <Integer> = (
+			(* Declare Anthropic's server-run web_search and web_fetch tools. They
+	   execute on Anthropic's infrastructure, so they are not subject to
+	   the browser's CORS policy the way our own local_fetch tool is —
+	   this is what lets the model actually read the web from the IDE.
+
+	   Stores only the cap; the descriptors are built per request, because
+	   which tool VERSION is legal depends on the model, and the model can
+	   change mid-session via the picker. *)
+			
+			serverWebToolUses:: n
+		)
+		effectiveServerWebToolUses ^<Integer> = (
+			(* Nil-tolerant: a provider built before this slot existed (schema
+	   migration on hot-load) reads nil, not 0. *)
+			
+			serverWebToolUses isNil ifTrue: [ ^0 ].
+			^serverWebToolUses
+		)
+		supportsDynamicWebTools ^<Boolean> = (
+			(* The 20260209 web tools filter results with server-side code
+	   execution before they reach the context window, and are accepted
+	   only on the models listed here. Older models — Haiku 4.5 and the
+	   legacy Sonnet 4 in our own picker among them — must be sent the
+	   basic variants instead, or the request is rejected.
+
+	   This list and the version strings in serverToolSpecs are the parts
+	   most likely to drift as Anthropic revises these tools; they are
+	   deliberately kept together, as data, so updating them is a
+	   one-line edit. *)
+			
+			^{'claude-opus-5'. 'claude-opus-4-8'. 'claude-opus-4-7'. 'claude-opus-4-6'. 'claude-sonnet-5'. 'claude-sonnet-4-6'. 'claude-fable-5'. 'claude-mythos-5'. } inject: false
+				into: [:found <Boolean> :prefix <String> |
+					found or: [ [ model startsWith: prefix ] on: Exception do: [:e | false ] ]
+				]
+		)
+		serverToolSpecs ^<List[String]> = (
+			(* JSON descriptors for the server-run web tools, built for the
+	   CURRENT model. Empty when the cap is 0.
+
+	   No anthropic-beta header is involved — these tools are GA. An
+	   earlier draft of this code sent one, which is exactly the kind of
+	   staleness the model check above guards against.
+
+	   NB: the 20260209 variants run code execution under the hood to
+	   filter results, so we must NOT also declare a code_execution tool —
+	   a second execution environment confuses the model. *)
+			
+			| n <Integer> specs <List[String]> searchVersion <String> fetchVersion <String> |
+			n:: effectiveServerWebToolUses.
+			specs:: List new.
+			n > 0 ifFalse: [ ^specs ].
+			supportsDynamicWebTools ifTrue: [
+					searchVersion:: 'web_search_20260209'.
+					fetchVersion:: 'web_fetch_20260209'
+				]
+				ifFalse: [
+					searchVersion:: 'web_search_20250305'.
+					fetchVersion:: 'web_fetch_20250910'
+				].
+			specs add: '{"type": "' , searchVersion , '", "name": "web_search", "max_uses": ' , n printString , '}'.
+			specs add: '{"type": "' , fetchVersion , '", "name": "web_fetch", "max_uses": ' , n printString , '}'.
+			^specs
 		)
 		public pendingToolUseIdsIn: messages <List> ^<List[String]> = (
 			(* Anthropic: unanswered calls show up as tool_use blocks in a
@@ -2367,31 +2434,177 @@ class AIAccess usingPlatform: platform = Object new (
 				ifFalse: [ mt ]
 		] on: Exception do: [:e4 | '<unprintable exception>' ]
 	)
-	public webFetch: url <String> ^<Alien[Promise]> = (
-		(* Generic GET helper exposed to tools (web_fetch). Returns a Promise
-	   that resolves to the response body as a String, or rejects with a
-	   diagnostic string on HTTP error.
+	safeAt: receiver <Object> field: field <String | Integer> = (
+		(* Defensive JS field access for *structural navigation*. JS `undefined`
+   USUALLY maps to Newspeak `nil` in primordialsoup's alien bridge, but not in
+   every edge case (e.g. some object shapes where the at: dispatch raises rather
+   than returns nil). Wrap every field access on response-tree nodes in this so
+   a deviant shape produces nil rather than blowing up the chat session. Returns
+   nil for missing fields or non-respondent receivers; otherwise returns the
+   field value AS-IS — which may still be JS undefined for callers that read
+   scalar leaves directly. For those, use safeStringAt:field: instead.
 
-	   Like the provider doRequest: methods, we check status as a number
-	   rather than response.ok (getter access via the alien bridge is
-	   unreliable), and reject via Promise.reject rather than `Error
-	   signal:` to avoid unwinding through the bridge from inside a
-	   then-closure. *)
+   Lives at MODULE level so that BOTH the providers and the module's own
+   webFetch: can reach it: a nested class sees its enclosing scope, but a module
+   method cannot see a nested class's members. It sat on Provider until
+   2026-08-29, which made every successful webFetch: die with
+   `MessageNotUnderstood: AIAccess safeAt:field:` at the status check. *)
+		
+		receiver isNil ifTrue: [ ^nil ].
+		^[ receiver at: field ] on: Exception do: [:e | nil ]
+	)
+	safeStringAt: receiver <Object> field: field <String | Integer> ^<String | UndefinedObject> = (
+		(* Defensive String-field access. Like safeAt: but additionally filters out JS
+   undefined / null / non-String values that the alien bridge sometimes passes
+   through as values which fail isNil. Returns nil if the field is missing or
+   not a String, otherwise the String value.
+
+   Mechanism: a real String concatenated with the empty String returns itself.
+   Anything else (JS undefined, JS null, numbers, objects) raises on `,` and is
+   normalised to nil. Cheap, single alien round-trip, no type-class guessing.
+
+   Use this at every leaf where you read a string field from an alien
+   (response.parts[i].text, tool name, etc.) and intend to use it in a String
+   context. Module-level for the same reason as safeAt:field: above. *)
+		
+		| v |
+		receiver isNil ifTrue: [ ^nil ].
+		v:: [ receiver at: field ] on: Exception do: [:e | nil ].
+		v isNil ifTrue: [ ^nil ].
+		^[ v , '' ] on: Exception do: [:e | nil ]
+	)
+	public webFetch: url <String> ^<Alien[Promise]> = (
+		(* Generic GET behind the local_fetch tool. Tries the URL directly and, if the
+   fetch never completed, retries through the local CORS proxy — the same one
+   the repository clone path already uses (tool/cors-proxy.py, default
+   http://localhost:9999, convention <proxy>/<host>/<path>).
+
+   Direct first, proxy second, rather than always proxying: a direct hit is one
+   round trip, keeps the request on the user's own network identity, and reaches
+   same-origin resources the proxy would refuse. The proxy is the fallback for
+   exactly the case that used to be fatal — a cross-origin target that sends no
+   Access-Control-Allow-Origin.
+
+   ONLY transport failures are retried. An HTTP error is a real answer from the
+   server: re-fetching it through the proxy would double the traffic and could
+   mask the status.
+
+   Configure via localStorage 'ns_ai_web_fetch_proxy' — another prefix to
+   relocate it, or 'off' to disable the fallback entirely. Note the proxy always
+   speaks https upstream, so an http:// target is not proxyable. *)
+		
+		| proxied <String | UndefinedObject> |
+		proxied:: proxiedUrlFor: url.
+		^(fetchAndRead: url) then: [:body | body ]
+			onError: [:directError |
+				| desc <String> |
+				desc:: describeRejection: directError.
+				((desc startsWith: transportMarker) and: [ proxied isNil not ]) ifTrue: [
+						(fetchAndRead: proxied) then: [:body | body ]
+							onError: [:proxyError |
+								JSPromise reject: 'local_fetch failed both directly and through the proxy for ' , url , String lf , '  direct: ' , desc , String lf , '  proxy (' , proxied , '): ' , (describeRejection: proxyError) , String lf , 'If the proxy leg failed to connect, it is probably not running: python3 tool/cors-proxy.py'
+							]
+					]
+					ifFalse: [
+						JSPromise reject: (proxied isNil ifTrue: [
+									desc , String lf , '(No proxy fallback was attempted: either localStorage ns_ai_web_fetch_proxy is ''off'', or this URL is not http/https.)'
+								]
+								ifFalse: [ desc ])
+					]
+			]
+	)
+	fetchAndRead: url <String> ^<Alien[Promise]> = (
+		(* One attempt. Rejects with a transportMarker-prefixed reason when the fetch
+   itself never completed — CORS, DNS, refused connection, offline — since the
+   browser exposes no status, headers or body for that class. Rejects with
+   'HTTP <status>' plus a body excerpt when the server did answer >= 400: an
+   error PAGE is often the whole diagnosis (a Cloudflare 1014 names its own
+   misconfiguration), so it is returned rather than discarded. *)
 		
 		| options <Alien> |
 		options:: createJSObject.
 		options at: 'method' put: 'GET'.
 		^(global fetch: url with: options) then: [:response <Alien> |
 				[
-					| status <Integer | UndefinedObject> |
+					| status <Integer | UndefinedObject> statusText <String> |
 					status:: safeAt: response field: 'status'.
+					statusText:: safeStringAt: response field: 'statusText'.
+					statusText isNil ifTrue: [ statusText:: '' ].
 					(status isNil or: [ status >= 400 ]) ifTrue: [
-							JSPromise reject: 'HTTP ' , (status isNil ifTrue: [ '(no status)' ]
-									ifFalse: [ status printString ]) , ' fetching ' , url
+							response text then: [:body <String> |
+									JSPromise reject: 'HTTP ' , (statusLabel: status) , ' ' , statusText , ' fetching ' , url , String lf , 'Response body: ' , (excerptOf: body)
+								]
+								onError: [:e2 |
+									JSPromise reject: 'HTTP ' , (statusLabel: status) , ' ' , statusText , ' fetching ' , url , ' (response body unreadable)'
+								]
 						]
 						ifFalse: [ response text ]
 				] on: Exception
-					do: [:e | JSPromise reject: 'webFetch error: ' , (errorDescription: e) ]
+					do: [:e | JSPromise reject: 'local_fetch error: ' , (errorDescription: e) ]
 			]
+			onError: [:err |
+				JSPromise reject: transportMarker , url , ' — ' , (describeRejection: err) , '. The browser reports no status, headers or body for this class of failure, so it does NOT establish that the site is down.'
+			]
+	)
+	transportMarker ^<String> = (
+		(* Prefix marking "the request never completed", which is the only class of
+   failure worth retrying through the proxy. *)
+		
+		^'TRANSPORT '
+	)
+	statusLabel: status <Integer | UndefinedObject> ^<String> = (
+		status isNil ifTrue: [ ^'(no status)' ].
+		^status printString
+	)
+	describeRejection: reason ^<String> = (
+		(* A promise rejection may be a Newspeak String we produced or a JS error
+   alien; normalise either to something printable without raising. *)
+		
+		^[ reason , '' ] on: Exception
+			do: [:e |
+				[ reason printString ] on: Exception do: [:e2 | '(unprintable rejection)' ]
+			]
+	)
+	webFetchProxyPrefix ^<String | UndefinedObject> = (
+		(* Proxy prefix from localStorage 'ns_ai_web_fetch_proxy'; absent means the
+   default, 'off' means no fallback. Same per-user config pattern as the API
+   keys, so nothing is baked into the image. *)
+		
+		| raw <String | UndefinedObject> |
+		raw:: [ js localStorage getItem: 'ns_ai_web_fetch_proxy' ] on: Exception
+			do: [:e | nil ].
+		raw isNil ifTrue: [ ^'http://localhost:9999' ].
+		(raw isKindOfString and: [ raw isEmpty ]) ifTrue: [ ^'http://localhost:9999' ].
+		raw = 'off' ifTrue: [ ^nil ].
+		^raw
+	)
+	proxiedUrlFor: url <String> ^<String | UndefinedObject> = (
+		(* Rewrite https://host/path as <proxy>/host/path, the convention
+   @isomorphic-git/cors-proxy and tool/cors-proxy.py both use. Answers nil when
+   there is no proxy configured or the URL is not http/https — the proxy speaks
+   https upstream regardless, so an http:// target cannot be forwarded
+   faithfully and is not attempted. *)
+		
+		| prefix <String | UndefinedObject> rest <String> |
+		prefix:: webFetchProxyPrefix.
+		prefix isNil ifTrue: [ ^nil ].
+		(prefix endsWith: '/') ifTrue: [
+				prefix:: prefix copyFrom: 1 to: prefix size - 1
+			].
+		(url startsWith: 'https://') ifTrue: [ rest:: url copyFrom: 9 to: url size ]
+			ifFalse: [ ^nil ].
+		rest isEmpty ifTrue: [ ^nil ].
+		^prefix , '/' , rest
+	)
+	excerptOf: body <String> ^<String> = (
+		(* First ~1200 characters of a response body. Enough to carry an error page's
+   actual message without flooding the conversation. *)
+		
+		| limit <Integer> |
+		limit:: 1200.
+		^[
+			body size <= limit ifTrue: [ body ]
+				ifFalse: [ (body copyFrom: 1 to: limit) , String lf , '... (truncated)' ]
+		] on: Exception do: [:e | '(unreadable body)' ]
 	)
 ) : ()

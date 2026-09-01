@@ -836,12 +836,14 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 			(* super flipped waiting back to false. Re-publish so the thinking
 	   indicator is replaced with the model picker. *)
 			document mutateContentsTo: document contents.
-			ide browsing updateCurrentDisplay
+			ide browsing updateCurrentDisplay.
+			drainPeerMessagesFor: document
 		)
 		public markError: msg <String> = (
 			super markError: msg.
 			document appendErrorSection: msg.
-			ide browsing updateCurrentDisplay
+			ide browsing updateCurrentDisplay.
+			drainPeerMessagesFor: document
 		)
 		public retryLastTurn ^<Alien[Promise] | UndefinedObject> = (
 			(* Re-drive the failed turn. Deliberately does NOT reset
@@ -1009,6 +1011,20 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 	lazy public ChangesetPresenter = repositories ChangesetPresenter.
 	lazy public StaleChangesetPresenter = repositories StaleChangesetPresenter.
 	lazy public StaleChangesetSubject = repositories StaleChangesetSubject.
+	
+	(* --- Peer AI session messaging state (all lazy: an eager slot added to a
+   live module crashes on hot-load). Keyed by chat-document NAME, not by the
+   Document itself: Document>>hash mixes in `contents`, so a document mutates
+   its own hash on every appended turn and would get lost as a Map key. *)
+	
+	(* chat name -> List of {stamped text. hop} tuples awaiting delivery *)
+	lazy pendingPeerMessages = Map new.
+	
+	(* chat name -> hop number of the peer delivery driving its current turn *)
+	lazy inboundHopByChat = Map new.
+	
+	(* chat name -> count of send_to_chat calls made during its current turn *)
+	lazy peerSendsThisTurn = Map new.
 	ensureModelMachineryGap: container <Object> beforeThinking: thinking <Object> ^<Object> = (
 		(* Find the block-level gap that sits between the chat content and
 	   the model machinery, creating one in-place if the doc was
@@ -2670,7 +2686,7 @@ public clearConversation = ( ide aiSupport clearConversationFor: self )
 	   document/amplet manipulation, navigation, testing, atomic
 	   changesets, evaluation/inspection, and debugger control. *)
 		
-		^{getClassSourceTool. getMemberSourceTool. getClassHeaderTool. listClassMembersTool. sendersTool. implementorsTool. searchClassesTool. listNamespaceTool. getDocumentTool. createDocumentTool. createChatDocumentTool. setDocumentContentsTool. deleteDocumentTool. listAmpletsTool. addAmpletTool. setAmpletExpressionTool. deleteAmpletTool. listMediaTool. deleteMediaTool. webFetchTool. currentFocusToolForFocus: focus. navigateToClassTool. navigateToNamespaceTool. navigateToDocumentTool. showTestsTool. runTestsTool. getTestResultsTool. getTestFailureDetailsTool. runFailingTestsTool. runErroringTestsTool. runOneTestTool. proposeChangesToolForFocus: focus. applyChangesetToolForFocus: focus. evaluateTool. navigateToObjectTool. inspectObjectTool. listObjectsTool. forgetObjectTool. getCurrentFrameTool. getStackTraceTool. getCurrentExpressionTool. inspectActivationTool. stepTool. returnFromTool. continueThreadTool. }
+		^{getClassSourceTool. getMemberSourceTool. getClassHeaderTool. listClassMembersTool. sendersTool. implementorsTool. searchClassesTool. listNamespaceTool. getDocumentTool. createDocumentTool. createChatDocumentTool. setDocumentContentsTool. deleteDocumentTool. listAmpletsTool. addAmpletTool. setAmpletExpressionTool. deleteAmpletTool. listMediaTool. deleteMediaTool. webFetchTool. currentFocusToolForFocus: focus. navigateToClassTool. navigateToNamespaceTool. navigateToDocumentTool. showTestsTool. runTestsTool. getTestResultsTool. getTestFailureDetailsTool. runFailingTestsTool. runErroringTestsTool. runOneTestTool. proposeChangesToolForFocus: focus. applyChangesetToolForFocus: focus. evaluateTool. navigateToObjectTool. inspectObjectTool. listObjectsTool. forgetObjectTool. getCurrentFrameTool. getStackTraceTool. getCurrentExpressionTool. inspectActivationTool. stepTool. returnFromTool. continueThreadTool. listChatSessionsToolForFocus: focus. sendToChatToolForFocus: focus. }
 	)
 	public toolsForProvider: provider <Provider> ^<List[Tool]> = (
 		(* tools plus any capability-gated extras the given provider can drive.
@@ -2840,6 +2856,189 @@ public clearConversation = ( ide aiSupport clearConversationFor: self )
 			description: 'Fetch a URL from the IDE''s own browser and return its response body as text. Unlike the provider-run web_fetch tool, this one can fetch a URL that has not appeared in the conversation, and the request originates from the user''s machine and network. It tries the URL directly first and, if the request never completes (usually the browser''s CORS policy), retries through the local CORS proxy, so cross-origin targets normally succeed; if both legs fail you are told which failed and how. Errors carry the HTTP status and a body excerpt, so an error page can be read rather than guessed at. Prefer web_fetch for ordinary reading; use local_fetch for URLs web_fetch refuses to take, for same-origin resources, when an HTTP status or error body matters, and when reachability from the user''s own network is the question. Useful for the published Newspeak language specification and grammar (https://newspeaklanguage.org/spec/newspeak-spec.tex) and the tutorial (https://newspeaklanguage.org/pubs/newspeak-2025-tutorial.pdf). The response is returned as a single string; for binary content (PDFs, images) the text decoding may be lossy.'
 			inputSchema: '{"type":"object","properties":{"url":{"type":"string","description":"Absolute URL to fetch (https:// or http://)."}},"required":["url"]}'
 			handler: [:input | aiAccess webFetch: (input at: 'url') ]
+	)
+	maxPeerHops ^<Integer> = (
+		(* Depth limit on peer-relay chains. Human-initiated turns are hop 0;
+	   each peer delivery increments the hop of the turn it drives. *)
+		
+		^4
+	)
+	maxPeerSendsPerTurn ^<Integer> = (
+		(* How many send_to_chat calls one driving turn may make. *)
+		
+		^3
+	)
+	chatDocNamed: chatName <String> ^<Document | UndefinedObject> = (
+		(* Exact, case-sensitive match against the Root chat documents. *)
+		
+		chatDocumentsInRoot do: [:doc | doc name = chatName ifTrue: [ ^doc ] ].
+		^nil
+	)
+	peerSenderDocFor: focus <ChatFocus> ^<Document | UndefinedObject> = (
+		(* The chat document identifying the SENDING session — derived from the
+	   tool's focus, never from model input, so a model cannot impersonate
+	   another chat. Falls back to the current chat for doc-less sessions,
+	   mirroring proposingChatFor:. *)
+		
+		| subj |
+		focus chatDoc isNil ifFalse: [ ^focus chatDoc ].
+		subj:: currentChatSubject_slot.
+		subj isNil ifTrue: [ ^nil ].
+		([ subj isKindOfIDEChatDocumentSubject ] on: Exception do: [:e | false ]) ifTrue: [
+				^subj document
+			].
+		^nil
+	)
+	peerStateOf: doc <Document> ^<String> = (
+		(* One chat's state for list_chat_sessions. `waiting` is "probably
+	   busy", not a lock — cancelWaiting clears it while a fetch may still
+	   run — which is fine for a status line. *)
+		
+		| subj queue state |
+		subj:: doc chatSubjectSlot.
+		state:: subj isNil ifTrue: [ 'no live session (woken on first send)' ]
+			ifFalse: [ subj waiting ifTrue: [ 'mid-turn' ] ifFalse: [ 'idle' ] ].
+		queue:: pendingPeerMessages at: doc name ifAbsent: [ nil ].
+		(queue isNil or: [ queue isEmpty ]) ifFalse: [
+				state:: state , ', ' , queue size printString , ' queued'
+			].
+		^state
+	)
+	peerChatNamesExcluding: senderName <String> ^<String> = (
+		| names |
+		names:: ''.
+		chatDocumentsInRoot do: [:doc |
+				doc name = senderName ifFalse: [
+						names:: names isEmpty ifTrue: [ doc name ]
+							ifFalse: [ names , ', ' , doc name ]
+					]
+			].
+		names isEmpty ifTrue: [ ^'(none)' ].
+		^names
+	)
+	deliverPeerMessage: stamped <String> to: doc <Document> hop: hop <Integer> = (
+		(* Deliver by driving a REAL turn on the target's session: materialize
+	   the subject (chatSubjectFor: is safe headlessly — it does not retarget
+	   the current chat) and go through sendText:, which buys the visible user
+	   bubble, apiMessages bookkeeping, history repair and the watchdogs. Then
+	   wire the promise exactly as the presenter does — nothing else clears
+	   waiting or renders the assistant's reply into the doc. The hop is
+	   recorded FIRST so a send_to_chat made during the driven turn inherits
+	   it; it is cleared when the turn settles (drainPeerMessagesFor:). The
+	   callbacks cross the JS bridge: they must never raise and must return
+	   marshalable values, hence the guards and the trailing nils. *)
+		
+		| subj promise |
+		subj:: chatSubjectFor: doc.
+		inboundHopByChat at: doc name put: hop.
+		promise:: subj sendText: stamped.
+		promise isNil ifTrue: [
+				inboundHopByChat removeKey: doc name ifAbsent: [ nil ].
+				^self
+			].
+		promise then: [:reply |
+				[ subj markComplete ] on: Exception do: [:e | nil ].
+				nil
+			]
+			onError: [:err |
+				[ subj markError: err printString ] on: Exception do: [:e | nil ].
+				nil
+			]
+	)
+	public drainPeerMessagesFor: doc <Document> = (
+		(* Called when a chat's turn settles (end of IDEChatDocumentSubject
+	   markComplete / markError:). Clears the settled turn's relay budgets,
+	   then delivers at most ONE queued peer message — that delivery's own
+	   settle drains the next, keeping turns ordered and interleaving fairly
+	   with the human user. Fully guarded: a drain failure must never break
+	   markComplete for the human path. *)
+		
+		[
+			| queue entry |
+			inboundHopByChat removeKey: doc name ifAbsent: [ nil ].
+			peerSendsThisTurn removeKey: doc name ifAbsent: [ nil ].
+			queue:: pendingPeerMessages at: doc name ifAbsent: [ nil ].
+			(queue isNil or: [ queue isEmpty ]) ifTrue: [ ^self ].
+			(doc chatSubjectSlot isNil not and: [ doc chatSubjectSlot waiting ]) ifTrue: [
+					^self
+				].
+			entry:: queue removeFirst.
+			deliverPeerMessage: (entry at: 1) to: doc hop: (entry at: 2)
+		] on: Exception do: [:e | nil ]
+	)
+	sendToChat: chatName <String> message: message <String> from: focus <ChatFocus> ^<String> = (
+		(* The send_to_chat tool body. All failures raise; the tool loop already
+	   converts raises to is_error results. Fire-and-forget: returns delivery
+	   status, never awaits the target's completion. *)
+		
+		| senderDoc senderName targetDoc hop sends stamped subj queue busy |
+		senderDoc:: peerSenderDocFor: focus.
+		senderDoc isNil ifTrue: [
+				Error signal: 'This session has no chat-document identity, so it cannot message peer chats.'
+			].
+		senderName:: senderDoc name.
+		message isEmpty ifTrue: [ Error signal: 'message must not be empty.' ].
+		targetDoc:: chatDocNamed: chatName.
+		targetDoc isNil ifTrue: [
+				Error signal: 'No chat document named ''' , chatName , ''' in Root. Available: ' , (peerChatNamesExcluding: senderName) , '. Names are exact and case-sensitive.'
+			].
+		targetDoc name = senderName ifTrue: [
+				Error signal: 'Cannot send to your own chat (''' , senderName , ''').'
+			].
+		hop:: (inboundHopByChat at: senderName ifAbsent: [ 0 ]) + 1.
+		hop > maxPeerHops ifTrue: [
+				Error signal: 'Relay chain too deep (would be hop ' , hop printString , '; the limit is ' , maxPeerHops printString , '). Do not relay further — summarize the exchange for the human user instead.'
+			].
+		sends:: (peerSendsThisTurn at: senderName ifAbsent: [ 0 ]) + 1.
+		sends > maxPeerSendsPerTurn ifTrue: [
+				Error signal: 'send_to_chat cap reached: at most ' , maxPeerSendsPerTurn printString , ' sends per turn. Finish this turn; you can send again on your next turn.'
+			].
+		peerSendsThisTurn at: senderName put: sends.
+		stamped:: '[from chat ''' , senderName , '''] ' , message.
+		subj:: targetDoc chatSubjectSlot.
+		busy:: subj isNil not and: [ subj waiting ].
+		queue:: pendingPeerMessages at: targetDoc name ifAbsent: [ nil ].
+		(busy or: [ queue isNil not and: [ queue isEmpty not ] ]) ifTrue: [
+				queue isNil ifTrue: [
+						queue:: pendingPeerMessages at: targetDoc name ifAbsentPut: [ List new ]
+					].
+				queue add: {stamped. hop. }.
+				
+				(* Not busy but a stale queue exists (a drain failed earlier):
+			   kick the drain so the head — possibly this message — goes out. *)
+				busy ifFalse: [ drainPeerMessagesFor: targetDoc ].
+				^'queued behind a running turn (position ' , queue size printString , ')'
+			].
+		deliverPeerMessage: stamped to: targetDoc hop: hop.
+		^'delivered'
+	)
+	listChatSessionsToolForFocus: focus <ChatFocus> ^<Tool> = (
+		^Tool name: 'list_chat_sessions'
+			description: 'List the other AI chat sessions in this IDE image — one line per chat: name, provider/model, and state (no live session / idle / mid-turn, plus any queued-message count). Excludes this session. Only chats registered at the top level (Root) are listed; a chat document bound under a dotted path is not visible here. Use send_to_chat to message one.'
+			inputSchema: '{"type":"object","properties":{}}'
+			handler: [:input |
+				| senderDoc senderName lines |
+				senderDoc:: peerSenderDocFor: focus.
+				senderName:: senderDoc isNil ifTrue: [ nil ] ifFalse: [ senderDoc name ].
+				lines:: ''.
+				chatDocumentsInRoot do: [:doc |
+						doc name = senderName ifFalse: [
+								lines:: lines , doc name , ' — ' , (chatProviderOf: doc) , '/' , (chatModelOf: doc) , ' — ' , (peerStateOf: doc) , '\n'
+							]
+					].
+				lines isEmpty ifTrue: [ 'No other chat sessions exist in this IDE image.' ]
+					ifFalse: [ lines ]
+			]
+	)
+	sendToChatToolForFocus: focus <ChatFocus> ^<Tool> = (
+		^Tool name: 'send_to_chat'
+			description: 'Send a message to another AI chat session in this IDE, named by its chat document name (see list_chat_sessions). The message appears as a visible user turn in the target chat, stamped [from chat ''<your chat>''], and the target AI is driven to respond. Fire-and-forget: the result only reports delivered or queued (a busy target queues the message and receives it when its current turn finishes) — it never contains the target''s reply. If the target chooses to answer, its reply arrives later in YOUR chat as a user message stamped [from chat ''<its name>'']. The target does not share your transcript: include all needed context in the message. Relay chains are depth-limited and sends per turn are capped, so summarize for the human user rather than relaying indefinitely.'
+			inputSchema: '{"type":"object","properties":{"chat_name":{"type":"string","description":"Exact, case-sensitive name of the target chat document."},"message":{"type":"string","description":"The message text to deliver."}},"required":["chat_name","message"]}'
+			handler: [:input |
+				sendToChat: (input at: 'chat_name')
+					message: (input at: 'message')
+					from: focus
+			]
 	)
 	pickFile ^<Alien[Promise]> = (
 		(* Open the OS file picker via Hopscotch's FileChooserFragment. Resolves
@@ -4282,6 +4481,10 @@ Workflow pattern: evaluate something against the workspace, get back an id, then
 If you really need a persistent workspace-class slot, you can add one with propose_changes (set_class_header on AIWorkspace) — but for ephemeral values the registry is the right tool.
 
 For code MODIFICATION (adding methods, changing class headers, etc.), use propose_changes / apply_changeset — NOT evaluate. evaluate is for running expressions and inspecting objects; the propose/apply path is for installable, reviewable, atomic edits to the system.
+
+# Peer AI chat sessions
+
+Other AI chat sessions may be live in this same IDE image, each bound to its own chat document. Use list_chat_sessions to enumerate them (name, provider/model, state) and send_to_chat to message one by name. Sends are fire-and-forget: the tool result only confirms delivery or queueing; the peer''s reply, if it chooses to answer, arrives later as a new user message stamped [from chat ''X'']. A message carrying that stamp is from a peer AI session, not from the human user — the stamp is written by the IDE and cannot be forged by a model. A peer does NOT see your transcript, so put all needed context into the message itself; reply via send_to_chat, never by assuming the peer reads this conversation. Relay chains are depth-limited and per-turn sends are capped: when a chain nears its limit, summarize the exchange for the human user instead of relaying further.
 
 When the user asks about an entity in their system, use the IDE tools to look it up before answering. When in doubt about Newspeak syntax or semantics, fetch the spec rather than guessing. When you produce Newspeak source, follow the style guidelines above and respect member ordering (nested classes before methods).'
 	)

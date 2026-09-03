@@ -303,3 +303,42 @@ driver lived in the reboot-wiped scratchpad), liveview-edit and
 transclusion/timer/random determinism suites (same — need reconstruction from
 their session summaries). Stock out/ vfuels still pre-change; stock
 croquetpsoup.js already carries nsUnsubscribe (additive, inert for old vfuels).
+
+## 9. Follow-through (2026-09-03)
+
+COMMITTED after Gilad's interactive pass: newspeak master c973a10 (base
+disposal + CM selection-handler fix) + f68667c (Croquet lifecycle, glue
+mirror, plan doc, probe harness); psoup extraRevs 257f085 (nsUnsubscribe);
+webide-ai-access merged master (24c843a). Only my hunks were staged in
+HopscotchForHTML5.ns - another session's uncommitted work (navigator
+registerNewPresenter rework, AI model picker; also AIAccess.ns,
+AI_IDE_Support.ns, Documents.ns) was left untouched.
+
+NS2JS half VERIFIED: deploy driver reconstructed
+(croquet-probes/deploy-driver2.js - packages a Croquet JS IDE deploy from a
+headless plain psoup IDE via a workspace doIt, ~25s with
+--disable-background-timer-throttling, artifacts renamed to
+CroquetJSIDE-TEST.*). eval-probe5 js and latejoin-probe js both FULL PASS,
+censuses and scoped ids identical to psoup.
+
+typing-test.js (reconstruction of the liveview test's risky core): 9KB
+buffer over the detour, 6 chars typed under echo pressure - A==B
+convergence PASS, focus held, registry steady at 6 CM keys, syncRandom
+draw agrees across clients. Some typed chars interleave with delayed
+full-text echoes: the KNOWN PARKED fast-typing race (rate budget), not a
+regression - the identity machinery is idle during typing (no
+reconciliation; registry constant). A stock-baseline A/B run failed
+environmentally (stock vfuel likely stale vs committed state).
+
+MENU LEAK FIXED (uncommitted, awaiting Gilad's IDE pass): Menu gains
+public retire; DropDownMenuFragment holds currentMenu (adopted through
+same-kind transfer), retires the previous menu inside the synchronized
+open (updateContent) and at noticeDisposal. menu-probe.js: 3 synced opens
+=> exactly 1 nsmenu_ key throughout (was +1 per open). eval-probe5 +
+latejoin-probe re-PASS on the rebuilt TEST vfuel; typechecker 275/275.
+
+Still unreconstructed from the reboot: transclusion/timer determinism
+suites and the full document-liveview test (croquet-liveview-edit-test).
+NS2JS deploy predates the menu fix (platform-neutral; re-package via
+deploy-driver2.js when wanted). Stage-ii retarget-cell migration remains
+deferred until the explicit unsub/resub has soaked.

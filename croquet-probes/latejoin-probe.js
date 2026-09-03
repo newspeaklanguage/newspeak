@@ -11,7 +11,10 @@ const http = require('http');
 const WebSocket = require('ws');
 const CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const SESSION = 'ljprobe' + Math.floor(Date.now() / 1000);
-const URL = 'http://localhost:8080/croquetpsoup.html?snapshot=CroquetHopscotchWebIDE-TEST.vfuel&sessionId=' + SESSION + '&pwd=test&appId=org.newspeaklanguage.evprobe&apiKey=none&reflector=ws://localhost:9090&files=/files';
+const PAGE = process.argv[2] === 'js'
+  ? 'CroquetJSIDE-TEST.html?sessionId='
+  : 'croquetpsoup.html?snapshot=CroquetHopscotchWebIDE-TEST.vfuel&sessionId=';
+const URL = 'http://localhost:8080/' + PAGE + SESSION + '&pwd=test&appId=org.newspeaklanguage.evprobe&apiKey=none&reflector=ws://localhost:9090&files=/files';
 const CENSUS = `(function(){var c={button:0,imagebutton:0,codemirror:0,hyperlink:0,other:0};
   Array.from(newspeakSubscriptions.keys()).forEach(function(k){
     if(k.indexOf('nsbutton_')===0)c.button++;

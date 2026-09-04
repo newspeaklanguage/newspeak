@@ -1,5 +1,5 @@
 Newspeak3
-'Root'
+'Newspeak'
 class AIAccess usingPlatform: platform = Object new (
 	(* Provides AI model access from Newspeak. Supports multiple providers
  via the Provider abstraction. Manages multi-turn conversations with
@@ -444,6 +444,80 @@ class AIAccess usingPlatform: platform = Object new (
 						]
 				]
 		)
+		public stopReasonOf: response <Alien> ^<String | UndefinedObject> = (
+			(* The wire-level reason the model stopped, as this provider's raw string
+	   (Anthropic 'end_turn'/'max_tokens'/'tool_use', Gemini 'STOP'/'MAX_TOKENS',
+	   OpenAI 'stop'/'length'/'tool_calls'), or nil when the response carries
+	   none. Base answers nil so an untaught provider degrades to "unknown". *)
+			
+			^nil
+		)
+		public wasTruncated: response <Alien> ^<Boolean> = (
+			(* Did the model stop because it exhausted the output-token budget? When
+	   true, any tool_use blocks in the response are suspect: the model was
+	   still emitting when it was cut off, so a call's input may be a prefix
+	   of what it meant to send. Session refuses to execute such calls. *)
+			
+			^false
+		)
+		public usageOf: response <Alien> ^<Map[Symbol, Integer] | UndefinedObject> = (
+			(* Token accounting for one request/response, normalised across providers
+	   to the keys #input #output #cacheRead #cacheWrite (absent counts read as
+	   0), or nil if the response reports no usage. *)
+			
+			^nil
+		)
+		public costOfUsage: u <Map[Symbol, Integer]> ^<Number | UndefinedObject> = (
+			(* Estimated US-dollar cost of one request's normalised usage map, or
+	   nil when this provider has no price table — the UI then shows token
+	   counts without dollars. AnthropicProvider overrides. *)
+			
+			^nil
+		)
+		usageInput: i output: o cacheRead: r cacheWrite: w ^<Map[Symbol, Integer]> = (
+			| m <Map[Symbol, Integer]> = Map new. |
+			m at: #input put: (tokenCountOrZero: i);
+				at: #output put: (tokenCountOrZero: o);
+				at: #cacheRead put: (tokenCountOrZero: r);
+				at: #cacheWrite put: (tokenCountOrZero: w).
+			^m
+		)
+		tokenCountOrZero: v ^<Integer> = (
+			(* Usage leaves arrive through the alien bridge as JS numbers — usually a
+	   SmallInteger, occasionally a Float — or as undefined (missing field) or
+	   nil. Anything that is not a number counts as 0.
+
+	   NB: asInteger, not truncated. In this kernel truncated is defined on
+	   Float/Fraction only, so an Integer count raised DNU and was swallowed
+	   as 0 — which zeroed every token total while requestCount kept climbing. *)
+			
+			^[ v isNil ifTrue: [ 0 ] ifFalse: [ v asInteger ] ] on: Exception
+				do: [:e | 0 ]
+		)
+		public complete: messages <Alien[Array]> system: systemPrompt <String> notices: notices <List[String]> tools: tools <Alien[Array] | UndefinedObject> maxTokens: maxTokens <Integer> ^<Alien[Promise]> = (
+			(* As complete:system:tools:maxTokens:, with the turn's one-shot system
+	   notices passed separately from the stable prompt. Default: fold them
+	   into one string — the pre-caching behaviour, correct for every
+	   provider. A provider with a prefix cache (Anthropic) overrides this to
+	   keep the static prompt byte-stable across turns and ship the notices
+	   outside the cached region. *)
+			
+			^complete: messages
+				system: (foldNotices: notices intoSystem: systemPrompt)
+				tools: tools
+				maxTokens: maxTokens
+		)
+		foldNotices: notices <List[String]> intoSystem: systemPrompt <String> ^<String> = (
+			notices isEmpty ifTrue: [ ^systemPrompt ].
+			^systemPrompt , String lf , (noticesText: notices)
+		)
+		noticesText: notices <List[String]> ^<String> = (
+			(* The out-of-band-updates paragraph a turn's pending system notices
+	   render to. One line per notice. *)
+			
+			^notices inject: 'IMPORTANT — out-of-band updates since your last turn:'
+				into: [:acc :line | acc , String lf , '- ' , line ]
+		)
 	) : ()
 	public class AnthropicProvider apiKey: key <String> model: mdl <String> = Provider new (
 		(* Provider for Anthropic's Messages API (Claude models). Conversation
@@ -552,25 +626,61 @@ class AIAccess usingPlatform: platform = Object new (
 				].
 			^tuples
 		)
-		public complete: messages <Alien[Array]> system: systemPrompt <String> tools: tools <Alien[Array]> maxTokens: maxTokens <Integer> ^<Alien[Promise]> = (
+		public complete: messages <Alien[Array]> system: systemPrompt <String> notices: notices <List[String]> tools: tools <Alien[Array]> maxTokens: maxTokens <Integer> ^<Alien[Promise]> = (
+			(* Overrides the base fold-into-one-string version: this provider has a
+	   prefix cache, and the request is assembled to actually use it.
+
+	   Two cache_control breakpoints (Anthropic allows four):
+
+	   - The static system prompt is one block with a 1-HOUR breakpoint.
+	     Tools render before system on the wire, so this single marker caches
+	     tools + system together. 1h rather than the 5-minute default because
+	     IDE conversations pause for review-and-return gaps; a cache read
+	     refreshes the TTL free of charge, so the long static prefix stays
+	     warm through chatter and gaps alike. (Entries with the longer TTL
+	     must precede shorter ones — holds, since system renders before the
+	     messages breakpoint.)
+
+	   - markMessagesForCache: puts the 5-minute conversation breakpoint on
+	     the last content block of the last message, so each request reads
+	     the entire prior conversation from cache and pays full input price
+	     only for the new tail. Without it the whole history was re-billed
+	     uncached on every request — the dominant cost of a long session.
+
+	   The one-shot notices ride a SEPARATE block after the system
+	   breakpoint: folding them into the cached block (as the old
+	   effectiveSystemPrompt did) re-billed the entire prompt cache on every
+	   notice turn. A notice turn still invalidates the conversation cache
+	   once — its block sits between system and messages on the wire — but
+	   notice turns are the exception, not the rule. *)
+			
 			| body headers options |
 			body:: createJSObject.
 			body at: 'model' put: model.
 			body at: 'max_tokens' put: maxTokens.
+			markMessagesForCache: messages.
 			body at: 'messages' put: messages.
-			systemPrompt isEmpty ifFalse: [
-					| sysArr textBlock cacheControl |
-					
-					(* Send system as a content-block array with cache_control so Anthropic
-		   caches the (long, static) Newspeak prompt across turns. *)
+			(systemPrompt isEmpty and: [ notices isEmpty ]) ifFalse: [
+					| sysArr |
 					sysArr:: createJSArray.
-					textBlock:: createJSObject.
-					textBlock at: 'type' put: 'text'.
-					textBlock at: 'text' put: systemPrompt.
-					cacheControl:: createJSObject.
-					cacheControl at: 'type' put: 'ephemeral'.
-					textBlock at: 'cache_control' put: cacheControl.
-					sysArr push: textBlock.
+					systemPrompt isEmpty ifFalse: [
+							| textBlock cacheControl |
+							textBlock:: createJSObject.
+							textBlock at: 'type' put: 'text'.
+							textBlock at: 'text' put: systemPrompt.
+							cacheControl:: createJSObject.
+							cacheControl at: 'type' put: 'ephemeral'.
+							cacheControl at: 'ttl' put: '1h'.
+							textBlock at: 'cache_control' put: cacheControl.
+							sysArr push: textBlock
+						].
+					notices isEmpty ifFalse: [
+							| noticesBlock |
+							noticesBlock:: createJSObject.
+							noticesBlock at: 'type' put: 'text'.
+							noticesBlock at: 'text' put: (noticesText: notices).
+							sysArr push: noticesBlock
+						].
 					body at: 'system' put: sysArr
 				].
 			tools isNil ifFalse: [
@@ -608,11 +718,83 @@ class AIAccess usingPlatform: platform = Object new (
 						]
 				]
 		)
+		markMessagesForCache: messages <Alien[Array]> = (
+			(* Move this request's conversation cache_control breakpoint to the last
+	   content block of the LAST message.
+
+	   The marked message and block are COPIES; the stored history entry is
+	   never touched. Mutating stored messages would accumulate one marker
+	   per request until Anthropic's four-breakpoint limit rejects the
+	   request outright. A marker that moves (or vanishes) between requests
+	   does not invalidate the prefix: marker position is metadata, not
+	   content, so entries written by earlier requests still hit.
+
+	   The last message at request time is always user-role: plain text from
+	   addUserText: (an array of text blocks; sessions created before that
+	   change may hold a bare string, wrapped here into the equivalent
+	   one-block array on the wire) or the tool_result round from
+	   addToolResults:toMessages: — and text and tool_result blocks both
+	   accept cache_control. Anything unexpected is left unmarked, and the
+	   whole method is guarded: it must never break a request it can only
+	   make cheaper. *)
+			
+			[
+				| len last content cc msgCopy blocks |
+				len:: messages at: 'length'.
+				len = 0 ifTrue: [ ^self ].
+				last:: messages at: len - 1.
+				content:: last at: 'content'.
+				cc:: createJSObject.
+				cc at: 'type' put: 'ephemeral'.
+				blocks:: createJSArray.
+				content isKindOfString ifTrue: [
+						| blk |
+						blk:: createJSObject.
+						blk at: 'type' put: 'text'.
+						blk at: 'text' put: content.
+						blk at: 'cache_control' put: cc.
+						blocks push: blk
+					]
+					ifFalse: [
+						| clen lastBlock t blockCopy i |
+						clen:: safeAt: content field: 'length'.
+						(clen isNil or: [ clen = 0 ]) ifTrue: [ ^self ].
+						lastBlock:: safeAt: content field: clen - 1.
+						t:: safeStringAt: lastBlock field: 'type'.
+						(t = 'text' or: [
+								t = 'tool_result' or: [ t = 'image' or: [ t = 'document' ] ]
+							]) ifFalse: [ ^self ].
+						i:: 0.
+						[ i < (clen - 1) ] whileTrue: [
+								blocks push: (content at: i).
+								i:: i + 1
+							].
+						blockCopy:: (global at: 'Object') assign: createJSObject with: lastBlock.
+						blockCopy at: 'cache_control' put: cc.
+						blocks push: blockCopy
+					].
+				msgCopy:: createJSObject.
+				msgCopy at: 'role' put: (last at: 'role').
+				msgCopy at: 'content' put: blocks.
+				messages at: len - 1 put: msgCopy
+			] on: Exception do: [:e | nil ]
+		)
 		public addUserText: text <String> toMessages: messages <List> = (
-			| userMsg <Alien> |
+			(* The text is stored as an array holding one text block, not as a bare
+	   content string, so that the message's wire form is byte-stable whether
+	   or not it is currently the last message (markMessagesForCache: marks a
+	   block-array copy; a string would flip representation between the
+	   marked request and every later one). *)
+			
+			| userMsg <Alien> blocks <Alien> blk <Alien> |
+			blk:: createJSObject.
+			blk at: 'type' put: 'text'.
+			blk at: 'text' put: text.
+			blocks:: createJSArray.
+			blocks push: blk.
 			userMsg:: createJSObject.
 			userMsg at: 'role' put: 'user'.
-			userMsg at: 'content' put: text.
+			userMsg at: 'content' put: blocks.
 			messages add: userMsg
 		)
 		public appendAssistantResponse: response <Alien> toMessages: messages <List> = (
@@ -671,9 +853,12 @@ class AIAccess usingPlatform: platform = Object new (
 	   include non-text blocks (tool_use, future block types) whose
 	   'text' is JS undefined; isNil doesn't catch undefined.
 
-	   For user entries with array content (tool_result messages), skip:
-	   they're not for the human reader. For assistant entries, gather
-	   only 'text' blocks. *)
+	   For user entries, gather 'text' blocks: addUserText: stores the
+	   user's words as an array of text blocks (see its comment), while a
+	   tool_result round's array holds no text blocks and so stays hidden
+	   from the human reader, as before. Bare-string content (sessions
+	   predating the block-array change) still displays directly. For
+	   assistant entries, gather only 'text' blocks. *)
 			
 			| result <List> |
 			result:: List new.
@@ -683,6 +868,23 @@ class AIAccess usingPlatform: platform = Object new (
 					content:: msg at: 'content'.
 					role = 'user' ifTrue: [
 							content isKindOfString ifTrue: [ result add: {role. content. } ]
+								ifFalse: [
+									| text <String> len |
+									text:: ''.
+									len:: safeAt: content field: 'length'.
+									len isNil ifFalse: [
+											0 to: len - 1
+												do: [:i <Integer> |
+													| block t |
+													block:: safeAt: content field: i.
+													(safeStringAt: block field: 'type') = 'text' ifTrue: [
+															t:: safeStringAt: block field: 'text'.
+															t isNil ifFalse: [ text:: text , t ]
+														]
+												]
+										].
+									text isEmpty ifFalse: [ result add: {role. text. } ]
+								]
 						].
 					role = 'assistant' ifTrue: [
 							| text <String> len |
@@ -978,6 +1180,74 @@ class AIAccess usingPlatform: platform = Object new (
 			userMsg at: 'content' put: contentArr.
 			messages add: userMsg
 		)
+		public stopReasonOf: response <Alien> ^<String | UndefinedObject> = (
+			^safeStringAt: response field: 'stop_reason'
+		)
+		public wasTruncated: response <Alien> ^<Boolean> = (
+			^(stopReasonOf: response) = 'max_tokens'
+		)
+		public usageOf: response <Alien> ^<Map[Symbol, Integer] | UndefinedObject> = (
+			| usage m breakdown |
+			usage:: safeAt: response field: 'usage'.
+			usage isNil ifTrue: [ ^nil ].
+			m:: usageInput: (safeAt: usage field: 'input_tokens')
+				output: (safeAt: usage field: 'output_tokens')
+				cacheRead: (safeAt: usage field: 'cache_read_input_tokens')
+				cacheWrite: (safeAt: usage field: 'cache_creation_input_tokens').
+			
+			(* The cache_creation object splits the write count by TTL. The two
+		   are priced differently (1.25x base input for 5-minute entries, 2x
+		   for 1-hour), so costOfUsage: wants the split; readers that only
+		   care about the total keep using #cacheWrite. *)
+			breakdown:: safeAt: usage field: 'cache_creation'.
+			breakdown isNil ifFalse: [
+					m at: #cacheWrite5m
+						put: (tokenCountOrZero: (safeAt: breakdown
+								field: 'ephemeral_5m_input_tokens')).
+					m at: #cacheWrite1h
+						put: (tokenCountOrZero: (safeAt: breakdown
+								field: 'ephemeral_1h_input_tokens'))
+				].
+			^m
+		)
+		mtokRatesForModel: m <String> ^<Array | UndefinedObject> = (
+			(* {input $/MTok. output $/MTok} — Anthropic's published API prices as
+	   of 2026-09, matched on the model-family substring so point and dated
+	   releases (claude-fable-5-1) price with their family. THE one place to
+	   edit when prices change. An unknown family answers nil and the UI
+	   shows token counts without dollars. sonnet-5 must be tested before
+	   the generic sonnet row, which carries the 4.x price. *)
+			
+			(m includesSubstring: 'fable') ifTrue: [ ^{10. 50. } ].
+			(m includesSubstring: 'mythos') ifTrue: [ ^{10. 50. } ].
+			(m includesSubstring: 'opus') ifTrue: [ ^{5. 25. } ].
+			(m includesSubstring: 'sonnet-5') ifTrue: [ ^{2. 10. } ].
+			(m includesSubstring: 'sonnet') ifTrue: [ ^{3. 15. } ].
+			(m includesSubstring: 'haiku') ifTrue: [ ^{1. 5. } ].
+			^nil
+		)
+		public costOfUsage: u <Map[Symbol, Integer]> ^<Number | UndefinedObject> = (
+			(* Estimated US-dollar cost of one request's normalised usage map,
+	   priced for the CURRENT model — recordUsageFrom: calls this per
+	   request, so a mid-session model switch prices each request at the
+	   model that actually served it. Cache reads bill at 0.1x the input
+	   rate; cache writes at 1.25x (5-minute TTL) and 2x (1-hour) — the
+	   split comes from usageOf:'s #cacheWrite5m/#cacheWrite1h when the
+	   response carried it, else the whole write count is priced at the
+	   5-minute rate. Decimal literals are exact here (Fractions), so the
+	   accumulated total carries no float drift; it is an ESTIMATE only
+	   because the rate table can lag Anthropic's pricing page. *)
+			
+			| rates in out w5 w1 |
+			rates:: mtokRatesForModel: model.
+			rates isNil ifTrue: [ ^nil ].
+			in:: rates at: 1.
+			out:: rates at: 2.
+			w5:: u at: #cacheWrite5m ifAbsent: [ u at: #cacheWrite ifAbsent: [ 0 ] ].
+			w1:: u at: #cacheWrite1h ifAbsent: [ 0 ].
+			^(u at: #input ifAbsent: [ 0 ]) * in + ((u at: #output ifAbsent: [ 0 ]) * out) + ((u at: #cacheRead
+				ifAbsent: [ 0 ]) * in * 0.1) + (w5 * in * 1.25) + (w1 * in * 2) / 1000000
+		)
 	) : ()
 	public class Session provider: p <Provider> tools: toolList <List[Tool]> = Object new (
 		(* A multi-turn AI conversation bound to one provider. Holds the message
@@ -1001,121 +1271,71 @@ class AIAccess usingPlatform: platform = Object new (
 	   etc.) to inspect or mutate. *)
 			public apiMessages <List[Alien]> = List new.
 			public systemPrompt <String> ::= 'You are a helpful Newspeak programming assistant.'.
-			public maxTokens <Integer> ::= 4096.
+			
+			(* Output-token budget per request. Was 4096, which a single large tool
+	   argument (a document body, a class source) exceeds; the model then stops
+	   with a truncated tool call. Every model in the providers' fallback lists
+	   accepts 16384. *)
+			public maxTokens <Integer> ::= 16384.
 			
 			(* Optional zero-arg callback invoked when conversation state changes
 	   (a user message added, an assistant turn appended, an error
-	   recorded). Used by chat UIs to refresh without polling. *)
+	   recorded, a phase change). Used by chat UIs to refresh without polling. *)
 			public onUpdate <[Object] | UndefinedObject>
 			
-			(* One-shot system-context lines to fold into the NEXT turn's system
-		   prompt, then clear. Used to tell this session about out-of-band changes
-		   (e.g. another AI session edited the codebase) without polluting the
-		   visible message history. See addSystemNotice:/effectiveSystemPrompt. *)
+			(* One-shot system-context lines shipped with the NEXT turn's requests
+		   (passed to the provider's complete:system:notices:tools:maxTokens:,
+		   separately from the stable systemPrompt so a notice cannot invalidate
+		   the provider's prompt cache), then cleared. See addSystemNotice:. *)
 			pendingSystemNotices <List[String]> = List new.
 			
-			(* Watchdog budgets, in milliseconds. Nothing else on the API path
-		   bounds time: a fetch that never settles (dropped connection,
-		   sleeping laptop, proxy blackhole) used to leave the turn's promise
-		   pending forever, pinning the UI at "…thinking…" with no exit but
-		   reloading the page. See withWatchdog:ms:reason:.
-
-		   requestTimeoutMs covers one provider request; a tool-use turn makes
-		   several and each gets its own budget. toolTimeoutMs covers one
-		   round of tool execution — tools may legitimately be slow (a clone,
-		   a big search), hence the larger default. Set either to 0 to
-		   disable that watchdog. *)
+			(* Watchdog budgets, in milliseconds; 0 disables. requestTimeoutMs covers
+		   one provider request, toolTimeoutMs one round of tool execution. See
+		   withWatchdog:ms:reason:. *)
 			public requestTimeoutMs <Integer> ::= 120000.
 			public toolTimeoutMs <Integer> ::= 180000.
+			
+			(* Mid-turn progress, for the status UI: what the turn is doing right now
+		   ('idle', 'waiting for model', 'running <tools>') and when that began
+		   (JS wall-clock ms). See enterPhase:. *)
+			public phase <String> ::= 'idle'.
+			public phaseStartedAt <Number> ::= 0.
+			
+			(* Token accounting, from provider usageOf:. lastUsage is the most recent
+		   request's normalised map (#input #output #cacheRead #cacheWrite); the
+		   totals accumulate over the session. requestCount counts provider
+		   round-trips (a tool-use turn makes several). *)
+			public lastUsage <Map[Symbol, Integer] | UndefinedObject>
+			public lastStopReason <String | UndefinedObject>
+			public totalInputTokens <Integer> ::= 0.
+			public totalOutputTokens <Integer> ::= 0.
+			public totalCacheReadTokens <Integer> ::= 0.
+			public totalCacheWriteTokens <Integer> ::= 0.
+			public requestCount <Integer> ::= 0.
+			
+			(* User-facing lines about events inside the current turn that the
+		   model's own text may not report (output truncated, tool call refused).
+		   The chat surface drains them with takeTurnNotices when the turn
+		   settles. truncationsThisTurn bounds the refuse-and-retry loop. *)
+			turnNotices <List[String]> = List new.
+			truncationsThisTurn <Integer> ::= 0.
 		|
 		toolList do: [:t <Tool> | toolMap at: t name put: t ].
 	) (
+		
+		(* Running dollar estimate, accumulated per request by recordUsageFrom: at
+   the rates of the model that served each request (provider costOfUsage:),
+   so a mid-session model switch does not reprice history. Lazy DELIBERATELY:
+   these were added while sessions with the eager slots were live, and a new
+   eager slot is nil on every existing instance (schema migration does not
+   re-run initializers) — lazy slots initialize on first touch instead. *)
+		lazy public totalCostUsd ::= 0.
+		lazy public lastCostUsd ::= 0.
 		public addSystemNotice: line <String> = (
 			(* Queue a one-shot line to ride the next turn's system prompt. *)
 			
 			pendingSystemNotices add: line.
 			notifyUpdate
-		)
-		effectiveSystemPrompt ^<String> = (
-			(* systemPrompt plus any pending one-shot notices. Read each completion
-		   within a turn; the notices are cleared once the turn finishes. *)
-			
-			pendingSystemNotices isEmpty ifTrue: [ ^systemPrompt ].
-			^pendingSystemNotices inject: systemPrompt , String lf , 'IMPORTANT — out-of-band updates since your last turn:'
-				into: [:acc :line | acc , String lf , '- ' , line ]
-		)
-		executeToolCall: toolUseBlock <Alien> ^<Alien[Promise]> = (
-			(* Resolve a tool-use block to a tool-result promise. The toolUseBlock
-	   is whatever toolUseBlocksFrom: returned for this provider — by
-	   contract it has 'id', 'name', 'input' top-level fields (Anthropic's
-	   native tool_use block shape; GeminiProvider builds shim objects
-	   with the same surface). The tool_result is constructed via the
-	   provider so its wire shape stays provider-native.
-
-	   Tool handlers may return either a synchronous value or an
-	   Alien[Promise]; both are normalized to a Promise here. Errors at
-	   any point (unknown tool, handler raise, handler-returned promise
-	   rejection) produce an is_error tool_result that the AI sees on
-	   the next turn — rather than a silent chat hang. *)
-			
-			| toolName <String | UndefinedObject> input <Alien> tool <Tool | UndefinedObject> id <String | UndefinedObject> resultOrPromise stage <String> safeId <String> |
-			stage:: 'read id'.
-			[
-				id:: toolUseBlock at: 'id'.
-				stage:: 'read name'.
-				toolName:: toolUseBlock at: 'name'.
-				stage:: 'read input'.
-				input:: toolUseBlock at: 'input'
-			] on: Exception
-				do: [:e |
-					| dump |
-					dump:: [ JSON stringify: toolUseBlock ] on: Exception
-						do: [:e2 | '(unstringifiable)' ].
-					^JSPromise reject: '[executeToolCall stage: ' , stage , '] ' , (errorDescription: e) , ' | block: ' , dump
-				].
-			safeId:: id isNil ifTrue: [ '(no id)' ] ifFalse: [ id ].
-			toolName isNil ifTrue: [
-					| dump |
-					dump:: [ JSON stringify: toolUseBlock ] on: Exception
-						do: [:e2 | '(unstringifiable)' ].
-					^JSPromise reject: 'Tool call missing name field | block: ' , dump
-				].
-			tool:: toolMap at: toolName
-				ifAbsent: [
-					^JSPromise resolve: (toolResultFor: safeId
-							handlerValue: 'Unknown tool: ' , toolName
-							isError: true)
-				].
-			resultOrPromise:: [ tool handler value: input ] on: Exception
-				do: [:e |
-					| msg <String> |
-					
-					(* Be defensive about extracting the error message: some
-			   exceptions (e.g. CannotReturn from a stale stored block)
-			   raise when sent messageText, which would turn the original
-			   tool failure into a silent chat hang. *)
-					msg:: [ 'Error: ' , e messageText ] on: Exception
-						do: [:e2 |
-							[ 'Error: ' , e printString ] on: Exception
-								do: [:e3 | 'Error: <unprintable exception>' ]
-						].
-					^JSPromise resolve: (toolResultFor: id handlerValue: msg isError: true)
-				].
-			
-			(* Promise-returning handler: chain. *)
-			(resultOrPromise isKindOfJSAlien and: [ resultOrPromise includesKey: 'then' ]) ifTrue: [
-					^resultOrPromise then: [:result |
-							toolResultFor: id handlerValue: result isError: false
-						]
-						onError: [:err |
-							toolResultFor: id handlerValue: 'Error: ' , err printString isError: true
-						]
-				].
-			
-			(* Synchronous result. *)
-			^JSPromise resolve: (toolResultFor: id
-					handlerValue: resultOrPromise
-					isError: false)
 		)
 		toolResultFor: id <String> handlerValue: v isError: isError <Boolean> ^<Object> = (
 			(* Normalize a tool handler's resolved value to the canonical
@@ -1157,94 +1377,6 @@ class AIAccess usingPlatform: platform = Object new (
 			mlen isNil ifTrue: [ mlen:: 0 ].
 			(text isEmpty and: [ mlen > 0 ]) ifTrue: [ text:: 'See attached' ].
 			^provider makeToolResult: id textResult: text media: media isError: isError
-		)
-		completeWithToolLoop ^<Alien[Promise]> = (
-			(* One turn of the conversation, with recursion to handle tool-use
-	   rounds. Ships the current apiMessages to the provider, appends the
-	   assistant response, and either:
-	     - If the response contains tool_use blocks: execute each tool,
-	       append a user-role tool_result message holding the outcomes,
-	       recurse to send the results back to the model.
-	     - Else: extract the assistant's text and resolve the outer
-	       promise with it.
-
-	   The entire then-block body is wrapped in on:Exception do:
-	   returning a Promise.reject. Provider methods (appendAssistant-
-	   Response:, missingFieldError:on:) raise on malformed responses; if
-	   we let that raise unwind out of this then-closure, primordial-
-	   soup's JS-Promise bridge loses the rejection (the closure's
-	   rawPush: never runs and the next then-callback in the chain fires
-	   with garbage on the alien stack — observed as receiving
-	   document.documentElement on follow-up turns). See
-	   NEWSPEAK_JS_PROMISE_NOTES_2026-05-18.md for the deep dive. *)
-			
-			^(withWatchdog: (provider complete: (provider messagesAsRequestPayload: apiMessages)
-					system: effectiveSystemPrompt
-					tools: (provider buildToolsPayload: toolDefs)
-					maxTokens: maxTokens)
-				ms: effectiveRequestTimeoutMs
-				reason: (timeoutReason: 'The AI request' ms: effectiveRequestTimeoutMs)) then: [:response |
-					| stage <String> |
-					stage:: 'start of then'.
-					[
-						stage:: 'appendAssistantResponse:'.
-						provider appendAssistantResponse: response toMessages: apiMessages.
-						stage:: 'hasToolUse:'.
-						(provider hasToolUse: response) ifTrue: [
-								| toolBlocks <List> promises <Alien[Array]> |
-								stage:: 'toolUseBlocksFrom:'.
-								toolBlocks:: provider toolUseBlocksFrom: response.
-								promises:: createJSArray.
-								stage:: 'executeToolCall: dispatch'.
-								toolBlocks do: [:tb <Alien> | promises push: (executeToolCall: tb) ].
-								
-								(* Await all tool results, then hand them to the
-					   provider to wrap into a user-role message in its
-					   native shape (Anthropic: content array of
-					   tool_result blocks; Gemini: parts array of
-					   functionResponse parts), then recurse to send
-					   them back to the model. *)
-								stage:: 'Promise.all then'.
-								(withWatchdog: (JSPromise all: promises)
-									ms: effectiveToolTimeoutMs
-									reason: (timeoutReason: 'Tool execution' ms: effectiveToolTimeoutMs)) then: [:results <Alien[Array]> |
-										| innerStage <String> |
-										innerStage:: 'addToolResults:toMessages:'.
-										[
-											provider addToolResults: results toMessages: apiMessages.
-											notifyUpdate.
-											innerStage:: 'recursive completeWithToolLoop'.
-											completeWithToolLoop
-										] on: Exception
-											do: [:e |
-												notifyUpdate.
-												JSPromise reject: '[stage: ' , innerStage , '] ' , (errorDescription: e)
-											]
-									]
-							]
-							ifFalse: [
-								stage:: 'notifyUpdate (no tool use)'.
-								notifyUpdate.
-								stage:: 'extractTextFromResponse:'.
-								provider extractTextFromResponse: response
-							]
-					] on: Exception
-						do: [:e |
-							| dump |
-							notifyUpdate.
-							
-							(* Include the raw provider response in the rejection. This is
-			   the single most useful piece of context when something goes
-			   wrong — protocol drift, vendor returning a new part shape,
-			   or a freshly added provider following the recipe — and it
-			   lets the user paste the chat error verbatim into a bug
-			   report instead of us having to instrument fresh diagnostic
-			   code each time the AI says something unexpected. *)
-							dump:: [ JSON stringify: response ] on: Exception
-								do: [:e2 | '(unstringifiable response)' ].
-							JSPromise reject: '[stage: ' , stage , '] ' , (errorDescription: e) , ' | response: ' , dump
-						]
-				]
 		)
 		notifyUpdate = (
 			(* Fire the on-update callback if one is wired. Used by chat UIs to
@@ -1325,35 +1457,6 @@ class AIAccess usingPlatform: platform = Object new (
 			
 			^apiMessages isEmpty not
 		)
-		public retryLastTurn ^<Alien[Promise]> = (
-			(* Re-drive the current turn with no new user message — "pick up
-	   where it left off" after a failure. Tool results already recorded
-	   stay recorded; only the unfinished work runs again.
-
-	   Two cases after repair:
-	     - history ends with a user or tool-result message: the model
-	       never answered, so re-enter the tool loop.
-	     - history ends with an assistant message: the model DID answer
-	       and the turn died afterwards (e.g. while extracting text), so
-	       there is nothing to ask for. Resolve with the text we already
-	       have rather than sending an assistant message back as a
-	       prefill for the model to continue. *)
-			
-			| role <String | UndefinedObject> |
-			apiMessages isEmpty ifTrue: [
-					^JSPromise reject: 'Nothing to retry: this conversation has no messages yet.'
-				].
-			repairHistory.
-			notifyUpdate.
-			role:: [ provider lastMessageRoleIn: apiMessages ] on: Exception
-				do: [:e | nil ].
-			role = 'assistant' ifTrue: [ ^JSPromise resolve: lastAssistantText ].
-			^completeWithToolLoop then: [:responseText <String> |
-					pendingSystemNotices removeAll.
-					notifyUpdate.
-					responseText
-				]
-		)
 		lastAssistantText ^<String> = (
 			(* The most recent assistant text in the display projection, or ''.
 	   Used as retryLastTurn's value when the turn had in fact
@@ -1370,29 +1473,6 @@ class AIAccess usingPlatform: platform = Object new (
 				].
 			^''
 		)
-		public sendMessage: text <String> ^<Alien[Promise]> = (
-			(* User-facing entry: append the user's text to the history, drive
-	   the tool-loop, and return a Promise that resolves to the
-	   assistant's final text.
-
-	   repairHistory first: if the previous turn died mid-tool-loop, the
-	   history ends with unanswered tool calls and appending a user
-	   message on top of that produces a request the API rejects — so
-	   without this, one failed turn would make every later turn fail
-	   too. *)
-			
-			repairHistory.
-			provider addUserText: text toMessages: apiMessages.
-			notifyUpdate.
-			^completeWithToolLoop then: [:responseText <String> |
-					
-					(* M3: one-shot system notices were folded into this turn's prompt;
-				   clear them so they don't repeat on later turns. *)
-					pendingSystemNotices removeAll.
-					notifyUpdate.
-					responseText
-				]
-		)
 		public displayMessages ^<List> = (
 			(* Returns a List of {role <String>, text <String>} tuples for UI
 	   rendering, in conversation order. Skips entries that don't have
@@ -1408,23 +1488,373 @@ class AIAccess usingPlatform: platform = Object new (
 			apiMessages removeAll.
 			notifyUpdate
 		)
+		nowMs ^<Number> = (
+			(* JS wall-clock milliseconds, for phase timing; 0 if the bridge is not live. *)
+			
+			^[ (global at: 'Date') now ] on: Exception do: [:e | 0 ]
+		)
+		enterPhase: p <String> = (
+			(* Record what the turn is doing right now and when that began, then let
+	   the UI know. Short of true streaming, this is the only mid-turn signal
+	   a status view has. *)
+			
+			phase:: p.
+			phaseStartedAt:: nowMs.
+			notifyUpdate
+		)
+		addTurnNotice: text <String> = (
+			(* Queue a user-facing line about something that happened inside this
+	   turn which the model's own text may not report (output truncated, tool
+	   call refused). The chat surface drains these with takeTurnNotices when
+	   the turn settles, so the user sees them whether or not the model
+	   chose to mention them. *)
+			
+			turnNotices add: text.
+			notifyUpdate
+		)
+		public takeTurnNotices ^<List[String]> = (
+			(* Hand over and clear the notices accumulated during the current turn. *)
+			
+			| taken <List[String]> = List new. |
+			turnNotices do: [:n <String> | taken add: n ].
+			turnNotices removeAll.
+			^taken
+		)
+		beginTurn = (
+			(* Reset per-turn bookkeeping at the start of a send or retry. *)
+			
+			truncationsThisTurn:: 0.
+			enterPhase: 'waiting for model'
+		)
+		recordUsageFrom: response <Alien> = (
+			(* Fold one response's token usage and stop reason into the running
+	   totals. Never raises: accounting must not take down a turn. *)
+			
+			| u |
+			requestCount:: requestCount + 1.
+			lastStopReason:: [ provider stopReasonOf: response ] on: Exception
+				do: [:e | nil ].
+			u:: [ provider usageOf: response ] on: Exception do: [:e | nil ].
+			u isNil ifTrue: [ ^self ].
+			lastUsage:: u.
+			[
+				| cost |
+				cost:: provider costOfUsage: u.
+				cost isNil ifFalse: [
+						lastCostUsd:: cost.
+						totalCostUsd:: totalCostUsd + cost
+					]
+			] on: Exception do: [:e | nil ].
+			totalInputTokens:: totalInputTokens + (u at: #input ifAbsent: [ 0 ]).
+			totalOutputTokens:: totalOutputTokens + (u at: #output ifAbsent: [ 0 ]).
+			totalCacheReadTokens:: totalCacheReadTokens + (u at: #cacheRead
+				ifAbsent: [ 0 ]).
+			totalCacheWriteTokens:: totalCacheWriteTokens + (u at: #cacheWrite
+				ifAbsent: [ 0 ])
+		)
+		maxTruncationsPerTurn ^<Integer> = (
+			(* How many times in one turn the model may hit max_tokens mid-tool-call
+	   before we stop re-prompting it and hand the turn back to the user. *)
+			
+			^2
+		)
+		inputExcerptOf: toolUseBlock <Alien> ^<String> = (
+			(* The call's input as it arrived, JSON-serialised and clipped, so a
+	   truncation message can show exactly which fields made it through. *)
+			
+			| dump <String> |
+			dump:: [ JSON stringify: (toolUseBlock at: 'input') ] on: Exception
+				do: [:e | nil ].
+			dump isNil ifTrue: [ ^'(unavailable)' ].
+			dump size > 300 ifTrue: [ dump:: (dump copyFrom: 1 to: 300) , '…' ].
+			^dump
+		)
+		refuseTruncatedToolCall: toolUseBlock <Alien> ^<Alien[Promise]> = (
+			(* The model exhausted maxTokens while still emitting this call, so the
+	   input we hold is a prefix of what it meant to send. Running it would
+	   feed a handler garbage (an undefined document body, a half method).
+	   Instead answer an is_error tool_result that says precisely what
+	   happened and what arrived, and queue a notice for the user. *)
+			
+			| id name excerpt msg |
+			id:: [ toolUseBlock at: 'id' ] on: Exception do: [:e | nil ].
+			name:: [ toolUseBlock at: 'name' ] on: Exception do: [:e | nil ].
+			name isNil ifTrue: [ name:: '(unknown tool)' ].
+			excerpt:: inputExcerptOf: toolUseBlock.
+			msg:: 'Truncated: your output hit the token limit (max_tokens = ' , maxTokens printString , ') while you were still emitting the input for this ' , name , ' call. The tool was NOT run. Input received: ' , excerpt , '. Do not re-emit the same call: send a smaller payload (split the write, or use a patch-style tool that sends only the changed part), or tell the user the content is too large for one call.'.
+			addTurnNotice: 'Model output was cut off at the ' , maxTokens printString , '-token limit while emitting a ' , name , ' call; the call was not executed. Input received: ' , excerpt.
+			^JSPromise resolve: (toolResultFor: id handlerValue: msg isError: true)
+		)
+		missingRequiredInputsFor: tool <Tool> in: input <Alien> ^<String> = (
+			(* Names of the tool schema's `required` fields absent from input, comma
+	   separated; '' when all present or when the schema cannot be read. A
+	   handler must never see an input missing a required field — that is how
+	   a truncated call turned into a lost promise and a silent chat. *)
+			
+			| schema required len missing <String> |
+			schema:: [ JSON parse: tool inputSchema ] on: Exception do: [:e | nil ].
+			required:: safeAt: schema field: 'required'.
+			len:: safeAt: required field: 'length'.
+			missing:: ''.
+			len isNil ifTrue: [ ^missing ].
+			0 to: len - 1
+				do: [:i <Integer> |
+					| k present |
+					k:: safeStringAt: required field: i.
+					present:: [ input isNil not and: [ input includesKey: k ] ] on: Exception
+						do: [:e | false ].
+					(k isNil or: [ present ]) ifFalse: [
+							missing:: missing isEmpty ifTrue: [ k ] ifFalse: [ missing , ', ' , k ]
+						]
+				].
+			^missing
+		)
+		toolNamesOf: toolBlocks <List> ^<String> = (
+			(* Comma-separated tool names of a round's tool-use blocks, for the phase
+		   display. NB: names must be a MUTABLE temp (::=) — an immutable `=` temp
+		   has no setter, so `names::` compiles to a doesNotUnderstand send. *)
+			
+			| names <String> ::= ''. |
+			toolBlocks do: [:tb |
+					| n |
+					n:: [ tb at: 'name' ] on: Exception do: [:e | nil ].
+					n isNil ifTrue: [ n:: '?' ].
+					names:: names isEmpty ifTrue: [ n ] ifFalse: [ names , ', ' , n ]
+				].
+			^names
+		)
+		completeWithToolLoop ^<Alien[Promise]> = (
+			(* One turn of the conversation, recursing through tool-use rounds. Ships
+	   apiMessages to the provider, appends the assistant response, records
+	   usage, and either executes the tool calls and recurses, or resolves
+	   with the assistant's text.
+
+	   Truncation: if the provider reports the model stopped at maxTokens, any
+	   tool_use blocks are prefixes of what the model meant to send, so they
+	   are REFUSED (refuseTruncatedToolCall:) rather than executed — the model
+	   gets an is_error result explaining why, the user gets a turn notice.
+	   After maxTruncationsPerTurn refusals in one turn we stop recursing and
+	   hand the turn back rather than loop.
+
+	   The whole then-body is wrapped in on:Exception do: returning a
+	   Promise.reject: a raise unwinding out of a then-closure is LOST by the
+	   JS-Promise bridge (see NEWSPEAK_JS_PROMISE_NOTES_2026-05-18.md). *)
+			
+			enterPhase: 'waiting for model'.
+			^(withWatchdog: (provider complete: (provider messagesAsRequestPayload: apiMessages)
+					system: systemPrompt
+					notices: pendingSystemNotices
+					tools: (provider buildToolsPayload: toolDefs)
+					maxTokens: maxTokens)
+				ms: effectiveRequestTimeoutMs
+				reason: (timeoutReason: 'The AI request' ms: effectiveRequestTimeoutMs)) then: [:response |
+					| stage <String> |
+					stage:: 'start of then'.
+					[
+						| truncated <Boolean> |
+						stage:: 'appendAssistantResponse:'.
+						provider appendAssistantResponse: response toMessages: apiMessages.
+						stage:: 'recordUsageFrom:'.
+						recordUsageFrom: response.
+						truncated:: [ provider wasTruncated: response ] on: Exception
+							do: [:e | false ].
+						truncated ifTrue: [ truncationsThisTurn:: truncationsThisTurn + 1 ].
+						stage:: 'hasToolUse:'.
+						(provider hasToolUse: response) ifTrue: [
+								| toolBlocks <List> promises <Alien[Array]> |
+								stage:: 'toolUseBlocksFrom:'.
+								toolBlocks:: provider toolUseBlocksFrom: response.
+								promises:: createJSArray.
+								truncated ifTrue: [
+										stage:: 'refuseTruncatedToolCall: dispatch'.
+										toolBlocks do: [:tb <Alien> |
+												promises push: (refuseTruncatedToolCall: tb)
+											]
+									]
+									ifFalse: [
+										stage:: 'executeToolCall: dispatch'.
+										enterPhase: 'running ' , (toolNamesOf: toolBlocks).
+										toolBlocks do: [:tb <Alien> | promises push: (executeToolCall: tb) ]
+									].
+								stage:: 'Promise.all then'.
+								(withWatchdog: (JSPromise all: promises)
+									ms: effectiveToolTimeoutMs
+									reason: (timeoutReason: 'Tool execution' ms: effectiveToolTimeoutMs)) then: [:results <Alien[Array]> |
+										| innerStage <String> |
+										innerStage:: 'addToolResults:toMessages:'.
+										[
+											provider addToolResults: results toMessages: apiMessages.
+											notifyUpdate.
+											(truncated and: [ truncationsThisTurn >= maxTruncationsPerTurn ]) ifTrue: [
+													innerStage:: 'truncation limit'.
+													addTurnNotice: 'Turn stopped: the model''s output was cut off ' , truncationsThisTurn printString , ' times in a row. Ask it to proceed in smaller steps, or raise the session''s maxTokens.'.
+													enterPhase: 'idle'.
+													''
+												]
+												ifFalse: [
+													innerStage:: 'recursive completeWithToolLoop'.
+													completeWithToolLoop
+												]
+										] on: Exception
+											do: [:e |
+												notifyUpdate.
+												JSPromise reject: '[stage: ' , innerStage , '] ' , (errorDescription: e)
+											]
+									]
+							]
+							ifFalse: [
+								stage:: 'no tool use'.
+								truncated ifTrue: [
+										addTurnNotice: 'The model''s reply was cut off at the ' , maxTokens printString , '-token limit.'
+									].
+								enterPhase: 'idle'.
+								stage:: 'extractTextFromResponse:'.
+								provider extractTextFromResponse: response
+							]
+					] on: Exception
+						do: [:e |
+							| dump |
+							notifyUpdate.
+							
+							(* The raw provider response is the single most useful diagnostic
+			   for protocol drift; include it so the user can paste it verbatim. *)
+							dump:: [ JSON stringify: response ] on: Exception
+								do: [:e2 | '(unstringifiable response)' ].
+							JSPromise reject: '[stage: ' , stage , '] ' , (errorDescription: e) , ' | response: ' , dump
+						]
+				]
+		)
+		executeToolCall: toolUseBlock <Alien> ^<Alien[Promise]> = (
+			(* Resolve a tool-use block ('id', 'name', 'input' by provider contract)
+	   to a tool-result promise. Handlers may answer a value or a promise;
+	   both are normalised here. Every failure — unknown tool, missing
+	   required input, handler raise, rejected handler promise — becomes an
+	   is_error tool_result the model sees next round, never a hang.
+
+	   Required-input check: a handler must never see an input missing a
+	   schema-required field. That is how a truncated set_document_contents
+	   call fed an undefined body into a document, raised inside a JS
+	   callback, and lost the turn's promise — a silent chat. *)
+			
+			| toolName <String | UndefinedObject> input <Alien> tool <Tool | UndefinedObject> id <String | UndefinedObject> resultOrPromise stage <String> safeId <String> missing <String> |
+			stage:: 'read id'.
+			[
+				id:: toolUseBlock at: 'id'.
+				stage:: 'read name'.
+				toolName:: toolUseBlock at: 'name'.
+				stage:: 'read input'.
+				input:: toolUseBlock at: 'input'
+			] on: Exception
+				do: [:e |
+					| dump |
+					dump:: [ JSON stringify: toolUseBlock ] on: Exception
+						do: [:e2 | '(unstringifiable)' ].
+					^JSPromise reject: '[executeToolCall stage: ' , stage , '] ' , (errorDescription: e) , ' | block: ' , dump
+				].
+			safeId:: id isNil ifTrue: [ '(no id)' ] ifFalse: [ id ].
+			toolName isNil ifTrue: [
+					| dump |
+					dump:: [ JSON stringify: toolUseBlock ] on: Exception
+						do: [:e2 | '(unstringifiable)' ].
+					^JSPromise reject: 'Tool call missing name field | block: ' , dump
+				].
+			tool:: toolMap at: toolName
+				ifAbsent: [
+					^JSPromise resolve: (toolResultFor: safeId
+							handlerValue: 'Unknown tool: ' , toolName
+							isError: true)
+				].
+			missing:: missingRequiredInputsFor: tool in: input.
+			missing isEmpty ifFalse: [
+					addTurnNotice: 'Tool call ' , toolName , ' rejected: missing required input ' , missing , '. The call was not executed.'.
+					^JSPromise resolve: (toolResultFor: safeId
+							handlerValue: 'Rejected: this ' , toolName , ' call is missing required input field(s): ' , missing , '. The tool was NOT run. Input received: ' , (inputExcerptOf: toolUseBlock)
+							isError: true)
+				].
+			resultOrPromise:: [ tool handler value: input ] on: Exception
+				do: [:e |
+					| msg <String> |
+					
+					(* Some exceptions raise when sent messageText; be defensive. *)
+					msg:: [ 'Error: ' , e messageText ] on: Exception
+						do: [:e2 |
+							[ 'Error: ' , e printString ] on: Exception
+								do: [:e3 | 'Error: <unprintable exception>' ]
+						].
+					^JSPromise resolve: (toolResultFor: id handlerValue: msg isError: true)
+				].
+			(resultOrPromise isKindOfJSAlien and: [ resultOrPromise includesKey: 'then' ]) ifTrue: [
+					^resultOrPromise then: [:result |
+							toolResultFor: id handlerValue: result isError: false
+						]
+						onError: [:err |
+							toolResultFor: id handlerValue: 'Error: ' , err printString isError: true
+						]
+				].
+			^JSPromise resolve: (toolResultFor: id
+					handlerValue: resultOrPromise
+					isError: false)
+		)
+		public sendMessage: text <String> ^<Alien[Promise]> = (
+			(* User-facing entry: append the user's text, drive the tool loop, answer
+	   a Promise of the assistant's final text. repairHistory first, so a
+	   turn that died mid-tool-loop does not poison every later request.
+	   The phase is reset to idle however the turn settles. *)
+			
+			repairHistory.
+			provider addUserText: text toMessages: apiMessages.
+			beginTurn.
+			^completeWithToolLoop then: [:responseText <String> |
+					pendingSystemNotices removeAll.
+					enterPhase: 'idle'.
+					responseText
+				]
+				onError: [:err |
+					enterPhase: 'idle'.
+					JSPromise reject: err
+				]
+		)
 		public sendMessage: text <String> attachments: docs <List> ^<Alien[Promise]> = (
-			(* Like sendMessage: but also attaches document blocks to the user
-	   message. docs is a List of { filename <String>. content <String> }
-	   tuples, forwarded to the provider's addUserText:documents:toMessages:.
-	   sendMessage: is unchanged and remains the normal no-attachment path.
-	   Repairs an interrupted history first, exactly as sendMessage: does. *)
+			(* As sendMessage:, with document attachments ({filename. content} tuples)
+	   forwarded to the provider's addUserText:documents:toMessages:. *)
 			
 			repairHistory.
 			provider addUserText: text documents: docs toMessages: apiMessages.
-			notifyUpdate.
+			beginTurn.
 			^completeWithToolLoop then: [:responseText <String> |
-					
-					(* M3: one-shot system notices were folded into this turn's prompt;
-				   clear them so they don't repeat on later turns. *)
 					pendingSystemNotices removeAll.
-					notifyUpdate.
+					enterPhase: 'idle'.
 					responseText
+				]
+				onError: [:err |
+					enterPhase: 'idle'.
+					JSPromise reject: err
+				]
+		)
+		public retryLastTurn ^<Alien[Promise]> = (
+			(* Re-drive the current turn with no new user message. If the history
+	   ends with a user or tool-result message the model never answered, so
+	   re-enter the tool loop; if it ends with an assistant message the model
+	   did answer and the turn died afterwards, so resolve with that text. *)
+			
+			| role <String | UndefinedObject> |
+			apiMessages isEmpty ifTrue: [
+					^JSPromise reject: 'Nothing to retry: this conversation has no messages yet.'
+				].
+			repairHistory.
+			notifyUpdate.
+			role:: [ provider lastMessageRoleIn: apiMessages ] on: Exception
+				do: [:e | nil ].
+			role = 'assistant' ifTrue: [ ^JSPromise resolve: lastAssistantText ].
+			beginTurn.
+			^completeWithToolLoop then: [:responseText <String> |
+					pendingSystemNotices removeAll.
+					enterPhase: 'idle'.
+					responseText
+				]
+				onError: [:err |
+					enterPhase: 'idle'.
+					JSPromise reject: err
 				]
 		)
 	) : ()
@@ -2000,6 +2430,24 @@ class AIAccess usingPlatform: platform = Object new (
 						]
 				]
 		)
+		public stopReasonOf: response <Alien> ^<String | UndefinedObject> = (
+			| candidates firstCandidate |
+			candidates:: safeAt: response field: 'candidates'.
+			firstCandidate:: safeAt: candidates field: 0.
+			^safeStringAt: firstCandidate field: 'finishReason'
+		)
+		public wasTruncated: response <Alien> ^<Boolean> = (
+			^(stopReasonOf: response) = 'MAX_TOKENS'
+		)
+		public usageOf: response <Alien> ^<Map[Symbol, Integer] | UndefinedObject> = (
+			| usage |
+			usage:: safeAt: response field: 'usageMetadata'.
+			usage isNil ifTrue: [ ^nil ].
+			^usageInput: (safeAt: usage field: 'promptTokenCount')
+				output: (safeAt: usage field: 'candidatesTokenCount')
+				cacheRead: (safeAt: usage field: 'cachedContentTokenCount')
+				cacheWrite: 0
+		)
 	) : ()
 	public class OpenAICompatibleProvider apiKey: key <String> model: mdl <String> baseUrl: url <String> = Provider new (
 		(* Provider for any server speaking OpenAI's chat-completions API:
@@ -2385,6 +2833,25 @@ class AIAccess usingPlatform: platform = Object new (
 	   image_url parts) is deferred. *)
 			
 			^false
+		)
+		public stopReasonOf: response <Alien> ^<String | UndefinedObject> = (
+			| choices firstChoice |
+			choices:: safeAt: response field: 'choices'.
+			firstChoice:: safeAt: choices field: 0.
+			^safeStringAt: firstChoice field: 'finish_reason'
+		)
+		public wasTruncated: response <Alien> ^<Boolean> = (
+			^(stopReasonOf: response) = 'length'
+		)
+		public usageOf: response <Alien> ^<Map[Symbol, Integer] | UndefinedObject> = (
+			| usage details |
+			usage:: safeAt: response field: 'usage'.
+			usage isNil ifTrue: [ ^nil ].
+			details:: safeAt: usage field: 'prompt_tokens_details'.
+			^usageInput: (safeAt: usage field: 'prompt_tokens')
+				output: (safeAt: usage field: 'completion_tokens')
+				cacheRead: (safeAt: details field: 'cached_tokens')
+				cacheWrite: 0
 		)
 	) : ()
 	lazy public global = js global.

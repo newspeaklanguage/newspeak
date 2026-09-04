@@ -57,8 +57,10 @@ import os
 import secrets
 import sys
 import threading
-import urllib.request
+import time
 import urllib.error
+import urllib.parse
+import urllib.request
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 
 
@@ -128,9 +130,13 @@ TOKEN = secrets.token_urlsafe(32)
 CONFIG = {
     'version': 1,
     'git': True,
-    'fetch': False,
+    'fetch': True,
     'bus': False,
 }
+
+# /_ns/fetch returns at most this much body; the envelope says when it cut.
+FETCH_BODY_CAP = 256 * 1024
+FETCH_TIMEOUT_S = 30
 
 
 class HostServicesHandler(SimpleHTTPRequestHandler):
@@ -152,6 +158,9 @@ class HostServicesHandler(SimpleHTTPRequestHandler):
             return True
         if self.path == '/_ns/token' or self.path.startswith('/_ns/token?'):
             self._serve_token(method)
+            return True
+        if self.path == '/_ns/fetch' or self.path.startswith('/_ns/fetch?'):
+            self._serve_fetch(method)
             return True
         if self.path.startswith('/_ns/git/'):
             self._forward(method, self.path[len('/_ns/git/'):])
@@ -188,6 +197,88 @@ class HostServicesHandler(SimpleHTTPRequestHandler):
         self._send_json(200, {'token': TOKEN},
                         head_only=(method == 'HEAD'),
                         allow_origin=origin)
+
+    def _serve_fetch(self, method):
+        """Server-side GET of an http(s) URL, answered as a diagnostics
+        envelope — the whole point is that the browser's fetch collapses
+        transport failures into an opaque TypeError, while this side can
+        report status, headers, redirects and the error page itself:
+            {status, statusText, headers, redirects, elapsedMs,
+             body (first FETCH_BODY_CAP bytes), truncated}
+        or, when the request never completed,
+            {transportError, elapsedMs}.
+        The HTTP answer is 200 either way: a failed *target* fetch is a
+        successful diagnosis. Non-200 from this endpoint means the machinery
+        itself refused (bad token, bad url), so clients can fall back."""
+        if method != 'GET':
+            return self._send_json(405, {'error': 'GET only'})
+        if not self.require_token():
+            return
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+        url = (query.get('url') or [''])[0]
+        scheme = urllib.parse.urlsplit(url).scheme
+        if scheme not in ('http', 'https'):
+            # file:, data:, etc. are refused outright — a filesystem read is
+            # a different capability with its own path and its own gate.
+            return self._send_json(400, {'error': 'only http(s) URLs are fetched'})
+
+        recorder = _RedirectRecorder()
+        opener = urllib.request.build_opener(recorder)
+        req = urllib.request.Request(
+            url, headers={'User-Agent': self.server_version, 'Accept': '*/*'})
+        t0 = time.monotonic()
+
+        def elapsed():
+            return int((time.monotonic() - t0) * 1000)
+
+        def body_of(stream):
+            raw = stream.read(FETCH_BODY_CAP + 1)
+            truncated = len(raw) > FETCH_BODY_CAP
+            return raw[:FETCH_BODY_CAP].decode('utf-8', errors='replace'), truncated
+
+        try:
+            upstream = opener.open(req, timeout=FETCH_TIMEOUT_S)
+        except urllib.error.HTTPError as e:
+            # An error PAGE is frequently the whole answer (a Cloudflare 1014
+            # names the misconfiguration outright), so the body is returned.
+            try:
+                body, truncated = body_of(e)
+            except Exception:
+                body, truncated = '', False
+            return self._send_json(200, {
+                'status': e.code,
+                'statusText': str(e.reason),
+                'headers': {k.lower(): v for k, v in (e.headers or {}).items()},
+                'redirects': recorder.chain,
+                'elapsedMs': elapsed(),
+                'body': body,
+                'truncated': truncated,
+            })
+        except Exception as e:
+            return self._send_json(200, {
+                'transportError': str(e) or e.__class__.__name__,
+                'redirects': recorder.chain,
+                'elapsedMs': elapsed(),
+            })
+
+        with upstream:
+            try:
+                body, truncated = body_of(upstream)
+            except Exception as e:
+                return self._send_json(200, {
+                    'transportError': 'reading the body failed: %s' % e,
+                    'redirects': recorder.chain,
+                    'elapsedMs': elapsed(),
+                })
+            self._send_json(200, {
+                'status': upstream.status,
+                'statusText': getattr(upstream, 'reason', ''),
+                'headers': {k.lower(): v for k, v in upstream.getheaders()},
+                'redirects': recorder.chain,
+                'elapsedMs': elapsed(),
+                'body': body,
+                'truncated': truncated,
+            })
 
     @staticmethod
     def _is_loopback_origin(origin):
@@ -380,6 +471,17 @@ class HostServicesHandler(SimpleHTTPRequestHandler):
 
 
 HostServicesHandler.extensions_map['.wasm'] = 'application/wasm'
+
+
+class _RedirectRecorder(urllib.request.HTTPRedirectHandler):
+    """Records the redirect chain so the envelope can report it."""
+
+    def __init__(self):
+        self.chain = []
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        self.chain.append(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 def main():

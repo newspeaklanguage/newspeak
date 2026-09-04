@@ -318,7 +318,37 @@ call site without migrating anything.
 4. The `host` module + `fetcher`, in the Newspeak-promise idiom (§6).
 5. `/_ns/fetch`; `local_fetch` routes through it.
 6. `/_ns/bus`; Claude Code posts with `curl`, the IDE receives over SSE and
-   hydrates turns via `sendText:` / `addSystemNotice:`.
+   hydrates turns via `sendText:` / `addSystemNotice:`. **Built 2026-09-04.**
+   The endpoint is **off unless the front door is started with `--bus`** —
+   prompt injection into an IDE that edits and runs code is the sharpest
+   capability, so the operator enables it consciously; when off, `/_ns/config`
+   reports `bus:false` and the path 404s. External agents `POST` a JSON
+   message `{to, text, from?, kind?}`; the IDE holds a `GET` open as an SSE
+   stream, matching `to` against its Root chat names and delivering through
+   the **same address space and delivery core as in-image `send_to_chat`**
+   (`enqueueOrDeliver:to:hop:` / `deliverPeerMessage:to:hop:`), stamped
+   `[from external agent 'X']` at hop 0. `kind:"notice"` folds in via
+   `addSystemNotice:` instead of driving a turn. A small server-side backlog
+   plus `Last-Event-ID` covers EventSource reconnects. This settles the §8
+   scoping question for v1: **one token, but the capability is opt-in at
+   startup**, which is the real boundary alongside the loopback bind.
+
+   **Reverse direction (Level 1, 2026-09-04):** the IDE also reaches OUT — a
+   chat's `send_to_agent name: text` POSTs to the bus so an in-IDE AI can
+   converse with an external agent (a Claude Code session, or a human on the
+   other end). Addressing is symmetric: `from` is the reply address in both
+   directions, so a round trip closes with no separate correlation field, and
+   the agent's reply returns through the ordinary receive path as a
+   `[from external agent 'X']` turn. Because a chat holds the IDE's tools
+   (`evaluate`, `inspect_object`, the debugger, `propose_changes`), this makes
+   an in-IDE chat a **remote-control surface** for an external agent — every
+   exchange a visible turn, so the human sees it. The POST handler is a
+   **pass-through router**: it stamps a server id and fills two defaults but
+   forwards the poster's whole object, so a later `reply_to`/`corr_id`
+   completion envelope (Level 2 — a `BusProvider` backing a chat *directly*)
+   rides through untouched. `tool/bus-agent.py` is a stdlib reference for the
+   external end. Level 2 (correlated request/response so a chat is backed by an
+   agent or a human rather than a hosted model) is deferred but unblocked.
 
 Repositories and Croquet migrate to `platform host` opportunistically; neither
 is blocked by it, and neither should be destabilized for it.
@@ -333,7 +363,10 @@ address space to external agents rather than inventing a second one.
 
 - **Does the bus need per-path scoping?** One token granting fetch *and* prompt
   injection may be too coarse. (Token *distribution* is decided — the
-  loopback-served file, §4 — but scoping is not.)
+  loopback-served file, §4.) **v1 answer (2026-09-04):** one token, but the bus
+  is opt-in at startup (`--bus`, default off) and loopback-bound, so enabling
+  prompt injection is a conscious operator act. Finer per-path scoping remains
+  possible later if fetch and bus should be separable while both are on.
 - **Is a single URL field enough for the reflector?** The Croquet instance
   owns that. The scheme itself is not in question — §3 settles it (`ws://` now,
   `wss://` mandatory once the front door goes https) — but the entry may still

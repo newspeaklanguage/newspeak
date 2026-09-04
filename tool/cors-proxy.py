@@ -1,50 +1,65 @@
 #!/usr/bin/env python3
-"""Local host-services front door (and CORS proxy for isomorphic-git).
+"""Local host-services front door: static IDE serving, /_ns/ services, git proxy.
 
 Design: HOST_SERVICES_DESIGN_2026-08-31.md — one origin, reserved /_ns/ paths,
-discovery via /_ns/config, capabilities absent unless announced.
+discovery via /_ns/config, capabilities absent unless announced. Staging step 3
+folds static serving in, so this replaces both server3.py (:8080) and the old
+standalone CORS proxy (:9999) with ONE process answering on both ports:
 
-Serves two families of paths:
+The FRONT DOOR (default :8080) serves:
+    /                        static files from --root (default <repo>/out),
+                             with CORS and Cache-Control: no-cache (no-cache
+                             means REVALIDATE: without it browsers serve a
+                             stale/fresh MIX of psoup.js + .vfuel after a
+                             rebuild and Newspeak crashes on boot)
+    /files/...               the Croquet file server: PUT stores (with
+                             create_full_put_path semantics), GET retrieves.
+                             Croquet reads files= ahead of the sign server,
+                             which restores keyless file storage when
+                             reflector= is passed; events are too small for
+                             file payloads, so blobs live here and only a
+                             handle travels as an event
+    /_ns/config              discovery: what this origin offers (JSON)
+    /_ns/token               the auth token; answered ONLY to loopback
+    /_ns/git/<host>/<path>   the git proxy at its permanent address
+    (anything else under /_ns/ answers 404 — absent means unavailable)
 
-1. The legacy @isomorphic-git/cors-proxy convention, unchanged:
-       http://localhost:9999/<host>/<path>   ->   https://<host>/<path>
-   Existing clients (the Repositories.ns clone path, local_fetch's proxy
-   fallback) keep working untouched, with no token.
+The LEGACY listener (default :9999, --legacy-port 0 to disable) additionally
+answers the old bare @isomorphic-git/cors-proxy convention —
+    http://localhost:9999/<host>/<path>   ->   https://<host>/<path>
+— for the clients that still point at it (per-repository proxy fields,
+local_fetch's fallback, Host.ns's dev fallback). It serves /_ns/ too, no
+static. It retires once those defaults migrate to /_ns/git on the front door.
 
-2. Reserved host-services paths. '_' is illegal in hostnames, so /_ns/ can
-   never collide with a proxied host:
-       /_ns/config              discovery: what this origin offers (JSON)
-       /_ns/token               the auth token; answered ONLY to loopback
-       /_ns/git/<host>/<path>   the git proxy at its permanent address
-   Anything else under /_ns/ answers 404 — absent means unavailable.
+The token is minted fresh at startup, never written to disk, never required
+for git or static. Endpoints that will need it (/_ns/fetch, /_ns/bus) check
+it via require_token(). /_ns/token answers only to loopback peers and only
+to browser origins that are themselves loopback.
 
-The token is minted fresh at startup and served at /_ns/token, never written
-to disk here and never required for the legacy git convention. Endpoints that
-will need it (/_ns/fetch, /_ns/bus) check it via require_token() when they
-arrive. /_ns/token answers only to loopback peers, and only to browser
-origins whose host is itself loopback — so a public web page scripting
-requests at localhost cannot read it.
+Binds loopback by default. --bind 0.0.0.0 restores server3.py's any-interface
+reach (needed for phone / cross-device Croquet days; the token endpoint still
+answers loopback only, but git proxying and /files writes are then open to
+the LAN — the pre-existing dev tradeoff, now opt-in).
 
-Binds loopback by default. --bind 0.0.0.0 restores the old any-interface
-behavior (the token endpoint still answers loopback only).
-
-Run:
-    python3 tool/cors-proxy.py                # loopback:9999
-    python3 tool/cors-proxy.py 8888           # loopback:8888
-    python3 tool/cors-proxy.py --reflector ws://localhost:9090
-                                              # announce local Croquet
+Run (from the newspeak repo root or anywhere — --root defaults beside tool/):
+    python3 tool/cors-proxy.py                      # :8080 front door + :9999 legacy
+    python3 tool/cors-proxy.py --bind 0.0.0.0       # cross-device day
+    python3 tool/cors-proxy.py --reflector ws://localhost:9090   # announce Croquet
 
 Standard-library only. No deps. Intended for development; in production
 you'd run the equivalent on the same origin as the deployed IDE.
 """
 
 import argparse
+import functools
 import json
+import os
 import secrets
 import sys
+import threading
 import urllib.request
 import urllib.error
-from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 
 
 # Headers we forward from the browser request to the upstream git server.
@@ -79,21 +94,31 @@ FORWARDED_RESPONSE_HEADERS = {
     'vary',
 }
 
-EXPOSED_RESPONSE_HEADERS = ', '.join(sorted(FORWARDED_RESPONSE_HEADERS))
+# One merged CORS surface for every response class: the git set, the static
+# set server3.py sent (DNT, Range, If-Modified-Since, X-Requested-With), the
+# Croquet file-server headers, and our own token header.
+ALLOWED_REQUEST_HEADERS = (
+    'Accept, Accept-Encoding, Accept-Language, Authorization, Cache-Control, '
+    'Content-Type, DNT, Git-Protocol, If-Modified-Since, Pragma, Range, '
+    'User-Agent, X-Croquet-App, X-Croquet-Id, X-Croquet-Path, '
+    'X-Croquet-Session, X-Croquet-Version, X-HTTP-Method-Override, '
+    'X-NS-Token, X-Requested-With')
+
+EXPOSED_RESPONSE_HEADERS = ', '.join(
+    sorted(FORWARDED_RESPONSE_HEADERS | {'content-length'}))
 
 CORS_HEADERS = [
     ('Access-Control-Allow-Origin', '*'),
     ('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, HEAD, PUT, DELETE, PATCH'),
-    ('Access-Control-Allow-Headers',
-        'Accept, Accept-Encoding, Accept-Language, Authorization, '
-        'Cache-Control, Content-Type, Git-Protocol, Pragma, User-Agent, '
-        'X-HTTP-Method-Override, X-NS-Token'),
+    ('Access-Control-Allow-Headers', ALLOWED_REQUEST_HEADERS),
     ('Access-Control-Expose-Headers', EXPOSED_RESPONSE_HEADERS),
     ('Access-Control-Max-Age', '600'),
 ]
 
 LOOPBACK_PEERS = {'127.0.0.1', '::1', '::ffff:127.0.0.1'}
 LOOPBACK_ORIGIN_HOSTS = {'localhost', '127.0.0.1', '[::1]'}
+
+FILES_PREFIX = '/files/'
 
 # Minted per run. The page fetches it from /_ns/token before its first
 # token-gated /_ns/* call; nothing is pasted and nothing rests in localStorage.
@@ -108,25 +133,39 @@ CONFIG = {
 }
 
 
-class HostServicesHandler(BaseHTTPRequestHandler):
+class HostServicesHandler(SimpleHTTPRequestHandler):
 
-    server_version = 'ns-host/0.2'
+    server_version = 'ns-host/0.3'
+    front_port = 8080          # overwritten in main()
+
+    # Static responses get server3.py's headers appended in end_headers;
+    # service/proxy responses manage their own and leave this False.
+    _static_headers = False
 
     # ---- routing ---------------------------------------------------------
 
-    def _route(self, method):
+    def _handled_as_service(self, method):
+        """/_ns/ services on every listener; the bare proxy convention only
+        on the legacy listener. Answers True when the request was handled."""
         if self.path == '/_ns/config' or self.path.startswith('/_ns/config?'):
-            return self._serve_config(method)
+            self._serve_config(method)
+            return True
         if self.path == '/_ns/token' or self.path.startswith('/_ns/token?'):
-            return self._serve_token(method)
+            self._serve_token(method)
+            return True
         if self.path.startswith('/_ns/git/'):
-            return self._forward(method, self.path[len('/_ns/git/'):])
+            self._forward(method, self.path[len('/_ns/git/'):])
+            return True
         if self.path == '/_ns' or self.path.startswith('/_ns/'):
             # Absent means unavailable: an unknown /_ns/ path is a capability
-            # this origin does not offer, not a proxy target.
-            return self._send_json(404, {'error': 'no such host service'})
-        # Legacy convention: /<host>/<path>.
-        return self._forward(method, self.path.lstrip('/'))
+            # this origin does not offer, not a proxy target or a file.
+            self._send_json(404, {'error': 'no such host service'})
+            return True
+        if self.server.server_address[1] != self.front_port:
+            # Legacy listener: everything else is the old proxy convention.
+            self._forward(method, self.path.lstrip('/'))
+            return True
+        return False
 
     # ---- host services ---------------------------------------------------
 
@@ -191,7 +230,7 @@ class HostServicesHandler(BaseHTTPRequestHandler):
         if not head_only:
             self.wfile.write(body)
 
-    # ---- the proxy (legacy and /_ns/git/) --------------------------------
+    # ---- the git proxy (/_ns/git/ everywhere; bare convention on legacy) --
 
     def _forward(self, method, path):
         if not path:
@@ -248,14 +287,86 @@ class HostServicesHandler(BaseHTTPRequestHandler):
             self.send_header(name, value)
         self.end_headers()
 
+    # ---- static + Croquet file store (front door only) -------------------
+
+    def end_headers(self):
+        # server3.py's contract for static content: permissive CORS (the page
+        # may be served from elsewhere) and Cache-Control: no-cache, i.e.
+        # REVALIDATE (If-Modified-Since -> 304) — see module docstring for
+        # the stale-mix boot crash this prevents.
+        if self._static_headers:
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.send_header('Access-Control-Allow-Methods', 'GET, PUT, OPTIONS')
+            self.send_header('Access-Control-Allow-Headers', ALLOWED_REQUEST_HEADERS)
+            self.send_header('Access-Control-Expose-Headers', 'Content-Length, Content-Range')
+            self.send_header('Cache-Control', 'no-cache')
+        super().end_headers()
+
+    def _put_file(self):
+        # The Croquet file server: PUT to store, GET to retrieve — the whole
+        # protocol (nginx's dav_methods PUT + create_full_put_path in
+        # croquet-in-a-box). Writes are confined to FILES_PREFIX.
+        self._static_headers = True
+        if not self.path.startswith(FILES_PREFIX):
+            self.send_error(403, 'PUT is only allowed under %s' % FILES_PREFIX)
+            return
+        # translate_path normalises away '..' and anchors at --root.
+        dest = os.path.abspath(self.translate_path(self.path))
+        root = os.path.abspath(os.path.join(self.directory, FILES_PREFIX.strip('/')))
+        if os.path.commonpath([dest, root]) != root:
+            self.send_error(403, 'PUT outside the files directory')
+            return
+        try:
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            length = int(self.headers.get('Content-Length', 0))
+            remaining = length
+            with open(dest, 'wb') as f:
+                while remaining > 0:
+                    chunk = self.rfile.read(min(65536, remaining))
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    remaining -= len(chunk)
+        except OSError as e:
+            self.send_error(500, 'PUT failed: %s' % e)
+            return
+        self.send_response(201, 'Created')
+        self.send_header('Content-Length', '0')
+        self.end_headers()
+
     # ---- verbs -----------------------------------------------------------
 
-    def do_GET(self):    self._route('GET')
-    def do_POST(self):   self._route('POST')
-    def do_HEAD(self):   self._route('HEAD')
-    def do_PUT(self):    self._route('PUT')
-    def do_DELETE(self): self._route('DELETE')
-    def do_PATCH(self):  self._route('PATCH')
+    def do_GET(self):
+        if self._handled_as_service('GET'):
+            return
+        self._static_headers = True
+        super().do_GET()
+
+    def do_HEAD(self):
+        if self._handled_as_service('HEAD'):
+            return
+        self._static_headers = True
+        super().do_HEAD()
+
+    def do_PUT(self):
+        if self._handled_as_service('PUT'):
+            return
+        self._put_file()
+
+    def do_POST(self):
+        if self._handled_as_service('POST'):
+            return
+        self._send_json(405, {'error': 'POST is not accepted for static paths'})
+
+    def do_DELETE(self):
+        if self._handled_as_service('DELETE'):
+            return
+        self._send_json(405, {'error': 'DELETE is not accepted for static paths'})
+
+    def do_PATCH(self):
+        if self._handled_as_service('PATCH'):
+            return
+        self._send_json(405, {'error': 'PATCH is not accepted for static paths'})
 
     def do_OPTIONS(self):
         self.send_response(204)
@@ -268,11 +379,19 @@ class HostServicesHandler(BaseHTTPRequestHandler):
         sys.stderr.write(f'[ns-host] {self.command} {self.path} -> {fmt % args}\n')
 
 
+HostServicesHandler.extensions_map['.wasm'] = 'application/wasm'
+
+
 def main():
     parser = argparse.ArgumentParser(description='Newspeak host-services front door')
-    parser.add_argument('port', nargs='?', type=int, default=9999)
+    parser.add_argument('port', nargs='?', type=int, default=8080,
+                        help='front-door port: static + /files + /_ns (default 8080)')
+    parser.add_argument('--legacy-port', type=int, default=9999,
+                        help='extra listener answering the bare cors-proxy convention (default 9999; 0 disables)')
     parser.add_argument('--bind', default='127.0.0.1',
-                        help='interface to bind (default loopback; 0.0.0.0 for the old any-interface behavior)')
+                        help='interface to bind (default loopback; 0.0.0.0 for cross-device days)')
+    parser.add_argument('--root', default=None,
+                        help='static root (default: the out/ beside this script\'s repo)')
     parser.add_argument('--reflector', default=None,
                         help='announce a local Croquet reflector, e.g. ws://localhost:9090')
     parser.add_argument('--croquet-files', default='/files',
@@ -282,11 +401,26 @@ def main():
     if args.reflector:
         CONFIG['croquet'] = {'reflector': args.reflector, 'files': args.croquet_files}
 
-    server = ThreadingHTTPServer((args.bind, args.port), HostServicesHandler)
-    print(f'host services listening on http://{args.bind}:{args.port}')
-    print(f'  discovery:  /_ns/config -> {json.dumps(CONFIG)}')
-    print(f'  token:      /_ns/token (loopback clients only)')
-    print(f'  git proxy:  /_ns/git/<host>/<path> and legacy /<host>/<path> -> https://<host>/<path>')
+    root = args.root or os.path.abspath(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'out'))
+    if not os.path.isdir(root):
+        print(f'WARNING: static root {root} does not exist; static requests will 404')
+
+    HostServicesHandler.front_port = args.port
+    handler = functools.partial(HostServicesHandler, directory=root)
+
+    if args.legacy_port and args.legacy_port != args.port:
+        legacy = ThreadingHTTPServer((args.bind, args.legacy_port), handler)
+        threading.Thread(target=legacy.serve_forever, daemon=True).start()
+        print(f'legacy proxy listening on http://{args.bind}:{args.legacy_port} '
+              f'(bare /<host>/<path> convention, plus /_ns)')
+
+    server = ThreadingHTTPServer((args.bind, args.port), handler)
+    print(f'front door listening on http://{args.bind}:{args.port}')
+    print(f'  static root: {root} (CORS + no-cache; PUT under {FILES_PREFIX})')
+    print(f'  discovery:   /_ns/config -> {json.dumps(CONFIG)}')
+    print(f'  token:       /_ns/token (loopback clients only)')
+    print(f'  git proxy:   /_ns/git/<host>/<path> -> https://<host>/<path>')
     try:
         server.serve_forever()
     except KeyboardInterrupt:

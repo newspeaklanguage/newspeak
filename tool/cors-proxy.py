@@ -22,6 +22,9 @@ The FRONT DOOR (default :8080) serves:
     /_ns/config              discovery: what this origin offers (JSON)
     /_ns/token               the auth token; answered ONLY to loopback
     /_ns/git/<host>/<path>   the git proxy at its permanent address
+    /_ns/fetch?url=…         server-side GET returning a diagnostics envelope
+    /_ns/bus                 the agent channel (GET=SSE receive, POST=send);
+                             OFF unless --bus is passed
     (anything else under /_ns/ answers 404 — absent means unavailable)
 
 The LEGACY listener (default :9999, --legacy-port 0 to disable) additionally
@@ -51,9 +54,11 @@ you'd run the equivalent on the same origin as the deployed IDE.
 """
 
 import argparse
+import collections
 import functools
 import json
 import os
+import queue
 import secrets
 import sys
 import threading
@@ -138,6 +143,22 @@ CONFIG = {
 FETCH_BODY_CAP = 256 * 1024
 FETCH_TIMEOUT_S = 30
 
+# /_ns/bus — the agent channel. OFF unless --bus is passed: it injects prompts
+# into an IDE that edits and runs code, which is remote control, so the
+# operator enables it consciously. When off, CONFIG['bus'] stays false and the
+# endpoint 404s (absent means unavailable). External agents POST a JSON
+# message; the IDE holds a GET open as an SSE stream and receives it. Both are
+# token-gated. Fan-out is in-process across the ThreadingHTTPServer's threads:
+# a POST drops the message on every open stream's queue. A small backlog is
+# kept so an EventSource that reconnects (with Last-Event-ID) does not miss
+# what arrived during the gap.
+BUS_LOCK = threading.Lock()
+BUS_SUBSCRIBERS = []                                   # list[queue.Queue]
+BUS_HISTORY = collections.deque(maxlen=200)            # list[(id, payload_str)]
+BUS_NEXT_ID = [0]
+BUS_KEEPALIVE_S = 20
+BUS_MSG_CAP = 256 * 1024
+
 
 class HostServicesHandler(SimpleHTTPRequestHandler):
 
@@ -161,6 +182,9 @@ class HostServicesHandler(SimpleHTTPRequestHandler):
             return True
         if self.path == '/_ns/fetch' or self.path.startswith('/_ns/fetch?'):
             self._serve_fetch(method)
+            return True
+        if self.path == '/_ns/bus' or self.path.startswith('/_ns/bus?'):
+            self._serve_bus(method)
             return True
         if self.path.startswith('/_ns/git/'):
             self._forward(method, self.path[len('/_ns/git/'):])
@@ -279,6 +303,98 @@ class HostServicesHandler(SimpleHTTPRequestHandler):
                 'body': body,
                 'truncated': truncated,
             })
+
+    def _serve_bus(self, method):
+        """The agent channel. GET holds an SSE stream open for the IDE; POST
+        drops a JSON message onto every open stream. Off unless --bus."""
+        if not CONFIG.get('bus'):
+            return self._send_json(404, {'error': 'the bus is not enabled (start with --bus)'})
+        if method == 'GET':
+            return self._bus_stream()
+        if method == 'POST':
+            return self._bus_post()
+        return self._send_json(405, {'error': 'GET (subscribe) or POST (send)'})
+
+    def _bus_post(self):
+        if not self.require_token():
+            return
+        length = int(self.headers.get('Content-Length', '0'))
+        if length > BUS_MSG_CAP:
+            return self._send_json(413, {'error': 'bus message too large'})
+        raw = self.rfile.read(length) if length else b''
+        try:
+            msg = json.loads(raw.decode('utf-8'))
+        except Exception:
+            return self._send_json(400, {'error': 'body must be JSON'})
+        if not isinstance(msg, dict) or not isinstance(msg.get('to'), str) or not msg.get('to'):
+            return self._send_json(400, {
+                'error': 'a bus message needs "to" (a target name) and "text"'})
+        # Pass-through router: the poster's whole object rides through, so
+        # fields this server does not model (reply_to, correlation ids, a
+        # later completion envelope) reach the far side untouched. We only
+        # stamp a server id and fill the two defaults every consumer expects.
+        # 'message' drives a turn; 'notice' folds into the target's next turn.
+        with BUS_LOCK:
+            BUS_NEXT_ID[0] += 1
+            mid = BUS_NEXT_ID[0]
+            msg['id'] = mid
+            msg.setdefault('from', 'external agent')
+            if msg.get('kind') != 'notice':
+                msg['kind'] = 'message'
+            payload = json.dumps(msg)
+            BUS_HISTORY.append((mid, payload))
+            subscribers = list(BUS_SUBSCRIBERS)
+        for q in subscribers:
+            q.put((mid, payload))
+        self._send_json(200, {'id': mid, 'listeners': len(subscribers)})
+
+    def _bus_stream(self):
+        if not self.require_token():
+            return
+        my_queue = queue.Queue()
+        with BUS_LOCK:
+            BUS_SUBSCRIBERS.append(my_queue)
+        try:
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream')
+            self.send_header('Cache-Control', 'no-cache')
+            self.send_header('Connection', 'keep-alive')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(b': connected\n\n')
+            self.wfile.flush()
+            # EventSource reconnects with Last-Event-ID; replay what it missed.
+            last = self.headers.get('Last-Event-ID')
+            if last is not None:
+                try:
+                    last_id = int(last)
+                except ValueError:
+                    last_id = 0
+                with BUS_LOCK:
+                    backlog = [(i, p) for (i, p) in BUS_HISTORY if i > last_id]
+                for mid, payload in backlog:
+                    self._bus_write(mid, payload)
+            while True:
+                try:
+                    mid, payload = my_queue.get(timeout=BUS_KEEPALIVE_S)
+                except queue.Empty:
+                    # A comment line keeps the connection warm and, more
+                    # usefully, surfaces a dead peer as a write error here.
+                    self.wfile.write(b': keepalive\n\n')
+                    self.wfile.flush()
+                    continue
+                self._bus_write(mid, payload)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        finally:
+            with BUS_LOCK:
+                if my_queue in BUS_SUBSCRIBERS:
+                    BUS_SUBSCRIBERS.remove(my_queue)
+
+    def _bus_write(self, mid, payload):
+        frame = 'id: %d\ndata: %s\n\n' % (mid, payload)
+        self.wfile.write(frame.encode('utf-8'))
+        self.wfile.flush()
 
     @staticmethod
     def _is_loopback_origin(origin):
@@ -494,12 +610,16 @@ def main():
                         help='interface to bind (default loopback; 0.0.0.0 for cross-device days)')
     parser.add_argument('--root', default=None,
                         help='static root (default: the out/ beside this script\'s repo)')
+    parser.add_argument('--bus', action='store_true',
+                        help='enable /_ns/bus (the agent channel: external POST -> IDE over SSE). '
+                             'Off by default because it injects prompts into an IDE that edits and runs code')
     parser.add_argument('--reflector', default=None,
                         help='announce a local Croquet reflector, e.g. ws://localhost:9090')
     parser.add_argument('--croquet-files', default='/files',
                         help='origin-relative Croquet file-server path (announced only with --reflector)')
     args = parser.parse_args()
 
+    CONFIG['bus'] = bool(args.bus)
     if args.reflector:
         CONFIG['croquet'] = {'reflector': args.reflector, 'files': args.croquet_files}
 

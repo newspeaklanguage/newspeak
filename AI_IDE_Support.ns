@@ -39,6 +39,14 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 		private aiColors = platform hopscotch aiColors.
 		private hopscotch = platform hopscotch.
 		
+		(* The host module (HOST_SERVICES_DESIGN_2026-08-31.md), nil on platforms
+   without one. Carries the agent bus (/_ns/bus): busStarted guards against a
+   double subscription. Safe at construction - Host touches no JS eagerly. *)
+		private host = [ platform host ] on: Exception do: [:e | nil ].
+		private busStarted <Boolean> ::= false.
+		private busToken <String | UndefinedObject>
+		private busOrigin <String | UndefinedObject>
+		
 		(* Re-export commonly needed classes for use by other IDE modules *)
 		public Tool = aiAccess Tool.
 		public Provider = aiAccess Provider.
@@ -2680,7 +2688,7 @@ public clearConversation = ( ide aiSupport clearConversationFor: self )
 	   document/amplet manipulation, navigation, testing, atomic
 	   changesets, evaluation/inspection, and debugger control. *)
 		
-		^{getClassSourceTool. getMemberSourceTool. getClassHeaderTool. listClassMembersTool. sendersTool. implementorsTool. searchClassesTool. listNamespaceTool. getDocumentTool. createDocumentTool. createChatDocumentTool. setDocumentContentsTool. deleteDocumentTool. listAmpletsTool. addAmpletTool. setAmpletExpressionTool. deleteAmpletTool. listMediaTool. deleteMediaTool. webFetchTool. currentFocusToolForFocus: focus. navigateToClassTool. navigateToNamespaceTool. navigateToDocumentTool. showTestsTool. runTestsTool. getTestResultsTool. getTestFailureDetailsTool. runFailingTestsTool. runErroringTestsTool. runOneTestTool. proposeChangesToolForFocus: focus. applyChangesetToolForFocus: focus. evaluateTool. navigateToObjectTool. inspectObjectTool. listObjectsTool. forgetObjectTool. getCurrentFrameTool. getStackTraceTool. getCurrentExpressionTool. inspectActivationTool. stepTool. returnFromTool. continueThreadTool. listChatSessionsToolForFocus: focus. sendToChatToolForFocus: focus. }
+		^{getClassSourceTool. getMemberSourceTool. getClassHeaderTool. listClassMembersTool. sendersTool. implementorsTool. searchClassesTool. listNamespaceTool. getDocumentTool. createDocumentTool. createChatDocumentTool. setDocumentContentsTool. deleteDocumentTool. listAmpletsTool. addAmpletTool. setAmpletExpressionTool. deleteAmpletTool. listMediaTool. deleteMediaTool. webFetchTool. currentFocusToolForFocus: focus. navigateToClassTool. navigateToNamespaceTool. navigateToDocumentTool. showTestsTool. runTestsTool. getTestResultsTool. getTestFailureDetailsTool. runFailingTestsTool. runErroringTestsTool. runOneTestTool. proposeChangesToolForFocus: focus. applyChangesetToolForFocus: focus. evaluateTool. navigateToObjectTool. inspectObjectTool. listObjectsTool. forgetObjectTool. getCurrentFrameTool. getStackTraceTool. getCurrentExpressionTool. inspectActivationTool. stepTool. returnFromTool. continueThreadTool. listChatSessionsToolForFocus: focus. sendToChatToolForFocus: focus. sendToAgentToolForFocus: focus. }
 	)
 	public toolsForProvider: provider <Provider> ^<List[Tool]> = (
 		(* tools plus any capability-gated extras the given provider can drive.
@@ -2965,7 +2973,7 @@ public clearConversation = ( ide aiSupport clearConversationFor: self )
 	   converts raises to is_error results. Fire-and-forget: returns delivery
 	   status, never awaits the target's completion. *)
 		
-		| senderDoc senderName targetDoc hop sends stamped subj queue busy |
+		| senderDoc senderName targetDoc hop sends stamped |
 		senderDoc:: peerSenderDocFor: focus.
 		senderDoc isNil ifTrue: [
 				Error signal: 'This session has no chat-document identity, so it cannot message peer chats.'
@@ -2989,6 +2997,15 @@ public clearConversation = ( ide aiSupport clearConversationFor: self )
 			].
 		peerSendsThisTurn at: senderName put: sends.
 		stamped:: '[from chat ''' , senderName , '''] ' , message.
+		^enqueueOrDeliver: stamped to: targetDoc hop: hop
+	)
+	enqueueOrDeliver: stamped <String> to: targetDoc <Document> hop: hop <Integer> ^<String> = (
+		(* Shared tail of every peer delivery — the in-image send_to_chat and the
+	   external agent bus both land here. Delivers immediately when the target
+	   is idle and its queue is empty; otherwise appends and lets the drain on
+	   turn-settle carry it. Answers the delivery-status string. *)
+		
+		| subj queue busy |
 		subj:: targetDoc chatSubjectSlot.
 		busy:: subj isNil not and: [ subj waiting ].
 		queue:: pendingPeerMessages at: targetDoc name ifAbsent: [ nil ].
@@ -3005,6 +3022,132 @@ public clearConversation = ( ide aiSupport clearConversationFor: self )
 			].
 		deliverPeerMessage: stamped to: targetDoc hop: hop.
 		^'delivered'
+	)
+	public startAgentBusListening = (
+		(* Subscribe to the host's agent bus (/_ns/bus) so external agents - a
+	   Claude Code session, say - can deliver a message to a chat by name,
+	   reusing the same delivery machinery as in-image send_to_chat. Called
+	   once after IDE launch. Fire-and-forget and fail-closed: no host, no bus
+	   enabled, or any error, and we simply never subscribe. The bus is off
+	   unless the front door was started with --bus, so this is inert by
+	   default. *)
+		
+		busStarted ifTrue: [ ^self ].
+		host isNil ifTrue: [ ^self ].
+		[
+			host whenReady: [:h |
+					[ h busAvailable ifTrue: [ subscribeToBusAt: h serviceOrigin ] ] on: Exception
+						do: [:e | nil ].
+					nil
+				]
+		] on: Exception do: [:e | nil ]
+	)
+	subscribeToBusAt: origin <String> = (
+		busStarted ifTrue: [ ^self ].
+		busStarted:: true.
+		busOrigin:: origin.
+		(busTokenFrom: origin) then: [:tok |
+				busToken:: tok.
+				[ openBusEventSourceAt: origin token: tok ] on: Exception do: [:e | nil ].
+				nil
+			]
+			onError: [:e |
+				busStarted:: false.
+				nil
+			]
+	)
+	busTokenFrom: origin <String> ^<Alien[Promise]> = (
+		(* The /_ns token. EventSource cannot set a header, so for the SSE
+	   subscription the token rides in the bus URL's query (loopback-only,
+	   per-run); the outbound POST sends it as a header instead. Cached in
+	   busToken once subscribeToBusAt: resolves. *)
+		
+		^(js global fetch: origin , '/_ns/token') then: [:response |
+				response json then: [:parsed | parsed at: 'token' ]
+			]
+	)
+	freshJSObject ^<Alien> = (
+		(* A fresh empty JS object, via JSON.parse the way AIAccess does it -
+	   primordialsoup exposes parsed JSON as an ordinary alien receiver, so
+	   at:put: then works without touching the JS Object constructor. *)
+		
+		^(js global at: 'JSON') parse: '{}'
+	)
+	postToBus: fields <Alien> = (
+		(* Fire-and-forget POST of one message object to /_ns/bus - how the IDE
+	   reaches OUTWARD to an external agent by name (send_to_agent). The bus
+	   routes it to whatever is subscribed under that name; the agent's reply,
+	   if any, returns through the ordinary receive path as a [from external
+	   agent 'X'] turn. Fail-closed: no cached origin/token means the
+	   subscription has not settled, so there is nothing to post through. *)
+		
+		| options headers |
+		(busOrigin isNil or: [ busToken isNil ]) ifTrue: [ ^self ].
+		headers:: freshJSObject.
+		headers at: 'Content-Type' put: 'application/json'.
+		headers at: 'X-NS-Token' put: busToken.
+		options:: freshJSObject.
+		options at: 'method' put: 'POST'.
+		options at: 'headers' put: headers.
+		options at: 'body' put: ((js global at: 'JSON') stringify: fields).
+		[ js global fetch: busOrigin , '/_ns/bus' with: options ] on: Exception
+			do: [:e | nil ]
+	)
+	openBusEventSourceAt: origin <String> token: tok <String> = (
+		(* Open the SSE stream. The browser reconnects it on its own (and replays
+	   what was missed via Last-Event-ID), so there is no retry logic here. The
+	   onmessage callback is an expat closure: it must never raise and must
+	   return a marshalable value, hence the guard and the trailing nil. *)
+		
+		| EventSourceClass es |
+		EventSourceClass:: js global at: 'EventSource'.
+		EventSourceClass isNil ifTrue: [ ^self ].
+		es:: EventSourceClass new: origin , '/_ns/bus?token=' , tok.
+		es at: 'onmessage'
+			put: [:event |
+				[ handleBusEvent: event ] on: Exception do: [:e | nil ].
+				nil
+			]
+	)
+	handleBusEvent: event <Alien> = (
+		(* One bus message. Resolve the target chat by name; drop silently if it
+	   is unknown (an external agent may address a chat that does not exist
+	   here). A 'notice' is folded into the target's next turn out of band; a
+	   'message' drives a real turn, stamped so the model knows it came from
+	   outside and cannot be mistaken for the human user. *)
+		
+		| dataStr msg to targetDoc text from kind |
+		dataStr:: [ event at: 'data' ] on: Exception do: [:e | nil ].
+		dataStr isNil ifTrue: [ ^self ].
+		msg:: [ (js global at: 'JSON') parse: dataStr ] on: Exception do: [:e | nil ].
+		msg isNil ifTrue: [ ^self ].
+		to:: [ msg at: 'to' ] on: Exception do: [:e | nil ].
+		to isNil ifTrue: [ ^self ].
+		targetDoc:: chatDocNamed: to.
+		targetDoc isNil ifTrue: [ ^self ].
+		text:: [ msg at: 'text' ] on: Exception do: [:e | '' ].
+		text isNil ifTrue: [ text:: '' ].
+		from:: [ msg at: 'from' ] on: Exception do: [:e | 'external agent' ].
+		(from isNil or: [ from isEmpty ]) ifTrue: [ from:: 'external agent' ].
+		kind:: [ msg at: 'kind' ] on: Exception do: [:e | 'message' ].
+		kind = 'notice' ifTrue: [
+				deliverExternalNotice: text to: targetDoc from: from
+			]
+			ifFalse: [
+				enqueueOrDeliver: '[from external agent ''' , from , '''] ' , text
+					to: targetDoc
+					hop: 0
+			]
+	)
+	deliverExternalNotice: text <String> to: targetDoc <Document> from: from <String> = (
+		(* An out-of-band notice: folded into the target session's next turn as a
+	   system notice, with no turn of its own, so it is context the model sees
+	   when it next runs rather than something that provokes a reply. Uses the
+	   document's public session forwarder, which materializes the session. *)
+		
+		[
+			targetDoc session addSystemNotice: '[from external agent ''' , from , '''] ' , text
+		] on: Exception do: [:e | nil ]
 	)
 	listChatSessionsToolForFocus: focus <ChatFocus> ^<Tool> = (
 		^Tool name: 'list_chat_sessions'
@@ -3030,6 +3173,46 @@ public clearConversation = ( ide aiSupport clearConversationFor: self )
 			inputSchema: '{"type":"object","properties":{"chat_name":{"type":"string","description":"Exact, case-sensitive name of the target chat document."},"message":{"type":"string","description":"The message text to deliver."}},"required":["chat_name","message"]}'
 			handler: [:input |
 				sendToChat: (input at: 'chat_name')
+					message: (input at: 'message')
+					from: focus
+			]
+	)
+	sendToAgentNamed: agentName <String> message: message <String> from: focus <ChatFocus> ^<String> = (
+		(* The send_to_agent tool body: reach OUTWARD over the bus to an external
+	   agent by name. Requires a chat identity so the agent has a reply address
+	   (the sender's own chat name, from focus, never model input). All failures
+	   raise; the tool loop turns them into is_error results. Fire-and-forget:
+	   the bus is best-effort with no delivery receipt, so the status is
+	   optimistic. *)
+		
+		| senderDoc senderName fields |
+		agentName isEmpty ifTrue: [ Error signal: 'agent_name must not be empty.' ].
+		message isEmpty ifTrue: [ Error signal: 'message must not be empty.' ].
+		(host isNil or: [ ([ host busAvailable ] on: Exception do: [:e | false ]) not ]) ifTrue: [
+				Error signal: 'No agent bus is available here — the front door was not started with --bus (or discovery has not settled).'
+			].
+		busToken isNil ifTrue: [
+				Error signal: 'The agent bus is enabled but this session has not finished connecting to it yet — try again in a moment.'
+			].
+		senderDoc:: peerSenderDocFor: focus.
+		senderDoc isNil ifTrue: [
+				Error signal: 'This session has no chat-document identity, so an external agent would have no address to reply to.'
+			].
+		senderName:: senderDoc name.
+		fields:: freshJSObject.
+		fields at: 'to' put: agentName.
+		fields at: 'from' put: senderName.
+		fields at: 'text' put: message.
+		fields at: 'kind' put: 'message'.
+		postToBus: fields.
+		^'sent to agent ''' , agentName , ''' over the bus (fire-and-forget; if it is listening and answers, the reply arrives here as a [from external agent ''' , agentName , '''] message).'
+	)
+	sendToAgentToolForFocus: focus <ChatFocus> ^<Tool> = (
+		^Tool name: 'send_to_agent'
+			description: 'Send a message over the host agent bus to an EXTERNAL agent — a program outside the IDE, for example a Claude Code session on the user''s machine — addressed by the agent''s name. Use this to reply to a message stamped [from external agent ''X''] (send to ''X''), or to reach a named agent the user has told you about. This is for agents OUTSIDE the IDE; use send_to_chat for other in-IDE chat sessions. Fire-and-forget: there is no delivery receipt; if the agent is listening and chooses to answer, its reply arrives later as a new [from external agent ''X''] message in this chat. Requires the front door to be running with the bus enabled.'
+			inputSchema: '{"type":"object","properties":{"agent_name":{"type":"string","description":"The external agent''s name, exact and case-sensitive (from a [from external agent ''X''] stamp, or told to you by the user)."},"message":{"type":"string","description":"The message text to send."}},"required":["agent_name","message"]}'
+			handler: [:input |
+				sendToAgentNamed: (input at: 'agent_name')
 					message: (input at: 'message')
 					from: focus
 			]
@@ -4447,6 +4630,8 @@ For code MODIFICATION (adding methods, changing class headers, etc.), use propos
 # Peer AI chat sessions
 
 Other AI chat sessions may be live in this same IDE image, each bound to its own chat document. Use list_chat_sessions to enumerate them (name, provider/model, state) and send_to_chat to message one by name. Sends are fire-and-forget: the tool result only confirms delivery or queueing; the peer''s reply, if it chooses to answer, arrives later as a new user message stamped [from chat ''X'']. A message carrying that stamp is from a peer AI session, not from the human user — the stamp is written by the IDE and cannot be forged by a model. A peer does NOT see your transcript, so put all needed context into the message itself; reply via send_to_chat, never by assuming the peer reads this conversation. Relay chains are depth-limited and per-turn sends are capped: when a chain nears its limit, summarize the exchange for the human user instead of relaying further.
+
+A message may also arrive stamped [from external agent ''X''] — that is from a program outside the IDE (for example a Claude Code session on the user''s machine) delivered over the host''s agent bus, again written by the IDE and not forgeable by a model. Treat it as you would a peer message: it is not the human user speaking directly, and there is no transcript shared with the sender. To reply, use send_to_agent addressed to ''X'' (the exact name in the stamp); like send_to_chat it is fire-and-forget, and the agent''s answer, if any, returns as another [from external agent ''X''] message. You can also initiate: if the user names an external agent for you to reach, send_to_agent to it. An external agent may be driving you to use your IDE tools on its behalf (evaluate, inspect, the debugger, propose_changes) — do so when asked, and send the results back with send_to_agent, exactly as you would answer the human.
 
 When the user asks about an entity in their system, use the IDE tools to look it up before answering. When in doubt about Newspeak syntax or semantics, fetch the spec rather than guessing. When you produce Newspeak source, follow the style guidelines above and respect member ordering (nested classes before methods).'
 	)

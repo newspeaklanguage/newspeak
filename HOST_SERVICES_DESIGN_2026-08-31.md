@@ -353,6 +353,17 @@ call site without migrating anything.
 Repositories and Croquet migrate to `platform host` opportunistically; neither
 is blocked by it, and neither should be destabilized for it.
 
+**Legacy :9999 retired (2026-09-04).** The three clients that pointed at the
+bare `:9999` cors-proxy convention now use the front door's `/_ns/git`: the
+repository clone default (`corsProxyUrl` → `/_ns/git`) and `local_fetch`'s
+browser-side fallback (`webFetchProxyPrefix` → `/_ns/git`), both
+page-origin-relative so no port is hardcoded (verified: isomorphic-git clones
+through a relative `corsProxy`); `Host`'s discovery fallback moved from
+`:9999` to `:8080` (and is now rarely used, since the front door serves the
+page, so the same-origin probe wins). `cors-proxy.py`'s legacy listener now
+defaults **off** (`--legacy-port 0`; pass `9999` to revive it for an
+un-rebuilt client during a transition). One origin, one process, one port.
+
 **Parallel track (spun out 2026-08-31):** the *in-image* half of the bus —
 AI sessions in one IDE messaging each other, addressed by chat-document
 name — needs no server and proceeds independently; see

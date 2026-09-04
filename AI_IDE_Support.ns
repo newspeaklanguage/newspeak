@@ -1013,18 +1013,12 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 	lazy public StaleChangesetPresenter = repositories StaleChangesetPresenter.
 	lazy public StaleChangesetSubject = repositories StaleChangesetSubject.
 	
-	(* --- Peer AI session messaging state (all lazy: an eager slot added to a
-   live module crashes on hot-load). Keyed by chat-document NAME, not by the
-   Document itself: Document>>hash mixes in `contents`, so a document mutates
-   its own hash on every appended turn and would get lost as a Map key. *)
-	
-	(* chat name -> List of {stamped text. hop} tuples awaiting delivery *)
+	(* Peer AI session messaging state (lazy: safe to add to the live module).
+   Keyed by chat-document NAME — the tool-facing address, unique at Root bind
+   sites: pending {stamped text. hop} deliveries, the hop driving a chat's
+   current turn, and its send_to_chat count for this turn. *)
 	lazy pendingPeerMessages = Map new.
-	
-	(* chat name -> hop number of the peer delivery driving its current turn *)
 	lazy inboundHopByChat = Map new.
-	
-	(* chat name -> count of send_to_chat calls made during its current turn *)
 	lazy peerSendsThisTurn = Map new.
 	ensureModelMachineryGap: container <Object> beforeThinking: thinking <Object> ^<Object> = (
 		(* Find the block-level gap that sits between the chat content and
@@ -3737,39 +3731,6 @@ The Tester instance is captured for subsequent calls to get_test_results, run_fa
 				'Re-ran [' , testName , ']. Call get_test_results for the new outcome.'
 			]
 	)
-	proposeChangesToolForFocus: focus <ChatFocus> ^<Tool> = (
-		^Tool name: 'propose_changes'
-			description: 'Stage a set of code edits for atomic installation. Does NOT install. Returns a short summary plus a changeset id; the IDE renders the proposal as a structured diff inline in the chat. Wait for explicit user approval ("apply", "ok", "go ahead") before calling apply_changeset — or, if the user clicks the inline Apply button themselves, you will see a follow-up assistant note saying the changeset was applied. If the user wants something different, refine the changes and call propose_changes again.
-
-Each entry in the changes array is one of:
-- {kind: "add_or_replace_method",       class_name, side?, source}
-- {kind: "delete_method",               class_name, side?, selector}
-- {kind: "add_or_replace_lazy_slot",    class_name, side?, source}
-- {kind: "delete_lazy_slot",            class_name, side?, selector}
-- {kind: "set_class_header",            class_name, source}
-- {kind: "add_or_replace_nested_class", class_name, source}  -- class_name is the ENCLOSING class
-- {kind: "delete_nested_class",         class_name}          -- class_name is the nested class to remove
-- {kind: "add_top_level_class",         class_name, source}  -- class_name must match the simpleName in source
-
-class_name is a dotted path; side defaults to "instance" for member ops. source is full Newspeak source. Multiple changes in one call install atomically — use this for mutually dependent edits.
-
-Top-level class DELETION is not supported by this tool (different mechanism, not part of atomic install). Renaming a class is not supported either; set_class_header preserves the simple name.'
-			inputSchema: '{"type":"object","properties":{"changes":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string","enum":["add_or_replace_method","delete_method","add_or_replace_lazy_slot","delete_lazy_slot","set_class_header","add_or_replace_nested_class","delete_nested_class","add_top_level_class"]},"class_name":{"type":"string"},"side":{"type":"string","enum":["instance","class"]},"selector":{"type":"string"},"source":{"type":"string"}},"required":["kind","class_name"]}}},"required":["changes"]}'
-			handler: [:input |
-				| changes records id |
-				changes:: input at: 'changes'.
-				records:: List new.
-				
-				(* changes is a JS array, not a Newspeak Collection; iterate by index. *)
-				0 to: (changes at: 'length') - 1
-					do: [:i | records add: (validateChange: (changes at: i)) ].
-				records isEmpty ifTrue: [ Error signal: 'No changes provided' ].
-				id:: freshChangesetId.
-				proposedChangesets at: id put: records.
-				enqueuePendingChangesetId: id forChat: (proposingChatFor: focus).
-				summarizeChangesetId: id records: records
-			]
-	)
 	applyChangesetToolForFocus: focus <ChatFocus> ^<Tool> = (
 		^Tool name: 'apply_changeset'
 			description: 'Atomically install a previously proposed changeset. Call this only after the user has reviewed the diff returned by propose_changes and explicitly approved. On success returns "Applied changeset <id>". On failure the atomic install rolls back, so no partial state is left in the running system.'
@@ -4536,43 +4497,6 @@ When the user asks about an entity in their system, use the IDE tools to look it
 					]
 			]
 	)
-	public changesetPresenter: id <String> for: doc <Document> ^<Object> = (
-		(* Relocation of old ChatDocument>>changesetPresenterFor:. Returns a
-	   ChangesetPresenter on the doc-cached ChangesetSubject for `id`, or a
-	   stable banner when the proposal is no longer pending. *)
-		
-		| records subject |
-		records:: proposedChangesets at: id ifAbsent: [ nil ].
-		records isNil ifTrue: [
-				doc changesetSubjectsById removeKey: id ifAbsent: [ ].
-				^StaleChangesetPresenter onSubject: (StaleChangesetSubject onModel: id)
-			].
-		subject:: doc changesetSubjectsById at: id
-			ifAbsent: [
-				| strategy s |
-				strategy:: AIInstallStrategy onRecords: records
-					changesetId: id
-					onApplied: [:csId :recCount |
-						appendSection: 'Applied changeset ' , csId , ' (' , recCount printString , (recCount = 1 ifTrue: [
-									' record).'
-								]
-								ifFalse: [ ' records).' ])
-							role: 'assistant'
-							into: doc
-					(* Codebase-change notices now fire at the install choke point
-					   (ide installFromBuilders:into:), for every session. *) ]
-					onCanceled: [
-						forgetCachedChangesetSubject: id for: doc.
-						doc mutateContentsTo: doc contents
-					]
-					onComputed: [ doc mutateContentsTo: doc contents ].
-				s:: ChangesetSubject onModel: strategy.
-				s autoExpand: true.
-				doc changesetSubjectsById at: id put: s.
-				s
-			].
-		^ChangesetPresenter onSubject: subject
-	)
 	seedSnapshotForRecord: r <Map> snapsByTop: snapsByTop <Map> newClasses: newClasses <Set> sourcesByTop: sourcesByTop <Map> = (
 		(* Make sure snapsByTop has an entry for the top-level class touched
 	   by record r. add_top_level_class seeds from the record's full
@@ -4610,6 +4534,92 @@ When the user asks about an entity in their system, use the IDE tools to look it
 		liveCls:: Root at: topName ifAbsent: [ nil ].
 		liveCls isNil ifFalse: [
 				snapsByTop at: topName put: (repositories liveSnapshotOf: liveCls)
+			]
+	)
+	public changesetPresenter: id <String> for: doc <Document> ^<Object> = (
+		(* Relocation of old ChatDocument>>changesetPresenterFor:. Returns a
+	   ChangesetPresenter on the doc-cached ChangesetSubject for `id`, or a
+	   stable banner when the proposal is no longer pending. *)
+		
+		| records subject |
+		records:: proposedChangesets at: id ifAbsent: [ nil ].
+		records isNil ifTrue: [
+				doc changesetSubjectsById removeKey: id ifAbsent: [ ].
+				^StaleChangesetPresenter onSubject: (StaleChangesetSubject onModel: id)
+			].
+		subject:: doc changesetSubjectsById at: id
+			ifAbsent: [
+				| strategy s |
+				strategy:: AIInstallStrategy onRecords: records
+					changesetId: id
+					onApplied: [:csId :recCount |
+						| line <String> |
+						line:: 'Applied changeset ' , csId , ' (' , recCount printString , (recCount = 1 ifTrue: [
+								' record).'
+							]
+							ifFalse: [ ' records).' ]).
+						
+						(* The Apply button is the USER's act, performed by the IDE, so the
+					   transcript line is a 'notice' (labelled IDE), not an assistant
+					   bubble — the model never said it. *)
+						appendSection: line role: 'notice' into: doc.
+						
+						(* And the model must learn the same fact, or it will keep offering
+					   to apply a changeset that is already live. The generic codebase-
+					   changed notice from the install choke point names classes, not
+					   changeset ids, so add a specific one. Guarded: a failure here must
+					   never undo a successful install. *)
+						[
+							| subj |
+							subj:: doc chatSubjectSlot.
+							subj isNil ifFalse: [
+									subj session addSystemNotice: 'The user applied your proposed changeset ' , csId , ' (' , recCount printString , ' records) via the Apply button; it is now live. Do NOT call apply_changeset on it.'
+								]
+						] on: Exception do: [:e | nil ]
+					]
+					onCanceled: [
+						forgetCachedChangesetSubject: id for: doc.
+						doc mutateContentsTo: doc contents
+					]
+					onComputed: [ doc mutateContentsTo: doc contents ].
+				s:: ChangesetSubject onModel: strategy.
+				s autoExpand: true.
+				doc changesetSubjectsById at: id put: s.
+				s
+			].
+		^ChangesetPresenter onSubject: subject
+	)
+	proposeChangesToolForFocus: focus <ChatFocus> ^<Tool> = (
+		^Tool name: 'propose_changes'
+			description: 'Stage a set of code edits for atomic installation. Does NOT install. Returns a short summary plus a changeset id; the IDE renders the proposal as a structured diff inline in the chat. Wait for explicit user approval ("apply", "ok", "go ahead") before calling apply_changeset. If the user instead clicks the inline Apply button themselves, the IDE appends an IDE-labelled notice to the transcript and your next turn''s system prompt carries a line "The user applied your proposed changeset csN ... it is now live" — when you see that, the changeset is installed; do NOT call apply_changeset on it. If the user wants something different, refine the changes and call propose_changes again.
+
+Each entry in the changes array is one of:
+- {kind: "add_or_replace_method",       class_name, side?, source}
+- {kind: "delete_method",               class_name, side?, selector}
+- {kind: "add_or_replace_lazy_slot",    class_name, side?, source}
+- {kind: "delete_lazy_slot",            class_name, side?, selector}
+- {kind: "set_class_header",            class_name, source}
+- {kind: "add_or_replace_nested_class", class_name, source}  -- class_name is the ENCLOSING class
+- {kind: "delete_nested_class",         class_name}          -- class_name is the nested class to remove
+- {kind: "add_top_level_class",         class_name, source}  -- class_name must match the simpleName in source
+
+class_name is a dotted path; side defaults to "instance" for member ops. source is full Newspeak source. Multiple changes in one call install atomically — use this for mutually dependent edits.
+
+Top-level class DELETION is not supported by this tool (different mechanism, not part of atomic install). Renaming a class is not supported either; set_class_header preserves the simple name.'
+			inputSchema: '{"type":"object","properties":{"changes":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string","enum":["add_or_replace_method","delete_method","add_or_replace_lazy_slot","delete_lazy_slot","set_class_header","add_or_replace_nested_class","delete_nested_class","add_top_level_class"]},"class_name":{"type":"string"},"side":{"type":"string","enum":["instance","class"]},"selector":{"type":"string"},"source":{"type":"string"}},"required":["kind","class_name"]}}},"required":["changes"]}'
+			handler: [:input |
+				| changes records id |
+				changes:: input at: 'changes'.
+				records:: List new.
+				
+				(* changes is a JS array, not a Newspeak Collection; iterate by index. *)
+				0 to: (changes at: 'length') - 1
+					do: [:i | records add: (validateChange: (changes at: i)) ].
+				records isEmpty ifTrue: [ Error signal: 'No changes provided' ].
+				id:: freshChangesetId.
+				proposedChangesets at: id put: records.
+				enqueuePendingChangesetId: id forChat: (proposingChatFor: focus).
+				summarizeChangesetId: id records: records
 			]
 	)
 ) : ()

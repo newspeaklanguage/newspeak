@@ -3371,25 +3371,6 @@ This should be done by calling #registerNewPresenter: *)
 		public goToPastIndex: i <Integer> = (
 			1 to: i do: [:dontCare | goBack ]
 		)
-		public registerNewPresenter: newPresenter <Presenter> = (
-			| oldPresenter <Presenter> = equalVisitOr: newPresenter. |
-			oldPresenter == newPresenter ifTrue: [
-					
-					(* In this case, newPresenter was truly new and there was no actual oldPresenter, so equalVisitOr: returned its argument. *)
-					idFor: newPresenter
-				]
-				ifFalse: [
-					| id <Number> = idFor: oldPresenter. |
-					
-					(* update the new presenter state based on the old presenter *)
-					newPresenter updateVisualsFrom: oldPresenter.
-					
-					(* update the cached history to contain the new presenter *)
-					ids removeKey: oldPresenter.
-					ids at: newPresenter put: id.
-					replace: oldPresenter with: newPresenter
-				]
-		)
 		moveHistoryBack = (
 			subclassResponsibility
 		)
@@ -3411,6 +3392,45 @@ This should be done by calling #registerNewPresenter: *)
 					moveHistoryForward.
 					currentVisitSlot:: future removeFirst
 				]
+		)
+		public registerNewPresenter: newPresenter <Presenter> = (
+			| oldPresenter <Presenter> = equalVisitOr: newPresenter. |
+			oldPresenter == newPresenter ifTrue: [
+					
+					(* In this case, newPresenter was truly new and there was no actual oldPresenter, so equalVisitOr: returned its argument. *)
+					idFor: newPresenter
+				]
+				ifFalse: [
+					| id <Number> = idFor: oldPresenter. |
+					
+					(* update the new presenter state based on the old presenter *)
+					newPresenter updateVisualsFrom: oldPresenter.
+					
+					(* update the cached history to contain the new presenter.
+     equalVisitOr: found oldPresenter by a linear #= scan of the keys, but
+     removeKey: locates it by hash. If the key's hash drifted since insertion
+     (a model whose hash depends on mutable state), a plain removeKey: would
+     raise here - after newPresenter has already reconciled and taken over the
+     DOM, but before the caller displays it, stranding an unparented presenter
+     tree on screen. Fall back to rebuilding the map, which re-buckets every
+     key under its current hash and drops the old presenter. *)
+					ids removeKey: oldPresenter ifAbsent: [ rebuildIdsWithout: oldPresenter ].
+					ids at: newPresenter put: id.
+					replace: oldPresenter with: newPresenter
+				]
+		)
+		rebuildIdsWithout: presenter <Presenter> = (
+			(* Re-insert every id entry except the one for presenter (matched by
+     identity), so keys whose hash changed since insertion become findable
+     again. Only reached from registerNewPresenter: when a hash-drifted key
+     could not be removed normally. *)
+			
+			| entries <List> = List new. |
+			ids keysAndValuesDo: [:k <Presenter> :v <Integer> |
+					k == presenter ifFalse: [ entries add: {k. v. } ]
+				].
+			ids removeAll.
+			entries do: [:e | ids at: (e at: 1) put: (e at: 2) ]
 		)
 	) : ()
 	class PaddedFrameComposer content: c offsets: o = Composer new (
@@ -3795,6 +3815,12 @@ merely documents it. *)
 		)
 		checkbox: text <String> value: v <Boolean | Holder> action: a <[:Boolean | Object]> ^<CheckboxFragent> = (
 			^CheckboxFragment text: text value: v action: a
+		)
+		liveLabel: compute <[String]> every: ms <Integer> ^<LiveLabelFragment> = (
+			(* A label re-evaluating `compute` every ms milliseconds while on screen.
+		   See LiveLabelFragment. *)
+			
+			^LiveLabelFragment computing: compute every: ms
 		)
 	) : ()
 	public class Presenter onSubject: aSubject <Subject> = FragmentWithFactories new (
@@ -5864,6 +5890,16 @@ If none of the parents of a presenter accept a request, an error is signaled by 
 		public errorText ^<Color> = (
 			^Color r: 0.8 g: 0 b: 0
 		)
+		public noticeTurnBackground ^<String> = (
+			(* Neutral grey for IDE-originated lines (changeset applied, turn
+	   truncated, tool call refused) — visibly neither the user's words nor
+	   the assistant's, and not an error. *)
+			
+			^'#f3f3f0'
+		)
+		public noticeTurnBorder ^<String> = (
+			^'#c8c8c0'
+		)
 	) : ()
 	public class AIChatSetupSubject onModel: providerClass <Class> = Subject onModel: providerClass (
 		(* Subject for the initial chat setup screen where the user enters
@@ -6236,18 +6272,6 @@ If none of the parents of a presenter accept a request, an error is signaled by 
  anywhere else would mean building them twice. *)
 		
 	) (
-		definition = (
-			subject waiting ifTrue: [
-					^column: {row: {(label: '…thinking…') italic. mediumBlank. button: 'Cancel'
-								action: [ respondToCancel ]. }. (label: 'Model: ' , currentModelName) color: (Color r: 0.5
-								g: 0.5
-								b: 0.5). }
-				].
-			(canRetryQuietly and: [ subject errorMessage isNil not ]) ifTrue: [
-					^column: {retryRow. modelPicker. }
-				].
-			^modelPicker
-		)
 		canRetryQuietly ^<Boolean> = (
 			(* Is there a turn worth re-driving? Guarded because definition must
 	   never raise: a subject whose session is in a bad state should
@@ -6315,6 +6339,133 @@ If none of the parents of a presenter accept a request, an error is signaled by 
 		)
 		isMyKind: other ^<Boolean> = (
 			^other isKindOfChatStatusPresenter
+		)
+		definition = (
+			| usage <Fragment | UndefinedObject> |
+			subject waiting ifTrue: [
+					^column: {row: {progressLabel. mediumBlank. button: 'Cancel'
+								action: [ respondToCancel ]. }. (label: 'Model: ' , currentModelName) color: (Color r: 0.5
+								g: 0.5
+								b: 0.5). }
+				].
+			usage:: usageLine.
+			(canRetryQuietly and: [ subject errorMessage isNil not ]) ifTrue: [
+					usage isNil ifTrue: [ ^column: {retryRow. modelPicker. } ].
+					^column: {retryRow. modelPicker. usage. }
+				].
+			usage isNil ifTrue: [ ^modelPicker ].
+			^column: {modelPicker. usage. }
+		)
+		progressLabel ^<Fragment> = (
+			(* What the turn is doing right now and for how long, ticking once a
+	   second. The session's phase changes several times inside one turn
+	   (waiting for model / running <tools> / waiting again) and nothing
+	   re-renders this presenter mid-turn, so the label reads the session
+	   live on every tick instead of being baked in at render time. The
+	   turn clock starts when this presenter renders in the waiting state,
+	   which is when the send happened. *)
+			
+			| session <Session> turnStart <Number> |
+			session:: subject session.
+			turnStart:: nowMs.
+			^(liveLabel: [ progressTextFor: session since: turnStart ] every: 1000) italic
+		)
+		progressTextFor: session <Session> since: turnStart <Number> ^<String> = (
+			(* e.g. '… running evaluate · 3s (turn 41s)'. Falls back to the old
+	   static text if the session predates phase tracking or the clock is
+	   unavailable. *)
+			
+			^[
+				| phase <String> now <Number> started <Number> phaseSecs <Integer> turnSecs <Integer> |
+				phase:: session phase.
+				(phase isNil or: [ phase = 'idle' ]) ifTrue: [ phase:: 'finishing' ].
+				now:: nowMs.
+				started:: session phaseStartedAt.
+				phaseSecs:: (started isNil or: [ started = 0 ]) ifTrue: [ 0 ]
+					ifFalse: [ (now - started / 1000) asInteger max: 0 ].
+				turnSecs:: (now - turnStart / 1000) asInteger max: 0.
+				'… ' , phase , ' · ' , phaseSecs printString , 's (turn ' , turnSecs printString , 's)'
+			] on: Exception do: [:e | '…thinking…' ]
+		)
+		nowMs ^<Number> = (
+			(* JS wall-clock milliseconds; 0 if the bridge is unavailable. *)
+			
+			^[ (js global at: 'Date') now ] on: Exception do: [:e | 0 ]
+		)
+		usageLine ^<Fragment | UndefinedObject> = (
+			(* Token accounting for the session, shown under the model picker between
+	   turns; nil (nothing shown) until the session has made a request, and
+	   on any failure — the picker must render whatever state the session is
+	   in. *)
+			
+			| text <String | UndefinedObject> |
+			text:: [ usageTextFor: subject session ] on: Exception do: [:e | nil ].
+			text isNil ifTrue: [ ^nil ].
+			^(label: text) color: (Color r: 0.5 g: 0.5 b: 0.5)
+		)
+		usageTextFor: session <Session> ^<String | UndefinedObject> = (
+			(* 'Tokens — last request: 121,973 in / 438 out (cache write 24,366) ·
+	   session: 121,973 in / 438 out · 14 requests · stop: tool_use'. Cache
+	   figures appear only when non-zero. *)
+			
+			| n <Integer> u <Map[Symbol, Integer] | UndefinedObject> last <String> cache <String> stop <String | UndefinedObject> text <String> |
+			n:: session requestCount.
+			(n isNil or: [ n = 0 ]) ifTrue: [ ^nil ].
+			u:: session lastUsage.
+			u isNil ifTrue: [ last:: 'n/a' ]
+				ifFalse: [
+					| r <Integer> w <Integer> |
+					last:: (withThousands: (u at: #input ifAbsent: [ 0 ])) , ' in / ' , (withThousands: (u at: #output
+							ifAbsent: [ 0 ])) , ' out'.
+					r:: u at: #cacheRead ifAbsent: [ 0 ].
+					w:: u at: #cacheWrite ifAbsent: [ 0 ].
+					cache:: ''.
+					r > 0 ifTrue: [ cache:: 'cache read ' , (withThousands: r) ].
+					w > 0 ifTrue: [
+							cache:: cache , (cache isEmpty ifTrue: [ '' ] ifFalse: [ ', ' ]) , 'cache write ' , (withThousands: w)
+						].
+					cache isEmpty ifFalse: [ last:: last , ' (' , cache , ')' ]
+				].
+			text:: 'Tokens — last request: ' , last , ' · session: ' , (withThousands: session totalInputTokens) , ' in / ' , (withThousands: session totalOutputTokens) , ' out · ' , n printString , (n = 1 ifTrue: [
+					' request'
+				]
+				ifFalse: [ ' requests' ]).
+			stop:: session lastStopReason.
+			stop isNil ifFalse: [ text:: text , ' · stop: ' , stop ].
+			[
+				| cost |
+				cost:: session totalCostUsd.
+				(cost isNil or: [ cost = 0 ]) ifFalse: [
+						text:: text , ' · est. ' , (formatUsd: cost)
+					]
+			] on: Exception do: [:e | nil ].
+			^text
+		)
+		formatUsd: amount <Number> ^<String> = (
+			(* $12.34, rounded to cents (the amount arrives as an exact Fraction
+	   from the session's accumulator); a positive amount under half a cent
+	   shows as <$0.01 rather than a misleading $0.00. *)
+			
+			| cents <Integer> |
+			cents:: (amount * 100) rounded.
+			(cents = 0 and: [ amount > 0 ]) ifTrue: [ ^'<$0.01' ].
+			^'$' , (cents // 100) printString , '.' , (cents \\ 100 < 10 ifTrue: [ '0' ]
+				ifFalse: [ '' ]) , (cents \\ 100) printString
+		)
+		withThousands: n <Integer> ^<String> = (
+			(* 1234567 -> '1,234,567'. Non-integers and negatives print as-is. *)
+			
+			| s <String> len <Integer> out <String> |
+			(n isNil or: [ n < 0 ]) ifTrue: [ ^n printString ].
+			s:: n printString.
+			len:: s size.
+			out:: ''.
+			1 to: len
+				do: [:i <Integer> |
+					out:: out , (s copyFrom: i to: i).
+					(len - i \\ 3 = 0 and: [ i < len ]) ifTrue: [ out:: out , ',' ]
+				].
+			^out
 		)
 	) : ()
 	public class ChatInputPresenter onSubject: s = Presenter onSubject: s (
@@ -6442,6 +6593,81 @@ The picker is hidden while a request is in flight, to avoid switching in the mid
 			^html: (outer HopscotchForHTML5 chatBubbleHtml: (msg at: 2) role: (msg at: 1))
 		)
 	) : ()
+	class LiveLabelFragment computing: b <[String]> every: ms <Integer> = StaticLabelFragment text: '' (
+		(* A label whose text is recomputed by `compute` every `intervalMs`
+	   milliseconds, for values that change while the page is otherwise static
+	   (elapsed time, a phase read off a model that has no change notification).
+	   Only this node's textContent is touched on a tick; no presenter refresh.
+
+	   The interval is released on noticeDisposal (the fragment lost its visual
+	   to a different-kind successor or was removed) and handed over on
+	   updateVisualsFromSameKind: (a same-kind successor takes the node). As a
+	   fallback a tick that finds its visual no longer connected to the document
+	   stops itself, so no interval can outlive its node. *)
+		
+		|
+			compute <[String]> = b.
+			intervalMs <Integer> = ms.
+			timerId
+		|
+		refreshText.
+	) (
+		public isKindOfLiveLabelFragment ^<Boolean> = (
+			^true
+		)
+		isMyKind: f <Fragment> ^<Boolean> = (
+			^f isKindOfLiveLabelFragment
+		)
+		refreshText = (
+			(* A raising compute block keeps the previous text rather than taking
+		   down the tick. *)
+			
+			text: ([ compute value ] on: Exception do: [:e | text ])
+		)
+		startTicking = (
+			(* The callback ends with nil DELIBERATELY: the bridge marshals an
+		   expat's return value, and `tick` — a method — answers self, a
+		   Fragment, which is not marshalable. Every tick then did its work
+		   and raised 'rawPush: cannot marshal this receiver' on the way out,
+		   noise at best and, when a second raise was in flight, a corrupted
+		   bridge or an aborted VM. Fire-and-forget JS callbacks must return
+		   nil (or another bilingual primitive / alien). *)
+			
+			timerId isNil ifFalse: [ ^self ].
+			timerId:: js global setInterval: [
+					tick.
+					nil
+				]
+				every: intervalMs
+		)
+		public stopTicking = (
+			timerId isNil ifTrue: [ ^self ].
+			js global clearInterval: timerId.
+			timerId:: nil
+		)
+		tick = (
+			| connected <Boolean> |
+			connected:: [ hasVisual and: [ (visual at: 'isConnected') = true ] ] on: Exception
+				do: [:e | false ].
+			connected ifFalse: [ ^stopTicking ].
+			refreshText
+		)
+		createVisual = (
+			| element = super createVisual. |
+			startTicking.
+			^element
+		)
+		updateVisualsFromSameKind: oldFragment <Fragment> ^<Alien[Element]> = (
+			| oldVisual = super updateVisualsFromSameKind: oldFragment. |
+			oldFragment stopTicking.
+			startTicking.
+			^oldVisual
+		)
+		public noticeDisposal = (
+			stopTicking.
+			super noticeDisposal
+		)
+	) : ()
 	lazy public voiceController = VoiceController recognizer: (window at: #webkitSpeechRecognition)
 		transcript: transcript
 		editor: currentHopscotchWindow.
@@ -6455,44 +6681,6 @@ The picker is hidden while a request is in flight, to avoid switching in the mid
 	lazy private fontConfig = FontConfig new.
 	lazy private sequencePlanning = SequencePlanning new.
 	lazy public DOMParser = js global at: #DOMParser.
-	public chatBubbleHtml: text <String> role: role <String> ^<String> = (
-		(* The one definition of a chat turn bubble, shared by the inline
-   ChatPresenter and by the chat-as-document `chatTurn:role:` amplet
-   (AI_IDE_Support>>chatTurnText:role:). They were separate copies of the same
-   markup and drifted: the document one escaped its text, this one did not.
-
-   The escaping is the whole point. An assistant reply that mentions HTML —
-   which it does whenever it writes about markup, and code spans make that
-   common — was interpolated raw, so DOMParser read `<div>` or `</span>` as
-   MARKUP: the remainder of the turn was swallowed into a tag and the answer
-   appeared to stop mid-sentence. Backticks looked like the trigger because the
-   tag-like text usually sits inside a code span; the character that does the
-   damage is `<`, and a bare `&` corrupts more quietly. *)
-		
-		| labelText <String> bg <String> border <String> fontStyle <String> safe <String> |
-		role = 'user' ifTrue: [
-				labelText:: 'You'.
-				bg:: aiColors userTurnBackground.
-				border:: aiColors userTurnBorder.
-				fontStyle:: 'italic'
-			]
-			ifFalse: [
-				role = 'assistant' ifTrue: [
-						labelText:: 'Assistant'.
-						bg:: aiColors assistantTurnBackground.
-						border:: aiColors assistantTurnBorder.
-						fontStyle:: 'normal'
-					]
-					ifFalse: [
-						labelText:: 'Error'.
-						bg:: aiColors errorTurnBackground.
-						border:: aiColors errorTurnBorder.
-						fontStyle:: 'normal'
-					]
-			].
-		safe:: htmlEscapeForDisplay: text.
-		^'<div style="display:flex; flex-direction:row; align-items:flex-start; border:1px solid ' , border , '; border-radius:6px; padding:8px 12px; margin:4px 0; background-color:' , bg , ';">' , '<div style="min-width:5em; max-width:5em; padding-right:1em; text-align:right; flex-shrink:0;"><strong>' , labelText , '</strong></div>' , '<div style="flex:1; min-width:0;"><span style="white-space:pre-wrap; font-style:' , fontStyle , ';">' , safe , '</span></div></div>'
-	)
 	htmlEscapeForDisplay: s <String> ^<String> = (
 		(* Escape &, < and > so turn text containing markup or code renders literally.
    & FIRST, or the ampersands introduced by the later replacements get escaped
@@ -6836,5 +7024,56 @@ Ultimately, we aren't using this method because the navigation controls carry ov
 	)
 	public mikeImage = (
 		^images mikeImage
+	)
+	public chatBubbleHtml: text <String> role: role <String> ^<String> = (
+		(* The one definition of a chat turn bubble, shared by the inline
+   ChatPresenter and by the chat-as-document `chatTurn:role:` amplet
+   (AI_IDE_Support>>chatTurnText:role:). They were separate copies of the same
+   markup and drifted: the document one escaped its text, this one did not.
+
+   Roles: 'user', 'assistant', 'notice' (a line the IDE itself emitted — a
+   changeset applied via the Apply button, a truncated turn — labelled IDE so
+   it is never mistaken for something the model said), and anything else
+   renders as an error.
+
+   The escaping is the whole point. An assistant reply that mentions HTML —
+   which it does whenever it writes about markup, and code spans make that
+   common — was interpolated raw, so DOMParser read `<div>` or `</span>` as
+   MARKUP: the remainder of the turn was swallowed into a tag and the answer
+   appeared to stop mid-sentence. Backticks looked like the trigger because the
+   tag-like text usually sits inside a code span; the character that does the
+   damage is `<`, and a bare `&` corrupts more quietly. *)
+		
+		| labelText <String> bg <String> border <String> fontStyle <String> safe <String> |
+		role = 'user' ifTrue: [
+				labelText:: 'You'.
+				bg:: aiColors userTurnBackground.
+				border:: aiColors userTurnBorder.
+				fontStyle:: 'italic'
+			]
+			ifFalse: [
+				role = 'assistant' ifTrue: [
+						labelText:: 'Assistant'.
+						bg:: aiColors assistantTurnBackground.
+						border:: aiColors assistantTurnBorder.
+						fontStyle:: 'normal'
+					]
+					ifFalse: [
+						role = 'notice' ifTrue: [
+								labelText:: 'IDE'.
+								bg:: aiColors noticeTurnBackground.
+								border:: aiColors noticeTurnBorder.
+								fontStyle:: 'italic'
+							]
+							ifFalse: [
+								labelText:: 'Error'.
+								bg:: aiColors errorTurnBackground.
+								border:: aiColors errorTurnBorder.
+								fontStyle:: 'normal'
+							]
+					]
+			].
+		safe:: htmlEscapeForDisplay: text.
+		^'<div style="display:flex; flex-direction:row; align-items:flex-start; border:1px solid ' , border , '; border-radius:6px; padding:8px 12px; margin:4px 0; background-color:' , bg , ';">' , '<div style="min-width:5em; max-width:5em; padding-right:1em; text-align:right; flex-shrink:0;"><strong>' , labelText , '</strong></div>' , '<div style="flex:1; min-width:0;"><span style="white-space:pre-wrap; font-style:' , fontStyle , ';">' , safe , '</span></div></div>'
 	)
 ) : ()

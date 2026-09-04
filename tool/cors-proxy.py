@@ -27,12 +27,13 @@ The FRONT DOOR (default :8080) serves:
                              OFF unless --bus is passed
     (anything else under /_ns/ answers 404 — absent means unavailable)
 
-The LEGACY listener (default :9999, --legacy-port 0 to disable) additionally
-answers the old bare @isomorphic-git/cors-proxy convention —
+The clients have migrated to /_ns/git (repository clone, local_fetch's
+fallback) and to the front-door origin (Host discovery), so the old bare
+@isomorphic-git/cors-proxy convention on :9999 is RETIRED — the legacy
+listener is OFF by default. To revive it for an un-rebuilt client during a
+transition, pass --legacy-port 9999; it then answers the bare
     http://localhost:9999/<host>/<path>   ->   https://<host>/<path>
-— for the clients that still point at it (per-repository proxy fields,
-local_fetch's fallback, Host.ns's dev fallback). It serves /_ns/ too, no
-static. It retires once those defaults migrate to /_ns/git on the front door.
+convention (and /_ns/, no static).
 
 The token is minted fresh at startup, never written to disk, never required
 for git or static. Endpoints that will need it (/_ns/fetch, /_ns/bus) check
@@ -604,8 +605,10 @@ def main():
     parser = argparse.ArgumentParser(description='Newspeak host-services front door')
     parser.add_argument('port', nargs='?', type=int, default=8080,
                         help='front-door port: static + /files + /_ns (default 8080)')
-    parser.add_argument('--legacy-port', type=int, default=9999,
-                        help='extra listener answering the bare cors-proxy convention (default 9999; 0 disables)')
+    parser.add_argument('--legacy-port', type=int, default=0,
+                        help='extra listener answering the bare :9999 cors-proxy convention, for '
+                             'pre-/_ns/git clients (default 0 = off, now that clients use /_ns/git; '
+                             'pass 9999 to revive it during a transition)')
     parser.add_argument('--bind', default='127.0.0.1',
                         help='interface to bind (default loopback; 0.0.0.0 for cross-device days)')
     parser.add_argument('--root', default=None,

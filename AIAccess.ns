@@ -25,6 +25,13 @@ class AIAccess usingPlatform: platform = Object new (
 		private js = platform js.
 		private List = platform collections List.
 		private Map = platform collections Map.
+		
+		(* The platform host module (HOST_SERVICES_DESIGN_2026-08-31.md), nil on
+   platforms without one - the guard keeps Croquet and older platforms
+   constructing. Safe at snapshot time: Host's initializer touches no JS
+   values, and its discovery is lazy. *)
+		private hostModule = [ platform host ] on: Exception do: [:e | nil ].
+		private nsHostToken <String | UndefinedObject>
 	|
 ) (
 	public class Tool name: n <String> description: d <String> inputSchema: s <String> handler: h <[:Alien | Object]> = Object new (
@@ -2941,9 +2948,59 @@ class AIAccess usingPlatform: platform = Object new (
 		^[ v , '' ] on: Exception do: [:e | nil ]
 	)
 	public webFetch: url <String> ^<Alien[Promise]> = (
-		(* Generic GET behind the local_fetch tool. Tries the URL directly and, if the
-   fetch never completed, retries through the local CORS proxy — the same one
-   the repository clone path already uses (tool/cors-proxy.py, default
+		(* Generic GET behind the local_fetch tool. When the platform's host offers
+   /_ns/fetch (HOST_SERVICES_DESIGN_2026-08-31.md, staging step 5), the fetch
+   runs server-side through the front door: no CORS, and a failure comes back
+   as a diagnostics envelope - status, headers, redirects, and the error page
+   itself - instead of the browser's opaque TypeError. Anything that breaks in
+   the /_ns machinery itself falls back to the browser-side path, so a dead
+   front door never makes local_fetch worse than it was without one. Without a
+   host (a deployed origin, an old platform) the browser-side path stands
+   unchanged.
+
+   Discovery is fail-closed until it settles, so we WAIT for the host's probe
+   to finish before deciding rather than reading availability synchronously:
+   otherwise the first fetch of a session always races ahead of discovery and
+   silently takes the browser-side path. *)
+		
+		hostModule isNil ifTrue: [ ^webFetchBrowserSide: url ].
+		^hostReadyPromise then: [:ignored |
+				
+				(* No raise may escape a JS then: closure - it is memory-unsafe on the
+	   psoup bridge - so the decision is wrapped and any failure degrades to
+	   the browser-side path. *)
+				[
+					| origin <String | UndefinedObject> |
+					origin:: hostFetchOrigin.
+					origin isNil ifTrue: [ webFetchBrowserSide: url ]
+						ifFalse: [ webFetch: url throughHostAt: origin ]
+				] on: Exception do: [:e | webFetchBrowserSide: url ]
+			]
+			onError: [:e | webFetchBrowserSide: url ]
+	)
+	hostReadyPromise ^<Alien[Promise]> = (
+		(* A JS promise that resolves (with nil) once the host's discovery has
+   settled - fulfilled immediately if it already has. Bridges Host>>whenReady:
+   into the JS-promise world webFetch: lives in. The callback only resolves; it
+   never rejects and never raises, so a probe that fails closed simply resolves
+   and lets hostFetchOrigin answer nil. *)
+		
+		| deferred <Alien> resolveFn <Alien> |
+		deferred:: JSPromise withResolvers.
+		resolveFn:: deferred at: 'resolve'.
+		[
+			hostModule whenReady: [:h |
+					[ resolveFn call: js undefined with: js undefined ] on: Exception
+						do: [:e | nil ].
+					nil
+				]
+		] on: Exception do: [:e | resolveFn call: js undefined with: js undefined ].
+		^deferred at: 'promise'
+	)
+	webFetchBrowserSide: url <String> ^<Alien[Promise]> = (
+		(* The pre-host path. Tries the URL directly and, if the fetch never
+   completed, retries through the local CORS proxy — the same one the
+   repository clone path already uses (tool/cors-proxy.py, default
    http://localhost:9999, convention <proxy>/<host>/<path>).
 
    Direct first, proxy second, rather than always proxying: a direct hit is one
@@ -2979,6 +3036,82 @@ class AIAccess usingPlatform: platform = Object new (
 								ifFalse: [ desc ])
 					]
 			]
+	)
+	hostFetchOrigin ^<String | UndefinedObject> = (
+		(* The origin whose /_ns/fetch should carry local_fetch: '' for the page's
+   own origin, a base URL for the dev fallback, nil when this platform has no
+   host module, discovery has not settled (fail closed), or the host does not
+   offer fetch. *)
+		
+		^[
+			hostModule isNil ifTrue: [ nil ]
+				ifFalse: [
+					hostModule fetchAvailable ifTrue: [ hostModule serviceOrigin ]
+						ifFalse: [ nil ]
+				]
+		] on: Exception do: [:e | nil ]
+	)
+	webFetch: url <String> throughHostAt: origin <String> ^<Alien[Promise]> = (
+		(* Server-side fetch through the front door. A non-200 from /_ns/fetch
+   itself means the machinery refused (a stale token after a server restart,
+   most likely), not that the target failed - the token cache is dropped and
+   the browser-side path takes over for this call. *)
+		
+		^(hostTokenFrom: origin) then: [:tok |
+				(global fetch: origin , '/_ns/fetch?token=' , tok , '&url=' , (global encodeURIComponent: url)) then: [:response |
+						| status <Integer | UndefinedObject> |
+						status:: safeAt: response field: 'status'.
+						(status isNil or: [ status < 200 or: [ status >= 300 ] ]) ifTrue: [
+								nsHostToken:: nil.
+								webFetchBrowserSide: url
+							]
+							ifFalse: [
+								response json then: [:env | envelopeResult: env for: url ]
+									onError: [:e | webFetchBrowserSide: url ]
+							]
+					]
+					onError: [:e | webFetchBrowserSide: url ]
+			]
+			onError: [:e | webFetchBrowserSide: url ]
+	)
+	hostTokenFrom: origin <String> ^<Alien[Promise]> = (
+		(* The per-run token, fetched from /_ns/token once and cached in a slot -
+   the decided distribution: a loopback-only file, never localStorage (which
+   the Croquet runtime virtualizes away in any case). *)
+		
+		nsHostToken isNil ifFalse: [ ^JSPromise resolve: nsHostToken ].
+		^(global fetch: origin , '/_ns/token') then: [:response |
+				response json then: [:parsed |
+						nsHostToken:: safeStringAt: parsed field: 'token'.
+						nsHostToken isNil ifTrue: [
+								JSPromise reject: 'no token in the /_ns/token response'
+							]
+							ifFalse: [ nsHostToken ]
+					]
+			]
+	)
+	envelopeResult: env <Alien> for: url <String> = (
+		(* Unpack the /_ns/fetch diagnostics envelope: the body for a 2xx/3xx
+   answer, a legible rejection otherwise. Everything here was observed
+   server-side, so even a transport failure carries its cause. *)
+		
+		| transport <String | UndefinedObject> status <Integer | UndefinedObject> statusText <String | UndefinedObject> body <String | UndefinedObject> |
+		transport:: safeStringAt: env field: 'transportError'.
+		transport isNil ifFalse: [
+				^JSPromise reject: 'local_fetch (server-side, via /_ns/fetch) could not reach ' , url , ': ' , transport
+			].
+		status:: safeAt: env field: 'status'.
+		statusText:: safeStringAt: env field: 'statusText'.
+		statusText isNil ifTrue: [ statusText:: '' ].
+		body:: safeStringAt: env field: 'body'.
+		body isNil ifTrue: [ body:: '' ].
+		(status isNil or: [ status >= 400 ]) ifTrue: [
+				^JSPromise reject: 'HTTP ' , (statusLabel: status) , ' ' , statusText , ' fetching ' , url , String lf , 'Response body: ' , (excerptOf: body)
+			].
+		(safeAt: env field: 'truncated') = true ifTrue: [
+				^body , String lf , '[body truncated by /_ns/fetch at 256KB]'
+			].
+		^body
 	)
 	fetchAndRead: url <String> ^<Alien[Promise]> = (
 		(* One attempt. Rejects with a transportMarker-prefixed reason when the fetch

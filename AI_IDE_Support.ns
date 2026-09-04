@@ -47,12 +47,19 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 		private busToken <String | UndefinedObject>
 		private busOrigin <String | UndefinedObject>
 		
+		(* Level 2: a chat backed directly by an external agent. pendingCompletions
+   maps a correlation id to the {onReply. onError.} of a BusProvider awaiting
+   a completion_response; completionSeq mints those ids. *)
+		private pendingCompletions = Map new.
+		private completionSeq <Integer> ::= 0.
+		
 		(* Re-export commonly needed classes for use by other IDE modules *)
 		public Tool = aiAccess Tool.
 		public Provider = aiAccess Provider.
 		public AnthropicProvider = aiAccess AnthropicProvider.
 		public GeminiProvider = aiAccess GeminiProvider.
 		public OpenAICompatibleProvider = aiAccess OpenAICompatibleProvider.
+		public BusProvider = aiAccess BusProvider.
 		public Session = aiAccess Session.
 		private AIChatSetupSubject = platform hopscotch AIChatSetupSubject.
 		private AIChatSetupPresenter = platform hopscotch AIChatSetupPresenter.
@@ -228,6 +235,13 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 			providerName = 'openai-compat' ifTrue: [
 					^klass apiKey: apiKey model: modelName baseUrl: baseUrl
 				].
+			providerName = 'bus-agent' ifTrue: [
+					^
+					(* Setup-form preview only: availableModels/refreshAvailableModels
+			   never touch the bus, so a portless instance is safe here. The
+			   real session's provider is built in createFreshSessionFor:. *)
+					klass agentName: modelName chat: '' port: nil
+				].
 			^klass apiKey: apiKey model: modelName
 		)
 		public providerClass = (
@@ -282,6 +296,7 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 			pname = 'anthropic' ifTrue: [ ^'Anthropic' ].
 			pname = 'gemini' ifTrue: [ ^'Gemini' ].
 			pname = 'openai-compat' ifTrue: [ ^'Local' ].
+			pname = 'bus-agent' ifTrue: [ ^'Bus' ].
 			^pname
 		)
 		public startChat = (
@@ -291,9 +306,20 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 	   Returns nil on validation failure with errorMessage set. *)
 			
 			| doc <Document> |
-			apiKey isEmpty ifTrue: [
-					errorMessage:: 'Please enter an API key.'.
-					^nil
+			providerName = 'bus-agent' ifTrue: [
+					
+					(* A bus agent needs no API key; what it needs is the external
+			   agent's name, which lives in the Model field. *)
+					modelName isEmpty ifTrue: [
+							errorMessage:: 'Please enter the external agent''s name in the Model field.'.
+							^nil
+						]
+				]
+				ifFalse: [
+					apiKey isEmpty ifTrue: [
+							errorMessage:: 'Please enter an API key.'.
+							^nil
+						]
 				].
 			docName isEmpty ifTrue: [
 					errorMessage:: 'Please enter a chat name.'.
@@ -587,6 +613,8 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 								respondToProviderSwitch: 'gemini' defaultModel: 'gemini-3.5-flash'
 							]. }. {'Local (OpenAI-compatible)'. [
 								respondToProviderSwitch: 'openai-compat' defaultModel: ''
+							]. }. {'Bus Agent (external)'. [
+								respondToProviderSwitch: 'bus-agent' defaultModel: ''
 							]. }. }
 					]. }
 		)
@@ -1071,7 +1099,8 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 		pn = 'anthropic' ifTrue: [ ^AnthropicProvider ].
 		pn = 'gemini' ifTrue: [ ^GeminiProvider ].
 		pn = 'openai-compat' ifTrue: [ ^OpenAICompatibleProvider ].
-		Error signal: 'Unknown provider: ' , pn , ' (supported: anthropic, gemini, openai-compat)'
+		pn = 'bus-agent' ifTrue: [ ^BusProvider ].
+		Error signal: 'Unknown provider: ' , pn , ' (supported: anthropic, gemini, openai-compat, bus-agent)'
 	)
 	apiKeyStorageKeyFor: pn <String> ^<String> = (
 		^'ns_ai_apikey_' , (providerClassFor: pn) name
@@ -1686,10 +1715,25 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 		provider:: pn = 'openai-compat' ifTrue: [
 				cls apiKey: key model: mn baseUrl: (baseUrlForProvider: pn)
 			]
-			ifFalse: [ cls apiKey: key model: mn ].
+			ifFalse: [
+				pn = 'bus-agent' ifTrue: [
+						
+						(* The "model" IS the external agent's name; this module is the
+			   bus completion port, and the doc name is the reply address. *)
+						BusProvider agentName: mn chat: doc name port: self
+					]
+					ifFalse: [ cls apiKey: key model: mn ]
+			].
 		provider enableServerWebToolsMaxUses: serverWebToolUses.
 		session:: Session provider: provider
 			tools: (toolsForProvider: provider focus: focus).
+		pn = 'bus-agent' ifTrue: [
+				
+				(* An agent backend (a Claude Code session, say) may reason and use its
+			   own tools for well over the 120s a hosted-model request takes, so a
+			   bus-backed turn gets a far more generous watchdog. *)
+				session requestTimeoutMs: 600000
+			].
 		session systemPrompt: newspeakSystemPrompt.
 		^session
 	)
@@ -3121,6 +3165,12 @@ public clearConversation = ( ide aiSupport clearConversationFor: self )
 		dataStr isNil ifTrue: [ ^self ].
 		msg:: [ (js global at: 'JSON') parse: dataStr ] on: Exception do: [:e | nil ].
 		msg isNil ifTrue: [ ^self ].
+		kind:: [ msg at: 'kind' ] on: Exception do: [:e | 'message' ].
+		
+		(* Level 2: a completion_response is an external agent answering a
+	   BusProvider's request; it routes by correlation id to the waiting
+	   provider, NOT into a chat as a turn. *)
+		kind = 'completion_response' ifTrue: [ ^deliverCompletionResponse: msg ].
 		to:: [ msg at: 'to' ] on: Exception do: [:e | nil ].
 		to isNil ifTrue: [ ^self ].
 		targetDoc:: chatDocNamed: to.
@@ -3129,7 +3179,6 @@ public clearConversation = ( ide aiSupport clearConversationFor: self )
 		text isNil ifTrue: [ text:: '' ].
 		from:: [ msg at: 'from' ] on: Exception do: [:e | 'external agent' ].
 		(from isNil or: [ from isEmpty ]) ifTrue: [ from:: 'external agent' ].
-		kind:: [ msg at: 'kind' ] on: Exception do: [:e | 'message' ].
 		kind = 'notice' ifTrue: [
 				deliverExternalNotice: text to: targetDoc from: from
 			]
@@ -3148,6 +3197,53 @@ public clearConversation = ( ide aiSupport clearConversationFor: self )
 		[
 			targetDoc session addSystemNotice: '[from external agent ''' , from , '''] ' , text
 		] on: Exception do: [:e | nil ]
+	)
+	public requestCompletionTo: agentName <String> from: chatName <String> body: bodyAlien <Alien> onReply: onReply <[:Alien | Object]> onError: onError <[:String | Object]> = (
+		(* The bus completion PORT: a BusProvider (Level 2) calls this to have an
+	   external agent answer one model turn. Mints a correlation id, registers
+	   the callbacks, and posts a completion_request; deliverCompletionResponse:
+	   later matches the reply by that id. Fail-closed: with no bus connected we
+	   invoke onError at once rather than leaving the turn hung (Session's
+	   watchdog would eventually fire, but a clear reason is better). *)
+		
+		| corrId fields |
+		(busOrigin isNil or: [ busToken isNil ]) ifTrue: [
+				[
+					onError value: 'No agent bus is connected (start the front door with --bus, and give discovery a moment).'
+				] on: Exception do: [:e | nil ].
+				^self
+			].
+		completionSeq:: completionSeq + 1.
+		corrId:: chatName , '#' , completionSeq printString.
+		pendingCompletions at: corrId put: {onReply. onError. }.
+		fields:: freshJSObject.
+		fields at: 'to' put: agentName.
+		fields at: 'from' put: chatName.
+		fields at: 'kind' put: 'completion_request'.
+		fields at: 'corr_id' put: corrId.
+		fields at: 'request' put: bodyAlien.
+		postToBus: fields
+	)
+	deliverCompletionResponse: msg <Alien> = (
+		(* Route an external agent's completion_response back to the BusProvider
+	   that is waiting on its correlation id. The response object rides in the
+	   'request'-shaped 'response' field and is handed through unchanged - it is
+	   an Anthropic-style reply the provider's inherited extractors understand.
+	   Unknown or missing ids are dropped; a reply arriving twice finds no
+	   pending entry the second time. *)
+		
+		| corrId entry response |
+		corrId:: [ msg at: 'corr_id' ] on: Exception do: [:e | nil ].
+		corrId isNil ifTrue: [ ^self ].
+		entry:: pendingCompletions at: corrId ifAbsent: [ nil ].
+		entry isNil ifTrue: [ ^self ].
+		pendingCompletions removeKey: corrId ifAbsent: [ nil ].
+		response:: [ msg at: 'response' ] on: Exception do: [:e | nil ].
+		response isNil ifTrue: [
+				[ (entry at: 2) value: 'The external agent returned no response object.' ] on: Exception
+					do: [:e | nil ]
+			]
+			ifFalse: [ [ (entry at: 1) value: response ] on: Exception do: [:e | nil ] ]
 	)
 	listChatSessionsToolForFocus: focus <ChatFocus> ^<Tool> = (
 		^Tool name: 'list_chat_sessions'

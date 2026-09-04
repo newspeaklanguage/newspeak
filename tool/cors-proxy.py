@@ -340,8 +340,10 @@ class HostServicesHandler(SimpleHTTPRequestHandler):
             mid = BUS_NEXT_ID[0]
             msg['id'] = mid
             msg.setdefault('from', 'external agent')
-            if msg.get('kind') != 'notice':
-                msg['kind'] = 'message'
+            # Preserve whatever kind the sender chose (message, notice,
+            # completion_request, completion_response, …); default only when
+            # absent. The router does not interpret kinds — the IDE does.
+            msg.setdefault('kind', 'message')
             payload = json.dumps(msg)
             BUS_HISTORY.append((mid, payload))
             subscribers = list(BUS_SUBSCRIBERS)

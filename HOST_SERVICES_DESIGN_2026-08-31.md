@@ -347,8 +347,28 @@ call site without migrating anything.
    forwards the poster's whole object, so a later `reply_to`/`corr_id`
    completion envelope (Level 2 — a `BusProvider` backing a chat *directly*)
    rides through untouched. `tool/bus-agent.py` is a stdlib reference for the
-   external end. Level 2 (correlated request/response so a chat is backed by an
-   agent or a human rather than a hosted model) is deferred but unblocked.
+   external end.
+
+   **Level 2 — a chat backed directly by an external agent (built 2026-09-04).**
+   A chat created with the **"Bus Agent"** provider has no hosted model behind
+   it; each turn it ships a completion request over the bus to the agent named
+   in its model field and awaits the reply. Implemented as `BusProvider`
+   (AIAccess), which **subclasses `AnthropicProvider` and overrides only the
+   transport** — `complete:` sends the Anthropic-style body over the bus
+   instead of to `api.anthropic.com` — inheriting every message-shape and
+   tool-use method. So the wire protocol *is* an Anthropic Messages
+   request/response, carried over the bus and correlated by `corr_id`, and an
+   external agent that emits `tool_use` blocks drives the IDE's own tool loop
+   for free (its tool calls execute against the live IDE and the results return
+   to it). The other end can equally be a **human** — same shape, a text
+   reply. AI_IDE_Support is the completion **port**
+   (`requestCompletionTo:from:body:onReply:onError:` + a `pendingCompletions`
+   map keyed by `corr_id`); the bus receiver routes a `completion_response` to
+   the waiting provider instead of into a chat. The router now preserves any
+   `kind` (a step-6 bug that forced non-`notice` kinds to `message` is fixed).
+   `tool/bus-responder.py` is the stdlib reference responder (human-backed by
+   default; `/json` to hand-craft a `tool_use` response). Session's watchdog
+   bounds a hung completion, so `BusProvider` needs no timeout of its own.
 
 Repositories and Croquet migrate to `platform host` opportunistically; neither
 is blocked by it, and neither should be destabilized for it.

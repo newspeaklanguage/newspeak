@@ -25,7 +25,13 @@ async function main() {
   await send('Runtime.enable');
   const ev = async e => { const r = await send('Runtime.evaluate',{expression:e,returnByValue:true}); return r&&r.result&&r.result.value; };
   await send('Page.navigate',{url:URL});
-  for (let i=0;i<120;i++){ const t=await ev('document.body?document.body.innerText:""'); if (typeof t==='string'&&t.includes('Workspaces')) break; await new Promise(r=>setTimeout(r,1500)); }
+  for (let i=0;i<120;i++){ const t=await ev('document.body?document.body.innerText:""'); if (typeof t==='string'&&(t.includes('Workspaces')||t.includes('backup changes'))) break; await new Promise(r=>setTimeout(r,1500)); }
+  // A backup-restore prompt may precede the home page; a probe never saves,
+  // so ignore stored state and boot pristine.
+  if (await ev("document.body.innerText.includes('backup changes')")) {
+    await ev(`(function(){var m=Array.from(document.querySelectorAll('a,button,span,div,label')).filter(e=>(e.innerText||'').trim().indexOf('Use current version')===0);var e=m[m.length-1];['mousedown','mouseup','click'].forEach(t=>e.dispatchEvent(new MouseEvent(t,{bubbles:true,cancelable:true,view:window})));return 'DISMISSED'})()`).then(r=>console.log('backup dialog:',r));
+    for (let i=0;i<40;i++){ if (await ev("document.body.innerText.includes('Workspaces')")) break; await new Promise(r=>setTimeout(r,1500)); }
+  }
   await new Promise(r=>setTimeout(r,3000));
   await ev(`(function(){var m=Array.from(document.querySelectorAll('a,button,span,div,label')).filter(e=>(e.innerText||'').trim()==='Workspaces');var e=m[m.length-1];['mousedown','mouseup','click'].forEach(t=>e.dispatchEvent(new MouseEvent(t,{bubbles:true,cancelable:true,view:window})));return 'C'})()`);
   for (let i=0;i<30;i++){ if (await ev("document.body.innerText.includes('Evaluate')")) break; await new Promise(r=>setTimeout(r,1000)); }

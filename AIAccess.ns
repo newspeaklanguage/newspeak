@@ -2861,6 +2861,305 @@ class AIAccess usingPlatform: platform = Object new (
 				cacheWrite: 0
 		)
 	) : ()
+	public class OpenAIProvider apiKey: key <String> model: mdl <String> = OpenAICompatibleProvider apiKey: key
+		model: mdl
+		baseUrl: 'https://api.openai.com/v1' (
+		(* Hosted OpenAI provider using the Responses API. It subclasses the
+   OpenAI-compatible adapter only to reuse API-key/model storage and the
+   standard GET /v1/models implementation; conversation and tool traffic use
+   Responses-native items throughout.
+
+   The history is the exact Responses input sequence: user messages, every
+   item from response.output (including reasoning and function_call items),
+   and function_call_output items. Keeping the returned output items is
+   required for manually managed multi-turn context. Requests are stateless
+   (store:false), so encrypted reasoning content is requested and retained in
+   that sequence as well. *)
+		
+	) (
+		public staticFallbackModels ^<List[String]> = (
+			^{'gpt-5.6-terra'. 'gpt-5.6-luna'. 'gpt-5.6-sol'. 'gpt-6-astra'. }
+		)
+		public staticDisplayNameFor: modelId <String> ^<String> = (
+			modelId = 'gpt-5.6-terra' ifTrue: [ ^'GPT-5.6 Terra' ].
+			modelId = 'gpt-5.6-luna' ifTrue: [ ^'GPT-5.6 Luna' ].
+			modelId = 'gpt-5.6-sol' ifTrue: [ ^'GPT-5.6 Sol' ].
+			modelId = 'gpt-6-astra' ifTrue: [ ^'GPT-6 Astra' ].
+			^modelId
+		)
+		public complete: messages <Alien[Array]> system: systemPrompt <String> tools: tools <Alien[Array] | UndefinedObject> maxTokens: maxTokens <Integer> ^<Alien[Promise]> = (
+			(* POST /v1/responses without streaming or server-side conversation
+	   storage. The stable IDE prompt is sent as instructions and the caller's
+		   native history as input. *)
+			
+			| body headers options include |
+			body:: createJSObject.
+			body at: 'model' put: model.
+			body at: 'input' put: messages.
+			body at: 'max_output_tokens' put: maxTokens.
+			body at: 'store' put: false.
+			systemPrompt isEmpty ifFalse: [ body at: 'instructions' put: systemPrompt ].
+			tools isNil ifFalse: [
+					(tools at: 'length') > 0 ifTrue: [ body at: 'tools' put: tools ]
+				].
+			include:: createJSArray.
+			include push: 'reasoning.encrypted_content'.
+			body at: 'include' put: include.
+			headers:: createJSObject.
+			headers at: 'Content-Type' put: 'application/json'.
+			headers at: 'Authorization' put: 'Bearer ' , apiKey.
+			options:: createJSObject.
+			options at: 'method' put: 'POST'.
+			options at: 'headers' put: headers.
+			options at: 'body' put: (JSON stringify: body).
+			^(global fetch: baseUrl , '/responses' with: options) then: [:response |
+					[
+						| status statusText |
+						status:: safeAt: response field: 'status'.
+						statusText:: safeAt: response field: 'statusText'.
+						statusText isNil ifTrue: [ statusText:: '' ].
+						(status isNil or: [ status >= 400 ]) ifTrue: [
+								JSPromise reject: 'OpenAI API error: ' , (status isNil ifTrue: [
+											'(no status)'
+										]
+										ifFalse: [ status printString ]) , ' ' , statusText
+							]
+							ifFalse: [ response json ]
+					] on: Exception
+						do: [:e |
+							JSPromise reject: 'OpenAI provider error: ' , (errorDescription: e)
+						]
+				]
+		)
+		public addUserText: text <String> toMessages: messages <List> = (
+			| userMsg |
+			userMsg:: createJSObject.
+			userMsg at: 'role' put: 'user'.
+			userMsg at: 'content' put: text.
+			messages add: userMsg
+		)
+		public appendAssistantResponse: response <Alien> toMessages: messages <List> = (
+			(* Every output item must round-trip, not merely the display message:
+		   reasoning items and function calls are part of the next request's input. *)
+			
+			| output len |
+			output:: safeAt: response field: 'output'.
+			len:: safeAt: output field: 'length'.
+			(len isNil or: [ len = 0 ]) ifTrue: [
+					Error signal: 'OpenAI response missing output items'
+				].
+			0 to: len - 1 do: [:i <Integer> | messages add: (output at: i) ]
+		)
+		public messagesAsRequestPayload: messages <List> ^<Alien[Array]> = (
+			| arr |
+			arr:: createJSArray.
+			messages do: [:m | arr push: m ].
+			^arr
+		)
+		textFromOutputMessage: message <Alien> ^<String> = (
+			| content len result |
+			result:: ''.
+			content:: safeAt: message field: 'content'.
+			len:: safeAt: content field: 'length'.
+			len isNil ifTrue: [ ^result ].
+			0 to: len - 1
+				do: [:i <Integer> |
+					| part text |
+					part:: safeAt: content field: i.
+					(safeStringAt: part field: 'type') = 'output_text' ifTrue: [
+							text:: safeStringAt: part field: 'text'.
+							text isNil ifFalse: [ result:: result , text ]
+						]
+				].
+			^result
+		)
+		public extractTextFromResponse: response <Alien> ^<String> = (
+			| output len result |
+			result:: ''.
+			output:: safeAt: response field: 'output'.
+			len:: safeAt: output field: 'length'.
+			len isNil ifTrue: [ ^result ].
+			0 to: len - 1
+				do: [:i <Integer> |
+					| item |
+					item:: safeAt: output field: i.
+					(safeStringAt: item field: 'type') = 'message' ifTrue: [
+							result:: result , (textFromOutputMessage: item)
+						]
+				].
+			^result
+		)
+		public displayMessagesFromMessages: messages <List> ^<List> = (
+			| result |
+			result:: List new.
+			messages do: [:item <Alien> |
+					| type role text content |
+					type:: safeStringAt: item field: 'type'.
+					role:: safeStringAt: item field: 'role'.
+					(role = 'user' and: [ type isNil or: [ type = 'message' ] ]) ifTrue: [
+							content:: safeStringAt: item field: 'content'.
+							(content isNil or: [ content isEmpty ]) ifFalse: [
+									result add: {'user'. content. }
+								]
+						].
+					(type = 'message' and: [ role = 'assistant' ]) ifTrue: [
+							text:: textFromOutputMessage: item.
+							text isEmpty ifFalse: [ result add: {'assistant'. text. } ]
+						]
+				].
+			^result
+		)
+		public hasToolUse: response <Alien> ^<Boolean> = (
+			| output len |
+			output:: safeAt: response field: 'output'.
+			len:: safeAt: output field: 'length'.
+			len isNil ifTrue: [ ^false ].
+			0 to: len - 1
+				do: [:i <Integer> |
+					(safeStringAt: (safeAt: output field: i) field: 'type') = 'function_call' ifTrue: [
+							^true
+						]
+				].
+			^false
+		)
+		public toolUseBlocksFrom: response <Alien> ^<List> = (
+			| output len blocks |
+			blocks:: List new.
+			output:: safeAt: response field: 'output'.
+			len:: safeAt: output field: 'length'.
+			len isNil ifTrue: [ ^blocks ].
+			0 to: len - 1
+				do: [:i <Integer> |
+					| call callId name argsStr argsObj shim |
+					call:: safeAt: output field: i.
+					(safeStringAt: call field: 'type') = 'function_call' ifTrue: [
+							callId:: safeStringAt: call field: 'call_id'.
+							name:: safeStringAt: call field: 'name'.
+							argsStr:: safeStringAt: call field: 'arguments'.
+							argsObj:: (argsStr isNil or: [ argsStr isEmpty ]) ifTrue: [
+									createJSObject
+								]
+								ifFalse: [
+									[ JSON parse: argsStr ] on: Exception do: [:e | createJSObject ]
+								].
+							(callId isNil or: [ name isNil ]) ifFalse: [
+									shim:: createJSObject.
+									shim at: 'id' put: callId.
+									shim at: 'name' put: name.
+									shim at: 'input' put: argsObj.
+									blocks add: shim
+								]
+						]
+				].
+			^blocks
+		)
+		public makeToolResult: id <String> textResult: text <String> media: mediaParts <Alien[Array]> isError: err <Boolean> ^<Alien> = (
+			| result finalText skippedNotes mlen |
+			finalText:: text.
+			skippedNotes:: ''.
+			mlen:: safeAt: mediaParts field: 'length'.
+			mlen isNil ifTrue: [ mlen:: 0 ].
+			0 to: mlen - 1
+				do: [:i <Integer> |
+					| media mime name label |
+					media:: mediaParts at: i.
+					mime:: safeStringAt: media field: 'mimeType'.
+					mime isNil ifTrue: [ mime:: '' ].
+					name:: safeStringAt: media field: 'name'.
+					name isNil ifTrue: [ name:: '' ].
+					label:: name isEmpty ifTrue: [ mime ] ifFalse: [ name , ' (' , mime , ')' ].
+					skippedNotes:: skippedNotes isEmpty ifTrue: [ label ]
+						ifFalse: [ skippedNotes , ', ' , label ]
+				].
+			skippedNotes isEmpty ifFalse: [
+					finalText:: finalText , String lf , '[note: skipped attachments - OpenAI function outputs in this integration are text-only: ' , skippedNotes , ']'
+				].
+			err ifTrue: [ finalText:: 'Error: ' , finalText ].
+			result:: createJSObject.
+			result at: 'type' put: 'function_call_output'.
+			result at: 'call_id' put: id.
+			result at: 'output' put: finalText.
+			^result
+		)
+		public buildToolsPayload: toolDefs <List[Tool]> ^<Alien[Array] | UndefinedObject> = (
+			(* Responses function tools are flat: name, description, and parameters
+		   live beside type rather than under a nested function object. *)
+			
+			| arr |
+			toolDefs isEmpty ifTrue: [ ^nil ].
+			arr:: createJSArray.
+			toolDefs do: [:tool <Tool> |
+					| spec |
+					spec:: createJSObject.
+					spec at: 'type' put: 'function'.
+					spec at: 'name' put: tool name.
+					spec at: 'description' put: tool description.
+					spec at: 'parameters' put: (JSON parse: tool inputSchema).
+					arr push: spec
+				].
+			^arr
+		)
+		public pendingToolUseIdsIn: messages <List> ^<List[String]> = (
+			(* Track calls across the native item stream and subtract outputs. In a
+	   healthy history the result is empty; after interruption it contains the
+		   unanswered call_ids that repairTrailingToolUseIn: must close. *)
+			
+			| ids |
+			ids:: List new.
+			messages do: [:item <Alien> |
+					| type id |
+					type:: safeStringAt: item field: 'type'.
+					type = 'function_call' ifTrue: [
+							id:: safeStringAt: item field: 'call_id'.
+							id isNil ifFalse: [ ids add: id ]
+						].
+					type = 'function_call_output' ifTrue: [
+							id:: safeStringAt: item field: 'call_id'.
+							id isNil ifFalse: [ ids remove: id ifAbsent: [ ] ]
+						]
+				].
+			^ids
+		)
+		public addToolResults: results <Alien[Array]> toMessages: messages <List> = (
+			| len |
+			len:: safeAt: results field: 'length'.
+			len isNil ifTrue: [ ^self ].
+			0 to: len - 1 do: [:i <Integer> | messages add: (results at: i) ]
+		)
+		public lastMessageRoleIn: messages <List> ^<String | UndefinedObject> = (
+			| last type role |
+			messages isEmpty ifTrue: [ ^nil ].
+			last:: messages at: messages size.
+			type:: safeStringAt: last field: 'type'.
+			role:: safeStringAt: last field: 'role'.
+			role isNil ifFalse: [ ^role ].
+			type = 'function_call' ifTrue: [ ^'assistant' ].
+			type = 'function_call_output' ifTrue: [ ^'user' ].
+			^nil
+		)
+		public stopReasonOf: response <Alien> ^<String | UndefinedObject> = (
+			| status details reason |
+			status:: safeStringAt: response field: 'status'.
+			status = 'incomplete' ifFalse: [ ^status ].
+			details:: safeAt: response field: 'incomplete_details'.
+			reason:: safeStringAt: details field: 'reason'.
+			reason isNil ifTrue: [ ^status ].
+			^reason
+		)
+		public wasTruncated: response <Alien> ^<Boolean> = (
+			^(stopReasonOf: response) = 'max_output_tokens'
+		)
+		public usageOf: response <Alien> ^<Map[Symbol, Integer] | UndefinedObject> = (
+			| usage details |
+			usage:: safeAt: response field: 'usage'.
+			usage isNil ifTrue: [ ^nil ].
+			details:: safeAt: usage field: 'input_tokens_details'.
+			^usageInput: (safeAt: usage field: 'input_tokens')
+				output: (safeAt: usage field: 'output_tokens')
+				cacheRead: (safeAt: details field: 'cached_tokens')
+				cacheWrite: 0
+		)
+	) : ()
 	public class BusProvider agentName: name <String> chat: cn <String> port: aPort = AnthropicProvider apiKey: ''
 		model: name (
 		(* A Provider whose transport is the host agent bus, not HTTPS: the

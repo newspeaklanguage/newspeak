@@ -155,5 +155,8 @@ NewspeakPrettyPrinter.ns into the IDE.
   NewspeakTypecheckerTesting (~146 lines), VCSIsomorphicGitBackendProvider
   (~17), WebFiles (1). Suites after the reprint: typechecker 275/275,
   parsing 32/32, lazy-slot migration 53/53, printer 121/122 (testEmptyBlock).
-- Still open: hot-load the new NewspeakPrettyPrinter.ns into the IDE;
-  the remaining 15 drifted files listed under "Verification" are untouched.
+- The new NewspeakPrettyPrinter.ns is loaded in the IDE and in the latest
+  build (Gilad, 2026-09-09, via the IDE's AI chat that authored the fix), so
+  accept-time printing now moves a member-leading comment inside the member.
+  **This item is closed.** The remaining 15 drifted files listed under
+  "Verification" are untouched and are a separate decision.

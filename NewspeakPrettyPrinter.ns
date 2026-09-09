@@ -111,25 +111,28 @@ Slots:
 		|
 	) (
 		public printClass: node = (
-			emitCommentsBefore: node.
+			(* No emitCommentsBefore: here, nor in the other member entry
+	   points below: a comment in front of a class, method or lazy
+	   slot is printed INSIDE it by its visitor. See
+	   emitLeadingCommentsOf:from:inline: for why. *)
+			
 			visitClassDeclaration: node.
 			flushTrailingComments
 		)
 		public printClassHeader: node = (
-			emitCommentsBefore: node.
 			node isKindOfClassDeclarationAST ifTrue: [ visitClassHeader: node header ]
 				ifFalse: [ visitClassHeader: node ]
 		)
 		public printMethod: node = (
-			emitCommentsBefore: node.
 			visitMethod: node
 		)
 		public printSlot: node = (
 			(* SlotDefAST — lazy or not. Lazy slots are emitted with the
 	   leading 'lazy' keyword; regular slots are emitted as they would
-	   appear inside the slot bar. *)
+	   appear inside the slot bar. A plain slot has no inside to move a
+	   leading comment to, so for it the comment stays in front. *)
 			
-			emitCommentsBefore: node.
+			node isLazy ifFalse: [ emitCommentsBefore: node ].
 			visitSlotDef: node
 		)
 		public printStatement: node = (
@@ -581,6 +584,62 @@ Slots:
 			memoCommentIndex: idx at: limit.
 			cursor:: limit
 		)
+		emitLeadingCommentsOf: member from: lo <Integer> inline: isInline <Boolean> = (
+			(* A member's leading comments -- written between the member
+	   that precedes it in source and its own first token, that is in
+	   [lo, member start) -- emitted INSIDE the member rather than in
+	   front of it. The caller has already opened the member's own
+	   delimiters: a method's body after '= (', a class's header parens
+	   after '(', a lazy slot's initializer after '='.
+
+	   Why inside: the IDE does not store files. It stores each member
+	   as the parser's span from its first token to its last
+	   (MethodMirror source, the lazy slot's source, the class's
+	   _headerSource) and reassembles the file from those on save. A
+	   comment in front of a member is lexer whitespace that belongs
+	   to no span, so it is silently dropped by the next save from
+	   the IDE. Inside the member it survives, and canonical form
+	   puts it there so a file printed by the tool cannot lose
+	   documentation by being saved from the IDE.
+
+	   Restores the cursor afterwards: the caller's forward scan
+	   continues from where it was, and the entries just emitted are
+	   marked consumed so no later drain re-emits them. *)
+			
+			^emitCommentsFrom: lo upTo: member start inline: isInline
+		)
+		emitCommentsFrom: lo <Integer> upTo: hi <Integer> inline: isInline <Boolean> = (
+			(* Emit the unconsumed comments in [lo, hi) from a rewound cursor,
+	   then put the cursor back -- at hi if the caller had not reached
+	   it yet, so that a forward scan never re-covers the range. *)
+			
+			| saved |
+			source isNil ifTrue: [ ^self ].
+			(hi isNil or: [ hi <= 0 ]) ifTrue: [ ^self ].
+			lo >= hi ifTrue: [ ^self ].
+			saved:: cursor.
+			cursor:: lo.
+			emitCommentsUpTo: hi inline: isInline.
+			cursor:: saved max: hi
+		)
+		skipLeadingCommentsOf: member ^<Integer> = (
+			(* Move the cursor to the member's first token and answer where
+	   it was, so the member's visitor can print the member without
+	   any forward scan claiming its leading comments, then hand the
+	   answered position to emitLeadingCommentsOf:from:inline: once
+	   the member's own delimiters are open. The scans this protects
+	   are the ones that look up '=' from the cursor
+	   (emitInPatternMetadata:, findBodyOpenPosFrom:); with the
+	   cursor at the first token, an '=' inside a leading comment can
+	   no longer be mistaken for the member's own. *)
+			
+			| lo |
+			lo:: cursor.
+			(source isNil not and: [
+					member start isNil not and: [ member start > cursor ]
+				]) ifTrue: [ cursor:: member start ].
+			^lo
+		)
 		emitCommentsBefore: node = (
 			(* Thin wrapper for callers that have an AST node in hand. *)
 			
@@ -769,7 +828,8 @@ Slots:
 	   shape for class headers; pass the cursor position at entry so
 	   the scan starts at 'class' and ends at the first '='. *)
 			
-			| savedCursor |
+			| leadingLo savedCursor |
+			leadingLo:: skipLeadingCommentsOf: node.
 			savedCursor:: cursor.
 			emitAccessModifier: node accessModifier.
 			emit: 'class '.
@@ -801,7 +861,7 @@ Slots:
 			emit: ' = '.
 			emitSuperclassClause: node.
 			emit: ' ('.
-			emitClassHeaderBody: node.
+			emitClassHeaderBody: node leadingFrom: leadingLo.
 			newline.
 			emit: ')'
 		)
@@ -828,21 +888,25 @@ Slots:
 					visitMessage: header superConstructorCall
 				]
 		)
-		emitClassHeaderBody: header = (
+		emitClassHeaderBody: header leadingFrom: leadingLo <Integer> = (
 			| hasSlots hasInit firstContentPos ccText hasComment |
 			hasSlots:: header slots isNil not and: [ header slots isEmpty not ].
 			hasInit:: header initExprs isNil not and: [ header initExprs isEmpty not ].
 			
-			(* Drain any comments between the body's opening '(' and the first
-	   body content (slot, init expr, or — if none — the closing ')').
-	   The pre-scanned commentTable already holds these; the unified
-	   emitter places them in source order. Falls back to the AST's
-	   classComment field when no source is attached (commentTable
-	   empty). *)
+			(* The class's leading comments come first, in the class comment
+	   position just inside the '(' -- the one place in a class
+	   declaration the IDE keeps, since its stored header starts at
+	   the 'class' keyword. Then drain any comments between the
+	   body's opening '(' and the first body content (slot, init
+	   expr, or — if none — the closing ')'). The pre-scanned
+	   commentTable already holds these; the unified emitter places
+	   them in source order. Falls back to the AST's classComment
+	   field when no source is attached (commentTable empty). *)
 			firstContentPos:: hasSlots ifTrue: [ header slots first start ]
 				ifFalse: [
 					hasInit ifTrue: [ header initExprs first start ] ifFalse: [ header end ]
 				].
+			indented: [ emitLeadingCommentsOf: header from: leadingLo inline: false ].
 			(source isNil not and: [
 					firstContentPos isNil not and: [ firstContentPos > 0 ]
 				]) ifTrue: [ indented: [ emitCommentsUpTo: firstContentPos ] ].
@@ -942,8 +1006,22 @@ Slots:
 	looks for the lazy keyword first). 'public lazy' raises
 	'expected ='. *)
 			
+			| leadingLo |
+			leadingLo:: skipLeadingCommentsOf: slot.
 			emit: 'lazy '.
 			emitAccessModifier: slot accessModifier.
+			
+			(* A lazy slot has no body to hold its leading comments, so they
+	   go inline: after the '=' ahead of the initializer, or ahead of
+	   the name when there is no initializer. Both are inside the
+	   slot's stored span ('lazy' through the initializer), which is
+	   what makes them survive a save from the IDE. The initializer
+	   case drains everything up to the initializer inline, so a
+	   comment already sitting after the '=' prints the same way and
+	   the output is a fixed point. *)
+			slot initializer isNil ifTrue: [
+					emitLeadingCommentsOf: slot from: leadingLo inline: true
+				].
 			(slot slotDecl isNil not and: [
 					slot slotDecl start isNil not and: [ slot slotDecl start > 0 ]
 				]) ifTrue: [ emitCommentsUpTo: slot slotDecl start inline: true ].
@@ -955,6 +1033,12 @@ Slots:
 				].
 			slot initializer isNil ifFalse: [
 					slot isMutable ifTrue: [ emit: ' ::= ' ] ifFalse: [ emit: ' = ' ].
+					(slot initializer start isNil or: [ slot initializer start <= 0 ]) ifTrue: [
+							emitLeadingCommentsOf: slot from: leadingLo inline: true
+						]
+						ifFalse: [
+							emitCommentsFrom: leadingLo upTo: slot initializer start inline: true
+						].
 					printAtLevel: slot initializer minLevel: levelCascade.
 					emit: '.'
 				]
@@ -1032,27 +1116,34 @@ Slots:
 	   window to compute, and no reordering hazard either, since with
 	   no source there are no comments to misplace. *)
 			
-			| savedWindowHi |
+			| savedWindowHi windowLo |
 			(source isNil or: [ member start isNil or: [ member start <= 0 ] ]) ifTrue: [
 					newline.
 					emitCommentsBefore: member.
 					^visitBlock value: member
 				].
 			savedWindowHi:: commentWindowHi.
-			cursor:: commentWindowLowerBoundFor: member of: side from: entryPos.
+			windowLo:: commentWindowLowerBoundFor: member of: side from: entryPos.
+			cursor:: windowLo.
 			commentWindowHi:: (member end isNil or: [ member end <= 0 ]) ifTrue: [ nil ]
 				ifFalse: [ member end ].
 			newline.
-			emitCommentsBefore: member.
+			
+			(* The member's leading comments -- the ones in [windowLo,
+	   member start) -- are NOT emitted here, in front of the member.
+	   The visitor emits them INSIDE the member (see
+	   emitLeadingCommentsOf:from:inline:), because a comment in front
+	   of a member is not part of any member's stored source and is
+	   dropped by the next save from the IDE. *)
 			visitBlock value: member.
 			
-			(* Anything still unclaimed inside the member. The visitors are
-	   expected to have emitted it all in its proper place; this is
-	   the backstop that turns a visitor gap into a displaced comment
-	   rather than a lost one, now that closing the window means the
-	   cursor moves past the member for good.
+			(* Anything still unclaimed in the member's window. The visitors
+	   are expected to have emitted it all in its proper place; this
+	   is the backstop that turns a visitor gap into a displaced
+	   comment rather than a lost one, now that closing the window
+	   means the cursor moves past the member for good.
 
-	   The cursor is rewound to the member's start first, because a
+	   The cursor is rewound to the window's start first, because a
 	   visitor gap is exactly the case where the cursor has already
 	   been advanced past the comment without consuming it --
 	   advanceCursorPast: does that after every statement, so a
@@ -1060,7 +1151,7 @@ Slots:
 	   new.') would otherwise be behind the cursor and invisible here.
 	   consumedFlags makes the rescan idempotent. *)
 			(member end isNil not and: [ member end > 0 ]) ifTrue: [
-					cursor:: member start.
+					cursor:: windowLo.
 					emitCommentsUpTo: member end + 1
 				].
 			commentWindowHi:: savedWindowHi.
@@ -1117,7 +1208,8 @@ Slots:
 	emitCodeBodyContents can scan the body's interior for leading
 	comments (those between '(' and the first temp or stmt). *)
 			
-			| savedCursor bodyOpenPos |
+			| leadingLo savedCursor bodyOpenPos |
+			leadingLo:: skipLeadingCommentsOf: node.
 			savedCursor:: cursor.
 			emitAccessModifier: node accessModifier.
 			visitMessagePattern: node pattern.
@@ -1127,7 +1219,13 @@ Slots:
 			(bodyOpenPos > 0 and: [ bodyOpenPos >= cursor ]) ifTrue: [
 					cursor:: bodyOpenPos + 1
 				].
-			indented: [ emitCodeBodyContents: node body inMethod: true bodyEnd: node end ].
+			indented: [
+					
+					(* The method's leading comments become its first body
+			   comments -- the one place in a method the IDE keeps. *)
+					emitLeadingCommentsOf: node from: leadingLo inline: false.
+					emitCodeBodyContents: node body inMethod: true bodyEnd: node end
+				].
 			newline.
 			emit: ')'
 		)

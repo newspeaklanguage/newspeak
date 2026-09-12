@@ -70,6 +70,7 @@ Copyright Gilad Bracha 2022-2025 *)
 		private JSObject = p js global at: 'Object'.
 		private JSArray = p js global at: 'Array'.
 		private JSPromise = p js global at: 'Promise'.
+		private Promise = p actors Promise.
 		private JSString = p js global at: 'String'.
 		private URL = p js global at: 'URL'.
 		private ide = webIDE.
@@ -2458,6 +2459,7 @@ bothered writing code for mortals like you to use?</p>'
 		)
 	) : ()
 	lazy public JSZip = retainedPlatform js global at: 'JSZip'.
+	lazy serverLoadsInFlight <Map[String, List]> = (* Document name -> the {ifSuccess. ifFailure. } pairs waiting on a load of it that has been started but has not installed yet. loadFromServerNamed:'s only other guard is `Root at: n`, which is not populated until the fetch, the unzip and the install have all completed; two overlapping loads of one document would otherwise each start a fetch. That used to be harmless, because the coordination key was the constant 'document:' , n and the second request simply joined the first's pending list. It is not harmless now: the host mints a per-request key (URL digest plus an ordinal), so a second request is a DIFFERENT resource as far as coordination is concerned, and under Croquet it elects a second initiator and fetches the bytes again. Deduplicating here is the right place regardless - it also stops us unzipping the same archive twice. *) Map new.
 	createDocumentSubclassNamed: n <Symbol> body: b <String> ^<Class>
 	(* :exemplar: createDocumentSubclassNamed: #ADoc body: '()()' *)
 	 = (
@@ -2863,55 +2865,74 @@ bothered writing code for mortals like you to use?</p>'
 	public loadFromServerNamed: n <String> ifSuccess: sb <[:Document | Object]> ifFailure: fb <[:String | Object]> = (
 		(* Load the document named n into the Root namespace and report the live
      Document to sb. On a cache hit (already loaded this session) sb fires
-     immediately. The byte fetch runs through the UI platform's
-     coordinatedFetch:via:ifSuccess:ifFailure: - a domain-neutral
-     once-per-session IO primitive - so that under Croquet one elected client
-     fetches and everyone installs the same stored bytes; on the plain
-     platform the fetcher block simply runs locally. All document knowledge
-     (the <n>.zip URL, unzipping, installing into Root) stays here. Every
-     failure path goes to fb. Nothing is signalled inside the JSZip then:
-     callback - that corrupts the alien bridge - so errors there are routed
-     to fb instead. The fetcher and both continuations are stored callbacks,
-     so they contain no ^ (branch with ifTrue:ifFalse:). *)
+     immediately.
+
+     The bytes come from the platform's host fetcher, which is the polymorphic
+     seam: a plain GET on the base platform, and on Croquet a coordinated read
+     where the reflector elects one client to fetch and every client - including
+     a late joiner replaying the history - installs the identical recorded
+     bytes. This method used to pass 'document:' , n as a coordination key and
+     hand-roll the XHR itself. Both are gone: the key is minted inside the host
+     from the URL, so nothing here knows whether it is being coordinated, which
+     is the whole point of the Croquet platform being transparent to the
+     applications above it.
+
+     All document knowledge (the <n>.zip URL, unzipping, installing into Root)
+     stays here. Every failure path goes to fb. Nothing is signalled inside the
+     JSZip then: callback - that corrupts the alien bridge - so errors there are
+     routed to fb instead. The continuations are stored callbacks, so they
+     contain no ^ (branch with ifTrue:ifFalse:). *)
 		
-		| ns |
+		| ns fetcher waiting fresh |
 		ns:: NamespaceSubject onModel: Root key: #Root.
 		(Root at: n ifAbsent: [ nil ]) isNil ifFalse: [ ^sb value: (Root at: n) ].
-		retainedPlatform hopscotch coordinatedFetch: 'document:' , n
-			via: [:success <[:Alien[ArrayBuffer] | Object]> :failure <[:String | Object]> |
-				| req = (retainedPlatform js global at: #XMLHttpRequest) new. |
-				req open: 'GET' filenamed: n , '.zip' flag: true;
-					at: #responseType put: 'arraybuffer';
-					at: #onload
-						put: [:event |
-							(req at: #status) = 200 ifTrue: [ success value: (req at: #response) ]
-								ifFalse: [
-									failure value: 'No document named ' , n , ' on server (HTTP ' , (req at: #status) printString , ')'
-								].
-							nil
-						];
-					at: #onerror
-						put: [:event |
-							failure value: 'Network error loading ' , n.
-							nil
-						];
-					send
-			]
-			ifSuccess: [:bytes |
+		waiting:: serverLoadsInFlight at: n ifAbsent: [ nil ].
+		waiting isNil ifFalse: [ ^waiting add: {sb. fb. } ].
+		fresh:: List new.
+		fresh add: {sb. fb. }.
+		serverLoadsInFlight at: n put: fresh.
+		fetcher:: [ retainedPlatform host fetcher ] on: Exception do: [:e | nil ].
+		fetcher isNil ifTrue: [
+				^settleServerLoadOf: n
+					failure: 'This platform has no host fetcher, so ' , n , ' cannot be loaded from the server'
+			].
+		Promise when: (fetcher fetchBytes: n , '.zip')
+			fulfilled: [:bytes |
 				(JSZip loadAsync: bytes) then: [:jsz |
 						loadDocument: jsz
 							named: n
 							into: ns
-							ifSuccess: [ sb value: (Root at: n) ]
-							ifFailure: [:errs | fb value: errs printString ].
+							ifSuccess: [ settleServerLoadOf: n success: (Root at: n) ]
+							ifFailure: [:errs | settleServerLoadOf: n failure: errs printString ].
 						nil
 					]
 					onError: [:ex |
-						fb value: ex printString.
+						settleServerLoadOf: n failure: ex printString.
 						nil
 					]
 			]
-			ifFailure: [:msg | fb value: msg ]
+			broken: [:reason | settleServerLoadOf: n failure: reason ]
+	)
+	settleServerLoadOf: n <String> success: doc <Document> = (
+		(* Hand the loaded document to everyone who asked for it while it was in
+     flight, and retire the entry. *)
+		
+		| waiting |
+		waiting:: serverLoadsInFlight at: n ifAbsent: [ nil ].
+		waiting isNil ifTrue: [ ^self ].
+		serverLoadsInFlight removeKey: n.
+		waiting do: [:pair | (pair at: 1) value: doc ]
+	)
+	settleServerLoadOf: n <String> failure: msg = (
+		(* As settleServerLoadOf:success:, for the failure side: every waiter hears
+     the same reason, and the entry is retired so a later attempt can retry
+     rather than attach to a load that is over. *)
+		
+		| waiting |
+		waiting:: serverLoadsInFlight at: n ifAbsent: [ nil ].
+		waiting isNil ifTrue: [ ^self ].
+		serverLoadsInFlight removeKey: n.
+		waiting do: [:pair | (pair at: 2) value: msg ]
 	)
 	public staticProseFor: doc <Document> ^<String> = (
 		^staticProseFor: doc inlineStack: Set new lazyChildren: List new

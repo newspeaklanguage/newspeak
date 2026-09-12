@@ -1455,6 +1455,7 @@ To produce a non-synchronizing part of the UI, subclass NonSyncingPresenter and 
 		lazy coordinatedFetchPending <Map[String, List]> = Map new.
 		lazy coordinatedFetchers <Map[String, [:[:Alien[ArrayBuffer] | Object] :[:String | Object] | Object]]> = Map new.
 		lazy coordinatedFetchSubscribed <Map[String, Boolean]> = Map new.
+		lazy coordinatedFetchInline <Map[String, Boolean]> = Map new.
 		newImageButtonId ^<String> = (
 			^newIdFor: 'imageButton'
 		)
@@ -1481,6 +1482,28 @@ To produce a non-synchronizing part of the UI, subclass NonSyncingPresenter and 
 				event: #coordinatedFetch_request
 				data: (js global newspeakFragmentData: (coordinatedFetchEventKeyFor: key)
 					data: (rootView at: #viewId))
+		)
+		public coordinatedText: key <String> via: fetcher <[:[:String | Object] :[:String | Object] | Object]> ifSuccess: sb <[:String | Object]> ifFailure: fb <[:String | Object]> = (
+			(* The text-result form (see the base method). The election is identical;
+	   only the carriage of the answer differs. The elected client publishes the
+	   TEXT as the loaded event's own data instead of storing it and publishing a
+	   Data API handle.
+
+	   That is what puts the answer in order. Every Newspeak handler runs through
+	   the dispatch chain in nsSubscribe, so handlers are serialized and replay
+	   sees them in the recorded order - but the Data API read that the bytes
+	   form does is a separate round trip OUTSIDE that chain, so its completion
+	   floats free of it. A client replaying a history could therefore reach a
+	   handler that READS the answer before the answer had arrived: the concrete
+	   case was a joining client building a model-picker menu from the static
+	   fallback list, then replaying a click on a discovered model that its menu
+	   did not contain. Carried as event data the answer is resolved inside the
+	   chain - nsPublish detours it through the file server if it is too big for
+	   the reflector, and nsResolvePayload awaits that detour in the chain - so
+	   ordering holds either way. *)
+			
+			coordinatedFetchInline at: key put: true.
+			coordinatedFetch: key via: fetcher ifSuccess: sb ifFailure: fb
 		)
 		coordinatedFetchEventKeyFor: key <String> ^<String> = (
 			(* Croquet rejects subscription scopes containing ':' (its internal
@@ -1537,19 +1560,26 @@ To produce a non-synchronizing part of the UI, subclass NonSyncingPresenter and 
 						data: (js global newspeakFragmentData: eventKey
 							data: 'No fetcher registered for ' , key , ' on the elected client')
 				].
-			fetcher value: [:bytes |
-					(rootView storedData store: bytes) then: [:handle |
+			fetcher value: [:result |
+					(coordinatedFetchInline at: key ifAbsent: [ false ]) ifTrue: [
 							publish: 'nscoordfetch_'
 								event: #coordinatedFetch_loaded
-								data: (js global newspeakFragmentData: eventKey data: handle).
-							nil
+								data: (js global newspeakFragmentData: eventKey data: result)
 						]
-						onError: [:ex |
-							publish: 'nscoordfetch_'
-								event: #coordinatedFetch_failed
-								data: (js global newspeakFragmentData: eventKey
-									data: 'Storing ' , key , ' failed: ' , ex printString).
-							nil
+						ifFalse: [
+							(rootView storedData store: result) then: [:handle |
+									publish: 'nscoordfetch_'
+										event: #coordinatedFetch_loaded
+										data: (js global newspeakFragmentData: eventKey data: handle).
+									nil
+								]
+								onError: [:ex |
+									publish: 'nscoordfetch_'
+										event: #coordinatedFetch_failed
+										data: (js global newspeakFragmentData: eventKey
+											data: 'Storing ' , key , ' failed: ' , ex printString).
+									nil
+								]
 						]
 				]
 				value: [:msg |
@@ -1558,16 +1588,26 @@ To produce a non-synchronizing part of the UI, subclass NonSyncingPresenter and 
 						data: (js global newspeakFragmentData: eventKey data: msg)
 				]
 		)
-		deliverCoordinatedFetchBytes: key <String> handle: h <Alien[CroquetHandle]> = (
+		deliverCoordinatedFetchBytes: key <String> handle: h <Alien[CroquetHandle] | String> = (
 			(* A recorded loaded answer arrived. If no request is pending locally (a
 	   repeat answer to some other client's late request, or replay after this
-	   client already consumed the bytes) there is nothing to do - skip the
-	   fetch entirely. *)
+	   client already consumed the answer) there is nothing to do - skip the
+	   fetch entirely.
+
+	   For an inline (text) key the answer IS h: it travelled in the event and
+	   has already been resolved by the dispatch chain, so it is handed to the
+	   waiters here and now, at this position in the replay. For a bytes key it
+	   is a Data API handle and must be fetched - a round trip outside the chain,
+	   which is why anything a synchronized handler reads should use the text
+	   form. *)
 			
 			| pending = coordinatedFetchPending at: key ifAbsent: [ nil ]. |
 			pending isNil ifTrue: [ ^self ].
 			pending isEmpty ifTrue: [ ^self ].
 			coordinatedFetchPending at: key put: List new.
+			(coordinatedFetchInline at: key ifAbsent: [ false ]) ifTrue: [
+					^pending do: [:pair | (pair at: 1) value: h ]
+				].
 			(rootView storedData fetch: h) then: [:bytes |
 					pending do: [:pair | (pair at: 1) value: bytes ].
 					nil

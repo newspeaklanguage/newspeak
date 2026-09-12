@@ -148,6 +148,25 @@ cp ./TelescreenTemplate.zip out
 mkdir -p out/vendor
 cp ./vendor/*.js out/vendor/
 
+# 7b. Stage the test fixtures the probe batteries read over HTTP.
+# testfixtures/mockai/v1/models is a fixed list-models payload, so
+# croquet-probes/model-discovery-battery.js can exercise model discovery
+# through OpenAICompatibleProvider with NO API key and a deterministic
+# result; ProbeDoc.zip is a throwaway document for the coordinated
+# document-load test, so that test does not depend on a real one staying
+# put. Both are served by the front door from out/, which a clean build
+# wipes - hence staging them here rather than leaving them in out/.
+# Guarded: the fixtures are only needed to RUN the probe batteries, so a tree
+# without them (or a checkout made before they were committed) should still
+# build rather than die on a missing cp.
+if [ -d ./testfixtures ]; then
+    mkdir -p out/mockai/v1
+    cp ./testfixtures/mockai/v1/models out/mockai/v1/
+    cp ./testfixtures/*.zip out
+else
+    echo "NOTE: testfixtures/ absent - probe fixtures not staged (croquet-probes batteries will fail until it is)"
+fi
+
 cd ${NEWSPEAK}/out || exit 1
 
 # ${PRIMORDIALSOUP}/out/ReleaseX64/primordialsoup \

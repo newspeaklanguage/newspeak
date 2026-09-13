@@ -348,14 +348,19 @@ old text (#removed field) *)
 					options: croquetOrigin
 			)
 			isSyncOrigin: origin ^<Boolean> = (
-				(* Selection/cursor signals originating from applying a synchronized event: our tagged programmatic operations ('croquet') and the selection fallout of a full-buffer setValue. CodeMirror may deliver these at the END of its operation - after the reflecting flag has been restored - so the flag alone cannot suppress their echo, which stormed the reflector (see croquetOrigin). Deliberately NOT consulted by the change/beforeChange publishers: setValue-originated CHANGE events have always been published and parts of the document-update pipeline ride on them. *)
+				(* Selection/cursor signals originating from applying a synchronized event: our tagged programmatic operations ('croquet') and the selection fallout of a full-buffer setValue. CodeMirror may deliver these at the END of its operation - after the reflecting flag has been restored - so the flag alone cannot suppress their echo, which stormed the reflector (see croquetOrigin). The change/beforeChange publishers consult it too, through isUserOrigin:: a setValue-originated change is handled locally rather than published. (It used to be published so that the change response would run on the echo; the response now runs directly, on every client, from its own re-render.) *)
 				
 				origin = 'croquet' ifTrue: [ ^true ].
 				origin = 'setValue' ifTrue: [ ^true ].
 				^false
 			)
 			respondToBeforeSelectionChange: event <Alien[Event]> = (
-				(reflecting and: [ (isSyncOrigin: (event at: #origin)) not ]) ifTrue: [
+				(* Published only for a selection the USER moved ('*mouse', '+move',
+		   the selection that accompanies '+input' ...). A programmatic
+		   setCursor/setSelection, tagged or not, is every client's own
+		   business, exactly as a programmatic change is - see isUserOrigin:. *)
+				
+				(reflecting and: [ isUserOrigin: (event at: #origin) ]) ifTrue: [
 						publish: 'nscodemirror_'
 							event: #codeMirror_beforeSelectionChange
 							data: (js global newspeakFragmentData: fragmentId
@@ -371,9 +376,17 @@ old text (#removed field) *)
 			updateEditedText: oldFragment <CodeMirrorFragment> = (
 				(* We don't want spurious changes signaling croquet, so we update only when needed. This isn't quite right. This will update when needed, but even that is not a real change. This method is called when no edits have occurred. The situation to worry about is when we edited a method and changed the selector, changing a different method. That method has changed, even though it was not being edited. At the same time, the edited method has not changed, yet the text in its editor has. So it was always best to just update the method. However, we do need to avoid the change events thereby generated. Once the correct test for this is implemented, it will likely be cheaper to use it to avoid the notification than to compare old and new text. *)
 				
-				textSlot = oldFragment textBeingAccepted ifFalse: [
-						editor setValue: textSlot
+				(* The caller (the base updateVisualsFromSameKind:) raises
+		   lastChangeWasSynthetic before calling here, counting on the setValue
+		   to fire the change that consumes it. When the text is unchanged there
+		   is no setValue and no change, so lower the flag ourselves: left raised
+		   it eats the NEXT real change, and a paste - a single change - then
+		   never enters edit state and the accept/cancel bar never appears. *)
+				
+				textSlot = oldFragment textBeingAccepted ifTrue: [
+						lastChangeWasSynthetic:: false
 					]
+					ifFalse: [ editor setValue: textSlot ]
 			)
 			setupCroquetView = (
 				subscribe: #model_codeMirror_change
@@ -437,18 +450,55 @@ old text (#removed field) *)
 					]
 			)
 			respondToChange: change <Alien[CodeMirrorChangeObject]> = (
-				reflecting ifTrue: [
-						publish: 'nscodemirror_'
-							event: #codeMirror_change
-							data: (codeMirrorData: (js global nsCodeMirrorChange: change))
-					]
+				(* reflecting is false while a synchronized event is being applied; its
+		   handler (setupCroquetView) runs the base response itself, so nothing
+		   to do here. Otherwise: a USER edit is published, and its response runs
+		   when the event comes back from the model, on every client alike. A
+		   PROGRAMMATIC change - a setValue from a re-render, or one of our own
+		   tagged operations - is a deterministic consequence of replicated state
+		   that every client produces for itself, in lockstep; it must not enter
+		   the stream. Its response runs locally, right here. See isUserOrigin:. *)
+				
+				reflecting ifFalse: [ ^self ].
+				(isUserOrigin: (change at: #origin)) ifFalse: [
+						^super respondToChange: change
+					].
+				publish: 'nscodemirror_'
+					event: #codeMirror_change
+					data: (codeMirrorData: (js global nsCodeMirrorChange: change))
 			)
 			respondToBeforeChange: event <Alien[Event]> = (
-				reflecting ifTrue: [
-						publish: 'nscodemirror_'
-							event: #codeMirror_beforeChange
-							data: codeMirrorData
-					]
+				(* As respondToChange:. The base response is updateEditState. *)
+				
+				reflecting ifFalse: [ ^self ].
+				(isUserOrigin: (event at: #origin)) ifFalse: [
+						^super respondToBeforeChange: event
+					].
+				publish: 'nscodemirror_'
+					event: #codeMirror_beforeChange
+					data: codeMirrorData
+			)
+			isUserOrigin: origin ^<Boolean> = (
+				(* True for a change the user made in THIS editor - CodeMirror tags
+		   those '+input', '+delete', 'paste', 'cut', 'undo', ... - which is what
+		   the other clients need told about. False for 'setValue' and 'croquet'
+		   (see isSyncOrigin:) and for an untagged programmatic operation, whose
+		   origin is undefined.
+
+		   Why this matters: programmatic changes used to be published too, so
+		   that their change response would run when the event came back. But
+		   every client re-renders the same way and published the same setValue,
+		   multiplying each one by the number of clients; and a late joiner,
+		   re-rendering as it replayed, published its own on top of the recorded
+		   ones - 48 extra events and five extra editors in one probe run
+		   (croquet-probes/setup-latejoin-probe.js, 2026-09-12). Those echoes drove
+		   extra change responses and re-renders, and so extra fragment
+		   ordinals, on the joiner alone: every later keystroke then addressed an
+		   editor the joiner had numbered differently, and its replay stalled
+		   15s per event. *)
+				
+				origin isKindOfString ifFalse: [ ^false ].
+				^(isSyncOrigin: origin) not
 			)
 		) : ()
 		public class HyperlinkImageFragment image: i action: a = super HyperlinkImageFragment new (
@@ -1455,6 +1505,7 @@ To produce a non-synchronizing part of the UI, subclass NonSyncingPresenter and 
 		lazy coordinatedFetchPending <Map[String, List]> = Map new.
 		lazy coordinatedFetchers <Map[String, [:[:Alien[ArrayBuffer] | Object] :[:String | Object] | Object]]> = Map new.
 		lazy coordinatedFetchSubscribed <Map[String, Boolean]> = Map new.
+		lazy coordinatedFetchInline <Map[String, Boolean]> = Map new.
 		newImageButtonId ^<String> = (
 			^newIdFor: 'imageButton'
 		)
@@ -1481,6 +1532,28 @@ To produce a non-synchronizing part of the UI, subclass NonSyncingPresenter and 
 				event: #coordinatedFetch_request
 				data: (js global newspeakFragmentData: (coordinatedFetchEventKeyFor: key)
 					data: (rootView at: #viewId))
+		)
+		public coordinatedText: key <String> via: fetcher <[:[:String | Object] :[:String | Object] | Object]> ifSuccess: sb <[:String | Object]> ifFailure: fb <[:String | Object]> = (
+			(* The text-result form (see the base method). The election is identical;
+	   only the carriage of the answer differs. The elected client publishes the
+	   TEXT as the loaded event's own data instead of storing it and publishing a
+	   Data API handle.
+
+	   That is what puts the answer in order. Every Newspeak handler runs through
+	   the dispatch chain in nsSubscribe, so handlers are serialized and replay
+	   sees them in the recorded order - but the Data API read that the bytes
+	   form does is a separate round trip OUTSIDE that chain, so its completion
+	   floats free of it. A client replaying a history could therefore reach a
+	   handler that READS the answer before the answer had arrived: the concrete
+	   case was a joining client building a model-picker menu from the static
+	   fallback list, then replaying a click on a discovered model that its menu
+	   did not contain. Carried as event data the answer is resolved inside the
+	   chain - nsPublish detours it through the file server if it is too big for
+	   the reflector, and nsResolvePayload awaits that detour in the chain - so
+	   ordering holds either way. *)
+			
+			coordinatedFetchInline at: key put: true.
+			coordinatedFetch: key via: fetcher ifSuccess: sb ifFailure: fb
 		)
 		coordinatedFetchEventKeyFor: key <String> ^<String> = (
 			(* Croquet rejects subscription scopes containing ':' (its internal
@@ -1537,19 +1610,26 @@ To produce a non-synchronizing part of the UI, subclass NonSyncingPresenter and 
 						data: (js global newspeakFragmentData: eventKey
 							data: 'No fetcher registered for ' , key , ' on the elected client')
 				].
-			fetcher value: [:bytes |
-					(rootView storedData store: bytes) then: [:handle |
+			fetcher value: [:result |
+					(coordinatedFetchInline at: key ifAbsent: [ false ]) ifTrue: [
 							publish: 'nscoordfetch_'
 								event: #coordinatedFetch_loaded
-								data: (js global newspeakFragmentData: eventKey data: handle).
-							nil
+								data: (js global newspeakFragmentData: eventKey data: result)
 						]
-						onError: [:ex |
-							publish: 'nscoordfetch_'
-								event: #coordinatedFetch_failed
-								data: (js global newspeakFragmentData: eventKey
-									data: 'Storing ' , key , ' failed: ' , ex printString).
-							nil
+						ifFalse: [
+							(rootView storedData store: result) then: [:handle |
+									publish: 'nscoordfetch_'
+										event: #coordinatedFetch_loaded
+										data: (js global newspeakFragmentData: eventKey data: handle).
+									nil
+								]
+								onError: [:ex |
+									publish: 'nscoordfetch_'
+										event: #coordinatedFetch_failed
+										data: (js global newspeakFragmentData: eventKey
+											data: 'Storing ' , key , ' failed: ' , ex printString).
+									nil
+								]
 						]
 				]
 				value: [:msg |
@@ -1558,16 +1638,26 @@ To produce a non-synchronizing part of the UI, subclass NonSyncingPresenter and 
 						data: (js global newspeakFragmentData: eventKey data: msg)
 				]
 		)
-		deliverCoordinatedFetchBytes: key <String> handle: h <Alien[CroquetHandle]> = (
+		deliverCoordinatedFetchBytes: key <String> handle: h <Alien[CroquetHandle] | String> = (
 			(* A recorded loaded answer arrived. If no request is pending locally (a
 	   repeat answer to some other client's late request, or replay after this
-	   client already consumed the bytes) there is nothing to do - skip the
-	   fetch entirely. *)
+	   client already consumed the answer) there is nothing to do - skip the
+	   fetch entirely.
+
+	   For an inline (text) key the answer IS h: it travelled in the event and
+	   has already been resolved by the dispatch chain, so it is handed to the
+	   waiters here and now, at this position in the replay. For a bytes key it
+	   is a Data API handle and must be fetched - a round trip outside the chain,
+	   which is why anything a synchronized handler reads should use the text
+	   form. *)
 			
 			| pending = coordinatedFetchPending at: key ifAbsent: [ nil ]. |
 			pending isNil ifTrue: [ ^self ].
 			pending isEmpty ifTrue: [ ^self ].
 			coordinatedFetchPending at: key put: List new.
+			(coordinatedFetchInline at: key ifAbsent: [ false ]) ifTrue: [
+					^pending do: [:pair | (pair at: 1) value: h ]
+				].
 			(rootView storedData fetch: h) then: [:bytes |
 					pending do: [:pair | (pair at: 1) value: bytes ].
 					nil

@@ -16,15 +16,20 @@ class AIAccess usingPlatform: platform = Object new (
 	(* Only class-imports and the platform handle go in the slot block —
    they must be safe at AIAccess-construction time, which now happens
    during platform construction (Hopscotch reads `p aiAccess` from its
-   slot block). The JS-side handles (global, JSON, Promise) are forced
+   slot block). The JS-side handles (global, JSON, JSPromise) are forced
    lazily at module body, so they're only fetched on first actual API
    call — well after primordialsoup snapshot creation, when JS aliens
-   are live. *)
+   are live.
+
+   Note that Promise below is the NEWSPEAK promise class, an ordinary
+   class-import; JSPromise is the JS one and stays lazy. *)
 	
 	|
 		private js = platform js.
 		private List = platform collections List.
 		private Map = platform collections Map.
+		private Promise = platform actors Promise.
+		private Resolver = platform actors Resolver.
 		
 		(* The platform host module (HOST_SERVICES_DESIGN_2026-08-31.md), nil on
    platforms without one - the guard keeps Croquet and older platforms
@@ -349,21 +354,6 @@ class AIAccess usingPlatform: platform = Object new (
 			
 			subclassResponsibility
 		)
-		public fetchAvailableModelsFromAPI ^<Alien[Promise]> = (
-			(* Hit listModelsEndpoint with provider-appropriate auth headers and
-	   resolve with the *raw* parsed JSON body (provider-specific shape).
-	   Rejects with a String reason on HTTP / network failure.
-
-	   This mirrors complete:'s pattern: a single then-block that returns
-	   `response json` straight through. Parsing the body into {id.
-	   displayName} tuples is done by refreshAvailableModels in a flat
-	   second then-stage, NOT nested inside this one — primordialsoup's
-	   JS-Promise bridge handles flat chains cleanly but a raise inside a
-	   nested `response json then: [...]` can corrupt the alien stack and
-	   surface as the next callback receiving document.documentElement. *)
-			
-			subclassResponsibility
-		)
 		public parseListModelsResponse: body <Alien> ^<List> = (
 			(* Walk the provider-native response body and return a Newspeak List
 	   of {id <String>. displayName <String>} 2-tuples. Implementations
@@ -424,32 +414,6 @@ class AIAccess usingPlatform: platform = Object new (
 			str isNil ifTrue: [ ^self ].
 			[ js localStorage setItem: localStorageModelsKey to: str ] on: Exception
 				do: [:e | ]
-		)
-		public refreshAvailableModels ^<Alien[Promise]> = (
-			(* Fetch the raw body, parse into tuples, persist, and resolve. Cache
-	   mutates only on success. The parse + store happen in a single flat
-	   then-stage with an on:Exception backstop so any raise turns into a
-	   clean Promise.reject — keeps the alien bridge from corrupting
-	   downstream callbacks.
-
-	   NB: a Newspeak List is NOT a JS-marshallable value, so we must NOT
-	   resolve the Promise with `tuples` — doing so makes the alien bridge
-	   try to push the List into JS (List >> index doesNotUnderstand) and
-	   crash. The parsed list lives in the cache (storeCachedModels:);
-	   callers read it from there, not from the Promise value. We resolve
-	   with nil. *)
-			
-			^fetchAvailableModelsFromAPI then: [:body |
-					[
-						| tuples |
-						tuples:: parseListModelsResponse: body.
-						storeCachedModels: tuples.
-						nil
-					] on: Exception
-						do: [:e |
-							JSPromise reject: 'list-models parse error: ' , (errorDescription: e)
-						]
-				]
 		)
 		public stopReasonOf: response <Alien> ^<String | UndefinedObject> = (
 			(* The wire-level reason the model stopped, as this provider's raw string
@@ -525,6 +489,149 @@ class AIAccess usingPlatform: platform = Object new (
 			^notices inject: 'IMPORTANT — out-of-band updates since your last turn:'
 				into: [:acc :line | acc , String lf , '- ' , line ]
 		)
+		public listModelsHeaders ^<Alien[JSObject]> = (
+			(* Request headers for the list-models call. None by default; providers
+	   that authenticate override. Declared apart from the fetch so that the
+	   fetch itself can live here in the base and go through the platform's
+	   web-read capability, leaving subclasses to contribute only
+	   listModelsEndpoint and these headers. *)
+			
+			^createJSObject
+		)
+		public providerLabel ^<String> = (
+			(* Name used in discovery diagnostics. The class's own simple name is more
+	   use in a console than a hand-written label, and needs no override. *)
+			
+			^class name
+		)
+		public fetchAvailableModelsFromAPI ^<Promise> = (
+			(* Fetch the raw list-models body as text through the platform's host
+	   fetcher. This was a per-subclass js global fetch: with a hand-rolled JS
+	   Promise chain and a duplicated status check in each; subclasses now
+	   contribute only listModelsEndpoint and listModelsHeaders, and the
+	   capability reports HTTP failure by breaking the promise.
+
+	   The result is a NEWSPEAK promise, not a JS one. That is what the host
+	   capability answers, and it is what lets the Croquet platform settle it
+	   from a recorded event rather than a network callback - which is the
+	   point of routing through it at all: every client parses the same bytes.
+
+	   Breaks rather than raises when the platform has no host module, so all
+	   failures reach callers by one path. *)
+			
+			| fetcher |
+			fetcher:: hostFetcher.
+			fetcher isNil ifTrue: [
+					^Promise broken: providerLabel , ' model discovery unavailable: this platform has no host fetcher'
+				].
+			^fetcher fetchText: listModelsEndpoint headers: listModelsHeaders
+		)
+		completionVia: url <String> headers: hdrs <Alien[JSObject]> body: body <Alien> label: label <String> ^<Alien[Promise]> = (
+			(* POST one completion through the platform's host capability and answer a
+	   JS promise of the parsed response, which is the shape Session's turn loop
+	   and watchdog already consume.
+
+	   Routing through the capability is what makes a completion happen once per
+	   SESSION rather than once per client: on Croquet the elected initiator
+	   issues it and every other client - and every late joiner replaying - reads
+	   the recorded response instead of asking the provider again. That matters
+	   more here than for model discovery, because a completion is billed and is
+	   not idempotent.
+
+	   The capability answers a NEWSPEAK promise; the bridge back to a JS one is
+	   deliberate and temporary. Converting the turn loop, the tool round and the
+	   watchdog to Newspeak promises is wanted eventually and is a phase of its
+	   own; until then the conversion lives here, at the provider boundary, and
+	   nothing above it changes.
+
+	   Nothing is raised inside the continuations - a raise escaping one is lost
+	   on the alien bridge - so both settle the deferred and stop. *)
+			
+			| fetcher |
+			fetcher:: hostFetcher.
+			fetcher isNil ifTrue: [
+					^JSPromise reject: label , ' unavailable: this platform has no host fetcher'
+				].
+			^bridgeCompletion: (fetcher fetchText: url
+					headers: hdrs
+					body: (JSON stringify: body))
+				label: label
+		)
+		bridgeCompletion: answer <Promise> label: label <String> ^<Alien[Promise]> = (
+			(* Turn a Newspeak promise of response TEXT into the JS promise of a parsed
+	   response that Session's turn loop and watchdog consume.
+
+	   Shared by every transport: an HTTP completion and a bus completion differ
+	   in how the text is obtained and not at all in what happens to it. The
+	   bridge is deliberate and temporary - Newspeak promises are wanted all the
+	   way up eventually, and when that lands this method is what goes away.
+
+	   Nothing is raised inside the continuations; a raise escaping one is lost
+	   on the alien bridge, so each settles the deferred and stops. *)
+			
+			| deferred resolveFn rejectFn |
+			deferred:: JSPromise withResolvers.
+			resolveFn:: deferred at: 'resolve'.
+			rejectFn:: deferred at: 'reject'.
+			Promise when: answer
+				fulfilled: [:text |
+					[ resolveFn call: js undefined with: (JSON parse: text) ] on: Exception
+						do: [:e |
+							[
+								rejectFn call: js undefined
+									with: label , ' response was not JSON: ' , (errorDescription: e)
+							] on: Exception do: [:e2 | nil ]
+						]
+				]
+				broken: [:reason |
+					[
+						rejectFn call: js undefined
+							with: label , ' API error: ' , (describeBreakage: reason)
+					] on: Exception do: [:e | nil ]
+				].
+			^deferred at: 'promise'
+		)
+		public refreshAvailableModels ^<Promise> = (
+			(* Fetch, parse into {id. displayName} tuples, persist, and settle. The
+	   cache mutates only on success.
+
+	   Parsing happens here rather than in fetchAvailableModelsFromAPI so that
+	   a malformed body breaks this promise with a legible reason instead of
+	   raising inside a continuation. Callers read the list from the cache
+	   (storeCachedModels:), never from the resolution: this settles with nil.
+	   The old JS-promise version had to say so too, because a Newspeak List
+	   cannot be marshalled across the alien bridge - now it simply never
+	   crosses one. *)
+			
+			| r = Resolver new. |
+			Promise when: fetchAvailableModelsFromAPI
+				fulfilled: [:body |
+					[
+						storeCachedModels: (parseListModelsResponse: (JSON parse: body)).
+						fulfillQuietly: r with: nil
+					] on: Exception
+						do: [:e |
+							breakQuietly: r
+								with: providerLabel , ' list-models parse error: ' , (errorDescription: e)
+						]
+				]
+				broken: [:reason |
+					breakQuietly: r
+						with: providerLabel , ' list-models error: ' , (describeBreakage: reason)
+				].
+			^r promise
+		)
+		public refreshAvailableModelsThen: onDone <[]> onError: onError <[:String | Object]> = (
+			(* Block-shaped refreshAvailableModels for UI callers: re-render on
+	   success, log on failure. Spares every call site an import of Promise -
+	   which HopscotchForHTML5 and HopscotchWebIDE would otherwise each need
+	   purely to chain a discovery refresh - and keeps the promise protocol
+	   out of presenters. The failure reason is already a String. *)
+			
+			Promise when: refreshAvailableModels
+				fulfilled: [:ignored | onDone value ]
+				broken: [:reason | onError value: (describeBreakage: reason) ]
+		)
 	) : ()
 	public class AnthropicProvider apiKey: key <String> model: mdl <String> = Provider new (
 		(* Provider for Anthropic's Messages API (Claude models). Conversation
@@ -577,41 +684,6 @@ class AIAccess usingPlatform: platform = Object new (
 		public listModelsEndpoint ^<String> = (
 			^'https://api.anthropic.com/v1/models'
 		)
-		public fetchAvailableModelsFromAPI ^<Alien[Promise]> = (
-			(* GET /v1/models with the standard Anthropic auth headers. Returns
-	   the raw parsed body Promise (shape {data: [{id, display_name,
-	   ...}, ...]}). Same flat then-shape as complete:: status check
-	   inside the outer then-block, return `response json` straight
-	   through on success. Parsing into tuples is done one level up by
-	   refreshAvailableModels, NOT nested here. *)
-			
-			| headers options |
-			headers:: createJSObject.
-			headers at: 'x-api-key' put: apiKey.
-			headers at: 'anthropic-version' put: apiVersion.
-			headers at: 'anthropic-dangerous-direct-browser-access' put: 'true'.
-			options:: createJSObject.
-			options at: 'method' put: 'GET'.
-			options at: 'headers' put: headers.
-			^(global fetch: listModelsEndpoint with: options) then: [:response |
-					[
-						| status statusText |
-						status:: safeAt: response field: 'status'.
-						statusText:: safeAt: response field: 'statusText'.
-						statusText isNil ifTrue: [ statusText:: '' ].
-						(status isNil or: [ status >= 400 ]) ifTrue: [
-								JSPromise reject: 'Anthropic list-models error: ' , (status isNil ifTrue: [
-											'(no status)'
-										]
-										ifFalse: [ status printString ]) , ' ' , statusText
-							]
-							ifFalse: [ response json ]
-					] on: Exception
-						do: [:e |
-							JSPromise reject: 'Anthropic list-models error: ' , (errorDescription: e)
-						]
-				]
-		)
 		public parseListModelsResponse: body <Alien> ^<List> = (
 			(* Walk the data array and build {id, displayName} 2-tuples. *)
 			
@@ -661,7 +733,7 @@ class AIAccess usingPlatform: platform = Object new (
 	   once — its block sits between system and messages on the wire — but
 	   notice turns are the exception, not the rule. *)
 			
-			| body headers options |
+			| body headers |
 			body:: createJSObject.
 			body at: 'model' put: model.
 			body at: 'max_tokens' put: maxTokens.
@@ -698,32 +770,7 @@ class AIAccess usingPlatform: platform = Object new (
 			headers at: 'x-api-key' put: apiKey.
 			headers at: 'anthropic-version' put: apiVersion.
 			headers at: 'anthropic-dangerous-direct-browser-access' put: 'true'.
-			options:: createJSObject.
-			options at: 'method' put: 'POST'.
-			options at: 'headers' put: headers.
-			options at: 'body' put: (JSON stringify: body).
-			^(global fetch: apiUrl with: options) then: [:response |
-					[
-						| status statusText |
-						
-						(* See GeminiProvider doRequest: for the rationale on
-			   status >= 400 and on returning Promise.reject instead of
-			   raising. *)
-						status:: safeAt: response field: 'status'.
-						statusText:: safeAt: response field: 'statusText'.
-						statusText isNil ifTrue: [ statusText:: '' ].
-						(status isNil or: [ status >= 400 ]) ifTrue: [
-								JSPromise reject: 'Anthropic API error: ' , (status isNil ifTrue: [
-											'(no status)'
-										]
-										ifFalse: [ status printString ]) , ' ' , statusText
-							]
-							ifFalse: [ response json ]
-					] on: Exception
-						do: [:e |
-							JSPromise reject: 'Anthropic provider error: ' , (errorDescription: e)
-						]
-				]
+			^completionVia: apiUrl headers: headers body: body label: 'Anthropic'
 		)
 		markMessagesForCache: messages <Alien[Array]> = (
 			(* Move this request's conversation cache_control breakpoint to the last
@@ -1255,6 +1302,18 @@ class AIAccess usingPlatform: platform = Object new (
 			^(u at: #input ifAbsent: [ 0 ]) * in + ((u at: #output ifAbsent: [ 0 ]) * out) + ((u at: #cacheRead
 				ifAbsent: [ 0 ]) * in * 0.1) + (w5 * in * 1.25) + (w1 * in * 2) / 1000000
 		)
+		public listModelsHeaders ^<Alien[JSObject]> = (
+			(* Standard Anthropic auth, plus the direct-browser-access opt-in the API
+	   requires of a page. These reach the network only from the elected
+	   client's fetcher closure, so the key is not published to a reflector. *)
+			
+			| headers |
+			headers:: createJSObject.
+			headers at: 'x-api-key' put: apiKey.
+			headers at: 'anthropic-version' put: apiVersion.
+			headers at: 'anthropic-dangerous-direct-browser-access' put: 'true'.
+			^headers
+		)
 	) : ()
 	public class Session provider: p <Provider> tools: toolList <List[Tool]> = Object new (
 		(* A multi-turn AI conversation bound to one provider. Holds the message
@@ -1329,13 +1388,6 @@ class AIAccess usingPlatform: platform = Object new (
 		|
 		toolList do: [:t <Tool> | toolMap at: t name put: t ].
 	) (
-		
-		(* Running dollar estimate, accumulated per request by recordUsageFrom: at
-   the rates of the model that served each request (provider costOfUsage:),
-   so a mid-session model switch does not reprice history. Lazy DELIBERATELY:
-   these were added while sessions with the eager slots were live, and a new
-   eager slot is nil on every existing instance (schema migration does not
-   re-run initializers) — lazy slots initialize on first touch instead. *)
 		lazy public totalCostUsd ::= 0.
 		lazy public lastCostUsd ::= 0.
 		public addSystemNotice: line <String> = (
@@ -1445,6 +1497,17 @@ class AIAccess usingPlatform: platform = Object new (
 		effectiveToolTimeoutMs ^<Integer> = (
 			toolTimeoutMs isNil ifTrue: [ ^180000 ].
 			^toolTimeoutMs
+		)
+		effectiveToolBatchTimeoutMs ^<Integer> = (
+			(* Backstop budget for a whole round of tool calls. Each call is
+	   individually bounded by effectiveToolTimeoutMs and converts its own
+	   timeout into an is_error result (watchedToolCall:), so this only
+	   fires if the batch itself wedges somewhere outside any single call
+	   - and unlike the per-call budget it IS fatal to the turn. Derived
+	   rather than stored: a new eager slot on Session would be nil on
+	   every instance that predates it, and this needs no configuring. *)
+			
+			^effectiveToolTimeoutMs * 2
 		)
 		timeoutReason: what <String> ms: ms <Integer> ^<String> = (
 			^what , ' timed out after ' , (ms // 1000) printString , 's. The turn was abandoned; nothing further will arrive from it. Retry re-drives this turn from the last recorded message.'
@@ -1681,12 +1744,13 @@ class AIAccess usingPlatform: platform = Object new (
 									ifFalse: [
 										stage:: 'executeToolCall: dispatch'.
 										enterPhase: 'running ' , (toolNamesOf: toolBlocks).
-										toolBlocks do: [:tb <Alien> | promises push: (executeToolCall: tb) ]
+										toolBlocks do: [:tb <Alien> | promises push: (watchedToolCall: tb) ]
 									].
 								stage:: 'Promise.all then'.
 								(withWatchdog: (JSPromise all: promises)
-									ms: effectiveToolTimeoutMs
-									reason: (timeoutReason: 'Tool execution' ms: effectiveToolTimeoutMs)) then: [:results <Alien[Array]> |
+									ms: effectiveToolBatchTimeoutMs
+									reason: (timeoutReason: 'Tool execution'
+										ms: effectiveToolBatchTimeoutMs)) then: [:results <Alien[Array]> |
 										| innerStage <String> |
 										innerStage:: 'addToolResults:toMessages:'.
 										[
@@ -1801,6 +1865,49 @@ class AIAccess usingPlatform: platform = Object new (
 			^JSPromise resolve: (toolResultFor: id
 					handlerValue: resultOrPromise
 					isError: false)
+		)
+		watchedToolCall: toolUseBlock <Alien> ^<Alien[Promise]> = (
+			(* executeToolCall: with a per-call time budget whose expiry is NOT
+	   fatal to the turn: a tool that never settles becomes an is_error
+	   tool_result the model reads next round, exactly like every other
+	   tool failure, so the loop still folds results into apiMessages and
+	   recurses.
+
+	   This budget used to sit around the whole Promise.all batch instead.
+	   That watchdog REJECTS, which skips the then: that calls
+	   addToolResults:toMessages:, so one slow tool killed the turn,
+	   discarded the results of every sibling call that had already
+	   succeeded, and left an announced tool_use with no tool_result -
+	   visible to the user only as a chat that stopped. The model was
+	   never told it had timed out, so it could not adapt. A batch-level
+	   backstop remains, at effectiveToolBatchTimeoutMs.
+
+	   The budget stops us WAITING; it cannot cancel the work. An
+	   abandoned fetch may still settle later, into nothing - hence the
+	   wording of the result, which tells the model not to assume the
+	   call failed. *)
+			
+			| id <String> name <String> |
+			id:: [ toolUseBlock at: 'id' ] on: Exception do: [:e | nil ].
+			name:: [ toolUseBlock at: 'name' ] on: Exception do: [:e | nil ].
+			id isNil ifTrue: [ id:: '(no id)' ].
+			name isNil ifTrue: [ name:: '(unknown tool)' ].
+			^(withWatchdog: (executeToolCall: toolUseBlock)
+				ms: effectiveToolTimeoutMs
+				reason: 'tool call timed out') then: [:result | result ]
+				onError: [:e |
+					[
+						| secs <String> |
+						secs:: (effectiveToolTimeoutMs // 1000) printString.
+						addTurnNotice: 'Tool ' , name , ' did not finish within ' , secs , 's; the call was abandoned and reported to the model as an error.'.
+						JSPromise resolve: (toolResultFor: id
+								handlerValue: 'Tool ' , name , ' did not finish within ' , secs , 's and was abandoned. The underlying work may still be running, so do not assume it failed; prefer a narrower request or a different approach.'
+								isError: true)
+					] on: Exception
+						do: [:e2 |
+							JSPromise reject: 'tool watchdog failed: ' , (errorDescription: e2)
+						]
+				]
 		)
 		public sendMessage: text <String> ^<Alien[Promise]> = (
 			(* User-facing entry: append the user's text, drive the tool loop, answer
@@ -1926,36 +2033,6 @@ class AIAccess usingPlatform: platform = Object new (
 		)
 		public listModelsEndpoint ^<String> = (
 			^'https://generativelanguage.googleapis.com/v1beta/models'
-		)
-		public fetchAvailableModelsFromAPI ^<Alien[Promise]> = (
-			(* GET /v1beta/models with the x-goog-api-key header. Returns the raw
-	   parsed body Promise. Filtering + 'models/' prefix stripping happens
-	   in parseListModelsResponse: one level up, NOT nested here. *)
-			
-			| headers options |
-			headers:: createJSObject.
-			headers at: 'x-goog-api-key' put: apiKey.
-			options:: createJSObject.
-			options at: 'method' put: 'GET'.
-			options at: 'headers' put: headers.
-			^(global fetch: listModelsEndpoint with: options) then: [:response |
-					[
-						| status statusText |
-						status:: safeAt: response field: 'status'.
-						statusText:: safeAt: response field: 'statusText'.
-						statusText isNil ifTrue: [ statusText:: '' ].
-						(status isNil or: [ status >= 400 ]) ifTrue: [
-								JSPromise reject: 'Gemini list-models error: ' , (status isNil ifTrue: [
-											'(no status)'
-										]
-										ifFalse: [ status printString ]) , ' ' , statusText
-							]
-							ifFalse: [ response json ]
-					] on: Exception
-						do: [:e |
-							JSPromise reject: 'Gemini list-models error: ' , (errorDescription: e)
-						]
-				]
 		)
 		public parseListModelsResponse: body <Alien> ^<List> = (
 			(* Walk the models array, filter to entries that support
@@ -2374,7 +2451,7 @@ class AIAccess usingPlatform: platform = Object new (
 	   resolves to the parsed JSON body (success) or rejects with a
 	   diagnostic string (HTTP error or other failure). *)
 			
-			| body <Alien> headers <Alien> options <Alien> apiUrl <String> |
+			| body <Alien> headers <Alien> apiUrl <String> |
 			body:: createJSObject.
 			
 			(* messages is already Gemini-shaped (built via addUserText: and
@@ -2397,45 +2474,7 @@ class AIAccess usingPlatform: platform = Object new (
 			headers:: createJSObject.
 			headers at: 'Content-Type' put: 'application/json'.
 			headers at: 'x-goog-api-key' put: apiKey.
-			options:: createJSObject.
-			options at: 'method' put: 'POST'.
-			options at: 'headers' put: headers.
-			options at: 'body' put: (JSON stringify: body).
-			^(global fetch: apiUrl with: options) then: [:response <Alien> |
-					[
-						| status <Integer | UndefinedObject> statusText <String | UndefinedObject> |
-						
-						(* Check status as a number (via at:) rather than response.ok.
-			   ok is a getter; primordialsoup's alien bridge does not
-			   reliably invoke getters via either at: or unary sends. *)
-						status:: safeAt: response field: 'status'.
-						statusText:: safeAt: response field: 'statusText'.
-						statusText isNil ifTrue: [ statusText:: '' ].
-						(status isNil or: [ status >= 400 ]) ifTrue: [
-								
-								(* Return a JS-rejected Promise rather than `Error signal:`.
-					   Raising a Newspeak exception inside a closure passed to
-					   `jsPromise then:` unwinds non-locally through the alien
-					   bridge BEFORE the expat's rawPush: runs, leaving the
-					   alien stack in a state where the next chained then-
-					   callback receives garbage. Returning Promise.reject(...)
-					   keeps the rejection on the JS Promise side, which A+
-					   propagates correctly. *)
-								JSPromise reject: 'Gemini API error: ' , (status isNil ifTrue: [
-											'(no status)'
-										]
-										ifFalse: [ status printString ]) , ' ' , statusText
-							]
-							ifFalse: [ response json ]
-					] on: Exception
-						do: [:e |
-							
-							(* Backstop: any raise from inside the then-block (e.g. unexpected
-			   MNU) becomes a JS-side rejection, never a non-local unwind
-			   through the bridge. *)
-							JSPromise reject: 'Gemini provider error: ' , (errorDescription: e)
-						]
-				]
+			^completionVia: apiUrl headers: headers body: body label: 'Gemini'
 		)
 		public stopReasonOf: response <Alien> ^<String | UndefinedObject> = (
 			| candidates firstCandidate |
@@ -2454,6 +2493,12 @@ class AIAccess usingPlatform: platform = Object new (
 				output: (safeAt: usage field: 'candidatesTokenCount')
 				cacheRead: (safeAt: usage field: 'cachedContentTokenCount')
 				cacheWrite: 0
+		)
+		public listModelsHeaders ^<Alien[JSObject]> = (
+			| headers |
+			headers:: createJSObject.
+			headers at: 'x-goog-api-key' put: apiKey.
+			^headers
 		)
 	) : ()
 	public class OpenAICompatibleProvider apiKey: key <String> model: mdl <String> baseUrl: url <String> = Provider new (
@@ -2521,40 +2566,6 @@ class AIAccess usingPlatform: platform = Object new (
 		public listModelsEndpoint ^<String> = (
 			^baseUrl , '/models'
 		)
-		public fetchAvailableModelsFromAPI ^<Alien[Promise]> = (
-			(* GET {baseUrl}/models with Bearer auth (when a key is set).
-	   Returns the raw parsed body Promise. The flat then-shape mirrors
-	   AnthropicProvider's fetchAvailableModelsFromAPI — parsing into
-	   tuples is done by refreshAvailableModels one level up, not
-	   nested here. *)
-			
-			| headers options |
-			headers:: createJSObject.
-			apiKey isEmpty ifFalse: [
-					headers at: 'Authorization' put: 'Bearer ' , apiKey
-				].
-			options:: createJSObject.
-			options at: 'method' put: 'GET'.
-			options at: 'headers' put: headers.
-			^(global fetch: listModelsEndpoint with: options) then: [:response |
-					[
-						| status statusText |
-						status:: safeAt: response field: 'status'.
-						statusText:: safeAt: response field: 'statusText'.
-						statusText isNil ifTrue: [ statusText:: '' ].
-						(status isNil or: [ status >= 400 ]) ifTrue: [
-								JSPromise reject: 'OpenAI-compat list-models error: ' , (status isNil ifTrue: [
-											'(no status)'
-										]
-										ifFalse: [ status printString ]) , ' ' , statusText
-							]
-							ifFalse: [ response json ]
-					] on: Exception
-						do: [:e |
-							JSPromise reject: 'OpenAI-compat list-models error: ' , (errorDescription: e)
-						]
-				]
-		)
 		public parseListModelsResponse: body <Alien> ^<List> = (
 			(* Walk the data array and build {id, displayName} 2-tuples. Standard
 	   OpenAI entries are {id, object, created, owned_by, ...}; some
@@ -2587,7 +2598,7 @@ class AIAccess usingPlatform: platform = Object new (
 	   separate top-level field like Anthropic does). stream:false is
 	   explicit because the IDE has no streaming pipeline. *)
 			
-			| body headers options url payload sysMsg |
+			| body headers url payload sysMsg |
 			payload:: createJSArray.
 			systemPrompt isEmpty ifFalse: [
 					sysMsg:: createJSObject.
@@ -2610,29 +2621,8 @@ class AIAccess usingPlatform: platform = Object new (
 			apiKey isEmpty ifFalse: [
 					headers at: 'Authorization' put: 'Bearer ' , apiKey
 				].
-			options:: createJSObject.
-			options at: 'method' put: 'POST'.
-			options at: 'headers' put: headers.
-			options at: 'body' put: (JSON stringify: body).
 			url:: baseUrl , '/chat/completions'.
-			^(global fetch: url with: options) then: [:response |
-					[
-						| status statusText |
-						status:: safeAt: response field: 'status'.
-						statusText:: safeAt: response field: 'statusText'.
-						statusText isNil ifTrue: [ statusText:: '' ].
-						(status isNil or: [ status >= 400 ]) ifTrue: [
-								JSPromise reject: 'OpenAI-compat API error: ' , (status isNil ifTrue: [
-											'(no status)'
-										]
-										ifFalse: [ status printString ]) , ' ' , statusText
-							]
-							ifFalse: [ response json ]
-					] on: Exception
-						do: [:e |
-							JSPromise reject: 'OpenAI-compat provider error: ' , (errorDescription: e)
-						]
-				]
+			^completionVia: url headers: headers body: body label: 'OpenAI-compat'
 		)
 		public addUserText: text <String> toMessages: messages <List> = (
 			| userMsg <Alien> |
@@ -2860,6 +2850,19 @@ class AIAccess usingPlatform: platform = Object new (
 				cacheRead: (safeAt: details field: 'cached_tokens')
 				cacheWrite: 0
 		)
+		public listModelsHeaders ^<Alien[JSObject]> = (
+			(* Bearer auth only when a key is configured. Many local servers (Ollama,
+	   mlx-omni-server, llama.cpp) need none, and some reject a blank
+	   Authorization header outright, so it is omitted rather than sent
+	   empty. *)
+			
+			| headers |
+			headers:: createJSObject.
+			apiKey isEmpty ifFalse: [
+					headers at: 'Authorization' put: 'Bearer ' , apiKey
+				].
+			^headers
+		)
 	) : ()
 	public class OpenAIProvider apiKey: key <String> model: mdl <String> = OpenAICompatibleProvider apiKey: key
 		model: mdl
@@ -2892,7 +2895,7 @@ class AIAccess usingPlatform: platform = Object new (
 	   storage. The stable IDE prompt is sent as instructions and the caller's
 		   native history as input. *)
 			
-			| body headers options include |
+			| body headers include |
 			body:: createJSObject.
 			body at: 'model' put: model.
 			body at: 'input' put: messages.
@@ -2908,28 +2911,10 @@ class AIAccess usingPlatform: platform = Object new (
 			headers:: createJSObject.
 			headers at: 'Content-Type' put: 'application/json'.
 			headers at: 'Authorization' put: 'Bearer ' , apiKey.
-			options:: createJSObject.
-			options at: 'method' put: 'POST'.
-			options at: 'headers' put: headers.
-			options at: 'body' put: (JSON stringify: body).
-			^(global fetch: baseUrl , '/responses' with: options) then: [:response |
-					[
-						| status statusText |
-						status:: safeAt: response field: 'status'.
-						statusText:: safeAt: response field: 'statusText'.
-						statusText isNil ifTrue: [ statusText:: '' ].
-						(status isNil or: [ status >= 400 ]) ifTrue: [
-								JSPromise reject: 'OpenAI API error: ' , (status isNil ifTrue: [
-											'(no status)'
-										]
-										ifFalse: [ status printString ]) , ' ' , statusText
-							]
-							ifFalse: [ response json ]
-					] on: Exception
-						do: [:e |
-							JSPromise reject: 'OpenAI provider error: ' , (errorDescription: e)
-						]
-				]
+			^completionVia: baseUrl , '/responses'
+				headers: headers
+				body: body
+				label: 'OpenAI'
 		)
 		public addUserText: text <String> toMessages: messages <List> = (
 			| userMsg |
@@ -3160,6 +3145,55 @@ class AIAccess usingPlatform: platform = Object new (
 				cacheWrite: 0
 		)
 	) : ()
+	public class GrokProvider apiKey: key <String> model: mdl <String> = OpenAICompatibleProvider apiKey: key
+		model: mdl
+		baseUrl: 'https://api.x.ai/v1' (
+		(* Hosted xAI (Grok) provider. xAI's API speaks the OpenAI chat-completions
+   protocol — the same messages array, tools array, tool_calls, finish_reason
+   and usage shapes — so the entire wire and history implementation is
+   inherited from OpenAICompatibleProvider unchanged. All this class fixes is
+   the base URL, plus a static model list for the picker to show before
+   GET /v1/models has resolved (the fetched list takes over once it has).
+
+   Grok reasoning models ignore presence/frequency penalties and stop
+   sequences; we send none of those, so nothing needs special-casing. *)
+		
+	) (
+		public staticFallbackModels ^<List[String]> = (
+			^{'grok-4-1-fast-reasoning'. 'grok-4-1-fast-non-reasoning'. 'grok-4'. 'grok-4-fast-reasoning'. 'grok-code-fast-1'. 'grok-3-mini'. }
+		)
+		public staticDisplayNameFor: modelId <String> ^<String> = (
+			modelId = 'grok-4-1-fast-reasoning' ifTrue: [ ^'Grok 4.1 Fast (reasoning)' ].
+			modelId = 'grok-4-1-fast-non-reasoning' ifTrue: [
+					^'Grok 4.1 Fast (non-reasoning)'
+				].
+			modelId = 'grok-4' ifTrue: [ ^'Grok 4' ].
+			modelId = 'grok-4-fast-reasoning' ifTrue: [ ^'Grok 4 Fast (reasoning)' ].
+			modelId = 'grok-code-fast-1' ifTrue: [ ^'Grok Code Fast 1' ].
+			modelId = 'grok-3-mini' ifTrue: [ ^'Grok 3 Mini' ].
+			^modelId
+		)
+		mtokRatesForModel: m <String> ^<Array | UndefinedObject> = (
+			(* {input $/MTok. output $/MTok} — current xAI pricing (Sep 2026).
+	   All grok-4* models are priced the same as the grok-4.6 flagship.
+	   Edit here when xAI changes pricing. *)
+			
+			(m includesSubstring: 'grok-4') ifTrue: [ ^{2. 6. } ].
+			^nil
+		)
+		public costOfUsage: u <Map[Symbol, Integer]> ^<Number | UndefinedObject> = (
+			(* Estimated US-dollar cost using the same formula as AnthropicProvider.
+	   Cache read/write are not yet reported by xAI, so those fields are
+	   treated as zero. *)
+			
+			| rates in out |
+			rates:: mtokRatesForModel: model.
+			rates isNil ifTrue: [ ^nil ].
+			in:: rates at: 1.
+			out:: rates at: 2.
+			^(u at: #input ifAbsent: [ 0 ]) * in + ((u at: #output ifAbsent: [ 0 ]) * out) / 1000000
+		)
+	) : ()
 	public class BusProvider agentName: name <String> chat: cn <String> port: aPort = AnthropicProvider apiKey: ''
 		model: name (
 		(* A Provider whose transport is the host agent bus, not HTTPS: the
@@ -3189,7 +3223,7 @@ class AIAccess usingPlatform: platform = Object new (
 	   never a raise; Session's watchdog bounds the wait, so there is no timeout
 	   here. Notices fold into the system string (no prefix cache over the bus). *)
 			
-			| body deferred resolveFn rejectFn sys |
+			| body sys performer |
 			body:: createJSObject.
 			body at: 'model' put: model.
 			body at: 'max_tokens' put: maxTokens.
@@ -3199,34 +3233,35 @@ class AIAccess usingPlatform: platform = Object new (
 			(tools isNil not and: [ (tools at: 'length') > 0 ]) ifTrue: [
 					body at: 'tools' put: tools
 				].
-			deferred:: JSPromise withResolvers.
-			resolveFn:: deferred at: 'resolve'.
-			rejectFn:: deferred at: 'reject'.
-			port requestCompletionTo: model
-				from: chatName
-				body: body
-				onReply: [:responseAlien |
-					[ resolveFn call: js undefined with: responseAlien ] on: Exception
-						do: [:e | nil ].
-					nil
-				]
-				onError: [:reason |
-					[ rejectFn call: js undefined with: reason ] on: Exception do: [:e | nil ].
-					nil
+			performer:: hostPerformer.
+			performer isNil ifTrue: [
+					^JSPromise reject: 'Bus completion unavailable: this platform has no host performer'
 				].
-			^deferred at: 'promise'
+			^bridgeCompletion: (performer performText: (JSON stringify: body)
+					via: [:ok :fail |
+						port requestCompletionTo: model
+							from: chatName
+							body: body
+							onReply: [:responseAlien |
+								[ ok value: (JSON stringify: responseAlien) ] on: Exception
+									do: [:e |
+										fail value: 'Bus reply was not serialisable: ' , (errorDescription: e)
+									].
+								nil
+							]
+							onError: [:reason |
+								[ fail value: reason ] on: Exception do: [:e | nil ].
+								nil
+							].
+						nil
+					])
+				label: 'Bus'
 		)
 		public staticFallbackModels ^<List[String]> = (
 			(* No model list: the "model" is a free-typed agent name, so an empty
 	   list makes the setup UI render that field as freeform text. *)
 			
 			^List new
-		)
-		public refreshAvailableModels ^<Alien[Promise]> = (
-			(* A bus agent has no model-list endpoint; the boot/refresh path is a
-	   no-op rather than an errored fetch against Anthropic's API. *)
-			
-			^JSPromise resolve: nil
 		)
 		public supportsFileUploads ^<Boolean> = (
 			^false
@@ -3236,6 +3271,13 @@ class AIAccess usingPlatform: platform = Object new (
 	   so buildToolsPayload: declares only the IDE's own executable tools. *)
 			
 			^self
+		)
+		public refreshAvailableModels ^<Promise> = (
+			(* A bus agent has no model-list endpoint; the boot/refresh path is a no-op
+	   rather than an errored fetch against some other provider's API. Answers
+	   a Newspeak promise, matching the base. *)
+			
+			^Promise fulfilled: nil
 		)
 	) : ()
 	lazy public global = js global.
@@ -3435,19 +3477,32 @@ class AIAccess usingPlatform: platform = Object new (
    the browser-side path takes over for this call. *)
 		
 		^(hostTokenFrom: origin) then: [:tok |
-				(global fetch: origin , '/_ns/fetch?token=' , tok , '&url=' , (global encodeURIComponent: url)) then: [:response |
-						| status <Integer | UndefinedObject> |
-						status:: safeAt: response field: 'status'.
-						(status isNil or: [ status < 200 or: [ status >= 300 ] ]) ifTrue: [
-								nsHostToken:: nil.
-								webFetchBrowserSide: url
-							]
-							ifFalse: [
-								response json then: [:env | envelopeResult: env for: url ]
-									onError: [:e | webFetchBrowserSide: url ]
-							]
-					]
-					onError: [:e | webFetchBrowserSide: url ]
+				
+				(* Guarded for the same reason as hostTokenFrom:: a raise here is lost
+		   rather than rejected, and the sibling onError: would not see it.
+		   Building the query string raises if tok is not a String; the status
+		   comparison below raises if the response reports a non-numeric
+		   status. Either would hang local_fetch permanently. *)
+				[
+					(global fetch: origin , '/_ns/fetch?token=' , tok , '&url=' , (global encodeURIComponent: url)) then: [:response |
+							| status <Integer | UndefinedObject> |
+							[
+								status:: safeAt: response field: 'status'.
+								(status isNil or: [ status < 200 or: [ status >= 300 ] ]) ifTrue: [
+										nsHostToken:: nil.
+										webFetchBrowserSide: url
+									]
+									ifFalse: [
+										response json then: [:env |
+												[ envelopeResult: env for: url ] on: Exception
+													do: [:e | webFetchBrowserSide: url ]
+											]
+											onError: [:e | webFetchBrowserSide: url ]
+									]
+							] on: Exception do: [:e | webFetchBrowserSide: url ]
+						]
+						onError: [:e | webFetchBrowserSide: url ]
+				] on: Exception do: [:e | webFetchBrowserSide: url ]
 			]
 			onError: [:e | webFetchBrowserSide: url ]
 	)
@@ -3458,12 +3513,31 @@ class AIAccess usingPlatform: platform = Object new (
 		
 		nsHostToken isNil ifFalse: [ ^JSPromise resolve: nsHostToken ].
 		^(global fetch: origin , '/_ns/token') then: [:response |
-				response json then: [:parsed |
-						nsHostToken:: safeStringAt: parsed field: 'token'.
-						nsHostToken isNil ifTrue: [
-								JSPromise reject: 'no token in the /_ns/token response'
-							]
-							ifFalse: [ nsHostToken ]
+				
+				(* Both closure bodies are guarded. A raise escaping a then: closure
+		   is LOST by the psoup promise bridge - it does not become a
+		   rejection, so the promise never settles and every local_fetch
+		   behind it hangs until a watchdog fires. The sibling onError: does
+		   NOT cover this: it handles the UPSTREAM promise rejecting, not a
+		   raise in the fulfillment handler. A front door that answers
+		   /_ns/token with a non-JSON body (an error page, a stale route)
+		   raises in exactly this spot. See fetchAndRead: for the pattern. *)
+				[
+					response json then: [:parsed |
+							[
+								nsHostToken:: safeStringAt: parsed field: 'token'.
+								nsHostToken isNil ifTrue: [
+										JSPromise reject: 'no token in the /_ns/token response'
+									]
+									ifFalse: [ nsHostToken ]
+							] on: Exception
+								do: [:e |
+									JSPromise reject: 'unreadable /_ns/token response: ' , (errorDescription: e)
+								]
+						]
+				] on: Exception
+					do: [:e |
+						JSPromise reject: 'the /_ns/token response was not JSON: ' , (errorDescription: e)
 					]
 			]
 	)
@@ -3587,5 +3661,53 @@ class AIAccess usingPlatform: platform = Object new (
 			body size <= limit ifTrue: [ body ]
 				ifFalse: [ (body copyFrom: 1 to: limit) , String lf , '... (truncated)' ]
 		] on: Exception do: [:e | '(unreadable body)' ]
+	)
+	hostFetcher ^<Fetcher | UndefinedObject> = (
+		(* The platform's attenuated web-read capability - GET a URL, get a Newspeak
+   promise of the body text - or nil where there is no host module. Not held
+   in a slot: the host caches it in a lazy slot of its own, and hostModule is
+   already retained here.
+
+   Model discovery goes through this rather than js global fetch so that on the
+   Croquet platform one elected client performs the fetch and every client,
+   including a late joiner replaying the session, consumes the identical
+   recorded bytes. Nothing here knows that - the capability presents the same
+   interface on both platforms. *)
+		
+		hostModule isNil ifTrue: [ ^nil ].
+		^hostModule fetcher
+	)
+	hostPerformer = (
+		(* The platform's coordinated-exchange capability - hand it the request text
+   and a block that performs the exchange, get a Newspeak promise of the reply
+   text - or nil where there is no host module.
+
+   The bus needs this rather than the Fetcher: its reply arrives later on a
+   shared event stream rather than from the request, so there is no URL for the
+   Fetcher seam to key on. Same bargain either way - on Croquet one elected
+   client performs the exchange and everyone reads the recording. *)
+		
+		hostModule isNil ifTrue: [ ^nil ].
+		^hostModule performer
+	)
+	describeBreakage: reason ^<String> = (
+		(* A broken Newspeak promise carries whatever the breaker passed. The host
+   fetcher breaks with a String, but a raise inside a continuation can surface
+   an Exception instead. Concatenating with the empty String returns a real
+   String unchanged and raises on anything else - the same cheap
+   discrimination safeStringAt:field: uses - so an Exception falls through to
+   errorDescription:. *)
+		
+		^[ reason , '' ] on: Exception do: [:e | errorDescription: reason ]
+	)
+	fulfillQuietly: r <Resolver> with: value = (
+		(* Settling a resolver twice raises, and a raise inside the callback that
+   settles it is unrecoverable - the alien bridge has no one to report it to.
+   Same guard the host module uses. *)
+		
+		[ r fulfill: value ] on: Exception do: [:e | nil ]
+	)
+	breakQuietly: r <Resolver> with: reason <String> = (
+		[ r break: reason ] on: Exception do: [:e | nil ]
 	)
 ) : ()

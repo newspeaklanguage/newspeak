@@ -1,0 +1,434 @@
+Newspeak3
+'Root'
+class HostForCroquet usingPlatform: p hostClass: H = Object new (
+	|
+		private platform = p.
+		private HostClass = H.
+		private js = p js.
+		private Resolver = p actors Resolver.
+		
+		(* Per-resource fetch ordinals: URL digest -> the number of fetches of that
+   resource this client has issued. See sharingKeyFor:. Replaces a single flat
+   request counter, whose numbering any unrelated fetch could shift. *)
+		private uriFetchCounts = p collections Map new.
+	|
+) (
+	public class Fetcher new = Object new (
+		(* The attenuated web-read capability, as in the base host - but coordinated: the elected initiator fetches, and everyone shares the recorded result. *)
+		
+	) (
+		public fetchText: url <String> ^<Promise> = (
+			^coordinatedFetchText: url
+		)
+		public fetchText: url <String> headers: hdrs <Alien[JSObject] | UndefinedObject> ^<Promise> = (
+			(* As fetchText:, with request headers - coordinated like every other fetch
+	   through this capability, and with the headers confined to the elected
+	   initiator's closure. *)
+			
+			^coordinatedFetchText: url headers: hdrs
+		)
+		public fetchBytes: url <String> ^<Promise> = (
+			(* The bytes the elected initiator fetched, as an ArrayBuffer. The stored
+	   result IS bytes, so this is the coordinated read without the decode
+	   step fetchText: applies. *)
+			
+			^coordinatedFetchBytes: url
+		)
+		public fetchBytes: url <String> headers: hdrs <Alien[JSObject] | UndefinedObject> ^<Promise> = (
+			(* As fetchBytes:, with request headers. *)
+			
+			^coordinatedFetchBytes: url headers: hdrs
+		)
+		public fetchText: url <String> headers: hdrs <Alien[JSObject] | UndefinedObject> body: body <String | UndefinedObject> ^<Promise> = (
+			(* POST, coordinated. This is the one that earns the whole scheme: a
+	   model completion is a POST, it is billed, and it is not idempotent, so
+	   it must happen ONCE per session rather than once per client. The
+	   elected initiator issues it, the response is recorded, and every other
+	   client - and every late joiner replaying - reads that recording instead
+	   of asking the provider again. *)
+			
+			^coordinatedFetchText: url headers: hdrs body: body
+		)
+	) : ()
+	public class Performer new = Object new (
+		(* The coordinated Performer (see Host.Performer). The elected initiator runs
+	 the caller's block; its reply text is recorded and every other client -
+	 and every late joiner replaying - reads that recording instead of running
+	 the exchange again. For a bus completion that is the whole point: one
+	 request to the agent per session, not one per participant. *)
+		
+	) (
+		public performText: request <String> via: op <[:[:String | Object] :[:String | Object] | Object]> ^<Promise> = (
+			^coordinatedPerform: request via: op
+		)
+	) : ()
+	lazy private hopscotch = platform hopscotch.
+	lazy private localHost = HostClass usingPlatform: platform.
+	lazy public fetcher = Fetcher new.
+	lazy public performer = Performer new.
+	public busAvailable ^<Boolean> = (
+		(* True, on the same footing as fetchAvailable: branch-deterministic, with a
+	   genuine absence surfacing as the request's shared failure rather than as
+	   a client-local answer that would send clients down different paths.
+
+	   What this affirms is that a bus COMPLETION may be attempted: it runs
+	   through the coordinated performer, so the elected initiator makes the one
+	   request to the agent and every other client - and every late joiner
+	   replaying - reads the recorded reply.
+
+	   KNOWN GAP, deliberate and temporary: this same answer is what starts the
+	   inbound event stream, and inbound messages and notices are NOT coordinated
+	   - they arrive per client, in whatever order that client's stream delivers
+	   them, and nothing records them. Publishing inbound bus traffic as
+	   synchronized events is the destination; until then a Croquet session whose
+	   chat receives unsolicited bus messages can diverge on them. Completions,
+	   which is what a Bus Agent chat actually turns on, do not. *)
+		
+		^true
+	)
+	public croquetFiles ^<String | UndefinedObject> = (
+		^localHost croquetFiles
+	)
+	public croquetReflector ^<String | UndefinedObject> = (
+		^localHost croquetReflector
+	)
+	public fetchAvailable ^<Boolean> = (
+		^true
+	)
+	public gitAvailable ^<Boolean> = (
+		^false
+	)
+	public serviceOrigin ^<String | UndefinedObject> = (
+		^localHost serviceOrigin
+	)
+	public whenReady: onKnown <[:HostForCroquet | Object]> = (
+		(* There is no SESSION-wide discovery to await - what the session can do is
+	   decided per request, by whichever client the reflector elects. There is
+	   local discovery to await, though, and this used to run onKnown at once
+	   without it. That was wrong: every synchronous accessor here
+	   (serviceOrigin, croquetReflector, croquetFiles) forwards to the base host
+	   and answers nil until ITS probe settles, so a caller told the host was
+	   ready read nil from all of them. The agent bus is the case that exposed
+	   it - subscribeToBusAt: got nil for an origin and could never connect -
+	   but croquetReflector and croquetFiles had the same hole.
+
+	   So: wait for the local host, then report ready. onKnown is handed THIS
+	   host, not the local one; what it gets is the coordinated capabilities
+	   with local discovery behind them. These are bootstrap concerns, consulted
+	   outside the synchronized computation, so a client-determined settling
+	   time is proper to them. *)
+		
+		localHost whenReady: [:ignored |
+				onKnown value: self.
+				nil
+			].
+		^self
+	)
+	breakQuietly: r <Resolver> with: reason <String> = (
+		[ r break: reason ] on: Exception do: [:e | nil ]
+	)
+	describeJS: reason ^<String> = (
+		(* A failure may be a Newspeak string we produced or a JS value; normalise either to something printable without raising. *)
+		
+		^[ reason , '' ] on: Exception
+			do: [:e |
+				[ reason printString ] on: Exception do: [:e2 | '(indescribable failure)' ]
+			]
+	)
+	fulfillQuietly: r <Resolver> with: value = (
+		[ r fulfill: value ] on: Exception do: [:e | nil ]
+	)
+	isSuccessStatus: status ^<Boolean> = (
+		status isNil ifTrue: [ ^false ].
+		^status >= 200 and: [ status < 400 ]
+	)
+	settleInitiatorFetch: response <Alien> url: url <String> ok: ok <[:Alien[ArrayBuffer] | Object]> fail: fail <[:String | Object]> = (
+		| status |
+		status:: [ response at: 'status' ] on: Exception do: [:e | nil ].
+		(isSuccessStatus: status) ifFalse: [
+				^fail value: 'HTTP ' , (statusLabel: status) , ' fetching ' , url
+			].
+		response arrayBuffer then: [:buffer |
+				[ ok value: buffer ] on: Exception do: [:e | nil ].
+				nil
+			]
+			onError: [:e |
+				[
+					fail value: 'HTTP ' , (statusLabel: status) , ' but the body was unreadable for ' , url
+				] on: Exception do: [:e2 | nil ].
+				nil
+			]
+	)
+	statusLabel: status ^<String> = (
+		status isNil ifTrue: [ ^'(no status)' ].
+		^status printString
+	)
+	textFrom: bytes <Alien[ArrayBuffer]> ^<String> = (
+		^(js global at: #TextDecoder) new decode: bytes
+	)
+	digestOf: url <String> ^<String> = (
+		(* FNV-1a over the code points, folded to 32 bits and rendered as decimal
+	   digits.
+
+	   A digest rather than the URL itself because this string is PUBLISHED as a
+	   Croquet event scope: a URL carrying credentials in its query string would
+	   otherwise be recorded on every client and in the session's history. It
+	   also keeps scopes short and free of the ':' that coordinatedFetchEventKeyFor:
+	   rewrites to '.' - and which it warns will collide keys differing only
+	   there.
+
+	   A collision would cross two resources' fetch streams, answering one with
+	   the other's bytes, so this is not merely an optimisation. 32 bits over the
+	   handful of distinct URLs a session fetches makes that vanishingly
+	   unlikely; widen it if that stops being true. *)
+		
+		| h |
+		h:: 2166136261.
+		1 to: url size
+			do: [:i <Integer> |
+				h:: h bitXor: (url at: i) asInteger.
+				h:: h * 16777619 bitAnd: 4294967295
+			].
+		^h printString
+	)
+	sharingKeyFor: url <String> ^<String> = (
+		(* The event scope under which this fetch is coordinated: a digest of the
+	   resource, plus an ordinal counting this client's fetches of it.
+
+	   Both halves are load-bearing. The digest makes clients agree without the
+	   application naming anything - a collaboration-oblivious application has to
+	   stay oblivious, so the key is minted here from the URL it already passed
+	   to fetch - and it scopes the ordinal to one resource, so unrelated fetch
+	   traffic cannot shift this resource's numbering the way a single flat
+	   counter did.
+
+	   The ordinal distinguishes successive fetches of the same resource. Without
+	   it the first answer is replayed for every later read: a session that
+	   fetched A and later B would be replayed to a late joiner as A then A,
+	   leaving it in a state no client was ever in. With it, each version is
+	   recorded separately and replayed in order.
+
+	   Agreement therefore needs only that clients fetch a given resource the
+	   same number of times in the same order, which holds while fetches are
+	   initiated inside synchronized event handlers. One started from a promise
+	   callback or an unsynchronized startup path lands at a client-determined
+	   position and skews that resource's ordinal - and only that resource's -
+	   from then on. *)
+		
+		^sharingKeyFor: url body: nil
+	)
+	sharingKeyFor: url <String> body: body <String | UndefinedObject> ^<String> = (
+		(* As sharingKeyFor:, for a request that carries a body. The digest covers
+	   the body too: for a GET the URL names the resource, but two POSTs to one
+	   endpoint with different bodies are different requests, and the digest
+	   should name the request rather than the endpoint it was sent to. The
+	   ordinal would separate them anyway - this makes the key faithful instead
+	   of relying on the ordinals lining up.
+
+	   MUTATES uriFetchCounts, so it is not idempotent: do not call it to peek
+	   at a key. *)
+		
+		| digest n |
+		digest:: digestOf: (body isNil ifTrue: [ url ] ifFalse: [ url , body ]).
+		n:: (uriFetchCounts at: digest ifAbsent: [ 0 ]) + 1.
+		uriFetchCounts at: digest put: n.
+		^'fetch.' , digest , '.' , n printString
+	)
+	fetchOptionsForHeaders: hdrs <Alien[JSObject] | UndefinedObject> ^<Alien[JSObject] | UndefinedObject> = (
+		^fetchOptionsForHeaders: hdrs body: nil
+	)
+	fetchOptionsForHeaders: hdrs <Alien[JSObject] | UndefinedObject> body: body <String | UndefinedObject> ^<Alien[JSObject] | UndefinedObject> = (
+		(* As the base host's: a body implies POST, and neither headers nor body
+	   means the bare one-argument fetch. Built identically on both platforms so
+	   the elected initiator sends exactly the request the plain host would. *)
+		
+		| options |
+		(hdrs isNil and: [ body isNil ]) ifTrue: [ ^nil ].
+		options:: (js global at: #Object) new.
+		options at: 'method' put: (body isNil ifTrue: [ 'GET' ] ifFalse: [ 'POST' ]).
+		hdrs isNil ifFalse: [ options at: 'headers' put: hdrs ].
+		body isNil ifFalse: [ options at: 'body' put: body ].
+		^options
+	)
+	initiatorFetchText: url <String> headers: hdrs <Alien[JSObject] | UndefinedObject> body: body <String | UndefinedObject> ok: ok <[:String | Object]> fail: fail <[:String | Object]> = (
+		(* Runs only on the elected client, and answers the body as TEXT so it can
+	   ride the recorded event. Same request as initiatorFetch:, same confinement
+	   of headers and body to this client; only the reading differs. *)
+		
+		| jsPromise options |
+		options:: fetchOptionsForHeaders: hdrs body: body.
+		jsPromise:: [
+			options isNil ifTrue: [ js global fetch: url ]
+				ifFalse: [ js global fetch: url with: options ]
+		] on: Exception do: [:e | nil ].
+		jsPromise isNil ifTrue: [ ^fail value: 'fetch could not start for ' , url ].
+		jsPromise then: [:response |
+				[ settleInitiatorText: response url: url ok: ok fail: fail ] on: Exception
+					do: [:e | fail value: (describeJS: e) ].
+				nil
+			]
+			onError: [:e |
+				[
+					fail value: 'fetch failed for ' , url , ' - ' , (describeJS: e) , '. The browser reports no status, headers or body for this class of failure, so it does NOT establish that the site is down.'
+				] on: Exception do: [:e2 | nil ].
+				nil
+			]
+	)
+	settleInitiatorText: response <Alien> url: url <String> ok: ok <[:String | Object]> fail: fail <[:String | Object]> = (
+		| status |
+		status:: [ response at: 'status' ] on: Exception do: [:e | nil ].
+		(isSuccessStatus: status) ifFalse: [
+				^fail value: 'HTTP ' , (statusLabel: status) , ' fetching ' , url
+			].
+		response text then: [:body |
+				[ ok value: body ] on: Exception do: [:e | nil ].
+				nil
+			]
+			onError: [:e |
+				[
+					fail value: 'HTTP ' , (statusLabel: status) , ' but the body was unreadable for ' , url
+				] on: Exception do: [:e2 | nil ].
+				nil
+			]
+	)
+	initiatorFetch: url <String> headers: hdrs <Alien[JSObject] | UndefinedObject> ok: ok <[:Alien[ArrayBuffer] | Object]> fail: fail <[:String | Object]> = (
+		^initiatorFetch: url headers: hdrs body: nil ok: ok fail: fail
+	)
+	initiatorFetch: url <String> headers: hdrs <Alien[JSObject] | UndefinedObject> body: body <String | UndefinedObject> ok: ok <[:Alien[ArrayBuffer] | Object]> fail: fail <[:String | Object]> = (
+		(* Runs only on the elected client. Fetches the body as bytes - the Data API
+	   stores an ArrayBuffer, and oversized bodies ride the same store rather
+	   than the 16KB reflector limit. The headers reach the network from here and
+	   nowhere else, so a credential in them never leaves this client. *)
+		
+		| jsPromise options |
+		options:: fetchOptionsForHeaders: hdrs body: body.
+		jsPromise:: [
+			options isNil ifTrue: [ js global fetch: url ]
+				ifFalse: [ js global fetch: url with: options ]
+		] on: Exception do: [:e | nil ].
+		jsPromise isNil ifTrue: [ ^fail value: 'fetch could not start for ' , url ].
+		jsPromise then: [:response |
+				[ settleInitiatorFetch: response url: url ok: ok fail: fail ] on: Exception
+					do: [:e | fail value: (describeJS: e) ].
+				nil
+			]
+			onError: [:e |
+				[
+					fail value: 'fetch failed for ' , url , ' - ' , (describeJS: e) , '. The browser reports no status, headers or body for this class of failure, so it does NOT establish that the site is down.'
+				] on: Exception do: [:e2 | nil ].
+				nil
+			]
+	)
+	initiatorFetch: url <String> ok: ok <[:Alien[ArrayBuffer] | Object]> fail: fail <[:String | Object]> = (
+		^initiatorFetch: url headers: nil ok: ok fail: fail
+	)
+	coordinatedFetch: url <String> headers: hdrs <Alien[JSObject] | UndefinedObject> decode: decode <[:Alien[ArrayBuffer] | Object]> ^<Promise> = (
+		^coordinatedFetch: url headers: hdrs body: nil decode: decode
+	)
+	coordinatedFetch: url <String> headers: hdrs <Alien[JSObject] | UndefinedObject> body: body <String | UndefinedObject> decode: decode <[:Alien[ArrayBuffer] | Object]> ^<Promise> = (
+		(* The Newspeak promise settles when the recorded result arrives - on the
+	   live clients when the initiator's store completes, on a late joiner during
+	   replay. The fetcher block runs ONLY on the elected initiator, so both the
+	   URL and the headers travel in its closure rather than on the wire.
+
+	   The sharing key is minted here, from the URL the caller already supplied,
+	   so neither the caller nor the application above it knows that anything is
+	   being coordinated. See sharingKeyFor:.
+
+	   What the stored bytes become is the caller's business: decode maps them to
+	   the promise's value, so the text and bytes readings share one coordination
+	   path rather than two copies of it. It is a stored block - no ^ inside. *)
+		
+		| r = Resolver new. |
+		hopscotch coordinatedFetch: (sharingKeyFor: url body: body)
+			via: [:ok :fail |
+				initiatorFetch: url headers: hdrs body: body ok: ok fail: fail.
+				nil
+			]
+			ifSuccess: [:bytes |
+				fulfillQuietly: r with: (decode value: bytes).
+				nil
+			]
+			ifFailure: [:msg |
+				breakQuietly: r with: (describeJS: msg).
+				nil
+			].
+		^r promise
+	)
+	coordinatedFetchText: url <String> headers: hdrs <Alien[JSObject] | UndefinedObject> ^<Promise> = (
+		^coordinatedFetchText: url headers: hdrs body: nil
+	)
+	coordinatedFetchText: url <String> headers: hdrs <Alien[JSObject] | UndefinedObject> body: body <String | UndefinedObject> ^<Promise> = (
+		(* Text results travel IN the recorded event (hopscotch coordinatedText:),
+	   not through the Data API. That keeps them inside the dispatch chain, so
+	   they land in the same order on every client and under replay - which
+	   matters because synchronized code reads them: a model list a menu is
+	   built from must be there before a replayed click on one of its entries.
+	   The initiator therefore reads the response as text rather than bytes. *)
+		
+		| r = Resolver new. |
+		hopscotch coordinatedText: (sharingKeyFor: url body: body)
+			via: [:ok :fail |
+				initiatorFetchText: url headers: hdrs body: body ok: ok fail: fail.
+				nil
+			]
+			ifSuccess: [:text |
+				fulfillQuietly: r with: text.
+				nil
+			]
+			ifFailure: [:msg |
+				breakQuietly: r with: (describeJS: msg).
+				nil
+			].
+		^r promise
+	)
+	coordinatedFetchText: url <String> ^<Promise> = (
+		^coordinatedFetchText: url headers: nil
+	)
+	coordinatedFetchBytes: url <String> headers: hdrs <Alien[JSObject] | UndefinedObject> ^<Promise> = (
+		^coordinatedFetch: url headers: hdrs decode: [:bytes | bytes ]
+	)
+	coordinatedFetchBytes: url <String> ^<Promise> = (
+		^coordinatedFetchBytes: url headers: nil
+	)
+	coordinatedPerform: request <String> via: op <[:[:String | Object] :[:String | Object] | Object]> ^<Promise> = (
+		(* As coordinatedFetch:headers:body:decode:, for an exchange the caller
+	   performs itself. The block runs ONLY on the elected initiator, so whatever
+	   credentials or connections it needs stay on that client; what travels is
+	   the reply text, recorded like any other coordinated result.
+
+	   The reply is encoded to bytes because that is what the session Data API
+	   stores, and decoded back on the way out - the caller deals in text at both
+	   ends and never sees the encoding. *)
+		
+		| r = Resolver new. |
+		hopscotch coordinatedText: (performKeyFor: request)
+			via: [:ok :fail |
+				op value: [:text | ok value: text ] value: [:reason | fail value: reason ].
+				nil
+			]
+			ifSuccess: [:text |
+				fulfillQuietly: r with: text.
+				nil
+			]
+			ifFailure: [:msg |
+				breakQuietly: r with: (describeJS: msg).
+				nil
+			].
+		^r promise
+	)
+	performKeyFor: request <String> ^<String> = (
+		(* As sharingKeyFor:, digesting the REQUEST rather than a URL - a performed
+	   exchange has no URL to name it by. The 'perform.' prefix keeps these keys
+	   disjoint from fetch keys, so a fetch and an exchange whose texts happen to
+	   digest alike cannot be confused for one another.
+
+	   MUTATES uriFetchCounts, like sharingKeyFor:. Not idempotent. *)
+		
+		| digest n |
+		digest:: digestOf: request.
+		n:: (uriFetchCounts at: digest ifAbsent: [ 0 ]) + 1.
+		uriFetchCounts at: digest put: n.
+		^'perform.' , digest , '.' , n printString
+	)
+) : ()

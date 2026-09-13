@@ -1435,7 +1435,79 @@ class AIAccess usingPlatform: platform = Object new (
 			mlen:: [ media at: 'length' ] on: Exception do: [:e | 0 ].
 			mlen isNil ifTrue: [ mlen:: 0 ].
 			(text isEmpty and: [ mlen > 0 ]) ifTrue: [ text:: 'See attached' ].
-			^provider makeToolResult: id textResult: text media: media isError: isError
+			
+			(* Answers a PROMISE of the provider's result, not the result: the text
+		   is first put through the host's sharing seam (shareToolText:forCall:),
+		   which on a synchronized platform settles with the text the session
+		   agreed on. Every call site already sits inside a JS promise (resolve:
+		   adopts a promise, then: chains one), so the change of shape is
+		   absorbed there. *)
+			^(shareToolText: text forCall: id) then: [:shared |
+					provider makeToolResult: id
+						textResult: shared
+						media: media
+						isError: isError
+				]
+		)
+		shareToolText: text <String> forCall: id <String | UndefinedObject> ^<Alien[Promise]> = (
+			(* The text a tool produced HERE, or - on a synchronized platform - the
+		   text the session's elected client produced, which is what every
+		   participant must put in the shared conversation. Every client runs the
+		   tool for its effects; a tool may nonetheless read things the replicated
+		   image does not carry (a probe reading the synchronization machinery's
+		   own event count is how this surfaced, 2026-09-13: a late joiner saw
+		   the whole history's count where the original saw the count so far, its
+		   request body diverged, and its coordination key with it), so the result
+		   is shared through platform host performer shareText:via:, keyed by the
+		   tool call's id - shared already, since it came from the model.
+
+		   Degenerate everywhere else: no host, a host without the seam (an image
+		   predating it), or a breakage all answer the local text. Nothing is
+		   raised inside the continuations; they settle the deferred and stop. *)
+			
+			| deferred resolveFn key perf |
+			deferred:: JSPromise withResolvers.
+			resolveFn:: deferred at: 'resolve'.
+			key:: 'tool ' , (id isNil ifTrue: [ '(no id)' ] ifFalse: [ id ]).
+			
+			(* hostPerformer is the module's accessor (nil without a host). The
+		   `performer` the bus provider sends is BusProvider's own and is not
+		   visible from here - reaching for it was a silent MNU that left every
+		   tool text local (2026-09-13). *)
+			perf:: hostPerformer.
+			[
+				perf isNil ifTrue: [
+						'shareToolText: no host performer; tool text stays local' out.
+						resolveFn call: js undefined with: text
+					]
+					ifFalse: [
+						Promise when: (perf shareText: key
+								via: [:ok :fail |
+									ok value: text.
+									nil
+								])
+							fulfilled: [:shared |
+								[ resolveFn call: js undefined with: shared ] on: Exception
+									do: [:e | nil ].
+								nil
+							]
+							broken: [:reason |
+								[
+									('shareToolText: sharing broke (' , (describeBreakage: reason) , '); tool text stays local') out
+								] on: Exception do: [:e | nil ].
+								[ resolveFn call: js undefined with: text ] on: Exception
+									do: [:e | nil ].
+								nil
+							]
+					]
+			] on: Exception
+				do: [:e |
+					[
+						('shareToolText: raised (' , (errorDescription: e) , '); tool text stays local') out
+					] on: Exception do: [:e2 | nil ].
+					[ resolveFn call: js undefined with: text ] on: Exception do: [:e2 | nil ]
+				].
+			^deferred at: 'promise'
 		)
 		notifyUpdate = (
 			(* Fire the on-update callback if one is wired. Used by chat UIs to

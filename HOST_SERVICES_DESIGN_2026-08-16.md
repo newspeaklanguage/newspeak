@@ -1,6 +1,13 @@
 # Host services: one front door, one Newspeak capability, one async idiom
 
-**Status:** design, nothing implemented. Written 2026-08-16.
+**Status:** ARCHIVAL — superseded as the design statement by
+`HOST_SERVICES_DESIGN_2026-08-31.md`, which folds in every correction made here.
+Kept for the evidence behind the decisions: the `AsyncBridgeProbe` runs, their
+provenance caveats, and the bugs they exposed. Do not read the plan below as a
+statement of what exists; the program shipped, and the 08-31 document plus
+`HOST_SERVICES_FOLLOWUPS_2026-09-05.md` say what it became.
+
+Written 2026-08-16.
 **Companion artifact:** `AsyncBridgeProbe.ns` + `AsyncBridgeProbeApp.ns`.
 **Updated 2026-08-25:** probe RUN on BOTH runtimes — results in §6.1, and they
 are decisive: the gate passes. It also exposed a latent bug in `ActorsForJS`

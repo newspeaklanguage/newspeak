@@ -25,7 +25,10 @@ function post(path,obj,token){return new Promise((res,rej)=>{const d=JSON.string
 // The agent: hold the SSE open, answer completion_request addressed to AGENT.
 async function startAgent(token){
   return new Promise((resolve)=>{
-    const req=http.get(ORIGIN+'/_ns/bus?token='+encodeURIComponent(token),res=>{
+    /* Named: the IDE asks /_ns/bus/agents whether the addressee is reachable
+       here before entering the election, and an unnamed subscriber is a
+       listener rather than an addressable agent. */
+    const req=http.get(ORIGIN+'/_ns/bus?token='+encodeURIComponent(token)+'&name='+encodeURIComponent(AGENT),res=>{
       let buf='';
       res.on('data',chunk=>{ buf+=chunk;
         let i; while((i=buf.indexOf('\n\n'))>=0){

@@ -348,14 +348,19 @@ old text (#removed field) *)
 					options: croquetOrigin
 			)
 			isSyncOrigin: origin ^<Boolean> = (
-				(* Selection/cursor signals originating from applying a synchronized event: our tagged programmatic operations ('croquet') and the selection fallout of a full-buffer setValue. CodeMirror may deliver these at the END of its operation - after the reflecting flag has been restored - so the flag alone cannot suppress their echo, which stormed the reflector (see croquetOrigin). Deliberately NOT consulted by the change/beforeChange publishers: setValue-originated CHANGE events have always been published and parts of the document-update pipeline ride on them. *)
+				(* Selection/cursor signals originating from applying a synchronized event: our tagged programmatic operations ('croquet') and the selection fallout of a full-buffer setValue. CodeMirror may deliver these at the END of its operation - after the reflecting flag has been restored - so the flag alone cannot suppress their echo, which stormed the reflector (see croquetOrigin). The change/beforeChange publishers consult it too, through isUserOrigin:: a setValue-originated change is handled locally rather than published. (It used to be published so that the change response would run on the echo; the response now runs directly, on every client, from its own re-render.) *)
 				
 				origin = 'croquet' ifTrue: [ ^true ].
 				origin = 'setValue' ifTrue: [ ^true ].
 				^false
 			)
 			respondToBeforeSelectionChange: event <Alien[Event]> = (
-				(reflecting and: [ (isSyncOrigin: (event at: #origin)) not ]) ifTrue: [
+				(* Published only for a selection the USER moved ('*mouse', '+move',
+		   the selection that accompanies '+input' ...). A programmatic
+		   setCursor/setSelection, tagged or not, is every client's own
+		   business, exactly as a programmatic change is - see isUserOrigin:. *)
+				
+				(reflecting and: [ isUserOrigin: (event at: #origin) ]) ifTrue: [
 						publish: 'nscodemirror_'
 							event: #codeMirror_beforeSelectionChange
 							data: (js global newspeakFragmentData: fragmentId
@@ -371,9 +376,17 @@ old text (#removed field) *)
 			updateEditedText: oldFragment <CodeMirrorFragment> = (
 				(* We don't want spurious changes signaling croquet, so we update only when needed. This isn't quite right. This will update when needed, but even that is not a real change. This method is called when no edits have occurred. The situation to worry about is when we edited a method and changed the selector, changing a different method. That method has changed, even though it was not being edited. At the same time, the edited method has not changed, yet the text in its editor has. So it was always best to just update the method. However, we do need to avoid the change events thereby generated. Once the correct test for this is implemented, it will likely be cheaper to use it to avoid the notification than to compare old and new text. *)
 				
-				textSlot = oldFragment textBeingAccepted ifFalse: [
-						editor setValue: textSlot
+				(* The caller (the base updateVisualsFromSameKind:) raises
+		   lastChangeWasSynthetic before calling here, counting on the setValue
+		   to fire the change that consumes it. When the text is unchanged there
+		   is no setValue and no change, so lower the flag ourselves: left raised
+		   it eats the NEXT real change, and a paste - a single change - then
+		   never enters edit state and the accept/cancel bar never appears. *)
+				
+				textSlot = oldFragment textBeingAccepted ifTrue: [
+						lastChangeWasSynthetic:: false
 					]
+					ifFalse: [ editor setValue: textSlot ]
 			)
 			setupCroquetView = (
 				subscribe: #model_codeMirror_change
@@ -437,18 +450,55 @@ old text (#removed field) *)
 					]
 			)
 			respondToChange: change <Alien[CodeMirrorChangeObject]> = (
-				reflecting ifTrue: [
-						publish: 'nscodemirror_'
-							event: #codeMirror_change
-							data: (codeMirrorData: (js global nsCodeMirrorChange: change))
-					]
+				(* reflecting is false while a synchronized event is being applied; its
+		   handler (setupCroquetView) runs the base response itself, so nothing
+		   to do here. Otherwise: a USER edit is published, and its response runs
+		   when the event comes back from the model, on every client alike. A
+		   PROGRAMMATIC change - a setValue from a re-render, or one of our own
+		   tagged operations - is a deterministic consequence of replicated state
+		   that every client produces for itself, in lockstep; it must not enter
+		   the stream. Its response runs locally, right here. See isUserOrigin:. *)
+				
+				reflecting ifFalse: [ ^self ].
+				(isUserOrigin: (change at: #origin)) ifFalse: [
+						^super respondToChange: change
+					].
+				publish: 'nscodemirror_'
+					event: #codeMirror_change
+					data: (codeMirrorData: (js global nsCodeMirrorChange: change))
 			)
 			respondToBeforeChange: event <Alien[Event]> = (
-				reflecting ifTrue: [
-						publish: 'nscodemirror_'
-							event: #codeMirror_beforeChange
-							data: codeMirrorData
-					]
+				(* As respondToChange:. The base response is updateEditState. *)
+				
+				reflecting ifFalse: [ ^self ].
+				(isUserOrigin: (event at: #origin)) ifFalse: [
+						^super respondToBeforeChange: event
+					].
+				publish: 'nscodemirror_'
+					event: #codeMirror_beforeChange
+					data: codeMirrorData
+			)
+			isUserOrigin: origin ^<Boolean> = (
+				(* True for a change the user made in THIS editor - CodeMirror tags
+		   those '+input', '+delete', 'paste', 'cut', 'undo', ... - which is what
+		   the other clients need told about. False for 'setValue' and 'croquet'
+		   (see isSyncOrigin:) and for an untagged programmatic operation, whose
+		   origin is undefined.
+
+		   Why this matters: programmatic changes used to be published too, so
+		   that their change response would run when the event came back. But
+		   every client re-renders the same way and published the same setValue,
+		   multiplying each one by the number of clients; and a late joiner,
+		   re-rendering as it replayed, published its own on top of the recorded
+		   ones - 48 extra events and five extra editors in one probe run
+		   (croquet-probes/setup-latejoin-probe.js, 2026-09-12). Those echoes drove
+		   extra change responses and re-renders, and so extra fragment
+		   ordinals, on the joiner alone: every later keystroke then addressed an
+		   editor the joiner had numbered differently, and its replay stalled
+		   15s per event. *)
+				
+				origin isKindOfString ifFalse: [ ^false ].
+				^(isSyncOrigin: origin) not
 			)
 		) : ()
 		public class HyperlinkImageFragment image: i action: a = super HyperlinkImageFragment new (

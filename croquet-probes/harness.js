@@ -71,7 +71,10 @@ async function launchBrowser({ port, tag, session, initScript }) {
     const r = await send('Runtime.evaluate', { expression: e, returnByValue: true });
     return r && r.result ? r.result.value : undefined;
   };
-  return { proc, v, logs, navigate: url => send('Page.navigate', { url }) };
+  /* `send` is the raw protocol call, for probes that need Input.* (real
+     keystrokes reach CodeMirror's own input path; synthetic DOM events
+     do not always). */
+  return { proc, v, logs, navigate: url => send('Page.navigate', { url }), send };
 }
 
 /* Click the LAST element whose trimmed text is exactly `label`. Hopscotch

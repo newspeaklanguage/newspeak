@@ -1506,6 +1506,8 @@ To produce a non-synchronizing part of the UI, subclass NonSyncingPresenter and 
 		lazy coordinatedFetchers <Map[String, [:[:Alien[ArrayBuffer] | Object] :[:String | Object] | Object]]> = Map new.
 		lazy coordinatedFetchSubscribed <Map[String, Boolean]> = Map new.
 		lazy coordinatedFetchInline <Map[String, Boolean]> = Map new.
+		lazy mintLedgerOn <Boolean> = [ (js global at: 'nsMintLedgerOn') = true ] on: Exception
+			do: [:e | false ].
 		newImageButtonId ^<String> = (
 			^newIdFor: 'imageButton'
 		)
@@ -1555,6 +1557,43 @@ To produce a non-synchronizing part of the UI, subclass NonSyncingPresenter and 
 			coordinatedFetchInline at: key put: true.
 			coordinatedFetch: key via: fetcher ifSuccess: sb ifFailure: fb
 		)
+		public awaitCoordinatedText: key <String> ifSuccess: sb <[:String | Object]> ifFailure: fb <[:String | Object]> = (
+			(* Synchronized override of the base method: register as a waiter for this
+	   key and subscribe to its events, but do NOT publish a request. The
+	   election is over the requesters, so a client that abstains here cannot be
+	   elected - it simply consumes the recorded answer, live or under replay,
+	   exactly as a losing requester does.
+
+	   No fetcher is registered, which is the backstop: were this client somehow
+	   elected, runCoordinatedFetcherFor: publishes a failure naming the key
+	   rather than doing something undefined.
+
+	   The caller must still have minted the key the same way an initiator would
+	   - the ordinal is a per-client count of calls per digest, so a client that
+	   waits without counting would disagree with everyone else from then on.
+
+	   The await event is what makes a LATE waiter work. A Croquet broadcast
+	   reaches whoever is subscribed at that instant, and the replay stash covers
+	   only a client walking recorded history - so a client that starts waiting
+	   after the answer was published would wait forever. The model answers an
+	   await from an already-loaded entry, and ignores it otherwise (the loaded
+	   broadcast is still to come, and this client is now subscribed for it).
+
+	   Two things separate an await from a request. It never elects. And its
+	   answer is never RECORDED: the asking client may itself be replaying - a
+	   joiner catching up through a bus chat asks here - and appending to the
+	   history a client is walking skews its cursor and orphans events for
+	   everyone, which is why the answer comes back as model_coordinatedFetch_
+	   awaited rather than as another loaded. *)
+			
+			coordinatedFetchInline at: key put: true.
+			(coordinatedFetchPending at: key ifAbsentPut: [ List new ]) add: {sb. fb. }.
+			subscribeCoordinatedFetchEventsFor: key.
+			publish: 'nscoordfetch_'
+				event: #coordinatedFetch_await
+				data: (js global newspeakFragmentData: (coordinatedFetchEventKeyFor: key)
+					data: (rootView at: #viewId))
+		)
 		coordinatedFetchEventKeyFor: key <String> ^<String> = (
 			(* Croquet rejects subscription scopes containing ':' (its internal
 	   scope:event separator), and the recorded fid must match the subscription
@@ -1571,8 +1610,13 @@ To produce a non-synchronizing part of the UI, subclass NonSyncingPresenter and 
 	   coordinatedFetch:via:ifSuccess:ifFailure:). The loaded event is RECORDED
 	   in the model's history, so its handler must go through subscribeFragment: -
 	   whose wrapper counts processed events to keep the replay cursor exact. The
-	   fetch and failed events are never recorded, so they must NOT be counted:
-	   they are subscribed directly via nsSubscribe. *)
+	   fetch, failed and awaited events are never recorded, so they must NOT be
+	   counted: they are subscribed directly via nsSubscribe.
+
+	   awaited answers an await (see awaitCoordinatedText:). Same payload as
+	   loaded, delivered the same way, but off the record - the client asking may
+	   itself be REPLAYING, and appending to the history a client is walking
+	   skews its cursor and orphans events for everyone. *)
 			
 			| scope = 'nscoordfetch_' , (coordinatedFetchEventKeyFor: key). |
 			(coordinatedFetchSubscribed at: key ifAbsent: [ false ]) ifTrue: [ ^self ].
@@ -1589,6 +1633,12 @@ To produce a non-synchronizing part of the UI, subclass NonSyncingPresenter and 
 				eventSpec: #model_coordinatedFetch_failed
 				handler: [:msg |
 					deliverCoordinatedFetchFailure: key message: msg.
+					nil
+				].
+			js global nsSubscribe: scope
+				eventSpec: #model_coordinatedFetch_awaited
+				handler: [:handle |
+					deliverCoordinatedFetchBytes: key handle: handle.
 					nil
 				].
 			subscribeFragment: key
@@ -1750,12 +1800,31 @@ To produce a non-synchronizing part of the UI, subclass NonSyncingPresenter and 
 		newIdFor: type <String> ^<String> = (
 			(* An ordinal within the current scope, per fragment type, rendered as a path.
      The caller prefixes its type marker, so two types in one scope may share an
-     ordinal without colliding. *)
+     ordinal without colliding.
+
+     Every mint is recorded in the diagnostic ledger (croquet-post.js) when it is
+     switched on. This counter IS the event address, so two clients agree about
+     which widget an event names only while they mint in the same order - and the
+     ledger is what makes a disagreement attributable at the point it happens
+     rather than at its first consequence, which may be thousands of events and
+     one dead chat later. *)
 			
 			| key = fragmentScopePath , '/' , type. n = (scopedCounters at: key
 				ifAbsent: [ 0 ]) + 1. |
 			scopedCounters at: key put: n.
+			mintLedgerOn ifTrue: [
+					js global nsRecordMint: type ordinal: n scope: fragmentScopePath
+				].
 			^fragmentScopePath , '/' , n printString
+		)
+		mintingContext: label <String> do: block <[X def]> ^<X> = (
+			(* Label every id minted inside block with what was being built. ensure:, like
+     withFragmentScope:do: - an unwound stack would mislabel everything after
+     it. *)
+			
+			mintLedgerOn ifFalse: [ ^block value ].
+			js global nsPushMintContext: label.
+			^[ block value ] ensure: [ js global nsPopMintContext: nil ]
 		)
 		newFragmentScope ^<String> = (
 			(* Minted in the CURRENT scope, so the token is itself the same on every

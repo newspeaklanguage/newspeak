@@ -3140,6 +3140,144 @@ public clearConversation = ( ide aiSupport clearConversationFor: self )
 		
 		^(js global at: 'JSON') parse: '{}'
 	)
+	public agentReachableHere: agentName <String> then: k <[:Boolean | Object]> = (
+		(* Ask THIS machine's front door whether an agent of that name is listening,
+	   and hand the answer to k.
+
+	   The bus is per-machine: an agent is a process holding a subscription open
+	   on one participant's front door. So in a synchronized session the answer
+	   differs per participant, and it is deliberately NOT coordinated - it is
+	   what lets the participant that can reach the agent be the one that talks
+	   to it, instead of whichever client the reflector happened to elect.
+
+	   Answers TRUE when it cannot find out: no bus, no token, a transport
+	   failure, an unparseable body, or a front door with no /_ns/bus/agents at
+	   all (an older one answers 404, whose body is perfectly good JSON without
+	   an agents array - hence the status check rather than trusting the parse).
+	   That reproduces the behaviour from before capability was consulted, and it
+	   fails in the safer direction: every client believing itself able still
+	   elects exactly one performer, whereas every client abstaining would elect
+	   none and hang the turn.
+
+	   k is always run, and exactly once - but not always asynchronously: with no
+	   bus or no token it runs before this returns. *)
+		
+		| options headers |
+		(busOrigin isNil or: [ busToken isNil ]) ifTrue: [
+				^answerReachability: k with: true
+			].
+		headers:: freshJSObject.
+		headers at: 'X-NS-Token' put: busToken.
+		options:: freshJSObject.
+		options at: 'headers' put: headers.
+		[
+			(js global fetch: busOrigin , '/_ns/bus/agents' with: options) then: [:response |
+					[
+						(response at: 'ok') ifFalse: [ answerReachability: k with: true ]
+							ifTrue: [
+								response json then: [:body |
+										answerReachability: k with: (namesIn: body include: agentName).
+										nil
+									]
+									onError: [:e |
+										answerReachability: k with: true.
+										nil
+									]
+							]
+					] on: Exception do: [:e | answerReachability: k with: true ].
+					nil
+				]
+				onError: [:e |
+					answerReachability: k with: true.
+					nil
+				]
+		] on: Exception do: [:e | answerReachability: k with: true ]
+	)
+	answerReachability: k <[:Boolean | Object]> with: able <Boolean> = (
+		(* Run the continuation and swallow anything it raises: most call sites are
+	   inside a JS promise continuation, where a raise is lost on the alien
+	   bridge and can leave the bridge in a bad state. *)
+		
+		[ k value: able ] on: Exception do: [:e | nil ]
+	)
+	namesIn: body <Alien> include: agentName <String> ^<Boolean> = (
+		(* Search the agents array of a /_ns/bus/agents body by index: a JS array
+	   arriving in Newspeak is an Alien, not a collection, so it has no do:. *)
+		
+		| names count index |
+		names:: [ body at: 'agents' ] on: Exception do: [:e | nil ].
+		names isNil ifTrue: [ ^false ].
+		count:: [ names at: 'length' ] on: Exception do: [:e | 0 ].
+		index:: 0.
+		[ index < count ] whileTrue: [
+				([ names at: index ] on: Exception do: [:e | nil ]) = agentName ifTrue: [
+						^true
+					].
+				index:: index + 1
+			].
+		^false
+	)
+	postToBusOnce: fields <Alien> = (
+		(* Post ONE outbound message, once per SESSION rather than once per client.
+
+	   The tool loop runs on every client - that is how a synchronized session
+	   re-derives the same state from a shared completion - so a tool whose effect
+	   is confined to the image is right to run everywhere. This tool's effect is
+	   not: it leaves the image and reaches an external agent, and running it on
+	   every participant delivers the same message three times in a three-client
+	   session.
+
+	   So it goes through the host's coordinated performer, exactly as a bus
+	   COMPLETION does: the elected client performs the post and the others read
+	   the recorded outcome. On a platform whose performer is absent - or that has
+	   only one client, where the base host simply runs the block - this is the
+	   plain post it always was.
+
+	   Election alone is not enough, though, because the bus is per-MACHINE: the
+	   agent is a process listening on one participant's front door, and a client
+	   elected on another machine would post into a bus the agent is not on. So
+	   participation is gated first on whether the addressee is reachable from
+	   HERE (#agentReachableHere:then:); only clients that can reach it enter the
+	   election, and among co-located clients exactly one still posts.
+
+	   Not awaited: the bus is fire-and-forget with no delivery receipt, and the
+	   caller's status is already optimistic. Distinct from #postToBus:, which
+	   must stay uncoordinated - its other caller is the completion request, and
+	   that ALREADY runs inside the performer's block. Coordinating it twice would
+	   have the elected client wait on an election nested in its own. *)
+		
+		| target |
+		target:: [ fields at: 'to' ] on: Exception do: [:e | nil ].
+		target isNil ifTrue: [ ^postToBus: fields ].
+		agentReachableHere: target
+			then: [:able |
+				postToBusCoordinated: fields canPerformHere: able.
+				nil
+			]
+	)
+	postToBusCoordinated: fields <Alien> canPerformHere: able <Boolean> = (
+		(* The coordinated half of #postToBusOnce:. Only a client that can reach the
+	   addressee enters the election; the rest still go through the performer,
+	   abstaining, because the coordination key carries a per-digest ordinal and
+	   a client that skipped minting it would disagree with everyone else about
+	   every later key for this request. They discard the recorded outcome - the
+	   post is fire-and-forget and there is nothing to hand back. *)
+		
+		| perf |
+		perf:: [ host isNil ifTrue: [ nil ] ifFalse: [ host performer ] ] on: Exception
+			do: [:e | nil ].
+		perf isNil ifTrue: [
+				able ifTrue: [ postToBus: fields ].
+				^self
+			].
+		perf performText: ((js global at: 'JSON') stringify: fields)
+			via: [:ok :fail |
+				postToBus: fields.
+				ok value: 'posted'.
+				nil
+			]
+			canPerformHere: able
+	)
 	postToBus: fields <Alien> = (
 		(* Fire-and-forget POST of one message object to /_ns/bus - how the IDE
 	   reaches OUTWARD to an external agent by name (send_to_agent). The bus
@@ -3323,7 +3461,7 @@ public clearConversation = ( ide aiSupport clearConversationFor: self )
 		fields at: 'from' put: senderName.
 		fields at: 'text' put: message.
 		fields at: 'kind' put: 'message'.
-		postToBus: fields.
+		postToBusOnce: fields.
 		^'sent to agent ''' , agentName , ''' over the bus (fire-and-forget; if it is listening and answers, the reply arrives here as a [from external agent ''' , agentName , '''] message).'
 	)
 	sendToAgentToolForFocus: focus <ChatFocus> ^<Tool> = (

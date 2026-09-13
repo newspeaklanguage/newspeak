@@ -36,6 +36,7 @@ import argparse
 import json
 import sys
 import threading
+import urllib.parse
 import urllib.request
 
 
@@ -125,7 +126,10 @@ class Responder:
                   end='', flush=True)
 
     def receive_loop(self):
-        url = self.origin + '/_ns/bus?token=' + self.token
+        # Declare our name on the stream so the front door can answer
+        # /_ns/bus/agents. The bus is per-machine, and a collaborating IDE
+        # session needs to know WHICH participant can reach this agent.
+        url = self.origin + '/_ns/bus?token=' + self.token + '&name=' + urllib.parse.quote(self.name)
         req = urllib.request.Request(url, headers={'Accept': 'text/event-stream'})
         while True:
             try:

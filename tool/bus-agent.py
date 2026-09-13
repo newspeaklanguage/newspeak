@@ -32,6 +32,7 @@ import argparse
 import json
 import sys
 import threading
+import urllib.parse
 import urllib.request
 
 
@@ -51,7 +52,10 @@ def post(origin, token, obj):
 
 def receive_loop(origin, token, my_name):
     # Hold the SSE stream open; print messages addressed to this agent.
-    url = origin + '/_ns/bus?token=' + token
+    # Declare our name on the stream so the front door can answer
+    # /_ns/bus/agents. The bus is per-machine, and a collaborating IDE
+    # session needs to know WHICH participant can reach this agent.
+    url = origin + '/_ns/bus?token=' + token + '&name=' + urllib.parse.quote(my_name)
     req = urllib.request.Request(url, headers={'Accept': 'text/event-stream'})
     while True:
         try:

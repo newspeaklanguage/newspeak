@@ -61,6 +61,13 @@ class HostForCroquet usingPlatform: p hostClass: H = Object new (
 		public performText: request <String> via: op <[:[:String | Object] :[:String | Object] | Object]> ^<Promise> = (
 			^coordinatedPerform: request via: op
 		)
+		public performText: request <String> via: op <[:[:String | Object] :[:String | Object] | Object]> canPerformHere: able <Boolean> ^<Promise> = (
+			(* See Host.Performer. A client that cannot carry out the exchange here
+	   abstains from the election and waits for one that can, rather than being
+	   elected and performing it into the wrong machine. *)
+			
+			^coordinatedPerform: request via: op canPerformHere: able
+		)
 		public shareText: request <String> via: op <[:[:String | Object] :[:String | Object] | Object]> ^<Promise> = (
 			(* See Host.Performer shareText:via:. Every client runs op, here and now,
 		   for its effects; the text it produced then goes through the same
@@ -87,7 +94,12 @@ class HostForCroquet usingPlatform: p hostClass: H = Object new (
 	   What this affirms is that a bus COMPLETION may be attempted: it runs
 	   through the coordinated performer, so the elected initiator makes the one
 	   request to the agent and every other client - and every late joiner
-	   replaying - reads the recorded reply.
+	   replaying - reads the recorded reply. Note that it does NOT affirm the
+	   agent is reachable from this client: the bus is per-machine, so the
+	   caller asks its own front door that (AI_IDE_Support
+	   agentReachableHere:then:) and passes the answer to the performer, which
+	   keeps clients that cannot reach the agent out of the election while still
+	   handing them the reply.
 
 	   KNOWN GAP, deliberate and temporary: this same answer is what starts the
 	   inbound event stream, and inbound messages and notices are NOT coordinated
@@ -443,18 +455,32 @@ class HostForCroquet usingPlatform: p hostClass: H = Object new (
 			].
 		^r promise
 	)
-	coordinatedPerform: request <String> via: op <[:[:String | Object] :[:String | Object] | Object]> ^<Promise> = (
-		(* As coordinatedFetch:headers:body:decode:, for an exchange the caller
-	   performs itself. The block runs ONLY on the elected initiator, so whatever
-	   credentials or connections it needs stay on that client; what travels is
-	   the reply text, recorded like any other coordinated result.
+	coordinatedPerform: request <String> via: op <[:[:String | Object] :[:String | Object] | Object]> canPerformHere: able <Boolean> ^<Promise> = (
+		(* As coordinatedPerform:via:, for a client that may not be able to carry
+	   the exchange out. It mints the key either way - the ordinal counts a
+	   client's calls per digest, so a client that skipped the mint would
+	   disagree with everyone else about every later key for that request - and
+	   then either joins the election or merely waits on it.
 
-	   The reply is encoded to bytes because that is what the session Data API
-	   stores, and decoded back on the way out - the caller deals in text at both
-	   ends and never sees the encoding. *)
+	   Optimism on an unknown answer is deliberate: the caller passes true when
+	   it could not find out, which reproduces the behaviour before capability
+	   was consulted at all. Every willing client entering the election still
+	   yields exactly one performer; every client abstaining would yield none. *)
 		
-		| r = Resolver new. |
-		hopscotch coordinatedText: (performKeyFor: request)
+		| r = Resolver new. key = performKeyFor: request. |
+		able ifFalse: [
+				hopscotch awaitCoordinatedText: key
+					ifSuccess: [:text |
+						fulfillQuietly: r with: text.
+						nil
+					]
+					ifFailure: [:msg |
+						breakQuietly: r with: (describeJS: msg).
+						nil
+					].
+				^r promise
+			].
+		hopscotch coordinatedText: key
 			via: [:ok :fail |
 				op value: [:text | ok value: text ] value: [:reason | fail value: reason ].
 				nil
@@ -468,6 +494,18 @@ class HostForCroquet usingPlatform: p hostClass: H = Object new (
 				nil
 			].
 		^r promise
+	)
+	coordinatedPerform: request <String> via: op <[:[:String | Object] :[:String | Object] | Object]> ^<Promise> = (
+		(* As coordinatedFetch:headers:body:decode:, for an exchange the caller
+	   performs itself. The block runs ONLY on the elected initiator, so whatever
+	   credentials or connections it needs stay on that client; what travels is
+	   the reply text, recorded like any other coordinated result.
+
+	   Every client is willing here. A caller for whom that is not true - the
+	   agent bus, whose agent lives on one machine - passes its own answer to
+	   canPerformHere:. *)
+		
+		^coordinatedPerform: request via: op canPerformHere: true
 	)
 	performKeyFor: request <String> ^<String> = (
 		(* As sharingKeyFor:, digesting the REQUEST rather than a URL - a performed

@@ -23,6 +23,8 @@ The FRONT DOOR (default :8080) serves:
     /_ns/token               the auth token; answered ONLY to loopback
     /_ns/git/<host>/<path>   the git proxy at its permanent address
     /_ns/fetch?url=…         server-side GET returning a diagnostics envelope
+    /_ns/bus/agents          which named agents are reachable AT THIS front
+                             door (the bus is per-machine; see _bus_agents)
     /_ns/bus                 the agent channel (GET=SSE receive, POST=send);
                              OFF unless --bus is passed
     (anything else under /_ns/ answers 404 — absent means unavailable)
@@ -144,6 +146,29 @@ CONFIG = {
 FETCH_BODY_CAP = 256 * 1024
 FETCH_TIMEOUT_S = 30
 
+# ...and at most this much wall clock, in total. FETCH_TIMEOUT_S is urllib's
+# per-socket-operation timeout, NOT a budget for the request: a redirect chain
+# gets a fresh 30s on every hop, and the body read is bounded by
+# FETCH_BODY_CAP (a size) rather than by time, so a server that trickles bytes
+# can hold the read open indefinitely. Either can outlast the IDE's 180s tool
+# watchdog, which then abandons the whole turn. FETCH_TOTAL_S is the real
+# deadline, enforced across redirects and while reading the body.
+FETCH_TOTAL_S = 45
+FETCH_MAX_REDIRECTS = 5
+
+# Sent on the fetch itself. The default here is the server's own name, which
+# bot protection in front of a documentation site will often stall rather than
+# answer - and a stall reads as a network fault, which is the wrong diagnosis
+# entirely. This is the same request the operator could make from the browser
+# already open on this machine, so presenting as that browser is accurate.
+FETCH_HEADERS = {
+    'User-Agent': ('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+                   'AppleWebKit/537.36 (KHTML, like Gecko) '
+                   'Chrome/140.0.0.0 Safari/537.36'),
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+}
+
 # /_ns/bus — the agent channel. OFF unless --bus is passed: it injects prompts
 # into an IDE that edits and runs code, which is remote control, so the
 # operator enables it consciously. When off, CONFIG['bus'] stays false and the
@@ -154,7 +179,16 @@ FETCH_TIMEOUT_S = 30
 # kept so an EventSource that reconnects (with Last-Event-ID) does not miss
 # what arrived during the gap.
 BUS_LOCK = threading.Lock()
-BUS_SUBSCRIBERS = []                                   # list[queue.Queue]
+# Each entry is {'q': Queue, 'name': str}. The name is what a subscriber calls
+# ITSELF, declared as ?name= on the SSE URL; messages are still fanned out to
+# everyone and filtered by the receiver, so a name is advertising, not routing.
+# It exists so a caller can ask whether a given agent is reachable AT THIS FRONT
+# DOOR before addressing it: the bus is per-machine, and in a session whose
+# participants are on different machines only some of them can reach any given
+# agent. Without this, addressing an absent agent looked exactly like addressing
+# a present one - the post succeeded, the fan-out found listeners (the IDE
+# clients are subscribers too), and nothing ever answered.
+BUS_SUBSCRIBERS = []                                   # list[dict]
 BUS_HISTORY = collections.deque(maxlen=200)            # list[(id, payload_str)]
 BUS_NEXT_ID = [0]
 BUS_KEEPALIVE_S = 20
@@ -183,6 +217,9 @@ class HostServicesHandler(SimpleHTTPRequestHandler):
             return True
         if self.path == '/_ns/fetch' or self.path.startswith('/_ns/fetch?'):
             self._serve_fetch(method)
+            return True
+        if self.path == '/_ns/bus/agents' or self.path.startswith('/_ns/bus/agents?'):
+            self._bus_agents()
             return True
         if self.path == '/_ns/bus' or self.path.startswith('/_ns/bus?'):
             self._serve_bus(method)
@@ -247,17 +284,38 @@ class HostServicesHandler(SimpleHTTPRequestHandler):
             # a different capability with its own path and its own gate.
             return self._send_json(400, {'error': 'only http(s) URLs are fetched'})
 
-        recorder = _RedirectRecorder()
-        opener = urllib.request.build_opener(recorder)
-        req = urllib.request.Request(
-            url, headers={'User-Agent': self.server_version, 'Accept': '*/*'})
         t0 = time.monotonic()
+        deadline = t0 + FETCH_TOTAL_S
+        recorder = _RedirectRecorder(deadline)
+        opener = urllib.request.build_opener(recorder)
+        req = urllib.request.Request(url, headers=FETCH_HEADERS)
 
         def elapsed():
             return int((time.monotonic() - t0) * 1000)
 
         def body_of(stream):
-            raw = stream.read(FETCH_BODY_CAP + 1)
+            # Chunked, with a deadline check between chunks: the per-socket
+            # timeout only fires on a socket that goes quiet, so a slow trickle
+            # would otherwise never trip it.
+            #
+            # read1, not read: read(n) blocks until it has all n bytes or the
+            # stream ends, so a trickle keeps ONE read alive indefinitely and
+            # the deadline below never gets its turn. read1 returns as soon as
+            # anything is available, which is what makes the check reachable.
+            # (A stream that goes silent entirely is still the socket timeout's
+            # job; this loop only bounds one that stays busy saying nothing.)
+            read = getattr(stream, 'read1', None) or stream.read
+            chunks, got = [], 0
+            while got <= FETCH_BODY_CAP:
+                if time.monotonic() > deadline:
+                    raise TimeoutError(
+                        'the body did not finish within %ds' % FETCH_TOTAL_S)
+                chunk = read(min(65536, FETCH_BODY_CAP + 1 - got))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                got += len(chunk)
+            raw = b''.join(chunks)
             truncated = len(raw) > FETCH_BODY_CAP
             return raw[:FETCH_BODY_CAP].decode('utf-8', errors='replace'), truncated
 
@@ -347,16 +405,40 @@ class HostServicesHandler(SimpleHTTPRequestHandler):
             payload = json.dumps(msg)
             BUS_HISTORY.append((mid, payload))
             subscribers = list(BUS_SUBSCRIBERS)
-        for q in subscribers:
-            q.put((mid, payload))
+        for sub in subscribers:
+            sub['q'].put((mid, payload))
         self._send_json(200, {'id': mid, 'listeners': len(subscribers)})
+
+    def _bus_agents(self):
+        """Who is listening here, by the name they gave.
+
+        The bus lives on ONE machine, so this answers a question that only makes
+        sense locally: can an agent of this name be reached through THIS front
+        door. A collaborating session whose participants sit on different
+        machines gets a different answer per participant, which is the point -
+        the one that can reach the agent should be the one that talks to it.
+
+        Unnamed subscribers (the IDE clients themselves) are omitted: they are
+        listeners, not addressable agents.
+        """
+        if not CONFIG.get('bus'):
+            self._send_json(404, {'error': 'bus not enabled'})
+            return
+        if not self.require_token():
+            return
+        with BUS_LOCK:
+            names = sorted({s['name'] for s in BUS_SUBSCRIBERS if s.get('name')})
+        self._send_json(200, {'agents': names})
 
     def _bus_stream(self):
         if not self.require_token():
             return
+        parsed = urllib.parse.urlparse(self.path)
+        name = (urllib.parse.parse_qs(parsed.query).get('name') or [''])[0]
         my_queue = queue.Queue()
+        entry = {'q': my_queue, 'name': name}
         with BUS_LOCK:
-            BUS_SUBSCRIBERS.append(my_queue)
+            BUS_SUBSCRIBERS.append(entry)
         try:
             self.send_response(200)
             self.send_header('Content-Type', 'text/event-stream')
@@ -391,8 +473,8 @@ class HostServicesHandler(SimpleHTTPRequestHandler):
             pass
         finally:
             with BUS_LOCK:
-                if my_queue in BUS_SUBSCRIBERS:
-                    BUS_SUBSCRIBERS.remove(my_queue)
+                if entry in BUS_SUBSCRIBERS:
+                    BUS_SUBSCRIBERS.remove(entry)
 
     def _bus_write(self, mid, payload):
         frame = 'id: %d\ndata: %s\n\n' % (mid, payload)
@@ -593,12 +675,25 @@ HostServicesHandler.extensions_map['.wasm'] = 'application/wasm'
 
 
 class _RedirectRecorder(urllib.request.HTTPRedirectHandler):
-    """Records the redirect chain so the envelope can report it."""
+    """Records the redirect chain so the envelope can report it, and enforces
+    the caller's total deadline across hops.
 
-    def __init__(self):
+    urllib follows redirects inside a single opener.open() call, giving each
+    hop a fresh socket timeout. Without the deadline check, the default ten
+    hops at FETCH_TIMEOUT_S each is five minutes of legitimate waiting - past
+    the point where the IDE has given up on the tool call."""
+
+    max_redirections = FETCH_MAX_REDIRECTS
+
+    def __init__(self, deadline=None):
         self.chain = []
+        self.deadline = deadline
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if self.deadline is not None and time.monotonic() > self.deadline:
+            raise urllib.error.URLError(
+                'exceeded the %ds fetch budget after %d redirect(s)'
+                % (FETCH_TOTAL_S, len(self.chain)))
         self.chain.append(newurl)
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 

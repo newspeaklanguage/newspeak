@@ -814,6 +814,15 @@ var nsPublishChain = Promise.resolve();
 
 // The single outbound funnel: HopscotchForCroquet''s publish:event:data: calls
 // this instead of theView.publish directly.
+// A synchronized-inbox post (HopscotchForCroquet synchronizedInbox:post:payload:):
+// input that reached ONE client from outside the session, recorded once per
+// (topic, id) by the model and applied everywhere from the record. The id
+// travels beside the envelope''s data so the model can read it even when the
+// text has been detoured for size.
+function nsSyncInboxPost(topic, id, text) {
+    nsPublish(''nssyncinbox_'', ''syncInbox_post'', {fid: topic, id: String(id), data: text});
+}
+
 function nsPublish(scope, eventSpec, data) {
     nsPublishChain = nsPublishChain.then(async () => {
 	try {
@@ -834,7 +843,9 @@ function nsPublish(scope, eventSpec, data) {
 		&& !nsContainsDataHandle(data.data)) {
 		const bytes = new TextEncoder().encode(JSON.stringify(data.data));
 		const handle = await theView.session.data.store(bytes.buffer);
-		payload = {fid: data.fid, data: {__nsDetouredPayload: true, handle: handle}};
+		// Keep every other field of the envelope (an inbox post carries its
+		// message id beside the data, and the model needs it visible).
+		payload = Object.assign({}, data, {data: {__nsDetouredPayload: true, handle: handle}});
 	    }
 	    theView.publish(scope, eventSpec, payload);
 	} catch (err) {
@@ -967,6 +978,7 @@ Only afterward is the snapshot state restored in the new model. Next a new root 
 	    version: 1,
 	    newspeakEvents: nsFlattenHandles(this.newspeakEvents),
 	    coordinatedFetches: nsFlattenHandles(this.coordinatedFetches),
+	    syncInboxSeen: this.syncInboxSeen,
 	    timers: this.timers
 	}));
     }
@@ -1043,6 +1055,13 @@ Only afterward is the snapshot state restored in the new model. Next a new root 
 	this.subscribe(''nscoordfetch_'', ''coordinatedFetch_loaded'', this.coordinatedFetch_loaded);
 	this.subscribe(''nscoordfetch_'', ''coordinatedFetch_failed'', this.coordinatedFetch_failed);
 
+	// Synchronized inbox (HopscotchForCroquet synchronizedInbox:post:payload:):
+	// topic -> {id: true} for every delivery recorded, so a message posted by
+	// several local clients - or re-sent by a reconnecting stream - is
+	// delivered once. Persisted with the history, like coordinatedFetches.
+	this.syncInboxSeen = {};
+	this.subscribe(''nssyncinbox_'', ''syncInbox_post'', this.syncInbox_post);
+
 	// Synchronized timers (see HopscotchForCroquet.ns TimerFragment). Maps
 	// fragment id -> {remaining} while a countdown runs, then PERMANENTLY
 	// {status: ''done''} - completed entries must survive so that a fragment
@@ -1066,6 +1085,7 @@ Only afterward is the snapshot state restored in the new model. Next a new root 
 	    this.newspeakEvents = nsReviveHandles(persisted.newspeakEvents) || [];
 	    this.coordinatedFetches = nsReviveHandles(persisted.coordinatedFetches) || {};
 	    this.timers = persisted.timers || {};
+	    this.syncInboxSeen = persisted.syncInboxSeen || {};
 	    // Countdowns that were mid-flight when the previous island died:
 	    // their pending future ticks died with it, so reschedule.
 	    for (const fid in this.timers) {
@@ -1240,6 +1260,16 @@ Only afterward is the snapshot state restored in the new model. Next a new root 
     coordinatedFetch_failed(nsOptions){
 	this.coordinatedFetches[nsOptions.fid] = {status: ''failed'', reason: nsOptions.data};
 	this.publishEventAndData(''nscoordfetch_'', ''model_coordinatedFetch_failed'', nsOptions.data, nsOptions.fid);
+    }
+    // Synchronized inbox: record one delivery per (topic, id). The delivery
+    // is a recorded event under the topic''s scope, so every client - and
+    // every late joiner replaying - applies the input at the same position.
+    syncInbox_post(nsOptions){
+	const topic = nsOptions.fid, id = String(nsOptions.id);
+	const seen = this.syncInboxSeen[topic] || (this.syncInboxSeen[topic] = {});
+	if (seen[id]) return;
+	seen[id] = true;
+	this.publishEventAndData(''nssyncinbox_'', ''model_syncInbox_deliver'', nsOptions.data, topic);
     }
     // Synchronized timers. Every client publishes start on realizing a timer
     // fragment; only the first registers (idempotent start). The count rides

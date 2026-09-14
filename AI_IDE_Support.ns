@@ -1055,6 +1055,7 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 				]
 		)
 	) : ()
+	lazy private busInboxSubscribed <Boolean> ::= (* Lazy rather than eager: an eager slot added to this live module arrives nil on hot-load. *) false.
 	lazy public repositories = ide repositories.
 	lazy public ApplyStrategy = repositories ApplyStrategy.
 	lazy public ChangesetSubject = repositories ChangesetSubject.
@@ -3001,10 +3002,16 @@ public clearConversation = ( ide aiSupport clearConversationFor: self )
 			].
 		promise then: [:reply |
 				[ subj markComplete ] on: Exception do: [:e | nil ].
+				
+				(* A driven turn has no presenter to updateGUI: for it; markComplete's
+			   own refresh repaints the current top-level presenter only, and a chat
+			   REGION embedded in some other page kept its old transcript. *)
+				hopscotch updateAllGUIs.
 				nil
 			]
 			onError: [:err |
 				[ subj markError: err printString ] on: Exception do: [:e | nil ].
+				hopscotch updateAllGUIs.
 				nil
 			]
 	)
@@ -3093,6 +3100,7 @@ public clearConversation = ( ide aiSupport clearConversationFor: self )
 	   unless the front door was started with --bus, so this is inert by
 	   default. *)
 		
+		ensureBusInboxSubscribed.
 		busStarted ifTrue: [ ^self ].
 		host isNil ifTrue: [ ^self ].
 		[
@@ -3308,40 +3316,98 @@ public clearConversation = ( ide aiSupport clearConversationFor: self )
 				nil
 			]
 	)
-	handleBusEvent: event <Alien> = (
-		(* One bus message. Resolve the target chat by name; drop silently if it
-	   is unknown (an external agent may address a chat that does not exist
-	   here). A 'notice' is folded into the target's next turn out of band; a
-	   'message' drives a real turn, stamped so the model knows it came from
-	   outside and cannot be mistaken for the human user. *)
+	ensureBusInboxSubscribed = (
+		(* Register, once, as the handler of the 'bus' synchronized inbox (see
+	   HopscotchForHTML5 synchronizedInbox:post:payload:). On EVERY client,
+	   before the bus itself is consulted: a client that cannot reach this
+	   machine's bus - another machine's, or a late joiner replaying - still
+	   applies the inbound messages the record carries, and on the Croquet
+	   platform a recorded delivery without a subscriber is lost. Guarded, as
+	   the handler runs as a stored callback: it must never raise. *)
 		
-		| dataStr msg to targetDoc text from kind |
+		busInboxSubscribed ifTrue: [ ^self ].
+		busInboxSubscribed:: true.
+		hopscotch synchronizedInbox: 'bus'
+			do: [:dataStr |
+				[ applyBusEvent: dataStr ] on: Exception do: [:e | nil ].
+				nil
+			]
+	)
+	handleBusEvent: event <Alien> = (
+		(* One frame of this client's bus stream. A completion_response is an
+	   external agent answering a BusProvider's request: it routes by
+	   correlation id to the waiting provider on THIS client - the elected
+	   performer, whose reply the coordinated performer records - and never
+	   into a chat as a turn. Everything else is inbound traffic that must
+	   reach every participant identically, so it is not applied here: it is
+	   posted to the synchronized inbox under the front door's own id for the
+	   message (the SSE event id), and applied - once, everywhere, at the same
+	   position in the shared history - by applyBusEvent: when the inbox
+	   delivers it. Before this, each client applied its own stream's frames
+	   when they arrived and a joiner never saw them (2026-09-14). *)
+		
+		| dataStr msg kind id to |
 		dataStr:: [ event at: 'data' ] on: Exception do: [:e | nil ].
 		dataStr isNil ifTrue: [ ^self ].
 		msg:: [ (js global at: 'JSON') parse: dataStr ] on: Exception do: [:e | nil ].
 		msg isNil ifTrue: [ ^self ].
 		kind:: [ msg at: 'kind' ] on: Exception do: [:e | 'message' ].
-		
-		(* Level 2: a completion_response is an external agent answering a
-	   BusProvider's request; it routes by correlation id to the waiting
-	   provider, NOT into a chat as a turn. *)
 		kind = 'completion_response' ifTrue: [ ^deliverCompletionResponse: msg ].
+		
+		(* The front door echoes EVERY frame to every stream, this client's own
+	   completion requests to an agent included. Only frames that address a
+	   chat are inbound to the session; and a chat unknown here is unknown
+	   everywhere (chats live in Root, which is shared), so the check is
+	   safe to make locally and spares the history a recorded copy of every
+	   request body. *)
+		(kind = 'message' or: [ kind = 'notice' ]) ifFalse: [ ^self ].
+		to:: [ msg at: 'to' ] on: Exception do: [:e | nil ].
+		(to isNil or: [ (chatDocNamed: to) isNil ]) ifTrue: [ ^self ].
+		id:: [ event at: 'lastEventId' ] on: Exception do: [:e | nil ].
+		(id isNil or: [ [ id isEmpty ] on: Exception do: [:e | true ] ]) ifTrue: [
+				id:: dataStr
+			].
+		hopscotch synchronizedInbox: 'bus' post: id payload: dataStr
+	)
+	applyBusEvent: dataStr <String> = (
+		(* One inbound bus message, as delivered by the synchronized inbox.
+	   Resolve the target chat by name; drop silently if it is unknown (an
+	   external agent may address a chat that does not exist here). A 'notice'
+	   is folded into the target's next turn out of band; a 'message' drives a
+	   real turn, stamped so the model knows it came from outside and cannot be
+	   mistaken for the human user. *)
+		
+		| msg to targetDoc text from kind |
+		msg:: [ (js global at: 'JSON') parse: dataStr ] on: Exception do: [:e | nil ].
+		msg isNil ifTrue: [ ^self ].
+		kind:: [ msg at: 'kind' ] on: Exception do: [:e | 'message' ].
 		to:: [ msg at: 'to' ] on: Exception do: [:e | nil ].
 		to isNil ifTrue: [ ^self ].
 		targetDoc:: chatDocNamed: to.
-		targetDoc isNil ifTrue: [ ^self ].
+		targetDoc isNil ifTrue: [
+				logBus: 'dropped: no chat named ' , to.
+				^self
+			].
 		text:: [ msg at: 'text' ] on: Exception do: [:e | '' ].
 		text isNil ifTrue: [ text:: '' ].
 		from:: [ msg at: 'from' ] on: Exception do: [:e | 'external agent' ].
 		(from isNil or: [ from isEmpty ]) ifTrue: [ from:: 'external agent' ].
 		kind = 'notice' ifTrue: [
-				deliverExternalNotice: text to: targetDoc from: from
+				deliverExternalNotice: text to: targetDoc from: from.
+				logBus: 'notice for ' , to , ' from ' , from
 			]
 			ifFalse: [
-				enqueueOrDeliver: '[from external agent ''' , from , '''] ' , text
-					to: targetDoc
-					hop: 0
+				logBus: 'message for ' , to , ' from ' , from , ': ' , (enqueueOrDeliver: '[from external agent ''' , from , '''] ' , text
+						to: targetDoc
+						hop: 0)
 			]
+	)
+	logBus: s <String> = (
+		(* One console line per inbound delivery outcome - what the probes read
+	   when a message recorded in the history did not become a turn. *)
+		
+		[ (js global at: 'console') log: 'bus inbox: ' , s ] on: Exception
+			do: [:e | nil ]
 	)
 	deliverExternalNotice: text <String> to: targetDoc <Document> from: from <String> = (
 		(* An out-of-band notice: folded into the target session's next turn as a

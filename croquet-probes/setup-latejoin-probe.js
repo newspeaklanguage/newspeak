@@ -75,6 +75,9 @@ const URL = ORIGIN + '/' + NS_PAGE_FILE + '?snapshot=CroquetHopscotchWebIDE' + S
    drift between A and B can be traced to the FIRST differing mint instead of
    its consequences. Cheap enough to leave on. */
 const JOIN_MS = Number(process.env.JOIN_MS || 240000);
+/* DevTools ports for the two browsers; override when a previous run's
+   browsers were left behind holding the defaults. */
+const PORT_A = Number(process.env.PORT_A || 9821), PORT_B = Number(process.env.PORT_B || 9822);
 const REPLY_DELAY_MS = Number(process.env.REPLY_DELAY_MS || 30000);
 /* Which tool the provider asks for in a tool round. 'evaluate' (default)
    reads the synchronization machinery's own event count - a value that is
@@ -96,6 +99,18 @@ const PROPOSE_USE = { name: 'propose_changes', input: { changes: [{ kind: 'add_t
 /* FAIL_TURN: the text request of that turn (the one carrying the tool result)
    is answered with HTTP 500, once. */
 const FAIL_TURN = Number(process.env.FAIL_TURN || 0);
+/* INBOUND: after turn 1 the probe, as the agent, POSTs an UNSOLICITED message
+   to the chat over the bus. Every client on this machine receives it on its
+   own stream; it must be applied once, everywhere, as a recorded turn - and
+   by the joiner, which never had a stream to receive it on. The message
+   drives a turn of its own (tool round + text), so the user's second message
+   gets the third text reply. Bus provider only, and the chat gets a known
+   name so the message can be addressed. */
+const INBOUND = process.env.INBOUND === '1';
+const CHAT_NAME = 'ProbeChat';
+const INBOUND_TEXT = 'unsolicited probe message from the agent';
+const replyNo = t => t + (INBOUND && t >= 2 ? 1 : 0);
+let busToken = null;
 /* The transcript's record of an applied proposal, by presenter (see the
    Apply step). */
 const APPLIED_TEXT = FROM_CLASS ? 'is no longer pending' : 'Applied changeset';
@@ -387,17 +402,19 @@ async function main() {
   } else {
     if (!cfg.bus) { console.log('front door has no bus (start it with --bus)'); process.exitCode = 1; return }
     const token = JSON.parse(await get('/_ns/token')).token;
+    busToken = token;
     agentReq = await startAgent(token);
     console.log('agent "' + AGENT + '" listening on the bus');
   }
   if (FAIL_TURN && !REMOTE) { console.log('FAIL_TURN needs PROVIDER=openai-compat (the bus has no HTTP status to fail with)'); process.exitCode = 1; return done([]) }
   if (FAIL_TURN && !TOOL_TURNS) { console.log('FAIL_TURN fails the text request that carries a tool result; it needs TOOL_TURNS=1'); process.exitCode = 1; return done([]) }
   if (NOTICE && (!TOOL_TURNS || TURNS < 2)) { console.log('NOTICE needs TOOL_TURNS=1 and TURNS>=2 (the notices ride the turn after the Apply)'); process.exitCode = 1; return done([]) }
+  if (INBOUND && REMOTE) { console.log('INBOUND posts over the bus; it needs PROVIDER=bus'); process.exitCode = 1; return done([]) }
   console.log('provider=' + PROVIDER + ' page=' + NS_PAGE_FILE + ' vfuel suffix="' + SUFFIX + '" fromClass=' + FROM_CLASS + ' toolTurns=' + TOOL_TURNS + ' tool=' + TOOL_USE.name +
     ' notice=' + NOTICE + ' failTurn=' + FAIL_TURN);
   await sleep(1000);
 
-  const A = await launchBrowser({ port: 9821, tag: 'slj-a', session: SESSION });
+  const A = await launchBrowser({ port: PORT_A, tag: 'slj-a', session: SESSION });
   await A.navigate(URL);
   if (!await waitFor(A, "document.body && document.body.innerText.includes('Workspaces')", 240000)) {
     check('A boots', false, A.logs.slice(-4).join(' | ')); return done([A]);
@@ -441,6 +458,7 @@ async function main() {
     const typed = await typeInto(A, focusRowCM('Model:'), AGENT);
     console.log('  type agent name: ' + typed);
     if (!typed.startsWith('TYPED')) return bail(A, 'could not type the agent name');
+    if (INBOUND) console.log('  type chat name: ' + await typeInto(A, focusRowCM('Chat name:'), CHAT_NAME));
   }
   await sleep(3000);
   console.log('A after typing census:', await A.v(CENSUS));
@@ -495,10 +513,26 @@ async function main() {
       await sleep(3000);
       await step(A, 'click Retry', click('Retry'));
     }
-    const got = await waitFor(A, "document.body.innerText.includes(" + JSON.stringify(REPLY + '-' + t) + ")", budget);
+    const got = await waitFor(A, "document.body.innerText.includes(" + JSON.stringify(REPLY + '-' + replyNo(t)) + ")", budget);
     check('A gets reply ' + t + (FAIL_TURN === t ? ' after Retry' : ''), got, 'requests=' + requests + ' toolRequests=' + toolRequests);
     if (!got) return bail(A, 'no reply to message ' + t);
     await sleep(6000);
+    if (INBOUND && t === 1) {
+      /* The agent speaks first: an unsolicited message to the chat, by name,
+         over the bus. On the IDE side this is inbound traffic - nobody asked
+         for it - and the chat answers it as a turn of its own. */
+      const r = await post('/_ns/bus', { to: CHAT_NAME, from: AGENT, text: INBOUND_TEXT }, busToken);
+      console.log('  posted an unsolicited bus message to ' + CHAT_NAME + ': ' + r);
+      /* A driven turn renders its transcript when the turn settles, not when
+         the message lands, so the reply is the thing to wait for; the
+         message's own bubble is checked once it is there. */
+      const answered = await waitFor(A, "document.body.innerText.includes(" + JSON.stringify(REPLY + '-2') + ")", budget);
+      check('A gets the reply to the inbound message', answered, 'requests=' + requests + ' toolRequests=' + toolRequests);
+      if (!answered) return bail(A, 'no reply to the inbound message');
+      const shown = await A.v("document.body.innerText.includes(" + JSON.stringify(INBOUND_TEXT) + ")");
+      check('A shows the inbound message as a turn', shown);
+      await sleep(6000);
+    }
     if (NOTICE && t === 1) {
       /* The proposal was rendered inline at markComplete, with the install
          strategy's Apply button. Applying installs the class on every client
@@ -546,7 +580,7 @@ async function main() {
   console.log('A storyline:', await A.v(STORY(aTotal)));
 
   console.log('\n--- late joiner B ---');
-  const B = await launchBrowser({ port: 9822, tag: 'slj-b', session: SESSION });
+  const B = await launchBrowser({ port: PORT_B, tag: 'slj-b', session: SESSION });
   const t0 = Date.now();
   await B.navigate(URL);
   const caught = await waitFor(B, 'window.lastProcessedEvent >= ' + aTotal, JOIN_MS);
@@ -560,7 +594,7 @@ async function main() {
   check('B replay is orphan-free', orph.length === 0, orph.length + ' skips');
   if (orph.length) console.log('B orphans:\n' + orph.map(l => '    ' + l.slice(0, 220)).join('\n'));
   console.log('B held answers: ' + held.length + (held.length ? '\n' + held.map(l => '    ' + l.slice(0, 220)).join('\n') : ''));
-  const expectedRequests = TURNS * (TOOL_TURNS ? 2 : 1) + (FAIL_TURN ? 1 : 0);
+  const expectedRequests = (TURNS + (INBOUND ? 1 : 0)) * (TOOL_TURNS ? 2 : 1) + (FAIL_TURN ? 1 : 0);
   check('the provider saw exactly ' + expectedRequests + ' requests (replay added none)', requests === expectedRequests, 'requests=' + requests + ' toolRequests=' + toolRequests);
   /* A request beyond the expected count came from the joiner. Its body should
      equal the original's request at the same position in the conversation
@@ -606,7 +640,7 @@ async function main() {
       console.log('    B ' + JSON.stringify(sb.slice(Math.max(0, i - 3), i + 4)));
     }
   }
-  check('B shows the last reply', await B.v("document.body.innerText.includes(" + JSON.stringify(REPLY + '-' + TURNS) + ")"));
+  check('B shows the last reply', await B.v("document.body.innerText.includes(" + JSON.stringify(REPLY + '-' + replyNo(TURNS)) + ")"));
   /* Two transcript lines only a faithful replay reproduces. The failed
      attempt's error section exists on A because A's fetch failed; the model
      never recorded that failure, so a joiner can only show it by having its
@@ -620,6 +654,9 @@ async function main() {
   };
   if (FAIL_TURN) await same('B shows the failed attempt\'s error section as A does', 'HTTP 500');
   if (NOTICE) await same('B shows the applied proposal as A does (' + APPLIED_TEXT + ')', APPLIED_TEXT);
+  /* The joiner had no bus stream to receive the unsolicited message on; it
+     can only show it by having applied the recorded delivery. */
+  if (INBOUND) await same('B shows the inbound bus message as A does', INBOUND_TEXT);
   /* Answers recorded since B joined are repeat answers to B's late requests
      - keys the history already held - unless B got itself ELECTED for a key
      nobody had answered (a replaying client fetching afresh: the failed-then-

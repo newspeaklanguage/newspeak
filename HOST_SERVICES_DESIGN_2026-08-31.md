@@ -1,6 +1,18 @@
 # Host services: one front door, one Newspeak capability, one async idiom
 
-**Status:** design for review, 2026-08-31. Nothing implemented.
+**Status:** SHIPPED. Written as a design for review on 2026-08-31; everything in
+it was built, IDE-tested and committed over the following fortnight, and the
+Croquet host override of §5 landed 2026-09-12. Read it as the rationale for what
+exists, not as a proposal.
+
+Three things arrived that this document does not describe: the `Performer`
+capability (an exchange the caller carries out itself, for a transport whose
+reply does not come back from the request — the agent bus), `shareText:via:`
+(every client runs the operation for its effects, but one client's text is the
+shared result), and bus locality (the bus is per-machine, so a client asks its
+own front door whether an agent is reachable before joining the election). For
+those, and for what is still open, see `HOST_SERVICES_FOLLOWUPS_2026-09-05.md`
+and `AI_BUS_GUIDE_2026-09-04.md` §3.5.
 This supersedes `HOST_SERVICES_DESIGN_2026-08-16.md` as the design statement;
 the older document remains the record of the evidence behind it — the
 `AsyncBridgeProbe` runs, their provenance caveats, and the bugs they exposed.

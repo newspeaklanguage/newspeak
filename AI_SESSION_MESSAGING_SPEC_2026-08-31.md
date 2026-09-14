@@ -1,12 +1,18 @@
 # In-image AI session messaging — implementation spec
 
-**Status:** ready to implement, 2026-08-31. Spun out of the host-services plan
-(`HOST_SERVICES_DESIGN_2026-08-31.md` §7) as an independent parallel track.
-**Scope:** AI chat sessions *within one IDE image* message each other,
-addressed by chat-document name. No server, no `/_ns/bus`, no Croquet.
-The bus (host-services step 6) will later extend this same address space to
-external agents; do not invent addressing that only works in-image (names are
-strings, not object references, in every tool-facing surface).
+**Status:** IMPLEMENTED. Written 2026-08-31 as a spec ready to implement, spun
+out of the host-services plan (`HOST_SERVICES_DESIGN_2026-08-31.md` §7); built
+and shipped since. Read it as the rationale for the design, not as a plan.
+
+**Scope as written:** AI chat sessions *within one IDE image* message each
+other, addressed by chat-document name — no server, no `/_ns/bus`, no Croquet.
+That scope has since been outgrown exactly as anticipated, and the anticipation
+paid off: because names are strings in every tool-facing surface, the same
+address space now reaches **external agents over the bus** (`send_to_agent`) and
+works **under Croquet**, where an outbound message goes out once per session via
+a client that can actually reach the addressee (`AI_BUS_GUIDE_2026-09-04.md`
+§3.5). Inbound traffic is still per-client and uncoordinated — followup 7 in
+`HOST_SERVICES_FOLLOWUPS_2026-09-05.md`.
 
 Read first: `CLAUDE.md` at the worktree root (mandatory editing gates),
 `SESSION_SUMMARY_2026-08-14_to_29_AI_ACCESS.md` (the session/watchdog/repair

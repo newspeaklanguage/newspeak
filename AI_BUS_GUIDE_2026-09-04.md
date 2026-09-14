@@ -1,6 +1,10 @@
 # The AI agent bus — how it works and how to run it
 
-**Written 2026-09-04.** A guide for anyone, not only the people who built it.
+**Written 2026-09-04; revised 2026-09-13** for named subscribers
+(`/_ns/bus/agents`) and what the bus being per-machine means once the IDE
+session is shared (§3.2, §3.5).
+
+A guide for anyone, not only the people who built it.
 It explains the background concepts (HTTP, `curl`, Server-Sent Events, the
 token) before the bus itself, so you should be able to follow it even if those
 terms are new.
@@ -148,9 +152,23 @@ whether a name belongs to a chat or an external program.
 
 When the front door receives a `POST`, it **fans the message out to every open
 subscriber**. Each subscriber then keeps only the messages whose `to` matches
-its own name and ignores the rest. (On a loopback dev machine this broadcast is
-simple and fine; if it ever matters, subscribers could register their names for
-targeted delivery — but that's not needed today.)
+its own name and ignores the rest. On a loopback dev machine this broadcast is
+simple and fine, and it is still how delivery works.
+
+**Subscribers do now declare their names**, as `?name=` on the streaming `GET`
+(`…/_ns/bus?token=…&name=claude-code`). This is *advertising, not routing* —
+delivery is unchanged — and it exists so that a caller can ask **whether a given
+agent is reachable through this front door** before addressing it:
+
+```
+curl -s -H "X-NS-Token: $TOKEN" http://localhost:8080/_ns/bus/agents
+# → {"agents": ["claude-code"]}
+```
+
+Only named subscribers appear; the IDE's own subscriber is unnamed, because it
+is a listener rather than an addressable agent. A subscriber that goes away is
+dropped from the registry within the 20-second keepalive, when the next write to
+its dead stream fails. Why this matters is §3.5.
 
 The key convention: **`from` is the reply address.** If `claude-code` sends a
 message to `alpha`, `alpha` sees it came `from: "claude-code"`, so to reply
@@ -204,6 +222,45 @@ respond, exactly as if a person had typed it. So:
 Both directions are the same mechanism (POST to send, SSE to receive); the only
 difference is who is subscribed under which name.
 
+### 3.5 The bus is per-machine — which matters once the session is shared
+
+Everything above describes one IDE in one browser. Under Croquet the IDE is
+*collaborative*: several clients, possibly on different machines, share one
+synchronized session. The bus does not become shared with it. An agent is a
+process holding an SSE stream open on **one** participant's front door, so in a
+shared session only some participants can reach any given agent.
+
+That collides with how the IDE avoids doing outside work several times over. A
+model completion is billed and is not idempotent, so it must happen once per
+*session*, not once per client: the clients elect one of their number to make
+the request and everyone reads the recorded reply. For an HTTP provider any
+client will do. For a bus agent it will not — an elected client on another
+machine posts into its own machine's bus, where the fan-out finds listeners (the
+IDE clients are subscribers too) and nothing ever answers, so the chat hangs
+until the watchdog fires.
+
+Hence the registry. Before entering the election, each client asks its **own**
+front door whether the addressee is listening there. Clients that can reach it
+take part; among co-located clients exactly one still posts. Clients that cannot
+**abstain** — they wait for the answer without volunteering to produce it — so
+they still end the turn with the same reply text. The question is deliberately
+answered per client and never synchronized: that is what makes the participant
+who can reach the agent the one who talks to it.
+
+If the answer cannot be obtained — no bus, no token, or a front door predating
+`/_ns/bus/agents` (an older one answers `404`) — the client assumes it *can*
+reach the agent, which is exactly how things behaved before any of this existed.
+That fails in the safer direction: every client believing itself able still
+elects exactly one performer, whereas every client abstaining would elect none
+and hang the turn.
+
+**Operationally:** an agent started against an older front door, or one whose
+launcher does not pass `&name=`, simply does not appear in `/_ns/bus/agents`.
+Nothing breaks — the optimistic fallback covers it — but the locality guarantee
+is not in force, so in a cross-machine session the wrong client may be elected.
+The bundled launchers (`bus-agent.py`, `bus-responder.py`, `bus-claude.py`) all
+declare their names.
+
 ---
 
 ## 4. How to run it
@@ -245,8 +302,9 @@ a name to subscribe under:
 python3 tool/bus-agent.py claude-code
 ```
 
-It fetches the token, subscribes as `claude-code`, prints any message addressed
-to `claude-code`, and lets you send messages by typing at the prompt:
+It fetches the token, subscribes as `claude-code` — declaring that name on the
+stream, so it shows up in `/_ns/bus/agents` (§3.2) — prints any message
+addressed to `claude-code`, and lets you send messages by typing at the prompt:
 
 ```
 alpha  Hello alpha, what is 6*7?
@@ -291,8 +349,13 @@ arrive. The token goes in the query string here (a streaming GET can't use a
 header from a browser, so we keep it uniform):
 
 ```
-curl -sN "http://localhost:8080/_ns/bus?token=$TOKEN"
+curl -sN "http://localhost:8080/_ns/bus?token=$TOKEN&name=claude-code"
 ```
+
+`&name=` is optional and changes nothing about what you receive — you still get
+every message and filter it yourself. It only puts you in the registry that
+`/_ns/bus/agents` reports, which is how a collaborative session works out which
+client can reach you (§3.5). Omit it and you are an anonymous listener.
 
 This prints `: connected`, then a `data:` line for each message as it arrives,
 and `: keepalive` every 20 seconds. Leave it running in one terminal; send from
@@ -537,7 +600,8 @@ Level 2 (Bus Agent chats):
 ## 9. Where the code lives
 
 - `tool/cors-proxy.py` — the front door, including the `/_ns/bus` router (SSE
-  stream, POST, fan-out, backlog).
+  stream, POST, fan-out, backlog) and `/_ns/bus/agents`, the named-subscriber
+  registry.
 - `tool/bus-agent.py` — the reference external agent (messaging).
 - `tool/bus-responder.py` — the reference *human-backed* responder for a
   Bus-Agent-backed chat (Level 2, §6).
@@ -549,5 +613,10 @@ Level 2 (Bus Agent chats):
   (`startAgentBusListening`), delivering incoming messages into chats, and the
   `send_to_chat` / `send_to_agent` tools.
 - `HopscotchWebIDE.ns` — the one line that starts the subscription after launch.
+- `HostForCroquet.ns` — the collaborative host: the coordinated `Performer` that
+  elects one client per exchange, and `canPerformHere:` for a client that must
+  abstain (§3.5). `AI_IDE_Support agentReachableHere:then:` asks the local front
+  door; `croquet-probes/bus-locality-probe.js` tests the whole path with two
+  clients behind two front doors.
 - `HOST_SERVICES_DESIGN_2026-08-31.md` — the design rationale and the wider host
   services of which the bus is one part.

@@ -184,6 +184,59 @@ would be better).
 - Probe lesson: `cm.setValue` in a probe is now a PROGRAMMATIC change and is
   not published; type with CDP `Input.insertText` (harness exposes `send`).
 
+## 2026-09-13 (later still): a failed coordinated fetch is an ANSWER, not a vacancy
+
+Found with the probe's `FAIL_TURN=1` (the mock provider answers a turn's text
+request with HTTP 500 once; the user clicks Retry). Under the old semantics a
+failure DELETED the model's entry "so a retry can re-elect" and the failure
+broadcast was unrecorded. A late joiner replaying the Send then found no entry
+for the first attempt's key (`fetch.<digest>.1`), was elected, and POSTed the
+original request to the provider itself: a call the original never made, a
+reply the original never saw (the mock's third text reply against the
+original's first), no Retry row (its fetch had succeeded) so the replayed
+Retry click orphaned, the retry's recorded answer (`.2`) held forever, and
+every later key diverged (6 of 13 checks failed).
+
+Fix: record failures the way loaded answers are recorded.
+
+- Model (`meta/croquet-post.js`, and the embedded copy in
+  `DeploymentManager.ns`): `coordinatedFetch_failed` keeps the entry as
+  `{status: 'failed', reason}` and `publishEventAndData`s the failed event; a
+  request against a failed entry gets a recorded repeat failure (as a loaded
+  entry gets a repeat loaded); an await against one gets an unrecorded
+  `model_coordinatedFetch_awaitedFailure` (as `awaited`). Nothing re-elects
+  for the same key: every live caller reaches the coordinator through
+  `HostForCroquet`, which mints a key per ATTEMPT (`sharingKeyFor:` /
+  `performKeyFor:` ordinals), so a retry is a new request under a new key. No
+  raw-key caller that retried under the same key remains (Documents go through
+  the host fetcher).
+- Client (`HopscotchForCroquet.ns` `subscribeCoordinatedFetchEventsFor:`):
+  the failed handler is subscribed through `subscribeFragment:` (counted, the
+  event is now in the history); `awaitedFailure` through `nsSubscribe`
+  (uncounted). The replay loop's 10s requester wait and the held-answer stash
+  already cover the new event: they key on the `nscoordfetch_` scope.
+
+Result (TEST artifacts, `NS_SUFFIX=-TEST NS_PAGE=croquetpsoup-test.html
+FAIL_TURN=1 PROVIDER=openai-compat`): 13/13. Storyline: the completion's
+failure is event 35, the Retry click 36, the retry's answer 37; the joiner
+replays with 0 orphans and 0 held answers (so it showed the Retry row and the
+click found its button), the provider saw exactly 5 requests, and every answer
+recorded after the join repeats a known key (the model re-records answers to
+late requests by design - "no new recorded events after join" is the WRONG
+observable; the probe now checks for NEW KEYS).
+
+Side effect worth knowing: model-discovery failures (Anthropic 401 without a
+key, Ollama's port refusing) are now in the history too (events 1 and 5 of the
+storyline), so a joiner meets the recorded failure rather than trying its own
+discovery - consistent with everything else coordinated.
+
+Also found on the way, not Croquet: a chat embedded in a class presenter's
+region (inline `IDEChatSubject`) had a no-op applied hook, so a user's Apply
+click never queued the "user applied your proposed changeset" notice for the
+model (only the choke point's "codebase changed" line). Fixed in
+`AI_IDE_Support.ns` `changesetSubjectFor:`; the probe's `NOTICE=1` recipe
+checks both notices ride turn 2's first request.
+
 ## Files
 
 - `HopscotchForCroquet.ns` — `respondToChange:`, `respondToBeforeChange:`,

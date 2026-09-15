@@ -265,7 +265,7 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 		public createSession: provider <Provider> ^<Session> = (
 			| session <Session> |
 			session:: Session provider: provider tools: (toolsForProvider: provider).
-			session systemPrompt: newspeakSystemPrompt.
+			session systemPrompt: (systemPromptFor: session).
 			^session
 		)
 		public createPresenter = (
@@ -1752,7 +1752,7 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 			   bus-backed turn gets a far more generous watchdog. *)
 				session requestTimeoutMs: 600000
 			].
-		session systemPrompt: newspeakSystemPrompt.
+		session systemPrompt: (systemPromptFor: session).
 		^session
 	)
 	chatProviderOf: doc <Document> ^<String> = (
@@ -3353,6 +3353,7 @@ public clearConversation = ( ide aiSupport clearConversationFor: self )
 		msg isNil ifTrue: [ ^self ].
 		kind:: [ msg at: 'kind' ] on: Exception do: [:e | 'message' ].
 		kind = 'completion_response' ifTrue: [ ^deliverCompletionResponse: msg ].
+		kind = 'completion_progress' ifTrue: [ ^deliverCompletionProgress: msg ].
 		
 		(* The front door echoes EVERY frame to every stream, this client's own
 	   completion requests to an agent included. Only frames that address a
@@ -3465,6 +3466,26 @@ public clearConversation = ( ide aiSupport clearConversationFor: self )
 					do: [:e | nil ]
 			]
 			ifFalse: [ [ (entry at: 1) value: response ] on: Exception do: [:e | nil ] ]
+	)
+	deliverCompletionProgress: msg <Alien> = (
+		(* The heartbeat: an external agent, mid-request, reporting what it is
+	   doing (one frame per tool call it makes, from bus-claude.py). Only a
+	   frame for a request still pending counts; it reaches the chat's session,
+	   which pushes its watchdog out and shows the text as the turn's phase.
+	   Nothing is recorded and no turn is driven: a heartbeat is per-client
+	   status, like the watchdog it feeds. *)
+		
+		| corrId to doc text |
+		corrId:: [ msg at: 'corr_id' ] on: Exception do: [:e | nil ].
+		corrId isNil ifTrue: [ ^self ].
+		(pendingCompletions includesKey: corrId) ifFalse: [ ^self ].
+		to:: [ msg at: 'to' ] on: Exception do: [:e | nil ].
+		to isNil ifTrue: [ ^self ].
+		doc:: chatDocNamed: to.
+		doc isNil ifTrue: [ ^self ].
+		text:: [ msg at: 'text' ] on: Exception do: [:e | '' ].
+		text isNil ifTrue: [ text:: '' ].
+		[ doc session noteProviderProgress: text ] on: Exception do: [:e | nil ]
 	)
 	listChatSessionsToolForFocus: focus <ChatFocus> ^<Tool> = (
 		^Tool name: 'list_chat_sessions'
@@ -4629,11 +4650,55 @@ Side-effecting expressions (collection mutations, slot assignments via setters, 
 	public createSessionWithProvider: provider <Provider> ^<Session> = (
 		| session |
 		session:: Session provider: provider tools: (toolsForProvider: provider).
-		session systemPrompt: newspeakSystemPrompt.
+		session systemPrompt: (systemPromptFor: session).
 		^session
 	)
 	public createChatWithProvider: provider <Provider> ^<IDEChatSubject> = (
 		^IDEChatSubject onModel: (createSessionWithProvider: provider)
+	)
+	public systemPromptFor: session <Session> ^<String> = (
+		(* The static prompt plus the turn budget THIS session lives under, so the
+	   model can pace itself. The budgets differ by an order of magnitude - a
+	   hosted model's request is bounded at two minutes, a bus-backed agent's at
+	   ten - and a model that does not know its budget learns it only by being
+	   abandoned: the user sees nothing, and every later message resumes the same
+	   unfinished work and is abandoned again (2026-09-14, a bridge session that
+	   ran six-minute probes inside nine-minute turns, four times over). *)
+		
+		| req tool heartbeat |
+		req:: session requestTimeoutMs.
+		req isNil ifTrue: [ req:: 120000 ].
+		tool:: session toolTimeoutMs.
+		tool isNil ifTrue: [ tool:: 180000 ].
+		heartbeat:: [ session provider isKindOfBusProvider ] on: Exception
+			do: [:e | false ].
+		^newspeakSystemPrompt , (turnTimingSectionRequestMs: req
+			toolMs: tool
+			heartbeat: heartbeat)
+	)
+	turnTimingSectionRequestMs: req <Integer> toolMs: tool <Integer> heartbeat: heartbeat <Boolean> ^<String> = (
+		| secs = [:ms |
+			ms <= 0 ifTrue: [ 'unlimited' ]
+				ifFalse: [ (ms // 1000) printString , ' seconds' ]
+		]. |
+		^'
+
+# Turn timing (this session)
+
+Each of your replies must arrive within a fixed budget, or the IDE abandons the turn: the user sees only a timeout, nothing you did reaches the chat, and their next message resumes the same unfinished work and times out again - the chat is effectively dead until you stop.
+
+- Budget for one reply (from the user''s message, or a tool result, to your next reply): ' , (secs value: req) , '.
+- Budget for the IDE to run one tool call you made: ' , (secs value: tool) , '.
+' , (heartbeat ifTrue: [
+				'
+The budget bounds SILENCE, not the whole reply: every tool call you make on your own machine is reported to the IDE as a heartbeat, which restarts the clock and shows the user what you are doing. So a long run of tool calls is safe; a single tool call that itself runs longer than the budget (a probe, a build, a long test suite) is not - run such things in the background and report when they finish.'
+			]
+			ifFalse: [
+				'
+There is no heartbeat: the only way to keep the chat alive is to reply within the budget. So never start work inside a turn that cannot finish within it.'
+			]) , '
+
+Reply first - say what you have found so far and what you are about to do - and end the turn; do long work in a later turn, in the background where you can, and report when the user asks or when it completes. Frequent short replies beat one long silent one: while you are silent the user cannot tell working from stuck.'
 	)
 	public newspeakSystemPrompt ^<String> = (
 		^'You are a programming assistant for the Newspeak programming language, embedded in the Newspeak Web IDE. Use the tools listed below to look up actual definitions in the user''s running IDE rather than guessing from training — Newspeak documentation is sparse and recall is unreliable. Prefer concise answers; when the user asks about code, show the source you found via tools.

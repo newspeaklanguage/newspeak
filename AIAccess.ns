@@ -1367,6 +1367,13 @@ class AIAccess usingPlatform: platform = Object new (
 			public phase <String> ::= 'idle'.
 			public phaseStartedAt <Number> ::= 0.
 			
+			(* Heartbeat. A provider that can report progress mid-request (a bus-backed
+		   agent, one frame per tool call it makes) calls noteProviderProgress:,
+		   which pushes the request watchdog's deadline out to now + the request
+		   budget: the budget bounds SILENCE, not the whole request. JS wall-clock
+		   ms; 0 (or nil, on a session that predates the slot) means no extension. *)
+			public progressUntil <Number> ::= 0.
+			
 			(* Token accounting, from provider usageOf:. lastUsage is the most recent
 		   request's normalised map (#input #output #cacheRead #cacheWrite); the
 		   totals accumulate over the session. requestCount counts provider
@@ -1537,15 +1544,23 @@ class AIAccess usingPlatform: platform = Object new (
 	   ignores later settlement), so a lost clearTimeout would be a
 	   waste, not a bug. *)
 			
-			| deferred <Alien> rejectFn <Alien> timerId contenders <Alien[Array]> |
+			| deferred <Alien> rejectFn <Alien> timerId contenders <Alien[Array]> fire |
 			ms <= 0 ifTrue: [ ^promise ].
 			deferred:: JSPromise withResolvers.
 			rejectFn:: deferred at: 'reject'.
-			timerId:: global setTimeout: [
-					rejectFn call: js undefined with: reason.
-					nil
-				]
-				with: ms.
+			progressUntil:: 0.
+			
+			(* When the timer fires, a heartbeat (noteProviderProgress:) may have
+		   pushed the deadline out; if so, sleep again until then rather than
+		   reject. Otherwise the silence really lasted the whole budget. *)
+			fire:: [
+				| left |
+				left:: (progressUntil isNil ifTrue: [ 0 ] ifFalse: [ progressUntil ]) - nowMs.
+				left > 0 ifTrue: [ timerId:: global setTimeout: fire with: left ]
+					ifFalse: [ rejectFn call: js undefined with: reason ].
+				nil
+			].
+			timerId:: global setTimeout: fire with: ms.
 			contenders:: createJSArray.
 			contenders push: promise.
 			contenders push: (deferred at: 'promise').
@@ -1557,6 +1572,15 @@ class AIAccess usingPlatform: platform = Object new (
 					global clearTimeout: timerId.
 					JSPromise reject: err
 				]
+		)
+		public noteProviderProgress: text <String> = (
+			(* The heartbeat: the provider (an external agent over the bus) reports
+		   what it is doing mid-request. Push the request watchdog out by a full
+		   budget from now - the budget bounds silence - and show the text as the
+		   turn's phase so the status view says what the agent is doing. *)
+			
+			progressUntil:: nowMs + effectiveRequestTimeoutMs.
+			enterPhase: 'agent: ' , text
 		)
 		effectiveRequestTimeoutMs ^<Integer> = (
 			(* Nil-tolerant read: a Session that predates these slots (schema
@@ -3289,6 +3313,12 @@ class AIAccess usingPlatform: platform = Object new (
 			private port = aPort.
 		|
 	) (
+		public isKindOfBusProvider ^<Boolean> = (
+			(* A bus-backed provider can heartbeat (Session noteProviderProgress:),
+		   which the system prompt's turn-timing section tells the model about. *)
+			
+			^true
+		)
 		public complete: messages <Alien[Array]> system: systemPrompt <String> notices: notices <List[String]> tools: tools <Alien[Array] | UndefinedObject> maxTokens: maxTokens <Integer> ^<Alien[Promise]> = (
 			(* Ship an Anthropic-style request over the bus and resolve to the
 	   external agent's response. Rejections come back as JSPromise reject:,

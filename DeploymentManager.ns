@@ -877,8 +877,72 @@ async function nsResolvePayload(e) {
 // it. The RAW handler is recorded too: replayEvents must invoke handlers
 // inline from its own chain thunks (see there), where calling the wrapped form
 // would re-enqueue and decouple lookup order from execution order.
+/* Divergence alarm.
+
+   The invariant every synchronized fragment rests on: a recorded event''s
+   address (scope + fragment id + event kind) names a live, subscribed fragment
+   on EVERY client. When a client has minted ids in a different order, an event
+   lands on a fragment that is not there - and until now that was silent live:
+   Croquet delivers to no one, the client''s state quietly stops matching, and
+   the failure surfaces hundreds of events later as a dead chat, debugged
+   backwards. (Replay had its own "no subscriber" warning; this is the live
+   counterpart.)
+
+   The check is per event and deterministic - no digests, no timing races
+   between concurrent users. The root model tells its own view about every
+   event it records (nsEventRecorded, a local model-to-view publish: nothing
+   crosses the reflector). The view counts how many events it EXPECTS per
+   address and how many were actually DELIVERED to a handler; when, after a
+   bounded wait for deferred realization, delivered lags expected, it reports
+   the event: index, address, and whether the fragment was ever here (retired -
+   a late event for something this client legitimately disposed of, e.g. a
+   click racing a navigation - is a warning, not a divergence). nsDivergences
+   keeps the reports for the probes. */
+const nsExpectedDeliveries = new Map(), nsActualDeliveries = new Map();
+const nsRetiredKeys = new Set();
+const nsDivergences = [];
+const NS_DELIVERY_WAIT_MS = 15000;
+
+function nsNoteDelivered(key) {
+    nsActualDeliveries.set(key, (nsActualDeliveries.get(key) || 0) + 1);
+}
+
+function nsCheckDelivery(n) {
+    const e = theModel && theModel.newspeakEvents[n];
+    if (!e) return;
+    // A coordinated answer this client never asked for is benign (see replayEvents).
+    if (e.scope === ''nscoordfetch_'') return;
+    const key = e.scope + e.fid + e.eventSpec;
+    nsExpectedDeliveries.set(key, (nsExpectedDeliveries.get(key) || 0) + 1);
+    const expected = nsExpectedDeliveries.get(key);
+    const started = Date.now();
+    const poll = () => {
+        if ((nsActualDeliveries.get(key) || 0) >= expected) return;
+        if (Date.now() - started < NS_DELIVERY_WAIT_MS) { setTimeout(poll, 250); return }
+        const retired = nsRetiredKeys.has(key);
+        const report = {event: n, key: key, scope: e.scope, fid: e.fid, eventSpec: e.eventSpec,
+                        retired: retired, expected: expected, delivered: nsActualDeliveries.get(key) || 0};
+        nsDivergences.push(report);
+        const where = ''recorded event '' + n + '' ('' + e.eventSpec + '' for '' + e.scope + e.fid + '')'';
+        if (retired) {
+            console.warn(''Croquet: '' + where + '' arrived for a fragment this client had retired; '' +
+                ''harmless if every client retired it too (a click racing a navigation), '' +
+                ''a divergence if not'');
+        } else {
+            console.error(''Croquet DIVERGENCE: '' + where + '' was never delivered on this client - '' +
+                ''no fragment here is subscribed at that address, so this client minted ids in a '' +
+                ''different order (or lost the fragment). Ledger (mintLedger=on) names the first '' +
+                ''differing mint; nsDivergences holds the report.'');
+        }
+    };
+    setTimeout(poll, 250);
+}
+
+function nsDivergenceCount() { return nsDivergences.length }
+
 function nsSubscribe(scope, eventSpec, handler) {
     const wrapped = e => {
+	nsNoteDelivered(scope + eventSpec);
 	nsDispatchChain = nsDispatchChain.then(async () => {
 	    try {
 		handler(await nsResolvePayload(e));
@@ -904,6 +968,7 @@ function nsUnsubscribe(scope, eventSpec) {
     const entry = newspeakSubscriptions.get(key);
     if (!entry) return;
     newspeakSubscriptions.delete(key);
+    nsRetiredKeys.add(key);
     if (theView && theView.session) {
 	theView.unsubscribe(scope, eventSpec, entry.handler);
     }
@@ -964,6 +1029,8 @@ Only afterward is the snapshot state restored in the new model. Next a new root 
 
     addEvent(e){
 	this.newspeakEvents.push(e);
+	// Local (model-to-view) notice for the divergence alarm, nsCheckDelivery.
+	this.publish(this.sessionId, ''nsEventRecorded'', this.newspeakEvents.length - 1);
 	// Debounced persistence: one pending future per burst of events; the
 	// flag is model state, so it snapshots/restores consistently.
 	if (!this.persistPending) {
@@ -1331,6 +1398,7 @@ class NewspeakCroquetView extends Croquet.View {
 	if (!nsSyncRandomSeeded) { nsSyncRandomSeeded = true; nsSyncRandomSeed(this.sessionId); }
 	this.presenter = presenter;
 	storeModelAndView(model, this);
+	this.subscribe(this.sessionId, ''nsEventRecorded'', nsCheckDelivery);
 	replaySubscriptions();
 	this.replay();
     }
@@ -1377,6 +1445,7 @@ class NewspeakCroquetView extends Croquet.View {
 			'') after '' + waited + ''ms, event '' + n + '' of '' + total + '' - skipped'');
 		    return;
 		}
+		nsNoteDelivered(k);
 		try {
 		    // raw, not the wrapped handler: wrapped would re-enqueue at
 		    // the chain''s tail, decoupling execution from this slot.

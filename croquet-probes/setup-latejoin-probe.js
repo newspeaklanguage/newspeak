@@ -592,6 +592,13 @@ async function main() {
   const held = B.logs.filter(l => l.includes('holding early answer') || l.includes('delivering held answer'));
   check('B caught up', caught, secs + 's');
   check('B replay is orphan-free', orph.length === 0, orph.length + ' skips');
+  /* The live divergence alarm (croquet-post.js nsCheckDelivery): a recorded
+     event never delivered on a client is reported there at the moment it
+     happens; a clean run reports nothing on either client. */
+  const DIVS = "typeof nsDivergences === 'undefined' ? null : JSON.stringify(nsDivergences)";
+  const divA = await A.v(DIVS), divB = await B.v(DIVS);
+  if (divA === null) console.log('  (this build has no divergence alarm)');
+  else check('no divergence reported on A or B', divA === '[]' && divB === '[]', 'A=' + divA + ' B=' + divB);
   if (orph.length) console.log('B orphans:\n' + orph.map(l => '    ' + l.slice(0, 220)).join('\n'));
   console.log('B held answers: ' + held.length + (held.length ? '\n' + held.map(l => '    ' + l.slice(0, 220)).join('\n') : ''));
   const expectedRequests = (TURNS + (INBOUND ? 1 : 0)) * (TOOL_TURNS ? 2 : 1) + (FAIL_TURN ? 1 : 0);

@@ -171,7 +171,18 @@ clients use `/_ns/git`. Once you're confident no un-rebuilt client anywhere
 still points at `:9999`, the legacy-listener code in `cors-proxy.py` can be
 deleted outright rather than kept as an opt-in escape hatch.
 
-### 7. Inbound bus traffic is not coordinated
+### 7. ~~Inbound bus traffic is not coordinated~~ DONE 2026-09-14
+
+**Built as described below**: newspeak `d6ef14e` + psoup `122cbc8`. Inbound
+messages and notices now go through a synchronized inbox
+(`hopscotch synchronizedInbox:post:payload:`, applied by
+`AI_IDE_Support>>applyBusEvent:`): the client that receives a frame posts it
+once, keyed by the stream's event id, and every participant applies it in the
+recorded order. The INBOUND probe mode passes 14/14. With this, every
+host-services item that the Croquet host was designed around is closed; the
+remaining items (2–6) are independent of Croquet.
+
+The description as it stood while open:
 
 The one gap the Croquet host leaves open, and it is recorded in
 `HostForCroquet>>busAvailable`'s comment so it cannot be lost. Outbound is

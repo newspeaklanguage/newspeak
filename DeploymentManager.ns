@@ -847,6 +847,17 @@ function nsPublish(scope, eventSpec, data) {
 		// message id beside the data, and the model needs it visible).
 		payload = Object.assign({}, data, {data: {__nsDetouredPayload: true, handle: handle}});
 	    }
+	    // The publisher''s label rides along for the divergence alarm''s label
+	    // check (nsCheckLabel): the model records it beside the event. A bare
+	    // fragment id becomes {fid, label, bare: true}; the model''s
+	    // publishEvent unwraps it (nsBareFid). No label registered (a
+	    // coordinated fetch, an inbox post, an old vfuel): payload unchanged.
+	    const fid = isEnvelope ? data.fid : (typeof data === ''string'' ? data : null);
+	    const label = fid === null ? undefined : nsFragmentLabels.get(scope + fid);
+	    if (label !== undefined) {
+		payload = isEnvelope ? Object.assign({}, payload, {label: label})
+		                     : {fid: data, label: label, bare: true};
+	    }
 	    theView.publish(scope, eventSpec, payload);
 	} catch (err) {
 	    console.error(''nsPublish ('' + scope + '' '' + eventSpec + '') failed; event not sent:'', err);
@@ -903,6 +914,41 @@ const nsRetiredKeys = new Set();
 const nsDivergences = [];
 const NS_DELIVERY_WAIT_MS = 15000;
 
+/* The alarm''s second half: the label check. The delivery count above is
+   silent when a fragment of the SAME kind happens to sit at the address -
+   ids shifted by one inside a presenter, so a click recorded for Apply is
+   delivered to Cancel (the ledger''s finding of 2026-09-14). So each
+   subscription registers what its fragment IS - its croquetLabel
+   (HopscotchForCroquet): enclosing presenter, kind, and a button''s or
+   link''s text - the publisher''s label rides in the recorded event (nsPublish,
+   publishEvent), and every client compares the two at the address on
+   receipt: live from nsCheckDelivery once the event has been delivered,
+   under replay from replayEvents before it is dispatched. Deterministic per
+   event, like the count. Reported once, kind ''label''. An event recorded by a
+   build without labels carries none and is not checked; nor is an address
+   this client has no label for. Labels are kept for the session (an address
+   is re-subscribed with its current label on every re-display; a retired
+   one costs a few bytes). */
+const nsFragmentLabels = new Map();   // subscriber scope (type marker + fid) -> label
+
+// A bare payload as the model receives it: the fragment id itself, or the
+// {fid, label, bare} wrapper nsPublish sends for a labelled publisher.
+function nsBareFid(p) { return (p && typeof p === ''object'' && p.bare) ? p.fid : p }
+function nsBareLabel(p) { return (p && typeof p === ''object'' && p.bare) ? p.label : undefined }
+
+function nsCheckLabel(n, e, key) {
+    if (e.label == null) return false;
+    const mine = nsFragmentLabels.get(e.scope + e.fid);
+    if (mine == null || mine === e.label) return false;
+    nsDivergences.push({event: n, key: key, kind: ''label'', scope: e.scope, fid: e.fid,
+                        eventSpec: e.eventSpec, published: e.label, here: mine});
+    console.error(''Croquet DIVERGENCE: recorded event '' + n + '' ('' + e.eventSpec + '' for '' +
+        e.scope + e.fid + '') was published by "'' + e.label + ''" but the fragment at that '' +
+        ''address on this client is "'' + mine + ''": this client minted ids in a different '' +
+        ''order. Ledger (mintLedger=on) names the first differing mint; nsDivergences holds the report.'');
+    return true;
+}
+
 function nsNoteDelivered(key) {
     nsActualDeliveries.set(key, (nsActualDeliveries.get(key) || 0) + 1);
 }
@@ -917,10 +963,10 @@ function nsCheckDelivery(n) {
     const expected = nsExpectedDeliveries.get(key);
     const started = Date.now();
     const poll = () => {
-        if ((nsActualDeliveries.get(key) || 0) >= expected) return;
+        if ((nsActualDeliveries.get(key) || 0) >= expected) { nsCheckLabel(n, e, key); return }
         if (Date.now() - started < NS_DELIVERY_WAIT_MS) { setTimeout(poll, 250); return }
         const retired = nsRetiredKeys.has(key);
-        const report = {event: n, key: key, scope: e.scope, fid: e.fid, eventSpec: e.eventSpec,
+        const report = {event: n, key: key, kind: ''delivery'', scope: e.scope, fid: e.fid, eventSpec: e.eventSpec,
                         retired: retired, expected: expected, delivered: nsActualDeliveries.get(key) || 0};
         nsDivergences.push(report);
         const where = ''recorded event '' + n + '' ('' + e.eventSpec + '' for '' + e.scope + e.fid + '')'';
@@ -940,7 +986,9 @@ function nsCheckDelivery(n) {
 
 function nsDivergenceCount() { return nsDivergences.length }
 
-function nsSubscribe(scope, eventSpec, handler) {
+// label (optional): the subscribing fragment''s croquetLabel, registered for
+// the address for the alarm''s label check (nsCheckLabel); nothing else reads it.
+function nsSubscribe(scope, eventSpec, handler, label) {
     const wrapped = e => {
 	nsNoteDelivered(scope + eventSpec);
 	nsDispatchChain = nsDispatchChain.then(async () => {
@@ -951,8 +999,9 @@ function nsSubscribe(scope, eventSpec, handler) {
 	    }
 	});
     };
+    if (label != null) nsFragmentLabels.set(scope, label);
     newspeakSubscriptions.set(scope + eventSpec,
-	{scope: scope, eventSpec: eventSpec, handler: wrapped, raw: handler});
+	{scope: scope, eventSpec: eventSpec, handler: wrapped, raw: handler, label: label});
     theView.subscribe(scope, eventSpec, wrapped);
 }
 
@@ -1050,13 +1099,23 @@ Only afterward is the snapshot state restored in the new model. Next a new root 
 	}));
     }
 
-    publishEventAndData(scope, eventSpec, data, fid) {
-	this.addEvent({scope: scope, eventSpec: eventSpec, fid: fid, data: data});
+    // label: the publisher''s croquetLabel when nsPublish attached one; recorded
+    // beside the event for the alarm''s label check, absent otherwise so an
+    // event''s record keeps its old shape.
+    publishEventAndData(scope, eventSpec, data, fid, label) {
+	const e = {scope: scope, eventSpec: eventSpec, fid: fid, data: data};
+	if (label != null) e.label = label;
+	this.addEvent(e);
 	this.publish(scope + fid, eventSpec, data);
     }
 
-    publishEvent(scope, eventSpec, fid) {
-	this.addEvent({scope: scope, eventSpec: eventSpec, fid: fid, data: fid});
+    // p: a bare fragment id, or {fid, label, bare: true} from a publisher
+    // with a registered label (nsPublish).
+    publishEvent(scope, eventSpec, p) {
+	const fid = nsBareFid(p);
+	const e = {scope: scope, eventSpec: eventSpec, fid: fid, data: fid};
+	if (nsBareLabel(p) != null) e.label = nsBareLabel(p);
+	this.addEvent(e);
 	this.publish(scope + fid, eventSpec);
     }
 
@@ -1232,68 +1291,69 @@ Only afterward is the snapshot state restored in the new model. Next a new root 
 	this.publishEvent(''nsradiobutton_'', ''model_radioButton_pressed'', fid);
     }
     codeMirror_beforeChange(nsOptions){
-	this.publishEventAndData(''nscodemirror_'', ''model_codeMirror_beforeChange'', nsOptions.data, nsOptions.fid);
+	this.publishEventAndData(''nscodemirror_'', ''model_codeMirror_beforeChange'', nsOptions.data, nsOptions.fid, nsOptions.label);
     }
     codeMirror_change(nsOptions){
-	this.publishEventAndData(''nscodemirror_'', ''model_codeMirror_change'', nsOptions.data, nsOptions.fid);
+	this.publishEventAndData(''nscodemirror_'', ''model_codeMirror_change'', nsOptions.data, nsOptions.fid, nsOptions.label);
     }
     codeMirror_keydown(nsOptions){
-	this.publishEventAndData(''nscodemirror_'', ''model_codeMirror_keydown'', nsOptions.data, nsOptions.fid);
+	this.publishEventAndData(''nscodemirror_'', ''model_codeMirror_keydown'', nsOptions.data, nsOptions.fid, nsOptions.label);
     }
     codeMirror_accept(nsOptions){
-	this.publishEventAndData(''nscodemirror_'', ''model_codeMirror_accept'', nsOptions.data, nsOptions.fid);
+	this.publishEventAndData(''nscodemirror_'', ''model_codeMirror_accept'', nsOptions.data, nsOptions.fid, nsOptions.label);
     }
     codeMirror_cancel(nsOptions){
-	this.publishEventAndData(''nscodemirror_'', ''model_codeMirror_cancel'', nsOptions.data, nsOptions.fid);
+	this.publishEventAndData(''nscodemirror_'', ''model_codeMirror_cancel'', nsOptions.data, nsOptions.fid, nsOptions.label);
     }
     codeMirror_beforeSelectionChange(nsOptions){
-	this.publishEventAndData(''nscodemirror_'', ''model_codeMirror_beforeSelectionChange'', nsOptions.data, nsOptions.fid);
+	this.publishEventAndData(''nscodemirror_'', ''model_codeMirror_beforeSelectionChange'', nsOptions.data, nsOptions.fid, nsOptions.label);
     }
     textEditor_accept(nsOptions){
-	this.publishEventAndData(''nstexteditor_'', ''model_textEditor_accept'', nsOptions.data, nsOptions.fid);
+	this.publishEventAndData(''nstexteditor_'', ''model_textEditor_accept'', nsOptions.data, nsOptions.fid, nsOptions.label);
     }
     textEditor_change(nsOptions){
-	this.publishEventAndData(''nstexteditor_'', ''model_textEditor_change'', nsOptions.data, nsOptions.fid);
+	this.publishEventAndData(''nstexteditor_'', ''model_textEditor_change'', nsOptions.data, nsOptions.fid, nsOptions.label);
     }
     textEditor_cancel(nsOptions){
-	this.publishEventAndData(''nstexteditor_'', ''model_textEditor_cancel'', nsOptions.data, nsOptions.fid);
+	this.publishEventAndData(''nstexteditor_'', ''model_textEditor_cancel'', nsOptions.data, nsOptions.fid, nsOptions.label);
     }
     toggleComposer_toggle(fid){
 	this.publishEvent(''nstogglecomposer_'', ''model_toggleComposer_toggle'', fid);
     }
     picker_pick(nsOptions){
-	this.publishEventAndData(''nspicker_'', ''model_picker_pick'', nsOptions.data, nsOptions.fid);
+	this.publishEventAndData(''nspicker_'', ''model_picker_pick'', nsOptions.data, nsOptions.fid, nsOptions.label);
     }
     color_picker_pick(nsOptions){
-	this.publishEventAndData(''nscolorpicker_'', ''model_colorPicker_pick'', nsOptions.data, nsOptions.fid);
+	this.publishEventAndData(''nscolorpicker_'', ''model_colorPicker_pick'', nsOptions.data, nsOptions.fid, nsOptions.label);
     }
     date_picker_pick(nsOptions){
-	this.publishEventAndData(''nsdatepicker_'', ''model_datePicker_pick'', nsOptions.data, nsOptions.fid);
+	this.publishEventAndData(''nsdatepicker_'', ''model_datePicker_pick'', nsOptions.data, nsOptions.fid, nsOptions.label);
     }
     time_picker_pick(nsOptions){
-	this.publishEventAndData(''nstimepicker_'', ''model_timePicker_pick'', nsOptions.data, nsOptions.fid);
+	this.publishEventAndData(''nstimepicker_'', ''model_timePicker_pick'', nsOptions.data, nsOptions.fid, nsOptions.label);
     }
     slider_pick(nsOptions){
-	this.publishEventAndData(''nsslider_'', ''model_slider_pick'', nsOptions.data, nsOptions.fid);
+	this.publishEventAndData(''nsslider_'', ''model_slider_pick'', nsOptions.data, nsOptions.fid, nsOptions.label);
     }
-    dropDownMenu_click(fid){
-	this.publishEventAndData(''nsdropdownmenu_'', ''model_dropDownMenu_click'', fid, fid);
+    dropDownMenu_click(p){
+	const fid = nsBareFid(p);
+	this.publishEventAndData(''nsdropdownmenu_'', ''model_dropDownMenu_click'', fid, fid, nsBareLabel(p));
     }
     menu_click(nsOptions){
-	this.publishEventAndData(''nsmenu_'', ''model_menu_click'', nsOptions.data, nsOptions.fid);
+	this.publishEventAndData(''nsmenu_'', ''model_menu_click'', nsOptions.data, nsOptions.fid, nsOptions.label);
     }
     shell_userBack(nsOptions){
-	this.publishEventAndData(''nsshell_'', ''model_shell_userBack'', nsOptions.data, nsOptions.fid);
+	this.publishEventAndData(''nsshell_'', ''model_shell_userBack'', nsOptions.data, nsOptions.fid, nsOptions.label);
     }
     shell_activeMenuBlurred(fid){
 	console.log(''shell_activeMenuBlurred '' + fid);
 	this.publishEvent(''nsshell_'', ''model_shell_activeMenuBlurred'', fid);
     }
     fileChooser_click(nsOptions){
-	this.publishEventAndData(''nsfilechooser_'', ''model_fileChooser_click'', nsOptions.data, nsOptions.fid);
+	this.publishEventAndData(''nsfilechooser_'', ''model_fileChooser_click'', nsOptions.data, nsOptions.fid, nsOptions.label);
     }
     mediaCreator_setFile(nsOptions){
-	this.publishEventAndData(''nsmediacreator_'', ''model_mediaCreator_setFile'', nsOptions.data, nsOptions.fid);
+	this.publishEventAndData(''nsmediacreator_'', ''model_mediaCreator_setFile'', nsOptions.data, nsOptions.fid, nsOptions.label);
     }
     // Coordinated once-per-session fetches. Every client wanting the bytes
     // for a key publishes a request carrying its view id; the FIRST request
@@ -1322,11 +1382,11 @@ Only afterward is the snapshot state restored in the new model. Next a new root 
     }
     coordinatedFetch_loaded(nsOptions){
 	this.coordinatedFetches[nsOptions.fid] = {status: ''loaded'', handle: nsOptions.data};
-	this.publishEventAndData(''nscoordfetch_'', ''model_coordinatedFetch_loaded'', nsOptions.data, nsOptions.fid);
+	this.publishEventAndData(''nscoordfetch_'', ''model_coordinatedFetch_loaded'', nsOptions.data, nsOptions.fid, nsOptions.label);
     }
     coordinatedFetch_failed(nsOptions){
 	this.coordinatedFetches[nsOptions.fid] = {status: ''failed'', reason: nsOptions.data};
-	this.publishEventAndData(''nscoordfetch_'', ''model_coordinatedFetch_failed'', nsOptions.data, nsOptions.fid);
+	this.publishEventAndData(''nscoordfetch_'', ''model_coordinatedFetch_failed'', nsOptions.data, nsOptions.fid, nsOptions.label);
     }
     // Synchronized inbox: record one delivery per (topic, id). The delivery
     // is a recorded event under the topic''s scope, so every client - and
@@ -1446,6 +1506,9 @@ class NewspeakCroquetView extends Croquet.View {
 		    return;
 		}
 		nsNoteDelivered(k);
+		// The alarm''s label check, before dispatch: a replayed event whose
+		// publisher was labelled differently from the fragment here.
+		nsCheckLabel(n, e, k);
 		try {
 		    // raw, not the wrapped handler: wrapped would re-enqueue at
 		    // the chain''s tail, decoupling execution from this slot.

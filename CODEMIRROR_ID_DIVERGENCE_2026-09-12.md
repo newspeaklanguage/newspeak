@@ -140,10 +140,44 @@ damage but the counters are monotone within a scope too, so repeated renders in
 differing branches still drift. Not synchronizing per-client UI is the correct
 answer, and it is what the architecture already provides for.
 
-## Standing guard worth adding
+## Standing guard worth adding — BUILT 2026-09-14/15
 
 A divergence alarm: each client reports its minting-ledger length at
 synchronization points; a mismatch logs loudly *at the moment it happens* rather
 than hundreds of events later, naming the action responsible. The next construct
 that breaks the invariant then reports itself instead of being debugged from
 consequences.
+
+**As built** (croquet-post.js, mirrored in DeploymentManager.ns; HopscotchForCroquet.ns),
+in two halves, both deterministic per recorded event — no digests, no timing
+races between concurrent users:
+
+1. **Delivery count** (newspeak `75426ee`, psoup `44f9585`). The root model tells
+   its own view about every event it records (`nsEventRecorded`, a local
+   model-to-view publish). The view counts expected vs actual deliveries per
+   address (scope + fragment id + event kind) and, after a bounded wait for
+   deferred realization, reports an event that reached no handler:
+   `console.error('Croquet DIVERGENCE ...')`, or a warning if this client had
+   retired the fragment (a click racing a navigation). Silent when a fragment of
+   the *same kind* sits at the address — exactly the 2026-09-14 case (Cancel
+   where Apply should be), which delivered fine to the wrong button.
+2. **Label check** (2026-09-15). Every subscription registers what its fragment
+   IS — `Fragment>>croquetLabel`: the enclosing presenter's `presenterLabel`
+   (made public for this walk; `class` is not a public message), the fragment's
+   kind, and a button's or link's text, e.g.
+   `EvaluatorPresenter/ButtonFragment:Evaluate Selection`. The publisher's label
+   rides in the reflector payload (`nsPublish`; a bare fragment id becomes
+   `{fid, label, bare}` and the model's `publishEvent` unwraps it), is recorded
+   beside the event, and every client compares it with its own label at the
+   address on receipt — live once the event is delivered (`nsCheckDelivery` →
+   `nsCheckLabel`), under replay before dispatch. Old histories carry no labels
+   and are not checked. Labels must be identical on clients that are in sync:
+   nothing client-specific may enter one.
+
+Reports accumulate in `nsDivergences` (`kind: 'delivery' | 'label'`) for the
+probes. `setup-latejoin-probe.js` asserts a clean run reports nothing on either
+client, and its `PROVOKE=1` mode swaps two of B's button addresses, has A click
+one, and expects exactly one `label` report on B naming both labels (16/16 on
+the TEST build, 2026-09-15). Hazard found on the way: an unguarded `p class name`
+on another object raises, so every label was empty until `presenterLabel` was
+used — the census probe `label-census-probe.js` shows what a build registers.

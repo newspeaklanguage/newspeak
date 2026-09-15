@@ -43,6 +43,9 @@
  *                                  a joiner replaying the Send finds no answer for that key
  *                                  (remote provider only)
  *   JOIN_MS=240000                 how long to give B to catch up
+ *   PROVOKE=1                      last, two of B's buttons swap addresses and A clicks one:
+ *                                  the alarm's label check must report that event on B, and
+ *                                  only there (the delivery count alone cannot see it)
  */
 if (!process.env.NODE_PATH) {
   process.env.NODE_PATH = '/Users/gbracha/newspeak/dev/web/croquet/packages/reflector/node_modules';
@@ -107,6 +110,15 @@ const FAIL_TURN = Number(process.env.FAIL_TURN || 0);
    gets the third text reply. Bus provider only, and the chat gets a known
    name so the message can be addressed. */
 const INBOUND = process.env.INBOUND === '1';
+/* PROVOKE: after every other check, make B's fragment registry disagree with
+   A's the way a differently ordered mint does - two of B's buttons swap
+   addresses, each keeping its own handler and label under the other's scope -
+   then A clicks one of them. The click is recorded with A's label for that
+   address; on B the address IS delivered (the delivery count is satisfied),
+   but to the other button, whose label differs. The alarm's label check
+   (croquet-post.js nsCheckLabel) must report exactly that event on B, and
+   nothing on A. Last, because B is diverged from then on. */
+const PROVOKE = process.env.PROVOKE === '1';
 const CHAT_NAME = 'ProbeChat';
 const INBOUND_TEXT = 'unsolicited probe message from the agent';
 const replyNo = t => t + (INBOUND && t >= 2 ? 1 : 0);
@@ -701,6 +713,54 @@ async function main() {
   const errs = B.logs.filter(l => l.startsWith('[error]'));
   console.log('B console errors:', errs.length); errs.slice(0, 4).forEach(l => console.log('    ' + l.slice(0, 240)));
   console.log('--- B console tail ---'); console.log(B.logs.slice(-6).join('\n'));
+  if (PROVOKE) {
+    /* See PROVOKE above. The pair is chosen among B's labelled buttons whose
+       text is a clickable element on A's page right now, so the click lands. */
+    /* Texts that occur exactly once: the harness clicks by text, and a page
+       can show one label twice ('New Chat' in the chat controls and again in
+       an embedded chat), sending the click to a fragment other than the
+       swapped one (2026-09-15). */
+    const all = JSON.parse(await A.v("JSON.stringify(Array.from(document.querySelectorAll('button')).map(function(b){return (b.innerText||'').trim()}).filter(Boolean))"));
+    const texts = all.filter(t => all.indexOf(t) === all.lastIndexOf(t));
+    /* And, on B, texts that name exactly ONE subscribed button: a registry
+       keeps fragments the page no longer shows (the chat page's controls
+       after navigating to a class), and a text shared with one of those sends
+       the swap to a fragment the click cannot reach. */
+    const SWAP = `(function(){var want=${JSON.stringify(texts)};var count={},pick=[];` +
+      `var btns=[];newspeakSubscriptions.forEach(function(v){if(v.scope.indexOf('nsbutton_')!==0||v.eventSpec!=='model_button_click'||!v.label||v.label.indexOf(':')<0)return;` +
+      `var t=v.label.slice(v.label.indexOf(':')+1);count[t]=(count[t]||0)+1;btns.push([t,v])});` +
+      `btns.forEach(function(p){var t=p[0],v=p[1];if(pick.length>=2||count[t]!==1||want.indexOf(t)<0)return;pick.push(v)});` +
+      `if(pick.length<2)return 'NOPAIR';var a=pick[0],b=pick[1];` +
+      `theView.unsubscribe(a.scope,a.eventSpec,a.handler);theView.unsubscribe(b.scope,b.eventSpec,b.handler);` +
+      `newspeakSubscriptions.delete(a.scope+a.eventSpec);newspeakSubscriptions.delete(b.scope+b.eventSpec);` +
+      `nsSubscribe(a.scope,a.eventSpec,b.raw,b.label);nsSubscribe(b.scope,b.eventSpec,a.raw,a.label);` +
+      `return JSON.stringify({a:a.label,b:b.label,aScope:a.scope,bScope:b.scope})})()`;
+    const swapped = await B.v(SWAP);
+    check('PROVOKE: B had two labelled buttons to swap', swapped !== 'NOPAIR', swapped === 'NOPAIR' ? 'A buttons: ' + texts.join('|') : swapped);
+    if (swapped !== 'NOPAIR') {
+      const pair = JSON.parse(swapped);
+      const text = pair.a.slice(pair.a.indexOf(':') + 1);
+      const evBefore = await A.v('theModel.newspeakEvents.length');
+      const r = await A.v(click(text));
+      console.log('PROVOKE: A clicks "' + text + '": ' + r + ' (B now answers that address with "' + pair.b + '")');
+      const fired = await waitFor(B, "nsDivergences.some(function(d){return d.kind==='label'})", 30000);
+      /* What each client saw: the events recorded since the click (with any
+         label they carry) and the label each holds for the clicked address. */
+      const TAIL = `JSON.stringify(theModel.newspeakEvents.slice(${evBefore}).map(function(e){return [e.scope+e.fid, e.eventSpec, e.label === undefined ? '(no label)' : e.label]}))`;
+      console.log('PROVOKE: A events since click: ' + await A.v(TAIL));
+      console.log('PROVOKE: B events since click: ' + await B.v(TAIL));
+      const AT = `nsFragmentLabels.get(${JSON.stringify(pair.aScope)})`;
+      console.log('PROVOKE: label at ' + pair.aScope + ': A=' + await A.v(AT) + ' B=' + await B.v(AT));
+      console.log('PROVOKE: B delivered/expected at the address: ' + await B.v(`(nsActualDeliveries.get(${JSON.stringify(pair.aScope + 'model_button_click')})||0) + '/' + (nsExpectedDeliveries.get(${JSON.stringify(pair.aScope + 'model_button_click')})||0)`));
+      const divA2 = JSON.parse(await A.v('JSON.stringify(nsDivergences)')), divB2 = JSON.parse(await B.v('JSON.stringify(nsDivergences)'));
+      const labels = divB2.filter(d => d.kind === 'label');
+      check('PROVOKE: B reports the label divergence at the click', fired && labels.length === 1 && labels[0].event >= evBefore,
+        JSON.stringify(divB2));
+      check('PROVOKE: the report names the publisher\'s label and B\'s', labels.length === 1 && labels[0].published === pair.a && labels[0].here === pair.b,
+        labels.length ? 'published=' + labels[0].published + ' here=' + labels[0].here : 'no report');
+      check('PROVOKE: A, whose registry is right, reports nothing', divA2.length === 0, JSON.stringify(divA2));
+    }
+  }
   return done([A, B]);
 }
 function done(bs) {

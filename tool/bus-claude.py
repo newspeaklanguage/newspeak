@@ -39,6 +39,7 @@ Create a Bus Agent chat in the IDE whose Model field is <agent-name>, and talk.
 
 import argparse
 import json
+import queue
 import re
 import shlex
 import subprocess
@@ -59,6 +60,10 @@ import uuid
 # ~19 minutes in total, every second of it past the point of any use.
 TURN_BUDGET_S = 540
 MIN_RUN_S = 45          # below this there is no point starting a run at all
+# A run silent for this long is killed as stuck. Every tool call the agent
+# makes produces output, so genuine work is never silent for long; thinking
+# between tool calls is bounded by the model's own response time.
+IDLE_S = 300
 
 
 def fetch_token(origin):
@@ -300,9 +305,19 @@ _SESSION_GONE = re.compile(
     re.IGNORECASE)
 
 
-def run_claude(prompt, args, resume_session=None, timeout=TURN_BUDGET_S):
-    # --output-format json returns {result, session_id, is_error, …}.
-    cmd = [args.claude_bin, '-p', '--output-format', 'json']
+def run_claude(prompt, args, resume_session=None, timeout=TURN_BUDGET_S, progress=None):
+    """One `claude -p` run, streamed. Returns (result_text, session_id).
+
+    The run is watched line by line (--output-format stream-json) rather than
+    waited for as a whole, for two reasons. First, HEARTBEAT: every tool call
+    the agent makes is reported through `progress` while the run is still
+    going, and the bridge posts each one to the chat as a completion_progress
+    frame, so the IDE can restart its watchdog and show the user what the
+    agent is doing instead of silence. Second, the budget becomes two limits:
+    `timeout` still caps the whole run, but a run that has produced NOTHING
+    for IDLE_S is killed as stuck without waiting for the cap - a hung tool is
+    the common failure, and it looks exactly like thinking."""
+    cmd = [args.claude_bin, '-p', '--output-format', 'stream-json', '--verbose']
     if resume_session:
         cmd += ['--resume', resume_session]
     if args.claude_args:
@@ -311,18 +326,70 @@ def run_claude(prompt, args, resume_session=None, timeout=TURN_BUDGET_S):
     def run(on_stdin):
         # The prompt goes on stdin rather than argv. A resumed turn is a small
         # delta, but a cold turn carries the whole transcript plus its tool
-        # results — each of which the front door lets run to 256 KB — and macOS
+        # results - each of which the front door lets run to 256 KB - and macOS
         # caps a process's arguments plus environment at ~1 MB. Past that the
         # exec fails with E2BIG and the chat sees a bare bridge error, at
         # exactly the moment the history is most worth having.
-        return subprocess.run(
+        proc = subprocess.Popen(
             cmd if on_stdin else cmd + [prompt],
-            input=prompt if on_stdin else None,
-            cwd=args.cwd, capture_output=True, text=True, timeout=timeout)
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            cwd=args.cwd, text=True)
+        lines, errs = queue.Queue(), []
 
-    proc = run(_STDIN_PROMPT[0])
-    if (_STDIN_PROMPT[0] and prompt and proc.returncode == 0
-            and not (proc.stdout or '').strip()):
+        def pump(stream, sink):
+            try:
+                for line in stream:
+                    sink(line)
+            except Exception:
+                pass
+            sink(None)
+        threading.Thread(target=pump, args=(proc.stdout, lines.put), daemon=True).start()
+        threading.Thread(target=pump, args=(proc.stderr, lambda l: l is not None and errs.append(l)),
+                         daemon=True).start()
+        try:
+            proc.stdin.write(prompt if on_stdin else '')
+            proc.stdin.close()
+        except Exception:
+            pass
+        deadline = time.monotonic() + timeout
+        result, sid, is_error, saw_output = None, None, False, False
+        while True:
+            wait = min(IDLE_S, deadline - time.monotonic())
+            if wait <= 0:
+                proc.kill()
+                raise RuntimeError('claude did not finish within %ds' % timeout)
+            try:
+                line = lines.get(timeout=wait)
+            except queue.Empty:
+                proc.kill()
+                raise RuntimeError('claude produced no output for %ds (stuck?); killed' % IDLE_S)
+            if line is None:
+                break
+            line = line.strip()
+            if not line:
+                continue
+            saw_output = True
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                # Some builds print plain text even when asked for JSON; keep
+                # the last such line as the result.
+                result = line
+                continue
+            t = ev.get('type')
+            if t == 'assistant' and progress:
+                for b in (ev.get('message') or {}).get('content') or []:
+                    if isinstance(b, dict) and b.get('type') == 'tool_use':
+                        progress(tool_call_summary(b))
+            elif t == 'result':
+                result = str(ev.get('result', '') or '')
+                sid = ev.get('session_id')
+                is_error = bool(ev.get('is_error'))
+        proc.wait()
+        return proc.returncode, result, sid, is_error, ''.join(errs), saw_output
+
+    rc, result, sid, is_error, stderr, saw_output = run(_STDIN_PROMPT[0])
+    if _STDIN_PROMPT[0] and prompt and rc == 0 and not saw_output:
         # A build that ignores stdin sees an empty prompt and succeeds at
         # saying nothing. That exact shape - clean exit, no output - is what
         # distinguishes it from a real failure, which reports on stderr and is
@@ -330,25 +397,29 @@ def run_claude(prompt, args, resume_session=None, timeout=TURN_BUDGET_S):
         print('  [this claude build did not read the prompt from stdin; '
               'using argv (large prompts may fail)]', file=sys.stderr, flush=True)
         _STDIN_PROMPT[0] = False
-        proc = run(False)
+        rc, result, sid, is_error, stderr, saw_output = run(False)
 
-    if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout or 'claude exited nonzero').strip()[:500]
+    if rc != 0 or is_error:
+        detail = (stderr or result or 'claude exited nonzero').strip()[:500]
         if resume_session and _SESSION_GONE.search(detail):
             raise SessionGone(detail)
         raise RuntimeError(detail)
-    try:
-        data = json.loads(proc.stdout)
-    except ValueError:
-        # Some builds print plain text even with --output-format json; treat it
-        # as the result and give up on session tracking for this turn.
-        return proc.stdout.strip(), None
-    if data.get('is_error'):
-        detail = str(data.get('result') or 'claude reported an error')[:500]
-        if resume_session and _SESSION_GONE.search(detail):
-            raise SessionGone(detail)
-        raise RuntimeError(detail)
-    return str(data.get('result', '')).strip(), data.get('session_id')
+    return (result or '').strip(), sid
+
+
+def tool_call_summary(block):
+    """One line naming what the agent is doing, for the chat's status line:
+    the tool and, where the tool supplies one, its own description of the
+    call (Bash's `description`), else a short slice of the input."""
+    name = block.get('name') or 'tool'
+    inp = block.get('input') or {}
+    if isinstance(inp, dict):
+        text = inp.get('description') or inp.get('command') or inp.get('file_path') \
+            or inp.get('pattern') or inp.get('prompt') or ''
+    else:
+        text = ''
+    text = str(text).replace('\n', ' ').strip()
+    return name + (': ' + text[:100] if text else '')
 
 
 class Bridge:
@@ -357,7 +428,7 @@ class Bridge:
         self.sessions = {}          # chat name -> claude session_id
         self.lock = threading.Lock()
 
-    def reply_for(self, request, chat):
+    def reply_for(self, request, chat, progress=None):
         """Run the agent and return an Anthropic-style response object (a text
         turn, or a tool_use turn if the agent asked to call an IDE tool)."""
         with self.lock:
@@ -369,11 +440,12 @@ class Bridge:
 
         if sid is None:
             text, new_sid = run_claude(first_prompt(request), self.args,
-                                       timeout=remaining())
+                                       timeout=remaining(), progress=progress)
         else:
             try:
                 text, new_sid = run_claude(delta_prompt(request), self.args,
-                                           resume_session=sid, timeout=remaining())
+                                           resume_session=sid, timeout=remaining(),
+                                           progress=progress)
             except SessionGone as e:
                 # Only a dead session earns a cold re-run. A run that timed out
                 # or crashed is reported as-is: re-running the whole transcript
@@ -385,7 +457,7 @@ class Bridge:
                         f'in this turn to start a fresh one') from e
                 print(f'  [session {sid} is gone ({e}); starting a fresh session]', flush=True)
                 text, new_sid = run_claude(first_prompt(request), self.args,
-                                           timeout=remaining())
+                                           timeout=remaining(), progress=progress)
         if new_sid:
             with self.lock:
                 self.sessions[chat] = new_sid
@@ -393,8 +465,21 @@ class Bridge:
 
     def answer(self, msg):
         chat, corr_id = msg.get('from', '?'), msg.get('corr_id')
+
+        def progress(summary):
+            # Heartbeat: one frame per tool call the agent makes, on the same
+            # corr_id as the pending request, so the IDE can restart the turn's
+            # watchdog and show the user what is happening. Best effort: a lost
+            # heartbeat costs nothing the answer will not make good.
+            try:
+                post(self.origin, self.token, {
+                    'to': chat, 'from': self.name, 'kind': 'completion_progress',
+                    'corr_id': corr_id, 'text': summary}, attempts=1)
+                print(f'  [progress {corr_id}: {summary[:70]}]', flush=True)
+            except Exception as e:
+                print(f'  [progress frame for {corr_id} not posted: {e}]', file=sys.stderr, flush=True)
         try:
-            response = self.reply_for(msg.get('request', {}), chat)
+            response = self.reply_for(msg.get('request', {}), chat, progress=progress)
         except Exception as e:
             response = {'content': [{'type': 'text', 'text': f'[bus-claude bridge error: {e}]'}],
                         'stop_reason': 'end_turn'}

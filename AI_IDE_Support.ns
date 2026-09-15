@@ -265,7 +265,7 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 		public createSession: provider <Provider> ^<Session> = (
 			| session <Session> |
 			session:: Session provider: provider tools: (toolsForProvider: provider).
-			session systemPrompt: newspeakSystemPrompt.
+			session systemPrompt: (systemPromptFor: session).
 			^session
 		)
 		public createPresenter = (
@@ -840,6 +840,20 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 		public isKindOfIDEChatDocumentSubject ^<Boolean> = (
 			^true
 		)
+		public changesetSubjectFor: id <String> ^<Object | UndefinedObject> = (
+			(* A chat document keeps one ChangesetSubject per proposal, cached on
+		   the document and shared with the document's own changeset amplet
+		   (changesetSubject:for:). An Apply clicked in an embedded
+		   IDEChatPresenter of this chat thus runs the same hook as one clicked
+		   in the document, and the document gets its 'Applied changeset' notice
+		   turn either way. Overrides the inline-only cache of IDEChatSubject,
+		   which serves chats that have no document. *)
+			
+			^changesetSubject: id for: document
+		)
+		public forgetCachedChangesetSubjectFor: id <String> = (
+			forgetCachedChangesetSubject: id for: document
+		)
 		public focus ^<ChatFocus> = (
 			(* This chat's per-session brain-button focus (M2a). Read by its
 		   current_focus tool; written by captureFocusInto: on a brain click. *)
@@ -1055,6 +1069,7 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 				]
 		)
 	) : ()
+	lazy private busInboxSubscribed <Boolean> ::= (* Lazy rather than eager: an eager slot added to this live module arrives nil on hot-load. *) false.
 	lazy public repositories = ide repositories.
 	lazy public ApplyStrategy = repositories ApplyStrategy.
 	lazy public ChangesetSubject = repositories ChangesetSubject.
@@ -1751,7 +1766,7 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 			   bus-backed turn gets a far more generous watchdog. *)
 				session requestTimeoutMs: 600000
 			].
-		session systemPrompt: newspeakSystemPrompt.
+		session systemPrompt: (systemPromptFor: session).
 		^session
 	)
 	chatProviderOf: doc <Document> ^<String> = (
@@ -3001,10 +3016,16 @@ public clearConversation = ( ide aiSupport clearConversationFor: self )
 			].
 		promise then: [:reply |
 				[ subj markComplete ] on: Exception do: [:e | nil ].
+				
+				(* A driven turn has no presenter to updateGUI: for it; markComplete's
+			   own refresh repaints the current top-level presenter only, and a chat
+			   REGION embedded in some other page kept its old transcript. *)
+				hopscotch updateAllGUIs.
 				nil
 			]
 			onError: [:err |
 				[ subj markError: err printString ] on: Exception do: [:e | nil ].
+				hopscotch updateAllGUIs.
 				nil
 			]
 	)
@@ -3093,6 +3114,7 @@ public clearConversation = ( ide aiSupport clearConversationFor: self )
 	   unless the front door was started with --bus, so this is inert by
 	   default. *)
 		
+		ensureBusInboxSubscribed.
 		busStarted ifTrue: [ ^self ].
 		host isNil ifTrue: [ ^self ].
 		[
@@ -3308,40 +3330,99 @@ public clearConversation = ( ide aiSupport clearConversationFor: self )
 				nil
 			]
 	)
-	handleBusEvent: event <Alien> = (
-		(* One bus message. Resolve the target chat by name; drop silently if it
-	   is unknown (an external agent may address a chat that does not exist
-	   here). A 'notice' is folded into the target's next turn out of band; a
-	   'message' drives a real turn, stamped so the model knows it came from
-	   outside and cannot be mistaken for the human user. *)
+	ensureBusInboxSubscribed = (
+		(* Register, once, as the handler of the 'bus' synchronized inbox (see
+	   HopscotchForHTML5 synchronizedInbox:post:payload:). On EVERY client,
+	   before the bus itself is consulted: a client that cannot reach this
+	   machine's bus - another machine's, or a late joiner replaying - still
+	   applies the inbound messages the record carries, and on the Croquet
+	   platform a recorded delivery without a subscriber is lost. Guarded, as
+	   the handler runs as a stored callback: it must never raise. *)
 		
-		| dataStr msg to targetDoc text from kind |
+		busInboxSubscribed ifTrue: [ ^self ].
+		busInboxSubscribed:: true.
+		hopscotch synchronizedInbox: 'bus'
+			do: [:dataStr |
+				[ applyBusEvent: dataStr ] on: Exception do: [:e | nil ].
+				nil
+			]
+	)
+	handleBusEvent: event <Alien> = (
+		(* One frame of this client's bus stream. A completion_response is an
+	   external agent answering a BusProvider's request: it routes by
+	   correlation id to the waiting provider on THIS client - the elected
+	   performer, whose reply the coordinated performer records - and never
+	   into a chat as a turn. Everything else is inbound traffic that must
+	   reach every participant identically, so it is not applied here: it is
+	   posted to the synchronized inbox under the front door's own id for the
+	   message (the SSE event id), and applied - once, everywhere, at the same
+	   position in the shared history - by applyBusEvent: when the inbox
+	   delivers it. Before this, each client applied its own stream's frames
+	   when they arrived and a joiner never saw them (2026-09-14). *)
+		
+		| dataStr msg kind id to |
 		dataStr:: [ event at: 'data' ] on: Exception do: [:e | nil ].
 		dataStr isNil ifTrue: [ ^self ].
 		msg:: [ (js global at: 'JSON') parse: dataStr ] on: Exception do: [:e | nil ].
 		msg isNil ifTrue: [ ^self ].
 		kind:: [ msg at: 'kind' ] on: Exception do: [:e | 'message' ].
-		
-		(* Level 2: a completion_response is an external agent answering a
-	   BusProvider's request; it routes by correlation id to the waiting
-	   provider, NOT into a chat as a turn. *)
 		kind = 'completion_response' ifTrue: [ ^deliverCompletionResponse: msg ].
+		kind = 'completion_progress' ifTrue: [ ^deliverCompletionProgress: msg ].
+		
+		(* The front door echoes EVERY frame to every stream, this client's own
+	   completion requests to an agent included. Only frames that address a
+	   chat are inbound to the session; and a chat unknown here is unknown
+	   everywhere (chats live in Root, which is shared), so the check is
+	   safe to make locally and spares the history a recorded copy of every
+	   request body. *)
+		(kind = 'message' or: [ kind = 'notice' ]) ifFalse: [ ^self ].
+		to:: [ msg at: 'to' ] on: Exception do: [:e | nil ].
+		(to isNil or: [ (chatDocNamed: to) isNil ]) ifTrue: [ ^self ].
+		id:: [ event at: 'lastEventId' ] on: Exception do: [:e | nil ].
+		(id isNil or: [ [ id isEmpty ] on: Exception do: [:e | true ] ]) ifTrue: [
+				id:: dataStr
+			].
+		hopscotch synchronizedInbox: 'bus' post: id payload: dataStr
+	)
+	applyBusEvent: dataStr <String> = (
+		(* One inbound bus message, as delivered by the synchronized inbox.
+	   Resolve the target chat by name; drop silently if it is unknown (an
+	   external agent may address a chat that does not exist here). A 'notice'
+	   is folded into the target's next turn out of band; a 'message' drives a
+	   real turn, stamped so the model knows it came from outside and cannot be
+	   mistaken for the human user. *)
+		
+		| msg to targetDoc text from kind |
+		msg:: [ (js global at: 'JSON') parse: dataStr ] on: Exception do: [:e | nil ].
+		msg isNil ifTrue: [ ^self ].
+		kind:: [ msg at: 'kind' ] on: Exception do: [:e | 'message' ].
 		to:: [ msg at: 'to' ] on: Exception do: [:e | nil ].
 		to isNil ifTrue: [ ^self ].
 		targetDoc:: chatDocNamed: to.
-		targetDoc isNil ifTrue: [ ^self ].
+		targetDoc isNil ifTrue: [
+				logBus: 'dropped: no chat named ' , to.
+				^self
+			].
 		text:: [ msg at: 'text' ] on: Exception do: [:e | '' ].
 		text isNil ifTrue: [ text:: '' ].
 		from:: [ msg at: 'from' ] on: Exception do: [:e | 'external agent' ].
 		(from isNil or: [ from isEmpty ]) ifTrue: [ from:: 'external agent' ].
 		kind = 'notice' ifTrue: [
-				deliverExternalNotice: text to: targetDoc from: from
+				deliverExternalNotice: text to: targetDoc from: from.
+				logBus: 'notice for ' , to , ' from ' , from
 			]
 			ifFalse: [
-				enqueueOrDeliver: '[from external agent ''' , from , '''] ' , text
-					to: targetDoc
-					hop: 0
+				logBus: 'message for ' , to , ' from ' , from , ': ' , (enqueueOrDeliver: '[from external agent ''' , from , '''] ' , text
+						to: targetDoc
+						hop: 0)
 			]
+	)
+	logBus: s <String> = (
+		(* One console line per inbound delivery outcome - what the probes read
+	   when a message recorded in the history did not become a turn. *)
+		
+		[ (js global at: 'console') log: 'bus inbox: ' , s ] on: Exception
+			do: [:e | nil ]
 	)
 	deliverExternalNotice: text <String> to: targetDoc <Document> from: from <String> = (
 		(* An out-of-band notice: folded into the target session's next turn as a
@@ -3399,6 +3480,26 @@ public clearConversation = ( ide aiSupport clearConversationFor: self )
 					do: [:e | nil ]
 			]
 			ifFalse: [ [ (entry at: 1) value: response ] on: Exception do: [:e | nil ] ]
+	)
+	deliverCompletionProgress: msg <Alien> = (
+		(* The heartbeat: an external agent, mid-request, reporting what it is
+	   doing (one frame per tool call it makes, from bus-claude.py). Only a
+	   frame for a request still pending counts; it reaches the chat's session,
+	   which pushes its watchdog out and shows the text as the turn's phase.
+	   Nothing is recorded and no turn is driven: a heartbeat is per-client
+	   status, like the watchdog it feeds. *)
+		
+		| corrId to doc text |
+		corrId:: [ msg at: 'corr_id' ] on: Exception do: [:e | nil ].
+		corrId isNil ifTrue: [ ^self ].
+		(pendingCompletions includesKey: corrId) ifFalse: [ ^self ].
+		to:: [ msg at: 'to' ] on: Exception do: [:e | nil ].
+		to isNil ifTrue: [ ^self ].
+		doc:: chatDocNamed: to.
+		doc isNil ifTrue: [ ^self ].
+		text:: [ msg at: 'text' ] on: Exception do: [:e | '' ].
+		text isNil ifTrue: [ text:: '' ].
+		[ doc session noteProviderProgress: text ] on: Exception do: [:e | nil ]
 	)
 	listChatSessionsToolForFocus: focus <ChatFocus> ^<Tool> = (
 		^Tool name: 'list_chat_sessions'
@@ -4563,11 +4664,55 @@ Side-effecting expressions (collection mutations, slot assignments via setters, 
 	public createSessionWithProvider: provider <Provider> ^<Session> = (
 		| session |
 		session:: Session provider: provider tools: (toolsForProvider: provider).
-		session systemPrompt: newspeakSystemPrompt.
+		session systemPrompt: (systemPromptFor: session).
 		^session
 	)
 	public createChatWithProvider: provider <Provider> ^<IDEChatSubject> = (
 		^IDEChatSubject onModel: (createSessionWithProvider: provider)
+	)
+	public systemPromptFor: session <Session> ^<String> = (
+		(* The static prompt plus the turn budget THIS session lives under, so the
+	   model can pace itself. The budgets differ by an order of magnitude - a
+	   hosted model's request is bounded at two minutes, a bus-backed agent's at
+	   ten - and a model that does not know its budget learns it only by being
+	   abandoned: the user sees nothing, and every later message resumes the same
+	   unfinished work and is abandoned again (2026-09-14, a bridge session that
+	   ran six-minute probes inside nine-minute turns, four times over). *)
+		
+		| req tool heartbeat |
+		req:: session requestTimeoutMs.
+		req isNil ifTrue: [ req:: 120000 ].
+		tool:: session toolTimeoutMs.
+		tool isNil ifTrue: [ tool:: 180000 ].
+		heartbeat:: [ session provider isKindOfBusProvider ] on: Exception
+			do: [:e | false ].
+		^newspeakSystemPrompt , (turnTimingSectionRequestMs: req
+			toolMs: tool
+			heartbeat: heartbeat)
+	)
+	turnTimingSectionRequestMs: req <Integer> toolMs: tool <Integer> heartbeat: heartbeat <Boolean> ^<String> = (
+		| secs = [:ms |
+			ms <= 0 ifTrue: [ 'unlimited' ]
+				ifFalse: [ (ms // 1000) printString , ' seconds' ]
+		]. |
+		^'
+
+# Turn timing (this session)
+
+Each of your replies must arrive within a fixed budget, or the IDE abandons the turn: the user sees only a timeout, nothing you did reaches the chat, and their next message resumes the same unfinished work and times out again - the chat is effectively dead until you stop.
+
+- Budget for one reply (from the user''s message, or a tool result, to your next reply): ' , (secs value: req) , '.
+- Budget for the IDE to run one tool call you made: ' , (secs value: tool) , '.
+' , (heartbeat ifTrue: [
+				'
+The budget bounds SILENCE, not the whole reply: every tool call you make on your own machine is reported to the IDE as a heartbeat, which restarts the clock and shows the user what you are doing. So a long run of tool calls is safe; a single tool call that itself runs longer than the budget (a probe, a build, a long test suite) is not - run such things in the background and report when they finish.'
+			]
+			ifFalse: [
+				'
+There is no heartbeat: the only way to keep the chat alive is to reply within the budget. So never start work inside a turn that cannot finish within it.'
+			]) , '
+
+Reply first - say what you have found so far and what you are about to do - and end the turn; do long work in a later turn, in the background where you can, and report when the user asks or when it completes. Frequent short replies beat one long silent one: while you are silent the user cannot tell working from stuck.'
 	)
 	public newspeakSystemPrompt ^<String> = (
 		^'You are a programming assistant for the Newspeak programming language, embedded in the Newspeak Web IDE. Use the tools listed below to look up actual definitions in the user''s running IDE rather than guessing from training — Newspeak documentation is sparse and recall is unreliable. Prefer concise answers; when the user asks about code, show the source you found via tools.
@@ -4979,18 +5124,23 @@ When the user asks about an entity in their system, use the IDE tools to look it
 				snapsByTop at: topName put: (repositories liveSnapshotOf: liveCls)
 			]
 	)
-	public changesetPresenter: id <String> for: doc <Document> ^<Object> = (
-		(* Relocation of old ChatDocument>>changesetPresenterFor:. Returns a
-	   ChangesetPresenter on the doc-cached ChangesetSubject for `id`, or a
-	   stable banner when the proposal is no longer pending. *)
+	public changesetSubject: id <String> for: doc <Document> ^<Object | UndefinedObject> = (
+		(* The doc-cached ChangesetSubject for `id`, built on first use, or nil
+	   once the proposal is no longer pending (applied / discarded / never
+	   staged). Both views of a chat document share this one subject: the
+	   changeset amplet in the document (changesetPresenter:for:) and the
+	   inline IDEChatPresenter of a chat embedded in another presenter
+	   (IDEChatDocumentSubject>>changesetSubjectFor:). An Apply or Cancel
+	   from either view therefore runs the same hooks, and the document gets
+	   its 'Applied changeset' notice turn whichever view was clicked. *)
 		
-		| records subject |
+		| records |
 		records:: proposedChangesets at: id ifAbsent: [ nil ].
 		records isNil ifTrue: [
 				doc changesetSubjectsById removeKey: id ifAbsent: [ ].
-				^StaleChangesetPresenter onSubject: (StaleChangesetSubject onModel: id)
+				^nil
 			].
-		subject:: doc changesetSubjectsById at: id
+		^doc changesetSubjectsById at: id
 			ifAbsent: [
 				| strategy s |
 				strategy:: AIInstallStrategy onRecords: records
@@ -5022,12 +5172,29 @@ When the user asks about an entity in their system, use the IDE tools to look it
 					]
 					onCanceled: [
 						forgetCachedChangesetSubject: id for: doc.
-						doc mutateContentsTo: doc contents
+						doc mutateContentsTo: doc contents.
+						
+						(* An embedded IDEChatPresenter showing this chat is not part of the
+					   document render; it picks the cancellation up from the IDE
+					   display refresh, as the inline-only path always did. *)
+						ide browsing updateCurrentDisplay
 					].
 				s:: ChangesetSubject onModel: strategy.
 				s autoExpand: true.
 				doc changesetSubjectsById at: id put: s.
 				s
+			]
+	)
+	public changesetPresenter: id <String> for: doc <Document> ^<Object> = (
+		(* Relocation of old ChatDocument>>changesetPresenterFor:. Returns a
+	   ChangesetPresenter on the shared doc-cached ChangesetSubject for `id`
+	   (changesetSubject:for:), or a stable banner when the proposal is no
+	   longer pending. *)
+		
+		| subject |
+		subject:: changesetSubject: id for: doc.
+		subject isNil ifTrue: [
+				^StaleChangesetPresenter onSubject: (StaleChangesetSubject onModel: id)
 			].
 		^ChangesetPresenter onSubject: subject
 	)

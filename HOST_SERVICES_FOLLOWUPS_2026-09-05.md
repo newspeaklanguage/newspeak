@@ -159,11 +159,13 @@ re-check these against the current `bus-claude.py` before acting on them.
   per turn; the IDE's loop supports several. The agent can already iterate turn
   by turn, so this is a minor efficiency nicety.
 
-### 6. Delete the legacy `:9999` code (eventually) — still open
+### 6. ~~Delete the legacy `:9999` code (eventually)~~ DONE 2026-09-15
 
-Still exactly as written: the listener is default-off but the code is still
-there as an opt-in escape hatch, so the deletion this item asks for has not
-happened.
+Deleted: the `--legacy-port` option, the second listener, and the bare
+`/<host>/<path>` routing branch are gone from `cors-proxy.py`; `/_ns/git` is
+the only git proxy. The last `localhost:9999` default in the tree
+(`VCSIsomorphicGitBackendProvider` smoke-test config) now defaults to `/_ns/git`
+like `Repositories`. A client that still points at `:9999` is un-rebuilt.
 
 
 The legacy bare-proxy listener is default-off (`--legacy-port 0`) and all

@@ -392,9 +392,10 @@ browser-side fallback (`webFetchProxyPrefix` → `/_ns/git`), both
 page-origin-relative so no port is hardcoded (verified: isomorphic-git clones
 through a relative `corsProxy`); `Host`'s discovery fallback moved from
 `:9999` to `:8080` (and is now rarely used, since the front door serves the
-page, so the same-origin probe wins). `cors-proxy.py`'s legacy listener now
-defaults **off** (`--legacy-port 0`; pass `9999` to revive it for an
-un-rebuilt client during a transition). One origin, one process, one port.
+page, so the same-origin probe wins). `cors-proxy.py`'s legacy listener then
+defaulted **off** (`--legacy-port 0`), and on 2026-09-15 it was deleted
+outright, option and routing branch included (followup 6). One origin, one
+process, one port.
 
 **Parallel track (spun out 2026-08-31):** the *in-image* half of the bus —
 AI sessions in one IDE messaging each other, addressed by chat-document

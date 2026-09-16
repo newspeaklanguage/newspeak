@@ -3,8 +3,8 @@
 
 Design: HOST_SERVICES_DESIGN_2026-08-31.md — one origin, reserved /_ns/ paths,
 discovery via /_ns/config, capabilities absent unless announced. Staging step 3
-folds static serving in, so this replaces both server3.py (:8080) and the old
-standalone CORS proxy (:9999) with ONE process answering on both ports:
+folded static serving in, so this ONE process replaced both server3.py (:8080)
+and the old standalone CORS proxy (:9999):
 
 The FRONT DOOR (default :8080) serves:
     /                        static files from --root (default <repo>/out),
@@ -29,13 +29,13 @@ The FRONT DOOR (default :8080) serves:
                              OFF unless --bus is passed
     (anything else under /_ns/ answers 404 — absent means unavailable)
 
-The clients have migrated to /_ns/git (repository clone, local_fetch's
-fallback) and to the front-door origin (Host discovery), so the old bare
-@isomorphic-git/cors-proxy convention on :9999 is RETIRED — the legacy
-listener is OFF by default. To revive it for an un-rebuilt client during a
-transition, pass --legacy-port 9999; it then answers the bare
+The clients migrated to /_ns/git (repository clone, local_fetch's fallback)
+and to the front-door origin (Host discovery) on 2026-09-04, so the old bare
+@isomorphic-git/cors-proxy convention on :9999
     http://localhost:9999/<host>/<path>   ->   https://<host>/<path>
-convention (and /_ns/, no static).
+is gone: the legacy listener that answered it (--legacy-port, default off
+since then) was deleted on 2026-09-15. A client that still points at :9999
+is un-rebuilt; rebuild it.
 
 The token is minted fresh at startup, never written to disk, never required
 for git or static. Endpoints that will need it (/_ns/fetch, /_ns/bus) check
@@ -48,7 +48,7 @@ answers loopback only, but git proxying and /files writes are then open to
 the LAN — the pre-existing dev tradeoff, now opt-in).
 
 Run (from the newspeak repo root or anywhere — --root defaults beside tool/):
-    python3 tool/cors-proxy.py                      # :8080 front door + :9999 legacy
+    python3 tool/cors-proxy.py                      # :8080 front door
     python3 tool/cors-proxy.py --bind 0.0.0.0       # cross-device day
     python3 tool/cors-proxy.py --reflector ws://localhost:9090   # announce Croquet
 
@@ -198,7 +198,6 @@ BUS_MSG_CAP = 256 * 1024
 class HostServicesHandler(SimpleHTTPRequestHandler):
 
     server_version = 'ns-host/0.3'
-    front_port = 8080          # overwritten in main()
 
     # Static responses get server3.py's headers appended in end_headers;
     # service/proxy responses manage their own and leave this False.
@@ -207,8 +206,8 @@ class HostServicesHandler(SimpleHTTPRequestHandler):
     # ---- routing ---------------------------------------------------------
 
     def _handled_as_service(self, method):
-        """/_ns/ services on every listener; the bare proxy convention only
-        on the legacy listener. Answers True when the request was handled."""
+        """The /_ns/ services. Answers True when the request was handled;
+        anything else is a static file (or a /files/ store)."""
         if self.path == '/_ns/config' or self.path.startswith('/_ns/config?'):
             self._serve_config(method)
             return True
@@ -231,10 +230,6 @@ class HostServicesHandler(SimpleHTTPRequestHandler):
             # Absent means unavailable: an unknown /_ns/ path is a capability
             # this origin does not offer, not a proxy target or a file.
             self._send_json(404, {'error': 'no such host service'})
-            return True
-        if self.server.server_address[1] != self.front_port:
-            # Legacy listener: everything else is the old proxy convention.
-            self._forward(method, self.path.lstrip('/'))
             return True
         return False
 
@@ -522,7 +517,7 @@ class HostServicesHandler(SimpleHTTPRequestHandler):
         if not head_only:
             self.wfile.write(body)
 
-    # ---- the git proxy (/_ns/git/ everywhere; bare convention on legacy) --
+    # ---- the git proxy (/_ns/git/<host>/<path>) ----------------------------
 
     def _forward(self, method, path):
         if not path:
@@ -702,10 +697,6 @@ def main():
     parser = argparse.ArgumentParser(description='Newspeak host-services front door')
     parser.add_argument('port', nargs='?', type=int, default=8080,
                         help='front-door port: static + /files + /_ns (default 8080)')
-    parser.add_argument('--legacy-port', type=int, default=0,
-                        help='extra listener answering the bare :9999 cors-proxy convention, for '
-                             'pre-/_ns/git clients (default 0 = off, now that clients use /_ns/git; '
-                             'pass 9999 to revive it during a transition)')
     parser.add_argument('--bind', default='127.0.0.1',
                         help='interface to bind (default loopback; 0.0.0.0 for cross-device days)')
     parser.add_argument('--root', default=None,
@@ -728,14 +719,7 @@ def main():
     if not os.path.isdir(root):
         print(f'WARNING: static root {root} does not exist; static requests will 404')
 
-    HostServicesHandler.front_port = args.port
     handler = functools.partial(HostServicesHandler, directory=root)
-
-    if args.legacy_port and args.legacy_port != args.port:
-        legacy = ThreadingHTTPServer((args.bind, args.legacy_port), handler)
-        threading.Thread(target=legacy.serve_forever, daemon=True).start()
-        print(f'legacy proxy listening on http://{args.bind}:{args.legacy_port} '
-              f'(bare /<host>/<path> convention, plus /_ns)')
 
     server = ThreadingHTTPServer((args.bind, args.port), handler)
     print(f'front door listening on http://{args.bind}:{args.port}')

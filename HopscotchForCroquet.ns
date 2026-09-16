@@ -1023,15 +1023,27 @@ Once the menu is displayed, individual entries in it can be clicked.  This is ha
 				childrenDo: [:each | each rearmCroquetSubscriptions ]
 			)
 			adoptCroquetIdentityFrom: oldFragment <Fragment> = (
-				(* Same-kind transfer, sent from a leaf's updateVisualsFromSameKind: BEFORE the super send: take over the old fragment's lineage identity - its fragmentId, and therefore its scope, under which the lineage's whole recorded history lives - then re-point the lineage's subscriptions at this fragment: unsubscribe the old fragment's handlers and subscribe our own under the adopted scope. Publish-id and subscription-id then both equal the lineage id for the visual's entire life. *)
+				(* Same-kind transfer, sent from a leaf's updateVisualsFromSameKind: BEFORE the super send: take over the old fragment's lineage identity - its fragmentId, and therefore its scope, under which the lineage's whole recorded history lives - then re-point the lineage's subscriptions at this fragment: unsubscribe the old fragment's handlers and subscribe our own under the adopted scope. Publish-id and subscription-id then both equal the lineage id for the visual's entire life.
+
+	   Two cases the first version got wrong (a chat page left and re-entered typed into a dead address, 2026-09-16):
+	   - This fragment may already have attached under its OWN id: AmpleforthFragment>>processChildren realizes every amplet's visual at construction, before the diff adopts. Those subscriptions would outlive the id they were made under, so they are dropped first, while scope still names it.
+	   - The old fragment may be RETIRED - its page was navigated away from, so noticeDisposal unsubscribed it - and is now being re-displayed through a fresh tree. The lineage is being shown again, so it is subscribed again; whether the old fragment was still subscribed only decides whether its handlers need removing first. *)
 				
-				fragmentId: oldFragment fragmentId.
-				scope_slot: oldFragment scope.
+				croquetSubscribed ifTrue: [
+						croquetSubscribed: false.
+						croquetEventSpecs do: [:spec |
+								js global nsUnsubscribe: scope eventSpec: spec
+							]
+					].
 				oldFragment croquetSubscribed ifTrue: [
 						oldFragment croquetSubscribed: false.
 						croquetEventSpecs do: [:spec |
-								js global nsUnsubscribe: scope eventSpec: spec
-							].
+								js global nsUnsubscribe: oldFragment scope eventSpec: spec
+							]
+					].
+				fragmentId: oldFragment fragmentId.
+				scope_slot: oldFragment scope.
+				croquetEventSpecs isEmpty ifFalse: [
 						croquetSubscribed: true.
 						setupCroquetView
 					]
@@ -1155,6 +1167,7 @@ A complication is that the file API is asynchronous, so we only have promises in
 				fragmentId <String> = newFileChooserId.
 				scope_slot <String>
 				lastAction <[:List[Alien[File]] | Object]>
+				lastCancel <[Object]>
 			|
 			liveFileChoosers add: self.
 			setupCroquetView.
@@ -1187,37 +1200,70 @@ A complication is that the file API is asynchronous, so we only have promises in
 				
 				(* Locally read the files and pass their data to the reflector. In more detail:
       Once we've extracted the actual file contents, we can store them on the Croquet server. We then separate out the file metadata and pass that in the Croquet event. When that data is received by clients (including the one that sent it), it will be placed in File-like objects so that the original closure (now stored in #lastAction) can consume it.  See #setupCroquetView for details. *)
-				super chooseFileList: [:fs <List[Alien[File]]> |
-						extractFileData: fs
-							whenReady: [:fds <JSArray[JSObject]> |
-								| ps <List[Alien[Promise[[ArrayBuffer]]]]> = (js global at: 'Array') new: fds
-									at: #length. descriptors = (js global at: 'Array') new: fs size. |
-								1 to: fs size
-									do: [:i <Integer> |
-										| fd <JSObject> = fds at: i - 1. |
-										
-										(* store the file contents in the reflector *)
-										ps at: i - 1 put: (rootView storedData store: (fd at: #arrayBuff)).
-										
-										(* Gather file metadata, to be published to all clients *)
-										descriptors at: i - 1 put: (descriptorFor: fd)
-									].
+				super chooseFileList: [:fs <List[Alien[File]]> | storeAndPublish: fs ]
+			)
+			public chooseFileList: blk <[:List[Alien[File]] | Object]> ifCanceled: cancelBlk <[Object]> = (
+				(* As chooseFileList:, for a caller that also wants to hear of a dismissed
+	   dialog. Without this override the inherited method ran, which wires and
+	   clicks the input itself, so such a caller got no coordination at all:
+	   only the initiating client ever heard of the files, and every other
+	   client waited forever. The AI upload_file tool is such a caller (found
+	   2026-09-15).
+
+	   The cancel is coordinated too. The initiating client, the only one whose
+	   dialog opened, publishes a click carrying NO descriptors when its dialog
+	   is dismissed; the handler in setupCroquetView reads an empty list as the
+	   cancel and runs the cancel block, so every client - and a joiner
+	   replaying the session - gives up on the files together. An empty list
+	   needs no new model event, so the support script is untouched. Both
+	   blocks go to the inherited method together, which wires them to the one
+	   input it clicks (input builds a fresh node per access). *)
+				
+				lastAction:: blk.
+				lastCancel:: cancelBlk.
+				super chooseFileList: [:fs <List[Alien[File]]> | storeAndPublish: fs ]
+					ifCanceled: [
+						publish: 'nsfilechooser_'
+							event: #fileChooser_click
+							data: (js global newspeakFragmentData: fragmentId
+								data: ((js global at: 'Array') new: 0))
+					]
+			)
+			storeAndPublish: fs <List[Alien[File]]> = (
+				(* The locally chosen files: store each one's contents on the Croquet
+	   server, then publish the descriptors (metadata plus stored-data handle)
+	   as the click event every client - this one included - consumes in
+	   setupCroquetView. *)
+				
+				extractFileData: fs
+					whenReady: [:fds <JSArray[JSObject]> |
+						| ps <List[Alien[Promise[[ArrayBuffer]]]]> = (js global at: 'Array') new: fds
+							at: #length. descriptors = (js global at: 'Array') new: fs size. |
+						1 to: fs size
+							do: [:i <Integer> |
+								| fd <JSObject> = fds at: i - 1. |
 								
-								(* When data has been stored, publish notification, which will be passed on to all clients *)
-								((js global at: 'Promise') all: ps) then: [:handles <JSArray[CroquetHandle]> |
-										0 to: fs size - 1
-											do: [:i <Integer> |
-												(descriptors at: i) at: #handle put: (handles at: i)
-											].
-										publish: 'nsfilechooser_'
-											event: #fileChooser_click
-											data: (js global newspeakFragmentData: fragmentId data: descriptors).
-										nil
-									]
-									onError: [:ex |
-										alert: 'HopscotchForCroquet FileChooserFragment chooseFileList: ' , ex printString.
-										nil
-									]
+								(* store the file contents in the reflector *)
+								ps at: i - 1 put: (rootView storedData store: (fd at: #arrayBuff)).
+								
+								(* Gather file metadata, to be published to all clients *)
+								descriptors at: i - 1 put: (descriptorFor: fd)
+							].
+						
+						(* When data has been stored, publish notification, which will be passed on to all clients *)
+						((js global at: 'Promise') all: ps) then: [:handles <JSArray[CroquetHandle]> |
+								0 to: fs size - 1
+									do: [:i <Integer> |
+										(descriptors at: i) at: #handle put: (handles at: i)
+									].
+								publish: 'nsfilechooser_'
+									event: #fileChooser_click
+									data: (js global newspeakFragmentData: fragmentId data: descriptors).
+								nil
+							]
+							onError: [:ex |
+								alert: 'HopscotchForCroquet FileChooserFragment storeAndPublish: ' , ex printString.
+								nil
 							]
 					]
 			)
@@ -1258,35 +1304,42 @@ A complication is that the file API is asynchronous, so we only have promises in
 				
 				subscribe: #model_fileChooser_click
 					handler: [:e <JSArray[JSObject]> |
-						| len <Integer> = 
-						(* The event data: an array of file descriptors - JS objects of the form 
-             {name: String, type: String, lastModified: Float, webkitRelativePath: String, handle:   JSPromise *)
-						e at: #length. fds <List[Alien[File]]> = List new: len. contents <JSArray[JSPromise]> = (js global at: 'Array') new: len. |
 						
-						(* repackage the file data into File-ish objects *)
-						
-						(* Get the data from the server *)
+						(* An empty descriptor list is the initiating client's dismissed
+	      dialog; see chooseFileList:ifCanceled:. *)
+						(e at: #length) = 0 ifTrue: [
+								lastCancel isNil ifFalse: [ lastCancel value ].
+								liveFileChoosers remove: self
+							]
+							ifFalse: [ deliverChosenFiles: e ].
+						nil
+					]
+			)
+			deliverChosenFiles: e <JSArray[JSObject]> = (
+				(* The event data: an array of file descriptors - JS objects of the form
+	   {name: String, type: String, lastModified: Float, webkitRelativePath: String, handle: JSPromise}.
+	   Fetch each file's contents from the server, repackage them as File-ish
+	   objects and hand the list to the action block chooseFileList: kept. *)
+				
+				| len <Integer> = e at: #length. fds <List[Alien[File]]> = List new: len. contents <JSArray[JSPromise]> = (js global at: 'Array') new: len. |
+				0 to: len - 1
+					do: [:i <Integer> |
+						| fd <JSObject> = e at: i. |
+						contents at: i put: (rootView storedData fetch: (fd at: #handle))
+					].
+				((js global at: 'Promise') all: contents) then: [:cs |
 						0 to: len - 1
 							do: [:i <Integer> |
-								| fd <JSObject> = e at: i. |
-								contents at: i put: (rootView storedData fetch: (fd at: #handle))
+								(e at: i) at: #arrayBuff put: (cs at: i).
+								fds add: (createFile: (e at: i))
 							].
-						
-						(* Wait for data to resolve, and generate the File objects *)
-						((js global at: 'Promise') all: contents) then: [:cs |
-								0 to: len - 1
-									do: [:i <Integer> |
-										(e at: i) at: #arrayBuff put: (cs at: i).
-										fds add: (createFile: (e at: i))
-									].
-								lastAction value: fds.
-								liveFileChoosers remove: self.
-								nil
-							]
-							onError: [:ex |
-								alert: 'HopscotchForCroquet FileChooserFragment setupCroquetView: ' , ex printString.
-								nil
-							]
+						lastAction value: fds.
+						liveFileChoosers remove: self.
+						nil
+					]
+					onError: [:ex |
+						alert: 'HopscotchForCroquet FileChooserFragment deliverChosenFiles: ' , ex printString.
+						nil
 					]
 			)
 		) : (

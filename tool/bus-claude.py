@@ -39,6 +39,7 @@ Create a Bus Agent chat in the IDE whose Model field is <agent-name>, and talk.
 
 import argparse
 import json
+import os
 import queue
 import re
 import shlex
@@ -52,23 +53,77 @@ import urllib.request
 import uuid
 
 
-# The IDE gives a Bus Agent chat a 10-minute request watchdog. Everything the
-# bridge does for one request has to fit inside that, or the answer arrives
-# against a corr_id the IDE has already abandoned. TURN_BUDGET_S is the budget
-# for the WHOLE answer including a retry, not per `claude` run: a resume that
-# times out at 570s used to be followed by a fresh full run with another 570s,
-# ~19 minutes in total, every second of it past the point of any use.
+# The IDE gives a Bus Agent chat a 10-minute request watchdog - of SILENCE:
+# every completion_progress frame the bridge posts pushes it out
+# (AI_IDE_Support deliverCompletionProgress:). So the bridge's budget is a
+# silence budget too: TURN_BUDGET_S from the last thing the agent was seen
+# doing, not from the request, under an absolute cap (HARD_CAP_S) that only a
+# runaway reaches. It used to be a fixed 540s from the request, which killed
+# every turn of real work past nine minutes however alive it was, and the
+# answer's retry got no fresh budget either (2026-09-16). MIN_RUN_S: below this
+# much of the cap left there is no point starting a run at all.
 TURN_BUDGET_S = 540
-MIN_RUN_S = 45          # below this there is no point starting a run at all
-# A run silent for this long is killed as stuck. Every tool call the agent
-# makes produces output, so genuine work is never silent for long; thinking
-# between tool calls is bounded by the model's own response time.
-IDLE_S = 300
+HARD_CAP_S = 1800
+MIN_RUN_S = 45
+# A run silent for this long is killed as stuck. Silence means no line on the
+# stream. With --include-partial-messages generation itself streams, so the
+# only silence left is a tool call in progress; the harness caps a tool call at
+# 600s, so a longer silence really is a hang. While a call is in flight the
+# bridge posts a heartbeat of its own every TOOL_HEARTBEAT_S, so the IDE's
+# watchdog (and the user) know the turn is alive. The old limit was 300s with
+# no heartbeat, which killed every probe or build run as "stuck".
+IDLE_S = 660
+TOOL_HEARTBEAT_S = 60
 
 
 def fetch_token(origin):
     with urllib.request.urlopen(origin + '/_ns/token', timeout=5) as r:
         return json.load(r)['token']
+
+
+def fetch_config(origin):
+    with urllib.request.urlopen(origin + '/_ns/config', timeout=5) as r:
+        return json.load(r)
+
+
+# The bridge reports on itself, as the front door does (cors-proxy.py,
+# process_status): a bridge started before this file was last edited keeps
+# taking requests, runs the old code, and nothing says so - the fault shows up
+# as a turn that misbehaves in some older way. Checked before every request it
+# takes, so the warning lands beside the turn it affects; and at startup the
+# front door's own 'stale' bit is checked, since a bridge attached to a stale
+# door is stale by proxy.
+SOURCE = os.path.abspath(__file__)
+SOURCE_MTIME_AT_START = os.path.getmtime(SOURCE)
+_STALE_REPORTED = [False]
+
+
+def warn_if_stale():
+    try:
+        now_mtime = os.path.getmtime(SOURCE)
+    except OSError:
+        now_mtime = None
+    if now_mtime == SOURCE_MTIME_AT_START or _STALE_REPORTED[0]:
+        return
+    _STALE_REPORTED[0] = True
+    print(f'WARNING: {SOURCE} changed on disk since this bridge started; it is running '
+          f'the OLD code. Restart it (the chat keeps its session: --resume is per chat).',
+          file=sys.stderr, flush=True)
+
+
+def refuse_stale_front_door(origin):
+    """Exit if the front door reports that its own source changed after it
+    started. An older door (no 'process' block) is not refused: it predates
+    the check, and the launcher's other preflights already cover it."""
+    try:
+        process = fetch_config(origin).get('process') or {}
+    except Exception:
+        return
+    if process.get('stale'):
+        sys.exit(f'error: the front door at {origin} is STALE - it started '
+                 f'{process.get("started")} running {process.get("source")}, which has '
+                 f'changed on disk since. Restart it (python3 tool/cors-proxy.py --bus), '
+                 f'reload the IDE page, then start this bridge again.')
 
 
 def post(origin, token, obj, attempts=3):
@@ -191,10 +246,16 @@ def first_prompt(request):
     return '\n'.join(parts)
 
 
-def delta_prompt(request):
+def delta_prompt(request, killed=None):
     """For a resumed turn: only the newest message (the session already holds
     everything before it). Usually the user's new input; after a TOOL_CALL it is
-    the IDE's tool result, which we frame so the agent knows to continue."""
+    the IDE's tool result, which we frame so the agent knows to continue.
+
+    `killed`: the reason the chat's previous turn died in this bridge, if it
+    did. The resumed session remembers the work it was in the middle of and
+    nothing else tells it that none of that reached the user; left alone it
+    picks the same long work up again and dies again, turn after turn, until
+    the chat is abandoned (2026-09-16)."""
     messages = request.get('messages') or []
     # Notices ride the system prompt, which a resumed session never re-reads;
     # lead the delta with them so they are not lost. Framed as coming from the
@@ -202,6 +263,11 @@ def delta_prompt(request):
     notices = notices_text(request)
     prefix = ('[Notices from the IDE, delivered with this turn]\n' + notices + '\n\n'
               if notices else '')
+    if killed:
+        prefix = ('[Notice from the bridge] Your previous turn was KILLED: ' + killed +
+                  '. Nothing you did or wrote in it reached the user. Do not silently '
+                  'resume that work: reply with a short text status first, and do any '
+                  'long step alone in a later turn.\n\n' + prefix)
     if not messages:
         return prefix + '(no new message)'
     last = messages[-1]
@@ -305,19 +371,23 @@ _SESSION_GONE = re.compile(
     re.IGNORECASE)
 
 
-def run_claude(prompt, args, resume_session=None, timeout=TURN_BUDGET_S, progress=None):
+def run_claude(prompt, args, resume_session=None, timeout=TURN_BUDGET_S, hard_deadline=None,
+               progress=None):
     """One `claude -p` run, streamed. Returns (result_text, session_id).
 
-    The run is watched line by line (--output-format stream-json) rather than
-    waited for as a whole, for two reasons. First, HEARTBEAT: every tool call
-    the agent makes is reported through `progress` while the run is still
-    going, and the bridge posts each one to the chat as a completion_progress
-    frame, so the IDE can restart its watchdog and show the user what the
-    agent is doing instead of silence. Second, the budget becomes two limits:
-    `timeout` still caps the whole run, but a run that has produced NOTHING
-    for IDLE_S is killed as stuck without waiting for the cap - a hung tool is
-    the common failure, and it looks exactly like thinking."""
-    cmd = [args.claude_bin, '-p', '--output-format', 'stream-json', '--verbose']
+    The run is watched line by line (--output-format stream-json, with partial
+    messages so generation streams too) rather than waited for as a whole, for
+    two reasons. First, HEARTBEAT: every tool call the agent makes is reported
+    through `progress` while the run is still going, and the bridge posts each
+    one to the chat as a completion_progress frame, so the IDE can restart its
+    watchdog and show the user what the agent is doing instead of silence; a
+    call still running after TOOL_HEARTBEAT_S gets a heartbeat of its own.
+    Second, the budget is one of SILENCE: `timeout` counts from the last line
+    seen, not from the start, under `hard_deadline` (default HARD_CAP_S from
+    now); and a run silent for IDLE_S is killed as stuck - a hung tool is the
+    common failure, and it looks exactly like thinking."""
+    cmd = [args.claude_bin, '-p', '--output-format', 'stream-json', '--verbose',
+           '--include-partial-messages']
     if resume_session:
         cmd += ['--resume', resume_session]
     if args.claude_args:
@@ -351,24 +421,39 @@ def run_claude(prompt, args, resume_session=None, timeout=TURN_BUDGET_S, progres
             proc.stdin.close()
         except Exception:
             pass
-        deadline = time.monotonic() + timeout
+        hard = hard_deadline if hard_deadline is not None else time.monotonic() + HARD_CAP_S
+        last_seen = time.monotonic()
+        deadline = min(last_seen + timeout, hard)
         result, sid, is_error, saw_output = None, None, False, False
+        in_flight = None        # the tool call the agent is waiting on, if any
         while True:
-            wait = min(IDLE_S, deadline - time.monotonic())
-            if wait <= 0:
+            now = time.monotonic()
+            if now >= deadline:
                 proc.kill()
-                raise RuntimeError('claude did not finish within %ds' % timeout)
+                raise RuntimeError('claude did not finish within %ds of its last sign of life '
+                                   '(absolute cap %ds)' % (timeout, HARD_CAP_S))
+            wait = min(TOOL_HEARTBEAT_S, deadline - now, last_seen + IDLE_S - now)
             try:
-                line = lines.get(timeout=wait)
+                line = lines.get(timeout=max(wait, 0.1))
             except queue.Empty:
-                proc.kill()
-                raise RuntimeError('claude produced no output for %ds (stuck?); killed' % IDLE_S)
+                now = time.monotonic()
+                if now - last_seen >= IDLE_S:
+                    proc.kill()
+                    raise RuntimeError('claude produced no output for %ds (stuck?); killed' % IDLE_S)
+                # Alive but silent: a tool call in progress. Say so, so the
+                # IDE's watchdog is pushed out and the user sees it is working.
+                if progress:
+                    progress('still %s (%ds)' % (('running ' + in_flight) if in_flight else 'working',
+                                                 int(now - last_seen)))
+                continue
             if line is None:
                 break
             line = line.strip()
             if not line:
                 continue
             saw_output = True
+            last_seen = time.monotonic()
+            deadline = min(last_seen + timeout, hard)
             try:
                 ev = json.loads(line)
             except ValueError:
@@ -377,10 +462,15 @@ def run_claude(prompt, args, resume_session=None, timeout=TURN_BUDGET_S, progres
                 result = line
                 continue
             t = ev.get('type')
-            if t == 'assistant' and progress:
+            if t == 'assistant':
                 for b in (ev.get('message') or {}).get('content') or []:
                     if isinstance(b, dict) and b.get('type') == 'tool_use':
-                        progress(tool_call_summary(b))
+                        in_flight = b.get('name') or 'a tool'
+                        if progress:
+                            progress(tool_call_summary(b))
+            elif t == 'user':
+                # The tool result came back; the agent is generating again.
+                in_flight = None
             elif t == 'result':
                 result = str(ev.get('result', '') or '')
                 sid = ev.get('session_id')
@@ -426,6 +516,7 @@ class Bridge:
     def __init__(self, origin, token, name, args):
         self.origin, self.token, self.name, self.args = origin, token, name, args
         self.sessions = {}          # chat name -> claude session_id
+        self.killed = {}            # chat name -> why its last turn died here, until told
         self.lock = threading.Lock()
 
     def reply_for(self, request, chat, progress=None):
@@ -433,18 +524,21 @@ class Bridge:
         turn, or a tool_use turn if the agent asked to call an IDE tool)."""
         with self.lock:
             sid = self.sessions.get(chat)
-        deadline = time.monotonic() + TURN_BUDGET_S
+            killed = self.killed.pop(chat, None)
+        # The absolute cap for the whole answer, retry included; the silence
+        # budget (run_claude's `timeout`) restarts with every sign of life.
+        hard = time.monotonic() + HARD_CAP_S
 
         def remaining():
-            return int(deadline - time.monotonic())
+            return int(hard - time.monotonic())
 
         if sid is None:
             text, new_sid = run_claude(first_prompt(request), self.args,
-                                       timeout=remaining(), progress=progress)
+                                       hard_deadline=hard, progress=progress)
         else:
             try:
-                text, new_sid = run_claude(delta_prompt(request), self.args,
-                                           resume_session=sid, timeout=remaining(),
+                text, new_sid = run_claude(delta_prompt(request, killed=killed), self.args,
+                                           resume_session=sid, hard_deadline=hard,
                                            progress=progress)
             except SessionGone as e:
                 # Only a dead session earns a cold re-run. A run that timed out
@@ -457,7 +551,7 @@ class Bridge:
                         f'in this turn to start a fresh one') from e
                 print(f'  [session {sid} is gone ({e}); starting a fresh session]', flush=True)
                 text, new_sid = run_claude(first_prompt(request), self.args,
-                                           timeout=remaining(), progress=progress)
+                                           hard_deadline=hard, progress=progress)
         if new_sid:
             with self.lock:
                 self.sessions[chat] = new_sid
@@ -483,6 +577,10 @@ class Bridge:
         except Exception as e:
             response = {'content': [{'type': 'text', 'text': f'[bus-claude bridge error: {e}]'}],
                         'stop_reason': 'end_turn'}
+            # Told to the resumed session at its next turn (delta_prompt),
+            # so it does not pick the dead turn's work up as if it had landed.
+            with self.lock:
+                self.killed[chat] = str(e)[:200]
 
         def send(payload):
             post(self.origin, self.token, {
@@ -538,6 +636,7 @@ class Bridge:
                             continue
                         print(f'» completion request from chat {msg.get("from")!r} '
                               f'(corr {msg.get("corr_id")}) — running claude…', flush=True)
+                        warn_if_stale()
                         # One thread per request so a slow run doesn't stall the
                         # stream. The IDE serializes turns per chat, so a given
                         # chat's session id is never touched concurrently.
@@ -563,6 +662,7 @@ def main():
                     help='extra args passed to claude, e.g. "--permission-mode plan"')
     args = ap.parse_args()
 
+    refuse_stale_front_door(args.origin)
     token = fetch_token(args.origin)
     print(f'bus-claude {args.name!r} on {args.origin} — backing any Bus Agent chat '
           f'whose Model is {args.name!r} (one Claude Code session per chat). Ctrl-C to quit.',

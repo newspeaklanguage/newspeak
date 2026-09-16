@@ -261,6 +261,15 @@ is not in force, so in a cross-machine session the wrong client may be elected.
 The bundled launchers (`bus-agent.py`, `bus-responder.py`, `bus-claude.py`) all
 declare their names.
 
+Since 2026-09-15 a stale front door reports itself: `/_ns/config` carries a
+`process` block (`started`, `source`, `source_mtime`, `stale`), and `stale` is
+true once `cors-proxy.py` has changed on disk after the process started — the
+door also prints a warning the first time it notices. `startLiveChat.sh` and
+`bus-claude.py` refuse to attach to a stale door, and `bus-claude.py` likewise
+warns before each request it takes if its own source has changed since it
+started. Restart order when either is stale: the front door, then reload the
+IDE page (its open bus stream carries the old token), then the bridge.
+
 ---
 
 ## 4. How to run it
@@ -280,7 +289,9 @@ the bus live. Confirm it's on:
 
 ```
 curl -s http://localhost:8080/_ns/config
-# → {"version": 1, "git": true, "fetch": true, "bus": true}
+# → {"version": 1, "git": true, "fetch": true, "bus": true,
+#    "process": {"started": "…", "source": "…/tool/cors-proxy.py",
+#                "source_mtime": "…", "stale": false}}
 ```
 
 `"bus": true` means the bus is enabled. Without `--bus` it reads `false` and the

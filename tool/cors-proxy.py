@@ -19,7 +19,10 @@ The FRONT DOOR (default :8080) serves:
                              reflector= is passed; events are too small for
                              file payloads, so blobs live here and only a
                              handle travels as an event
-    /_ns/config              discovery: what this origin offers (JSON)
+    /_ns/config              discovery: what this origin offers (JSON), plus a
+                             "process" block: when this door started, which
+                             source it runs, and "stale": true once that
+                             source has changed on disk (restart it)
     /_ns/token               the auth token; answered ONLY to loopback
     /_ns/git/<host>/<path>   the git proxy at its permanent address
     /_ns/fetch?url=…         server-side GET returning a diagnostics envelope
@@ -134,13 +137,51 @@ FILES_PREFIX = '/files/'
 # token-gated /_ns/* call; nothing is pasted and nothing rests in localStorage.
 TOKEN = secrets.token_urlsafe(32)
 
-# Filled from CLI flags in main(); served verbatim by /_ns/config.
+# Filled from CLI flags in main(); served by /_ns/config with the process
+# block below added at answer time.
 CONFIG = {
     'version': 1,
     'git': True,
     'fetch': True,
     'bus': False,
 }
+
+# The process reports on itself, because nothing else can tell a current front
+# door from a stale one: a process started before this file was last edited
+# answers on the same port, with the same config, and silently lacks whatever
+# the edit added (a launcher then falls back to some older behaviour, and the
+# fault surfaces hours later somewhere else - 2026-09-12, 09-15). So the
+# answer to /_ns/config carries when this process started, which source it
+# runs, and whether that source has changed on disk since: 'stale' is the one
+# bit a launcher or an operator needs. Checked on every answer, not captured
+# at startup, so an edit made while the door is up shows on the next request.
+SOURCE = os.path.abspath(__file__)
+SOURCE_MTIME_AT_START = os.path.getmtime(SOURCE)
+STARTED_AT = time.time()
+_STALE_REPORTED = [False]
+
+
+def _iso(t):
+    return time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(t))
+
+
+def process_status():
+    try:
+        now_mtime = os.path.getmtime(SOURCE)
+    except OSError:
+        now_mtime = None
+    stale = now_mtime != SOURCE_MTIME_AT_START
+    if stale and not _STALE_REPORTED[0]:
+        _STALE_REPORTED[0] = True
+        print(f'WARNING: {SOURCE} changed on disk at {_iso(now_mtime) if now_mtime else "?"}; '
+              f'this front door started {_iso(STARTED_AT)} and is running the OLD code. '
+              f'Restart it.', file=sys.stderr, flush=True)
+    return {
+        'started': _iso(STARTED_AT),
+        'source': SOURCE,
+        'source_mtime': _iso(SOURCE_MTIME_AT_START),
+        'stale': stale,
+    }
 
 # /_ns/fetch returns at most this much body; the envelope says when it cut.
 FETCH_BODY_CAP = 256 * 1024
@@ -238,7 +279,8 @@ class HostServicesHandler(SimpleHTTPRequestHandler):
     def _serve_config(self, method):
         if method not in ('GET', 'HEAD'):
             return self._send_json(405, {'error': 'GET only'})
-        self._send_json(200, CONFIG, head_only=(method == 'HEAD'))
+        self._send_json(200, dict(CONFIG, process=process_status()),
+                        head_only=(method == 'HEAD'))
 
     def _serve_token(self, method):
         # Loopback peers only, regardless of the bind address; and browser
@@ -725,6 +767,9 @@ def main():
     print(f'front door listening on http://{args.bind}:{args.port}')
     print(f'  static root: {root} (CORS + no-cache; PUT under {FILES_PREFIX})')
     print(f'  discovery:   /_ns/config -> {json.dumps(CONFIG)}')
+    print(f'  process:     started {_iso(STARTED_AT)}, running {SOURCE} '
+          f'(modified {_iso(SOURCE_MTIME_AT_START)}); /_ns/config says "stale": true '
+          f'once that file changes')
     print(f'  token:       /_ns/token (loopback clients only)')
     print(f'  git proxy:   /_ns/git/<host>/<path> -> https://<host>/<path>')
     try:

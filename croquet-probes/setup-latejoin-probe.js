@@ -46,6 +46,11 @@
  *   PROVOKE=1                      last, two of B's buttons swap addresses and A clicks one:
  *                                  the alarm's label check must report that event on B, and
  *                                  only there (the delivery count alone cannot see it)
+ *   NAV=home | history             after the turns A leaves the chat page and re-enters it
+ *                                  (home button + toolbar brain, or the history page), then
+ *                                  sends one more message: the re-displayed page's editor
+ *                                  must accept and its keystrokes must reach a live address
+ *                                  (needs FROM_CLASS=0)
  */
 if (!process.env.NODE_PATH) {
   process.env.NODE_PATH = '/Users/gbracha/newspeak/dev/web/croquet/packages/reflector/node_modules';
@@ -119,6 +124,18 @@ const INBOUND = process.env.INBOUND === '1';
    (croquet-post.js nsCheckLabel) must report exactly that event on B, and
    nothing on A. Last, because B is diverged from then on. */
 const PROVOKE = process.env.PROVOKE === '1';
+/* NAV: after the turns, A leaves the chat page and comes back to it - by way
+   of NAV=home: the toolbar's home button, then the toolbar's AI Chat brain
+   (which re-enters the current chat); NAV=history: the toolbar's history
+   page and the chat's own entry there - and then sends one more message. The
+   re-displayed page is the cached presenter tree, whose subscriptions were
+   retired when it was left; the shell re-arms them on display. On 2026-09-16
+   a chat page re-entered this way kept publishing every keystroke under a
+   RETIRED editor address on both clients (100+ 'arrived for a fragment this
+   client had retired' warnings), so the input neither accepted nor synced.
+   Chat page only (FROM_CLASS=0). */
+const NAV = process.env.NAV || '';
+const NAV_TURN = NAV ? 1 : 0;
 const CHAT_NAME = 'ProbeChat';
 const INBOUND_TEXT = 'unsolicited probe message from the agent';
 const replyNo = t => t + (INBOUND && t >= 2 ? 1 : 0);
@@ -422,6 +439,8 @@ async function main() {
   if (FAIL_TURN && !TOOL_TURNS) { console.log('FAIL_TURN fails the text request that carries a tool result; it needs TOOL_TURNS=1'); process.exitCode = 1; return done([]) }
   if (NOTICE && (!TOOL_TURNS || TURNS < 2)) { console.log('NOTICE needs TOOL_TURNS=1 and TURNS>=2 (the notices ride the turn after the Apply)'); process.exitCode = 1; return done([]) }
   if (INBOUND && REMOTE) { console.log('INBOUND posts over the bus; it needs PROVIDER=bus'); process.exitCode = 1; return done([]) }
+  if (NAV && FROM_CLASS) { console.log('NAV re-enters the chat PAGE; it needs FROM_CLASS=0'); process.exitCode = 1; return done([]) }
+  if (NAV && NAV !== 'home' && NAV !== 'history') { console.log('NAV must be home or history'); process.exitCode = 1; return done([]) }
   console.log('provider=' + PROVIDER + ' page=' + NS_PAGE_FILE + ' vfuel suffix="' + SUFFIX + '" fromClass=' + FROM_CLASS + ' toolTurns=' + TOOL_TURNS + ' tool=' + TOOL_USE.name +
     ' notice=' + NOTICE + ' failTurn=' + FAIL_TURN);
   await sleep(1000);
@@ -564,6 +583,61 @@ async function main() {
     }
     console.log('A after turn ' + t + ' census:', await A.v(CENSUS));
   }
+  if (NAV) {
+    /* See NAV above. Leave the chat page and come back to it. */
+    const evLeave = await A.v('theModel.newspeakEvents.length');
+    if (NAV === 'history') {
+      await step(A, 'open history', clickTitle('history'));
+      if (!await waitFor(A, "document.body.innerText.includes('Viewed in this Browser')", 30000)) { check('history page opens', false); return bail(A, 'history page did not open') }
+      await sleep(3000);
+      const entries = await A.v("JSON.stringify(Array.from(document.querySelectorAll('a,span')).map(function(e){return (e.innerText||'').trim()}).filter(function(t){return t&&t.length<80}))");
+      console.log('  history entries: ' + entries.slice(0, 600));
+      await step(A, 'go home from history', clickTitle('Return to home screen'));
+    } else {
+      await step(A, 'leave the chat page (home)', clickTitle('Return to home screen'));
+    }
+    if (!await waitFor(A, "document.body.innerText.includes('Workspaces')", 30000)) { check('home page opens', false); return bail(A, 'home page did not open') }
+    await sleep(4000);
+    console.log('A home census:', await A.v(CENSUS));
+    if (NAV === 'history') {
+      await step(A, 'open history', clickTitle('history'));
+      if (!await waitFor(A, "document.body.innerText.includes('Viewed in this Browser')", 30000)) { check('history page opens again', false); return bail(A, 'history page did not open again') }
+      await sleep(3000);
+      /* The chat's entry: the one naming the model (the bus agent's name or the mock model). */
+      const CLICK_ENTRY = `(function(){var want=${JSON.stringify(modelName)};var m=Array.from(document.querySelectorAll('*')).filter(function(e){return (e.textContent||'').indexOf(want)>=0&&e.children.length===0});` +
+        `if(!m.length)return 'NOEL';var T=m[m.length-1];${MOUSE};return 'CLICKED('+m.length+' '+T.tagName+' '+(T.textContent||'').trim().slice(0,60)+')'})()`;
+      await step(A, 'click the chat\'s history entry', CLICK_ENTRY);
+    } else {
+      await step(A, 're-enter the chat (toolbar brain)', clickTitle('AI Chat'));
+    }
+    /* The editor registry, sampled while the page comes back: does the
+       retired editor's address ever return, and does it stay? */
+    let lastCm = '';
+    for (let i = 0; i < 16; i++) {
+      const cm = JSON.parse(await A.v(CENSUS)).cm.sort().join(',');
+      if (cm !== lastCm) { console.log('  +' + (i * 500) + 'ms editors: ' + cm); lastCm = cm }
+      await sleep(500);
+    }
+    const back = await waitFor(A, "!document.body.innerText.includes('AI Chat Setup') && !document.body.innerText.includes('Workspaces') && " + modelShown, 30000);
+    check('A is back on the chat page', back);
+    if (!back) return bail(A, 'did not get back to the chat page');
+    await sleep(1000);
+    console.log('A back on chat census:', await A.v(CENSUS), await A.v(PAGE));
+    const t = TURNS + 1;
+    console.log('  send message ' + t + ' after navigating back: ' + await sendChat(A, focusInput, 'probe message number ' + t + ' after navigating back'));
+    await sleep(Math.min(REPLY_DELAY_MS, 5000));
+    const retired = () => A.logs.filter(l => l.includes('had retired'));
+    console.log('  A after typing: retired-address warnings=' + retired().length + ' events=' + await A.v('theModel.newspeakEvents.length') + ' (was ' + evLeave + ' before leaving)');
+    const got = await waitFor(A, "document.body.innerText.includes(" + JSON.stringify(REPLY + '-' + replyNo(t)) + ")", 90000 + 2 * REPLY_DELAY_MS);
+    check('A gets reply ' + t + ' after leaving and re-entering the chat page', got, 'requests=' + requests + ' retired-address warnings=' + retired().length);
+    check('no keystroke landed on a retired editor address on A', retired().length === 0, retired().length + ' warnings' + (retired().length ? ': ' + retired()[0].slice(0, 200) : ''));
+    if (!got) {
+      console.log('A storyline since leaving:', await A.v(`(function(){var ev=theModel.newspeakEvents.slice(${evLeave});var seen=[];ev.forEach(function(e,i){var t=e.scope+e.fid+':'+String(e.eventSpec).replace('model_','');if(seen.indexOf(t)<0)seen.push((${evLeave}+i)+' '+t)});return seen.join(' | ')})()`));
+      return bail(A, 'no reply after navigating back');
+    }
+    await sleep(6000);
+    console.log('A after nav turn census:', await A.v(CENSUS));
+  }
   if (NOTICE) {
     /* Both notices must be in the system prompt of turn 2's FIRST request,
        and in no earlier one. */
@@ -613,7 +687,7 @@ async function main() {
   else check('no divergence reported on A or B', divA === '[]' && divB === '[]', 'A=' + divA + ' B=' + divB);
   if (orph.length) console.log('B orphans:\n' + orph.map(l => '    ' + l.slice(0, 220)).join('\n'));
   console.log('B held answers: ' + held.length + (held.length ? '\n' + held.map(l => '    ' + l.slice(0, 220)).join('\n') : ''));
-  const expectedRequests = (TURNS + (INBOUND ? 1 : 0)) * (TOOL_TURNS ? 2 : 1) + (FAIL_TURN ? 1 : 0);
+  const expectedRequests = (TURNS + NAV_TURN + (INBOUND ? 1 : 0)) * (TOOL_TURNS ? 2 : 1) + (FAIL_TURN ? 1 : 0);
   check('the provider saw exactly ' + expectedRequests + ' requests (replay added none)', requests === expectedRequests, 'requests=' + requests + ' toolRequests=' + toolRequests);
   /* A request beyond the expected count came from the joiner. Its body should
      equal the original's request at the same position in the conversation
@@ -659,7 +733,7 @@ async function main() {
       console.log('    B ' + JSON.stringify(sb.slice(Math.max(0, i - 3), i + 4)));
     }
   }
-  check('B shows the last reply', await B.v("document.body.innerText.includes(" + JSON.stringify(REPLY + '-' + replyNo(TURNS)) + ")"));
+  check('B shows the last reply', await B.v("document.body.innerText.includes(" + JSON.stringify(REPLY + '-' + replyNo(TURNS + NAV_TURN)) + ")"));
   /* Two transcript lines only a faithful replay reproduces. The failed
      attempt's error section exists on A because A's fetch failed; the model
      never recorded that failure, so a joiner can only show it by having its

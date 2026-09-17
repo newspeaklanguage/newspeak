@@ -6790,9 +6790,30 @@ The picker is hidden while a request is in flight, to avoid switching in the mid
 	)
 	deferAction: action = (
 		deferredContentQueue add: action.
-		deferredContentQueue size = 1 ifTrue: [ nextFrameDo: [ nextDeferredAction ] ]
+		deferredContentQueue size = 1 ifTrue: [ scheduleDeferredContent ]
+	)
+	scheduleDeferredContent = (
+		(* One deferred action per painted frame, so that the page stays responsive and each step's images get to load and render before the next. But a page that is not being painted gets no animation frames at all - a window on another desktop, a covered or minimized one, a background tab - and its queue then never moved: content that every other client had built simply did not exist there. Under HopscotchForCroquet that is a divergence, since events addressed to the unbuilt fragments find no subscriber (2026-09-17: a long list expanded while one client's window was on another macOS space). With nothing being painted there is nothing to pace for, so the whole queue is drained at once. *)
+		
+		nextFrameDo: [ nextDeferredAction ] ifNoFrame: [ drainDeferredActions ]
 	)
 	nextDeferredAction = (
+		(* Empty when a drain got here first. *)
+		
+		| action |
+		deferredContentQueue isEmpty ifTrue: [ ^self ].
+		action:: deferredContentQueue removeFirst.
+		deferredContentQueue size > 0 ifTrue: [ scheduleDeferredContent ].
+		runDeferredAction: action
+	)
+	drainDeferredActions = (
+		(* Actions may defer further ones; those join the queue and are run here too. *)
+		
+		[ deferredContentQueue isEmpty ] whileFalse: [
+				runDeferredAction: deferredContentQueue removeFirst
+			]
+	)
+	runDeferredAction: action <[Object]> = (
 		(* Report rather than swallow. These actions run from a requestAnimationFrame
      callback, so a failure here reaches JS rather than a Newspeak turn: nothing is
      printed, the deferred content simply never appears, and a page that renders
@@ -6800,29 +6821,62 @@ The picker is hidden while a request is in flight, to avoid switching in the mid
      the guard - printString can fail, and messageText is frequently nil, which
      raises on concatenation. *)
 		
-		| action = deferredContentQueue removeFirst. |
-		deferredContentQueue size > 0 ifTrue: [ nextFrameDo: [ nextDeferredAction ] ].
 		[ action value ] on: Error
 			do: [:e |
 				[ ('Deferred content failed: ' , e printString) out ] on: Exception
 					do: [:e2 | 'Deferred content failed (unprintable)' out ]
 			]
 	)
-	nextFrameDo: action <[Object]> = (
-		(* Our goal is to run the argument after images have been loaded and rendered. window.requestAnimationFrame runs the callback *before* the next frame. We register another callback in the callback so the first deferred action runs *after* the next frame. We register *that* callback in another RAF callback to let new images added from a deferred block load and render before the next deferred block runs. RAF is also a relatively new feature, so simply schedule a timer if it is not available. *)
+	pageIsHidden ^<Boolean> = (
+		(* The Page Visibility API: true for a background tab, a minimized or fully covered window, a window on another desktop. *)
 		
+		^[ (document at: 'hidden') = true ] on: Exception do: [:e | false ]
+	)
+	noFrameTimeout ^<Integer> = (
+		(* Milliseconds without an animation frame before a page that claims to be visible is treated as not being painted. Three frames take about 50ms; a busy page can take a good deal longer. *)
+		
+		^1000
+	)
+	nextFrameDo: action <[Object]> ifNoFrame: fallback <[Object]> = (
+		(* Our goal is to run the argument after images have been loaded and rendered. window.requestAnimationFrame runs the callback *before* the next frame. We register another callback in the callback so the first deferred action runs *after* the next frame. We register *that* callback in another RAF callback to let new images added from a deferred block load and render before the next deferred block runs. RAF is also a relatively new feature, so simply schedule a timer if it is not available.
+
+Animation frames stop while the page is not being painted, and a request already made then waits until it is painted again. So the frames race a timer: a hidden page goes straight to the fallback, and a page whose frames do not come within noFrameTimeout falls back too. Exactly one of the two runs. *)
+		
+		| settled <Boolean> ::= false. |
 		(window at: 'requestAnimationFrame') isUndefined ifTrue: [
 				Timer after: 200 do: action.
+				^self
+			].
+		pageIsHidden ifTrue: [
+				
+				(* A promise turn, not a timer: a hidden page's timers are throttled to one a second, and after five minutes to one a minute - by which time the events addressed to this content have long arrived. The turn comes right after the current one, ahead of any further event. Nothing may be raised inside it. *)
+				((window at: 'Promise') resolve: 0) then: [:ignored |
+						[ fallback value ] on: Exception do: [:e | nil ].
+						nil
+					].
 				^self
 			].
 		window requestAnimationFrame: [:time1 <Float> |
 				window requestAnimationFrame: [:time2 <Float> |
 						window requestAnimationFrame: [:time3 <Float> |
-								action value.
+								settled ifFalse: [
+										settled:: true.
+										action value
+									].
 								nil
-							]
-					]
+							].
+						nil
+					].
+				nil
+			].
+		window setTimeout: [
+				settled ifFalse: [
+						settled:: true.
+						fallback value
+					].
+				nil
 			]
+			with: noFrameTimeout
 	)
 	computeContentForMenu: menuSupplier <[Menu]> ^<Alien[Div]> = (
 		| dropDownContent = document createElement: 'div'. |

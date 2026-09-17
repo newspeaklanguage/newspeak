@@ -51,6 +51,12 @@
  *                                  sends one more message: the re-displayed page's editor
  *                                  must accept and its keystrokes must reach a live address
  *                                  (needs FROM_CLASS=0)
+ *   HIDDEN_B=1                     the late joiner is an UNPAINTED page - document.hidden is
+ *                                  true and requestAnimationFrame never calls back, as for a
+ *                                  window on another desktop or a background tab. It must
+ *                                  still replay the whole session and build everything
+ *                                  (2026-09-17: deferred content and the replay pacing both
+ *                                  waited on animation frames that never came)
  */
 if (!process.env.NODE_PATH) {
   process.env.NODE_PATH = '/Users/gbracha/newspeak/dev/web/croquet/packages/reflector/node_modules';
@@ -666,7 +672,18 @@ async function main() {
   console.log('A storyline:', await A.v(STORY(aTotal)));
 
   console.log('\n--- late joiner B ---');
-  const B = await launchBrowser({ port: PORT_B, tag: 'slj-b', session: SESSION });
+  /* HIDDEN_B: installed before any page script runs. Headless Chrome paints, so
+     the unpainted page is simulated: the visibility API says hidden, and frame
+     requests are accepted and never honoured. Timers are left alone - the real
+     thing throttles them too, which only makes it slower, not different. */
+  const HIDDEN_INIT = `
+    Object.defineProperty(document, 'hidden', { configurable: true, get: () => true });
+    Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'hidden' });
+    window.requestAnimationFrame = () => 0;
+    window.__nsHiddenProbe = true;`;
+  const hiddenB = process.env.HIDDEN_B === '1';
+  if (hiddenB) console.log('B is an UNPAINTED page (document.hidden, no animation frames)');
+  const B = await launchBrowser({ port: PORT_B, tag: 'slj-b', session: SESSION, initScript: hiddenB ? HIDDEN_INIT : undefined });
   const t0 = Date.now();
   await B.navigate(URL);
   const caught = await waitFor(B, 'window.lastProcessedEvent >= ' + aTotal, JOIN_MS);

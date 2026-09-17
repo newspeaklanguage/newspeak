@@ -18,17 +18,18 @@ resuming Croquet work. The previous record is
 | `6393704` | A keydown is published only for the keys the editor acts on |
 | `176c543` | An editor's before-change response rides its change event |
 
-**On disk, UNCOMMITTED, in Gilad's rebuild of 2026-09-17** (he is testing in a
-fresh session; commit only on his explicit word; planned as four newspeak
-commits, one per concern, plus one in primordialsoup):
+**Committed 2026-09-17**, after Gilad rebuilt and verified in a fresh session
+that large lists hold up cleanly with a client on another macOS space:
 
-| File | Concern |
+| Commit | What |
 |---|---|
-| `HopscotchForCroquet.ns` | Keystroke item 3: coalesced change publishing (was changeset cs4) |
-| `Browsing.ns` | Method editor collapsing on accept (cs5) |
-| `HopscotchForHTML5.ns` | Deferred content on an unpainted page (cs6 + promise-turn refinement) |
-| `croquet-probes/setup-latejoin-probe.js`, `croquet-probes/syntax-check.js` (new) | `HIDDEN_B=1` probe mode; glue syntax checker |
-| primordialsoup `meta/croquet-post.js` | Replay pacing no longer depends on animation frames |
+| `a5150ac` | Keystroke item 3: coalesced change publishing (`HopscotchForCroquet.ns`) |
+| `2dae710` | Method editor no longer collapses on accept (`Browsing.ns`) |
+| `33b0981` | Deferred content is built on an unpainted page (`HopscotchForHTML5.ns`) |
+| `101a146` | `HIDDEN_B=1` probe mode, `syntax-check.js`, this summary |
+| primordialsoup `6122c06` (extraRevs) | Replay pacing no longer depends on animation frames |
+
+`webide-ai-access` merged master at `6fa2c60`. Nothing is left uncommitted.
 
 Scratch helpers (untracked, regenerate at will): `scratch/splice_test_glue.py`
 (rebuilds `out/croquetpsoup-test.js` from the meta file, TEST artifact only),
@@ -71,7 +72,7 @@ holds the current context Menu and retires the previous one at the next open.
 - Item 2 (`176c543`): user before-change publishes nothing; the change handler
   sends the base before-change response first. Hot-load caveat: open editors
   keep old handler closures until re-armed.
-- Item 3 (uncommitted): a throttle, not a debounce. The first unpublished user
+- Item 3 (`a5150ac`): a throttle, not a debounce. The first unpublished user
   change starts an 80ms timer (`changeCoalescingWindow`, a method, tune by
   hot-load); the flush publishes the full text, the LAST change record, the
   sender's view id and an ordinal.
@@ -88,7 +89,7 @@ holds the current context Menu and retires the previous one at the next open.
   a keystroke sees older text on other clients (a probe could; a person cannot).
   `codeMirrorData:` is now unused.
 
-### 5. Method editor collapsed on accept, intermittently (fixed, uncommitted)
+### 5. Method editor collapsed on accept, intermittently (fixed, `2dae710`)
 Not Croquet and not the accept paths. Keyed list reconciliation (2026-08)
 matches by `#key`; `Presenter>>key` is the subject; a method subject's model
 compares method mirrors, which compare COMPILED METHODS BY IDENTITY. Accept
@@ -100,7 +101,7 @@ name), as tagged lists always matched. Lazy slots are unaffected.
 Noted, untouched: `Browsing` ~5535, `MiscBrowsing` ~833, `Inspecting` ~716 have
 a SLOT named `key` on presenters, shadowing the reconciliation key.
 
-### 6. A window that is not painted diverged (fixed, uncommitted, probe-verified)
+### 6. A window that is not painted diverged (fixed, `33b0981` + psoup `6122c06`, probe- and Gilad-verified)
 Gilad opened all senders of `#key` while a second client's window was on
 another macOS space. Base Hopscotch drains deferred content one action per
 three animation frames; **an unpainted page gets no animation frames**, so

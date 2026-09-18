@@ -274,8 +274,18 @@ Ultimately, we hope to go beyond the above, and be able to diff the saved model 
 				^{#model_codeMirror_change. #model_codeMirror_beforeChange. #model_codeMirror_keydown. #model_codeMirror_accept. #model_codeMirror_cancel. #model_codeMirror_beforeSelectionChange. }
 			)
 			createVisual ^<Alien[Element]> = (
+				| v <Alien[Element]> |
+				selectAllPublishes.
 				ensureCroquetSubscriptions.
-				^super createVisual
+				v:: super createVisual.
+				
+				(* Losing focus flushes a change waiting in the coalescing window: a button clicked right after typing takes focus first, and its synchronized action reads each client's own editor - which must hold the text by then. The blur is local, so the flush is too; every client then sees the change event ahead of the click. CodeMirror calls the handler as handler(cm, event); the block names both. *)
+				editor on: 'blur'
+					do: [:codeMirror :ev |
+						flushPendingChange.
+						nil
+					].
+				^v
 			)
 			public scope ^<String> = (
 				scope_slot isNil ifTrue: [ scope_slot: 'nscodemirror_' , fragmentId ].
@@ -387,6 +397,9 @@ old text (#removed field) *)
 		   business, exactly as a programmatic change is - see isUserOrigin:. *)
 				
 				(reflecting and: [ isUserOrigin: (event at: #origin) ]) ifTrue: [
+						
+						(* Nothing of this editor's is published while one of its changes waits in the coalescing window: the other clients would apply this selection to the text they still have, then replace that text, and end up with no selection at all (a select-all right after a paste; the determinism probe's Evaluate Selection then evaluated nothing on every client but the typist's, 2026-09-17). *)
+						flushPendingChange.
 						publish: 'nscodemirror_'
 							event: #codeMirror_beforeSelectionChange
 							data: (js global newspeakFragmentData: fragmentId
@@ -1706,6 +1719,30 @@ To produce a non-synchronizing part of the UI, subclass NonSyncingPresenter and 
 		lazy coordinatedFetchInline <Map[String, Boolean]> = Map new.
 		lazy mintLedgerOn <Boolean> = [ (js global at: 'nsMintLedgerOn') = true ] on: Exception
 			do: [:e | false ].
+		lazy selectAllPublishes <Boolean> = patchSelectAllCommand.
+		patchSelectAllCommand ^<Boolean> = (
+			(* CodeMirror's own selectAll command - Cmd-A, and execCommand('selectAll') - sets the selection with NO origin, so it looked like a programmatic operation to respondToBeforeSelectionChange: and stayed on the client that pressed it, while a mouse or shift-arrow selection ('*mouse', '+move') is published. A following synchronized Evaluate Selection then evaluated the text on that client alone and nothing anywhere else (found by the determinism probe, 2026-09-17). The command is replaced, once, by one that tags its selection '*selectAll', which isUserOrigin: accepts. Forced from every editor's createVisual through the lazy slot selectAllPublishes.
+
+The replacement lives in the Croquet support script (nsPatchSelectAll), in JavaScript, so that both platforms run the same code. The block below remains ONLY for a psoup page whose script predates nsPatchSelectAll; a JS deploy always ships the current script, so it never runs there. *)
+			
+			| patch = js global at: 'nsPatchSelectAll'. CM opts |
+			patch isUndefined ifFalse: [
+					patch apply: nil.
+					^true
+				].
+			CM:: js global at: 'CodeMirror'.
+			opts:: JSObject new.
+			opts at: #origin put: '*selectAll'.
+			opts at: #scroll put: false.
+			(CM at: 'commands') at: 'selectAll'
+				put: [:cm |
+					cm setSelection: (CM Pos: cm firstLine ch: 0)
+						head: (CM Pos: cm lastLine ch: 1000000000)
+						options: opts.
+					nil
+				].
+			^true
+		)
 		newImageButtonId ^<String> = (
 			^newIdFor: 'imageButton'
 		)

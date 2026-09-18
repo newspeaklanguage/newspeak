@@ -1,7 +1,12 @@
 #!/bin/sh
-# Build ONLY out/CroquetHopscotchWebIDE-TEST.vfuel from the current working
-# tree (uncommitted edits included), without emscripten and without touching
-# the live artifacts. Mirrors build.sh steps 4e (BuildInfo stamp), 6-7
+# Build ONLY the two TEST snapshots of the IDE from the current working tree
+# (uncommitted edits included), without emscripten and without touching the
+# live artifacts:
+#   out/CroquetHopscotchWebIDE-TEST.vfuel   the Croquet IDE, for the psoup probes
+#   out/HopscotchWebIDE-TEST.vfuel          the plain IDE, which
+#       croquet-probes/deploy-driver2.js boots headlessly to package the
+#       Croquet JS deploy (out/CroquetJSIDE-TEST.*) - so that deploy is only as
+#       current as this snapshot. Mirrors build.sh steps 4e (BuildInfo stamp), 6-7
 # (staging: psoup sources first, repo sources over them) and 8 (compile), in a
 # fresh scratch directory each time so nothing stale is captured.
 #
@@ -46,6 +51,7 @@ cd "$STAGE"
     "${PRIMORDIALSOUP}"/out/snapshots/WebCompiler.vfuel \
     ./*.ns \
     ./*.png \
-    RuntimeForCroquet HopscotchWebIDE "${NEWSPEAK}"/out/CroquetHopscotchWebIDE-TEST.vfuel
+    RuntimeForCroquet HopscotchWebIDE "${NEWSPEAK}"/out/CroquetHopscotchWebIDE-TEST.vfuel \
+    RuntimeForHopscotchForHTML HopscotchWebIDE "${NEWSPEAK}"/out/HopscotchWebIDE-TEST.vfuel
 
-ls -la "${NEWSPEAK}"/out/CroquetHopscotchWebIDE-TEST.vfuel
+ls -la "${NEWSPEAK}"/out/CroquetHopscotchWebIDE-TEST.vfuel "${NEWSPEAK}"/out/HopscotchWebIDE-TEST.vfuel

@@ -13,6 +13,11 @@
 # Runs from the repository root regardless of the caller's directory.
 cd "$(dirname "$0")/.." || exit 1
 NODE=/Users/gbracha/software/emsdk-main/node/22.16.0_64bit/bin/node
+# The probes require 'ws', which this repository does not vendor; the Croquet
+# reflector's checkout has it. Some probes set this for themselves, the older
+# ones never did. A NODE_PATH given on the command line still wins.
+: "${NODE_PATH:=/Users/gbracha/newspeak/dev/web/croquet/packages/reflector/node_modules}"
+export NODE_PATH
 while [ $# -gt 0 ]; do
     case "$1" in
         *=*) export "$1"; shift ;;

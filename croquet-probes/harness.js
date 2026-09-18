@@ -106,10 +106,15 @@ async function bootIDE(b, url, { bootMs = 240000, settleMs = 4000 } = {}) {
 /* Evaluate a Newspeak doIt in the workspace and wait for it to park a result
  * on `window[flag]`. The re-select before clicking is deliberate: a render
  * between setValue and the click can collapse the selection, and Evaluate
- * Selection reads the selection at dispatch. */
+ * Selection reads the selection at dispatch.
+ *
+ * The text goes in as a USER edit (origin '+input'): a plain setValue is a
+ * programmatic change, which since 2026-09-13 is not published, so the other
+ * clients would evaluate an empty workspace. The pause also covers the editor's
+ * publishing window (changeCoalescingWindow, 80ms). */
 async function evalDoIt(b, src, flag, secs) {
   await b.v(`(function(){var c=document.querySelectorAll('.CodeMirror');var cm=c[c.length-1].CodeMirror;` +
-            `cm.focus();cm.setValue(${JSON.stringify(src)});cm.execCommand('selectAll');return 1})()`);
+            `cm.focus();cm.execCommand('selectAll');cm.replaceSelection(${JSON.stringify(src)}, null, '+input');cm.execCommand('selectAll');return 1})()`);
   await sleep(1500);
   await b.v("(function(){var c=document.querySelectorAll('.CodeMirror');var cm=c[c.length-1].CodeMirror;" +
             "cm.focus();cm.execCommand('selectAll');return 1})()");

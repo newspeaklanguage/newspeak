@@ -40,7 +40,9 @@ const TICKS = "theModel.newspeakEvents.filter(e=>e.scope==='nstimer_'&&e.eventSp
 function getJson(port, path) { return new Promise((res, rej) => { http.get({host:'127.0.0.1',port,path}, r => { let b=''; r.on('data',c=>b+=c); r.on('end',()=>{try{res(JSON.parse(b))}catch(e){rej(e)}}); }).on('error', rej); }); }
 async function browser(port, tag) {
   const proc = spawn(CHROME, ['--headless=new','--remote-debugging-port='+port,'--remote-allow-origins=*','--user-data-dir=/tmp/cq-det-'+tag+'-'+SESSION,'--no-first-run','--disable-gpu','--disable-background-timer-throttling','--disable-renderer-backgrounding','about:blank'], {stdio:'ignore'});
-  let page; for (let i=0;i<100;i++){ try { const t=await getJson(port,'/json'); page=t&&t.find(x=>x.type==='page'); if(page)break;}catch(e){} await new Promise(r=>setTimeout(r,300)); }
+  /* 90s: a Chrome that has just updated itself can take well over 30s to offer its first page. */
+  let page; for (let i=0;i<300;i++){ try { const t=await getJson(port,'/json'); page=t&&t.find(x=>x.type==='page'); if(page)break;}catch(e){} await new Promise(r=>setTimeout(r,300)); }
+  if (!page) { try { proc.kill(); } catch (e) {} throw new Error('headless Chrome on port '+port+' offered no page within 90s (stale browser on the port? run probe-browsers.js --kill)'); }
   const ws = new WebSocket(page.webSocketDebuggerUrl,{perMessageDeflate:false});
   await new Promise(r=>ws.on('open',r));
   let id=0; const pending=new Map(); const log=[];
@@ -55,24 +57,46 @@ async function browser(port, tag) {
 const click = label => `(function(){var m=Array.from(document.querySelectorAll('a,button,span,div,label')).filter(e=>(e.innerText||'').trim()===${JSON.stringify(label)});var e=m[m.length-1];['mousedown','mouseup','click'].forEach(t=>e.dispatchEvent(new MouseEvent(t,{bubbles:true,cancelable:true,view:window})));return 'C'})()`;
 const LASTCM = "document.querySelectorAll('.CodeMirror')[document.querySelectorAll('.CodeMirror').length-1].CodeMirror";
 async function waitFor(b, pred, ms) { const t0=Date.now(); while (Date.now()-t0<ms){ if (await b.ev(pred)) return true; await new Promise(r=>setTimeout(r,1000)); } return false; }
-async function boot(b) {
+/* A page that never boots used to cost every later wait its full timeout, in
+   turn and in silence - a quarter of an hour with nothing printed. So: say how
+   each boot went, stop at once if one failed (with that page's console), and
+   hold the whole run to a deadline. */
+const BOOT_MS = Number(process.env.BOOT_MS || 120000);
+const DEADLINE_MS = Number(process.env.DEADLINE_MS || 480000);
+const live = [];
+function bail(why) {
+  console.log('BAIL: ' + why);
+  for (const b of live) { console.log('  ' + b.tag + ' console tail:', b.log.slice(-8).join(' || ')); try { b.proc.kill(); } catch (e) {} }
+  process.exit(1);
+}
+setTimeout(() => bail('overall deadline of ' + DEADLINE_MS + 'ms passed'), DEADLINE_MS).unref();
+async function boot(b, tag) {
+  b.tag = tag; live.push(b);
+  const t0 = Date.now();
   await b.navigate(URL);
-  await waitFor(b, "document.body && document.body.innerText.includes('Workspaces')", 240000);
+  const up = await waitFor(b, "document.body && document.body.innerText.includes('Workspaces')", BOOT_MS);
+  console.log(tag + ' boot: ' + (up ? 'UP' : 'FAILED') + ' after ' + Math.round((Date.now()-t0)/1000) + 's   ' + URL);
+  if (!up) bail(tag + ' never showed the home page; page text: ' + JSON.stringify(String(await b.ev("document.body ? document.body.innerText.slice(0,200) : '(no body)'"))));
   await new Promise(r=>setTimeout(r,4000));
 }
+/* The text must go in as a USER edit (origin '+input'). A plain setValue is a
+   programmatic change, and since 2026-09-13 those are not published: the other
+   clients never got the expression, so the synchronized Evaluate ran on text
+   only the typing client had. The pause that follows also covers the editor's
+   publishing window (changeCoalescingWindow, 80ms). */
 async function evalIn(b, doit, doneFlag) {
-  await b.ev(`(function(){var cm=${LASTCM};cm.focus();cm.setValue(${JSON.stringify(doit)});cm.execCommand('selectAll');return 'SET'})()`);
+  await b.ev(`(function(){var cm=${LASTCM};cm.focus();cm.execCommand('selectAll');cm.replaceSelection(${JSON.stringify(doit)}, null, '+input');cm.execCommand('selectAll');return 'SET'})()`);
   await new Promise(r=>setTimeout(r,2500));
   await b.ev(click('Evaluate Selection'));
   return waitFor(b, doneFlag, 30000);
 }
 const PASS = (label, ok, detail) => console.log(label+':', ok ? 'PASS' : 'FAIL', detail||'');
 async function main() {
-  const A = await browser(9481,'a'); await boot(A);
+  const A = await browser(9481,'a'); await boot(A, 'A');
   await A.ev(click('Workspaces'));
-  await waitFor(A, "document.body.innerText.includes('Evaluate')", 30000);
-  const B = await browser(9482,'b'); await boot(B);
-  await waitFor(B, "document.body.innerText.includes('Evaluate')", 60000);
+  if (!await waitFor(A, "document.body.innerText.includes('Evaluate')", 30000)) bail('A never reached the workspace page');
+  const B = await browser(9482,'b'); await boot(B, 'B');
+  if (!await waitFor(B, "document.body.innerText.includes('Evaluate')", 60000)) bail('B never followed A to the workspace page');
   await new Promise(r=>setTimeout(r,3000));
 
   console.log('--- phase 1: syncRandom ---');
@@ -81,6 +105,17 @@ async function main() {
   const triple = async b => JSON.stringify([await b.ev('window.r1'), await b.ev('window.r2'), await b.ev('window.r3')]);
   const tA = await triple(A), tB = await triple(B);
   PASS('RANDOM STREAMS AGREE (A==B)', tA === tB && tA.indexOf('null') < 0, tA === tB ? tA.slice(0,40)+'...' : tA+' vs '+tB);
+  if (tA !== tB) {
+    /* What did B actually receive? The recorded storyline, and the state of B's editor. */
+    const STORY = "theModel.newspeakEvents.map((e,i)=>i+' '+e.scope+e.fid+':'+e.eventSpec).join(' | ')";
+    const EDITOR = `(function(){var cm=${LASTCM};return JSON.stringify({text:cm.getValue().slice(0,60),len:cm.getValue().length,sel:cm.getSelection().length,cursor:cm.getCursor(),cms:document.querySelectorAll('.CodeMirror').length})})()`;
+    console.log('  storyline on A:', await A.ev(STORY));
+    console.log('  B processed', await B.ev('window.lastProcessedEvent'), 'of', await B.ev('theModel.newspeakEvents.length'));
+    console.log('  A editor:', await A.ev(EDITOR));
+    console.log('  B editor:', await B.ev(EDITOR));
+    console.log('  B page:', JSON.stringify(String(await B.ev("document.body.innerText.slice(0,300)"))));
+    console.log('  B console:', B.log.slice(-10).join(' || '));
+  }
 
   console.log('--- phase 2: coordinatedFetch election ---');
   await evalIn(A, CF_DOIT, "typeof window.cfGot === 'string' || typeof window.cfFail === 'string'");
@@ -98,6 +133,7 @@ async function main() {
   console.log('--- phase 3: late joiner ---');
   const total = await A.ev('theModel.newspeakEvents.length');
   const C = await browser(9483,'c');
+  C.tag = 'C'; live.push(C);
   await C.navigate(URL);
   const caught = await waitFor(C, 'window.lastProcessedEvent >= '+total, 240000);
   await new Promise(r=>setTimeout(r,4000));

@@ -7,7 +7,11 @@
    focus must survive; the registry must stay steady. Closes with a
    syncRandom determinism check: one synced eval draws on BOTH clients, whose
    streams must be at the same position (equal draws).
-   Run: node typing-test.js [js] */
+   Run: node typing-test.js [js]
+
+   Every edit goes in as a USER edit (origin '+input'). A plain setValue, or a
+   replaceSelection with no origin, is a programmatic change, and since
+   2026-09-13 those are not published - the other client would never see them. */
 const { spawn } = require('child_process');
 const http = require('http');
 const WebSocket = require('ws');
@@ -17,7 +21,8 @@ const PAGE = process.argv[2] === 'js'
   ? 'CroquetJSIDE-TEST.html?sessionId='
   : process.argv[2] === 'stock'
     ? 'croquetpsoup.html?snapshot=CroquetHopscotchWebIDE.vfuel&sessionId='
-    : 'croquetpsoup.html?snapshot=CroquetHopscotchWebIDE-TEST.vfuel&sessionId=';
+    : (process.env.NS_PAGE || 'croquetpsoup-test.html') + '?snapshot=CroquetHopscotchWebIDE-TEST.vfuel&sessionId=';
+setTimeout(() => { console.log('BAIL: overall deadline passed'); process.exit(1); }, Number(process.env.DEADLINE_MS || 420000)).unref();
 const URL = 'http://localhost:8080/' + PAGE + SESSION + '&pwd=test&appId=org.newspeaklanguage.evprobe&apiKey=none&reflector=ws://localhost:9090&files=/files';
 function getJson(port, path) { return new Promise((res, rej) => { http.get({host:'127.0.0.1',port,path}, r => { let b=''; r.on('data',c=>b+=c); r.on('end',()=>{try{res(JSON.parse(b))}catch(e){rej(e)}}); }).on('error', rej); }); }
 async function browser(port, tag) {
@@ -49,12 +54,15 @@ async function main() {
   await waitFor(B, "document.body.innerText.includes('Evaluate')", 60000);
   await new Promise(r=>setTimeout(r,3000));
   console.log('both on workspace. A sets 9KB buffer...');
-  await A.ev(`(function(){var cm=${LASTCM};cm.focus();var pad='(* '+'x'.repeat(9000)+' *) ';cm.setValue(pad);cm.setCursor(cm.lineCount()-1);return 'SET '+cm.getValue().length})()`);
+  await A.ev(`(function(){var cm=${LASTCM};cm.focus();var pad='(* '+'x'.repeat(9000)+' *) ';cm.execCommand('selectAll');cm.replaceSelection(pad, null, '+input');cm.setCursor({line:0,ch:0});return 'SET '+cm.getValue().length})()`);
   const bConverged1 = await waitFor(B, LASTCM+".getValue().length > 9000", 60000);
   console.log('B received 9KB buffer (detour path):', bConverged1 ? 'PASS' : 'FAIL');
+  /* Measured, not assumed: the probe left A's cursor at 0:0 with nothing selected.
+     Anything else here was put there by an echo. */
+  console.log('A selection just before typing:', await A.ev(`(function(){var cm=${LASTCM};return JSON.stringify({selectedChars:cm.getSelection().length,ranges:cm.listSelections().map(function(r){return r.anchor.line+':'+r.anchor.ch+'-'+r.head.line+':'+r.head.ch})})})()`));
   console.log('A types 6 chars...');
   for (const ch of 'abc123') {
-    await A.ev(`(function(){var cm=${LASTCM};cm.replaceSelection(${JSON.stringify(ch)});return 'T'})()`);
+    await A.ev(`(function(){var cm=${LASTCM};cm.replaceSelection(${JSON.stringify(ch)}, null, '+input');return 'T'})()`);
     await new Promise(r=>setTimeout(r,700));
   }
   const focusHeld = await A.ev("(function(){var el=document.activeElement;while(el){if(el.classList&&el.classList.contains('CodeMirror'))return true;el=el.parentElement}return false})()");
@@ -68,12 +76,14 @@ async function main() {
   let headB = String(await B.ev(LASTCM+'.getValue().slice(0,12)'));
   const t1=Date.now(); while (headB !== headA && Date.now()-t1<30000) { await new Promise(r=>setTimeout(r,2000)); headB = String(await B.ev(LASTCM+'.getValue().slice(0,12)')); }
   console.log('A==B CONVERGENCE:', headA === headB ? 'PASS' : 'FAIL', '| A:', JSON.stringify(headA), 'B:', JSON.stringify(headB));
+  const lenA = await A.ev(LASTCM+'.getValue().length'), lenB = await B.ev(LASTCM+'.getValue().length');
+  console.log('THE 9KB BUFFER SURVIVES THE TYPING:', (lenA > 9000 && lenB > 9000) ? 'PASS' : 'FAIL', '| lengths A:', lenA, 'B:', lenB);
   console.log('chars surviving the echo race (info, known parked issue):', JSON.stringify(headA.split('(*')[0]));
   const cmKeysA = await A.ev("Array.from(newspeakSubscriptions.keys()).filter(k=>k.indexOf('nscodemirror')===0).length");
   const cmKeysB = await B.ev("Array.from(newspeakSubscriptions.keys()).filter(k=>k.indexOf('nscodemirror')===0).length");
   console.log('REGISTRY STEADY (6 cm keys each):', (cmKeysA===6&&cmKeysB===6) ? 'PASS' : 'FAIL ('+cmKeysA+'/'+cmKeysB+')');
   console.log('--- syncRandom determinism ---');
-  await A.ev(`(function(){var cm=${LASTCM};cm.focus();cm.setValue("platform js global at: 'rnd' put: platform hopscotch syncRandom printString");cm.execCommand('selectAll');return 'SET'})()`);
+  await A.ev(`(function(){var cm=${LASTCM};cm.focus();cm.execCommand('selectAll');cm.replaceSelection("platform js global at: 'rnd' put: platform hopscotch syncRandom printString", null, '+input');cm.execCommand('selectAll');return 'SET'})()`);
   await new Promise(r=>setTimeout(r,2500));
   await A.ev(click('Evaluate Selection'));
   await waitFor(A, "typeof window.rnd === 'string'", 20000);

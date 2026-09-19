@@ -799,6 +799,7 @@ async function main() {
   /* The Session's sharing seam prints a 'shareToolText:' line whenever it
      falls back to the local text; on either client that line names why. */
   const shareA = A.logs.filter(l => l.includes('shareToolText')), shareB = B.logs.filter(l => l.includes('shareToolText'));
+  for (const x of [A, B]) console.log('shadow log ' + (x === A ? 'A' : 'B') + ': ' + await x.v("(typeof nsShadowLog==='undefined')?'none':nsShadowLog.slice(-60).join(' | ')"));
   console.log('A sharing fallbacks: ' + shareA.length + (shareA.length ? '\n' + shareA.map(l => '    ' + l.slice(0, 240)).join('\n') : ''));
   console.log('B sharing fallbacks: ' + shareB.length + (shareB.length ? '\n' + shareB.map(l => '    ' + l.slice(0, 240)).join('\n') : ''));
   const errs = B.logs.filter(l => l.startsWith('[error]'));

@@ -777,6 +777,11 @@ support the Newspeak GUI. *)
 			public cancelResponse <[TextEditorFragment]>
 			public evaluateResponse <[TextEditorFragment]>
 			styles ::= List new.
+			
+			(* Styling is batched; see style:from:to:. styleMarks holds the CodeMirror text markers our styles have produced, so that the next colorizing pass can clear them (public, because same-kind adoption hands the list over with the editor); resetPending, whether resetStyles has asked for them to be cleared; stylingScheduled, whether a turn that will apply the queued styles is on its way. All start out nil, deliberately: instances that predate a hot-load of this class have them as nil too. *)
+			public styleMarks <List[Alien[TextMarker]]>
+			resetPending <Boolean>
+			stylingScheduled <Boolean>
 			public beforeChangeHandler <CallBackWrapper>
 			public changeHandler <CallBackWrapper>
 			public keyHandler <CallBackWrapper>
@@ -791,17 +796,40 @@ support the Newspeak GUI. *)
 			(* Newspeak intervals are 1-origin and [start, stop]. JS intervals are 0-origin and [start, stop). *)
 			s:: editor posFromIndex: (style at: 1) - 1.
 			e:: editor posFromIndex: (style at: 2).
-			editor markText: s to: e style: (style at: 3)
+			^editor markText: s to: e style: (style at: 3)
 		)
 		applyStyles = (
-			nil = editor ifFalse: [
-					styles do: [:s <{Integer. Integer. Alien[JSObject]}> | applyStyle: s ].
-					styles:: List new.
-					editor refresh
+			(* Apply the queued styles as ONE CodeMirror operation, after clearing the markers of the previous colorizing pass if resetStyles asked for that. Until 2026-09-19 every style was applied as it was queued, as an operation of its own followed by a full refresh of the editor, and no marker was ever cleared: colorizing 9KB of text cost 114 operations and 114 re-measurements of the whole editor per change, and 114 more markers in the document each time. Measured in croquet-probes/typing-latency-probe.js (STYLE=off): that, not the colorizer's computation and not synchronization, was what made typing in a large text lag - 40 keys took 38s with it and 8s without. *)
+			
+			stylingScheduled:: false.
+			nil = editor ifTrue: [ ^self ].
+			(styles isEmpty and: [ (true = resetPending) not ]) ifTrue: [ ^self ].
+			styleMarks isNil ifTrue: [ styleMarks:: List new ].
+			editor startOperation.
+			[
+				true = resetPending ifTrue: [
+						styleMarks do: [:m <Alien[TextMarker]> | m clear ].
+						styleMarks:: List new.
+						resetPending:: false
+					].
+				styles do: [:s <{Integer. Integer. Alien[JSObject]}> |
+						styleMarks add: (applyStyle: s)
+					].
+				styles:: List new
+			] ensure: [ editor endOperation ]
+		)
+		scheduleStyling = (
+			(* The queued styles are applied in a turn of their own, right after the current one: by then the colorizing pass that is queuing them is complete. A promise turn, not a timer: an unpainted page's timers are throttled. Nothing may be raised inside it. *)
+			
+			true = stylingScheduled ifTrue: [ ^self ].
+			stylingScheduled:: true.
+			((window at: 'Promise') resolve: 0) then: [:ignored |
+					[ applyStyles ] on: Exception do: [:e | stylingScheduled:: false ].
+					nil
 				]
 		)
 		public defaultAcceptResponse = (
-			textSlot:: editor getValue.
+			textSlot:: textBeingAccepted.
 			leaveEditState
 		)
 		public defaultCancelResponse = (
@@ -827,7 +855,8 @@ support the Newspeak GUI. *)
 			refresh
 		)
 		public refresh = (
-			applyStyles
+			applyStyles.
+			nil = editor ifFalse: [ editor refresh ]
 		)
 		registerChangeHandler = (
 			changeHandler:: CallBackWrapper wrapping: [:codeMirror :change |
@@ -854,10 +883,13 @@ support the Newspeak GUI. *)
 			editor on: 'keydown' respondToKeyDown: keyHandler wrappedCallback
 		)
 		public resetStyles = (
+			(* A colorizing pass starts here: the previous pass's markers are to go, and whatever is still queued with them. The default style is queued like any other. *)
+			
 			hasVisual ifFalse: [ ^self ].
-			editor markText: (editor posFromIndex: 0)
-				to: (editor posFromIndex: textBeingAccepted size - 1)
-				style: defaultStyle
+			resetPending:: true.
+			styles:: List new.
+			styles add: {1. textBeingAccepted size - 1. defaultStyle. }.
+			scheduleStyling
 		)
 		respondToAccept: event <Alien[Event]> = (
 			nil = acceptResponse ifTrue: [ defaultAcceptResponse ]
@@ -883,12 +915,40 @@ support the Newspeak GUI. *)
 				ifFalse: [ changeResponse cull: self cull: change ]
 		)
 		public style: style <Alien[JSObject]> from: start <Integer> to: end <Integer> = (
+			(* Queued, and applied with the rest of the pass; see applyStyles. *)
+			
 			styles add: {start. end. style. }.
-			applyStyles
+			scheduleStyling
 		)
 		public text: t = (
 			textSlot:: t.
 			hasVisual ifTrue: [ editor setValue: t ]
+		)
+		public text: t <String> origin: origin <String> = (
+			(* Write t as a tagged edit of the range that actually differs, rather than as a whole-buffer setValue. Two things follow, and the document pipeline needs both. The origin travels on the change record, so a synchronizing subclass can tell a write caused by THIS client's user action (which exactly one client makes, and must publish) from the setValue every client makes for itself when it re-renders (which none must publish) - indistinguishable while both were 'setValue', and the reason Ampleforth documents stopped synchronizing when programmatic changes stopped being published (HopscotchForCroquet isUserOrigin:, 2026-09-12). And the common prefix and suffix are left in place, so a keystroke in a large document produces a change record the size of the keystroke instead of the size of the document, and marks, folds and the caret outside the replaced range survive. *)
+			
+			| old <String> head <Integer> tail <Integer> limit <Integer> |
+			textSlot:: t.
+			hasVisual ifFalse: [ ^self ].
+			old:: editor getValue.
+			old = t ifTrue: [ ^self ].
+			
+			(* head: how many leading characters are shared; tail: how many trailing ones, never overlapping what head already claimed on either string. *)
+			limit:: old size min: t size.
+			head:: 0.
+			[ head < limit and: [ (old at: head + 1) = (t at: head + 1) ] ] whileTrue: [
+					head:: head + 1
+				].
+			tail:: 0.
+			[
+				tail < (limit - head) and: [
+						(old at: old size - tail) = (t at: t size - tail)
+					]
+			] whileTrue: [ tail:: tail + 1 ].
+			editor replaceRange: (t copyFrom: head + 1 to: t size - tail)
+				from: (editor posFromIndex: head)
+				to: (editor posFromIndex: old size - tail)
+				origin: origin
 		)
 		public textBeingAccepted ^<String> = (
 			^editor getValue
@@ -1007,8 +1067,9 @@ support the Newspeak GUI. *)
 			keyHandler:: oldFragment keyHandler.
 			beforeSelectionChangeHandler:: oldFragment beforeSelectionChangeHandler.
 			editor:: oldFragment editor.
+			styleMarks:: oldFragment styleMarks.
 			readOnly:: oldFragment readOnly.
-			isInEditState ifTrue: [ textSlot:: oldFragment editor getValue ]
+			isInEditState ifTrue: [ textSlot:: oldFragment textBeingAccepted ]
 				ifFalse: [
 					lastChangeWasSynthetic:: true.
 					updateEditedText: oldFragment.

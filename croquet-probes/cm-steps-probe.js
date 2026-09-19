@@ -17,7 +17,7 @@ const CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const SESSION = 'cmsteps' + Math.floor(Date.now() / 1000);
 const PAGE = process.argv[2] === 'js'
   ? 'CroquetJSIDE-TEST.html?sessionId='
-  : 'croquetpsoup.html?snapshot=CroquetHopscotchWebIDE-TEST.vfuel&sessionId=';
+  : (process.env.NS_PAGE || 'croquetpsoup-test.html') + '?snapshot=CroquetHopscotchWebIDE-TEST.vfuel&sessionId=';
 const URL = 'http://localhost:8080/' + PAGE + SESSION + '&pwd=test&appId=org.newspeaklanguage.evprobe&apiKey=none&reflector=ws://localhost:9090&files=/files';
 const GAP = Number(process.env.GAP_MS || 1500);
 const sleep = ms => new Promise(r => setTimeout(r, ms));

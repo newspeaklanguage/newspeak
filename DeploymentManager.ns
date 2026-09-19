@@ -695,12 +695,174 @@ function newspeakFragmentData(fid, data) {
     return {fid: fid, data: data}
 }
 
+/* A CodeMirror change record, as published: where, and what was put there.
+   NOT what was removed - CodeMirror records the deleted text too, and for
+   select-all-and-paste that is the whole old document. Nothing reads it. */
 function nsCodeMirrorChange(change) {
     return {from: nsCursorPos(change.from.ch, change.from.line),
 	    to:  nsCursorPos(change.to.ch, change.to.line),
-	    text: change.text,
-	    removed: change.removed
+	    text: change.text
 	   }
+}
+
+/* Editors publish EDITS, never text (newspeak
+   CROQUET_EDITOR_DIFF_SYNC_DESIGN_2026-09-18.md). Until 2026-09-18 every change
+   event carried the editor''s full text; over 8KB each one took the Data-API
+   detour, about a second, strictly in order, and typing in a large class source
+   lagged without bound.
+
+   What replaces the text is the SHADOW: per editor, the document as the ordered
+   event stream defines it. Every client applies every change event to it, in
+   session order, its own echoes included, so the shadows are identical
+   everywhere by construction - the invariant that a full-text setValue on every
+   client used to buy. Synchronized responses read the shadow; the visible
+   editor of the client that is typing may be ahead of it.
+
+   A CodeMirror.Doc understands the same positions and the same replaceRange as
+   the editor. The shadows live HERE, in JavaScript, keyed by fragment id (which
+   survives same-kind adoption), rather than being driven by alien sends from
+   Newspeak, whose call semantics differ between psoup and NS2JS. */
+const nsShadows = new Map();
+
+// Diagnostics: the last few hundred shadow operations, for the probes and the console.
+const nsShadowLog = [];
+function nsShadowNote(op, fid, detail) {
+    nsShadowLog.push(op + '' '' + fid + '' '' + detail);
+    if (nsShadowLog.length > 400) nsShadowLog.splice(0, 200);
+}
+
+function nsShadowInit(fid, text) {
+    nsShadowNote(''init'', fid, ''len='' + (text == null ? 0 : String(text).length) + (nsShadows.has(fid) ? '' (replaces len='' + nsShadows.get(fid).getValue().length + '')'' : ''''));
+    nsShadows.set(fid, new CodeMirror.Doc(text == null ? '''' : String(text)));
+    return true;
+}
+
+// From the visible editor''s text, without taking the text through Newspeak.
+function nsShadowInitFrom(fid, cm) { return nsShadowInit(fid, cm.getValue()); }
+
+function nsShadowHas(fid) { return nsShadows.has(fid); }
+
+function nsShadowDrop(fid) { if (nsShadows.has(fid)) nsShadowNote(''drop'', fid, ''''); return nsShadows.delete(fid); }
+
+// null when there is no shadow: the caller falls back to the visible editor.
+function nsShadowText(fid) {
+    const doc = nsShadows.get(fid);
+    return doc ? doc.getValue() : null;
+}
+
+function nsReplaceRanges(target, changes, origin) {
+    for (const c of changes) {
+	target.replaceRange(c.text.join(''\n''), c.from, c.to, origin);
+    }
+}
+
+// changes: the records of one published event, each relative to the document
+// the one before it left. Answers false when there is no shadow to apply to.
+function nsShadowApply(fid, changes) {
+    const doc = nsShadows.get(fid);
+    if (!doc) { nsShadowNote(''apply-NO-SHADOW'', fid, ''''); return false; }
+    nsReplaceRanges(doc, changes, ''croquet'');
+    nsShadowNote(''apply'', fid, changes.length + '' record(s) -> len='' + doc.getValue().length);
+    return true;
+}
+
+// A PROGRAMMATIC partial edit (an untagged replaceSelection: an evaluation''s
+// result put into the text) reaches the shadow as the raw CodeMirror record.
+// Every client makes it for itself, in lockstep, so it is never published.
+function nsShadowApplyOne(fid, change) {
+    const doc = nsShadows.get(fid);
+    if (!doc) return false;
+    doc.replaceRange(change.text.join(''\n''), change.from, change.to, ''croquet'');
+    return true;
+}
+
+// The same records applied to a VISIBLE editor, as one operation, tagged
+// ''croquet'' so that the publishing hooks leave them alone. CodeMirror keeps
+// this client''s own cursor where it belongs.
+function nsApplyChanges(cm, changes) {
+    cm.operation(() => nsReplaceRanges(cm, changes, ''croquet''));
+    return true;
+}
+
+function nsShadowMatches(fid, cm) {
+    const doc = nsShadows.get(fid);
+    return !!doc && doc.getValue() === cm.getValue();
+}
+
+// Bring a visible editor back to the shadow - after another client''s edits
+// arrived while this one had edits of its own in flight. Local, no network.
+// Answers whether anything had to change.
+function nsResyncFromShadow(fid, cm) {
+    const doc = nsShadows.get(fid);
+    if (!doc) return false;
+    const text = doc.getValue();
+    if (cm.getValue() === text) return false;
+    const cursor = cm.getCursor();
+    cm.setValue(text);
+    cm.setCursor(cursor, null, {origin: ''croquet'', scroll: false});
+    return true;
+}
+
+// This client''s clock, in ms, for LOCAL decisions only (how long an echo has
+// been awaited); it must never reach replicated state. Both take an argument
+// because Newspeak cannot call a JavaScript function of none.
+function nsNowPlus(ms) { return Date.now() + ms; }
+function nsIsPast(deadline) { return Date.now() > deadline; }
+
+// The records of one flush window, per editor, not yet published. Kept here,
+// by fragment id, so that same-kind adoption needs no handoff.
+const nsPendingEdits = new Map();
+function nsPendingAdd(fid, change) {
+    let list = nsPendingEdits.get(fid);
+    if (!list) { list = []; nsPendingEdits.set(fid, list); }
+    list.push(nsCodeMirrorChange(change));
+    return list.length;
+}
+function nsPendingHas(fid) { return nsPendingEdits.has(fid); }
+function nsPendingDrop(fid) { return nsPendingEdits.delete(fid); }
+// Answers the records (an empty array when there are none) and forgets them.
+function nsPendingTake(fid) {
+    const list = nsPendingEdits.get(fid) || [];
+    nsPendingEdits.delete(fid);
+    return list;
+}
+
+// An event in the edit format (changes), as opposed to the full-text format
+// of sessions recorded before 2026-09-19 (textBeingAccepted + change).
+function nsIsEditEvent(e) { return !!e && Array.isArray(e.changes); }
+
+// One published edit event applied to a VISIBLE editor that did not send it:
+// the records, then the sender''s selection if it moved, as one operation.
+function nsApplyEdits(cm, e) {
+    cm.operation(() => {
+	nsReplaceRanges(cm, e.changes, ''croquet'');
+	if (e.selection) {
+	    cm.setSelection(e.selection.anchor, e.selection.head, {origin: ''croquet'', scroll: false});
+	}
+    });
+    return true;
+}
+
+// The payload of one published edit event. cm is the editor when the user''s
+// selection moved in the window, null when it did not: the selection is READ
+// here, at publication, when the editor holds exactly the document the records
+// lead to, rather than collected from beforeSelectionChange events, which
+// describe a selection CodeMirror may still adjust. Nothing here is ever
+// undefined, which would not survive publication.
+function nsCodeMirrorEdits(changes, cm, sender, seq) {
+    const d = {changes: changes, sender: sender, seq: seq};
+    if (cm) {
+	const r = cm.listSelections()[0];
+	d.selection = {anchor: nsSelectionPos(r.anchor), head: nsSelectionPos(r.head)};
+    }
+    return d;
+}
+
+// The payload of a selection published on its own: the user moved the cursor
+// and edited nothing in the window. Read at publication, as above.
+function nsCurrentSelection(cm, sender) {
+    const r = cm.listSelections()[0];
+    return {anchor: nsSelectionPos(r.anchor), head: nsSelectionPos(r.head), sender: sender};
 }
 
 /* A selection position always goes out with a NUMERIC column. CodeMirror lets a

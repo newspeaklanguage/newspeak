@@ -37,4 +37,14 @@ function getText(port, path) {
     console.log('  pid ' + pid + '  port ' + port + '  ' + dir + '\n    browser: ' + browser + '\n    pages: ' + pages);
     if (kill) { try { process.kill(pid, 'SIGTERM'); console.log('    terminated'); } catch (e) { console.log('    could not terminate: ' + e.message); } }
   }
+  /* Probe drivers left running by a turn that was killed: they hold the mock
+     servers' ports (8098 ...), and the next run dies with EADDRINUSE. */
+  let drivers = [];
+  try { drivers = execSync("ps -axo pid=,command= | grep -- '-probe.js\\|-test.js' | grep node | grep -v grep | grep -v probe-browsers", { encoding: 'utf8' }).split('\n').filter(Boolean); } catch (e) {}
+  console.log(drivers.length + ' probe driver(s) still running');
+  for (const l of drivers) {
+    const pid = Number(l.trim().split(/\s+/)[0]);
+    console.log('  pid ' + pid + '  ' + l.trim().slice(0, 160));
+    if (kill && pid !== process.pid) { try { process.kill(pid, 'SIGTERM'); console.log('    terminated'); } catch (e) { console.log('    could not terminate: ' + e.message); } }
+  }
 })();

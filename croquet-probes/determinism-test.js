@@ -24,7 +24,7 @@ const CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const SESSION = 'determ' + Math.floor(Date.now() / 1000);
 const PAGE = process.argv[2] === 'js'
   ? 'CroquetJSIDE-TEST.html?sessionId='
-  : 'croquetpsoup.html?snapshot=CroquetHopscotchWebIDE-TEST.vfuel&sessionId=';
+  : (process.env.NS_PAGE || 'croquetpsoup-test.html') + '?snapshot=CroquetHopscotchWebIDE-TEST.vfuel&sessionId=';
 const URL = 'http://localhost:8080/' + PAGE + SESSION + '&pwd=test&appId=org.newspeaklanguage.evprobe&apiKey=none&reflector=ws://localhost:9090&files=/files';
 const RANDOM_DOIT = "[:g | g at: 'r1' put: platform hopscotch syncRandom printString. g at: 'r2' put: platform hopscotch syncRandom printString. g at: 'r3' put: platform hopscotch syncRandom printString. 'DREW'] value: platform js global";
 /* The byte plumbing goes through pre-installed JS helpers (see browser())

@@ -144,8 +144,24 @@ class Finder(HTMLParser):
     def handle_starttag(self, tag, attrs):
         if 'classbody' in dict(attrs): self.found = True
 
-def repair_html(text, label, report, foreach=False):
-    """Returns (new_text, status). status in {'clean','fixed','failed','skip'}"""
+def escape_attr(body):
+    """Back into a classBody="..." attribute, escaping what Documents>>classSource
+    escapes and nothing else: & first, then ". Not < or >, which are legal
+    unescaped in an attribute value and are stored that way (the Telescreen
+    template body holds 123 of them). & must go first, or a quote escaped
+    afterwards would have its & escaped a second time."""
+    return body.replace('&', '&amp;').replace('"', '&quot;')
+
+
+def repair_html(text, label, report, foreach=False, normalize=False):
+    """Returns (new_text, status).
+
+    status in {'clean','fixed','normalized','failed','skip'}. Without
+    `normalize`, a body that already parses is left exactly as it is, so
+    working artefacts are never churned -- that is the repair contract. With
+    it, every body is printed, which is what puts document classes in the same
+    canonical member order as the rest of the codebase. A body whose printed
+    form is identical to what was there still reports 'clean'."""
     m = ATTR.search(text)
     if not m: return text, 'skip'
     raw_body = m.group(2)
@@ -161,40 +177,44 @@ def repair_html(text, label, report, foreach=False):
         src = os.path.join(td, 'Unit.ns')
         open(src, 'w').write(wrap(name, body))
         ok, msg = comb_ok(src)
-        if ok and not forced:
+        if ok and not forced and not normalize:
             return text, 'clean'
-        if ok and forced:
-            if not pretty(src): report("    pretty-print FAILED"); return text, 'failed'
-            ok2, msg2 = comb_ok(src)
-            if not ok2: report(f"    broken by the rewrite: {msg2}"); return text, 'failed'
-            nb = unwrap(open(src).read())
-            if nb is None: report("    could not locate class body"); return text, 'failed'
-            return text[:m.start(2)] + nb.replace('"','&quot;') + text[m.end(2):], 'fixed'
-        report(f"    parses only on psoup: {msg}")
+        was_broken = not ok
+        if was_broken:
+            report(f"    parses only on psoup: {msg}")
+        # One path from here on: print, then prove the result before keeping it.
         if not pretty(src):
             report("    pretty-print FAILED"); return text, 'failed'
         ok2, msg2 = comb_ok(src)
         if not ok2:
-            report(f"    still bad after printing: {msg2}"); return text, 'failed'
+            report(f"    {'still bad' if was_broken else 'BROKEN BY PRINTING'}: {msg2}")
+            return text, 'failed'
         if not roundtrip_ok(src):
             report("    round-trip check failed after printing"); return text, 'failed'
         new_body = unwrap(open(src).read())
         if new_body is None:
             report("    could not locate the class body in printed output"); return text, 'failed'
-    escaped = new_body.replace('"', '&quot;')
-    return text[:m.start(2)] + escaped + text[m.end(2):], 'fixed'
+    escaped = escape_attr(new_body)
+    if escaped == raw_body:
+        return text, 'clean'
+    if '"' in escaped:
+        # The attribute is delimited by double quotes, so one would truncate it.
+        report("    printed body still contains a raw double quote"); return text, 'failed'
+    return (text[:m.start(2)] + escaped + text[m.end(2):],
+            'fixed' if (was_broken or forced) else 'normalized')
 
-def process_zip(path, apply, backup_dir, report, foreach=False):
+def process_zip(path, apply, backup_dir, report, foreach=False, normalize=False):
     z = zipfile.ZipFile(path)
-    entries = []; changed = False; stats = {'clean':0,'fixed':0,'failed':0,'skip':0}
+    entries = []; changed = False
+    stats = {'clean':0,'fixed':0,'normalized':0,'failed':0,'skip':0}
     for info in z.infolist():
         data = z.read(info.filename)
         if info.filename.endswith('.html'):
             text = data.decode('utf-8', 'replace')
-            new, st = repair_html(text, f"{path}!{info.filename}", report, foreach)
+            new, st = repair_html(text, f"{path}!{info.filename}", report, foreach, normalize)
             stats[st] += 1
-            if st == 'fixed':
-                report(f"    FIXED {info.filename}"); data = new.encode('utf-8'); changed = True
+            if st in ('fixed', 'normalized'):
+                report(f"    {st.upper()} {info.filename}"); data = new.encode('utf-8'); changed = True
         elif info.filename.endswith('.zip'):
             inner = zipfile.ZipFile(io.BytesIO(data))
             ients = []; ichanged = False
@@ -202,10 +222,10 @@ def process_zip(path, apply, backup_dir, report, foreach=False):
                 idata = inner.read(ii.filename)
                 if ii.filename.endswith('.html'):
                     text = idata.decode('utf-8', 'replace')
-                    new, st = repair_html(text, f"{path}!{info.filename}!{ii.filename}", report, foreach)
+                    new, st = repair_html(text, f"{path}!{info.filename}!{ii.filename}", report, foreach, normalize)
                     stats[st] += 1
-                    if st == 'fixed':
-                        report(f"    FIXED {info.filename}!{ii.filename}")
+                    if st in ('fixed', 'normalized'):
+                        report(f"    {st.upper()} {info.filename}!{ii.filename}")
                         idata = new.encode('utf-8'); ichanged = True
                 ients.append((ii, idata))
             if ichanged:
@@ -229,6 +249,10 @@ def main():
     ap.add_argument('paths', nargs='*')
     ap.add_argument('--apply', action='store_true')
     ap.add_argument('--backup-dir')
+    ap.add_argument('--normalize', action='store_true',
+                    help="pretty-print every class body, not only the ones that fail to "
+                         "parse, so document classes share the canonical member order of "
+                         "the rest of the codebase")
     ap.add_argument('--foreach', action='store_true',
                     help="also retarget forEach: blocks that read the zip entry off the first parameter")
     a = ap.parse_args()
@@ -239,20 +263,21 @@ def main():
                 for f in fs:
                     if f.endswith('.zip'): targets.append(os.path.join(dp, f))
         elif p.endswith('.zip'): targets.append(p)
-    tot = {'clean':0,'fixed':0,'failed':0,'skip':0}; touched = []
+    tot = {'clean':0,'fixed':0,'normalized':0,'failed':0,'skip':0}; touched = []
     for t in sorted(targets):
         lines = []
         rep = lambda s: lines.append(s)
         try:
-            changed, stats = process_zip(t, a.apply, a.backup_dir, rep, a.foreach)
+            changed, stats = process_zip(t, a.apply, a.backup_dir, rep, a.foreach, a.normalize)
         except Exception as e:
             print(f"  {t}\n    ERROR {e}"); continue
         for k in tot: tot[k] += stats[k]
         if lines:
             print(f"  {t}"); [print(l) for l in lines]
         if changed: touched.append(t)
-    print(f"\ndocuments: {tot['clean']} already valid, {tot['fixed']} repaired, "
-          f"{tot['failed']} still broken, {tot['skip']} no classBody")
+    print(f"\ndocuments: {tot['clean']} unchanged, {tot['fixed']} repaired, "
+          f"{tot['normalized']} reprinted, {tot['failed']} still broken, "
+          f"{tot['skip']} no classBody")
     print(f"archives {'rewritten' if a.apply else 'that WOULD be rewritten'}: {len(touched)}")
     for t in touched: print("   ", t)
     if not a.apply: print("\n(dry run - pass --apply to write, ideally with --backup-dir)")

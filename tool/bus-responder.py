@@ -36,6 +36,7 @@ import argparse
 import json
 import sys
 import threading
+import time
 import urllib.parse
 import urllib.request
 
@@ -126,12 +127,20 @@ class Responder:
                   end='', flush=True)
 
     def receive_loop(self):
-        # Declare our name on the stream so the front door can answer
-        # /_ns/bus/agents. The bus is per-machine, and a collaborating IDE
-        # session needs to know WHICH participant can reach this agent.
-        url = self.origin + '/_ns/bus?token=' + self.token + '&name=' + urllib.parse.quote(self.name)
-        req = urllib.request.Request(url, headers={'Accept': 'text/event-stream'})
         while True:
+            # Declare our name on the stream so the front door can answer
+            # /_ns/bus/agents. The bus is per-machine, and a collaborating IDE
+            # session needs to know WHICH participant can reach this agent.
+            #
+            # Built fresh each time round, because the token is re-read on
+            # every reconnect rather than captured once: the front door mints
+            # a new one per run, so after it restarts the old token is refused
+            # and this would spin on 403 forever while appearing to be up.
+            # Answers go out under self.token too, so refreshing it here is
+            # also what keeps this responder able to reply after a restart.
+            url = (self.origin + '/_ns/bus?token=' + self.token
+                   + '&name=' + urllib.parse.quote(self.name))
+            req = urllib.request.Request(url, headers={'Accept': 'text/event-stream'})
             try:
                 with urllib.request.urlopen(req, timeout=None) as stream:
                     for raw in stream:
@@ -146,7 +155,16 @@ class Responder:
                             continue            # not addressed to us
                         self.on_message(msg)
             except Exception as e:
+                # And sleep before trying again: with the front door down,
+                # reconnecting flat out is a hot loop printing to stderr.
                 print(f'\n[stream dropped: {e}; reconnecting]', file=sys.stderr)
+                time.sleep(1)
+                try:
+                    self.token = fetch_token(self.origin)
+                except Exception as e2:
+                    print(f'[the front door is not answering ({e2}); will keep trying]',
+                          file=sys.stderr)
+                    time.sleep(4)
 
 
 def main():
@@ -173,7 +191,7 @@ def main():
         elif line.startswith('/msg '):
             rest = line[len('/msg '):].split(None, 1)
             if len(rest) == 2:
-                post(args.origin, token,
+                post(args.origin, r.token,
                      {'to': rest[0], 'from': args.name, 'text': rest[1], 'kind': 'message'})
             print('> ', end='', flush=True)
         elif line.strip() == '/skip':

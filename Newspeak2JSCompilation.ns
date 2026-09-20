@@ -321,34 +321,6 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 			setterBlockArgName = (
 				^'setter_arg' asSymbol
 			)
-			public unresolvedSendNode: node <UnresolvedSendAST> ^<AST> = (
-				#BOGUS.
-				
-				(* Eventual sends trump inlining, but we shouldn't need to duplicate the eventual send check. Maybe the inlining should be deferred until we know it is an immediate ordinary send? *)
-				node message isEventual ifTrue: [ ^processEventualSend: node ].
-				(inlineOperators and: [ isInlinableNumericOperator: node ]) ifTrue: [
-						^inline: node
-							as: InlinedOperatorAST
-							selector: (inlinableNumericOperators at: node message selector)
-							rewriteArgsAs: [:each | applyForValueTo: each ]
-					].
-				(inlineOperators and: [ isInlinableOperator: node ]) ifTrue: [
-						^inline: node
-							as: InlinedOperatorAST
-							selector: (inlinableOperators at: node message selector)
-							rewriteArgsAs: [:each | applyForValueTo: each ]
-					].
-				(inlineOperators and: [ isInlinableBooleanOperator: node ]) ifTrue: [
-						^inline: node
-							as: InlinedOperatorAST
-							selector: (node message selector = 'and:' ifTrue: [ '&&' ]
-								ifFalse: [ '||' ])
-							rewriteArgsAs: 
-							(* BOGUS *)
-							[:each <BlockAST> | applyForValueTo: each body statements first ]
-					].
-				^super unresolvedSendNode: node
-			)
 			public setterSendNode: node <SetterSendAST> ^<AST> = (
 				(* Rewrite a double-colon setter send. The value of the entire expression should be the value of the argument of the send, NOT the value returned by the setter method. This general case is somewhat inefficient, but in most cases the value of the expression is ignored by the parent so we can use a cheaper regular message send. *)
 				
@@ -404,6 +376,34 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 					start: node start;
 					end: node end.
 				^applyForValueTo: rewrittenSetterSend
+			)
+			public unresolvedSendNode: node <UnresolvedSendAST> ^<AST> = (
+				#BOGUS.
+				
+				(* Eventual sends trump inlining, but we shouldn't need to duplicate the eventual send check. Maybe the inlining should be deferred until we know it is an immediate ordinary send? *)
+				node message isEventual ifTrue: [ ^processEventualSend: node ].
+				(inlineOperators and: [ isInlinableNumericOperator: node ]) ifTrue: [
+						^inline: node
+							as: InlinedOperatorAST
+							selector: (inlinableNumericOperators at: node message selector)
+							rewriteArgsAs: [:each | applyForValueTo: each ]
+					].
+				(inlineOperators and: [ isInlinableOperator: node ]) ifTrue: [
+						^inline: node
+							as: InlinedOperatorAST
+							selector: (inlinableOperators at: node message selector)
+							rewriteArgsAs: [:each | applyForValueTo: each ]
+					].
+				(inlineOperators and: [ isInlinableBooleanOperator: node ]) ifTrue: [
+						^inline: node
+							as: InlinedOperatorAST
+							selector: (node message selector = 'and:' ifTrue: [ '&&' ]
+								ifFalse: [ '||' ])
+							rewriteArgsAs: 
+							(* BOGUS *)
+							[:each <BlockAST> | applyForValueTo: each body statements first ]
+					].
+				^super unresolvedSendNode: node
 			)
 		) : ()
 		class Translator new = ASTTool new (
@@ -463,65 +463,6 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 				tempCounter:: 0.
 				closureDepth:: 0.
 				tailElisionNode:: nil
-			)
-			emitStatement: statement = (
-				statementBuffers last add: statement
-			)
-			emitCheckedCall: callNode = (
-				(* Hoist a send out of expression position: bind its result to a fresh temp, emit the sentinel check, and answer the temp as the expression. In a direct-expression context (no buffer -- superclass accessors) leave the call in place, unchecked: nothing there can receive an in-flight sentinel record as its own result. *)
-				
-				| tName |
-				statementBuffers isEmpty ifTrue: [ ^callNode ].
-				tName:: nextTempName.
-				emitStatement: (_js var: tName value: callNode).
-				emitStatement: (sentinelCheckFor: tName).
-				^_js ident: tName
-			)
-			emitCheckedCall: callNode unlessTail: sendNode <AST> = (
-				(* Tail elision: when this very send is a return statement's whole expression (and the frame is not an unwrapping home frame -- tailElisionNode is never set for those), return the raw call: the emitted `return <call>` propagates a sentinel by construction. *)
-				
-				sendNode == tailElisionNode ifTrue: [ ^callNode ].
-				^emitCheckedCall: callNode
-			)
-			nextTempName = (
-				tempCounter:: tempCounter + 1.
-				^'nlrT' , tempCounter printString
-			)
-			noteSendSiteOf: message <MessageAST> = (
-				(* Count this send (pass 1) and, in pass 2, emit the site store for ambiguous selectors. Called by every send visitor AFTER receiver and arguments have translated (their hoisted statements are already in the buffer), IMMEDIATELY before the call is emitted: nested sends inside arguments each store before their own calls, so at any throw the slot holds the site of the innermost call actually in flight. The stored value is message start - the source coordinate the V5 DebugInfo maps for this same send. No-op outside a method translation and in direct-expression contexts. *)
-				
-				nil = sendSiteCounts ifTrue: [ ^self ].
-				sendSiteCounts at: message selector
-					put: (sendSiteCounts at: message selector ifAbsent: [ 0 ]) + 1.
-				nil = sendSiteAmbiguous ifTrue: [ ^self ].
-				statementBuffers isEmpty ifTrue: [ ^self ].
-				(sendSiteAmbiguous at: message selector ifAbsent: [ false ]) ifFalse: [
-						^self
-					].
-				emitStatement: (_js assign: (_js ident: 'nsSite')
-						toBe: (_js literal: message start))
-			)
-			nlrHomeIdName = (
-				^'nlrMyId'
-			)
-			sentinelCheckFor: tName <String> = (
-				(* The per-send M4 check. The compare is against NLRSentinel -- a CONST, never reassigned, so V8 embeds it as a constant in optimized code (comparing against the mutable payload pointer instead costs a context load per send: measured 2-5x on send-dense code, 2026-07-17). The record travels in NLRPayload. Propagate form everywhere; the unwrapping form only at depth 0 of a home method: on a homeId match the home captures the value BEFORE clearing the payload and returns it; a mismatch propagates -- either way this frame returns. *)
-				
-				| t cmp |
-				t:: _js ident: tName.
-				cmp:: _js operator: '===' with: t and: (_js ident: 'NLRSentinel').
-				(containsNonLocalReturn and: [ closureDepth = 0 ]) ifTrue: [
-						^_js if: cmp
-							then: (_js block: {_js if: (_js operator: '==='
-										with: (_js propertyOf: (_js ident: 'NLRPayload')
-											at: (_js literal: 'homeId'))
-										and: (_js ident: nlrHomeIdName))
-									then: (_js block: {_js assign: t
-											toBe: (_js propertyOf: (_js ident: 'NLRPayload')
-												at: (_js literal: 'value')). _js assign: (_js ident: 'NLRPayload')
-											toBe: (_js ident: 'null'). _js return: t. }). _js return: t. })
-					].
-				^_js if: cmp then: (_js return: t)
 			)
 			public blockLocalReturnNode: node <BlockLocalReturnAST> = (
 				(* A block's tail send may always elide its check: block frames never unwrap, and the block's caller (a checked send site, a kernel value method, or a boundary wrapper) handles a returned sentinel. *)
@@ -594,8 +535,34 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 			public conditionalNode: node <ConditionalAST> = (
 				^inlinableConditionalNode: node
 			)
+			emitCheckedCall: callNode = (
+				(* Hoist a send out of expression position: bind its result to a fresh temp, emit the sentinel check, and answer the temp as the expression. In a direct-expression context (no buffer -- superclass accessors) leave the call in place, unchecked: nothing there can receive an in-flight sentinel record as its own result. *)
+				
+				| tName |
+				statementBuffers isEmpty ifTrue: [ ^callNode ].
+				tName:: nextTempName.
+				emitStatement: (_js var: tName value: callNode).
+				emitStatement: (sentinelCheckFor: tName).
+				^_js ident: tName
+			)
+			emitCheckedCall: callNode unlessTail: sendNode <AST> = (
+				(* Tail elision: when this very send is a return statement's whole expression (and the frame is not an unwrapping home frame -- tailElisionNode is never set for those), return the raw call: the emitted `return <call>` propagates a sentinel by construction. *)
+				
+				sendNode == tailElisionNode ifTrue: [ ^callNode ].
+				^emitCheckedCall: callNode
+			)
+			emitStatement: statement = (
+				statementBuffers last add: statement
+			)
 			public enclosingObjectNode: node <EnclosingObjectAST> = (
 				^processOuterReceiverAtDepth: node depth
+			)
+			public implicitReceiverSendNode: node <ImplicitReceiverSendAST> = (
+				| receiver = processOuterReceiverAtDepth: node depth. |
+				^processLexicalSend: node message
+					to: receiver
+					binding: node binding
+					tail: node
 			)
 			public inlinableAsExpressionConditionalNode: node <InlinableConditionalAST> = (
 				| truePath falsePath condition |
@@ -664,6 +631,33 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 				^_js assign: (_js ident: (names mangleLocal: node name))
 					toBe: (node value apply: self)
 			)
+			public loopNode: node <LoopAST> = (
+				(* prologue; for(;;){ cond statements; if (break-cond) break; body } *)
+				
+				| nodePrologue = node prologue. prologue = nodePrologue isNil ifTrue: [
+						_js block: {}
+					]
+					ifFalse: [ nodePrologue apply: self ]. cond = node condition apply: self. body = node body isNil ifTrue: [
+						_js block: {}
+					]
+					ifFalse: [ node body apply: self ]. condExpression = 
+				(* Split the condition if it isn't a single expression *)
+				cond statements last. condPrologue = (List withAll: cond statements) removeLast;
+					yourself. breakCondition |
+				
+				(* The condition's non-final statements (under M4 linearization: every hoisted send in the condition) must re-run each iteration IN THE SAME SCOPE as the loop test. The old shape -- prologue copied both before the for and into the body -- breaks under let: the body copy only shadows, so the test never sees iteration N's values. Standard linearized shape instead: an unconditional for with the condition statements at the top of the body and an inverted-condition break. *)
+				breakCondition:: node isWhileTrue ifTrue: [
+						_js prefixOperator: '!' on: condExpression
+					]
+					ifFalse: [ condExpression ].
+				
+				(* Flatten prologue so its declarations are in scope for the loop *)
+				^_js block: prologue statements , {_js for: (_js verbatim: '')
+						while: (_js literal: true)
+						step: (_js verbatim: '')
+						do: (_js block: condPrologue asArray , {_js if: breakCondition
+								then: (_js verbatim: 'break'). } , body statements). }
+			)
 			maybeCaptureReceiver = (
 				methodIsPrivate ifTrue: [ ^{} ]
 					ifFalse: [ ^{_js var: selfName value: (_js ident: 'this'). } ]
@@ -723,48 +717,32 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 				hoistTempsFrom:: nil.
 				^_js functionOf: jsParams body: wrappedBody
 			)
-			shadowWrap: body <Block> methodNode: node <MethodAST> = (
-				(* Stage 3: try { <body> } catch (e) { NSShadowPush(e, mixin, selector, receiver, [args], site); throw e; }. The receiver in the catch is `this` (or the explicit self parameter of a private method: the body's own `let self = this` is block-scoped inside the try and invisible here). Captures method identity, receiver and arguments at unwind time; declared temporaries are likewise block-scoped and deferred. When the method has ambiguous send sites, the site slot is declared HERE - outside the try, the only place the catch can read - and the push passes it; otherwise the push passes literal 0 and no slot exists. *)
-				
-				| isPrivate receiverRef argRefs sitesActive siteRef temps pushArgs prologue inner |
-				isPrivate:: node accessModifier = #private.
-				receiverRef:: isPrivate ifTrue: [ _js ident: selfName ]
-					ifFalse: [ _js ident: 'this' ].
-				argRefs:: node pattern parameters collect: [:each |
-						_js ident: (names mangleLocal: each name)
-					].
-				sitesActive:: nil = sendSiteAmbiguous ifTrue: [ false ]
-					ifFalse: [ sendSiteAmbiguous size > 0 ].
-				siteRef:: sitesActive ifTrue: [ _js ident: 'nsSite' ]
-					ifFalse: [ _js literal: 0 ].
-				temps:: node body temporaries.
-				pushArgs:: {_js ident: 'nsShadowErr'. _js literal: currentMixinUID. _js literal: node pattern selector. receiverRef. _js array: argRefs asArray. siteRef. }.
-				temps isEmpty ifFalse: [
-						
-						(* Locals capture (statement-level restart): source names and current values of the hoisted temps; blk = 0 pads the position. *)
-						pushArgs:: pushArgs , {_js literal: 0. _js array: (temps collect: [:each |
-									_js literal: each name
-								]) asArray. _js array: (temps collect: [:each |
-									_js ident: (names mangleLocal: each name)
-								]) asArray. }
-					].
-				inner:: _js try: body
-					catch: 'nsShadowErr'
-					with: (_js block: {_js call: (_js ident: 'NSShadowPush')
-							with: pushArgs asArray. _js throw: (_js ident: 'nsShadowErr'). }).
-				prologue:: List new.
-				temps do: [:each | prologue add: (self temporaryDeclNode: each) ].
-				sitesActive ifTrue: [
-						prologue add: (_js var: 'nsSite' value: (_js literal: 0))
-					].
-				prologue isEmpty ifTrue: [ ^_js block: {inner. } ].
-				^_js block: (prologue asArray , {inner. }) asArray
+			nextTempName = (
+				tempCounter:: tempCounter + 1.
+				^'nlrT' , tempCounter printString
 			)
 			public nilNode: node = (
 				^_js ident: 'nil'
 			)
+			nlrHomeIdName = (
+				^'nlrMyId'
+			)
 			public nonLocalReturnNode: node <NonlocalReturnAST> = (
 				^returnStatNode: node
+			)
+			noteSendSiteOf: message <MessageAST> = (
+				(* Count this send (pass 1) and, in pass 2, emit the site store for ambiguous selectors. Called by every send visitor AFTER receiver and arguments have translated (their hoisted statements are already in the buffer), IMMEDIATELY before the call is emitted: nested sends inside arguments each store before their own calls, so at any throw the slot holds the site of the innermost call actually in flight. The stored value is message start - the source coordinate the V5 DebugInfo maps for this same send. No-op outside a method translation and in direct-expression contexts. *)
+				
+				nil = sendSiteCounts ifTrue: [ ^self ].
+				sendSiteCounts at: message selector
+					put: (sendSiteCounts at: message selector ifAbsent: [ 0 ]) + 1.
+				nil = sendSiteAmbiguous ifTrue: [ ^self ].
+				statementBuffers isEmpty ifTrue: [ ^self ].
+				(sendSiteAmbiguous at: message selector ifAbsent: [ false ]) ifFalse: [
+						^self
+					].
+				emitStatement: (_js assign: (_js ident: 'nsSite')
+						toBe: (_js literal: message start))
 			)
 			public numberNode: node <NumberAST> = (
 				^_js literal: node value
@@ -784,8 +762,42 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 				noteSendSiteOf: node message.
 				^emitCheckedCall: callNode unlessTail: node
 			)
+			public outerSendNode: node <OuterSendAST> = (
+				| receiver = processOuterReceiverAtDepth: node depth. |
+				^processLexicalSend: node message
+					to: receiver
+					binding: node binding
+					tail: node
+			)
 			public parameterDeclNode: node <ParameterAST> = (
 				^names mangleLocal: node name
+			)
+			processIntrinsic: msg <MessageAST> = (
+				usesIntrinsics:: true.
+				(msg selector = #block: and: [ msg arguments first isKindOfTupleNode ]) ifTrue: [
+						^
+						(* A _js block: tuple is a STATEMENT context: each element translates with its own buffer and any hoisted send statements splice in at the element's position. Without this, a send inside e.g. the protected block of a kernel try: would hoist OUT of the try and run unprotected. Argument tuples (call:with: etc.) keep the default behavior -- hoisting to the enclosing buffer correctly evaluates them before the construct. *)
+						_js block: (processIntrinsicStatements: msg arguments first)
+					].
+				msg selector = #functionOf:body: ifTrue: [
+						| params body buffered |
+						
+						(* The body of a _js functionOf: runs WHEN THE GENERATED FUNCTION IS CALLED, not where it is built: it must be a fresh statement context (its hoisted send statements stay inside the function -- without this, sends in an expression-shaped body execute EAGERLY in the enclosing method; AliensForJS expatriateBlock: ran every expatriated callback once at registration time) and a fresh closure level (never the enclosing home's unwrap form). *)
+						params:: processIntrinsicArg: msg arguments first.
+						closureDepth:: closureDepth + 1.
+						statementBuffers add: List new.
+						body:: processIntrinsicArg: (msg arguments at: 2).
+						closureDepth:: closureDepth - 1.
+						buffered:: statementBuffers removeLast.
+						buffered isEmpty ifTrue: [ ^_js functionOf: params body: body ].
+						^_js functionOf: params
+							body: (_js block: (buffered asArray , {body. }) asArray)
+					].
+				^jsMirror perform: msg selector
+					with: (msg arguments collect: [:arg | processIntrinsicArg: arg ]) asArray
+					ifFail: [:e |
+						('Failed to process an intrinsic during JS translation ' , e printString) out
+					]
 			)
 			processIntrinsicArg: arg <AST> = (
 				arg isKindOfTupleNode ifTrue: [
@@ -793,6 +805,38 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 					].
 				arg isKindOfLiteralNode ifTrue: [ ^arg value ].
 				^arg apply: self
+			)
+			processIntrinsicStatements: tuple <TupleAST> = (
+				| statements |
+				statements:: List new.
+				tuple elements do: [:each |
+						| translated |
+						statementBuffers add: List new.
+						translated:: processIntrinsicArg: each.
+						statementBuffers removeLast do: [:s | statements add: s ].
+						statements add: translated
+					].
+				^statements asArray
+			)
+			processLexicalSend: message to: jsReceiver binding: binding tail: sendNode <AST> = (
+				| callNode |
+				(binding isNil not and: [ binding ast accessModifier = #private ]) ifTrue: [
+						| definingMixinDepth = 
+						(* Do early binding. *)
+						binding depth - 1. definingMixin = _js ident: '$' , definingMixinDepth printString. targetMethod = _js propertyOf: definingMixin
+							at: (publicMessage: message). |
+						callNode:: _js call: targetMethod
+							with: 
+							(* (_js propertyOf: targetMethod at: (_js literal: 'call')) *)
+							{jsReceiver. } , (message arguments collect: [:each | each apply: self ]) asArray.
+						noteSendSiteOf: message.
+						^emitCheckedCall: callNode unlessTail: sendNode
+					].
+				callNode:: _js call: (_js propertyOf: jsReceiver
+						at: (protectedMessage: message))
+					with: (message arguments collect: [:each | each apply: self ]) asArray.
+				noteSendSiteOf: message.
+				^emitCheckedCall: callNode unlessTail: sendNode
 			)
 			processOuterReceiverAtDepth: depth <Integer> = (
 				| slotName |
@@ -831,6 +875,69 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 			)
 			selfName = (
 				^'self'
+			)
+			public selfSendNode: node <SelfSendAST> = (
+				| receiver = _js ident: selfName. |
+				^processLexicalSend: node message
+					to: receiver
+					binding: node binding
+					tail: node
+			)
+			sentinelCheckFor: tName <String> = (
+				(* The per-send M4 check. The compare is against NLRSentinel -- a CONST, never reassigned, so V8 embeds it as a constant in optimized code (comparing against the mutable payload pointer instead costs a context load per send: measured 2-5x on send-dense code, 2026-07-17). The record travels in NLRPayload. Propagate form everywhere; the unwrapping form only at depth 0 of a home method: on a homeId match the home captures the value BEFORE clearing the payload and returns it; a mismatch propagates -- either way this frame returns. *)
+				
+				| t cmp |
+				t:: _js ident: tName.
+				cmp:: _js operator: '===' with: t and: (_js ident: 'NLRSentinel').
+				(containsNonLocalReturn and: [ closureDepth = 0 ]) ifTrue: [
+						^_js if: cmp
+							then: (_js block: {_js if: (_js operator: '==='
+										with: (_js propertyOf: (_js ident: 'NLRPayload')
+											at: (_js literal: 'homeId'))
+										and: (_js ident: nlrHomeIdName))
+									then: (_js block: {_js assign: t
+											toBe: (_js propertyOf: (_js ident: 'NLRPayload')
+												at: (_js literal: 'value')). _js assign: (_js ident: 'NLRPayload')
+											toBe: (_js ident: 'null'). _js return: t. }). _js return: t. })
+					].
+				^_js if: cmp then: (_js return: t)
+			)
+			shadowWrap: body <Block> methodNode: node <MethodAST> = (
+				(* Stage 3: try { <body> } catch (e) { NSShadowPush(e, mixin, selector, receiver, [args], site); throw e; }. The receiver in the catch is `this` (or the explicit self parameter of a private method: the body's own `let self = this` is block-scoped inside the try and invisible here). Captures method identity, receiver and arguments at unwind time; declared temporaries are likewise block-scoped and deferred. When the method has ambiguous send sites, the site slot is declared HERE - outside the try, the only place the catch can read - and the push passes it; otherwise the push passes literal 0 and no slot exists. *)
+				
+				| isPrivate receiverRef argRefs sitesActive siteRef temps pushArgs prologue inner |
+				isPrivate:: node accessModifier = #private.
+				receiverRef:: isPrivate ifTrue: [ _js ident: selfName ]
+					ifFalse: [ _js ident: 'this' ].
+				argRefs:: node pattern parameters collect: [:each |
+						_js ident: (names mangleLocal: each name)
+					].
+				sitesActive:: nil = sendSiteAmbiguous ifTrue: [ false ]
+					ifFalse: [ sendSiteAmbiguous size > 0 ].
+				siteRef:: sitesActive ifTrue: [ _js ident: 'nsSite' ]
+					ifFalse: [ _js literal: 0 ].
+				temps:: node body temporaries.
+				pushArgs:: {_js ident: 'nsShadowErr'. _js literal: currentMixinUID. _js literal: node pattern selector. receiverRef. _js array: argRefs asArray. siteRef. }.
+				temps isEmpty ifFalse: [
+						
+						(* Locals capture (statement-level restart): source names and current values of the hoisted temps; blk = 0 pads the position. *)
+						pushArgs:: pushArgs , {_js literal: 0. _js array: (temps collect: [:each |
+									_js literal: each name
+								]) asArray. _js array: (temps collect: [:each |
+									_js ident: (names mangleLocal: each name)
+								]) asArray. }
+					].
+				inner:: _js try: body
+					catch: 'nsShadowErr'
+					with: (_js block: {_js call: (_js ident: 'NSShadowPush')
+							with: pushArgs asArray. _js throw: (_js ident: 'nsShadowErr'). }).
+				prologue:: List new.
+				temps do: [:each | prologue add: (self temporaryDeclNode: each) ].
+				sitesActive ifTrue: [
+						prologue add: (_js var: 'nsSite' value: (_js literal: 0))
+					].
+				prologue isEmpty ifTrue: [ ^_js block: {inner. } ].
+				^_js block: (prologue asArray , {inner. }) asArray
 			)
 			public stringNode: node <StringAST> = (
 				^_js literal: node value
@@ -875,113 +982,6 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 			wrapBodyNoNlrHandling: body <Block> = (
 				^_js block: maybeCaptureReceiver , body statements
 			)
-			processIntrinsic: msg <MessageAST> = (
-				usesIntrinsics:: true.
-				(msg selector = #block: and: [ msg arguments first isKindOfTupleNode ]) ifTrue: [
-						^
-						(* A _js block: tuple is a STATEMENT context: each element translates with its own buffer and any hoisted send statements splice in at the element's position. Without this, a send inside e.g. the protected block of a kernel try: would hoist OUT of the try and run unprotected. Argument tuples (call:with: etc.) keep the default behavior -- hoisting to the enclosing buffer correctly evaluates them before the construct. *)
-						_js block: (processIntrinsicStatements: msg arguments first)
-					].
-				msg selector = #functionOf:body: ifTrue: [
-						| params body buffered |
-						
-						(* The body of a _js functionOf: runs WHEN THE GENERATED FUNCTION IS CALLED, not where it is built: it must be a fresh statement context (its hoisted send statements stay inside the function -- without this, sends in an expression-shaped body execute EAGERLY in the enclosing method; AliensForJS expatriateBlock: ran every expatriated callback once at registration time) and a fresh closure level (never the enclosing home's unwrap form). *)
-						params:: processIntrinsicArg: msg arguments first.
-						closureDepth:: closureDepth + 1.
-						statementBuffers add: List new.
-						body:: processIntrinsicArg: (msg arguments at: 2).
-						closureDepth:: closureDepth - 1.
-						buffered:: statementBuffers removeLast.
-						buffered isEmpty ifTrue: [ ^_js functionOf: params body: body ].
-						^_js functionOf: params
-							body: (_js block: (buffered asArray , {body. }) asArray)
-					].
-				^jsMirror perform: msg selector
-					with: (msg arguments collect: [:arg | processIntrinsicArg: arg ]) asArray
-					ifFail: [:e |
-						('Failed to process an intrinsic during JS translation ' , e printString) out
-					]
-			)
-			processIntrinsicStatements: tuple <TupleAST> = (
-				| statements |
-				statements:: List new.
-				tuple elements do: [:each |
-						| translated |
-						statementBuffers add: List new.
-						translated:: processIntrinsicArg: each.
-						statementBuffers removeLast do: [:s | statements add: s ].
-						statements add: translated
-					].
-				^statements asArray
-			)
-			public loopNode: node <LoopAST> = (
-				(* prologue; for(;;){ cond statements; if (break-cond) break; body } *)
-				
-				| nodePrologue = node prologue. prologue = nodePrologue isNil ifTrue: [
-						_js block: {}
-					]
-					ifFalse: [ nodePrologue apply: self ]. cond = node condition apply: self. body = node body isNil ifTrue: [
-						_js block: {}
-					]
-					ifFalse: [ node body apply: self ]. condExpression = 
-				(* Split the condition if it isn't a single expression *)
-				cond statements last. condPrologue = (List withAll: cond statements) removeLast;
-					yourself. breakCondition |
-				
-				(* The condition's non-final statements (under M4 linearization: every hoisted send in the condition) must re-run each iteration IN THE SAME SCOPE as the loop test. The old shape -- prologue copied both before the for and into the body -- breaks under let: the body copy only shadows, so the test never sees iteration N's values. Standard linearized shape instead: an unconditional for with the condition statements at the top of the body and an inverted-condition break. *)
-				breakCondition:: node isWhileTrue ifTrue: [
-						_js prefixOperator: '!' on: condExpression
-					]
-					ifFalse: [ condExpression ].
-				
-				(* Flatten prologue so its declarations are in scope for the loop *)
-				^_js block: prologue statements , {_js for: (_js verbatim: '')
-						while: (_js literal: true)
-						step: (_js verbatim: '')
-						do: (_js block: condPrologue asArray , {_js if: breakCondition
-								then: (_js verbatim: 'break'). } , body statements). }
-			)
-			public outerSendNode: node <OuterSendAST> = (
-				| receiver = processOuterReceiverAtDepth: node depth. |
-				^processLexicalSend: node message
-					to: receiver
-					binding: node binding
-					tail: node
-			)
-			public implicitReceiverSendNode: node <ImplicitReceiverSendAST> = (
-				| receiver = processOuterReceiverAtDepth: node depth. |
-				^processLexicalSend: node message
-					to: receiver
-					binding: node binding
-					tail: node
-			)
-			processLexicalSend: message to: jsReceiver binding: binding tail: sendNode <AST> = (
-				| callNode |
-				(binding isNil not and: [ binding ast accessModifier = #private ]) ifTrue: [
-						| definingMixinDepth = 
-						(* Do early binding. *)
-						binding depth - 1. definingMixin = _js ident: '$' , definingMixinDepth printString. targetMethod = _js propertyOf: definingMixin
-							at: (publicMessage: message). |
-						callNode:: _js call: targetMethod
-							with: 
-							(* (_js propertyOf: targetMethod at: (_js literal: 'call')) *)
-							{jsReceiver. } , (message arguments collect: [:each | each apply: self ]) asArray.
-						noteSendSiteOf: message.
-						^emitCheckedCall: callNode unlessTail: sendNode
-					].
-				callNode:: _js call: (_js propertyOf: jsReceiver
-						at: (protectedMessage: message))
-					with: (message arguments collect: [:each | each apply: self ]) asArray.
-				noteSendSiteOf: message.
-				^emitCheckedCall: callNode unlessTail: sendNode
-			)
-			public selfSendNode: node <SelfSendAST> = (
-				| receiver = _js ident: selfName. |
-				^processLexicalSend: node message
-					to: receiver
-					binding: node binding
-					tail: node
-			)
 		) : ()
 		accessorForNestedClassNamed: simpleName <String> in: mixinName <String> superCall: superAccessor <Node> ^<String> = (
 			(* Build  a method that will lazily create a nested class 'simpleName' with superclass defined by 'superAccessor' via mixin application, and cache it.  Maybe replace null slot with self-replacing function that computes class and stores in its closure? *)
@@ -1012,6 +1012,63 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 			send:: rewriter applyTo: superclassCall withScope: s.
 			translator beginNewTranslationCycle.
 			^send apply: translator
+		)
+		attachBytecodeFrom: source <String> to: intermediate <IntermediateClassDeclaration> = (
+			(* Dual emission: compile the same unit source with the V5 bytecode compiler and attach each bytecode method to the corresponding JS method (see the bytecode section of the class comment). Bytecode is an enhancement for the debugger and senders support: a failure here must never break the JS compile, so any exception leaves the affected methods JS-only. Nested compiles (enclosingIR not nil) do not get here: the bytecode compiler would need an incremental scope built from a bytecode-side intermediate mixin, which does not exist yet, so reflectively edited nested classes degrade to JS-only until recompiled as part of their unit. *)
+			
+			nil = bytecodeCompiler ifTrue: [ ^self ].
+			[
+				pairBytecodeDeclaration: (bytecodeCompiler compileClassSource: source
+						within: nil)
+					with: intermediate
+			] on: Error do: [:e | nil ]
+		)
+		attachBytecodeToMethod: method <IntermediateMethod> from: source <String> within: enclosing <MixinMirror> = (
+			(* Method-level dual emission, for reflective accepts: compile the same method source with the V5 compiler in the same mirror-derived scope (the bytecode module's buildIncrementalScopeFor: consumes the identical mirror protocol). Failure-tolerant like attachBytecodeFrom:to:: any problem leaves the method JS-only. *)
+			
+			nil = bytecodeCompiler ifTrue: [ ^self ].
+			method usesIntrinsics ifTrue: [ ^self ].
+			[
+				method bytecodeMethod: (bytecodeCompiler compileMethodSource: source
+						within: enclosing)
+			] on: Error do: [:e | nil ]
+		)
+		buildIncrementalScopeFor: mm <MixinMirror> = (
+			| enclosingClass thisClass |
+			enclosingClass:: mm declaration enclosingClass.
+			nil = enclosingClass ifFalse: [
+					buildIncrementalScopeFor: enclosingClass instanceSide
+				].
+			thisClass:: ClassEntry forDeclaration: (MessagePatternAST new selector: mm declaration name)
+				atDepth: currentDepth.
+			thisClass enclosingClass: (currentScope at: #'@currentClass'
+					ifAbsent: [ nil ]).
+			pushScope:: Scope parent: currentScope.
+			currentDepth:: currentDepth + 1.
+			currentScope at: #'@currentClass' put: thisClass.
+			mm slots do: [:s <SlotMirror> |
+					| se = SlotEntry forDeclaration: (MessagePatternAST new selector: s name;
+							accessModifier: s accessModifier)
+						atDepth: currentDepth. |
+					currentScope at: (namer selectorForSlotInitializer: s) put: se.
+					currentScope at: (namer selectorForSlotGetter: s) put: se.
+					s isMutable ifTrue: [
+							currentScope at: (namer selectorForSlotSetter: s) put: se
+						]
+				].
+			mm methods do: [:m <MethodMirror> |
+					| me = MethodEntry forDeclaration: (MessagePatternAST new selector: m name;
+							accessModifier: m accessModifier)
+						atDepth: currentDepth. |
+					currentScope at: m name put: me
+				].
+			mm nestedClasses do: [:c <ClassDeclarationMirror> |
+					| ce = ClassEntry forDeclaration: (MessagePatternAST new selector: c name;
+							accessModifier: c accessModifier)
+						atDepth: currentDepth. |
+					ce enclosingClass: thisClass.
+					currentScope at: c name put: ce
+				]
 		)
 		checkForDuplicateNames: aNode = (
 			| namesWithDuplicates names duplicateNames |
@@ -1049,6 +1106,50 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 		)
 		checkForReservedWord: selector = (
 			^super checkForReservedWord: selector
+		)
+		classNode: aNode <ClassDeclarationAST> within: mixinIR ^<IntermediateClassDeclaration> = (
+			| ir <IntermediateClassDeclaration> priorMixinUID <String> |
+			aNode name = #Newspeak2JSCompilation ifTrue: [
+					#BOGUS.
+					
+					(* The flaw in the _js intrinsic scheme. *)
+					enableIntrinsics: false
+				].
+			checkForDuplicateNames: aNode.
+			ir:: computeMixinFrom: aNode header within: mixinIR.
+			ir accessModifier: aNode accessModifier.
+			priorMixinUID:: currentMixinUID.
+			currentMixinUID:: ir qualifiedName.
+			currentDepth:: currentDepth + 1.
+			processInstanceSideOf: aNode ofMixin: ir instanceSide.
+			generateLazySlotAccessorsFor: ir instanceSide.
+			
+			(* add slot accessors after lazy slot processing, to ensure lazy slot cache accessors are generated *)
+			generateSlotAccessorsFor: ir instanceSide.
+			
+			(* must be called after nested classes are processed, so all synthetic slots have been added *)
+			processClassSideOf: aNode ofMixin: ir classSide.
+			currentDepth:: currentDepth - 1.
+			currentMixinUID:: priorMixinUID.
+			^ir
+		)
+		public compileClassSource: source <String> within: enclosingIR <IntermediateMixin> ^<IntermediateClassDeclaration> = (
+			| tree <AST> intermediate <IntermediateClassDeclaration> |
+			setInput: source.
+			currentScope:: Scope new.
+			currentDepth:: 0.
+			tree:: nil = enclosingIR ifTrue: [ parser parseCompilationUnit: source ]
+				ifFalse: [
+					buildIncrementalScopeFor: enclosingIR builder.
+					parser parseClassDeclaration: source
+				].
+			toScope: currentScope addClass: tree.
+			
+			(* sentSelectors:: Set new. *)
+			intermediate:: nil = enclosingIR ifTrue: [ classNode: tree within: nil ]
+				ifFalse: [ compileNestedClassAST: tree into: enclosingIR ].
+			nil = enclosingIR ifTrue: [ attachBytecodeFrom: source to: intermediate ].
+			^intermediate
 		)
 		public compileExpressionSource: expression <String> inMixin: enclosing <MixinMirror> withScope: withScope <Map> ^<MethodIR> = (
 			| body <CodeBodyAST> method <MethodAST> result <LowLevelMethodMirror> |
@@ -1093,6 +1194,19 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 			(* Rewrite and compile *)
 			^methodNode: method
 		)
+		public compileLazySlotSource: src <String> within: enclosing <MixinMirror> ^<IntermediateLazySlot> = (
+			| tree <SlotDefAST> |
+			setInput: src.
+			currentScope:: Scope new.
+			currentDepth:: 0.
+			buildIncrementalScopeFor: enclosing.
+			tree:: parser parseLazySlotDeclaration: src.
+			currentMixinUID: enclosing declaration qualifiedName.
+			^compileLazySlotNoAdd: tree
+		)
+		compileMethod: aNode <MethodAST> ^<IntermediateMethod> = (
+			^methodNode: aNode
+		)
 		public compileMethodSource: source <String> within: enclosing <MixinMirror> ^<IntermediateMethod> = (
 			| tree <AST> method <IntermediateMethod> |
 			setInput: source.
@@ -1104,16 +1218,6 @@ Licensed under the Apache License, Version 2.0 (the ''License''); you may not us
 			method:: methodNode: tree.
 			attachBytecodeToMethod: method from: source within: enclosing.
 			^method
-		)
-		attachBytecodeToMethod: method <IntermediateMethod> from: source <String> within: enclosing <MixinMirror> = (
-			(* Method-level dual emission, for reflective accepts: compile the same method source with the V5 compiler in the same mirror-derived scope (the bytecode module's buildIncrementalScopeFor: consumes the identical mirror protocol). Failure-tolerant like attachBytecodeFrom:to:: any problem leaves the method JS-only. *)
-			
-			nil = bytecodeCompiler ifTrue: [ ^self ].
-			method usesIntrinsics ifTrue: [ ^self ].
-			[
-				method bytecodeMethod: (bytecodeCompiler compileMethodSource: source
-						within: enclosing)
-			] on: Error do: [:e | nil ]
 		)
 		compileNestedClassAST: tree <ClassDeclarationAST | MixinApplicationClassAST> into: enclosingIR <IntermediateMixin> ^<IntermediateClassDeclaration> = (
 			^(compileNestedClasses: {tree. } within: enclosingIR) first
@@ -1199,6 +1303,12 @@ This accessor will lazily generate the nested class when its enclosing instance 
 				body: (_js block: {_js call: (_js propertyOf: (_js ident: 'vmmirror')
 							at: (_js literal: '$registerSelectors$on$'))
 						with: {mangledSelectors. _js ident: 'p'. }. })
+		)
+		generateLazySlotAccessorsFor: mixinIR <MixinIR> = (
+			mixinIR lazySlots do: [:slotIR |
+					slotIR addMethodsTo: mixinIR methods.
+					slotIR addSlotsInto: mixinIR slots
+				]
 		)
 		generateSlotAccessorsFor: mixinIR <MixinIR> = (
 			mixinIR slots do: [:slotIR |
@@ -1344,6 +1454,33 @@ This accessor will lazily generate the nested class when its enclosing instance 
 			method sourceStart: aNode start.
 			^method
 		)
+		pairBytecodeDeclaration: bytecodeDecl with: jsDecl <IntermediateClassDeclaration> = (
+			(* Both declarations were compiled from the same source, so their class trees are parallel; methods are matched by selector, nested classes by simple name. Synthetic methods (initializers, factories) intentionally fail to match: their two compilers synthesize different shapes. *)
+			
+			pairBytecodeSide: bytecodeDecl instanceSide with: jsDecl instanceSide.
+			pairBytecodeSide: bytecodeDecl classSide with: jsDecl classSide.
+			jsDecl instanceSide nestedClasses do: [:jsNested |
+					bytecodeDecl instanceSide nestedClasses do: [:bcNested |
+							(qualifiedName: jsNested qualifiedName hasSimpleName: bcNested simpleName) ifTrue: [
+									pairBytecodeDeclaration: bcNested with: jsNested
+								]
+						]
+				]
+		)
+		pairBytecodeSide: bytecodeSide with: jsSide = (
+			jsSide methods do: [:jsMethod <IntermediateMethod> |
+					jsMethod usesIntrinsics ifFalse: [
+							bytecodeSide methods do: [:bcMethod |
+									bcMethod name = jsMethod name ifTrue: [
+											jsMethod bytecodeMethod: bcMethod
+										]
+								]
+						]
+				]
+		)
+		public parser = (
+			^outer Newspeak2JSCompilation parser
+		)
 		popScope = (
 			currentScope:: currentScope parent
 		)
@@ -1395,6 +1532,33 @@ This accessor will lazily generate the nested class when its enclosing instance 
 				inScope: currentScope
 				in: mixinIR
 		)
+		processInstanceSideOf: classNode <ClassDeclarationAST> ofMixin: mixinIR <MixinIR> ^<Collection[MixinRep]> = (
+			| thisClass <ClassEntry> |
+			thisClass:: currentScope at: classNode name.
+			pushScope:: Scope parent: currentScope.
+			currentScope at: #'@currentClass' put: thisClass.
+			classNode header slots do: [:slotNode <SlotDefAST> |
+					toScope: currentScope addSlot: slotNode
+				].
+			classNode instanceSide methods do: [:methodNode <MethodAST> |
+					toScope: currentScope addMethod: methodNode
+				].
+			classNode instanceSide nestedClasses do: [:nestedClassNode <ClassDeclarationAST> |
+					toScope: currentScope addClass: nestedClassNode
+				].
+			classNode instanceSide lazySlots do: [:lazySlotNode <SlotDefAST> |
+					toScope: currentScope addLazySlot: lazySlotNode.
+					mixinIR lazySlots add: (compileLazySlotNoAdd: lazySlotNode)
+				].
+			processInitializerFor: classNode in: mixinIR.
+			processSide: classNode instanceSide ofMixin: mixinIR.
+			
+			(* compile instance methods *)
+			compileNestedClassesOf: classNode instanceSide within: mixinIR.
+			
+			(* gather nested classes *)
+			popScope
+		)
 		processMethod: aNode <MethodAST> inScope: s <Scope> in: mixinIR <MixinIR> = (
 			| method <MethodMirror> |
 			method:: computeMethod: aNode inScope: s.
@@ -1408,6 +1572,26 @@ This accessor will lazily generate the nested class when its enclosing instance 
 		)
 		pushScope: scope <Scope> = (
 			currentScope:: scope
+		)
+		qualifiedName: qualifiedName <String> hasSimpleName: simpleName <String> ^<Boolean> = (
+			(* The JS declarations carry backquote-qualified names; the bytecode declarations carry simple names. *)
+			
+			qualifiedName = simpleName ifTrue: [ ^true ].
+			^qualifiedName endsWith: '`' , simpleName
+		)
+		rejectPragmasIn: aNode <MethodAST> = (
+			(* On the JS platform, Smalltalk-style primitives do not exist and the pragma syntax is illegal: a module that needs the powers a primitive provided must import the relevant capability (currently the VMMirror) and use ordinary sends. Gated by the rejectPragmas setting until the legacy pragmas are gone. *)
+			
+			| literalMsgs |
+			rejectPragmas ifFalse: [ ^self ].
+			literalMsgs:: aNode body literalMessages.
+			nil = literalMsgs ifFalse: [
+					literalMsgs do: [:messageAST |
+							messageAST selector = #primitive: ifTrue: [
+									Error signal: 'The primitive: pragma is illegal on the JS platform (in ' , aNode pattern selector , '); import a capability (VMMirror) instead'
+								]
+						]
+				]
 		)
 		selectorForSlotInitializer: slot <SlotDefAST | InstanceVariableMirror> ^<Symbol> = (
 			^('init`' , slot name , ':') asSymbol
@@ -1509,132 +1693,6 @@ This accessor will lazily generate the nested class when its enclosing instance 
 			entry enclosingClass: (currentScope at: #'@currentClass' ifAbsent: [ nil ]).
 			scope at: nestedClassNode selector put: entry
 		)
-		toScope: scope <Scope> addMethod: methodNode <MethodAST> = (
-			checkForReservedWord: methodNode selector.
-			currentScope at: methodNode selector
-				put: (MethodEntry forDeclaration: methodNode atDepth: currentDepth)
-		)
-		toScope: scope <Scope> addSlot: slotNode <SlotDeclAST> = (
-			| entry = SlotEntry forDeclaration: slotNode atDepth: currentDepth. |
-			checkForReservedWord: slotNode name.
-			scope at: (namer selectorForSlotInitializer: slotNode) put: entry.
-			scope at: (namer selectorForSlotGetter: slotNode) put: entry.
-			slotNode isMutable ifTrue: [
-					scope at: (namer selectorForSlotSetter: slotNode) put: entry
-				]
-		)
-		public compileLazySlotSource: src <String> within: enclosing <MixinMirror> ^<IntermediateLazySlot> = (
-			| tree <SlotDefAST> |
-			setInput: src.
-			currentScope:: Scope new.
-			currentDepth:: 0.
-			buildIncrementalScopeFor: enclosing.
-			tree:: parser parseLazySlotDeclaration: src.
-			currentMixinUID: enclosing declaration qualifiedName.
-			^compileLazySlotNoAdd: tree
-		)
-		compileMethod: aNode <MethodAST> ^<IntermediateMethod> = (
-			^methodNode: aNode
-		)
-		processInstanceSideOf: classNode <ClassDeclarationAST> ofMixin: mixinIR <MixinIR> ^<Collection[MixinRep]> = (
-			| thisClass <ClassEntry> |
-			thisClass:: currentScope at: classNode name.
-			pushScope:: Scope parent: currentScope.
-			currentScope at: #'@currentClass' put: thisClass.
-			classNode header slots do: [:slotNode <SlotDefAST> |
-					toScope: currentScope addSlot: slotNode
-				].
-			classNode instanceSide methods do: [:methodNode <MethodAST> |
-					toScope: currentScope addMethod: methodNode
-				].
-			classNode instanceSide nestedClasses do: [:nestedClassNode <ClassDeclarationAST> |
-					toScope: currentScope addClass: nestedClassNode
-				].
-			classNode instanceSide lazySlots do: [:lazySlotNode <SlotDefAST> |
-					toScope: currentScope addLazySlot: lazySlotNode.
-					mixinIR lazySlots add: (compileLazySlotNoAdd: lazySlotNode)
-				].
-			processInitializerFor: classNode in: mixinIR.
-			processSide: classNode instanceSide ofMixin: mixinIR.
-			
-			(* compile instance methods *)
-			compileNestedClassesOf: classNode instanceSide within: mixinIR.
-			
-			(* gather nested classes *)
-			popScope
-		)
-		public parser = (
-			^outer Newspeak2JSCompilation parser
-		)
-		classNode: aNode <ClassDeclarationAST> within: mixinIR ^<IntermediateClassDeclaration> = (
-			| ir <IntermediateClassDeclaration> priorMixinUID <String> |
-			aNode name = #Newspeak2JSCompilation ifTrue: [
-					#BOGUS.
-					
-					(* The flaw in the _js intrinsic scheme. *)
-					enableIntrinsics: false
-				].
-			checkForDuplicateNames: aNode.
-			ir:: computeMixinFrom: aNode header within: mixinIR.
-			ir accessModifier: aNode accessModifier.
-			priorMixinUID:: currentMixinUID.
-			currentMixinUID:: ir qualifiedName.
-			currentDepth:: currentDepth + 1.
-			processInstanceSideOf: aNode ofMixin: ir instanceSide.
-			generateLazySlotAccessorsFor: ir instanceSide.
-			
-			(* add slot accessors after lazy slot processing, to ensure lazy slot cache accessors are generated *)
-			generateSlotAccessorsFor: ir instanceSide.
-			
-			(* must be called after nested classes are processed, so all synthetic slots have been added *)
-			processClassSideOf: aNode ofMixin: ir classSide.
-			currentDepth:: currentDepth - 1.
-			currentMixinUID:: priorMixinUID.
-			^ir
-		)
-		generateLazySlotAccessorsFor: mixinIR <MixinIR> = (
-			mixinIR lazySlots do: [:slotIR |
-					slotIR addMethodsTo: mixinIR methods.
-					slotIR addSlotsInto: mixinIR slots
-				]
-		)
-		buildIncrementalScopeFor: mm <MixinMirror> = (
-			| enclosingClass thisClass |
-			enclosingClass:: mm declaration enclosingClass.
-			nil = enclosingClass ifFalse: [
-					buildIncrementalScopeFor: enclosingClass instanceSide
-				].
-			thisClass:: ClassEntry forDeclaration: (MessagePatternAST new selector: mm declaration name)
-				atDepth: currentDepth.
-			thisClass enclosingClass: (currentScope at: #'@currentClass'
-					ifAbsent: [ nil ]).
-			pushScope:: Scope parent: currentScope.
-			currentDepth:: currentDepth + 1.
-			currentScope at: #'@currentClass' put: thisClass.
-			mm slots do: [:s <SlotMirror> |
-					| se = SlotEntry forDeclaration: (MessagePatternAST new selector: s name;
-							accessModifier: s accessModifier)
-						atDepth: currentDepth. |
-					currentScope at: (namer selectorForSlotInitializer: s) put: se.
-					currentScope at: (namer selectorForSlotGetter: s) put: se.
-					s isMutable ifTrue: [
-							currentScope at: (namer selectorForSlotSetter: s) put: se
-						]
-				].
-			mm methods do: [:m <MethodMirror> |
-					| me = MethodEntry forDeclaration: (MessagePatternAST new selector: m name;
-							accessModifier: m accessModifier)
-						atDepth: currentDepth. |
-					currentScope at: m name put: me
-				].
-			mm nestedClasses do: [:c <ClassDeclarationMirror> |
-					| ce = ClassEntry forDeclaration: (MessagePatternAST new selector: c name;
-							accessModifier: c accessModifier)
-						atDepth: currentDepth. |
-					ce enclosingClass: thisClass.
-					currentScope at: c name put: ce
-				]
-		)
 		toScope: scope <Scope> addLazySlot: slotNode <SlotDefAST> = (
 			| entry = SlotEntry forDeclaration: slotNode atDepth: currentDepth. cacheDecl = IntermediateSlotDeclaration named: (IntermediateLazySlot slotNameForLazySlotNamed: slotNode name)
 				mutable: true
@@ -1659,76 +1717,18 @@ This accessor will lazily generate the nested class when its enclosing instance 
 			scope at: cacheDecl name put: cacheEntry.
 			scope at: (cacheDecl name , ':') asSymbol put: cacheEntry
 		)
-		public compileClassSource: source <String> within: enclosingIR <IntermediateMixin> ^<IntermediateClassDeclaration> = (
-			| tree <AST> intermediate <IntermediateClassDeclaration> |
-			setInput: source.
-			currentScope:: Scope new.
-			currentDepth:: 0.
-			tree:: nil = enclosingIR ifTrue: [ parser parseCompilationUnit: source ]
-				ifFalse: [
-					buildIncrementalScopeFor: enclosingIR builder.
-					parser parseClassDeclaration: source
-				].
-			toScope: currentScope addClass: tree.
-			
-			(* sentSelectors:: Set new. *)
-			intermediate:: nil = enclosingIR ifTrue: [ classNode: tree within: nil ]
-				ifFalse: [ compileNestedClassAST: tree into: enclosingIR ].
-			nil = enclosingIR ifTrue: [ attachBytecodeFrom: source to: intermediate ].
-			^intermediate
+		toScope: scope <Scope> addMethod: methodNode <MethodAST> = (
+			checkForReservedWord: methodNode selector.
+			currentScope at: methodNode selector
+				put: (MethodEntry forDeclaration: methodNode atDepth: currentDepth)
 		)
-		attachBytecodeFrom: source <String> to: intermediate <IntermediateClassDeclaration> = (
-			(* Dual emission: compile the same unit source with the V5 bytecode compiler and attach each bytecode method to the corresponding JS method (see the bytecode section of the class comment). Bytecode is an enhancement for the debugger and senders support: a failure here must never break the JS compile, so any exception leaves the affected methods JS-only. Nested compiles (enclosingIR not nil) do not get here: the bytecode compiler would need an incremental scope built from a bytecode-side intermediate mixin, which does not exist yet, so reflectively edited nested classes degrade to JS-only until recompiled as part of their unit. *)
-			
-			nil = bytecodeCompiler ifTrue: [ ^self ].
-			[
-				pairBytecodeDeclaration: (bytecodeCompiler compileClassSource: source
-						within: nil)
-					with: intermediate
-			] on: Error do: [:e | nil ]
-		)
-		pairBytecodeDeclaration: bytecodeDecl with: jsDecl <IntermediateClassDeclaration> = (
-			(* Both declarations were compiled from the same source, so their class trees are parallel; methods are matched by selector, nested classes by simple name. Synthetic methods (initializers, factories) intentionally fail to match: their two compilers synthesize different shapes. *)
-			
-			pairBytecodeSide: bytecodeDecl instanceSide with: jsDecl instanceSide.
-			pairBytecodeSide: bytecodeDecl classSide with: jsDecl classSide.
-			jsDecl instanceSide nestedClasses do: [:jsNested |
-					bytecodeDecl instanceSide nestedClasses do: [:bcNested |
-							(qualifiedName: jsNested qualifiedName hasSimpleName: bcNested simpleName) ifTrue: [
-									pairBytecodeDeclaration: bcNested with: jsNested
-								]
-						]
-				]
-		)
-		qualifiedName: qualifiedName <String> hasSimpleName: simpleName <String> ^<Boolean> = (
-			(* The JS declarations carry backquote-qualified names; the bytecode declarations carry simple names. *)
-			
-			qualifiedName = simpleName ifTrue: [ ^true ].
-			^qualifiedName endsWith: '`' , simpleName
-		)
-		pairBytecodeSide: bytecodeSide with: jsSide = (
-			jsSide methods do: [:jsMethod <IntermediateMethod> |
-					jsMethod usesIntrinsics ifFalse: [
-							bytecodeSide methods do: [:bcMethod |
-									bcMethod name = jsMethod name ifTrue: [
-											jsMethod bytecodeMethod: bcMethod
-										]
-								]
-						]
-				]
-		)
-		rejectPragmasIn: aNode <MethodAST> = (
-			(* On the JS platform, Smalltalk-style primitives do not exist and the pragma syntax is illegal: a module that needs the powers a primitive provided must import the relevant capability (currently the VMMirror) and use ordinary sends. Gated by the rejectPragmas setting until the legacy pragmas are gone. *)
-			
-			| literalMsgs |
-			rejectPragmas ifFalse: [ ^self ].
-			literalMsgs:: aNode body literalMessages.
-			nil = literalMsgs ifFalse: [
-					literalMsgs do: [:messageAST |
-							messageAST selector = #primitive: ifTrue: [
-									Error signal: 'The primitive: pragma is illegal on the JS platform (in ' , aNode pattern selector , '); import a capability (VMMirror) instead'
-								]
-						]
+		toScope: scope <Scope> addSlot: slotNode <SlotDeclAST> = (
+			| entry = SlotEntry forDeclaration: slotNode atDepth: currentDepth. |
+			checkForReservedWord: slotNode name.
+			scope at: (namer selectorForSlotInitializer: slotNode) put: entry.
+			scope at: (namer selectorForSlotGetter: slotNode) put: entry.
+			slotNode isMutable ifTrue: [
+					scope at: (namer selectorForSlotSetter: slotNode) put: entry
 				]
 		)
 	) : ()
@@ -1745,6 +1745,15 @@ This accessor will lazily generate the nested class when its enclosing instance 
 			public accessModifier <Symbol>
 		|
 	) (
+		basicNew = (
+			^_js functionOf: {}
+				body: (_js block: {_js call: (_js ident: 'superBasicNew.call')
+						with: {_js ident: 'this'. }. } , (instanceSide slots collect: [:s |
+							_js assign: (_js propertyOf: (_js ident: 'this')
+									at: (_js literal: (names mangleSlot: s name)))
+								toBe: (_js ident: 'nil')
+						]))
+		)
 		basicNewMeta = (
 			^_js functionOf: {}
 				body: (_js block: {_js call: (_js ident: 'superBasicNew.call')
@@ -1755,40 +1764,6 @@ This accessor will lazily generate the nested class when its enclosing instance 
 						_js new: (_js ident: 'MM')
 							with: {_js literal: method name. _js literal: method accessModifier. _js literal: method isSynthetic. encodeSource: method source. encodeBytecodeOf: method. }
 					])
-		)
-		encodeBytecodeOf: method <IntermediateMethod> = (
-			(* The V5 bytecode record for the MM metadata: a positional array [bytes, literals, numArgs, numLocals, maxStack, bciMap, sourceStart], or null for JS-only methods. bciMap is a flat [bci, start, end, ...] triple list of source ranges whose offsets are relative to the UNIT source the bytecode compiler consumed; sourceStart is the method's own offset in that unit (both compilers parse the same text), so methodRelative = unitRelative - sourceStart + 1 rebases onto the method source stored in MM.source. Literals are emitted in their runtime representation (strings and numbers); a method with a literal that has no such representation (a fraction, an oversized integer) stays JS-only. *)
-			
-			| bytecodeMethod literalNodes |
-			bytecodeMethod:: method bytecodeMethod.
-			nil = bytecodeMethod ifTrue: [ ^_js ident: 'null' ].
-			literalNodes:: List new.
-			bytecodeMethod literals do: [:literal |
-					(encodableBytecodeLiteral: literal) ifFalse: [ ^_js ident: 'null' ].
-					literalNodes add: (_js literal: literal)
-				].
-			^_js array: {_js array: (bytecodeMethod bytes collect: [:b | _js literal: b ]). _js array: literalNodes. _js literal: bytecodeMethod argCount. _js literal: bytecodeMethod maxLocals. _js literal: bytecodeMethod maxStack. encodeBciMapOf: bytecodeMethod. _js literal: (nil = method sourceStart ifTrue: [
-							0
-						]
-						ifFalse: [ method sourceStart ]). }
-		)
-		encodableBytecodeLiteral: literal ^<Boolean> = (
-			literal isKindOfString ifTrue: [ ^true ].
-			literal isKindOfInteger ifTrue: [
-					^literal between: -9007199254740991 and: 9007199254740991
-				].
-			literal isKindOfFloat ifTrue: [ ^true ].
-			^false
-		)
-		encodeBciMapOf: bytecodeMethod = (
-			| entries = List new. |
-			nil = bytecodeMethod debugInfo ifTrue: [ ^_js array: entries ].
-			bytecodeMethod debugInfo bciSourceMapping keysAndValuesDo: [:bci :interval |
-					entries add: (_js literal: bci).
-					entries add: (_js literal: interval first).
-					entries add: (_js literal: interval last)
-				].
-			^_js array: entries
 		)
 		copyMethods: methods = (
 			| stmts = List new. |
@@ -1825,6 +1800,40 @@ This accessor will lazily generate the nested class when its enclosing instance 
 		)
 		dnuCatcherFor: publicMangling = (
 			^_js call: (_js ident: 'dnuCatcher') with: {_js literal: publicMangling. }
+		)
+		encodableBytecodeLiteral: literal ^<Boolean> = (
+			literal isKindOfString ifTrue: [ ^true ].
+			literal isKindOfInteger ifTrue: [
+					^literal between: -9007199254740991 and: 9007199254740991
+				].
+			literal isKindOfFloat ifTrue: [ ^true ].
+			^false
+		)
+		encodeBciMapOf: bytecodeMethod = (
+			| entries = List new. |
+			nil = bytecodeMethod debugInfo ifTrue: [ ^_js array: entries ].
+			bytecodeMethod debugInfo bciSourceMapping keysAndValuesDo: [:bci :interval |
+					entries add: (_js literal: bci).
+					entries add: (_js literal: interval first).
+					entries add: (_js literal: interval last)
+				].
+			^_js array: entries
+		)
+		encodeBytecodeOf: method <IntermediateMethod> = (
+			(* The V5 bytecode record for the MM metadata: a positional array [bytes, literals, numArgs, numLocals, maxStack, bciMap, sourceStart], or null for JS-only methods. bciMap is a flat [bci, start, end, ...] triple list of source ranges whose offsets are relative to the UNIT source the bytecode compiler consumed; sourceStart is the method's own offset in that unit (both compilers parse the same text), so methodRelative = unitRelative - sourceStart + 1 rebases onto the method source stored in MM.source. Literals are emitted in their runtime representation (strings and numbers); a method with a literal that has no such representation (a fraction, an oversized integer) stays JS-only. *)
+			
+			| bytecodeMethod literalNodes |
+			bytecodeMethod:: method bytecodeMethod.
+			nil = bytecodeMethod ifTrue: [ ^_js ident: 'null' ].
+			literalNodes:: List new.
+			bytecodeMethod literals do: [:literal |
+					(encodableBytecodeLiteral: literal) ifFalse: [ ^_js ident: 'null' ].
+					literalNodes add: (_js literal: literal)
+				].
+			^_js array: {_js array: (bytecodeMethod bytes collect: [:b | _js literal: b ]). _js array: literalNodes. _js literal: bytecodeMethod argCount. _js literal: bytecodeMethod maxLocals. _js literal: bytecodeMethod maxStack. encodeBciMapOf: bytecodeMethod. _js literal: (nil = method sourceStart ifTrue: [
+							0
+						]
+						ifFalse: [ method sourceStart ]). }
 		)
 		encodeSource: source = (
 			source isNil ifTrue: [ ^_js literal: 0 ].
@@ -1866,6 +1875,14 @@ This accessor will lazily generate the nested class when its enclosing instance 
 									at: (_js literal: 'nonMeta'))
 								toBe: (_js ident: 'null'). _js verbatim: 'this.newspeakClass = null'. }). _js verbatim: 'constructRuntimeClass.prototype = runtimeSuperclass'. _js verbatim: 'return new constructRuntimeClass(runtimeSuperclass.basicNew)'. })
 		)
+		lazySlotsMetadata = (
+			(* Do we need different data then regular slots? In which case, we must define LSM? *)
+			
+			^_js array: (instanceSide lazySlots collect: [:slot |
+						_js new: (_js ident: 'SM')
+							with: {_js literal: slot name. _js literal: slot accessModifier. _js literal: slot isMutable. _js literal: true. }
+					])
+		)
 		makeMixin: rm = (
 			^_js call: (_js propertyOf: (_js ident: 'Mixin')
 					at: (_js literal: 'fromRuntimeMixin'))
@@ -1905,12 +1922,6 @@ This accessor will lazily generate the nested class when its enclosing instance 
 									at: (_js literal: 'invoke'))
 								toBe: invokeMeta. }))
 					with: {})
-		)
-		slotsMetadata = (
-			^_js array: (instanceSide slots collect: [:slot |
-						_js new: (_js ident: 'SM')
-							with: {_js literal: slot name. _js literal: slot accessModifier. _js literal: slot isMutable. _js literal: slot isSynthetic. }
-					])
 		)
 		public runtimeMixin = (
 			^_js new: (_js functionOf: {}
@@ -1952,24 +1963,66 @@ This accessor will lazily generate the nested class when its enclosing instance 
 							toBe: (_js ident: 'this'). }))
 				with: {}
 		)
-		basicNew = (
-			^_js functionOf: {}
-				body: (_js block: {_js call: (_js ident: 'superBasicNew.call')
-						with: {_js ident: 'this'. }. } , (instanceSide slots collect: [:s |
-							_js assign: (_js propertyOf: (_js ident: 'this')
-									at: (_js literal: (names mangleSlot: s name)))
-								toBe: (_js ident: 'nil')
-						]))
-		)
-		lazySlotsMetadata = (
-			(* Do we need different data then regular slots? In which case, we must define LSM? *)
-			
-			^_js array: (instanceSide lazySlots collect: [:slot |
+		slotsMetadata = (
+			^_js array: (instanceSide slots collect: [:slot |
 						_js new: (_js ident: 'SM')
-							with: {_js literal: slot name. _js literal: slot accessModifier. _js literal: slot isMutable. _js literal: true. }
+							with: {_js literal: slot name. _js literal: slot accessModifier. _js literal: slot isMutable. _js literal: slot isSynthetic. }
 					])
 		)
 	) : ()
+	public class IntermediateLazySlot new = Object new (
+		(* This code is duplicated. We should create a common Intermediates class, and subclass from it, then import its components into the compiler *)
+		
+		|
+			public intermediateInitMethod <IntermediateMethod>
+			public intermediateMainMethod <IntermediateMethod>
+			public intermediateSetterMethod <IntermediateMethod>
+		|
+	) (
+		public accessModifier ^<Symbol> = (
+			^intermediateMainMethod accessModifier
+		)
+		public addMethodsTo: methods = (
+			intermediateInitMethod isLazySlotMethod: true.
+			methods add: intermediateInitMethod.
+			intermediateMainMethod isLazySlotMethod: true.
+			methods add: intermediateMainMethod.
+			isMutable ifTrue: [
+					intermediateSetterMethod isLazySlotMethod: true.
+					methods add: intermediateSetterMethod
+				]
+		)
+		public addSlotsInto: aCollection = (
+			aCollection add: intermediateSlotDeclaration
+		)
+		public debugInfo ^<DebugInfo> = (
+			(* If we want to debug, we'll be debugging the init expression *)
+			
+			^intermediateInitMethod debugInfo
+		)
+		public intermediateSlotDeclaration = (
+			^IntermediateSlotDeclaration named: (class slotNameForLazySlotNamed: name)
+				mutable: true
+				accessModifier: #private
+				isSynthetic: true
+		)
+		public isMutable ^<Boolean> = (
+			^intermediateSetterMethod isNil not
+		)
+		public name = (
+			^intermediateMainMethod name
+		)
+		public source = (
+			^intermediateMainMethod source
+		)
+	) : (
+		public initMethodNameForLazySlotNamed: selector <Symbol> ^<Symbol> = (
+			^(selector , '`method') asSymbol
+		)
+		public slotNameForLazySlotNamed: selector <Symbol> ^<Symbol> = (
+			^(selector , '`cache`slot') asSymbol
+		)
+	)
 	public class IntermediateMethod named: n accessModifier: am function: f source: s = Object new (
 		|
 			public name <Symbol> = n.
@@ -2012,11 +2065,11 @@ This accessor will lazily generate the nested class when its enclosing instance 
 			public nestedClasses <List[IntermediateClassDeclaration]> = List new.
 		|
 	) (
-		public qualifiedName = (
-			^declaration qualifiedName
-		)
 		public isKindOfIntermediateMixin ^<Boolean> = (
 			^true
+		)
+		public qualifiedName = (
+			^declaration qualifiedName
 		)
 	) : ()
 	public class IntermediateSlotDeclaration named: n <Symbol> mutable: m <Boolean> accessModifier: am <Symbol> isSynthetic: s <Boolean> = Object new (
@@ -2045,6 +2098,26 @@ This accessor will lazily generate the nested class when its enclosing instance 
 				specialCharacterManglings at: (char runeAt: 1) put: mangling
 			].
 	) (
+		_mangleSelector: selector <String> ^<String> = (
+			(* Convert a Newspeak selector into a JS identifer. *)
+			
+			| sb = StringBuilder new. |
+			
+			(* Binary *)
+			('+-*/\<>~=@%|&?!,' indexOf: (String with: selector last)) ~= 0 ifTrue: [
+					sb add: '$'.
+					selector do: [:specialCharacter |
+							sb add: (specialCharacterManglings at: specialCharacter)
+						].
+					^sb asString asSymbol
+				].
+			sb add: '$'.
+			selector do: [:e |
+					('.:`@' indexOf: (String with: e)) ~= 0 ifTrue: [ sb add: '$' ]
+						ifFalse: [ sb addByte: e ]
+				].
+			^sb asString asSymbol
+		)
 		public fullyQualifiedNameToSimple: fullName <String> = (
 			(* specialCharacterManglings 
 		at: ("+" put: '$plus';
@@ -2089,26 +2162,6 @@ This accessor will lazily generate the nested class when its enclosing instance 
 		public privateDnu = (
 			^'dnu'
 		)
-		_mangleSelector: selector <String> ^<String> = (
-			(* Convert a Newspeak selector into a JS identifer. *)
-			
-			| sb = StringBuilder new. |
-			
-			(* Binary *)
-			('+-*/\<>~=@%|&?!,' indexOf: (String with: selector last)) ~= 0 ifTrue: [
-					sb add: '$'.
-					selector do: [:specialCharacter |
-							sb add: (specialCharacterManglings at: specialCharacter)
-						].
-					^sb asString asSymbol
-				].
-			sb add: '$'.
-			selector do: [:e |
-					('.:`@' indexOf: (String with: e)) ~= 0 ifTrue: [ sb add: '$' ]
-						ifFalse: [ sb addByte: e ]
-				].
-			^sb asString asSymbol
-		)
 	) : ()
 	public class ProgramBuilder new = Object new (
 		|
@@ -2121,6 +2174,23 @@ This accessor will lazily generate the nested class when its enclosing instance 
 			private mixinsDeduplicated <Boolean> ::= false.
 		|
 	) (
+		public addImageResource: relativeUrl under: name = (
+			(* Emit the relative URL as a path string. The runtime's resolveImage:
+	   (and the eager image getters in Images>>imageName) construct a new
+	   JS Image and assign this string as its [src], expecting a String.
+
+	   The previous emission wrapped a pre-built Image alien in a Future;
+	   when the runtime's getter assigned that Future to a fresh Image's
+	   [src], expatriate: wrapped it as an Expat and the browser saw
+	   '[object Object]' as the URL. Emitting the path string lets the
+	   browser fetch [relativeUrl] from the serve directory normally.
+
+	   Caveat: JSDeployment>>save does not currently bundle the PNG files
+	   into the zip; the deployer must arrange for them to be served at
+	   [relativeUrl] alongside the deployed HTML. *)
+			
+			addStringResource: relativeUrl under: name
+		)
 		public addStringResource: string under: name = (
 			| r |
 			r:: _js assign: (_js propertyOf: (_js ident: 'this')
@@ -2136,11 +2206,71 @@ This accessor will lazily generate the nested class when its enclosing instance 
 				].
 			applicationConfiguration: results first
 		)
+		compileSource: source <String> enableIntrinsics: flag <Boolean> ^<ClassDeclarationIR> = (
+			| compilation |
+			compilation:: cachedCompilations at: {source. }
+				ifAbsentPut: [
+					| newCompilation = CachedCompilation new. |
+					newCompilation source: source.
+					newCompilation enableIntrinsics: flag.
+					compiler enableIntrinsics: flag.
+					compiler sentSelectors: Set new.
+					newCompilation ir: (compiler compileClassSource: source within: nil).
+					newCompilation sentSelectors: compiler sentSelectors
+				].
+			mixins add: compilation ir.
+			sentSelectors addAll: compilation sentSelectors.
+			^compilation ir
+		)
+		private declaredSelectorsOf: cd into: acc <Set[String]> = (
+			cd instanceSide methods do: [:m | acc add: m name ].
+			cd classSide methods do: [:m | acc add: m name ].
+			cd instanceSide nestedClasses do: [:nc | declaredSelectorsOf: nc into: acc ]
+		)
+		deduplicateMixins = (
+			| mixinMap = Map new. |
+			mixinsDeduplicated ifFalse: [
+					mixins do: [:m <ClassDeclarationIR> | mixinMap at: m qualifiedName put: m ].
+					mixins:: mixinMap values.
+					mixinsDeduplicated:: true
+				]
+		)
 		private main = (
 			^_js verbatim: 'var runtime = ns.$' , runtimeConfiguration qualifiedName , '().$packageUsing$(ns);
 vmmirror.platform = runtime.$using$(vmmirror);
 var app = ns.$' , applicationConfiguration qualifiedName , '().$packageUsing$(ns);
 app.$main$args$(vmmirror.platform, [])'
+		)
+		private namespace = (
+			^_js var: 'ns'
+				value: (_js new: (_js functionOf: {}
+						body: (_js block: (mixins asArray collect: [:cd |
+									_js assign: (_js propertyOf: (_js ident: 'this')
+											at: (_js literal: (names mangleSlot: cd qualifiedName)))
+										toBe: (_js call: (_js propertyOf: (_js ident: 'vmmirror')
+												at: (_js literal: 'applyTopLevelMixin'))
+											with: {_js propertyOf: (_js ident: 'mixins')
+												at: (_js literal: (names manglePublic: cd qualifiedName)). })
+								]) , (mixins asArray collect: [:cd |
+									_js assign: (_js propertyOf: (_js ident: 'this')
+											at: (_js literal: (names manglePublic: cd qualifiedName)))
+										toBe: (_js functionOf: {}
+											body: (_js block: {_js return: (_js propertyOf: (_js ident: 'this')
+														at: (_js literal: (names mangleSlot: cd qualifiedName))). }))
+								]) , resources asArray))
+					with: {})
+		)
+		public outputProgram ^<String> = (
+			| sb = StringBuilder new. |
+			deduplicateMixins.
+			JavascriptWriter new generateSourceFor: script on: sb.
+			^sb asString
+		)
+		public outputSources ^<String> = (
+			| sb = StringBuilder new. |
+			deduplicateMixins.
+			JavascriptWriter new generateSourceFor: sourcesScript on: sb.
+			^sb asString
 		)
 		private runtimeMixinNamespace = (
 			^_js new: (_js functionOf: {}
@@ -2157,11 +2287,6 @@ app.$main$args$(vmmirror.platform, [])'
 					compileSource: source enableIntrinsics: true
 				].
 			runtimeConfiguration: results first
-		)
-		private declaredSelectorsOf: cd into: acc <Set[String]> = (
-			cd instanceSide methods do: [:m | acc add: m name ].
-			cd classSide methods do: [:m | acc add: m name ].
-			cd instanceSide nestedClasses do: [:nc | declaredSelectorsOf: nc into: acc ]
 		)
 		private script = (
 			(* The program's selectors are the ones it sends AND the ones it declares.
@@ -2790,78 +2915,6 @@ var vmmirror = new function(){
 };
 '
 		)
-		compileSource: source <String> enableIntrinsics: flag <Boolean> ^<ClassDeclarationIR> = (
-			| compilation |
-			compilation:: cachedCompilations at: {source. }
-				ifAbsentPut: [
-					| newCompilation = CachedCompilation new. |
-					newCompilation source: source.
-					newCompilation enableIntrinsics: flag.
-					compiler enableIntrinsics: flag.
-					compiler sentSelectors: Set new.
-					newCompilation ir: (compiler compileClassSource: source within: nil).
-					newCompilation sentSelectors: compiler sentSelectors
-				].
-			mixins add: compilation ir.
-			sentSelectors addAll: compilation sentSelectors.
-			^compilation ir
-		)
-		deduplicateMixins = (
-			| mixinMap = Map new. |
-			mixinsDeduplicated ifFalse: [
-					mixins do: [:m <ClassDeclarationIR> | mixinMap at: m qualifiedName put: m ].
-					mixins:: mixinMap values.
-					mixinsDeduplicated:: true
-				]
-		)
-		public outputProgram ^<String> = (
-			| sb = StringBuilder new. |
-			deduplicateMixins.
-			JavascriptWriter new generateSourceFor: script on: sb.
-			^sb asString
-		)
-		public outputSources ^<String> = (
-			| sb = StringBuilder new. |
-			deduplicateMixins.
-			JavascriptWriter new generateSourceFor: sourcesScript on: sb.
-			^sb asString
-		)
-		private namespace = (
-			^_js var: 'ns'
-				value: (_js new: (_js functionOf: {}
-						body: (_js block: (mixins asArray collect: [:cd |
-									_js assign: (_js propertyOf: (_js ident: 'this')
-											at: (_js literal: (names mangleSlot: cd qualifiedName)))
-										toBe: (_js call: (_js propertyOf: (_js ident: 'vmmirror')
-												at: (_js literal: 'applyTopLevelMixin'))
-											with: {_js propertyOf: (_js ident: 'mixins')
-												at: (_js literal: (names manglePublic: cd qualifiedName)). })
-								]) , (mixins asArray collect: [:cd |
-									_js assign: (_js propertyOf: (_js ident: 'this')
-											at: (_js literal: (names manglePublic: cd qualifiedName)))
-										toBe: (_js functionOf: {}
-											body: (_js block: {_js return: (_js propertyOf: (_js ident: 'this')
-														at: (_js literal: (names mangleSlot: cd qualifiedName))). }))
-								]) , resources asArray))
-					with: {})
-		)
-		public addImageResource: relativeUrl under: name = (
-			(* Emit the relative URL as a path string. The runtime's resolveImage:
-	   (and the eager image getters in Images>>imageName) construct a new
-	   JS Image and assign this string as its [src], expecting a String.
-
-	   The previous emission wrapped a pre-built Image alien in a Future;
-	   when the runtime's getter assigned that Future to a fresh Image's
-	   [src], expatriate: wrapped it as an Expat and the browser saw
-	   '[object Object]' as the URL. Emitting the path string lets the
-	   browser fetch [relativeUrl] from the serve directory normally.
-
-	   Caveat: JSDeployment>>save does not currently bundle the PNG files
-	   into the zip; the deployer must arrange for them to be served at
-	   [relativeUrl] alongside the deployed HTML. *)
-			
-			addStringResource: relativeUrl under: name
-		)
 	) : ()
 	class WithMappedEntry name: nom = SymbolTableEntry forAST: nil atDepth: nil (
 		|
@@ -2887,58 +2940,10 @@ var vmmirror = new function(){
 						arguments: {SymbolAST new value: name. newVal. })
 		)
 	) : ()
-	public class IntermediateLazySlot new = Object new (
-		(* This code is duplicated. We should create a common Intermediates class, and subclass from it, then import its components into the compiler *)
+	assert: block <[Boolean]> = (
+		super assert: block message: 'assertion failed'
+		(* block value ifFalse: [error: 'assertion failed'] *)
 		
-		|
-			public intermediateInitMethod <IntermediateMethod>
-			public intermediateMainMethod <IntermediateMethod>
-			public intermediateSetterMethod <IntermediateMethod>
-		|
-	) (
-		public addMethodsTo: methods = (
-			intermediateInitMethod isLazySlotMethod: true.
-			methods add: intermediateInitMethod.
-			intermediateMainMethod isLazySlotMethod: true.
-			methods add: intermediateMainMethod.
-			isMutable ifTrue: [
-					intermediateSetterMethod isLazySlotMethod: true.
-					methods add: intermediateSetterMethod
-				]
-		)
-		public addSlotsInto: aCollection = (
-			aCollection add: intermediateSlotDeclaration
-		)
-		public debugInfo ^<DebugInfo> = (
-			(* If we want to debug, we'll be debugging the init expression *)
-			
-			^intermediateInitMethod debugInfo
-		)
-		public source = (
-			^intermediateMainMethod source
-		)
-		public name = (
-			^intermediateMainMethod name
-		)
-		public accessModifier ^<Symbol> = (
-			^intermediateMainMethod accessModifier
-		)
-		public isMutable ^<Boolean> = (
-			^intermediateSetterMethod isNil not
-		)
-		public intermediateSlotDeclaration = (
-			^IntermediateSlotDeclaration named: (class slotNameForLazySlotNamed: name)
-				mutable: true
-				accessModifier: #private
-				isSynthetic: true
-		)
-	) : (
-		public slotNameForLazySlotNamed: selector <Symbol> ^<Symbol> = (
-			^(selector , '`cache`slot') asSymbol
-		)
-		public initMethodNameForLazySlotNamed: selector <Symbol> ^<Symbol> = (
-			^(selector , '`method') asSymbol
-		)
 	)
 	ClassEntry = (
 		^super ClassEntry
@@ -2949,22 +2954,17 @@ var vmmirror = new function(){
 	MethodEntry = (
 		^super MethodEntry
 	)
-	Scope = (
-		^super Scope
-	)
-	SlotEntry = (
-		^super SlotEntry
-	)
-	assert: block <[Boolean]> = (
-		super assert: block message: 'assertion failed'
-		(* block value ifFalse: [error: 'assertion failed'] *)
-		
-	)
 	mixinSlotNameFor: nestedName <String> = (
 		^nestedName
 	)
 	namer = (
 		^super namer
+	)
+	Scope = (
+		^super Scope
+	)
+	SlotEntry = (
+		^super SlotEntry
 	)
 	split: aString at: aCharacter = (
 		| parts start |

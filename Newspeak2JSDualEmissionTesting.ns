@@ -30,36 +30,29 @@ jsCompilation is a Newspeak2JSCompilation instance constructed WITH a V5 bytecod
 			side methods do: [:each | each name = selector ifTrue: [ ^each ] ].
 			Exception new signal: 'no method ' , selector
 		)
-		sampleDeclaration = (
-			^compiler compileClassSource: sampleSource within: nil
+		nlrGeneratedText ^<String> = (
+			(* Compiled WITHOUT shadow frames: these tests pin the NLR emission shapes, and the Stage 3 wrapper (default on) adds its own try/catch/throw noise. *)
+			
+			| plainCompiler sb |
+			plainCompiler:: jsCompilation Compiler new.
+			plainCompiler emitShadowFrames: false.
+			sb:: StringBuilder new.
+			generation Writer new generateSourceFor: (plainCompiler compileClassSource: nlrSampleSource
+					within: nil) runtimeMixin
+				on: sb.
+			^sb asString
 		)
-		sampleSource ^<String> = (
-			^'Newspeak3 ''Uncategorized'' class DualSample = ( ) (
-add: a to: b = ( ^a + b )
-raw = ( ^_js verbatim: ''42'' )
-class Inner = ( ) (
-three = ( ^3 )
-) : ( )
+		nlrSampleSource ^<String> = (
+			^'Newspeak3 ''Uncategorized'' class NlrSample = ( ) (
+home = ( [ ^1 ] value. ^2 )
+plain: x = ( ^x foo )
+lazy: x with: y = ( ^x and: [ y foo ] )
 )'
 		)
-		public testIntrinsicMethodIsJSOnly = (
-			(* A body using the _js compile-time intrinsic has no Newspeak semantics for the bytecode backend: it must be recorded as JS-only. *)
-			
-			| method = methodNamed: #raw in: sampleDeclaration instanceSide. |
-			assert: method usesIntrinsics.
-			assert: nil = method bytecodeMethod
-		)
-		public testNestedClassMethodPaired = (
-			| inner = sampleDeclaration instanceSide nestedClasses first. method |
-			method:: methodNamed: #three in: inner instanceSide.
-			deny: nil = method bytecodeMethod.
-			assert: (byteStringOf: method bytecodeMethod bytes) equals: '249 3 0 170 '
-		)
-		public testPlainMethodPaired = (
-			| method = methodNamed: #add:to: in: sampleDeclaration instanceSide. |
-			deny: nil = method bytecodeMethod.
-			assert: (byteStringOf: method bytecodeMethod bytes)
-				equals: '114 113 176 170 '
+		pragmaSampleSource ^<String> = (
+			^'Newspeak3 ''Uncategorized'' class PragmaSample = ( ) (
+beep = ( (* :literalmessage: primitive: 42 *) ^nil )
+)'
 		)
 		programWithADeclaredOnlySelector ^<String> = (
 			(* A whole program, emitted the way a deploy emits one. The application
@@ -75,6 +68,59 @@ public main: p args: a = ( ^self zorkSentOnly )
 zorkDeclaredOnly = ( ^42 )
 )'. }.
 			^builder outputProgram
+		)
+		sampleDeclaration = (
+			^compiler compileClassSource: sampleSource within: nil
+		)
+		sampleSource ^<String> = (
+			^'Newspeak3 ''Uncategorized'' class DualSample = ( ) (
+add: a to: b = ( ^a + b )
+raw = ( ^_js verbatim: ''42'' )
+class Inner = ( ) (
+three = ( ^3 )
+) : ( )
+)'
+		)
+		siteSampleSource ^<String> = (
+			^'Newspeak3 ''Uncategorized'' class SiteSample = ( ) (
+twice: x with: y = ( x foo. y foo. ^x bar )
+once: x = ( ^x foo )
+)'
+		)
+		string: big contains: small = (
+			| limit |
+			limit:: big size - small size + 1.
+			1 to: limit
+				do: [:start |
+					(big copyFrom: start to: start + small size - 1) = small ifTrue: [ ^true ]
+				].
+			^false
+		)
+		string: big indexOf: small ^<Integer> = (
+			| limit |
+			limit:: big size - small size + 1.
+			1 to: limit
+				do: [:start |
+					(big copyFrom: start to: start + small size - 1) = small ifTrue: [ ^start ]
+				].
+			^0
+		)
+		public testBlockShadowWrapEmission = (
+			(* Stage 3 closure wrappers: a genuine block body gets its own try/catch pushing a record with the home method's identity, the home receiver (self - a block's own `this` is the closure function), the block's parameters, the site slot or 0, and the block's source start as 7th argument. Inlined control-structure blocks are rewritten away before translation and must NOT be wrapped: a method whose only blocks are inlined carries no block-style push (recognizable by the `self` receiver in a public method). *)
+			
+			| source sb generated |
+			source:: 'Newspeak3 ''Uncategorized'' class BlkSample = ( ) (
+run: c = ( ^c collect: [:e | e squared ] )
+guard: x = ( x isNil ifTrue: [ ^1 ]. ^2 )
+)'.
+			sb:: StringBuilder new.
+			generation Writer new generateSourceFor: (compiler compileClassSource: source
+					within: nil) runtimeMixin
+				on: sb.
+			generated:: sb asString.
+			assert: (string: generated contains: '"run:", self, [$e], 0, ').
+			assert: (string: generated contains: '"run:", this, [$c], 0)').
+			deny: (string: generated contains: '"guard:", self, ')
 		)
 		public testDnuSeedCarriesDeclaredOnlySelectors = (
 			(* The boot-time selector set seeds the runtime registry, which backs both
@@ -94,33 +140,23 @@ zorkDeclaredOnly = ( ^42 )
 			assert: (string: seed contains: '"$zorkSentOnly"').
 			assert: (string: seed contains: '"$zorkDeclaredOnly"')
 		)
-		pragmaSampleSource ^<String> = (
-			^'Newspeak3 ''Uncategorized'' class PragmaSample = ( ) (
-beep = ( (* :literalmessage: primitive: 42 *) ^nil )
-)'
-		)
-		public testPragmaIsIllegalWhenRejectionEnabled = (
-			| strictCompiler = jsCompilation Compiler new. |
-			strictCompiler rejectPragmas: true.
-			should: [ strictCompiler compileClassSource: pragmaSampleSource within: nil ]
-				signal: Exception
-		)
-		public testPragmaToleratedByDefaultButJSOnly = (
-			(* Until the legacy pragmas are eradicated, the default JS compile accepts the pragma; the V5 side rejects it, so the unit carries no bytecode. *)
+		public testFunctionOfBodyIsNotHoisted = (
+			(* Sends in a _js functionOf: body execute when the generated function runs, never eagerly in the enclosing method (the AliensForJS expatriateBlock: bug: callbacks ran once at registration). The send's temp/check must sit AFTER the function literal opens. *)
 			
-			| declaration method |
-			declaration:: compiler compileClassSource: pragmaSampleSource within: nil.
-			method:: methodNamed: #beep in: declaration instanceSide.
-			assert: nil = method bytecodeMethod
-		)
-		string: big contains: small = (
-			| limit |
-			limit:: big size - small size + 1.
-			1 to: limit
-				do: [:start |
-					(big copyFrom: start to: start + small size - 1) = small ifTrue: [ ^true ]
-				].
-			^false
+			| source sb generated fnPos sendPos |
+			source:: 'Newspeak3 ''Uncategorized'' class FnSample = ( ) (
+wrap: b = ( ^_js functionOf: {} body: (_js return: (b value)) )
+)'.
+			sb:: StringBuilder new.
+			generation Writer new generateSourceFor: (compiler compileClassSource: source
+					within: nil) runtimeMixin
+				on: sb.
+			generated:: sb asString.
+			fnPos:: string: generated indexOf: 'return function'.
+			sendPos:: string: generated indexOf: '$b["$value"]'.
+			deny: 0 = fnPos.
+			deny: 0 = sendPos.
+			assert: fnPos < sendPos
 		)
 		public testGeneratedSourceCarriesBytecodeRecords = (
 			(* The encoded records must survive the JavascriptWriter: this is the same write MirrorsForJS performs at reflective install and ProgramBuilder at deploy. *)
@@ -135,35 +171,46 @@ beep = ( (* :literalmessage: primitive: 42 *) ^nil )
 			(* the special-selector send of + in add:to: *)
 			
 		)
-		public testV5UnitTreeShape = (
-			(* The V5 compiler's view of the same unit: the nested class and its method must be present under the expected names, since pairing depends on them. *)
+		public testHomeTailSendKeepsUnwrapForm = (
+			(* In a home method even a return-position send must use the unwrapping check: a sentinel targeted at this very frame must not be returned raw. homeTail: is ^x foo in a method whose block does ^1. *)
 			
-			| decl nested |
-			decl:: v5Compilation Compiler new compileClassSource: sampleSource
-				within: nil.
-			assert: decl instanceSide nestedClasses size equals: 1.
-			nested:: decl instanceSide nestedClasses first.
-			assert: nested simpleName equals: 'Inner'.
-			assert: ((nested instanceSide methods collect: [:m | m name ]) includes: #three)
-		)
-		nlrSampleSource ^<String> = (
-			^'Newspeak3 ''Uncategorized'' class NlrSample = ( ) (
-home = ( [ ^1 ] value. ^2 )
-plain: x = ( ^x foo )
-lazy: x with: y = ( ^x and: [ y foo ] )
-)'
-		)
-		nlrGeneratedText ^<String> = (
-			(* Compiled WITHOUT shadow frames: these tests pin the NLR emission shapes, and the Stage 3 wrapper (default on) adds its own try/catch/throw noise. *)
-			
-			| plainCompiler sb |
-			plainCompiler:: jsCompilation Compiler new.
-			plainCompiler emitShadowFrames: false.
+			| source sb generated |
+			source:: 'Newspeak3 ''Uncategorized'' class HomeTailSample = ( ) (
+homeTail: x = ( x bar: [ ^1 ]. ^x foo )
+)'.
 			sb:: StringBuilder new.
-			generation Writer new generateSourceFor: (plainCompiler compileClassSource: nlrSampleSource
+			generation Writer new generateSourceFor: (compiler compileClassSource: source
 					within: nil) runtimeMixin
 				on: sb.
-			^sb asString
+			generated:: sb asString.
+			deny: (string: generated contains: 'return $x["$foo"]()').
+			assert: (string: generated contains: 'NLRPayload["homeId"]')
+		)
+		public testIntrinsicMethodIsJSOnly = (
+			(* A body using the _js compile-time intrinsic has no Newspeak semantics for the bytecode backend: it must be recorded as JS-only. *)
+			
+			| method = methodNamed: #raw in: sampleDeclaration instanceSide. |
+			assert: method usesIntrinsics.
+			assert: nil = method bytecodeMethod
+		)
+		public testLoopConditionSendReevaluatesInScope = (
+			(* A loop condition containing a send linearizes to the for(;;){ cond statements; if (...) break; body } shape: the hoisted condition statements must re-run each iteration in the same scope as the test (the old prologue-duplication shape only shadowed under let). *)
+			
+			| sb source |
+			source:: 'Newspeak3 ''Uncategorized'' class LoopSample = ( ) (
+count: c = ( | n ::= 0. | [ c hasMore ] whileTrue: [ n:: n + 1 ]. ^n )
+)'.
+			sb:: StringBuilder new.
+			generation Writer new generateSourceFor: (compiler compileClassSource: source
+					within: nil) runtimeMixin
+				on: sb.
+			assert: (string: sb asString contains: 'break')
+		)
+		public testNestedClassMethodPaired = (
+			| inner = sampleDeclaration instanceSide nestedClasses first. method |
+			method:: methodNamed: #three in: inner instanceSide.
+			deny: nil = method bytecodeMethod.
+			assert: (byteStringOf: method bytecodeMethod bytes) equals: '249 3 0 170 '
 		)
 		public testNlrEmissionIsThrowFree = (
 			(* M4 sentinel NLR: no try/catch NLR machinery, no thrown tokens anywhere in the unit. *)
@@ -186,91 +233,37 @@ lazy: x with: y = ( ^x and: [ y foo ] )
 			assert: (string: nlrGeneratedText contains: '=== NLRSentinel').
 			deny: (string: nlrGeneratedText contains: '=== NLRPayload')
 		)
-		public testTailSendElidesCheck = (
-			(* plain: is ^x foo in a non-home method: the tail send returns raw -- returning the sentinel IS propagation -- with no temp and no check. *)
-			
-			assert: (string: nlrGeneratedText contains: 'return $x["$foo"]()')
+		public testPlainMethodPaired = (
+			| method = methodNamed: #add:to: in: sampleDeclaration instanceSide. |
+			deny: nil = method bytecodeMethod.
+			assert: (byteStringOf: method bytecodeMethod bytes)
+				equals: '114 113 176 170 '
 		)
-		public testHomeTailSendKeepsUnwrapForm = (
-			(* In a home method even a return-position send must use the unwrapping check: a sentinel targeted at this very frame must not be returned raw. homeTail: is ^x foo in a method whose block does ^1. *)
+		public testPragmaIsIllegalWhenRejectionEnabled = (
+			| strictCompiler = jsCompilation Compiler new. |
+			strictCompiler rejectPragmas: true.
+			should: [ strictCompiler compileClassSource: pragmaSampleSource within: nil ]
+				signal: Exception
+		)
+		public testPragmaToleratedByDefaultButJSOnly = (
+			(* Until the legacy pragmas are eradicated, the default JS compile accepts the pragma; the V5 side rejects it, so the unit carries no bytecode. *)
 			
-			| source sb generated |
-			source:: 'Newspeak3 ''Uncategorized'' class HomeTailSample = ( ) (
-homeTail: x = ( x bar: [ ^1 ]. ^x foo )
-)'.
+			| declaration method |
+			declaration:: compiler compileClassSource: pragmaSampleSource within: nil.
+			method:: methodNamed: #beep in: declaration instanceSide.
+			assert: nil = method bytecodeMethod
+		)
+		public testSendSiteFlagOffIsClean = (
+			(* emitSendSites: false must leave no trace: no slot, no stores, NSShadowPush site argument is literal 0. *)
+			
+			| plainCompiler sb |
+			plainCompiler:: jsCompilation Compiler new.
+			plainCompiler emitSendSites: false.
 			sb:: StringBuilder new.
-			generation Writer new generateSourceFor: (compiler compileClassSource: source
+			generation Writer new generateSourceFor: (plainCompiler compileClassSource: siteSampleSource
 					within: nil) runtimeMixin
 				on: sb.
-			generated:: sb asString.
-			deny: (string: generated contains: 'return $x["$foo"]()').
-			assert: (string: generated contains: 'NLRPayload["homeId"]')
-		)
-		public testFunctionOfBodyIsNotHoisted = (
-			(* Sends in a _js functionOf: body execute when the generated function runs, never eagerly in the enclosing method (the AliensForJS expatriateBlock: bug: callbacks ran once at registration). The send's temp/check must sit AFTER the function literal opens. *)
-			
-			| source sb generated fnPos sendPos |
-			source:: 'Newspeak3 ''Uncategorized'' class FnSample = ( ) (
-wrap: b = ( ^_js functionOf: {} body: (_js return: (b value)) )
-)'.
-			sb:: StringBuilder new.
-			generation Writer new generateSourceFor: (compiler compileClassSource: source
-					within: nil) runtimeMixin
-				on: sb.
-			generated:: sb asString.
-			fnPos:: string: generated indexOf: 'return function'.
-			sendPos:: string: generated indexOf: '$b["$value"]'.
-			deny: 0 = fnPos.
-			deny: 0 = sendPos.
-			assert: fnPos < sendPos
-		)
-		string: big indexOf: small ^<Integer> = (
-			| limit |
-			limit:: big size - small size + 1.
-			1 to: limit
-				do: [:start |
-					(big copyFrom: start to: start + small size - 1) = small ifTrue: [ ^start ]
-				].
-			^0
-		)
-		public testLoopConditionSendReevaluatesInScope = (
-			(* A loop condition containing a send linearizes to the for(;;){ cond statements; if (...) break; body } shape: the hoisted condition statements must re-run each iteration in the same scope as the test (the old prologue-duplication shape only shadowed under let). *)
-			
-			| sb source |
-			source:: 'Newspeak3 ''Uncategorized'' class LoopSample = ( ) (
-count: c = ( | n ::= 0. | [ c hasMore ] whileTrue: [ n:: n + 1 ]. ^n )
-)'.
-			sb:: StringBuilder new.
-			generation Writer new generateSourceFor: (compiler compileClassSource: source
-					within: nil) runtimeMixin
-				on: sb.
-			assert: (string: sb asString contains: 'break')
-		)
-		public testShortCircuitOperandStaysLazy = (
-			(* lazy:with: inlines and: as &&; the send in the right operand must emit INSIDE the guard: temp initialized from the left operand, conditionally reassigned. *)
-			
-			assert: (string: nlrGeneratedText contains: 'let nlrT2 = $x').
-			assert: (string: nlrGeneratedText contains: 'nlrT2 = nlrT1')
-		)
-		public testShadowFrameWrapperEmission = (
-			(* Stage 3: with emitShadowFrames (the default), every method body is wrapped in try/catch calling NSShadowPush with method identity, receiver and args, then rethrowing. With the flag off (the NLR-shape samples), no wrapper. *)
-			
-			| sb generated |
-			sb:: StringBuilder new.
-			generation Writer new generateSourceFor: (compiler compileClassSource: sampleSource
-					within: nil) runtimeMixin
-				on: sb.
-			generated:: sb asString.
-			assert: (string: generated
-					contains: 'NSShadowPush(nsShadowErr, "DualSample", "add:to:", this, [').
-			assert: (string: generated contains: 'throw nsShadowErr').
-			deny: (string: nlrGeneratedText contains: 'NSShadowPush')
-		)
-		siteSampleSource ^<String> = (
-			^'Newspeak3 ''Uncategorized'' class SiteSample = ( ) (
-twice: x with: y = ( x foo. y foo. ^x bar )
-once: x = ( ^x foo )
-)'
+			deny: (string: sb asString contains: 'nsSite')
 		)
 		public testSendSiteInstrumentationShapes = (
 			(* Send-site tracking (default on): a method with a selector sent twice declares the frame-local site slot outside the try (the catch must see it), stores the message source offset before each ambiguous send, and passes the slot to NSShadowPush; a method whose selectors are all single-site gets no slot and passes literal 0 - the display derives its call sites statically. *)
@@ -289,34 +282,30 @@ once: x = ( ^x foo )
 			assert: (string: generated contains: '], nsSite)').
 			assert: (string: generated contains: '"once:", this, [$x], 0)')
 		)
-		public testSendSiteFlagOffIsClean = (
-			(* emitSendSites: false must leave no trace: no slot, no stores, NSShadowPush site argument is literal 0. *)
+		public testShadowFrameWrapperEmission = (
+			(* Stage 3: with emitShadowFrames (the default), every method body is wrapped in try/catch calling NSShadowPush with method identity, receiver and args, then rethrowing. With the flag off (the NLR-shape samples), no wrapper. *)
 			
-			| plainCompiler sb |
-			plainCompiler:: jsCompilation Compiler new.
-			plainCompiler emitSendSites: false.
+			| sb generated |
 			sb:: StringBuilder new.
-			generation Writer new generateSourceFor: (plainCompiler compileClassSource: siteSampleSource
-					within: nil) runtimeMixin
-				on: sb.
-			deny: (string: sb asString contains: 'nsSite')
-		)
-		public testBlockShadowWrapEmission = (
-			(* Stage 3 closure wrappers: a genuine block body gets its own try/catch pushing a record with the home method's identity, the home receiver (self - a block's own `this` is the closure function), the block's parameters, the site slot or 0, and the block's source start as 7th argument. Inlined control-structure blocks are rewritten away before translation and must NOT be wrapped: a method whose only blocks are inlined carries no block-style push (recognizable by the `self` receiver in a public method). *)
-			
-			| source sb generated |
-			source:: 'Newspeak3 ''Uncategorized'' class BlkSample = ( ) (
-run: c = ( ^c collect: [:e | e squared ] )
-guard: x = ( x isNil ifTrue: [ ^1 ]. ^2 )
-)'.
-			sb:: StringBuilder new.
-			generation Writer new generateSourceFor: (compiler compileClassSource: source
+			generation Writer new generateSourceFor: (compiler compileClassSource: sampleSource
 					within: nil) runtimeMixin
 				on: sb.
 			generated:: sb asString.
-			assert: (string: generated contains: '"run:", self, [$e], 0, ').
-			assert: (string: generated contains: '"run:", this, [$c], 0)').
-			deny: (string: generated contains: '"guard:", self, ')
+			assert: (string: generated
+					contains: 'NSShadowPush(nsShadowErr, "DualSample", "add:to:", this, [').
+			assert: (string: generated contains: 'throw nsShadowErr').
+			deny: (string: nlrGeneratedText contains: 'NSShadowPush')
+		)
+		public testShortCircuitOperandStaysLazy = (
+			(* lazy:with: inlines and: as &&; the send in the right operand must emit INSIDE the guard: temp initialized from the left operand, conditionally reassigned. *)
+			
+			assert: (string: nlrGeneratedText contains: 'let nlrT2 = $x').
+			assert: (string: nlrGeneratedText contains: 'nlrT2 = nlrT1')
+		)
+		public testTailSendElidesCheck = (
+			(* plain: is ^x foo in a non-home method: the tail send returns raw -- returning the sentinel IS propagation -- with no temp and no check. *)
+			
+			assert: (string: nlrGeneratedText contains: 'return $x["$foo"]()')
 		)
 		public testTempHoistingAndLocalsCapture = (
 			(* Statement-level restart support: a method with declared temps hoists their `let $t = nil` declarations into the wrapper scope (so the catch can read them) and NSShadowPush receives source names and current values as trailing arguments (after a 0 padding the block position). A method without temps keeps the shorter push. *)
@@ -334,6 +323,17 @@ plain: x = ( ^x foo )
 			assert: (string: generated contains: 'let $t = nil').
 			assert: (string: generated contains: ', 0, 0, ["t"], [$t])').
 			assert: (string: generated contains: '"plain:", this, [$x], 0)')
+		)
+		public testV5UnitTreeShape = (
+			(* The V5 compiler's view of the same unit: the nested class and its method must be present under the expected names, since pairing depends on them. *)
+			
+			| decl nested |
+			decl:: v5Compilation Compiler new compileClassSource: sampleSource
+				within: nil.
+			assert: decl instanceSide nestedClasses size equals: 1.
+			nested:: decl instanceSide nestedClasses first.
+			assert: nested simpleName equals: 'Inner'.
+			assert: ((nested instanceSide methods collect: [:m | m name ]) includes: #three)
 		)
 		public testWithoutBytecodeCompilationNoRecords = (
 			(* bytecodeCompilation: nil must be a clean no-op: same compile, no bytecode intermediates. *)

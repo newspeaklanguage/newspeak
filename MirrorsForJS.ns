@@ -83,6 +83,491 @@ Copyright Google Inc. 2014 - 2017 *)
 			subclassResponsibility
 		)
 	) : ()
+	public class ActivationMirror reflecting: activation thread: thr = Object new (
+		(* A mirror on one SimulatedActivation of a SimulatedThread, presenting the psoup ActivationMirror API the Debugging UI consumes (sender, receiver, method, sourceRange, slots, stepping, restart, return:). Stepping and stack surgery delegate to the thread; the UI refreshes its activation chain from the thread mirror afterwards. *)
+		
+		|
+			private reflectee <SimulatedActivation> = activation.
+			private thread <SimulatedThread> = thr.
+		|
+	) (
+		public = other ^<Boolean> = (
+			other isKindOfActivationMirror ifFalse: [ ^false ].
+			^reflectee == other reflectedActivation
+		)
+		classOfReflectee: obj = (
+			^_js call: (_js propertyOf: (_js ident: 'Object')
+					at: (_js literal: 'getPrototypeOf'))
+				with: {obj. }
+		)
+		public closure ^<ObjectMirror | nil> = (
+			nil = reflectee closure ifTrue: [ ^nil ].
+			^ObjectMirror reflecting: reflectee closure
+		)
+		debugInfoMapper = (
+			(* A DebugMapper over this frame, or nil. A runtime-compiled method (a doIt) carries its DebugInfo directly; otherwise recompile the frame's method source with the V5 compiler within the defining mixin (both compilers parse the same text, so bcis and local layouts agree with the frame's record). *)
+			
+			| bcc cm src |
+			nil = reflectee method debugInfo ifFalse: [
+					^[ reflectee method debugInfo mapperForContext: reflectee ] on: Exception
+						do: [:e | nil ]
+				].
+			bcc:: bytecodeCompilationModule.
+			nil = bcc ifTrue: [ ^nil ].
+			cm:: definingClassMirror.
+			nil = cm ifTrue: [ ^nil ].
+			src:: thread simulator sourceOf: reflectee.
+			nil = src ifTrue: [ ^nil ].
+			^[
+				(bcc Compiler new compileMethodSource: src within: cm mixin) debugInfo mapperForContext: reflectee
+			] on: Exception do: [:e | nil ]
+		)
+		definingClassMirror ^<ClassMirror | nil> = (
+			(* The NS class whose mixin defines the frame's method. The simulator query is non-raising and covers flat-patched primitive receivers (their runtime chain materializes no applications) via the NS class chain - displaying a transplanted frame must never fail on an unresolvable mixin. *)
+			
+			| nsClass |
+			nsClass:: thread simulator newspeakClassApplying: reflectee method mixin
+				startingAt: (classOfReflectee: reflectee receiver).
+			nil = nsClass ifTrue: [ ^nil ].
+			^ClassMirror reflecting: nsClass
+		)
+		public enclosingActivation ^<ActivationMirror | nil> = (
+			| outerFrame = reflectee outerContext. |
+			nil = outerFrame ifTrue: [ ^nil ].
+			^ActivationMirror reflecting: outerFrame thread: thread
+		)
+		public evaluate: expression <String> ^<ThreadMirror> = (
+			(* psoup semantics: evaluateSuspended + resume. *)
+			
+			^(evaluateSuspended: expression) resume
+		)
+		public evaluateSuspended: expression <String> ^<ThreadMirror> = (
+			(* psoup API: a suspended, steppable thread evaluating the expression in the FRAME's scope - the expression is V5-compiled with this frame's debug mapper (so its locals resolve to tempAt:/outerContext accesses on the frame) and activated with ctxt = the frame. Receiver-scope fallback when the bytecode stack is unavailable. *)
+			
+			| mapper bcc im simMethod sim |
+			bcc:: bytecodeCompilationModule.
+			mapper:: nil = bcc ifTrue: [ nil ] ifFalse: [ debugInfoMapper ].
+			nil = mapper ifTrue: [
+					^(ObjectMirror reflecting: reflectee receiver) evaluateSuspended: expression
+				].
+			^[
+				im:: bcc Compiler new compileExpressionSource: expression
+					debugMapper: mapper
+					withScope: Map new
+					inMixin: method definingMixin.
+				simMethod:: simulatorModule SimulatedMethod record: (bytecodeRecordFor: im)
+					mixin: reflectee method mixin
+					selector: #DoIt
+					accessModifier: #public.
+				simMethod sourceText: expression.
+				simMethod debugInfo: im debugInfo.
+				sim:: simulatorModule Simulator new.
+				sim startMethod: simMethod
+					receiver: reflectee receiver
+					arguments: {reflectee. Map new. }.
+				ThreadMirror onSimulated: (simulatorModule SimulatedThread over: sim)
+			] on: Exception
+				do: [:e |
+					(ObjectMirror reflecting: reflectee receiver) evaluateSuspended: expression
+				]
+		)
+		public hash ^<Integer> = (
+			^(identityHashOf: reflectee) bitXor: class hash
+		)
+		public isKindOfActivationMirror ^<Boolean> = (
+			^true
+		)
+		public isUncontinuable ^<Boolean> = (
+			^reflectee isDead
+		)
+		public method ^<MethodMirror> = (
+			(* The proper MethodMirror when the defining mixin is reachable; otherwise a FrameMethodMirror carrying what the frame knows. NB: the regular MethodMirror's source: parameter is a sources-array INDEX, not text - passing text (or nil) there yields sources[garbage] = raw JS undefined, which once crashed the debugger UI's CodeMirror. *)
+			
+			| cm found |
+			cm:: definingClassMirror.
+			nil = cm ifFalse: [
+					found:: [ cm mixin methods findMirrorNamed: reflectee method selector ] on: Exception
+						do: [:e | nil ].
+					nil = found ifFalse: [ ^found ]
+				].
+			^FrameMethodMirror name: reflectee method selector
+				accessModifier: reflectee method accessModifier
+				mixin: (nil = cm ifTrue: [ nil ] ifFalse: [ cm mixin ])
+				sourceText: (thread simulator sourceOf: reflectee)
+		)
+		normalizeUndefined: v = (
+			(_js operator: '==' with: v and: (_js ident: 'null')) ifTrue: [ ^nil ].
+			^v
+		)
+		positionalSlots ^<List[LocalSlotMirror]> = (
+			| result = List new. |
+			1 to: reflectee size
+				do: [:i |
+					result add: (LocalSlotMirror name: 't' , i printString
+							value: (ObjectMirror reflecting: (reflectee tempAt: i)))
+				].
+			^result
+		)
+		public receiver ^<ObjectMirror> = (
+			^ObjectMirror reflecting: reflectee receiver
+		)
+		public reflectedActivation ^<SimulatedActivation> = (
+			^reflectee
+		)
+		public restart ^<ThreadMirror> = (
+			thread restart: reflectee withLookup: false.
+			^threadMirror
+		)
+		public restartWithLookup ^<ThreadMirror> = (
+			thread restart: reflectee withLookup: true.
+			^threadMirror
+		)
+		public return: result <ObjectMirror> ^<ThreadMirror> = (
+			thread return: result reflectee from: reflectee.
+			^threadMirror
+		)
+		public sender ^<ActivationMirror | nil> = (
+			(* Hide the simulation root sentinel, psoup-style. *)
+			
+			| s = reflectee sender. |
+			nil = s ifTrue: [ ^nil ].
+			s == thread simulator rootActivation ifTrue: [ ^nil ].
+			nil = s method ifTrue: [ ^nil ].
+			^ActivationMirror reflecting: s thread: thread
+		)
+		public slots ^<List[LocalSlotMirror]> = (
+			(* Named local variables via the V5 DebugInfo mapper, psoup-style: lazily recompile the method source with the bytecode compiler in the defining mixin's scope and read values through the mapper (the SimulatedActivation satisfies the mapper's context protocol: bci, closure, outerContext, size, tempAt:). Positional temps when the recompile is unavailable. *)
+			
+			| mapper result |
+			mapper:: debugInfoMapper.
+			nil = mapper ifTrue: [ ^positionalSlots ].
+			^[
+				result:: List new.
+				mapper localNames do: [:localName |
+						result add: (LocalSlotMirror name: localName
+								value: (ObjectMirror reflecting: (mapper getValueOf: localName)))
+					].
+				result
+			] on: Exception do: [:e | positionalSlots ]
+		)
+		public sourceRange ^<Interval | nil> = (
+			| range = thread simulator sourceRangeOf: reflectee. |
+			nil = range ifTrue: [ ^nil ].
+			^Interval from: (range at: 1) to: (range at: 2)
+		)
+		public stepInto ^<ThreadMirror> = (
+			thread stepInto: reflectee.
+			^threadMirror
+		)
+		public stepOut ^<ThreadMirror> = (
+			thread stepOut: reflectee.
+			^threadMirror
+		)
+		public stepOver ^<ThreadMirror> = (
+			thread stepOver: reflectee.
+			^threadMirror
+		)
+		public stepThrough ^<ThreadMirror> = (
+			thread stepThrough: reflectee.
+			^threadMirror
+		)
+		public threadMirror ^<ThreadMirror> = (
+			^ThreadMirror onSimulated: thread
+		)
+	) : (
+		calleeSelectorFor: rawCalleeSelector <String | nil> exception: ex ^<String | nil> = (
+			(* The selector to look for in the CALLER's bytecode when deriving a transplant frame's bci. A doesNotUnderstand: callee means the source-level send was the MNU's own message: dNU is invoked by the DNU catcher machinery, so its selector never appears at the call site. Any probe failure keeps the raw selector. *)
+			
+			nil = rawCalleeSelector ifTrue: [ ^nil ].
+			'doesNotUnderstand:' = rawCalleeSelector ifFalse: [ ^rawCalleeSelector ].
+			^[ ex message selector ] on: Exception
+				do: [:probeFailed | rawCalleeSelector ]
+		)
+		public debug: receiver send: selector with: arguments <List> ^<ThreadMirror> = (
+			(* The Stage-1 debugger entry: begin the send under the simulator, suspended before the first instruction; step with the returned thread's activation mirrors. Degrades to an eager sendSuspended: when the simulator module is not packaged. *)
+			
+			| sim simThread |
+			nil = simulatorModule ifTrue: [
+					^(ObjectMirror reflecting: receiver) eagerSendSuspended: selector
+						with: arguments
+				].
+			sim:: simulatorModule Simulator new.
+			sim start: receiver send: selector with: arguments asArray.
+			simThread:: simulatorModule SimulatedThread over: sim.
+			^ThreadMirror onSimulated: simThread
+		)
+		doItSimMethodFor: expression <String> receiver: rcvr scope: rawScope <Map> in: sim ^<SimulatedMethod | nil> = (
+			(* The V5-compiled doIt of a failed evaluation, ready for restart-quality frames (the method record's own frame and its blocks' frames alike). Compiled from the same bare expression the JS doIt was, so shadow-record source coordinates agree. nil when the bytecode pipeline is unavailable; a compile failure raises to the caller's backstop. *)
+			
+			| bcc im simMethod |
+			bcc:: bytecodeCompilationModule.
+			nil = bcc ifTrue: [ ^nil ].
+			im:: bcc Compiler new compileExpressionSource: expression
+				debugMapper: nil
+				withScope: rawScope
+				inMixin: (ObjectMirror reflecting: rcvr) getClass mixin.
+			simMethod:: simulatorModule SimulatedMethod record: (bytecodeRecordFor: im)
+				mixin: (sim runtimeMixinForDebugOf: rcvr)
+				selector: #DoIt
+				accessModifier: #public.
+			simMethod sourceText: expression.
+			simMethod debugInfo: im debugInfo.
+			^simMethod
+		)
+		public invokeSuspended: closure <[]> ^<ThreadMirror> = (
+			(* API-compatible with psoup: answer a suspended thread that runs the closure when resumed. On JS the run is at full speed (closures are opaque compiled functions -- they cannot be entered in simulation), so a broken outcome carries the exception but no frames until Stage 3's lazy shadow stack. For steppable debugging use ObjectMirror debugSuspended:with:. *)
+			
+			^ThreadMirror deferred: closure
+		)
+		restoreLocalsOf: act from: frameRec method: simMethod in: sim = (
+			(* Best-effort restore of the frame's captured locals (statement-level restart + slot inspection): the shadow record's values matched by SOURCE NAME against the V5 local layout, obtained from the method's own debugInfo (doIts) or by recompiling the method source in its defining mixin's scope. DIRECT locals only: a closure-captured local lives in a remote vector on the V5 side while the JS capture holds the plain value - restoring it raw would corrupt the vector slot, so those stay nil. Any failure leaves the frame as it was. *)
+			
+			| names vals di lvs limit n v |
+			names:: _js propertyOf: frameRec at: (_js literal: 'localNames').
+			(_js operator: '==' with: names and: (_js ident: 'null')) ifTrue: [ ^self ].
+			vals:: _js propertyOf: frameRec at: (_js literal: 'locals').
+			(_js operator: '==' with: vals and: (_js ident: 'null')) ifTrue: [ ^self ].
+			[
+				di:: transplantDebugInfoFor: simMethod of: act in: sim.
+				nil = di ifTrue: [ ^self ].
+				lvs:: di localVariables.
+				limit:: _js propertyOf: names at: (_js literal: 'length').
+				1 to: limit
+					do: [:i |
+						n:: _js propertyOf: names at: i - 1.
+						v:: _js propertyOf: vals at: i - 1.
+						lvs do: [:lv |
+								(lv name = n and: [ 0 = lv contextDepth and: [ nil = lv remoteVector ] ]) ifTrue: [
+										
+										(* zeroOriginOffset is COMBINED-space (params included): DebugMapper getValueOf: reads tempAt: offset + 1 directly - write exactly where the mapper reads. (The bytecode pushLocal space is locals-only and adds numArgs; that is a different coordinate system.) *)
+										act tempAt: lv zeroOriginOffset + 1 put: v
+									]
+							]
+					]
+			] on: Exception do: [:restoreFailed | nil ]
+		)
+		statementRestartBciFor: act in: sim ^<Integer> = (
+			(* The bci of the top-level statement containing the frame's display bci - the sound Continue entry point (empty operand stack, no live control flow at top-level statement boundaries, locals restored to their at-failure values). 1 whenever anything is unresolvable: Continue then degrades to a full restart. *)
+			
+			(* Coordinates: everything stays in RAW parser coordinates - bciMap interval starts ARE parser node starts. A doIt's map came from a standalone parse of the same bare expression (sourceStart 0), so map values align with a fresh parse at bias 0; a deployed method's map came from the class-source parse (values minus sourceStart are zero-anchored at the method start), so the fresh standalone parse's own origin - the parsed declaration's start - is subtracted as bias. *)
+			
+			| simMethod src root stmts bias failStart stmt map i entryBci bestBci best s candidates |
+			simMethod:: act method.
+			nil = simMethod ifTrue: [ ^1 ].
+			nil = simMethod record ifTrue: [ ^1 ].
+			src:: sim sourceOf: act.
+			nil = src ifTrue: [ ^1 ].
+			#DoIt = simMethod selector ifTrue: [
+					root:: parsing CommonParser new parseExpression: src.
+					stmts:: root statements.
+					bias:: 0
+				]
+				ifFalse: [
+					root:: parsing CommonParser new parseMethodDeclaration: src.
+					stmts:: root body statements.
+					bias:: root start
+				].
+			map:: simMethod bciMap.
+			
+			(* The raw source start of the frame's current position: the nearest mapped entry at or before the display bci. *)
+			failStart:: nil.
+			bestBci:: -1.
+			i:: 1.
+			[ i + 2 <= map size ] whileTrue: [
+					entryBci:: map at: i.
+					(entryBci <= act bci and: [ entryBci > bestBci ]) ifTrue: [
+							bestBci:: entryBci.
+							failStart:: (map at: i + 1) - simMethod sourceStart
+						].
+					i:: i + 3
+				].
+			nil = failStart ifTrue: [ ^1 ].
+			stmt:: nil.
+			stmts do: [:each |
+					
+					(* Parenthesize the arithmetic INSIDE the comparisons: Newspeak binary operators are uniform-precedence left-associative, so a bare `failStart <= each end - bias` is `(failStart <= each end) - bias` - a boolean minus a number, silently coerced by JS and then DNUing on ifTrue: (found 2026-07-22). *)
+					(each start - bias <= failStart and: [ failStart <= (each end - bias) ]) ifTrue: [
+							stmt:: each
+						]
+				].
+			nil = stmt ifTrue: [ ^1 ].
+			
+			(* All mapped bcis of the failing statement; the simulator derives the sound entry - the start of the push-run into the earliest method-level one - since the map marks only sends and stores, never a statement's first instruction. *)
+			candidates:: List new.
+			i:: 1.
+			[ i + 2 <= map size ] whileTrue: [
+					s:: (map at: i + 1) - simMethod sourceStart.
+					(s >= (stmt start - bias) and: [ s <= (stmt end - bias) ]) ifTrue: [
+							candidates add: (map at: i)
+						].
+					i:: i + 3
+				].
+			candidates isEmpty ifTrue: [ ^1 ].
+			best:: sim statementEntryAmong: candidates in: simMethod.
+			0 = best ifTrue: [ ^1 ].
+			^best
+		)
+		public threadForBrokenActivation: a reason: e ^<ThreadMirror> = (
+			(* A broken thread over an existing simulated stack (a's thread), presenting the frames at the raise point. When [a] is not a simulated activation (eager evaluation paths), degrade to a frameless broken thread. *)
+			
+			(nil = a or: [ a isKindOfActivationMirror not ]) ifTrue: [
+					^ThreadMirror state: #broken result: (ObjectMirror reflecting: e)
+				].
+			^a threadMirror
+		)
+		public threadForShadowFrames: rawFrames exception: ex ^<ThreadMirror> = (
+			^threadForShadowFrames: rawFrames
+				exception: ex
+				doItSource: nil
+				receiver: nil
+				scope: nil
+		)
+		public threadForShadowFrames: rawFrames exception: ex doItSource: expression <String | nil> receiver: rcvr scope: rawScope <Map | nil> ^<ThreadMirror> = (
+			(* Stage 3 transplant: the raw shadow-frame records built during a reconstruction unwind (innermost first: {mixin, selector, receiver, args}) become a BROKEN simulated thread the Debugging UI presents like any other. Frames are restart-quality (receiver and arguments captured at unwind, locals cleared, bci 1): inspect everything, evaluate in frame scope, restart any frame to re-execute it. Unresolvable frames (edited away, record-less) are skipped. Degrades to a frameless broken thread without the simulator.
+
+		With a doItSource (the evaluate:with: reconstruction boundary): the doIt itself is compiled fresh with the V5 pipeline - exactly as evaluateSuspended: does - and appended as the OUTERMOST frame. The doIt is installed nowhere, so shadow-record resolution can never find it; without this the evaluation's own frame, usually the one the user cares about, is missing, and Continue has nothing meaningful to restart. *)
+			
+			| sim count frameRec simMethod act innermost prev simThread doItFrame prevSelector calleeSel siteRaw site b blkRaw blk doItMethod doItRecordFramed isDoIt recSelector |
+			nil = simulatorModule ifTrue: [
+					^ThreadMirror state: #broken result: (ObjectMirror reflecting: ex)
+				].
+			sim:: simulatorModule Simulator new.
+			doItMethod:: nil.
+			doItRecordFramed:: false.
+			nil = expression ifFalse: [
+					doItMethod:: [
+						doItSimMethodFor: expression receiver: rcvr scope: rawScope in: sim
+					] on: Exception do: [:compileError | nil ]
+				].
+			count:: _js propertyOf: rawFrames at: (_js literal: 'length').
+			innermost:: nil.
+			prev:: nil.
+			prevSelector:: nil.
+			1 to: count
+				do: [:i |
+					frameRec:: _js propertyOf: rawFrames at: i - 1.
+					recSelector:: _js propertyOf: frameRec at: (_js literal: 'selector').
+					simMethod:: sim transplantMethodMixinNamed: (_js propertyOf: frameRec
+							at: (_js literal: 'mixin'))
+						selector: recSelector
+						receiver: (_js propertyOf: frameRec at: (_js literal: 'receiver')).
+					
+					(* The doIt and its blocks are homed in a synthetic method installed nowhere - unresolvable by name. Their records carry the compiler's synthetic selector: mount them on the freshly V5-compiled doIt method (same bare expression source, so the source coordinates agree). *)
+					isDoIt:: false.
+					(nil = simMethod and: [ (nil = doItMethod) not ]) ifTrue: [
+							'DoItWith:' = recSelector ifTrue: [
+									simMethod:: doItMethod.
+									isDoIt:: true
+								]
+						].
+					nil = simMethod ifFalse: [
+							
+							(* A block record (blk = the block's source start) is a CLOSURE activation of the home method: same compilation unit, but its captured args are the BLOCK's parameters - they must not be mounted into the home method's argument slots, where the slot mapper would present them under the wrong names. A doIt method record mounts the canonical psoup activation (receiver = the evaluation receiver, arguments {ctxt. scope.}). *)
+							blkRaw:: _js propertyOf: frameRec at: (_js literal: 'blk').
+							blk:: (_js operator: '==' with: blkRaw and: (_js ident: 'null')) ifTrue: [
+									0
+								]
+								ifFalse: [ blkRaw ].
+							act:: sim transplantFrameFor: simMethod
+								receiver: (isDoIt ifTrue: [ rcvr ]
+									ifFalse: [ _js propertyOf: frameRec at: (_js literal: 'receiver') ])
+								arguments: (blk > 0 ifTrue: [ {} ]
+									ifFalse: [
+										isDoIt ifTrue: [ {nil. rawScope. } ]
+											ifFalse: [ _js propertyOf: frameRec at: (_js literal: 'args') ]
+									]).
+							(isDoIt and: [ 0 = blk ]) ifTrue: [ doItRecordFramed:: true ].
+							
+							(* Display bci: where this frame invoked its callee - the ADJACENT RAW record's method, whether or not that record itself resolved to a frame. Stored site for instrumented multi-site selectors, static derivation for single-site ones; a block frame with neither falls back to the block's first mapped instruction; bci 1 otherwise. *)
+							calleeSel:: calleeSelectorFor: prevSelector exception: ex.
+							b:: 0.
+							nil = calleeSel ifFalse: [
+									siteRaw:: _js propertyOf: frameRec at: (_js literal: 'site').
+									site:: (_js operator: '==' with: siteRaw and: (_js ident: 'null')) ifTrue: [
+											0
+										]
+										ifFalse: [ siteRaw ].
+									b:: sim transplantBciFor: simMethod callee: calleeSel site: site
+								].
+							(0 = b and: [ blk > 0 ]) ifTrue: [
+									b:: sim bciAtOrAfterSourceStart: blk in: simMethod
+								].
+							0 = b ifFalse: [ act bci: b ].
+							restoreLocalsOf: act from: frameRec method: simMethod in: sim.
+							nil = innermost ifTrue: [ innermost:: act ].
+							nil = prev ifFalse: [ prev sender: act ].
+							prev:: act
+						].
+					prevSelector:: recSelector
+				].
+			
+			(* The doIt method frame normally mounts from its own record above; this append covers captures that lost it (e.g. truncated record chains). *)
+			(nil = doItMethod or: [ doItRecordFramed ]) ifFalse: [
+					doItFrame:: sim transplantFrameFor: doItMethod
+						receiver: rcvr
+						arguments: {nil. rawScope. }.
+					calleeSel:: calleeSelectorFor: prevSelector exception: ex.
+					nil = calleeSel ifFalse: [
+							b:: sim transplantBciFor: doItMethod callee: calleeSel site: 0.
+							0 = b ifFalse: [ doItFrame bci: b ]
+						].
+					nil = innermost ifTrue: [ innermost:: doItFrame ].
+					nil = prev ifFalse: [ prev sender: doItFrame ].
+					prev:: doItFrame
+				].
+			nil = innermost ifTrue: [
+					^ThreadMirror state: #broken result: (ObjectMirror reflecting: ex)
+				].
+			
+			(* Continue restarts the OUTERMOST frame: give it its statement-level entry point. *)
+			nil = prev ifFalse: [
+					prev restartBci: ([ statementRestartBciFor: prev in: sim ] on: Exception
+							do: [:noStatement | 1 ])
+				].
+			sim adoptBrokenStack: innermost.
+			simThread:: simulatorModule SimulatedThread over: sim.
+			simThread state: #broken.
+			simThread result: ex.
+			^ThreadMirror onSimulated: simThread
+		)
+		transplantDebugInfoFor: simMethod of: act in: sim ^<DebugInfo | nil> = (
+			(* The V5 DebugInfo describing simMethod's local layout: carried directly by runtime-compiled doIts, recompiled from source for deployed methods (same text, both compilers, so layouts agree). nil-tolerant throughout. *)
+			
+			| src nsClass |
+			nil = simMethod debugInfo ifFalse: [ ^simMethod debugInfo ].
+			nil = bytecodeCompilationModule ifTrue: [ ^nil ].
+			src:: sim sourceOf: act.
+			nil = src ifTrue: [ ^nil ].
+			nsClass:: sim newspeakClassApplying: simMethod mixin
+				startingAt: (_js call: (_js propertyOf: (_js ident: 'Object')
+						at: (_js literal: 'getPrototypeOf'))
+					with: {act receiver. }).
+			nil = nsClass ifTrue: [ ^nil ].
+			^(bytecodeCompilationModule Compiler new compileMethodSource: src
+				within: (ClassMirror reflecting: nsClass) mixin) debugInfo
+		)
+	)
+	public class AtomicInstallWrapper new = Object new (
+		(* reflectees at: self put: activation *)
+		
+		(* :TODO :Bogus *)
+		
+	) (
+		public install: builders <List[ClassDeclarationBuilder]> into: ns <Map[Symbol, Object]> ^<List[MixinMirror]> = (
+			(* Nothing atomic about this. We'd have to implement the whole thing in JS, and even then, it needs to be a transaction *)
+			
+			#BOGUS yourself.
+			^builders collect: [:b <ClassDeclarationBuilder> |
+					| mm <MixinMirror> |
+					mm:: b install instanceSide.
+					ns at: b name
+						ifAbsent: [
+							ns at: b name put: (mm apply: Object withName: b name) reflectee
+						].
+					mm
+				]
+		)
+	) : ()
 	public class ClassDeclarationBuilder forExistingMixin: m <Mixin> within: enclosing <ClassDeclarationBuilder> = Object new (
 		(* A mutable description of a class, ready for installation. This class is the abstract superclass of two alternate
 implementations: IRBasedClassDeclarationBuilder and MixinBasedClassDeclarationBuilder.
@@ -170,9 +655,6 @@ Still lacking are facilities for correctly adding slots (and hence nested classe
 			nil = pendingHeaderSource ifFalse: [ ^pendingHeaderSource ].
 			^originalHeaderSource
 		)
-		originalHeaderSource ^<String> = (
-			^subclassResponsibility
-		)
 		public install ^<ClassDeclarationMirror> = (
 			| writer sb <StringBuilder> src <String> runtimeMixin <JRM> cdir <IntermediateClassDeclaration> |
 			writer:: generation Writer new.
@@ -208,114 +690,6 @@ Still lacking are facilities for correctly adding slots (and hence nested classe
 				].
 			^ClassDeclarationMirror reflecting: prvtExistingMixin
 		)
-		updateDeployTimeMixinFor: cdir <IntermediateClassDeclaration> from: newRuntimeMixin <JRM> = (
-			(* For top-level cdir only: look up the deploy-time mixin at
-	   [mixins[manglePublic(qualifiedName)]] and, if it's a different
-	   object from [prvtExistingMixin]'s runtime mixin, run [updateMixin:]
-	   on it too. Top-level is detected by absence of a backtick in
-	   the qualifiedName. *)
-			
-			| deployRtm |
-			(cdir qualifiedName indexOf: '`') > 0 ifTrue: [ ^self ].
-			deployRtm:: vmmirror ownPropertyOf: (_js ident: 'mixins')
-				at: (vmmirror mangleSelector: cdir qualifiedName).
-			(_js operator: '===' with: deployRtm and: (_js ident: 'undefined')) ifTrue: [
-					^self
-				].
-			(_js operator: '==='
-				with: deployRtm
-				and: (_js propertyOf: prvtExistingMixin at: (_js literal: 'runtimeMixin'))) ifTrue: [
-					^self
-				].
-			updateMixin: (Mixin fromRuntimeMixin: deployRtm)
-				from: newRuntimeMixin
-				by: cdir
-		)
-		public name ^<Symbol> = (
-			^subclassResponsibility
-		)
-		public qualifiedName = (
-			^declarationData qualifiedName
-		)
-		public simpleName ^<Symbol> = (
-			^name
-		)
-		public source ^<String> = (
-			| sb = StringBuilder new. |
-			sb add: header source.
-			sb writeln: ' ( '.
-			
-			(* Lazy slots MUST be emitted (their generated methods are synthetic
-	   and thus absent from the methods group); losing them here once caused
-	   live lazy caches to be schema-change-deleted.
-
-	   CANONICAL member order: lazy slots, then nested classes, then
-	   methods -- the order the class browser shows a class in -- each
-	   bin sorted by name. The point is that a class saved from the IDE
-	   and its file pretty-printed come out identical, so this must
-	   agree exactly with MirrorsForPrimordialSoup
-	   (writeClassDeclaration) and NewspeakPrettyPrinter
-	   (sortedByName:by:). The bin order here is the one that was kept;
-	   psoup and the printer both emitted nested classes before lazy
-	   slots and moved to match this. *)
-			(sortedMembers: instanceSide lazySlots by: [:ea | ea name ])
-				do: [:ea <LazySlotMirror | LazySlotBuilder> |
-					nil = ea source ifFalse: [ sb writeln: ea source ]
-				].
-			(sortedMembers: instanceSide nestedClasses by: [:ea | ea name ])
-				do: [:ea <ClassDeclarationMirror | ClassDeclarationBuilder> |
-					sb writeln: ea source
-				].
-			(sortedMembers: instanceSide methods by: [:ea | ea selector ])
-				do: [:ea <MethodMirror | MethodBuilder> |
-					sb writeln: ea source
-				].
-			sb writeln: ' ) : ( '.
-			(sortedMembers: classSide methods by: [:ea | ea selector ])
-				do: [:ea <MethodMirror | MethodBuilder> |
-					sb writeln: ea source
-				].
-			sb writeln: ' )'.
-			^sb asString
-		)
-		schemaChangeFor: oldRuntimeMixin <JRM> withOldSlotNames: oldSlotNames <Array[String]> by: classDeclIR <IntermediateClassDeclaration> = (
-			(* Detect a slot-layout change and, if there is one, have the vmmirror
-	   rebuild basicNew for every affected runtime class (the mixin''s
-	   applications and their transitive subclasses) and reshape all live
-	   instances in place (added slots initialized to nil, removed slots
-	   deleted; identity preserved, so nothing else needs fixing).
-
-	   Must run AFTER the mixin''s metadata and methods have been updated in
-	   place: the vmmirror reads each class''s CURRENT slot metadata through
-	   its class object''s mixin. The slot lists include synthetic slots
-	   (nested-class caches, lazy-slot backing slots), so adding a nested
-	   class also reshapes existing enclosing instances correctly. *)
-			
-			| newSlotNames <List[String]> added <List[String]> removed <List[String]> |
-			newSlotNames:: classDeclIR instanceSide slots collect: [:s | s name ].
-			added:: newSlotNames reject: [:n | oldSlotNames includes: n ].
-			removed:: oldSlotNames reject: [:n | newSlotNames includes: n ].
-			(added isEmpty and: [ removed isEmpty ]) ifTrue: [ ^self ].
-			vmmirror performSchemaChangeFor: oldRuntimeMixin
-				adding: added asArray
-				removing: removed asArray
-			(* The accessors of removed slots are retired by the general member
-	   diff in retireDeletedMembersOf:...by: — they are present in the old
-	   method metadata and absent from the faithfully reconstructed new
-	   declaration. *)
-			
-		)
-		slotNamesOf: rtm <JRM> ^<Array[String]> = (
-			(* The slot names recorded in [rtm]''s SM metadata. Defensive: a
-	   mixin-like object without a [slots] property yields the empty array,
-	   which degrades the schema-change diff to adds-only (benign: adds are
-	   guarded by hasOwnProperty on each instance) instead of crashing. *)
-			
-			| raw |
-			raw:: _js propertyOf: rtm at: (_js literal: 'slots').
-			(_js operator: '===' with: raw and: (_js ident: 'undefined')) ifTrue: [ ^{} ].
-			^raw collect: [:sm | _js propertyOf: sm at: (_js literal: 'name') ]
-		)
 		methodNamesOf: rtm <JRM | MJRM> ^<Array[String]> = (
 			(* The method names recorded in [rtm]''s MM metadata, synthetic
 	   methods included — accessors and lazy slot machinery participate in
@@ -326,6 +700,9 @@ Still lacking are facilities for correctly adding slots (and hence nested classe
 			(_js operator: '===' with: raw and: (_js ident: 'undefined')) ifTrue: [ ^{} ].
 			^raw collect: [:mm | _js propertyOf: mm at: (_js literal: 'name') ]
 		)
+		public name ^<Symbol> = (
+			^subclassResponsibility
+		)
 		nestedClassNamesOf: rtm <JRM> ^<Array[String]> = (
 			(* The qualified nested class names recorded in [rtm]''s metadata.
 	   Same defensive guard as slotNamesOf:. *)
@@ -334,6 +711,12 @@ Still lacking are facilities for correctly adding slots (and hence nested classe
 			raw:: _js propertyOf: rtm at: (_js literal: 'nestedClasses').
 			(_js operator: '===' with: raw and: (_js ident: 'undefined')) ifTrue: [ ^{} ].
 			^raw
+		)
+		originalHeaderSource ^<String> = (
+			^subclassResponsibility
+		)
+		public qualifiedName = (
+			^declarationData qualifiedName
 		)
 		retireDeletedMembersOf: oldRuntimeMixin <JRM> withOldMethodNames: oldMethodNames <Array[String]> oldClassMethodNames: oldClassMethodNames <Array[String]> oldNestedClassNames: oldNestedClassNames <Array[String]> by: classDeclIR <IntermediateClassDeclaration> = (
 			(* Retire members that are present in the pre-update metadata but
@@ -378,6 +761,81 @@ Still lacking are facilities for correctly adding slots (and hence nested classe
 					vmmirror deleteClassMethods: deletedClassMethods asArray
 						from: oldRuntimeMixin
 				]
+		)
+		schemaChangeFor: oldRuntimeMixin <JRM> withOldSlotNames: oldSlotNames <Array[String]> by: classDeclIR <IntermediateClassDeclaration> = (
+			(* Detect a slot-layout change and, if there is one, have the vmmirror
+	   rebuild basicNew for every affected runtime class (the mixin''s
+	   applications and their transitive subclasses) and reshape all live
+	   instances in place (added slots initialized to nil, removed slots
+	   deleted; identity preserved, so nothing else needs fixing).
+
+	   Must run AFTER the mixin''s metadata and methods have been updated in
+	   place: the vmmirror reads each class''s CURRENT slot metadata through
+	   its class object''s mixin. The slot lists include synthetic slots
+	   (nested-class caches, lazy-slot backing slots), so adding a nested
+	   class also reshapes existing enclosing instances correctly. *)
+			
+			| newSlotNames <List[String]> added <List[String]> removed <List[String]> |
+			newSlotNames:: classDeclIR instanceSide slots collect: [:s | s name ].
+			added:: newSlotNames reject: [:n | oldSlotNames includes: n ].
+			removed:: oldSlotNames reject: [:n | newSlotNames includes: n ].
+			(added isEmpty and: [ removed isEmpty ]) ifTrue: [ ^self ].
+			vmmirror performSchemaChangeFor: oldRuntimeMixin
+				adding: added asArray
+				removing: removed asArray
+			(* The accessors of removed slots are retired by the general member
+	   diff in retireDeletedMembersOf:...by: — they are present in the old
+	   method metadata and absent from the faithfully reconstructed new
+	   declaration. *)
+			
+		)
+		public simpleName ^<Symbol> = (
+			^name
+		)
+		slotNamesOf: rtm <JRM> ^<Array[String]> = (
+			(* The slot names recorded in [rtm]''s SM metadata. Defensive: a
+	   mixin-like object without a [slots] property yields the empty array,
+	   which degrades the schema-change diff to adds-only (benign: adds are
+	   guarded by hasOwnProperty on each instance) instead of crashing. *)
+			
+			| raw |
+			raw:: _js propertyOf: rtm at: (_js literal: 'slots').
+			(_js operator: '===' with: raw and: (_js ident: 'undefined')) ifTrue: [ ^{} ].
+			^raw collect: [:sm | _js propertyOf: sm at: (_js literal: 'name') ]
+		)
+		public source ^<String> = (
+			| sb = StringBuilder new. |
+			sb add: header source.
+			sb writeln: ' ( '.
+			
+			(* Lazy slots MUST be emitted (their generated methods are synthetic
+	   and thus absent from the methods group); losing them here once caused
+	   live lazy caches to be schema-change-deleted.
+
+	   CANONICAL member order: lazy slots, then nested classes, then
+	   methods -- the order the class browser shows a class in -- each
+	   bin sorted by name. The point is that a class saved from the IDE
+	   and its file pretty-printed come out identical, so this must
+	   agree exactly with MirrorsForPrimordialSoup
+	   (writeClassDeclaration) and NewspeakPrettyPrinter
+	   (sortedByName:by:). The bin order here is the one that was kept;
+	   psoup and the printer both emitted nested classes before lazy
+	   slots and moved to match this. *)
+			(sortedMembers: instanceSide lazySlots by: [:ea | ea name ]) do: [:ea <LazySlotMirror | LazySlotBuilder> |
+					nil = ea source ifFalse: [ sb writeln: ea source ]
+				].
+			(sortedMembers: instanceSide nestedClasses by: [:ea | ea name ]) do: [:ea <ClassDeclarationMirror | ClassDeclarationBuilder> |
+					sb writeln: ea source
+				].
+			(sortedMembers: instanceSide methods by: [:ea | ea selector ]) do: [:ea <MethodMirror | MethodBuilder> |
+					sb writeln: ea source
+				].
+			sb writeln: ' ) : ( '.
+			(sortedMembers: classSide methods by: [:ea | ea selector ]) do: [:ea <MethodMirror | MethodBuilder> |
+					sb writeln: ea source
+				].
+			sb writeln: ' )'.
+			^sb asString
 		)
 		updateApplicationsOf: oldRuntimeMixin <JRM> from: newRuntimeMixin <JRM> by: classDeclIR <IntermediateClassDeclaration> = (
 			| newRuntimeMetamixin <MJRM> = _js propertyOf: newRuntimeMixin
@@ -429,6 +887,29 @@ Still lacking are facilities for correctly adding slots (and hence nested classe
 								]
 						]
 				]
+		)
+		updateDeployTimeMixinFor: cdir <IntermediateClassDeclaration> from: newRuntimeMixin <JRM> = (
+			(* For top-level cdir only: look up the deploy-time mixin at
+	   [mixins[manglePublic(qualifiedName)]] and, if it's a different
+	   object from [prvtExistingMixin]'s runtime mixin, run [updateMixin:]
+	   on it too. Top-level is detected by absence of a backtick in
+	   the qualifiedName. *)
+			
+			| deployRtm |
+			(cdir qualifiedName indexOf: '`') > 0 ifTrue: [ ^self ].
+			deployRtm:: vmmirror ownPropertyOf: (_js ident: 'mixins')
+				at: (vmmirror mangleSelector: cdir qualifiedName).
+			(_js operator: '===' with: deployRtm and: (_js ident: 'undefined')) ifTrue: [
+					^self
+				].
+			(_js operator: '==='
+				with: deployRtm
+				and: (_js propertyOf: prvtExistingMixin at: (_js literal: 'runtimeMixin'))) ifTrue: [
+					^self
+				].
+			updateMixin: (Mixin fromRuntimeMixin: deployRtm)
+				from: newRuntimeMixin
+				by: cdir
 		)
 		updateHeaderSourceForNewRuntimeMixin: runtimeMixin <JRM> from: cdir <IntermediateClassDeclaration> = (
 			| headerSourceIndex <Integer> ::= _js propertyOf: (_js ident: 'sources')
@@ -781,6 +1262,10 @@ Still lacking are facilities for correctly adding slots (and hence nested classe
 			public classSide <MixinMirror> = MixinMirror reflecting: (classMixinOf: mixin).
 		|
 	) (
+		public = other = (
+			other isKindOfClassDeclarationMirror ifFalse: [ ^false ].
+			^_js operator: '===' with: reflectee and: other reflectee
+		)
 		public accessModifier ^<Symbol> = (
 			^header accessModifier
 		)
@@ -806,17 +1291,26 @@ Still lacking are facilities for correctly adding slots (and hence nested classe
 				].
 			^ClassDeclarationMirror reflecting: (Mixin fromRuntimeMixin: enclosing)
 		)
+		public hash ^<Integer> = (
+			^(identityHashOf: reflectee) bitXor: class hash
+		)
 		public header ^<ClassHeaderMirror> = (
 			^ClassHeaderMirror reflecting: reflectee
 		)
 		public isKindOfClassDeclarationMirror ^<Boolean> = (
 			^true
 		)
+		public metadata = (
+			^header metadata
+		)
 		public name = (
 			^(reflectee name splitBy: '`') last
 		)
 		public primaryFactorySelector ^<Symbol> = (
 			^header primaryFactorySelector
+		)
+		public printString = (
+			^'ClassDeclarationMirror:' , simpleName
 		)
 		public qualifiedName = (
 			#BOGUS.
@@ -843,18 +1337,43 @@ Still lacking are facilities for correctly adding slots (and hence nested classe
 			sb writeln: ' )'.
 			^sb asString
 		)
-		public = other = (
-			other isKindOfClassDeclarationMirror ifFalse: [ ^false ].
-			^_js operator: '===' with: reflectee and: other reflectee
+	) : ()
+	class ClassHeaderBuilder onDeclarationBuilder: b <ClassDeclarationBuilder> = AbstractClassHeaderMirror new (
+		(* The header facet of a ClassDeclarationBuilder, mirroring the psoup
+   ClassHeaderBuilder API (MirrorsForPrimordialSoup). [source:] stages a new
+   header on the declaration builder; the change takes effect when the builder
+   is installed, which recompiles the whole class from its reconstructed
+   source. If the new header changes the slot layout, installation flows into
+   the schema-change path (live instances reshaped, basicNews rebuilt). *)
+		
+		|
+			public declarationBuilder <ClassDeclarationBuilder> = b.
+		|
+	) (
+		public name = (
+			^declarationBuilder name
 		)
-		public hash ^<Integer> = (
-			^(identityHashOf: reflectee) bitXor: class hash
+		public preamble ^<String> = (
+			(* Foo factory = SuperFoo superFactory *)
+			
+			| headerAst |
+			headerAst:: compilation parser parseClassHeader: source.
+			^source copyFrom: headerAst start to: headerAst superConstructorCall end
 		)
-		public printString = (
-			^'ClassDeclarationMirror:' , simpleName
+		public source ^<String> = (
+			^declarationBuilder headerSourceForBuilding
 		)
-		public metadata = (
-			^header metadata
+		public source: newHeader <String> = (
+			(* Parse now so a syntactically invalid header is rejected at accept
+	   time rather than corrupting the builder. Renames must go through a
+	   dedicated rename operation, as in the psoup mirrors. *)
+			
+			| headerAst |
+			headerAst:: compilation parser parseClassHeader: newHeader.
+			name = headerAst name ifFalse: [
+					^Error signal: 'Class name must not be changed in a header edit (expected ' , name , ', got ' , headerAst name , ')'
+				].
+			declarationBuilder pendingHeaderSource: newHeader
 		)
 	) : ()
 	class ClassHeaderMirror reflecting: mixin = AbstractClassHeaderMirror new (
@@ -862,9 +1381,6 @@ Still lacking are facilities for correctly adding slots (and hence nested classe
 			public reflectee <Mixin> = mixin.
 		|
 	) (
-		public isKindOfClassHeaderMirror ^<Boolean> = (
-			^true
-		)
 		public = other = (
 			other isKindOfClassHeaderMirror ifFalse: [ ^false ].
 			^_js operator: '===' with: reflectee and: other reflectee
@@ -872,8 +1388,20 @@ Still lacking are facilities for correctly adding slots (and hence nested classe
 		public hash ^<Integer> = (
 			^(identityHashOf: reflectee) bitXor: class hash
 		)
+		public isKindOfClassHeaderMirror ^<Boolean> = (
+			^true
+		)
+		public metadata ^<Map[String, String]> = (
+			^parseMetadata metadata
+		)
 		public name = (
 			^(reflectee name splitBy: '`') last
+		)
+		parseMetadata ^<MetadataParser> = (
+			| src <String> = source copyFrom: 1
+				to: (source indexOf: '=' startingAt: 1) - 1. metadataParser <MetadataParser> = metadataParsing MetadataParser onSource: src. |
+			metadataParser gatherMetadataBackwards.
+			^metadataParser
 		)
 		public preamble ^<String> = (
 			(* Foo factory = SuperFoo superFactory *)
@@ -897,15 +1425,6 @@ Still lacking are facilities for correctly adding slots (and hence nested classe
 					at: (_js literal: 'runtimeMixin'))
 				at: (_js literal: 'header'). |
 			^_js propertyOf: (_js ident: 'sources') at: sourceIndex
-		)
-		public metadata ^<Map[String, String]> = (
-			^parseMetadata metadata
-		)
-		parseMetadata ^<MetadataParser> = (
-			| src <String> = source copyFrom: 1
-				to: (source indexOf: '=' startingAt: 1) - 1. metadataParser <MetadataParser> = metadataParsing MetadataParser onSource: src. |
-			metadataParser gatherMetadataBackwards.
-			^metadataParser
 		)
 	) : ()
 	public class ClassMirror reflecting: r <Class> = Object new (
@@ -960,6 +1479,9 @@ Still lacking are facilities for correctly adding slots (and hence nested classe
 			
 			^mixin isMeta
 		)
+		public lazySlots ^<MirrorGroup[LazySlotMirror]> = (
+			^computeMirrorGroup: [:r <MixinMirror> | r lazySlots ]
+		)
 		public methods ^<MirrorGroup[MethodMirror]> = (
 			^computeMirrorGroup: [:r | r methods ]
 		)
@@ -982,9 +1504,6 @@ Still lacking are facilities for correctly adding slots (and hence nested classe
 			reflectee superclass isNil ifTrue: [ ^nil ].
 			^ClassMirror reflecting: reflectee superclass
 		)
-		public lazySlots ^<MirrorGroup[LazySlotMirror]> = (
-			^computeMirrorGroup: [:r <MixinMirror> | r lazySlots ]
-		)
 	) : (
 		public allInstancesOf: b <Behavior> ^<Array> = (
 			(* All (exact) instances of behavior b, found via the object table maintained by the vmmirror. Same API as MirrorsForPrimordialSoup, where this is primitive 96. *)
@@ -992,6 +1511,93 @@ Still lacking are facilities for correctly adding slots (and hence nested classe
 			^vmmirror allInstancesOf: b
 		)
 	)
+	public class ClosureMirror reflecting: c <Closure> = Object new (
+		(* Read-only introspection on a closure. Source / definingMethod /
+   receiver depend on closure metadata wiring in the JS code generator
+   (Tier 3 / debugger track). *)
+		
+		|
+			public reflectee <Closure> = c.
+			definingActivation <Activation> = definingActivationOf: c.
+		|
+	) (
+		public = other = (
+			other isKindOfClosureMirror ifFalse: [ ^false ].
+			^_js operator: '===' with: reflectee and: other reflectee
+		)
+		public definingMethod ^<MethodMirror | nil> = (
+			(* See [source]. *)
+			
+			^nil
+		)
+		public hash ^<Integer> = (
+			^(identityHashOf: reflectee) bitXor: class hash
+		)
+		public isDead ^<Boolean> = (
+			(* JS closures don't have a notion of "dead" — they exist as long as
+	   anything references them. Always false for now. *)
+			
+			^false
+		)
+		public isKindOfClosureMirror ^<Boolean> = (
+			^true
+		)
+		public receiver ^<ObjectMirror> = (
+			(* Best effort: without activation metadata the receiver is unknown. *)
+			
+			^ObjectMirror reflecting: nil
+		)
+		public source ^<String | nil> = (
+			(* reflectees at: self put: c. *)
+			
+			(* Closure source requires closure metadata wiring in the code
+	   generator (debugger track); nil = unavailable, which the browsing
+	   code treats as a displayable absence. *)
+			
+			^nil
+		)
+	) : ()
+	class CompileOnlyInternalKernel new = Object new (
+		(* Satisfies IntermediatesForPrimordialSoup's imports for compile-only use of the bytecode compilation pipeline: the dual-emission path reads bytes and literals off IntermediateMethods and never assembles a psoup Method, so the Method and MethodMetadata bindings are never used. (Same stub as DeploymentManager's.) *)
+		
+	) (
+		public Method = (
+			^nil
+		)
+		public MethodMetadata = (
+			^nil
+		)
+	) : ()
+	class FrameMethodMirror name: n <Symbol> accessModifier: a <Symbol> mixin: m <MixinMirror | nil> sourceText: s <String | nil> = Object new (
+		(* A method mirror for a simulated frame whose method has no browsable MethodMirror: a runtime-compiled doIt, or a frame whose defining mixin could not be located. Carries source TEXT directly (possibly nil - the UI shows its absence marker), unlike the regular MethodMirror whose source: parameter is an index into the deployed sources array. *)
+		
+		|
+			public name <Symbol> = n.
+			public accessModifier <Symbol> = a.
+			public definingMixin <MixinMirror | nil> = m.
+			public source <String | nil> = s.
+		|
+	) (
+		public = other ^<Boolean> = (
+			other isKindOfMethodMirror ifFalse: [ ^false ].
+			^name = other name and: [ definingMixin = other definingMixin ]
+		)
+		public hash ^<Integer> = (
+			^name hash bitXor: class hash
+		)
+		public isKindOfMethodMirror ^<Boolean> = (
+			^true
+		)
+		public isSynthetic ^<Boolean> = (
+			^true
+		)
+		public selectors ^<List[Symbol]> = (
+			^List new
+		)
+		public simpleName ^<Symbol> = (
+			^name
+		)
+	) : ()
 	class IRBasedClassDeclarationBuilder fromIR: ir <IntermediateClassDeclaration> existingMixin: m <Mixin> within: enclosing <ClassDeclarationBuilder> = ClassDeclarationBuilder forExistingMixin: m
 		within: enclosing (
 		|
@@ -1025,11 +1631,243 @@ Still lacking are facilities for correctly adding slots (and hence nested classe
 		public header ^<ClassHeaderBuilder> = (
 			^ClassHeaderBuilder onDeclarationBuilder: self
 		)
+		public name ^<Symbol> = (
+			^compilation names fullyQualifiedNameToSimple: qualifiedName
+		)
 		originalHeaderSource ^<String> = (
 			^prvtIR headerSource
 		)
-		public name ^<Symbol> = (
-			^compilation names fullyQualifiedNameToSimple: qualifiedName
+	) : ()
+	class LazyMutableSlotGroup group: ms <List[Mirror]> within: mb <MixinBuilder> = MutableMirrorGroup group: ms
+		within: mb (
+	) (
+		public addFromSource: source <String> ^<LazySlotBuilder> = (
+			(* Compile a lazy slot declaration and add (or replace) its builder,
+	   mirroring the psoup LazySlotBuilder addFromSource: flow. The runtime
+	   effect happens at install: the reconstructed source (which includes
+	   the group''s lazy declarations) is recompiled, the schema-change slot
+	   diff adds the backing slot to live instances, and the method copy
+	   installs the accessors. Without this override the send fell through
+	   to ImmutableMirrorGroup and raised. *)
+			
+			| iSlot <IntermediateLazySlot> newBuilder <LazySlotBuilder> |
+			iSlot:: compiler compileLazySlotSource: source within: definingMixin.
+			
+			(* TODO: check for name conflicts, as the psoup version does *)
+			newBuilder:: LazySlotBuilder reflecting: iSlot in: definingMixin.
+			removeMirrorNamed: iSlot name.
+			addMirror: newBuilder.
+			^newBuilder
+		)
+	) : ()
+	public class LazySlotActivationMirror reflecting: a <Activation> thread: t <Thread> = ActivationMirror reflecting: a
+		thread: t (
+		(* :TODO :Bogus
+Mirror for the activation of a lazy slot. It takes care of computing the right sender, providing the current sourceRange considering the particular grammar , providing access to compiling the lazy slot code etc *)
+		
+	) (
+	) : ()
+	public class LazySlotBuilder reflecting: ir <IntermediateLazySlot> in: mb <MixinBuilder> = Object new (
+		(* Trivial delegations to the underlying IntermediateLazySlot for the
+   IDE's read path. Mutation (rename, etc.) requires Tier 2 work. *)
+		
+		|
+			public prvtIntermediate <IntermediateLazySlot> = ir.
+			prvtMixinBuilder <MixinBuilder> = mb.
+		|
+	) (
+		public accessModifier = (
+			^prvtIntermediate accessModifier
+		)
+		public definingMixin = (
+			^prvtMixinBuilder
+		)
+		public isKindOfLazySlotMirror ^<Boolean> = (
+			^true
+		)
+		public isMutable ^<Boolean> = (
+			^prvtIntermediate isMutable
+		)
+		public name = (
+			^prvtIntermediate name
+		)
+		public simpleName = (
+			^prvtIntermediate name
+		)
+		public source = (
+			^prvtIntermediate source
+		)
+	) : ()
+	public class LazySlotMirror reflecting: m <Symbol> in: em <MixinMirror> = Object new (
+		(* The mirror for a particular lazy slot. Every lazy slot consist of an underlying storage location (the cache) and 2-3 methods:
+
+a. The getter, which tests if the slot is nil, and if so, calls the init method (see (b) below) to compute the value and set the underlying storage. In any case it returns the value stored in the slot.  This method is sometimes referred to as the the main method of the lazy slot.
+
+b. The init method, in charge of doing the actual computation.
+
+c. If the slot is mutable, there will be a third method, which is an ordinary setter. *)
+		
+		|
+			reflectee <Symbol> = m.
+			enclosingMixinMirror <MixinMirror> = em.
+		|
+	) (
+		public = other = (
+			other isKindOfLazySlotMirror ifFalse: [ ^false ].
+			^reflectee = other name
+		)
+		public accessModifier ^<Symbol> = (
+			| mm = mainMethod. |
+			nil = mm ifTrue: [ ^#public ].
+			^mm accessModifier
+		)
+		public cachedValueFor: anObjectMirror <ObjectMirror> ^<ObjectMirror> = (
+			^anObjectMirror getSlot: cacheSlotName
+		)
+		cacheSlotName ^<Symbol> = (
+			^compilation IntermediateLazySlot slotNameForLazySlotNamed: name
+		)
+		public category = (
+			^#lazyslots
+		)
+		public definingMixin = (
+			^enclosingMixinMirror
+		)
+		public enclosingMixin = (
+			^enclosingMixinMirror reflectee
+		)
+		public hash = (
+			^reflectee hash
+		)
+		public initMethod ^<MethodMirror | nil> = (
+			(* The synthetic init method (the lazy initializer expression), looked
+	   up directly in the metadata like mainMethod. Public because browsing
+	   code sends it cross-object (psoup got away with private via its
+	   different dispatch). *)
+			
+			| mms wanted |
+			wanted:: initMethodName.
+			mms:: _js propertyOf: (_js propertyOf: enclosingMixinMirror reflectee
+					at: (_js literal: 'runtimeMixin'))
+				at: (_js literal: 'methods').
+			mms do: [:mm |
+					(_js propertyOf: mm at: (_js literal: 'name')) = wanted ifTrue: [
+							^MethodMirror name: (_js propertyOf: mm at: (_js literal: 'name'))
+								accessModifier: (_js propertyOf: mm at: (_js literal: 'accessModifier'))
+								mixin: enclosingMixinMirror
+								source: (_js propertyOf: mm at: (_js literal: 'source'))
+						]
+				].
+			^nil
+		)
+		public initMethodName = (
+			^compilation IntermediateLazySlot initMethodNameForLazySlotNamed: name
+		)
+		public isExpression ^<Boolean> = (
+			^false
+		)
+		public isKindOfLazySlotMirror ^<Boolean> = (
+			^true
+		)
+		public isMutable ^<Boolean> = (
+			(* From the enclosing runtime mixin''s lazySlots SM metadata. *)
+			
+			| raw |
+			raw:: _js propertyOf: (_js propertyOf: enclosingMixinMirror reflectee
+					at: (_js literal: 'runtimeMixin'))
+				at: (_js literal: 'lazySlots').
+			(_js operator: '===' with: raw and: (_js ident: 'undefined')) ifTrue: [
+					^false
+				].
+			raw do: [:sm |
+					(_js propertyOf: sm at: (_js literal: 'name')) = reflectee ifTrue: [
+							^_js propertyOf: sm at: (_js literal: 'isMutable')
+						]
+				].
+			^false
+		)
+		public mainMethod ^<MethodMirror | nil> = (
+			(* Look the main method up DIRECTLY in the runtime mixin''s method
+	   metadata: lazy slot methods are synthetic, so MixinMirror>>methods
+	   (which filters out synthetics) never surfaces them. The MM entry''s
+	   source is the COMPLETE lazy slot declaration (the compiler derives
+	   method source from AST positions, and the synthetic lazy methods
+	   copy their positions from the declaration), which is what makes
+	   faithful source reconstruction of classes with lazy slots possible. *)
+			
+			| mms |
+			mms:: _js propertyOf: (_js propertyOf: enclosingMixinMirror reflectee
+					at: (_js literal: 'runtimeMixin'))
+				at: (_js literal: 'methods').
+			mms do: [:mm |
+					(_js propertyOf: mm at: (_js literal: 'name')) = reflectee ifTrue: [
+							^MethodMirror name: (_js propertyOf: mm at: (_js literal: 'name'))
+								accessModifier: (_js propertyOf: mm at: (_js literal: 'accessModifier'))
+								mixin: enclosingMixinMirror
+								source: (_js propertyOf: mm at: (_js literal: 'source'))
+						]
+				].
+			^nil
+		)
+		public metadata ^<Map[String, String]> = (
+			(* Defensive: a lazy slot whose declaration source is unavailable
+	   (or was lost by a pre-fidelity install) has no metadata rather than
+	   crashing the presenters that ask. *)
+			
+			| src = source. |
+			nil = src ifTrue: [ ^Map new ].
+			(_js operator: '===' with: src and: (_js ident: 'undefined')) ifTrue: [
+					^Map new
+				].
+			^parseMetadata metadata
+		)
+		public name = (
+			(* [mainMethod] was previously a slot eagerly initialized to
+	   [MethodMirror reflecting: ...] — but MethodMirror has no [reflecting:]
+	   factory, and the slot referenced an undefined [mixin] (should be
+	   [em]). The eager init crashes when LazySlotMirror is constructed.
+	   Removed; mainMethod is now a method that looks up on demand.
+	   Tier-2 work (MixinMirror>>lazySlots that actually constructs lazy
+	   slot mirrors) will exercise this and is gated on pinning the lazy
+	   slot naming convention. *)
+			
+			^reflectee
+		)
+		parseMetadata ^<MetadataParser> = (
+			| src <String> = source copyFrom: 1
+				to: (source indexOf: '=' startingAt: 1) - 1. metadataParser <MetadataParser> = metadataParsing MetadataParser onSource: src. |
+			metadataParser gatherMetadataBackwards.
+			^metadataParser
+		)
+		public selectors ^<List[Symbol]> = (
+			(* psoup LazySlotMirror parity: the sends of the lazy initializer expression. *)
+			
+			| m = initMethod. |
+			nil = m ifTrue: [ ^List new ].
+			^m selectors
+		)
+		public setCachedValueFor: anObjectMirror <ObjectMirror> to: newValue <Object> ^<ObjectMirror> = (
+			^anObjectMirror setSlot: cacheSlotName to: newValue
+		)
+		public simpleName = (
+			^reflectee
+		)
+		public source ^<String | nil> = (
+			| mm = mainMethod. |
+			nil = mm ifTrue: [ ^nil ].
+			^mm source
+		)
+	) : ()
+	public class LocalSlotMirror name: n <String> value: v <ObjectMirror> = Object new (
+		(* A named local (parameter or temporary) of an activation, psoup API. *)
+		
+		|
+			public name <String> = n.
+			public value <ObjectMirror> = v.
+		|
+	) (
+		public isKindOfLocalSlotMirror ^<Boolean> = (
+			^true
 		)
 	) : ()
 	class MethodBuilder reflecting: mir in: mb source: s = Object new (
@@ -1060,42 +1898,9 @@ Still lacking are facilities for correctly adding slots (and hence nested classe
 			private sourceIndex <Integer> = s.
 		|
 	) (
-		public isKindOfMethodMirror ^<Boolean> = (
-			^true
-		)
 		public = other = (
 			other isKindOfMethodMirror ifFalse: [ ^false ].
 			^name = other name and: [ definingMixin = other definingMixin ]
-		)
-		public hash ^<Integer> = (
-			^name hash bitXor: class hash
-		)
-		public isSynthetic ^<Boolean> = (
-			(* MixinMirror>>methods already filters out isSynthetic methods, so any
-	   MethodMirror that exists in user-facing groups is non-synthetic.
-	   Returning false here matches what the IDE sees. A real fix would
-	   thread the flag through the constructor. *)
-			
-			^false
-		)
-		public isPrimitive ^<Boolean> = (
-			(* JS-emitted methods have no [primitive] field; they're all plain JS
-	   functions. *)
-			
-			^false
-		)
-		public primitive ^<Integer> = (
-			^0
-		)
-		public selectors ^<List[Symbol]> = (
-			(* The selectors of every send in the method, decoded from its V5 bytecode record (psoup MethodMirror parity; drives senders). Methods without a record - JS-only bodies, images predating dual emission, reflectively edited classes - answer the empty list. *)
-			
-			| record |
-			nil = simulation ifTrue: [ ^List new ].
-			record:: bytecodeRecord.
-			nil = record ifTrue: [ ^List new ].
-			^(simulation SelectorCollector overBytecode: (record at: 1)
-				literals: (record at: 2)) selectors
 		)
 		bytecodeRecord = (
 			| mms |
@@ -1114,11 +1919,25 @@ Still lacking are facilities for correctly adding slots (and hence nested classe
 				].
 			^nil
 		)
-		public simpleName ^<Symbol> = (
-			^name
+		public hash ^<Integer> = (
+			^name hash bitXor: class hash
 		)
-		public source ^<String> = (
-			^_js propertyOf: (_js ident: 'sources') at: sourceIndex
+		public isKindOfMethodMirror ^<Boolean> = (
+			^true
+		)
+		public isPrimitive ^<Boolean> = (
+			(* JS-emitted methods have no [primitive] field; they're all plain JS
+	   functions. *)
+			
+			^false
+		)
+		public isSynthetic ^<Boolean> = (
+			(* MixinMirror>>methods already filters out isSynthetic methods, so any
+	   MethodMirror that exists in user-facing groups is non-synthetic.
+	   Returning false here matches what the IDE sees. A real fix would
+	   thread the flag through the constructor. *)
+			
+			^false
 		)
 		public metadata ^<Map[String, String]> = (
 			^parseMetadata metadata
@@ -1128,6 +1947,25 @@ Still lacking are facilities for correctly adding slots (and hence nested classe
 				to: (source indexOf: '=' startingAt: 1) - 1. metadataParser <MetadataParser> = metadataParsing MetadataParser onSource: src. |
 			metadataParser gatherMetadataBackwards.
 			^metadataParser
+		)
+		public primitive ^<Integer> = (
+			^0
+		)
+		public selectors ^<List[Symbol]> = (
+			(* The selectors of every send in the method, decoded from its V5 bytecode record (psoup MethodMirror parity; drives senders). Methods without a record - JS-only bodies, images predating dual emission, reflectively edited classes - answer the empty list. *)
+			
+			| record |
+			nil = simulation ifTrue: [ ^List new ].
+			record:: bytecodeRecord.
+			nil = record ifTrue: [ ^List new ].
+			^(simulation SelectorCollector overBytecode: (record at: 1)
+				literals: (record at: 2)) selectors
+		)
+		public simpleName ^<Symbol> = (
+			^name
+		)
+		public source ^<String> = (
+			^_js propertyOf: (_js ident: 'sources') at: sourceIndex
 		)
 	) : ()
 	public class MixinBasedClassDeclarationBuilder forExistingMixin: m <InstanceMixin> within: enclosing <ClassDeclarationBuilder> = ClassDeclarationBuilder forExistingMixin: m
@@ -1153,11 +1991,11 @@ Still lacking are facilities for correctly adding slots (and hence nested classe
 		public header ^<ClassHeaderBuilder> = (
 			^ClassHeaderBuilder onDeclarationBuilder: self
 		)
-		originalHeaderSource ^<String> = (
-			^declarationData header source
-		)
 		public name ^<Symbol> = (
 			^declarationData name
+		)
+		originalHeaderSource ^<String> = (
+			^declarationData header source
 		)
 	) : ()
 	class MixinBuilder for: dataSource <IntermediateMixin | MixinMirror> classDeclaration: cdb <ClassDeclarationBuilder> existingMixin: em <Mixin> = Object new (
@@ -1261,6 +2099,25 @@ on the data to decide what action to take. *)
 			public reflectee <Mixin> = mixin.
 		|
 	) (
+		public = other = (
+			other isKindOfMixinMirror ifFalse: [ ^false ].
+			^_js operator: '===' with: reflectee and: other reflectee
+		)
+		public applications ^<List[ClassMirror]> = (
+			(* Returns ClassMirrors for every live class built from this mixin.
+	   The runtime mixin's [applications] property is populated by
+	   $applyMixin$toSuperclass$withEnclosingObjects$ in the vmmirror
+	   bootstrap heredoc each time the mixin is applied. *)
+			
+			| raw |
+			raw:: _js propertyOf: (_js propertyOf: reflectee
+					at: (_js literal: 'runtimeMixin'))
+				at: (_js literal: 'applications').
+			^raw collect: [:runtimeClass |
+					ClassMirror reflecting: (_js propertyOf: runtimeClass
+							at: (_js literal: 'newspeakClass'))
+				]
+		)
 		public apply: newSuperclass <Class> withName: n <Symbol> ^<ClassMirror> = (
 			^ClassMirror reflecting: (reflectee applyTo: newSuperclass withName: n)
 		)
@@ -1287,11 +2144,45 @@ on the data to decide what action to take. *)
 				].
 			^ClassDeclarationMirror reflecting: (Mixin fromRuntimeMixin: nonMeta)
 		)
+		public enclosingMixin ^<MixinMirror | nil> = (
+			| enclosing |
+			enclosing:: _js propertyOf: (_js propertyOf: reflectee
+					at: (_js literal: 'runtimeMixin'))
+				at: (_js literal: 'enclosingMixin').
+			(_js operator: '===' with: enclosing and: (_js ident: 'undefined')) ifTrue: [
+					^nil
+				].
+			^MixinMirror reflecting: (Mixin fromRuntimeMixin: enclosing)
+		)
+		public hash ^<Integer> = (
+			^(identityHashOf: reflectee) bitXor: class hash
+		)
 		public isKindOfMixinMirror ^<Boolean> = (
 			^true
 		)
 		public isMeta ^<Boolean> = (
 			^reflectee isMeta
+		)
+		public lazySlots = (
+			(* Lazy slot mirrors, built from the runtime mixin''s [lazySlots]
+	   metadata (SM records by name; the declaration source lives in the
+	   MM entry of the synthetic main method — see
+	   LazySlotMirror>>mainMethod). Meta runtime mixins carry no
+	   [lazySlots] property, hence the undefined guard. *)
+			
+			| results = List new. raw |
+			raw:: _js propertyOf: (_js propertyOf: reflectee
+					at: (_js literal: 'runtimeMixin'))
+				at: (_js literal: 'lazySlots').
+			(_js operator: '===' with: raw and: (_js ident: 'undefined')) ifTrue: [
+					^ImmutableMirrorGroup group: results
+				].
+			raw do: [:sm |
+					results add: (LazySlotMirror reflecting: (_js propertyOf: sm
+								at: (_js literal: 'name'))
+							in: self)
+				].
+			^ImmutableMirrorGroup group: results
 		)
 		public methods ^<MirrorGroup[MethodMirror]> = (
 			| raw <Array[MethodMirror]> |
@@ -1330,6 +2221,16 @@ on the data to decide what action to take. *)
 				].
 			^ImmutableMirrorGroup group: (raw reject: [:m | nil = m ])
 		)
+		public primaryFactoryMethod ^<MethodMirror | nil> = (
+			| selector |
+			selector:: primaryFactorySelector.
+			nil = selector ifTrue: [ ^nil ].
+			(classMixinOf: reflectee) ifNil: [ ^nil ].
+			(MixinMirror reflecting: (classMixinOf: reflectee)) methods do: [:m |
+					m name = selector ifTrue: [ ^m ]
+				].
+			^nil
+		)
 		public primaryFactorySelector ^<Symbol> = (
 			^declaration primaryFactorySelector
 		)
@@ -1347,69 +2248,6 @@ on the data to decide what action to take. *)
 						mixin: self
 				].
 			^ImmutableMirrorGroup group: raw
-		)
-		public lazySlots = (
-			(* Lazy slot mirrors, built from the runtime mixin''s [lazySlots]
-	   metadata (SM records by name; the declaration source lives in the
-	   MM entry of the synthetic main method — see
-	   LazySlotMirror>>mainMethod). Meta runtime mixins carry no
-	   [lazySlots] property, hence the undefined guard. *)
-			
-			| results = List new. raw |
-			raw:: _js propertyOf: (_js propertyOf: reflectee
-					at: (_js literal: 'runtimeMixin'))
-				at: (_js literal: 'lazySlots').
-			(_js operator: '===' with: raw and: (_js ident: 'undefined')) ifTrue: [
-					^ImmutableMirrorGroup group: results
-				].
-			raw do: [:sm |
-					results add: (LazySlotMirror reflecting: (_js propertyOf: sm
-								at: (_js literal: 'name'))
-							in: self)
-				].
-			^ImmutableMirrorGroup group: results
-		)
-		public enclosingMixin ^<MixinMirror | nil> = (
-			| enclosing |
-			enclosing:: _js propertyOf: (_js propertyOf: reflectee
-					at: (_js literal: 'runtimeMixin'))
-				at: (_js literal: 'enclosingMixin').
-			(_js operator: '===' with: enclosing and: (_js ident: 'undefined')) ifTrue: [
-					^nil
-				].
-			^MixinMirror reflecting: (Mixin fromRuntimeMixin: enclosing)
-		)
-		public applications ^<List[ClassMirror]> = (
-			(* Returns ClassMirrors for every live class built from this mixin.
-	   The runtime mixin's [applications] property is populated by
-	   $applyMixin$toSuperclass$withEnclosingObjects$ in the vmmirror
-	   bootstrap heredoc each time the mixin is applied. *)
-			
-			| raw |
-			raw:: _js propertyOf: (_js propertyOf: reflectee
-					at: (_js literal: 'runtimeMixin'))
-				at: (_js literal: 'applications').
-			^raw collect: [:runtimeClass |
-					ClassMirror reflecting: (_js propertyOf: runtimeClass
-							at: (_js literal: 'newspeakClass'))
-				]
-		)
-		public primaryFactoryMethod ^<MethodMirror | nil> = (
-			| selector |
-			selector:: primaryFactorySelector.
-			nil = selector ifTrue: [ ^nil ].
-			(classMixinOf: reflectee) ifNil: [ ^nil ].
-			(MixinMirror reflecting: (classMixinOf: reflectee)) methods do: [:m |
-					m name = selector ifTrue: [ ^m ]
-				].
-			^nil
-		)
-		public = other = (
-			other isKindOfMixinMirror ifFalse: [ ^false ].
-			^_js operator: '===' with: reflectee and: other reflectee
-		)
-		public hash ^<Integer> = (
-			^(identityHashOf: reflectee) bitXor: class hash
 		)
 	) : ()
 	class MutableMethodGroup group: ms <List[Mirror]> within: mb <MixinBuilder> = MutableMirrorGroup group: ms
@@ -1494,6 +2332,11 @@ on the data to decide what action to take. *)
 			other isKindOfObjectMirror ifFalse: [ ^false ].
 			^_js operator: '===' with: reflectee and: other reflectee
 		)
+		public compileExpression: expression <String> scope: scope ^<JS[Function]> = (
+			(* Public wrapper around the private [compileExpression:with:]. *)
+			
+			^compileExpression: expression with: scope
+		)
 		private compileExpression: expression <String> with: rawScope <Map[Symbol, Object]> ^<JS[Function]> = (
 			| compiler ir writer sb src chain params wrapper |
 			compiler:: compilation Compiler new.
@@ -1522,6 +2365,27 @@ on the data to decide what action to take. *)
 				with: {'(function(' , params , '){ return (' , src , ') })'. }.
 			^_js call: (_js propertyOf: wrapper at: (_js literal: 'apply'))
 				with: {_js ident: 'null'. chain asArray. }
+		)
+		public debugSuspended: selector with: arguments <List[Object]> ^<ThreadMirror> = (
+			(* Begin the send under the bytecode simulator, suspended before the first instruction: a steppable thread whose activation mirrors drive the Debugging UI. Falls back to the eager sendSuspended: when the simulator is unavailable. *)
+			
+			^ActivationMirror debug: reflectee send: selector with: arguments
+		)
+		public eagerSendSuspended: selector with: arguments <List[Object]> ^<ThreadMirror> = (
+			(* Best-effort fallback when the simulator is unavailable: an eager send mirroring evaluate:with: - a fulfilled ThreadMirror on success, or a broken one carrying the raised exception. The thread's suspendedActivation is set to this receiver mirror so the exemplar evaluator can evaluate expressions with self = the receiver; consumers expecting activations must guard with isKindOfActivationMirror. Public: invoked across objects from ActivationMirror class-side debug:send:with:. *)
+			
+			| state result thread |
+			[
+				result:: (Message selector: selector arguments: arguments) sendTo: reflectee.
+				state:: #fulfilled
+			] on: Error
+				do: [:e |
+					result:: e.
+					state:: #broken
+				].
+			thread:: ThreadMirror state: state result: (ObjectMirror reflecting: result).
+			thread suspendedActivation: self.
+			^thread
 		)
 		private enclosingRuntimeMixinChain ^<List> = (
 			(* The runtime mixin objects of the reflectee's class and its lexically enclosing classes, outermost first: the values for the $0..$K bindings in an eval'd doIt. *)
@@ -1568,66 +2432,6 @@ on the data to decide what action to take. *)
 			kernelModule handlerChainRestore: savedChain.
 			^ThreadMirror state: state result: (ObjectMirror reflecting: result)
 		)
-		public getClass = (
-			#BOGUS.
-			
-			(* Wrong for bilingual objects. *)
-			^ClassMirror reflecting: (_js propertyOf: reflectee
-					at: (_js literal: 'newspeakClass'))
-		)
-		public getLazySlot: name ^<ObjectMirror> = (
-			(* The cached value of the lazy slot [name] on the reflectee, as on
-	   psoup (name-based; the argument is the lazy slot''s name, not a
-	   mirror). Defensive where getSlot: halts: the reflectee may not have
-	   the cache property at all — e.g. the object presenter asks a CLASS
-	   object about its instance side''s lazy slots — in which case the
-	   answer is a mirror on nil (never initialized). *)
-			
-			| cacheName mangledName raw |
-			cacheName:: compilation IntermediateLazySlot slotNameForLazySlotNamed: name.
-			mangledName:: vmmirror mangleSelector: cacheName , '`slot'.
-			raw:: _js propertyOf: reflectee at: mangledName.
-			(_js operator: '===' with: raw and: (_js ident: 'undefined')) ifTrue: [
-					^ObjectMirror reflecting: nil
-				].
-			^ObjectMirror reflecting: raw
-		)
-		public setLazySlot: name to: value = (
-			(* Set the cached value of the lazy slot [name] on the reflectee, as
-	   on psoup. *)
-			
-			| cacheName mangledName |
-			cacheName:: compilation IntermediateLazySlot slotNameForLazySlotNamed: name.
-			mangledName:: vmmirror mangleSelector: cacheName , '`slot'.
-			_js assign: (_js propertyOf: reflectee at: mangledName) toBe: value
-		)
-		public getSlot: selector = (
-			| mangledName = vmmirror mangleSelector: selector , '`slot'. raw = _js propertyOf: reflectee
-				at: mangledName. |
-			(_js operator: '===' with: (_js ident: 'undefined') and: raw) ifTrue: [ halt ].
-			^ObjectMirror reflecting: raw
-		)
-		public hash ^<Integer> = (
-			^(identityHashOf: reflectee) bitXor: class hash
-		)
-		public isKindOfObjectMirror ^<Boolean> = (
-			^true
-		)
-		public perform: selector with: arguments ifFail: failBlock = (
-			(* Reflectively invoke [selector] on the reflectee with [arguments].
-	   On any Exception, runs failBlock with the exception. *)
-			
-			^[ (Message selector: selector arguments: arguments) sendTo: reflectee ] on: Exception
-				do: [:e | failBlock value: e ]
-		)
-		public performPublic: selector with: arguments = (
-			^(Message selector: selector arguments: arguments) sendTo: reflectee
-		)
-		public debugSuspended: selector with: arguments <List[Object]> ^<ThreadMirror> = (
-			(* Begin the send under the bytecode simulator, suspended before the first instruction: a steppable thread whose activation mirrors drive the Debugging UI. Falls back to the eager sendSuspended: when the simulator is unavailable. *)
-			
-			^ActivationMirror debug: reflectee send: selector with: arguments
-		)
 		public evaluateSuspended: expression <String> ^<ThreadMirror> = (
 			^evaluateSuspended: expression with: Map new
 		)
@@ -1657,34 +2461,68 @@ on the data to decide what action to take. *)
 				ThreadMirror onSimulated: (simulatorModule SimulatedThread over: sim)
 			] on: Exception do: [:e | evaluate: expression with: scope ]
 		)
+		public getClass = (
+			#BOGUS.
+			
+			(* Wrong for bilingual objects. *)
+			^ClassMirror reflecting: (_js propertyOf: reflectee
+					at: (_js literal: 'newspeakClass'))
+		)
+		public getLazySlot: name ^<ObjectMirror> = (
+			(* The cached value of the lazy slot [name] on the reflectee, as on
+	   psoup (name-based; the argument is the lazy slot''s name, not a
+	   mirror). Defensive where getSlot: halts: the reflectee may not have
+	   the cache property at all — e.g. the object presenter asks a CLASS
+	   object about its instance side''s lazy slots — in which case the
+	   answer is a mirror on nil (never initialized). *)
+			
+			| cacheName mangledName raw |
+			cacheName:: compilation IntermediateLazySlot slotNameForLazySlotNamed: name.
+			mangledName:: vmmirror mangleSelector: cacheName , '`slot'.
+			raw:: _js propertyOf: reflectee at: mangledName.
+			(_js operator: '===' with: raw and: (_js ident: 'undefined')) ifTrue: [
+					^ObjectMirror reflecting: nil
+				].
+			^ObjectMirror reflecting: raw
+		)
+		public getSlot: selector = (
+			| mangledName = vmmirror mangleSelector: selector , '`slot'. raw = _js propertyOf: reflectee
+				at: mangledName. |
+			(_js operator: '===' with: (_js ident: 'undefined') and: raw) ifTrue: [ halt ].
+			^ObjectMirror reflecting: raw
+		)
+		public hash ^<Integer> = (
+			^(identityHashOf: reflectee) bitXor: class hash
+		)
+		public isKindOfObjectMirror ^<Boolean> = (
+			^true
+		)
+		public perform: selector with: arguments ifFail: failBlock = (
+			(* Reflectively invoke [selector] on the reflectee with [arguments].
+	   On any Exception, runs failBlock with the exception. *)
+			
+			^[ (Message selector: selector arguments: arguments) sendTo: reflectee ] on: Exception
+				do: [:e | failBlock value: e ]
+		)
+		public performPublic: selector with: arguments = (
+			^(Message selector: selector arguments: arguments) sendTo: reflectee
+		)
+		public printString = (
+			^'ObjectMirror on ' , reflectee printString
+		)
 		public sendSuspended: selector with: arguments <List[Object]> ^<ThreadMirror> = (
 			(* psoup contract: a thread SUSPENDED AT THE METHOD'S ENTRY whose suspendedActivation is a real ActivationMirror, carrying both the evaluation scope and the method identity - the exemplar method editor reads #method from it (MethodEvaluatorSubject), and the debugger walks #sender. Runs under the bytecode simulator, suspended before the first instruction (cheap: nothing executes until stepped or resumed); degrades to the eager best-effort eagerSendSuspended:with: when the simulator is not packaged. The previous always-eager version stashed the RECEIVER's ObjectMirror as suspendedActivation, which satisfied evaluator scope but broke every consumer expecting an activation. *)
 			
 			^debugSuspended: selector with: arguments
 		)
-		public eagerSendSuspended: selector with: arguments <List[Object]> ^<ThreadMirror> = (
-			(* Best-effort fallback when the simulator is unavailable: an eager send mirroring evaluate:with: - a fulfilled ThreadMirror on success, or a broken one carrying the raised exception. The thread's suspendedActivation is set to this receiver mirror so the exemplar evaluator can evaluate expressions with self = the receiver; consumers expecting activations must guard with isKindOfActivationMirror. Public: invoked across objects from ActivationMirror class-side debug:send:with:. *)
+		public setLazySlot: name to: value = (
+			(* Set the cached value of the lazy slot [name] on the reflectee, as
+	   on psoup. *)
 			
-			| state result thread |
-			[
-				result:: (Message selector: selector arguments: arguments) sendTo: reflectee.
-				state:: #fulfilled
-			] on: Error
-				do: [:e |
-					result:: e.
-					state:: #broken
-				].
-			thread:: ThreadMirror state: state result: (ObjectMirror reflecting: result).
-			thread suspendedActivation: self.
-			^thread
-		)
-		public printString = (
-			^'ObjectMirror on ' , reflectee printString
-		)
-		public compileExpression: expression <String> scope: scope ^<JS[Function]> = (
-			(* Public wrapper around the private [compileExpression:with:]. *)
-			
-			^compileExpression: expression with: scope
+			| cacheName mangledName |
+			cacheName:: compilation IntermediateLazySlot slotNameForLazySlotNamed: name.
+			mangledName:: vmmirror mangleSelector: cacheName , '`slot'.
+			_js assign: (_js propertyOf: reflectee at: mangledName) toBe: value
 		)
 		public setSlot: selector to: value = (
 			(* JS strict mode forbids setting properties on primitives (number,
@@ -1743,44 +2581,6 @@ on the data to decide what action to take. *)
 		|
 	) (
 	) : ()
-	class ClassHeaderBuilder onDeclarationBuilder: b <ClassDeclarationBuilder> = AbstractClassHeaderMirror new (
-		(* The header facet of a ClassDeclarationBuilder, mirroring the psoup
-   ClassHeaderBuilder API (MirrorsForPrimordialSoup). [source:] stages a new
-   header on the declaration builder; the change takes effect when the builder
-   is installed, which recompiles the whole class from its reconstructed
-   source. If the new header changes the slot layout, installation flows into
-   the schema-change path (live instances reshaped, basicNews rebuilt). *)
-		
-		|
-			public declarationBuilder <ClassDeclarationBuilder> = b.
-		|
-	) (
-		public name = (
-			^declarationBuilder name
-		)
-		public preamble ^<String> = (
-			(* Foo factory = SuperFoo superFactory *)
-			
-			| headerAst |
-			headerAst:: compilation parser parseClassHeader: source.
-			^source copyFrom: headerAst start to: headerAst superConstructorCall end
-		)
-		public source ^<String> = (
-			^declarationBuilder headerSourceForBuilding
-		)
-		public source: newHeader <String> = (
-			(* Parse now so a syntactically invalid header is rejected at accept
-	   time rather than corrupting the builder. Renames must go through a
-	   dedicated rename operation, as in the psoup mirrors. *)
-			
-			| headerAst |
-			headerAst:: compilation parser parseClassHeader: newHeader.
-			name = headerAst name ifFalse: [
-					^Error signal: 'Class name must not be changed in a header edit (expected ' , name , ', got ' , headerAst name , ')'
-				].
-			declarationBuilder pendingHeaderSource: newHeader
-		)
-	) : ()
 	class ThreadMirror state: s result: r = Object new (
 		(* Two kinds of thread. EAGER (legacy): state/result fixed at construction, from evaluate:/sendSuspended: -- the computation already ran at full speed. SIMULATED: wraps a live SimulatedThread (see class-side onSimulated:); state/result/suspendedActivation track the thread as it is stepped, and resume/terminate drive it. DEFERRED (see class-side deferred:): a not-yet-run closure; resume runs it at full speed -- the psoup invokeSuspended:-then-resume idiom without simulation. *)
 		
@@ -1792,23 +2592,43 @@ on the data to decide what action to take. *)
 			deferredClosure ::= nil.
 		|
 	) (
-		public state = (
-			nil = simThread ifFalse: [ ^simThread state ].
-			^state_slot
-		)
-		public result ^<ObjectMirror | nil> = (
-			nil = simThread ifFalse: [ ^ObjectMirror reflecting: simThread result ].
-			^result_slot
-		)
-		public simulatedThread = (
-			^simThread
-		)
-		public simulatedThread: st = (
-			simThread:: st
+		public = other = (
+			other isKindOfThreadMirror ifFalse: [ ^false ].
+			nil = simThread ifFalse: [ ^simThread == other simulatedThread ].
+			nil = other simulatedThread ifFalse: [ ^false ].
+			^state = other state and: [ result = other result ]
 		)
 		public beDeferred: c = (
 			deferredClosure:: c.
 			state_slot:: #suspended
+		)
+		public hash ^<Integer> = (
+			(* MUST NOT depend on state/result: those mutate as a simulated thread is stepped, and this hash reaches presenter-registry map keys via Presenter hash -> Subject hash -> model hash. A time-varying key hash corrupts the maps (duplicate entries; shouldNotHappen in growTable - seen 2026-07-18). Simulated threads hash by the underlying thread's identity; eager/deferred threads by class (their fields are settled by the time they serve as keys, but class hash is unconditionally safe). *)
+			
+			nil = simThread ifFalse: [ ^(identityHashOf: simThread) bitXor: class hash ].
+			^class hash
+		)
+		public isBroken ^<Boolean> = (
+			^state = #broken
+		)
+		public isFulfilled ^<Boolean> = (
+			^state = #fulfilled
+		)
+		public isKindOfThreadMirror ^<Boolean> = (
+			^true
+		)
+		public isRunning ^<Boolean> = (
+			^state = #running
+		)
+		public isSuspended ^<Boolean> = (
+			^state = #suspended
+		)
+		public isTerminated ^<Boolean> = (
+			^state = #terminated
+		)
+		public result ^<ObjectMirror | nil> = (
+			nil = simThread ifFalse: [ ^ObjectMirror reflecting: simThread result ].
+			^result_slot
 		)
 		public resume = (
 			nil = simThread ifFalse: [
@@ -1827,35 +2647,15 @@ on the data to decide what action to take. *)
 			deferredClosure:: nil.
 			^self
 		)
-		public isBroken ^<Boolean> = (
-			^state = #broken
+		public simulatedThread = (
+			^simThread
 		)
-		public isFulfilled ^<Boolean> = (
-			^state = #fulfilled
+		public simulatedThread: st = (
+			simThread:: st
 		)
-		public isKindOfThreadMirror ^<Boolean> = (
-			^true
-		)
-		public isSuspended ^<Boolean> = (
-			^state = #suspended
-		)
-		public isRunning ^<Boolean> = (
-			^state = #running
-		)
-		public isTerminated ^<Boolean> = (
-			^state = #terminated
-		)
-		public hash ^<Integer> = (
-			(* MUST NOT depend on state/result: those mutate as a simulated thread is stepped, and this hash reaches presenter-registry map keys via Presenter hash -> Subject hash -> model hash. A time-varying key hash corrupts the maps (duplicate entries; shouldNotHappen in growTable - seen 2026-07-18). Simulated threads hash by the underlying thread's identity; eager/deferred threads by class (their fields are settled by the time they serve as keys, but class hash is unconditionally safe). *)
-			
-			nil = simThread ifFalse: [ ^(identityHashOf: simThread) bitXor: class hash ].
-			^class hash
-		)
-		public = other = (
-			other isKindOfThreadMirror ifFalse: [ ^false ].
-			nil = simThread ifFalse: [ ^simThread == other simulatedThread ].
-			nil = other simulatedThread ifFalse: [ ^false ].
-			^state = other state and: [ result = other result ]
+		public state = (
+			nil = simThread ifFalse: [ ^simThread state ].
+			^state_slot
 		)
 		public suspendedActivation = (
 			(* SIMULATED threads: the innermost live simulated frame, wrapped -- the debugger's entry into the stack. EAGER threads: the context the exemplar evaluator evaluates expressions in (set by ObjectMirror>>sendSuspended:with: to the receiver's mirror -- self-scope only); nil for threads from a plain evaluate:. *)
@@ -1881,12 +2681,6 @@ on the data to decide what action to take. *)
 			^self
 		)
 	) : (
-		public onSimulated: aSimulatedThread ^<ThreadMirror> = (
-			| tm |
-			tm:: state: nil result: nil.
-			tm simulatedThread: aSimulatedThread.
-			^tm
-		)
 		public deferred: aClosure ^<ThreadMirror> = (
 			(* A thread that has not run yet: resume runs the closure at full speed. Serves the psoup invokeSuspended:-then-resume idiom (run tests, run app) without simulation; a broken result carries the exception but no frames (Stage 3 adds those). *)
 			
@@ -1895,823 +2689,29 @@ on the data to decide what action to take. *)
 			tm beDeferred: aClosure.
 			^tm
 		)
-	)
-	public class LazySlotMirror reflecting: m <Symbol> in: em <MixinMirror> = Object new (
-		(* The mirror for a particular lazy slot. Every lazy slot consist of an underlying storage location (the cache) and 2-3 methods:
-
-a. The getter, which tests if the slot is nil, and if so, calls the init method (see (b) below) to compute the value and set the underlying storage. In any case it returns the value stored in the slot.  This method is sometimes referred to as the the main method of the lazy slot.
-
-b. The init method, in charge of doing the actual computation.
-
-c. If the slot is mutable, there will be a third method, which is an ordinary setter. *)
-		
-		|
-			reflectee <Symbol> = m.
-			enclosingMixinMirror <MixinMirror> = em.
-		|
-	) (
-		public name = (
-			(* [mainMethod] was previously a slot eagerly initialized to
-	   [MethodMirror reflecting: ...] — but MethodMirror has no [reflecting:]
-	   factory, and the slot referenced an undefined [mixin] (should be
-	   [em]). The eager init crashes when LazySlotMirror is constructed.
-	   Removed; mainMethod is now a method that looks up on demand.
-	   Tier-2 work (MixinMirror>>lazySlots that actually constructs lazy
-	   slot mirrors) will exercise this and is gated on pinning the lazy
-	   slot naming convention. *)
-			
-			^reflectee
-		)
-		public simpleName = (
-			^reflectee
-		)
-		public definingMixin = (
-			^enclosingMixinMirror
-		)
-		public enclosingMixin = (
-			^enclosingMixinMirror reflectee
-		)
-		public isExpression ^<Boolean> = (
-			^false
-		)
-		public isKindOfLazySlotMirror ^<Boolean> = (
-			^true
-		)
-		public category = (
-			^#lazyslots
-		)
-		public hash = (
-			^reflectee hash
-		)
-		public = other = (
-			other isKindOfLazySlotMirror ifFalse: [ ^false ].
-			^reflectee = other name
-		)
-		public mainMethod ^<MethodMirror | nil> = (
-			(* Look the main method up DIRECTLY in the runtime mixin''s method
-	   metadata: lazy slot methods are synthetic, so MixinMirror>>methods
-	   (which filters out synthetics) never surfaces them. The MM entry''s
-	   source is the COMPLETE lazy slot declaration (the compiler derives
-	   method source from AST positions, and the synthetic lazy methods
-	   copy their positions from the declaration), which is what makes
-	   faithful source reconstruction of classes with lazy slots possible. *)
-			
-			| mms |
-			mms:: _js propertyOf: (_js propertyOf: enclosingMixinMirror reflectee
-					at: (_js literal: 'runtimeMixin'))
-				at: (_js literal: 'methods').
-			mms do: [:mm |
-					(_js propertyOf: mm at: (_js literal: 'name')) = reflectee ifTrue: [
-							^MethodMirror name: (_js propertyOf: mm at: (_js literal: 'name'))
-								accessModifier: (_js propertyOf: mm at: (_js literal: 'accessModifier'))
-								mixin: enclosingMixinMirror
-								source: (_js propertyOf: mm at: (_js literal: 'source'))
-						]
-				].
-			^nil
-		)
-		public source ^<String | nil> = (
-			| mm = mainMethod. |
-			nil = mm ifTrue: [ ^nil ].
-			^mm source
-		)
-		public accessModifier ^<Symbol> = (
-			| mm = mainMethod. |
-			nil = mm ifTrue: [ ^#public ].
-			^mm accessModifier
-		)
-		parseMetadata ^<MetadataParser> = (
-			| src <String> = source copyFrom: 1
-				to: (source indexOf: '=' startingAt: 1) - 1. metadataParser <MetadataParser> = metadataParsing MetadataParser onSource: src. |
-			metadataParser gatherMetadataBackwards.
-			^metadataParser
-		)
-		public metadata ^<Map[String, String]> = (
-			(* Defensive: a lazy slot whose declaration source is unavailable
-	   (or was lost by a pre-fidelity install) has no metadata rather than
-	   crashing the presenters that ask. *)
-			
-			| src = source. |
-			nil = src ifTrue: [ ^Map new ].
-			(_js operator: '===' with: src and: (_js ident: 'undefined')) ifTrue: [
-					^Map new
-				].
-			^parseMetadata metadata
-		)
-		public initMethodName = (
-			^compilation IntermediateLazySlot initMethodNameForLazySlotNamed: name
-		)
-		public initMethod ^<MethodMirror | nil> = (
-			(* The synthetic init method (the lazy initializer expression), looked
-	   up directly in the metadata like mainMethod. Public because browsing
-	   code sends it cross-object (psoup got away with private via its
-	   different dispatch). *)
-			
-			| mms wanted |
-			wanted:: initMethodName.
-			mms:: _js propertyOf: (_js propertyOf: enclosingMixinMirror reflectee
-					at: (_js literal: 'runtimeMixin'))
-				at: (_js literal: 'methods').
-			mms do: [:mm |
-					(_js propertyOf: mm at: (_js literal: 'name')) = wanted ifTrue: [
-							^MethodMirror name: (_js propertyOf: mm at: (_js literal: 'name'))
-								accessModifier: (_js propertyOf: mm at: (_js literal: 'accessModifier'))
-								mixin: enclosingMixinMirror
-								source: (_js propertyOf: mm at: (_js literal: 'source'))
-						]
-				].
-			^nil
-		)
-		public selectors ^<List[Symbol]> = (
-			(* psoup LazySlotMirror parity: the sends of the lazy initializer expression. *)
-			
-			| m = initMethod. |
-			nil = m ifTrue: [ ^List new ].
-			^m selectors
-		)
-		cacheSlotName ^<Symbol> = (
-			^compilation IntermediateLazySlot slotNameForLazySlotNamed: name
-		)
-		public cachedValueFor: anObjectMirror <ObjectMirror> ^<ObjectMirror> = (
-			^anObjectMirror getSlot: cacheSlotName
-		)
-		public setCachedValueFor: anObjectMirror <ObjectMirror> to: newValue <Object> ^<ObjectMirror> = (
-			^anObjectMirror setSlot: cacheSlotName to: newValue
-		)
-		public isMutable ^<Boolean> = (
-			(* From the enclosing runtime mixin''s lazySlots SM metadata. *)
-			
-			| raw |
-			raw:: _js propertyOf: (_js propertyOf: enclosingMixinMirror reflectee
-					at: (_js literal: 'runtimeMixin'))
-				at: (_js literal: 'lazySlots').
-			(_js operator: '===' with: raw and: (_js ident: 'undefined')) ifTrue: [
-					^false
-				].
-			raw do: [:sm |
-					(_js propertyOf: sm at: (_js literal: 'name')) = reflectee ifTrue: [
-							^_js propertyOf: sm at: (_js literal: 'isMutable')
-						]
-				].
-			^false
-		)
-	) : ()
-	class LazyMutableSlotGroup group: ms <List[Mirror]> within: mb <MixinBuilder> = MutableMirrorGroup group: ms
-		within: mb (
-	) (
-		public addFromSource: source <String> ^<LazySlotBuilder> = (
-			(* Compile a lazy slot declaration and add (or replace) its builder,
-	   mirroring the psoup LazySlotBuilder addFromSource: flow. The runtime
-	   effect happens at install: the reconstructed source (which includes
-	   the group''s lazy declarations) is recompiled, the schema-change slot
-	   diff adds the backing slot to live instances, and the method copy
-	   installs the accessors. Without this override the send fell through
-	   to ImmutableMirrorGroup and raised. *)
-			
-			| iSlot <IntermediateLazySlot> newBuilder <LazySlotBuilder> |
-			iSlot:: compiler compileLazySlotSource: source within: definingMixin.
-			
-			(* TODO: check for name conflicts, as the psoup version does *)
-			newBuilder:: LazySlotBuilder reflecting: iSlot in: definingMixin.
-			removeMirrorNamed: iSlot name.
-			addMirror: newBuilder.
-			^newBuilder
-		)
-	) : ()
-	public class ActivationMirror reflecting: activation thread: thr = Object new (
-		(* A mirror on one SimulatedActivation of a SimulatedThread, presenting the psoup ActivationMirror API the Debugging UI consumes (sender, receiver, method, sourceRange, slots, stepping, restart, return:). Stepping and stack surgery delegate to the thread; the UI refreshes its activation chain from the thread mirror afterwards. *)
-		
-		|
-			private reflectee <SimulatedActivation> = activation.
-			private thread <SimulatedThread> = thr.
-		|
-	) (
-		public = other ^<Boolean> = (
-			other isKindOfActivationMirror ifFalse: [ ^false ].
-			^reflectee == other reflectedActivation
-		)
-		public hash ^<Integer> = (
-			^(identityHashOf: reflectee) bitXor: class hash
-		)
-		public isKindOfActivationMirror ^<Boolean> = (
-			^true
-		)
-		public reflectedActivation ^<SimulatedActivation> = (
-			^reflectee
-		)
-		public closure ^<ObjectMirror | nil> = (
-			nil = reflectee closure ifTrue: [ ^nil ].
-			^ObjectMirror reflecting: reflectee closure
-		)
-		public enclosingActivation ^<ActivationMirror | nil> = (
-			| outerFrame = reflectee outerContext. |
-			nil = outerFrame ifTrue: [ ^nil ].
-			^ActivationMirror reflecting: outerFrame thread: thread
-		)
-		public receiver ^<ObjectMirror> = (
-			^ObjectMirror reflecting: reflectee receiver
-		)
-		public sender ^<ActivationMirror | nil> = (
-			(* Hide the simulation root sentinel, psoup-style. *)
-			
-			| s = reflectee sender. |
-			nil = s ifTrue: [ ^nil ].
-			s == thread simulator rootActivation ifTrue: [ ^nil ].
-			nil = s method ifTrue: [ ^nil ].
-			^ActivationMirror reflecting: s thread: thread
-		)
-		public threadMirror ^<ThreadMirror> = (
-			^ThreadMirror onSimulated: thread
-		)
-		definingClassMirror ^<ClassMirror | nil> = (
-			(* The NS class whose mixin defines the frame's method. The simulator query is non-raising and covers flat-patched primitive receivers (their runtime chain materializes no applications) via the NS class chain - displaying a transplanted frame must never fail on an unresolvable mixin. *)
-			
-			| nsClass |
-			nsClass:: thread simulator newspeakClassApplying: reflectee method mixin
-				startingAt: (classOfReflectee: reflectee receiver).
-			nil = nsClass ifTrue: [ ^nil ].
-			^ClassMirror reflecting: nsClass
-		)
-		classOfReflectee: obj = (
-			^_js call: (_js propertyOf: (_js ident: 'Object')
-					at: (_js literal: 'getPrototypeOf'))
-				with: {obj. }
-		)
-		normalizeUndefined: v = (
-			(_js operator: '==' with: v and: (_js ident: 'null')) ifTrue: [ ^nil ].
-			^v
-		)
-		public method ^<MethodMirror> = (
-			(* The proper MethodMirror when the defining mixin is reachable; otherwise a FrameMethodMirror carrying what the frame knows. NB: the regular MethodMirror's source: parameter is a sources-array INDEX, not text - passing text (or nil) there yields sources[garbage] = raw JS undefined, which once crashed the debugger UI's CodeMirror. *)
-			
-			| cm found |
-			cm:: definingClassMirror.
-			nil = cm ifFalse: [
-					found:: [ cm mixin methods findMirrorNamed: reflectee method selector ] on: Exception
-						do: [:e | nil ].
-					nil = found ifFalse: [ ^found ]
-				].
-			^FrameMethodMirror name: reflectee method selector
-				accessModifier: reflectee method accessModifier
-				mixin: (nil = cm ifTrue: [ nil ] ifFalse: [ cm mixin ])
-				sourceText: (thread simulator sourceOf: reflectee)
-		)
-		public sourceRange ^<Interval | nil> = (
-			| range = thread simulator sourceRangeOf: reflectee. |
-			nil = range ifTrue: [ ^nil ].
-			^Interval from: (range at: 1) to: (range at: 2)
-		)
-		public slots ^<List[LocalSlotMirror]> = (
-			(* Named local variables via the V5 DebugInfo mapper, psoup-style: lazily recompile the method source with the bytecode compiler in the defining mixin's scope and read values through the mapper (the SimulatedActivation satisfies the mapper's context protocol: bci, closure, outerContext, size, tempAt:). Positional temps when the recompile is unavailable. *)
-			
-			| mapper result |
-			mapper:: debugInfoMapper.
-			nil = mapper ifTrue: [ ^positionalSlots ].
-			^[
-				result:: List new.
-				mapper localNames do: [:localName |
-						result add: (LocalSlotMirror name: localName
-								value: (ObjectMirror reflecting: (mapper getValueOf: localName)))
-					].
-				result
-			] on: Exception do: [:e | positionalSlots ]
-		)
-		positionalSlots ^<List[LocalSlotMirror]> = (
-			| result = List new. |
-			1 to: reflectee size
-				do: [:i |
-					result add: (LocalSlotMirror name: 't' , i printString
-							value: (ObjectMirror reflecting: (reflectee tempAt: i)))
-				].
-			^result
-		)
-		debugInfoMapper = (
-			(* A DebugMapper over this frame, or nil. A runtime-compiled method (a doIt) carries its DebugInfo directly; otherwise recompile the frame's method source with the V5 compiler within the defining mixin (both compilers parse the same text, so bcis and local layouts agree with the frame's record). *)
-			
-			| bcc cm src |
-			nil = reflectee method debugInfo ifFalse: [
-					^[ reflectee method debugInfo mapperForContext: reflectee ] on: Exception
-						do: [:e | nil ]
-				].
-			bcc:: bytecodeCompilationModule.
-			nil = bcc ifTrue: [ ^nil ].
-			cm:: definingClassMirror.
-			nil = cm ifTrue: [ ^nil ].
-			src:: thread simulator sourceOf: reflectee.
-			nil = src ifTrue: [ ^nil ].
-			^[
-				(bcc Compiler new compileMethodSource: src within: cm mixin) debugInfo mapperForContext: reflectee
-			] on: Exception do: [:e | nil ]
-		)
-		public evaluateSuspended: expression <String> ^<ThreadMirror> = (
-			(* psoup API: a suspended, steppable thread evaluating the expression in the FRAME's scope - the expression is V5-compiled with this frame's debug mapper (so its locals resolve to tempAt:/outerContext accesses on the frame) and activated with ctxt = the frame. Receiver-scope fallback when the bytecode stack is unavailable. *)
-			
-			| mapper bcc im simMethod sim |
-			bcc:: bytecodeCompilationModule.
-			mapper:: nil = bcc ifTrue: [ nil ] ifFalse: [ debugInfoMapper ].
-			nil = mapper ifTrue: [
-					^(ObjectMirror reflecting: reflectee receiver) evaluateSuspended: expression
-				].
-			^[
-				im:: bcc Compiler new compileExpressionSource: expression
-					debugMapper: mapper
-					withScope: Map new
-					inMixin: method definingMixin.
-				simMethod:: simulatorModule SimulatedMethod record: (bytecodeRecordFor: im)
-					mixin: reflectee method mixin
-					selector: #DoIt
-					accessModifier: #public.
-				simMethod sourceText: expression.
-				simMethod debugInfo: im debugInfo.
-				sim:: simulatorModule Simulator new.
-				sim startMethod: simMethod
-					receiver: reflectee receiver
-					arguments: {reflectee. Map new. }.
-				ThreadMirror onSimulated: (simulatorModule SimulatedThread over: sim)
-			] on: Exception
-				do: [:e |
-					(ObjectMirror reflecting: reflectee receiver) evaluateSuspended: expression
-				]
-		)
-		public evaluate: expression <String> ^<ThreadMirror> = (
-			(* psoup semantics: evaluateSuspended + resume. *)
-			
-			^(evaluateSuspended: expression) resume
-		)
-		public isUncontinuable ^<Boolean> = (
-			^reflectee isDead
-		)
-		public restart ^<ThreadMirror> = (
-			thread restart: reflectee withLookup: false.
-			^threadMirror
-		)
-		public restartWithLookup ^<ThreadMirror> = (
-			thread restart: reflectee withLookup: true.
-			^threadMirror
-		)
-		public return: result <ObjectMirror> ^<ThreadMirror> = (
-			thread return: result reflectee from: reflectee.
-			^threadMirror
-		)
-		public stepInto ^<ThreadMirror> = (
-			thread stepInto: reflectee.
-			^threadMirror
-		)
-		public stepOut ^<ThreadMirror> = (
-			thread stepOut: reflectee.
-			^threadMirror
-		)
-		public stepOver ^<ThreadMirror> = (
-			thread stepOver: reflectee.
-			^threadMirror
-		)
-		public stepThrough ^<ThreadMirror> = (
-			thread stepThrough: reflectee.
-			^threadMirror
-		)
-	) : (
-		public debug: receiver send: selector with: arguments <List> ^<ThreadMirror> = (
-			(* The Stage-1 debugger entry: begin the send under the simulator, suspended before the first instruction; step with the returned thread's activation mirrors. Degrades to an eager sendSuspended: when the simulator module is not packaged. *)
-			
-			| sim simThread |
-			nil = simulatorModule ifTrue: [
-					^(ObjectMirror reflecting: receiver) eagerSendSuspended: selector
-						with: arguments
-				].
-			sim:: simulatorModule Simulator new.
-			sim start: receiver send: selector with: arguments asArray.
-			simThread:: simulatorModule SimulatedThread over: sim.
-			^ThreadMirror onSimulated: simThread
-		)
-		public invokeSuspended: closure <[]> ^<ThreadMirror> = (
-			(* API-compatible with psoup: answer a suspended thread that runs the closure when resumed. On JS the run is at full speed (closures are opaque compiled functions -- they cannot be entered in simulation), so a broken outcome carries the exception but no frames until Stage 3's lazy shadow stack. For steppable debugging use ObjectMirror debugSuspended:with:. *)
-			
-			^ThreadMirror deferred: closure
-		)
-		public threadForBrokenActivation: a reason: e ^<ThreadMirror> = (
-			(* A broken thread over an existing simulated stack (a's thread), presenting the frames at the raise point. When [a] is not a simulated activation (eager evaluation paths), degrade to a frameless broken thread. *)
-			
-			(nil = a or: [ a isKindOfActivationMirror not ]) ifTrue: [
-					^ThreadMirror state: #broken result: (ObjectMirror reflecting: e)
-				].
-			^a threadMirror
-		)
-		public threadForShadowFrames: rawFrames exception: ex ^<ThreadMirror> = (
-			^threadForShadowFrames: rawFrames
-				exception: ex
-				doItSource: nil
-				receiver: nil
-				scope: nil
-		)
-		public threadForShadowFrames: rawFrames exception: ex doItSource: expression <String | nil> receiver: rcvr scope: rawScope <Map | nil> ^<ThreadMirror> = (
-			(* Stage 3 transplant: the raw shadow-frame records built during a reconstruction unwind (innermost first: {mixin, selector, receiver, args}) become a BROKEN simulated thread the Debugging UI presents like any other. Frames are restart-quality (receiver and arguments captured at unwind, locals cleared, bci 1): inspect everything, evaluate in frame scope, restart any frame to re-execute it. Unresolvable frames (edited away, record-less) are skipped. Degrades to a frameless broken thread without the simulator.
-
-		With a doItSource (the evaluate:with: reconstruction boundary): the doIt itself is compiled fresh with the V5 pipeline - exactly as evaluateSuspended: does - and appended as the OUTERMOST frame. The doIt is installed nowhere, so shadow-record resolution can never find it; without this the evaluation's own frame, usually the one the user cares about, is missing, and Continue has nothing meaningful to restart. *)
-			
-			| sim count frameRec simMethod act innermost prev simThread doItFrame prevSelector calleeSel siteRaw site b blkRaw blk doItMethod doItRecordFramed isDoIt recSelector |
-			nil = simulatorModule ifTrue: [
-					^ThreadMirror state: #broken result: (ObjectMirror reflecting: ex)
-				].
-			sim:: simulatorModule Simulator new.
-			doItMethod:: nil.
-			doItRecordFramed:: false.
-			nil = expression ifFalse: [
-					doItMethod:: [
-						doItSimMethodFor: expression receiver: rcvr scope: rawScope in: sim
-					] on: Exception do: [:compileError | nil ]
-				].
-			count:: _js propertyOf: rawFrames at: (_js literal: 'length').
-			innermost:: nil.
-			prev:: nil.
-			prevSelector:: nil.
-			1 to: count
-				do: [:i |
-					frameRec:: _js propertyOf: rawFrames at: i - 1.
-					recSelector:: _js propertyOf: frameRec at: (_js literal: 'selector').
-					simMethod:: sim transplantMethodMixinNamed: (_js propertyOf: frameRec
-							at: (_js literal: 'mixin'))
-						selector: recSelector
-						receiver: (_js propertyOf: frameRec at: (_js literal: 'receiver')).
-					
-					(* The doIt and its blocks are homed in a synthetic method installed nowhere - unresolvable by name. Their records carry the compiler's synthetic selector: mount them on the freshly V5-compiled doIt method (same bare expression source, so the source coordinates agree). *)
-					isDoIt:: false.
-					(nil = simMethod and: [ (nil = doItMethod) not ]) ifTrue: [
-							'DoItWith:' = recSelector ifTrue: [
-									simMethod:: doItMethod.
-									isDoIt:: true
-								]
-						].
-					nil = simMethod ifFalse: [
-							
-							(* A block record (blk = the block's source start) is a CLOSURE activation of the home method: same compilation unit, but its captured args are the BLOCK's parameters - they must not be mounted into the home method's argument slots, where the slot mapper would present them under the wrong names. A doIt method record mounts the canonical psoup activation (receiver = the evaluation receiver, arguments {ctxt. scope.}). *)
-							blkRaw:: _js propertyOf: frameRec at: (_js literal: 'blk').
-							blk:: (_js operator: '==' with: blkRaw and: (_js ident: 'null')) ifTrue: [
-									0
-								]
-								ifFalse: [ blkRaw ].
-							act:: sim transplantFrameFor: simMethod
-								receiver: (isDoIt ifTrue: [ rcvr ]
-									ifFalse: [ _js propertyOf: frameRec at: (_js literal: 'receiver') ])
-								arguments: (blk > 0 ifTrue: [ {} ]
-									ifFalse: [
-										isDoIt ifTrue: [ {nil. rawScope. } ]
-											ifFalse: [ _js propertyOf: frameRec at: (_js literal: 'args') ]
-									]).
-							(isDoIt and: [ 0 = blk ]) ifTrue: [ doItRecordFramed:: true ].
-							
-							(* Display bci: where this frame invoked its callee - the ADJACENT RAW record's method, whether or not that record itself resolved to a frame. Stored site for instrumented multi-site selectors, static derivation for single-site ones; a block frame with neither falls back to the block's first mapped instruction; bci 1 otherwise. *)
-							calleeSel:: calleeSelectorFor: prevSelector exception: ex.
-							b:: 0.
-							nil = calleeSel ifFalse: [
-									siteRaw:: _js propertyOf: frameRec at: (_js literal: 'site').
-									site:: (_js operator: '==' with: siteRaw and: (_js ident: 'null')) ifTrue: [
-											0
-										]
-										ifFalse: [ siteRaw ].
-									b:: sim transplantBciFor: simMethod callee: calleeSel site: site
-								].
-							(0 = b and: [ blk > 0 ]) ifTrue: [
-									b:: sim bciAtOrAfterSourceStart: blk in: simMethod
-								].
-							0 = b ifFalse: [ act bci: b ].
-							restoreLocalsOf: act from: frameRec method: simMethod in: sim.
-							nil = innermost ifTrue: [ innermost:: act ].
-							nil = prev ifFalse: [ prev sender: act ].
-							prev:: act
-						].
-					prevSelector:: recSelector
-				].
-			
-			(* The doIt method frame normally mounts from its own record above; this append covers captures that lost it (e.g. truncated record chains). *)
-			(nil = doItMethod or: [ doItRecordFramed ]) ifFalse: [
-					doItFrame:: sim transplantFrameFor: doItMethod
-						receiver: rcvr
-						arguments: {nil. rawScope. }.
-					calleeSel:: calleeSelectorFor: prevSelector exception: ex.
-					nil = calleeSel ifFalse: [
-							b:: sim transplantBciFor: doItMethod callee: calleeSel site: 0.
-							0 = b ifFalse: [ doItFrame bci: b ]
-						].
-					nil = innermost ifTrue: [ innermost:: doItFrame ].
-					nil = prev ifFalse: [ prev sender: doItFrame ].
-					prev:: doItFrame
-				].
-			nil = innermost ifTrue: [
-					^ThreadMirror state: #broken result: (ObjectMirror reflecting: ex)
-				].
-			
-			(* Continue restarts the OUTERMOST frame: give it its statement-level entry point. *)
-			nil = prev ifFalse: [
-					prev restartBci: ([ statementRestartBciFor: prev in: sim ] on: Exception
-							do: [:noStatement | 1 ])
-				].
-			sim adoptBrokenStack: innermost.
-			simThread:: simulatorModule SimulatedThread over: sim.
-			simThread state: #broken.
-			simThread result: ex.
-			^ThreadMirror onSimulated: simThread
-		)
-		restoreLocalsOf: act from: frameRec method: simMethod in: sim = (
-			(* Best-effort restore of the frame's captured locals (statement-level restart + slot inspection): the shadow record's values matched by SOURCE NAME against the V5 local layout, obtained from the method's own debugInfo (doIts) or by recompiling the method source in its defining mixin's scope. DIRECT locals only: a closure-captured local lives in a remote vector on the V5 side while the JS capture holds the plain value - restoring it raw would corrupt the vector slot, so those stay nil. Any failure leaves the frame as it was. *)
-			
-			| names vals di lvs limit n v |
-			names:: _js propertyOf: frameRec at: (_js literal: 'localNames').
-			(_js operator: '==' with: names and: (_js ident: 'null')) ifTrue: [ ^self ].
-			vals:: _js propertyOf: frameRec at: (_js literal: 'locals').
-			(_js operator: '==' with: vals and: (_js ident: 'null')) ifTrue: [ ^self ].
-			[
-				di:: transplantDebugInfoFor: simMethod of: act in: sim.
-				nil = di ifTrue: [ ^self ].
-				lvs:: di localVariables.
-				limit:: _js propertyOf: names at: (_js literal: 'length').
-				1 to: limit
-					do: [:i |
-						n:: _js propertyOf: names at: i - 1.
-						v:: _js propertyOf: vals at: i - 1.
-						lvs do: [:lv |
-								(lv name = n and: [ 0 = lv contextDepth and: [ nil = lv remoteVector ] ]) ifTrue: [
-										
-										(* zeroOriginOffset is COMBINED-space (params included): DebugMapper getValueOf: reads tempAt: offset + 1 directly - write exactly where the mapper reads. (The bytecode pushLocal space is locals-only and adds numArgs; that is a different coordinate system.) *)
-										act tempAt: lv zeroOriginOffset + 1 put: v
-									]
-							]
-					]
-			] on: Exception do: [:restoreFailed | nil ]
-		)
-		transplantDebugInfoFor: simMethod of: act in: sim ^<DebugInfo | nil> = (
-			(* The V5 DebugInfo describing simMethod's local layout: carried directly by runtime-compiled doIts, recompiled from source for deployed methods (same text, both compilers, so layouts agree). nil-tolerant throughout. *)
-			
-			| src nsClass |
-			nil = simMethod debugInfo ifFalse: [ ^simMethod debugInfo ].
-			nil = bytecodeCompilationModule ifTrue: [ ^nil ].
-			src:: sim sourceOf: act.
-			nil = src ifTrue: [ ^nil ].
-			nsClass:: sim newspeakClassApplying: simMethod mixin
-				startingAt: (_js call: (_js propertyOf: (_js ident: 'Object')
-						at: (_js literal: 'getPrototypeOf'))
-					with: {act receiver. }).
-			nil = nsClass ifTrue: [ ^nil ].
-			^(bytecodeCompilationModule Compiler new compileMethodSource: src
-				within: (ClassMirror reflecting: nsClass) mixin) debugInfo
-		)
-		statementRestartBciFor: act in: sim ^<Integer> = (
-			(* The bci of the top-level statement containing the frame's display bci - the sound Continue entry point (empty operand stack, no live control flow at top-level statement boundaries, locals restored to their at-failure values). 1 whenever anything is unresolvable: Continue then degrades to a full restart. *)
-			
-			(* Coordinates: everything stays in RAW parser coordinates - bciMap interval starts ARE parser node starts. A doIt's map came from a standalone parse of the same bare expression (sourceStart 0), so map values align with a fresh parse at bias 0; a deployed method's map came from the class-source parse (values minus sourceStart are zero-anchored at the method start), so the fresh standalone parse's own origin - the parsed declaration's start - is subtracted as bias. *)
-			
-			| simMethod src root stmts bias failStart stmt map i entryBci bestBci best s candidates |
-			simMethod:: act method.
-			nil = simMethod ifTrue: [ ^1 ].
-			nil = simMethod record ifTrue: [ ^1 ].
-			src:: sim sourceOf: act.
-			nil = src ifTrue: [ ^1 ].
-			#DoIt = simMethod selector ifTrue: [
-					root:: parsing CommonParser new parseExpression: src.
-					stmts:: root statements.
-					bias:: 0
-				]
-				ifFalse: [
-					root:: parsing CommonParser new parseMethodDeclaration: src.
-					stmts:: root body statements.
-					bias:: root start
-				].
-			map:: simMethod bciMap.
-			
-			(* The raw source start of the frame's current position: the nearest mapped entry at or before the display bci. *)
-			failStart:: nil.
-			bestBci:: -1.
-			i:: 1.
-			[ i + 2 <= map size ] whileTrue: [
-					entryBci:: map at: i.
-					(entryBci <= act bci and: [ entryBci > bestBci ]) ifTrue: [
-							bestBci:: entryBci.
-							failStart:: (map at: i + 1) - simMethod sourceStart
-						].
-					i:: i + 3
-				].
-			nil = failStart ifTrue: [ ^1 ].
-			stmt:: nil.
-			stmts do: [:each |
-					
-					(* Parenthesize the arithmetic INSIDE the comparisons: Newspeak binary operators are uniform-precedence left-associative, so a bare `failStart <= each end - bias` is `(failStart <= each end) - bias` - a boolean minus a number, silently coerced by JS and then DNUing on ifTrue: (found 2026-07-22). *)
-					(each start - bias <= failStart and: [ failStart <= (each end - bias) ]) ifTrue: [
-							stmt:: each
-						]
-				].
-			nil = stmt ifTrue: [ ^1 ].
-			
-			(* All mapped bcis of the failing statement; the simulator derives the sound entry - the start of the push-run into the earliest method-level one - since the map marks only sends and stores, never a statement's first instruction. *)
-			candidates:: List new.
-			i:: 1.
-			[ i + 2 <= map size ] whileTrue: [
-					s:: (map at: i + 1) - simMethod sourceStart.
-					(s >= (stmt start - bias) and: [ s <= (stmt end - bias) ]) ifTrue: [
-							candidates add: (map at: i)
-						].
-					i:: i + 3
-				].
-			candidates isEmpty ifTrue: [ ^1 ].
-			best:: sim statementEntryAmong: candidates in: simMethod.
-			0 = best ifTrue: [ ^1 ].
-			^best
-		)
-		calleeSelectorFor: rawCalleeSelector <String | nil> exception: ex ^<String | nil> = (
-			(* The selector to look for in the CALLER's bytecode when deriving a transplant frame's bci. A doesNotUnderstand: callee means the source-level send was the MNU's own message: dNU is invoked by the DNU catcher machinery, so its selector never appears at the call site. Any probe failure keeps the raw selector. *)
-			
-			nil = rawCalleeSelector ifTrue: [ ^nil ].
-			'doesNotUnderstand:' = rawCalleeSelector ifFalse: [ ^rawCalleeSelector ].
-			^[ ex message selector ] on: Exception
-				do: [:probeFailed | rawCalleeSelector ]
-		)
-		doItSimMethodFor: expression <String> receiver: rcvr scope: rawScope <Map> in: sim ^<SimulatedMethod | nil> = (
-			(* The V5-compiled doIt of a failed evaluation, ready for restart-quality frames (the method record's own frame and its blocks' frames alike). Compiled from the same bare expression the JS doIt was, so shadow-record source coordinates agree. nil when the bytecode pipeline is unavailable; a compile failure raises to the caller's backstop. *)
-			
-			| bcc im simMethod |
-			bcc:: bytecodeCompilationModule.
-			nil = bcc ifTrue: [ ^nil ].
-			im:: bcc Compiler new compileExpressionSource: expression
-				debugMapper: nil
-				withScope: rawScope
-				inMixin: (ObjectMirror reflecting: rcvr) getClass mixin.
-			simMethod:: simulatorModule SimulatedMethod record: (bytecodeRecordFor: im)
-				mixin: (sim runtimeMixinForDebugOf: rcvr)
-				selector: #DoIt
-				accessModifier: #public.
-			simMethod sourceText: expression.
-			simMethod debugInfo: im debugInfo.
-			^simMethod
+		public onSimulated: aSimulatedThread ^<ThreadMirror> = (
+			| tm |
+			tm:: state: nil result: nil.
+			tm simulatedThread: aSimulatedThread.
+			^tm
 		)
 	)
-	class CompileOnlyInternalKernel new = Object new (
-		(* Satisfies IntermediatesForPrimordialSoup's imports for compile-only use of the bytecode compilation pipeline: the dual-emission path reads bytes and literals off IntermediateMethods and never assembles a psoup Method, so the Method and MethodMetadata bindings are never used. (Same stub as DeploymentManager's.) *)
+	addDeclaredSelectorsOf: cd to: result <List[String]> = (
+		cd instanceSide methods do: [:m | result add: m name ].
+		cd classSide methods do: [:m | result add: m name ].
+		cd instanceSide nestedClasses do: [:nc |
+				addDeclaredSelectorsOf: nc to: result
+			]
+	)
+	public allSelectorsDo: action <[:String | Object]> = (
+		| selectors = vmmirror allSelectors. |
 		
-	) (
-		public Method = (
-			^nil
-		)
-		public MethodMetadata = (
-			^nil
-		)
-	) : ()
-	class FrameMethodMirror name: n <Symbol> accessModifier: a <Symbol> mixin: m <MixinMirror | nil> sourceText: s <String | nil> = Object new (
-		(* A method mirror for a simulated frame whose method has no browsable MethodMirror: a runtime-compiled doIt, or a frame whose defining mixin could not be located. Carries source TEXT directly (possibly nil - the UI shows its absence marker), unlike the regular MethodMirror whose source: parameter is an index into the deployed sources array. *)
-		
-		|
-			public name <Symbol> = n.
-			public accessModifier <Symbol> = a.
-			public definingMixin <MixinMirror | nil> = m.
-			public source <String | nil> = s.
-		|
-	) (
-		public isKindOfMethodMirror ^<Boolean> = (
-			^true
-		)
-		public isSynthetic ^<Boolean> = (
-			^true
-		)
-		public simpleName ^<Symbol> = (
-			^name
-		)
-		public selectors ^<List[Symbol]> = (
-			^List new
-		)
-		public hash ^<Integer> = (
-			^name hash bitXor: class hash
-		)
-		public = other ^<Boolean> = (
-			other isKindOfMethodMirror ifFalse: [ ^false ].
-			^name = other name and: [ definingMixin = other definingMixin ]
-		)
-	) : ()
-	public class LocalSlotMirror name: n <String> value: v <ObjectMirror> = Object new (
-		(* A named local (parameter or temporary) of an activation, psoup API. *)
-		
-		|
-			public name <String> = n.
-			public value <ObjectMirror> = v.
-		|
-	) (
-		public isKindOfLocalSlotMirror ^<Boolean> = (
-			^true
-		)
-	) : ()
-	public class AtomicInstallWrapper new = Object new (
-		(* reflectees at: self put: activation *)
-		
-		(* :TODO :Bogus *)
-		
-	) (
-		public install: builders <List[ClassDeclarationBuilder]> into: ns <Map[Symbol, Object]> ^<List[MixinMirror]> = (
-			(* Nothing atomic about this. We'd have to implement the whole thing in JS, and even then, it needs to be a transaction *)
-			
-			#BOGUS yourself.
-			^builders collect: [:b <ClassDeclarationBuilder> |
-					| mm <MixinMirror> |
-					mm:: b install instanceSide.
-					ns at: b name
-						ifAbsent: [
-							ns at: b name put: (mm apply: Object withName: b name) reflectee
-						].
-					mm
-				]
-		)
-	) : ()
-	public class ClosureMirror reflecting: c <Closure> = Object new (
-		(* Read-only introspection on a closure. Source / definingMethod /
-   receiver depend on closure metadata wiring in the JS code generator
-   (Tier 3 / debugger track). *)
-		
-		|
-			public reflectee <Closure> = c.
-			definingActivation <Activation> = definingActivationOf: c.
-		|
-	) (
-		public source ^<String | nil> = (
-			(* reflectees at: self put: c. *)
-			
-			(* Closure source requires closure metadata wiring in the code
-	   generator (debugger track); nil = unavailable, which the browsing
-	   code treats as a displayable absence. *)
-			
-			^nil
-		)
-		public definingMethod ^<MethodMirror | nil> = (
-			(* See [source]. *)
-			
-			^nil
-		)
-		public receiver ^<ObjectMirror> = (
-			(* Best effort: without activation metadata the receiver is unknown. *)
-			
-			^ObjectMirror reflecting: nil
-		)
-		public isKindOfClosureMirror ^<Boolean> = (
-			^true
-		)
-		public = other = (
-			other isKindOfClosureMirror ifFalse: [ ^false ].
-			^_js operator: '===' with: reflectee and: other reflectee
-		)
-		public hash ^<Integer> = (
-			^(identityHashOf: reflectee) bitXor: class hash
-		)
-		public isDead ^<Boolean> = (
-			(* JS closures don't have a notion of "dead" — they exist as long as
-	   anything references them. Always false for now. *)
-			
-			^false
-		)
-	) : ()
-	public class LazySlotActivationMirror reflecting: a <Activation> thread: t <Thread> = ActivationMirror reflecting: a
-		thread: t (
-		(* :TODO :Bogus
-Mirror for the activation of a lazy slot. It takes care of computing the right sender, providing the current sourceRange considering the particular grammar , providing access to compiling the lazy slot code etc *)
-		
-	) (
-	) : ()
-	public class LazySlotBuilder reflecting: ir <IntermediateLazySlot> in: mb <MixinBuilder> = Object new (
-		(* Trivial delegations to the underlying IntermediateLazySlot for the
-   IDE's read path. Mutation (rename, etc.) requires Tier 2 work. *)
-		
-		|
-			public prvtIntermediate <IntermediateLazySlot> = ir.
-			prvtMixinBuilder <MixinBuilder> = mb.
-		|
-	) (
-		public source = (
-			^prvtIntermediate source
-		)
-		public name = (
-			^prvtIntermediate name
-		)
-		public simpleName = (
-			^prvtIntermediate name
-		)
-		public accessModifier = (
-			^prvtIntermediate accessModifier
-		)
-		public isMutable ^<Boolean> = (
-			^prvtIntermediate isMutable
-		)
-		public definingMixin = (
-			^prvtMixinBuilder
-		)
-		public isKindOfLazySlotMirror ^<Boolean> = (
-			^true
-		)
-	) : ()
-	public installDebugHook: presenter <[:ThreadMirror | Object]> = (
-		(* Arm the Stage 3 debugger: an unhandled signal then reconstructs the failed stack and this hook presents it. NSDebugHook is called from the boundary catch with RAW (exception, shadowFrames); a Newspeak closure IS a plain JS function, so it is assigned directly and receives the raw arguments. All failures are swallowed here (and again at the boundary): the debugger must never worsen the original failure. *)
-		
-		| hook |
-		hook:: [:ex :frames |
-			[
-				presenter value: (ActivationMirror threadForShadowFrames: frames
-						exception: ex)
-			] on: Exception do: [:e | nil ].
-			nil
-		].
-		_js assign: (_js ident: 'NSDebugHook') toBe: hook
+		(* Every selector this image may send: the deploy's sent selectors plus
+		everything minted by reflective compiles since. Answers selectors and
+		nothing else, so - unlike psoup, which scans the heap for canonical
+		strings and must ask which of them are symbols - there is no
+		canonicality test to make here. *)
+		selectors do: [:sel <String> | action value: sel ]
 	)
 	brokenEvalReasonFor: rawErr = (
 		(* The exception object a broken thread presents. NS exceptions (newspeakClass set - the same raw-vs-NS test as the kernel's protectedBodyOf:) pass through; a raw JS error - which reaches the evaluation boundary only without a reconstruction unwind - wraps into a kernel Exception carrying its JS description, so the results list can print it. Module-level: reached by here-sends from ObjectMirror. *)
@@ -2737,62 +2737,6 @@ Mirror for the activation of a lazy slot. It takes care of computing the right s
 			].
 		^{im bytes asArray. im literals asArray. im argCount. im maxLocals. im maxStack. bciMap asArray. 0. }
 	)
-	public allSelectorsDo: action <[:String | Object]> = (
-		| selectors = vmmirror allSelectors. |
-		
-		(* Every selector this image may send: the deploy's sent selectors plus
-		everything minted by reflective compiles since. Answers selectors and
-		nothing else, so - unlike psoup, which scans the heap for canonical
-		strings and must ask which of them are symbols - there is no
-		canonicality test to make here. *)
-		selectors do: [:sel <String> | action value: sel ]
-	)
-	addDeclaredSelectorsOf: cd to: result <List[String]> = (
-		cd instanceSide methods do: [:m | result add: m name ].
-		cd classSide methods do: [:m | result add: m name ].
-		cd instanceSide nestedClasses do: [:nc |
-				addDeclaredSelectorsOf: nc to: result
-			]
-	)
-	irForClassSource: src <String> within: enclosing = (
-		| ir = compiler compileClassSource: src within: enclosing. declared = List new. |
-		
-		(* Compile [src] and tell the runtime which selectors it involves. Every
-		reflective class compile goes through here, so the selector registry
-		cannot drift from the code the image is running. *)
-		addDeclaredSelectorsOf: ir to: declared.
-		registerSelectorsOf: compiler declaring: declared.
-		^ir
-	)
-	irForMethodSource: src <String> within: mixin = (
-		| ir = compiler compileMethodSource: src within: mixin. |
-		
-		(* As irForClassSource:within:, for a single method. *)
-		registerSelectorsOf: compiler declaring: {ir name. }.
-		^ir
-	)
-	registerSelectorsOf: aCompiler declaring: declaredNames <Collection[String]> = (
-		| all = List new. |
-		
-		(* Register the selectors a compile involves: the ones it sends, and the
-		ones it declares. Sending matters because a selector appearing for the
-		first time in freshly accepted code otherwise has no doesNotUnderstand:
-		catcher on Object.prototype, so sending it to an object that does not
-		implement it dies with a raw JS TypeError instead of answering
-		doesNotUnderstand: - which in particular breaks the isKindOfX protocols,
-		since those rely on DNU answering false.
-
-		Declaring matters because a selector that is only ever implemented is
-		still a selector, and the IDE must be able to find it: searching for a
-		method you just wrote, and have not yet called from anywhere, is the
-		normal case rather than an exotic one. *)
-		aCompiler sentSelectors do: [:sel <String> | all add: sel ].
-		declaredNames do: [:sel <String> | all add: sel ].
-		vmmirror registerSelectors: (all asArray collect: [:sel <String> |
-					compilation names manglePublic: sel
-				])
-			on: (_js verbatim: 'Object.prototype')
-	)
 	classDeclIRFor: mixin within: enclosing = (
 		| source = 'Newspeak3 ''Uncategorized'' ' , (ClassDeclarationMirror reflecting: mixin) source. |
 		
@@ -2810,6 +2754,14 @@ Mirror for the activation of a lazy slot. It takes care of computing the right s
 			at: (_js literal: 'meta').
 		(_js operator: '===' with: meta and: (_js ident: 'undefined')) ifTrue: [ ^nil ].
 		^Mixin fromRuntimeMixin: meta
+	)
+	foldedRuneOf: s <String> at: i <Integer> ^<Integer> = (
+		(* The rune at i with an ASCII capital lowered; see
+	   memberNameLessOrEqual:than: for why ASCII is the whole domain. *)
+		
+		| r = s runeAt: i. |
+		(r >= 65 and: [ r <= 90 ]) ifTrue: [ ^r + 32 ].
+		^r
 	)
 	private identityHashOf: object ^<Integer> = (
 		(* Compute an identity hash for [object]. Different paths by JS type
@@ -2837,42 +2789,38 @@ Mirror for the activation of a lazy slot. It takes care of computing the right s
 			].
 		^_js propertyOf: object at: (_js literal: 'hashCode')
 	)
-	sourceForMethod: methodName <String> ofMixin: m <Mixin> ^<String> = (
-		| _js = generation factory. sourceIndex <Integer> |
-		sourceIndex:: sourceIndexForMethod: methodName ofMixin: m.
-		^_js propertyOf: (_js ident: 'sources') at: sourceIndex
-	)
-	sourceIndexForMethod: methodName <String> ofMixin: m <Mixin> ^<Integer> = (
-		| _js = generation factory. methodMetadata |
-		methodMetadata:: (_js propertyOf: m at: (_js literal: 'methods')) select: [:e |
-				(_js propertyOf: e at: 'name') = methodName
-			].
-		^_js propertyOf: methodMetadata at: 'source'
-		(* compute the source index from the metadata *)
+	public installDebugHook: presenter <[:ThreadMirror | Object]> = (
+		(* Arm the Stage 3 debugger: an unhandled signal then reconstructs the failed stack and this hook presents it. NSDebugHook is called from the boundary catch with RAW (exception, shadowFrames); a Newspeak closure IS a plain JS function, so it is assigned directly and receives the raw arguments. All failures are swallowed here (and again at the boundary): the debugger must never worsen the original failure. *)
 		
+		| hook |
+		hook:: [:ex :frames |
+			[
+				presenter value: (ActivationMirror threadForShadowFrames: frames
+						exception: ex)
+			] on: Exception do: [:e | nil ].
+			nil
+		].
+		_js assign: (_js ident: 'NSDebugHook') toBe: hook
 	)
 	public installer ^<AtomicInstallWrapper> = (
 		^AtomicInstallWrapper new
 	)
-	sortedMembers: members by: nameBlock ^<List> = (
-		(* One bin of a class's members in CANONICAL order: by name, so that
-	   a class saved from the IDE and its file pretty-printed come out
-	   identical. The IDE does not store files; it emits each member
-	   from its own stored source in the image's order, and recompiling
-	   a member moves it to the end of its bin, so before this the order
-	   of a file was the order its members were last EDITED -- nothing a
-	   printer could predict. Sorting at emission makes the order a
-	   function of the class alone, and leaves the IR order,
-	   assembleMethods and the installer untouched.
-
-	   The same rule lives in MirrorsForPrimordialSoup, which is canonical for platform API if the two ever diverge, and in NewspeakPrettyPrinter
-	   (sortedByName:by:). All three must agree. *)
+	irForClassSource: src <String> within: enclosing = (
+		| ir = compiler compileClassSource: src within: enclosing. declared = List new. |
 		
-		| sorted = List withAll: members. |
-		sorted sort: [:a :b |
-				memberNameLessOrEqual: (nameBlock value: a) than: (nameBlock value: b)
-			].
-		^sorted
+		(* Compile [src] and tell the runtime which selectors it involves. Every
+		reflective class compile goes through here, so the selector registry
+		cannot drift from the code the image is running. *)
+		addDeclaredSelectorsOf: ir to: declared.
+		registerSelectorsOf: compiler declaring: declared.
+		^ir
+	)
+	irForMethodSource: src <String> within: mixin = (
+		| ir = compiler compileMethodSource: src within: mixin. |
+		
+		(* As irForClassSource:within:, for a single method. *)
+		registerSelectorsOf: compiler declaring: {ir name. }.
+		^ir
 	)
 	public memberNameLessOrEqual: a <String> than: b <String> ^<Boolean> = (
 		(* THE definition of canonical member order for this platform, lent
@@ -2918,12 +2866,60 @@ Mirror for the activation of a lazy slot. It takes care of computing the right s
 			].
 		^true
 	)
-	foldedRuneOf: s <String> at: i <Integer> ^<Integer> = (
-		(* The rune at i with an ASCII capital lowered; see
-	   memberNameLessOrEqual:than: for why ASCII is the whole domain. *)
+	registerSelectorsOf: aCompiler declaring: declaredNames <Collection[String]> = (
+		| all = List new. |
 		
-		| r = s runeAt: i. |
-		(r >= 65 and: [ r <= 90 ]) ifTrue: [ ^r + 32 ].
-		^r
+		(* Register the selectors a compile involves: the ones it sends, and the
+		ones it declares. Sending matters because a selector appearing for the
+		first time in freshly accepted code otherwise has no doesNotUnderstand:
+		catcher on Object.prototype, so sending it to an object that does not
+		implement it dies with a raw JS TypeError instead of answering
+		doesNotUnderstand: - which in particular breaks the isKindOfX protocols,
+		since those rely on DNU answering false.
+
+		Declaring matters because a selector that is only ever implemented is
+		still a selector, and the IDE must be able to find it: searching for a
+		method you just wrote, and have not yet called from anywhere, is the
+		normal case rather than an exotic one. *)
+		aCompiler sentSelectors do: [:sel <String> | all add: sel ].
+		declaredNames do: [:sel <String> | all add: sel ].
+		vmmirror registerSelectors: (all asArray collect: [:sel <String> |
+					compilation names manglePublic: sel
+				])
+			on: (_js verbatim: 'Object.prototype')
+	)
+	sortedMembers: members by: nameBlock ^<List> = (
+		(* One bin of a class's members in CANONICAL order: by name, so that
+	   a class saved from the IDE and its file pretty-printed come out
+	   identical. The IDE does not store files; it emits each member
+	   from its own stored source in the image's order, and recompiling
+	   a member moves it to the end of its bin, so before this the order
+	   of a file was the order its members were last EDITED -- nothing a
+	   printer could predict. Sorting at emission makes the order a
+	   function of the class alone, and leaves the IR order,
+	   assembleMethods and the installer untouched.
+
+	   The same rule lives in MirrorsForPrimordialSoup, which is canonical for platform API if the two ever diverge, and in NewspeakPrettyPrinter
+	   (sortedByName:by:). All three must agree. *)
+		
+		| sorted = List withAll: members. |
+		sorted sort: [:a :b |
+				memberNameLessOrEqual: (nameBlock value: a) than: (nameBlock value: b)
+			].
+		^sorted
+	)
+	sourceForMethod: methodName <String> ofMixin: m <Mixin> ^<String> = (
+		| _js = generation factory. sourceIndex <Integer> |
+		sourceIndex:: sourceIndexForMethod: methodName ofMixin: m.
+		^_js propertyOf: (_js ident: 'sources') at: sourceIndex
+	)
+	sourceIndexForMethod: methodName <String> ofMixin: m <Mixin> ^<Integer> = (
+		| _js = generation factory. methodMetadata |
+		methodMetadata:: (_js propertyOf: m at: (_js literal: 'methods')) select: [:e |
+				(_js propertyOf: e at: 'name') = methodName
+			].
+		^_js propertyOf: methodMetadata at: 'source'
+		(* compute the source index from the metadata *)
+		
 	)
 ) : ()

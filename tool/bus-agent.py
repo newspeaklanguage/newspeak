@@ -32,6 +32,7 @@ import argparse
 import json
 import sys
 import threading
+import time
 import urllib.parse
 import urllib.request
 
@@ -50,14 +51,22 @@ def post(origin, token, obj):
         return json.load(r)
 
 
-def receive_loop(origin, token, my_name):
+def receive_loop(origin, token_box, my_name):
     # Hold the SSE stream open; print messages addressed to this agent.
-    # Declare our name on the stream so the front door can answer
-    # /_ns/bus/agents. The bus is per-machine, and a collaborating IDE
-    # session needs to know WHICH participant can reach this agent.
-    url = origin + '/_ns/bus?token=' + token + '&name=' + urllib.parse.quote(my_name)
-    req = urllib.request.Request(url, headers={'Accept': 'text/event-stream'})
+    # `token_box` is a one-element list rather than the token itself so that a
+    # token re-read here is also seen by the sender in main().
     while True:
+        # Declare our name on the stream so the front door can answer
+        # /_ns/bus/agents. The bus is per-machine, and a collaborating IDE
+        # session needs to know WHICH participant can reach this agent.
+        #
+        # Built fresh each time round, because the token is re-read on every
+        # reconnect rather than captured once: the front door mints a new one
+        # per run, so after it restarts the old token is refused and this would
+        # spin on 403 forever while appearing to be up.
+        url = (origin + '/_ns/bus?token=' + token_box[0]
+               + '&name=' + urllib.parse.quote(my_name))
+        req = urllib.request.Request(url, headers={'Accept': 'text/event-stream'})
         try:
             with urllib.request.urlopen(req, timeout=None) as stream:
                 for raw in stream:
@@ -76,7 +85,16 @@ def receive_loop(origin, token, my_name):
                     print(f'\n<<< from {frm!r} ({kind}): {text}\n'
                           f'    (reply:  {frm} <your text>)\n> ', end='', flush=True)
         except Exception as e:
+            # And sleep before trying again: with the front door down,
+            # reconnecting flat out is a hot loop printing to stderr.
             print(f'\n[stream dropped: {e}; reconnecting]', file=sys.stderr)
+            time.sleep(1)
+            try:
+                token_box[0] = fetch_token(origin)
+            except Exception as e2:
+                print(f'[the front door is not answering ({e2}); will keep trying]',
+                      file=sys.stderr)
+                time.sleep(4)
 
 
 def main():
@@ -85,13 +103,13 @@ def main():
     ap.add_argument('--origin', default='http://localhost:8080')
     args = ap.parse_args()
 
-    token = fetch_token(args.origin)
+    token_box = [fetch_token(args.origin)]
     print(f'agent {args.name!r} on {args.origin}  (token acquired)')
     print('type:  <chat> <text>   |   /notice <chat> <text>   |   Ctrl-C to quit\n> ',
           end='', flush=True)
 
     t = threading.Thread(
-        target=receive_loop, args=(args.origin, token, args.name), daemon=True)
+        target=receive_loop, args=(args.origin, token_box, args.name), daemon=True)
     t.start()
 
     for line in sys.stdin:
@@ -109,7 +127,7 @@ def main():
             continue
         to, text = parts
         try:
-            res = post(args.origin, token,
+            res = post(args.origin, token_box[0],
                        {'to': to, 'from': args.name, 'text': text, 'kind': kind})
             print(f'    [sent id={res.get("id")}, {res.get("listeners")} listener(s)]\n> ',
                   end='', flush=True)

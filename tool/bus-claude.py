@@ -26,23 +26,30 @@ it runs on, pointing a chat at it is a real capability grant: run it
 deliberately, on a trusted machine, over the loopback bus. `--claude-args` can
 constrain it.
 
-The IDE raises a Bus Agent chat's request watchdog to 10 minutes, so an agentic
-run has room.
+BUDGETS. Neither side puts a clock on a turn that is visibly working. The IDE
+gives a Bus Agent chat a 10-minute watchdog of SILENCE, re-armed by every
+heartbeat this bridge posts; the bridge kills a run only after IDLE_S with
+nothing on its stream, or at --hard-cap, which exists for a runaway rather than
+for a long job. So an agentic run has as long as it takes, provided it keeps
+saying what it is doing.
 
 Usage (front door running with --bus, and `claude` on PATH and configured):
     python3 tool/bus-claude.py <agent-name> [--origin http://localhost:8080]
                                [--cwd DIR] [--claude-bin claude]
                                [--claude-args "--permission-mode plan"]
+                               [--hard-cap SECONDS]
 
 Create a Bus Agent chat in the IDE whose Model field is <agent-name>, and talk.
 """
 
 import argparse
+import atexit
 import json
 import os
 import queue
 import re
 import shlex
+import signal
 import subprocess
 import sys
 import threading
@@ -53,27 +60,81 @@ import urllib.request
 import uuid
 
 
-# The IDE gives a Bus Agent chat a 10-minute request watchdog - of SILENCE:
-# every completion_progress frame the bridge posts pushes it out
-# (AI_IDE_Support deliverCompletionProgress:). So the bridge's budget is a
-# silence budget too: TURN_BUDGET_S from the last thing the agent was seen
-# doing, not from the request, under an absolute cap (HARD_CAP_S) that only a
-# runaway reaches. It used to be a fixed 540s from the request, which killed
-# every turn of real work past nine minutes however alive it was, and the
-# answer's retry got no fresh budget either (2026-09-16). MIN_RUN_S: below this
-# much of the cap left there is no point starting a run at all.
-TURN_BUDGET_S = 540
-HARD_CAP_S = 1800
-MIN_RUN_S = 45
-# A run silent for this long is killed as stuck. Silence means no line on the
-# stream. With --include-partial-messages generation itself streams, so the
-# only silence left is a tool call in progress; the harness caps a tool call at
-# 600s, so a longer silence really is a hang. While a call is in flight the
-# bridge posts a heartbeat of its own every TOOL_HEARTBEAT_S, so the IDE's
-# watchdog (and the user) know the turn is alive. The old limit was 300s with
-# no heartbeat, which killed every probe or build run as "stuck".
-IDLE_S = 660
+# The bridge kills a run for ONE reason: silence. The IDE side is built the
+# same way - AIAccess withWatchdog:ms:reason: re-arms rather than rejecting
+# whenever a completion_progress frame has pushed its deadline out
+# (deliverCompletionProgress: -> noteProviderProgress:), so a bus chat only
+# times out when the bridge stops speaking, however long the turn takes.
+#
+# Silence here means no line on the `claude -p` stream. With
+# --include-partial-messages generation itself streams, so the only silence
+# left is a tool call in flight; the harness caps one tool call at 600s, so a
+# longer silence really is a hang. IDLE_S is that 600 plus margin. The
+# heartbeat the bridge posts every TOOL_HEARTBEAT_S does NOT reset it: the
+# bridge's own clock is no evidence that the agent is alive. It exists so the
+# IDE's watchdog and the user know the turn is working.
+#
+# There used to be a second budget of the same quantity, TURN_BUDGET_S = 540.
+# Being the smaller it always won, so IDLE_S was unreachable and any turn whose
+# agent made one long tool call died at nine minutes - short of the 600s the
+# harness allows a single call, so ordinary work was over budget by
+# construction (found and removed 2026-09-19).
+IDLE_S = 900
 TOOL_HEARTBEAT_S = 60
+# The absolute cap on one answer, retry included: the only limit a live,
+# streaming agent can still reach, and the only guard against a runaway loop
+# burning the monthly limit with nobody watching. Set by --hard-cap, which
+# takes 0 to remove it. MIN_RUN_S: with less than this much of the cap left
+# there is no point starting a run at all.
+HARD_CAP_S = 3600
+MIN_RUN_S = 45
+
+
+def hard_deadline_from(args):
+    """The absolute cap as a monotonic instant; infinite if --hard-cap 0."""
+    return time.monotonic() + args.hard_cap if args.hard_cap > 0 else float('inf')
+
+
+# Runs in flight, so that quitting the bridge does not leave agents behind.
+_LIVE = set()
+_LIVE_LOCK = threading.Lock()
+
+
+def kill_tree(proc):
+    """Kill a run AND everything it started, then reap it.
+
+    Killing only `claude` leaves its children - the shell it spawned, and
+    whatever that spawned - running, holding files, ports and CPU with nothing
+    left to answer to. It is the common case rather than a corner: the kill
+    happens because a tool call is hanging, so there is always a child, and a
+    killed probe turn has been observed keeping port 8098 to itself
+    afterwards. Each run therefore gets a session of its own (start_new_session
+    below) and the whole group is signalled here."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except OSError:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=5)        # reap: a killed turn leaves no zombie
+    except Exception:
+        pass
+    with _LIVE_LOCK:
+        _LIVE.discard(proc)
+
+
+def kill_live_runs(*_signal_args):
+    """Every run still going, on the way out. A run is in its own session, so
+    it does NOT get the Ctrl-C that reaches the bridge; without this, quitting
+    would strand one agent per chat mid-turn."""
+    with _LIVE_LOCK:
+        procs = list(_LIVE)
+    for proc in procs:
+        kill_tree(proc)
+    if procs:
+        print(f'[killed {len(procs)} run(s) still in flight]', file=sys.stderr, flush=True)
 
 
 def fetch_token(origin):
@@ -234,14 +295,43 @@ Below are the chat's own system instructions and the conversation so far.
 """
 
 
-def first_prompt(request):
+def killed_notice(reason, cold=False):
+    """What to tell an agent whose previous turn this bridge killed.
+
+    Two shapes, because the two situations differ in what the agent still
+    knows. A RESUMED session remembers the work it was in the middle of, and
+    nothing else tells it that none of that reached the user. A COLD one
+    remembers nothing - but it is handed a transcript ending at the same user
+    message, so left unwarned it walks straight back into the step that killed
+    the last attempt, which is how a chat dies the same death twice."""
+    if cold:
+        return ('[Notice from the bridge] The previous attempt to answer this was '
+                'KILLED: ' + reason + '. It ran in a session that is now gone, so '
+                'nothing from it reached the user and none of its context is available '
+                'to you. Do not just retry the same long step: reply with a short text '
+                'status first, and do any long step alone in a later turn.')
+    return ('[Notice from the bridge] Your previous turn was KILLED: ' + reason +
+            '. Nothing you did or wrote in it reached the user. Do not silently '
+            'resume that work: reply with a short text status first, and do any '
+            'long step alone in a later turn.')
+
+
+def first_prompt(request, killed=None):
     """Full context for turn 1: preamble + the chat's system prompt + the
-    conversation so far. This becomes the resumed session's cached prefix."""
+    conversation so far. This becomes the resumed session's cached prefix.
+
+    `killed`: see killed_notice. A cold run is not only the chat's first turn -
+    it is also what a bridge restart and a lost session produce, and either can
+    follow a turn this bridge killed. Until this argument existed the reason
+    was popped and dropped on exactly those paths."""
     parts = [PREAMBLE + system_text(request.get('system'))]
     parts.append('\n--- Conversation so far ---')
     for m in request.get('messages', []):
         who = 'User' if m.get('role') == 'user' else 'Assistant'
         parts.append(f'{who}: {block_text(m.get("content"))}')
+    if killed:
+        # Last, so it is the freshest thing before the agent starts writing.
+        parts.append('\n' + killed_notice(killed, cold=True))
     parts.append('\nAssistant:')
     return '\n'.join(parts)
 
@@ -264,10 +354,7 @@ def delta_prompt(request, killed=None):
     prefix = ('[Notices from the IDE, delivered with this turn]\n' + notices + '\n\n'
               if notices else '')
     if killed:
-        prefix = ('[Notice from the bridge] Your previous turn was KILLED: ' + killed +
-                  '. Nothing you did or wrote in it reached the user. Do not silently '
-                  'resume that work: reply with a short text status first, and do any '
-                  'long step alone in a later turn.\n\n' + prefix)
+        prefix = killed_notice(killed) + '\n\n' + prefix
     if not messages:
         return prefix + '(no new message)'
     last = messages[-1]
@@ -371,8 +458,7 @@ _SESSION_GONE = re.compile(
     re.IGNORECASE)
 
 
-def run_claude(prompt, args, resume_session=None, timeout=TURN_BUDGET_S, hard_deadline=None,
-               progress=None):
+def run_claude(prompt, args, resume_session=None, hard_deadline=None, progress=None):
     """One `claude -p` run, streamed. Returns (result_text, session_id).
 
     The run is watched line by line (--output-format stream-json, with partial
@@ -382,10 +468,10 @@ def run_claude(prompt, args, resume_session=None, timeout=TURN_BUDGET_S, hard_de
     one to the chat as a completion_progress frame, so the IDE can restart its
     watchdog and show the user what the agent is doing instead of silence; a
     call still running after TOOL_HEARTBEAT_S gets a heartbeat of its own.
-    Second, the budget is one of SILENCE: `timeout` counts from the last line
-    seen, not from the start, under `hard_deadline` (default HARD_CAP_S from
-    now); and a run silent for IDLE_S is killed as stuck - a hung tool is the
-    common failure, and it looks exactly like thinking."""
+    Second, the only budget is one of SILENCE: a run is killed once IDLE_S has
+    passed since the last line - a hung tool is the common failure, and it
+    looks exactly like thinking - under `hard_deadline` (the absolute cap for
+    the whole answer, retry included; --hard-cap from now by default)."""
     cmd = [args.claude_bin, '-p', '--output-format', 'stream-json', '--verbose',
            '--include-partial-messages']
     if resume_session:
@@ -403,7 +489,9 @@ def run_claude(prompt, args, resume_session=None, timeout=TURN_BUDGET_S, hard_de
         proc = subprocess.Popen(
             cmd if on_stdin else cmd + [prompt],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            cwd=args.cwd, text=True)
+            cwd=args.cwd, text=True, start_new_session=True)
+        with _LIVE_LOCK:
+            _LIVE.add(proc)
         lines, errs = queue.Queue(), []
 
         def pump(stream, sink):
@@ -421,30 +509,46 @@ def run_claude(prompt, args, resume_session=None, timeout=TURN_BUDGET_S, hard_de
             proc.stdin.close()
         except Exception:
             pass
-        hard = hard_deadline if hard_deadline is not None else time.monotonic() + HARD_CAP_S
+        hard = hard_deadline if hard_deadline is not None else hard_deadline_from(args)
         last_seen = time.monotonic()
-        deadline = min(last_seen + timeout, hard)
+        deadline = min(last_seen + IDLE_S, hard)
         result, sid, is_error, saw_output = None, None, False, False
         in_flight = None        # the tool call the agent is waiting on, if any
+        last_beat = last_seen
+
+        def beat(text):
+            # The IDE's watchdog is pushed out by our frames and by nothing
+            # else, so the rule is about OUR silence, not the agent's: a frame
+            # at least every TOOL_HEARTBEAT_S whatever the agent is doing.
+            # Heartbeating only when the stream went quiet was not enough - an
+            # agent generating steadily for the IDE's whole budget kept this
+            # loop fed while the IDE heard nothing and abandoned the turn, and
+            # the answer then came back to a corr_id no longer pending.
+            nonlocal last_beat
+            last_beat = time.monotonic()
+            if progress:
+                progress(text)
+
         while True:
             now = time.monotonic()
             if now >= deadline:
-                proc.kill()
-                raise RuntimeError('claude did not finish within %ds of its last sign of life '
-                                   '(absolute cap %ds)' % (timeout, HARD_CAP_S))
-            wait = min(TOOL_HEARTBEAT_S, deadline - now, last_seen + IDLE_S - now)
+                # Which of the two it was matters to the reader: one says the
+                # agent wedged, the other says it worked for an hour.
+                kill_tree(proc)
+                if now >= hard:
+                    raise RuntimeError('claude was still going at the absolute cap of %ds '
+                                       'for one answer; killed (raise or remove it with '
+                                       '--hard-cap)' % args.hard_cap)
+                raise RuntimeError('claude produced no output for %ds (stuck?); killed' % IDLE_S)
+            wait = min(TOOL_HEARTBEAT_S, deadline - now)
             try:
                 line = lines.get(timeout=max(wait, 0.1))
             except queue.Empty:
                 now = time.monotonic()
-                if now - last_seen >= IDLE_S:
-                    proc.kill()
-                    raise RuntimeError('claude produced no output for %ds (stuck?); killed' % IDLE_S)
                 # Alive but silent: a tool call in progress. Say so, so the
                 # IDE's watchdog is pushed out and the user sees it is working.
-                if progress:
-                    progress('still %s (%ds)' % (('running ' + in_flight) if in_flight else 'working',
-                                                 int(now - last_seen)))
+                beat('still %s (%ds)' % (('running ' + in_flight) if in_flight else 'working',
+                                         int(now - last_seen)))
                 continue
             if line is None:
                 break
@@ -453,7 +557,7 @@ def run_claude(prompt, args, resume_session=None, timeout=TURN_BUDGET_S, hard_de
                 continue
             saw_output = True
             last_seen = time.monotonic()
-            deadline = min(last_seen + timeout, hard)
+            deadline = min(last_seen + IDLE_S, hard)
             try:
                 ev = json.loads(line)
             except ValueError:
@@ -466,8 +570,7 @@ def run_claude(prompt, args, resume_session=None, timeout=TURN_BUDGET_S, hard_de
                 for b in (ev.get('message') or {}).get('content') or []:
                     if isinstance(b, dict) and b.get('type') == 'tool_use':
                         in_flight = b.get('name') or 'a tool'
-                        if progress:
-                            progress(tool_call_summary(b))
+                        beat(tool_call_summary(b))
             elif t == 'user':
                 # The tool result came back; the agent is generating again.
                 in_flight = None
@@ -475,7 +578,13 @@ def run_claude(prompt, args, resume_session=None, timeout=TURN_BUDGET_S, hard_de
                 result = str(ev.get('result', '') or '')
                 sid = ev.get('session_id')
                 is_error = bool(ev.get('is_error'))
+            if last_seen - last_beat >= TOOL_HEARTBEAT_S:
+                # Streaming steadily, and nothing above has spoken for a while:
+                # the stream keeps US alive but says nothing to the IDE.
+                beat('still %s' % (('running ' + in_flight) if in_flight else 'generating'))
         proc.wait()
+        with _LIVE_LOCK:
+            _LIVE.discard(proc)
         return proc.returncode, result, sid, is_error, ''.join(errs), saw_output
 
     rc, result, sid, is_error, stderr, saw_output = run(_STDIN_PROMPT[0])
@@ -526,14 +635,14 @@ class Bridge:
             sid = self.sessions.get(chat)
             killed = self.killed.pop(chat, None)
         # The absolute cap for the whole answer, retry included; the silence
-        # budget (run_claude's `timeout`) restarts with every sign of life.
-        hard = time.monotonic() + HARD_CAP_S
+        # budget (IDLE_S) restarts with every sign of life under it.
+        hard = hard_deadline_from(self.args)
 
         def remaining():
-            return int(hard - time.monotonic())
+            return hard - time.monotonic()      # inf when --hard-cap 0
 
         if sid is None:
-            text, new_sid = run_claude(first_prompt(request), self.args,
+            text, new_sid = run_claude(first_prompt(request, killed=killed), self.args,
                                        hard_deadline=hard, progress=progress)
         else:
             try:
@@ -550,7 +659,7 @@ class Bridge:
                         f'the session was gone ({e}) and there was no time left '
                         f'in this turn to start a fresh one') from e
                 print(f'  [session {sid} is gone ({e}); starting a fresh session]', flush=True)
-                text, new_sid = run_claude(first_prompt(request), self.args,
+                text, new_sid = run_claude(first_prompt(request, killed=killed), self.args,
                                            hard_deadline=hard, progress=progress)
         if new_sid:
             with self.lock:
@@ -637,9 +746,11 @@ class Bridge:
                         print(f'» completion request from chat {msg.get("from")!r} '
                               f'(corr {msg.get("corr_id")}) — running claude…', flush=True)
                         warn_if_stale()
-                        # One thread per request so a slow run doesn't stall the
-                        # stream. The IDE serializes turns per chat, so a given
-                        # chat's session id is never touched concurrently.
+                        # One thread per request so a slow run doesn't stall
+                        # the stream. Safe because the IDE serializes turns per
+                        # chat - confirmed by Gilad, 2026-09-19 - so a given
+                        # chat's session id is never touched concurrently, and
+                        # two runs never --resume the same session.
                         threading.Thread(target=self.answer, args=(msg,), daemon=True).start()
             except Exception as e:
                 print(f'[stream dropped: {e}; reconnecting]', file=sys.stderr, flush=True)
@@ -660,7 +771,17 @@ def main():
     ap.add_argument('--claude-bin', default='claude')
     ap.add_argument('--claude-args', default='',
                     help='extra args passed to claude, e.g. "--permission-mode plan"')
+    ap.add_argument('--hard-cap', type=int, default=HARD_CAP_S, metavar='SECONDS',
+                    help='absolute limit on one answer, however alive the agent is '
+                         '(default %(default)s, 0 for none). Silence is bounded separately '
+                         f'and always, at {IDLE_S}s.')
     args = ap.parse_args()
+
+    # A run outlives a plain Ctrl-C now that each one has its own session, so
+    # the bridge takes responsibility for ending them. SIGTERM does not run
+    # atexit handlers by itself, hence the explicit handler.
+    atexit.register(kill_live_runs)
+    signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
 
     refuse_stale_front_door(args.origin)
     token = fetch_token(args.origin)

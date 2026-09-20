@@ -13,40 +13,25 @@
      croquet-probes/run.sh ampleforth-sync-probe.js [js]
 
    N (12 characters)  CADENCE_MS (120)  NS_PAGE (croquetpsoup-test.html)
+   NS_SNAPSHOT (CroquetHopscotchWebIDE-TEST.vfuel)
+
+   Negative control - a green probe proves nothing on its own. Build the same
+   tree with the fix undone and run against it; the first assertion must fail:
+
+     cd tool && ./build-bugged-test-vfuel.sh
+     NS_SNAPSHOT=CroquetHopscotchWebIDE-BUG.vfuel \
+       croquet-probes/run.sh ampleforth-sync-probe.js
 
    The first assertion is the regression itself: typing in the live view must
    record events. A probe that only compared the two views would have passed
    for a week while nothing synchronized, because both views were equally
    stale.
 
-   INCOMPLETE 2026-09-19: everything below the navigation works, but no
-   candidate expression opens a document, so the probe bails before it asserts
-   anything. What the workspace answered (SCOUT=1 prints it): `ide` and
-   `ide documents` resolve, `enterSubject:` is understood by neither the IDE
-   nor the workspace object, and there is no `ide shell` - navigation lives on
-   presenters and HopscotchWindow, which a workspace evaluation cannot reach.
-   The IDE shows a document through TwoViewEditorPresenter class>>onSubject:,
-   an ObjectSubject over a Document, and Gilad reaches one by browsing to the
-   document's class (nested in `ide documentHolder`) - which needs a
-   REGISTERED document class, and the only creator,
-   createDocumentSubclassNamed:body:, is not public.
-
-   Why no expression can fix this: a workspace evaluation's `self` is the
-   Workspace MODEL object (WorkspaceManager `public class Workspace new`), and
-   navigation exists only on presenters and HopscotchWindow. No object an
-   expression opens is a presenter, so evaluation can never navigate - a hook
-   for this has to be CLICK-triggered from a presenter, not evaluated.
-
-   So finishing this needs one of: (a) a link on the workspaces page whose
-   action creates a document and enters `ide browsing ObjectSubject onModel:
-   (ObjectMirror reflecting: theDocument)` - TwoViewEditorPresenter
-   class>>onSubject: turns exactly that into the two-view editor; (b) driving
-   the class browser to a registered document the way Gilad does by hand; or
-   (c) reusing setup-latejoin-probe's chat route (a ChatDocument is an
-   Ampleforth document, and that probe already drives the setup form against
-   its own mock AI server) - the least invasive, since it adds no production
-   code. Until then this file is a harness with its assertions unexercised -
-   do not read a pass from it. */
+   The navigation was the hard part and is now solved with no production code
+   at all: `ide browsing navigateTo:` (see openDocument below). An earlier note
+   here concluded that only a click from a presenter could navigate, because
+   the verb is on neither the Workspace model nor `ide`; it is on the Browsing
+   module, put there for the AI tools, which have no presenter either. */
 const { spawn } = require('child_process');
 const http = require('http');
 const WebSocket = require('ws');
@@ -54,7 +39,8 @@ const CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const SESSION = 'ample' + Math.floor(Date.now() / 1000);
 const JS = process.argv[2] === 'js';
 const PAGE = JS ? 'CroquetJSIDE-TEST.html?sessionId='
-                : (process.env.NS_PAGE || 'croquetpsoup-test.html') + '?snapshot=CroquetHopscotchWebIDE-TEST.vfuel&sessionId=';
+                : (process.env.NS_PAGE || 'croquetpsoup-test.html') + '?snapshot=' +
+                  (process.env.NS_SNAPSHOT || 'CroquetHopscotchWebIDE-TEST.vfuel') + '&sessionId=';
 const URL = 'http://localhost:8080/' + PAGE + SESSION + '&pwd=test&appId=org.newspeaklanguage.evprobe&apiKey=none&reflector=ws://localhost:9090&files=/files';
 const N = Number(process.env.N || 12), CADENCE = Number(process.env.CADENCE_MS || 120);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -101,15 +87,30 @@ async function boot(b) {
   console.log(b.tag + ' booted'); await sleep(4000);
 }
 /* Open a document. The IDE has no one-click 'new document', so the workspace
-   evaluates one into existence; the candidates differ only in how the
-   navigation verb is reached, and the first that puts a .self_ampleforth host
-   on the page wins. Reported, so a future change of scope is visible rather
-   than mysterious. */
-const MAKE = "(ide documents TwoViewEditorSubject onModel: (ide documents freshDocumentNamed: 'ProbeDoc' initialText: 'Probe body.'))";
+   evaluates one into existence AND navigates to it.
+
+   An evaluation can navigate after all. Browsing>>navigateTo: (public, it
+   just sends currentWindow enterSubject:) exists precisely for "callers that
+   need to drive navigation without holding a presenter" - the AI tools are in
+   that position too, and AI_IDE_Support drives a document with exactly the
+   expression below. The earlier belief that only a click from a presenter
+   could navigate came from looking for the verb on the Workspace model and on
+   `ide`, where it is indeed absent; it lives on the Browsing module.
+
+   `ide documents DocumentSubject` is the right subject, not
+   TwoViewEditorSubject: its presenter is DocumentPresenter, which HOLDS a
+   TwoViewEditorPresenter (slot `twoViewEditor`) and is what the IDE shows for
+   a document, chrome and all. TwoViewEditorSubject alone would still render a
+   live view, but through a presenter no IDE path builds, so a break in the
+   IDE's own wrapper would go unseen.
+
+   The candidates are kept as a list so that a scope change names itself: the
+   first expression that puts a .self_ampleforth host on the page wins, and
+   every failure prints what the workspace answered. */
+const MAKE = "(ide documents freshDocumentNamed: #ProbeDoc initialText: 'Probe body.')";
 const CANDIDATES = [
-  'ide enterSubject: ' + MAKE,
-  'enterSubject: ' + MAKE,
-  'ide shell enterSubject: ' + MAKE,
+  'ide browsing navigateTo: (ide documents DocumentSubject onModel: ' + MAKE + ')',
+  'ide browsing navigateTo: (ide documents TwoViewEditorSubject onModel: ' + MAKE + ')',
 ];
 /* The workspace's control is 'Evaluate Selection': it evaluates what is
    selected, and replaceSelection leaves the caret after the insertion with

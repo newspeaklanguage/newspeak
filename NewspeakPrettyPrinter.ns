@@ -1,6 +1,6 @@
 Newspeak3
 'Root'
-class NewspeakPrettyPrinter usingPlatform: platform ast: astModule parser: commonParser metadata: mdModule = Object new (
+class NewspeakPrettyPrinter usingPlatform: platform ast: astModule parser: commonParser metadata: mdModule memberOrder: memberOrderBlock <[:String :String | Boolean]> = Object new (
 	(* Pretty-printer for Newspeak source.
 
 The module exposes two layers of API.
@@ -42,6 +42,18 @@ Factory parameters:
 	|
 		private List = platform collections List.
 		private StringBuilder = platform kernel StringBuilder.
+		(* How two member names compare, for canonical order. Supplied
+	   rather than implemented here, and supplied as a CLOSURE rather
+	   than by importing the module that defines it: the definition
+	   lives in Mirrors (memberNameLessOrEqual:than:), which the IDE's
+	   save path also uses, so printing and saving cannot drift apart
+	   -- and a formatter has no business holding the authority to
+	   reflect on every class in the image just to compare two
+	   strings. There is deliberately no default: a printer that
+	   quietly fell back to source order would emit files the IDE
+	   reorders on the next save, which is the churn canonical order
+	   exists to remove. *)
+		private memberOrder <[:String :String | Boolean]> = memberOrderBlock.
 		private ASTTool = astModule ASTTool.
 		private metadataModule = mdModule.
 		private commonParser_ = commonParser.
@@ -478,6 +490,29 @@ Slots:
 				].
 			memoCommentIndex: idx at: limit.
 			cursor:: pos
+		)
+		hasUnconsumedCommentsUpTo: pos <Integer> ^<Boolean> = (
+			(* Whether emitCommentsUpTo:inline: would emit anything: the same
+	   scan and the same guards, but consuming nothing and leaving the
+	   cursor alone. Lets a caller decide about separators BEFORE
+	   emitting, which is the only way to space a comment off its
+	   delimiters without spacing an empty pair of them apart -- see
+	   visitBlock:, where '[]' must stay '[]' while '[ (* why *) ]'
+	   wants the spaces. *)
+			
+			| idx limit |
+			source isNil ifTrue: [ ^false ].
+			pos isNil ifTrue: [ ^false ].
+			pos <= 0 ifTrue: [ ^false ].
+			pos <= cursor ifTrue: [ ^false ].
+			ensureCommentTable.
+			limit:: clampToWindow: pos.
+			idx:: commentIndexFrom: cursor.
+			[ idx <= commentTable size and: [ ((commentTable at: idx) at: 1) < limit ] ] whileTrue: [
+					(consumedFlags at: idx) ifFalse: [ ^true ].
+					idx:: idx + 1
+				].
+			^false
 		)
 		clampToWindow: pos <Integer> ^<Integer> = (
 			(* An emission bound of pos, reduced to the current member's
@@ -1075,21 +1110,21 @@ Slots:
 			entryPos:: (side start isNil or: [ side start <= 0 ]) ifTrue: [ cursor ]
 				ifFalse: [ side start ].
 			indented: [
+					side lazySlots isNil not ifTrue: [
+							(sortedByName: side lazySlots by: [:slot | slot name ]) do: [:slot |
+									emitMember: slot of: side from: entryPos with: [:m | visitLazySlot: m ]
+								]
+						].
 					side nestedClasses isNil not ifTrue: [
-							side nestedClasses do: [:cls |
+							(sortedByName: side nestedClasses by: [:cls | cls name ]) do: [:cls |
 									emitMember: cls
 										of: side
 										from: entryPos
 										with: [:m | visitClassDeclaration: m ]
 								]
 						].
-					side lazySlots isNil not ifTrue: [
-							side lazySlots do: [:slot |
-									emitMember: slot of: side from: entryPos with: [:m | visitLazySlot: m ]
-								]
-						].
 					side methods isNil not ifTrue: [
-							side methods do: [:m |
+							(sortedByName: side methods by: [:m | m pattern selector ]) do: [:m |
 									emitMember: m of: side from: entryPos with: [:mm | visitMethod: mm ]
 								]
 						].
@@ -1185,11 +1220,43 @@ Slots:
 		membersOf: side do: block = (
 			(* Every member of a side, in bin order. Callers that care about
 	   source order sort or scan for themselves. *)
-			
+
 			side isNil ifTrue: [ ^self ].
 			side nestedClasses isNil ifFalse: [ side nestedClasses do: block ].
 			side lazySlots isNil ifFalse: [ side lazySlots do: block ].
 			side methods isNil ifFalse: [ side methods do: block ]
+		)
+		sortedByName: members by: nameBlock ^<List> = (
+			(* One bin of a side's members in CANONICAL order: by name, so that
+	   the order of a class in a file is a function of the file and of
+	   nothing else.
+
+	   Canonical order exists so that printing a class and saving it
+	   from the IDE produce the same text. The bins come out lazy
+	   slots, then nested classes, then methods -- the order the class
+	   browser shows -- and this puts each bin in name order within
+	   that. Without it, file order was the order members were last
+	   EDITED: the IDE stores each member separately and emits them in
+	   the image's order, where recompiling a member moves it to the
+	   end (MirrorsForPrimordialSoup MethodGroup>>addFromSource:), so
+	   every save relocated whatever had been touched and no printer
+	   could predict where.
+
+	   The comparison itself is `memberOrder`, handed to this module by
+	   whoever built it and defined in Mirrors, so that what this
+	   prints and what the IDE saves cannot disagree.
+
+	   A copy is sorted, not the AST's own list: the caller may hold
+	   the AST for other purposes, and emission should not rearrange
+	   it. Reordering is safe for comments because a member's window
+	   is computed from source positions, not from a running cursor
+	   -- see commentWindowLowerBoundFor:of:from:. *)
+
+			| sorted = List withAll: members. |
+			sorted sort: [:a :b |
+					memberOrder value: (nameBlock value: a) value: (nameBlock value: b)
+				].
+			^sorted
 		)
 		visitMethod: node = (
 			(* [accessModifier] selector params [^<retType>] = (
@@ -1532,10 +1599,14 @@ Slots:
 				]
 				ifFalse: [
 					
-					(* No temps, no stmts. Drain any interior comments
-			   between '[' and ']' inline. *)
+					(* No temps, no stmts. Drain any interior comments between
+			   '[' and ']' inline, spaced off the brackets -- but only
+			   when there is something to drain. The space used to go in
+			   unconditionally, so every empty block printed as '[ ]'.
+			   emitCommentsUpTo: is still called either way: it advances
+			   the cursor, and skipping it would strand the scan. *)
 					(node end isNil not and: [ node end > 0 ]) ifTrue: [
-							space.
+							(hasUnconsumedCommentsUpTo: node end) ifTrue: [ space ].
 							emitCommentsUpTo: node end inline: true
 						]
 				].

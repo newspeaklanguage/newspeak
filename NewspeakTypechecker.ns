@@ -158,6 +158,13 @@ Use and distribution of this software is subject to the terms of the attached so
 	arrayMixin:: (kernelMixin nestedClasses findMirrorNamed: #_Array) instanceSide.
 	seedBuiltinSuperclasses.
 ) (
+	lazy subclassIndex <Map[MixinMirror, Set[MixinMirror]]> ::= (* The inverse of superclassTable: for each mixin, its DIRECT subclasses. Incremental
+propagation walks this downward, because a member lookup is recorded against the
+class that was asked rather than the class that answers.
+
+Lazy, not a header slot, so that hot-loading this class into a live image cannot
+leave an existing typechecker with the slot unset -- schema migration fills a new
+eager slot with nil and does not re-run the initializer. *) Map new.
 	class AccessErrorType new = ErrorType new (
 		(* A special type for access errors. These need to be reported whenever they come up, so they need to be preserved in caches.
    This, they are distinct from normal type errors. *)
@@ -299,6 +306,15 @@ Use and distribution of this software is subject to the terms of the attached so
 			s nextPutAll: returnType printString.
 			s nextPut: ']'
 		)
+		public sameTypeAs: other <Type> ^<Boolean> = (
+			(* ClosureType>>#= already compares parameter types element-wise, but with #= on
+each element; this recurses with sameTypeAs: so nested function and generic types
+are compared structurally too. *)
+			
+			(typeKindOf: self) = (typeKindOf: other) ifFalse: [ ^false ].
+			(typeList: parameterTypes sameAs: other parameterTypes) ifFalse: [ ^false ].
+			^returnType sameTypeAs: other returnType
+		)
 		public subtypeOf: t <Type> ^<Boolean> = (
 			(* Closure types use structural subtyping with contravariant parameters and covariant return types *)
 			
@@ -334,7 +350,7 @@ Use and distribution of this software is subject to the terms of the attached so
 		(* A structural, mirror-independent identity for a typecheckable declaration:
 	the top-level-rooted simple-name path of its enclosing class, the side
 	(#instance | #class), the kind (#method | #lazySlot | #classHeader |
-	#expression | #absent), and the member name. Used to key dependency tracking
+	#expression | #lookup), and the member name. Used to key dependency tracking
 	so that an edit -- which on the psoup VM preserves mixin/class identity via
 	become: but produces fresh method objects -- can still map back to the
 	pre-edit dependency edges. Pure value object: equal Declarations are
@@ -450,6 +466,15 @@ Use and distribution of this software is subject to the terms of the attached so
 			
 			^objectMixin
 		)
+		public sameTypeAs: other <Type> ^<Boolean> = (
+			(* Element-wise over the domain, then the range. FunctionType>>#= compares domains
+with List>>#=, which is identity here, so it answers false for every pair of
+separately built signatures -- the exact reason this selector exists. *)
+			
+			(typeKindOf: self) = (typeKindOf: other) ifFalse: [ ^false ].
+			(typeList: domain sameAs: other domain) ifFalse: [ ^false ].
+			^range sameTypeAs: other range
+		)
 		public subtypeOf: t <Type> ^<Boolean> = (
 			| ft <FunctionType> ftd <List[Type]> |
 			t isKindOfErrorType ifTrue: [ ^true ].
@@ -563,6 +588,15 @@ Use and distribution of this software is subject to the terms of the attached so
 					s nextPut: ' '
 				].
 			s nextPut: ']'
+		)
+		public sameTypeAs: other <Type> ^<Boolean> = (
+			(* Same mixin and element-wise equal type arguments. GenericType>>#= compares the
+argument lists with List>>#=, so List[Integer] is currently not equal to a
+separately built List[Integer]. *)
+			
+			(typeKindOf: self) = (typeKindOf: other) ifFalse: [ ^false ].
+			mixin = other mixin ifFalse: [ ^false ].
+			^typeList: typeArguments sameAs: other typeArguments
 		)
 		public subtypeOf: t <Type> ^<Boolean> = (
 			(* Generic types are subtypes if:
@@ -720,6 +754,15 @@ Use and distribution of this software is subject to the terms of the attached so
 			s nextPutAll: ' forMixin: '.
 			s nextPutAll: mixin name
 		)
+		public sameTypeAs: other <Type> ^<Boolean> = (
+			(* Same kind and same underlying mixin. The kind test carries real weight:
+ObjectType>>#= accepts anything answering isKindOfObjectType, so without it a
+SelfType, a GenericType or a TypeVariable would compare equal to a plain
+ObjectType over the same mixin. *)
+			
+			(typeKindOf: self) = (typeKindOf: other) ifFalse: [ ^false ].
+			^mixin = other mixin
+		)
 		selfIdAST ^<AST> = (
 			| tree <AST> |
 			assert: [ path isEmpty not ] message: 'Object type must have non-empty path'.
@@ -874,12 +917,43 @@ Use and distribution of this software is subject to the terms of the attached so
 			^mixin = o mixin
 		)
 		public at: selector <Symbol> ^<FunctionType> = (
-			(* override superclass to avoid access check. Maybe we just want to create an overridable access check to be called
-from ObjectType>>at: instead? *)
+			(* An outer send is spelled `outer C m`, and the parser makes that a reference to
+the pseudo-variable `outer` followed by two ordinary unary sends, so BOTH hops
+land here: first the selector C naming a lexically enclosing class, then the
+member m on the result.
+
+The class hop comes first. It answers a niladic FunctionType whose range is the
+OuterType of the named class, so the member hop becomes an at: on that class with
+its own any-modifier access. Without it, C was looked up as a member of the
+ASKING class -- which it never is -- so every outer send answered errorType and
+no outer send in the language typechecked at all.
+
+The member hop uses selfMember:at:, which is exactly the outer-send rule:
+everything declared in the named class whatever its modifier, then public and
+protected up its superclass chain. The old code used localMember:in:, which
+missed the inherited half.
+
+Ambiguity documented rather than resolved: if a member of the named class shares
+its name with a class enclosing it, the class hop wins, because hop one of an
+outer send must always be a class name and nothing in the AST says which hop this
+is.
+
+There is deliberately no signatureForNestedClass: override here any more. It
+answered a nested class's INSTANCE type, which suited the old reading in which
+`outer N` itself selected a nested class. Now that the class hop resolves the
+enclosing class, the only nested class reaching this code is one selected as an
+ordinary member, as in `outer C N` -- and sending N to an instance of C answers
+the class, so ObjectType's version is the correct one. *)
 			
-			| m <Mirror> = localMember: selector in: mixin. signature <MessagePatternAST> |
+			| enclosing <MixinMirror | Nil> m <Mirror> signature <MessagePatternAST> |
+			enclosing:: enclosingClassNamed: selector from: mixin.
+			nil = enclosing ifFalse: [
+					^FunctionType domain: {} range: (OuterType forMixin: enclosing)
+				].
+			m:: selfMember: selector at: mixin.
 			nil = m ifTrue: [ ^errorType ].
 			signature:: signatureFor: m withSelector: selector.
+			nil = signature ifTrue: [ ^errorType ].
 			
 			(* deal with substitution of Self *)
 			^(applyForeignSignature: (signature apply: selfSubstitution)
@@ -889,18 +963,6 @@ from ObjectType>>at: instead? *)
 		)
 		public isKindOfOuterType ^<Boolean> = (
 			^true
-		)
-		signatureForNestedClass: m <ClassDeclarationMirror> ^<MessagePatternAST> = (
-			(* override superclass so that we get the instance side, not the class side.
-This is because outer N signifies a receiver that is an instance of N
-whereas normally, a nested class N, gives us a receiver of type N class. *)
-			
-			^MessagePatternAST new selector: m name;
-				parameters: {};
-				returnType: (TypeIdAST new name: m name;
-						yourself);
-				accessModifier: m accessModifier;
-				yourself
 		)
 		public subtypeOf: t <Type> ^<Boolean> = (
 			^self = t
@@ -922,7 +984,7 @@ gets instantiated. *)
 			
 			o isKindOfPseudoType ifFalse: [ ^false ].
 			o isKindOfHereType ifTrue: [ ^false ].
-			o is isKindOfOuterType ifTrue: [ ^false ].
+			o isKindOfOuterType ifTrue: [ ^false ].
 			mixin = o mixin
 		)
 		public isKindOfPseudoType ^<Boolean> = (
@@ -1195,6 +1257,29 @@ for the current class, not the superclass *)
 		)
 		public isKindOfTypeParameterType ^<Boolean> = (
 			^false
+		)
+		public sameSignatureAs: other <Type> ^<Boolean> = (
+			(* Compare two results of a member lookup. A lookup answers a FunctionType when
+the selector resolves and an error type when it does not, so this is defined on
+Type rather than on FunctionType: the incremental propagation compares whatever
+was cached against whatever was just recomputed, without type-testing either. *)
+			
+			^sameTypeAs: other
+		)
+		public sameTypeAs: other <Type> ^<Boolean> = (
+			(* Structural type equivalence, used to decide whether a recomputed signature
+actually differs from the cached one. Deliberately CONSERVATIVE: the default is
+identity, so any type that does not explicitly know how to compare itself answers
+false and the caller treats the signature as changed. Over-invalidation is always
+correct; a false 'unchanged' silently drops a needed re-check. Identity is also
+the right answer for the singleton types (errorType, accessErrorType, bottom).
+
+This deliberately does NOT route through #= . List>>#= is identity on this
+platform, so the List-holding types compare their contents by identity, and
+ObjectType>>#= compares mixins only -- which makes a TypeVariable equal to its own
+bound. *)
+			
+			^self == other
 		)
 		public subtypeOf: t <Type> ^<Boolean> = (
 			subclassResponsibility
@@ -1516,6 +1601,14 @@ for the current class, not the superclass *)
 		public isKindOfTypeVariable ^<Boolean> = (
 			^true
 		)
+		public sameTypeAs: other <Type> ^<Boolean> = (
+			(* A type variable is identified by its NAME as well as its bound. TypeVariable>>#=
+compares mixins only, so E and K over the same bound are equal by it and a change
+from one to the other would look like no change at all. *)
+			
+			(typeKindOf: self) = (typeKindOf: other) ifFalse: [ ^false ].
+			^name = other name and: [ mixin = other mixin ]
+		)
 		public subtypeOf: t <Type> ^<Boolean> = (
 			^bound subtypeOf: t
 		)
@@ -1548,21 +1641,18 @@ for the current class, not the superclass *)
 			
 			^objectMixin
 		)
+		public sameTypeAs: other <Type> ^<Boolean> = (
+			(* Order-sensitive, element-wise. Two unions of the same types in a different
+order answer false, which over-invalidates rather than missing a change. *)
+			
+			(typeKindOf: self) = (typeKindOf: other) ifFalse: [ ^false ].
+			^typeList: elements sameAs: other elements
+		)
 		public subtypeOf: t <Type> ^<Boolean> = (
 			^elements inject: true
 				into: [:b <Boolean> :e <Type> | b and: [ e subtypeOf: t ] ]
 		)
 	) : ()
-	absenceDeclarationsFor: selector <Symbol> from: mixin <MixinMirror> ^<List[Declaration]> = (
-		| result <List[Declaration]> current <MixinMirror> |
-		result:: List new.
-		current:: mixin.
-		[ current ~= nil ] whileTrue: [
-				result add: (declarationFor: current kind: #absent name: selector).
-				current:: superclassOf: current
-			].
-		^result
-	)
 	anyMember: selector <Symbol> at: mixin <MixinMirror> ^<MethodMirror | ClassDeclarationMirror | SlotDeclarationMirror | Nil> = (
 		(* This routine is useful for delivering better errors. In cases where a member exists but is inaccessible, users may be confused
     as to why no member was found. If we can't find a legal member, we can call this routine to find out if an inacessible meber
@@ -1607,10 +1697,15 @@ for the current class, not the superclass *)
 	)
 	cacheableSignature: t <Type> ^<Boolean> = (
 		(* Error and access-error signature results must not be cached: an undefined
-	selector may become defined after an edit (its absence is tracked precisely via
-	#absent dependencies, not via a cached negative), and the cycle guard returns
-	errorType transiently. AccessErrorType is a subclass of ErrorType, so the one
-	test covers both. *)
+selector may become defined after an edit, and the cycle guard returns errorType
+transiently, so a cached negative would freeze either one. AccessErrorType is a
+subclass of ErrorType, so the one test covers both.
+
+Leaving them uncached is now load-bearing rather than merely cheap.
+propagateMemberChangeOf:at: reads the cached answer for a lookup and treats its
+ABSENCE as a change, which is how a selector that did not resolve before the edit
+gets its dependents re-checked. Caching error results would therefore need the
+walk to distinguish a genuine not-found from a transient cycle break first. *)
 		
 		^t isKindOfErrorType not
 	)
@@ -1633,6 +1728,11 @@ for the current class, not the superclass *)
 		dependentQueries:: Map new.
 		queriesOfDeclaration:: Map new.
 		namespaceDependents:: Map new.
+		
+		(* Safe to drop here, unlike in flushClassStructureCaches: with every cached
+	answer gone there is nothing left for a downward walk to invalidate, and the
+	index refills as classes are queried again. *)
+		subclassIndex:: Map new.
 		flushClassStructureCaches
 	)
 	public codeBodyNode: node ^<ObjectType> = (
@@ -1652,12 +1752,12 @@ for the current class, not the superclass *)
 		^lastStatementType
 	)
 	computeSuperclassOf: klass <MixinMirror> ^<MixinMirror | Nil> = (
-		| header = klass declaration header. headerAst = parser parseClassHeader: header source. superclassClause <SendAST> = headerAst superclassCall. superclassClauseType <ObjectType> enclosing <MixinMirror | Nil> = klass enclosingMixin. result |
+		| header = klass declaration header. headerAst = parser parseClassHeader: header source. superclassClause <SendAST> = headerAst superclassCall. superclassClauseType <ObjectType> enclosing <MixinMirror | Nil> = klass enclosingMixin. resolved <Boolean> ::= false. result |
 		
 		(* ('computing superclass of : ', klass name) out.
 	klass out. *)
 		^enclosing isNil ifTrue: [
-				superclassTable at: klass put: objectMixin.
+				recordSuperclassOf: klass is: objectMixin.
 				
 				(* 'Found Object for top level class' out. *)
 				objectMixin
@@ -1672,8 +1772,29 @@ for the current class, not the superclass *)
 			   positionally); a genuinely undefined superclass type is reported when
 			   klass's header is checked in typecheckClassHeader:. *)
 				suppressUndefinedDepth:: suppressUndefinedDepth + 1.
-				superclassClauseType:: [ superclassClause apply: self ] ensure: [
-						suppressUndefinedDepth:: suppressUndefinedDepth - 1
+				
+				(* A class header is not evaluated inside any method, so the scope stack may
+			   be empty (this runs from superclassOf:, which entry points call before
+			   any typecheck has pushed a scope). Visiting the clause reaches typeOfLocal:
+			   -> currentScope -> scopeStack last, which fails on an empty stack. Push a
+			   parentless scope: the clause's argument expressions (klass's own factory
+			   parameters) then resolve to nil rather than raising, and no method locals
+			   are visible to a header, which is what we want. *)
+				pushScope: (Scope parent: nil).
+				superclassClauseType:: [
+					| t <ObjectType> |
+					t:: superclassClause apply: self.
+					resolved:: true.
+					t
+				] ensure: [
+						popScope.
+						suppressUndefinedDepth:: suppressUndefinedDepth - 1.
+						
+						(* If the visit was curtailed, drop the cycle marker written above.
+				   Leaving it behind poisons the table permanently: superclassOf:
+				   maps cycle to objectMixin, so the class's whole inheritance chain
+				   silently collapses to Object on every later query. *)
+						resolved ifFalse: [ superclassTable removeKey: klass ifAbsent: [] ]
 					].
 				setClass: klass.
 				
@@ -1681,7 +1802,7 @@ for the current class, not the superclass *)
 				superclassClauseType mixin = nil ifTrue: [
 						
 						(* 'Error, superclass mixin is nil, returning object mixin' out. *)
-						superclassTable at: klass put: objectMixin.
+						recordSuperclassOf: klass is: objectMixin.
 						^objectMixin
 					].
 				superclassClauseType mixin isMeta ifFalse: [
@@ -1701,7 +1822,7 @@ for the current class, not the superclass *)
 									apps isEmpty ifTrue: [ nil ] ifFalse: [ apps first superclass mixin ]
 								] on: Error do: [:e | nil ].
 								runtimeSuper isNil ifFalse: [
-										superclassTable at: klass put: runtimeSuper.
+										recordSuperclassOf: klass is: runtimeSuper.
 										^runtimeSuper
 									]
 							].
@@ -1709,7 +1830,7 @@ for the current class, not the superclass *)
 							at: {superclassClause start. superclassClause end. }.
 						
 						(* 'Error, non meta, returning object mixin' out. *)
-						superclassTable at: klass put: objectMixin.
+						recordSuperclassOf: klass is: objectMixin.
 						^objectMixin
 					].
 				
@@ -1717,7 +1838,7 @@ for the current class, not the superclass *)
 				result:: superclassClauseType mixin declaration instanceSide.
 				
 				(* 'found: ' out. result out. *)
-				superclassTable at: klass put: result
+				recordSuperclassOf: klass is: result
 			]
 	)
 	currentConflictNamespace = (
@@ -1747,23 +1868,27 @@ for the current class, not the superclass *)
 		^declarationFor: (mixinOf: c) kind: kind name: selector
 	)
 	declarationsForSignatureQuery: q <SignatureQuery> ^<List[Declaration]> = (
-		(* The declarations a signature lookup (T, selector) depends on. If the
-	selector resolves (local or inherited), it depends on the single declaration
-	that defines it -- editing that member changes the answer. If it does NOT
-	resolve, the (errorType) answer depends on the *absence* of the selector along
-	the whole lookup chain: adding the selector to T or any ancestor must
-	invalidate, so we return an #absent declaration per class on the chain. Types
-	with no mixin (closures-as-values aside, unions, pseudo types) contribute no
-	structural dependency. *)
+		(* The single declaration a member lookup (T, selector) depends on: the #lookup
+declaration of T's own class. It names the EFFECTIVE result of looking selector up
+from T -- whether that resolves locally, resolves in an ancestor, or does not
+resolve at all.
+
+Recording the class that was ASKED rather than the class that ANSWERS is what
+makes an added override visible. The previous scheme recorded, for a lookup that
+resolved, the declaration of the defining ancestor; a newly added declaration on
+the subclass therefore had no dependents at all and the stale inherited signature
+survived the edit. It also retires #absent: a lookup that fails is now an
+ordinary lookup whose answer is simply not cached, and propagateMemberChangeOf:at:
+treats an uncached answer as changed.
+
+One edge per query, instead of one per class on the superclass chain. Types with
+no mixin (unions, closures as values, some pseudo types) contribute no structural
+dependency; invalidation of those falls back to the namespace edges. *)
 		
-		| t = q type. sel = q selector. mixin <MixinMirror | Nil> defining <MixinMirror | Nil> |
+		| t = q type. mixin <MixinMirror | Nil> |
 		[ mixin:: t mixin ] on: Exception do: [:ex | ^{} ].
 		mixin isNil ifTrue: [ ^{} ].
-		defining:: definingMixinOfMember: sel in: mixin.
-		defining isNil ifTrue: [ ^absenceDeclarationsFor: sel from: mixin ].
-		^{declarationFor: defining
-			kind: (kindForMember: (localMember: sel in: defining))
-			name: sel. }
+		^{declarationFor: mixin kind: #lookup name: q selector. }
 	)
 	declarationsForSubtypeQuery: q <SubtypeQuery> ^<List[Declaration]> = (
 		(* A subtype test S <: T depends on the class headers (superclass chains) of
@@ -1819,18 +1944,6 @@ for the current class, not the superclass *)
 			].
 		^result
 	)
-	definingMixinOfMember: selector <Symbol> in: mixin <MixinMirror> ^<MixinMirror | Nil> = (
-		(* The mixin in which selector is actually defined, walking local then up the
-	superclass chain; nil if undefined. *)
-		
-		| current <MixinMirror> |
-		current:: mixin.
-		[ current ~= nil ] whileTrue: [
-				(localMember: selector in: current) ~= nil ifTrue: [ ^current ].
-				current:: superclassOf: current
-			].
-		^nil
-	)
 	defVarNameIfDefType: t ^<Symbol | Nil> = (
 		(* If t is the annotation `def E` (a UnaryTypeOpAST whose operand is the TypeId #def),
 	   answer E; otherwise nil. *)
@@ -1853,6 +1966,54 @@ for the current class, not the superclass *)
 				name isNil ifFalse: [ result add: {name. i. } ]
 			].
 		^result
+	)
+	descendantsOf: mixin <MixinMirror> ^<List[MixinMirror]> = (
+		(* The classes whose lookup of a member can resolve to one of mixin's: its direct
+SUBCLASSES, which inherit it, and the classes lexically NESTED in it, whose
+implicit sends reach it through lexical scope.
+
+Both directions are needed and neither substitutes for the other. A nested class
+is not a subclass, so a subclass-only walk never re-checks a nested class that
+implicit-sends an edited member -- and since the dependency is recorded against
+the class that ASKED (declarationsForSignatureQuery:) rather than the definer,
+nothing else reaches it either. This matters most for PRIVATE and PROTECTED
+members, whose callers are exactly the enclosing class and the classes nested in
+it: lexical scope ignores access modifiers, so those dependents are real.
+
+Both sides of each nested class are included; class-side code is lexically inside
+the enclosing class just as instance-side code is. Mirror access is guarded --
+a mixin whose nested classes cannot be enumerated contributes its subclasses
+alone rather than failing the whole walk. *)
+		
+		| result <List[MixinMirror]> = List new. |
+		(subclassIndex at: mixin ifAbsent: [ Set new ]) do: [:sub <MixinMirror> |
+				result add: sub
+			].
+		[
+			mixin nestedClasses do: [:nc <ClassDeclarationMirror> |
+					result add: nc instanceSide.
+					result add: nc classSide
+				]
+		] on: Error do: [:e |].
+		^result
+	)
+	enclosingClassNamed: name <Symbol> from: mixin <MixinMirror> ^<MixinMirror | Nil> = (
+		(* The lexically enclosing class of mixin named `name`, or nil. Used to resolve the
+first hop of an outer send, `outer C`, where C must name an enclosing class.
+
+The walk starts AT mixin rather than at its enclosing class, so `outer C m`
+written inside C itself resolves -- which is how outer is used to reach a member
+that a nearer lexical scope shadows. Mirror access is guarded: a chain that cannot
+be walked answers nil, which degrades the send to the member lookup rather than
+raising out of a typecheck. *)
+		
+		| current <MixinMirror | Nil> |
+		current:: mixin.
+		[ nil = current ] whileFalse: [
+				current name asSymbol = name ifTrue: [ ^current ].
+				current:: [ current enclosingMixin ] on: Error do: [:e | nil ]
+			].
+		^nil
 	)
 	error: msg <String> at: location <Pair[Integer]> = (
 		errorSet add: (TypeError message: msg start: location first end: location last)
@@ -1944,13 +2105,26 @@ for the current class, not the superclass *)
 	)
 	flushClassStructureCaches = (
 		(* A class header / superclass change can alter subtype relations and
-	inherited-member lookups program-wide. Conservatively drop the superclass and
-	TypeBuilder caches (both rebuild lazily); the built-in superclass seeds are
-	restored. v1 is wholesale; per-class flushing is a later precision upgrade. *)
+inherited-member lookups program-wide. Conservatively drop the superclass and
+TypeBuilder caches (both rebuild lazily); the built-in superclass seeds are
+restored. v1 is wholesale; per-class flushing is a later precision upgrade.
+
+The subtype trail goes too. It memoizes S <: T permanently, and a subtype answer
+depends on every class BETWEEN the two ends, not just the ends -- with A < B < C,
+re-parenting B off C left A <: C cached true forever, because the query's
+dependencies name only the two endpoint headers and nothing else cleared the
+trail. Dropping it here is the conservative answer; recording the dependency on
+the subtype's chain and invalidating selectively is the precision upgrade.
+
+subclassIndex is deliberately NOT dropped. This flush fires on exactly the event
+where the PRE-edit inheritance graph is needed: re-parenting a class means the
+classes that used to inherit through it must be notified, and after the flush
+they are reachable only through the index's retained edges. *)
 		
 		superclassTable:: Map new.
 		seedBuiltinSuperclasses.
-		typeBuilderCache:: Map new
+		typeBuilderCache:: Map new.
+		trail:: Map new
 	)
 	functionTypeOf: node <SendASTNode> receiverType: receiverType <ObjectType> ^<MsgSignature> = (
 		(* A query *)
@@ -1967,8 +2141,10 @@ for the current class, not the superclass *)
 	registers the current declaration's dependency on the query, so an edit can
 	invalidate exactly the affected entries (invalidateDeclaration:). Error/access-
 	error results are NOT cached (cacheableSignature:) -- an undefined selector may
-	become defined after an edit (its absence is tracked via #absent dependencies),
-	and cycle-breaking returns errorType transiently. *)
+	become defined after an edit, and cycle-breaking returns errorType transiently.
+	The dependency is registered BEFORE the cache is consulted, so a lookup that
+	fails still leaves an edge behind for the class it was asked about; that edge
+	is what lets propagation notice when the selector later appears. *)
 		query:: SignatureQuery type: receiverType selector: selector.
 		registerDependenciesOfQuery: query.
 		(cachedTypes includesKey: query) ifTrue: [ cacheHits:: cacheHits + 1 ]
@@ -2125,11 +2301,34 @@ using #localNonPrivateMember:in: as the building block. *)
 		(* To be called when declaration has changed.
 (a) Wipe clean the set of queries declaration depends on, because they were derived from an old version.
 (b) Invalidate all queries that depended on the old declaration and return the declarations that depend on them.
-(c) For a class-header change, also flush the superclass/TypeBuilder structure caches. *)
+(c) For a class-header change, flush the superclass/TypeBuilder/subtype structure
+caches and then recheck the member lookups cached anywhere in the subtree, whose
+answers the moved superclass chain may have changed (propagateHeaderChangeAt:).
+The flush comes FIRST so the recomputation reads the new chain; the walk itself
+uses the retained pre-edit subclassIndex to find whom to notify.
+(d) For a member change, propagate the new lookup of that name DOWN the subclass
+tree. Member lookups are recorded against the class that was ASKED, so (b) alone
+reaches only the dependents that named THIS class; the dependents of a subclass
+lookup that resolved here by inheritance -- or that resolved nowhere before this
+edit -- are reached by the walk. #expression is excluded from both: it names no
+member and heads no class. *)
 		
-		declaration kind = #classHeader ifTrue: [ flushClassStructureCaches ].
+		| affected <Set[Declaration]> = Set new. mixin <MixinMirror | Nil> |
+		declaration kind = #expression ifFalse: [
+				mixin:: mixinForDeclaration: declaration.
+				declaration kind = #classHeader ifTrue: [
+						flushClassStructureCaches.
+						mixin isNil ifFalse: [ affected addAll: (propagateHeaderChangeAt: mixin) ]
+					]
+					ifFalse: [
+						mixin isNil ifFalse: [
+								affected addAll: (propagateMemberChangeOf: declaration name at: mixin)
+							]
+					]
+			].
 		removeDependenciesOf: declaration.
-		^invalidateDependenciesOn: declaration
+		affected addAll: (invalidateDependenciesOn: declaration).
+		^affected
 	)
 	invalidateDependenciesOn: declaration <Declaration> ^<Set[Declaration]> = (
 		(* Will invalidate all queries that depended on the declaration. *)
@@ -2144,16 +2343,26 @@ using #localNonPrivateMember:in: as the building block. *)
 		^invalidDeclarations
 	)
 	public invalidateNamespaceName: name <Symbol> ^<Set[Declaration]> = (
-		(* To be called when a top-level class named `name` is added, removed, or
-	renamed in the namespace. Every declaration whose typecheck resolved `name`
-	through the namespace must be re-checked; invalidate each (clearing its queries
-	and cascading to its dependents) and return the full affected set. A header
-	change anywhere also means inherited-member/subtype relations may shift, so the
-	structure caches are flushed once up front. *)
+		(* To be called when a top-level class named `name` is added, removed, or renamed
+in the namespace. Every declaration whose typecheck resolved `name` through the
+namespace must be re-checked; invalidate each (clearing its queries and cascading
+to its dependents) and return the full affected set. A header change anywhere
+also means inherited-member/subtype relations may shift, so the structure caches
+are flushed once up front.
+
+The recorded dependents are READ, not consumed. They used to be removed here, but
+they are only rebuilt when a dependent is actually re-typechecked, so any
+declaration whose re-check never happened -- or raised -- lost its edge
+permanently, and a second invalidation of the same name became a silent no-op.
+Keeping them costs at worst a stale edge for a declaration that has stopped
+referencing the name, which merely re-checks it once more than needed. *)
 		
-		| affected <Set[Declaration]> = Set new. |
+		| affected <Set[Declaration]> = Set new. snapshot <List[Declaration]> = List new. |
 		flushClassStructureCaches.
-		(namespaceDependents removeKey: name ifAbsent: [ Set new ]) do: [:d <Declaration> |
+		(namespaceDependents at: name ifAbsent: [ Set new ]) do: [:d <Declaration> |
+				snapshot add: d
+			].
+		snapshot do: [:d <Declaration> |
 				affected add: d.
 				affected addAll: (invalidateDeclaration: d)
 			].
@@ -2193,10 +2402,6 @@ using #localNonPrivateMember:in: as the building block. *)
 	)
 	isPublic: m <Mirror> ^<Boolean> = (
 		^m ~= nil and: [ m accessModifier = #public ]
-	)
-	kindForMember: m <Mirror> ^<Symbol> = (
-		m isKindOfLazySlotMirror ifTrue: [ ^#lazySlot ].
-		^#method
 	)
 	lexicalMember: selector <Symbol> inScopeOf: mixin <MixinMirror> ^<MethodMirror | ClassDeclarationMirror | SlotDeclarationMirror | Nil> = (
 		(* Find the method named selector defined in this
@@ -2431,6 +2636,120 @@ Otherwise, check the main namespace. *)
 		mutableSlotsStack removeLast.
 		^scopeStack removeLast
 	)
+	propagateHeaderChangeAt: mixin <MixinMirror> ^<Set[Declaration]> = (
+		(* A class header changed, so both the superclass clause and the header's slots --
+and with them the accessors they declare -- may have moved. Unlike a member edit
+there is no single selector to walk, so enumerate the subtree once, collect every
+#lookup recorded for a class in it, and recheck each.
+
+Rechecking the collected declarations DIRECTLY, rather than replaying
+propagateMemberChangeOf:at: once per distinct selector, is what makes this
+affordable. The per-selector form looks appealing because that walk prunes, but
+it re-enumerates the whole subtree for every name and rebuilds a Declaration --
+path walk included -- at every class it visits. Measured on this module: about 85
+distinct names over a 60-class subtree at 2.2ms per walk, which is the 188ms it
+cost. The scan already holds each declaration, so no re-derivation is needed.
+
+What is given up is pruning: a selector whose answer is unchanged is still
+checked at every class that recorded it, instead of stopping at the first. That
+costs a map lookup per recorded pair, and recheckLookup:of:into: recomputes a
+signature only where an answer is actually cached to compare against.
+
+The subtree is the descendantsOf: closure, subclasses AND nested classes: a
+re-parent moves the superclass chain that an implicit send in a nested class
+searches after its lexical scope, so those lookups can shift too. It is computed
+from the retained pre-edit index, which is why flushClassStructureCaches must
+leave subclassIndex alone. *)
+		
+		| affected <Set[Declaration]> = Set new. worklist <List[MixinMirror]> = List new. visited <Set[MixinMirror]> = Set new. lookups <List[Declaration]> = List new. |
+		worklist addLast: mixin.
+		visited add: mixin.
+		[ worklist isEmpty ] whileFalse: [
+				| current <MixinMirror> = worklist removeFirst. |
+				(descendantsOf: current) do: [:sub <MixinMirror> |
+						(visited includes: sub) ifFalse: [
+								visited add: sub.
+								worklist addLast: sub
+							]
+					]
+			].
+		
+		(* Snapshot the keys: rechecking registers queries and would mutate the map. *)
+		dependentQueries keysAndValuesDo: [:d <Declaration> :qs <Set[Query]> |
+				d kind = #lookup ifTrue: [
+						| owner <MixinMirror | Nil> = mixinForDeclaration: d. |
+						owner isNil ifFalse: [
+								(visited includes: owner) ifTrue: [ lookups add: d ]
+							]
+					]
+			].
+		lookups do: [:d <Declaration> | recheckLookup: d of: d name into: affected ].
+		^affected
+	)
+	propagateMemberChangeOf: selector <Symbol> at: mixin <MixinMirror> ^<Set[Declaration]> = (
+		(* A member named selector was added to, removed from, or edited at mixin.
+Invalidate the cached member lookups whose answer that changes, and report the
+declarations that depended on them.
+
+A signature query records ONE dependency, on the #lookup declaration of the class
+it was asked about (declarationsForSignatureQuery:), so a lookup that resolved to
+an INHERITED member is recorded against the subclass, not against the definer.
+Propagation is therefore downward: visit mixin and its descendants, and at each
+one compare every cached answer against a fresh computation
+(signatureOfMember:asSeenFrom:, compared with sameSignatureAs:).
+
+'Descendant' means BOTH a subclass and a lexically nested class (descendantsOf:).
+Inheritance is not the only way a lookup reaches this member: an implicit send in
+a nested class reaches it through lexical scope, regardless of access modifier, so
+a private or protected member's dependents are typically the enclosing class and
+the classes nested inside it.
+
+The recompute goes through each QUERY's own type, not once through the class,
+because several types over one mixin can ask the same question and get different
+answers: an ObjectType sees only public members while a SelfType also sees private
+and protected ones. Recomputing a private member through an ObjectType would
+answer an access error and never match what the self-send cached, so non-public
+members would never prune. One recompute per cached query is the price, and there
+are normally only one or two per (class, selector).
+
+Three cases keep the walk small:
+ - a descendant that declares selector ITSELF shadows the edit, so neither it nor
+anything below it can see the change: prune the subtree;
+ - a class with no recorded lookup has nothing stale of its own, but a descendant
+may, so the walk continues through it;
+ - a class whose recomputed answer is the same signature as the cached one cannot
+have changed for any descendant either (a descendant resolves selector to the same
+definer unless it overrides, and overriders are already pruned): prune.
+
+That last case is the win over the old scheme, which could not tell a body edit
+from a signature edit and so invalidated every caller of every edited method.
+
+An uncached answer counts as CHANGED wherever a dependent registered the query:
+error results are not cached (cacheableSignature:), so 'nothing cached' is how a
+lookup that FAILED shows up -- exactly the case where selector has just been
+added. A recomputation that raises counts as changed too. Over-invalidation is
+always correct here; a missed invalidation is silent staleness. *)
+		
+		| affected <Set[Declaration]> = Set new. worklist <List[MixinMirror]> = List new. visited <Set[MixinMirror]> = Set new. |
+		worklist addLast: mixin.
+		visited add: mixin.
+		[ worklist isEmpty ] whileFalse: [
+				| current <MixinMirror> = worklist removeFirst. lookup <Declaration> outcome <Symbol> |
+				lookup:: declarationFor: current kind: #lookup name: selector.
+				outcome:: recheckLookup: lookup of: selector into: affected.
+				(#none = outcome or: [ #changed = outcome ]) ifTrue: [
+						(descendantsOf: current) do: [:sub <MixinMirror> |
+								(visited includes: sub) ifFalse: [
+										([ localMember: selector in: sub ] on: Error do: [:e | nil ]) isNil ifTrue: [
+												visited add: sub.
+												worklist addLast: sub
+											]
+									]
+							]
+					]
+			].
+		^affected
+	)
 	publicMember: selector <Symbol> at: mixin <MixinMirror> ^<MethodMirror | ClassDeclarationMirror | SlotDeclarationMirror | Nil> = (
 		| result |
 		result:: localPublicMember: selector in: mixin.
@@ -2481,6 +2800,53 @@ Otherwise, check the main namespace. *)
 		
 		^recheckSeeded: {d. }
 	)
+	recheckLookup: lookup <Declaration> of: selector <Symbol> into: affected <Set[Declaration]> ^<Symbol> = (
+		(* Recompute every cached answer recorded against one #lookup declaration and
+compare it with what is cached. If any differs, invalidate the lookup and add its
+dependents to affected.
+
+Answers #none when nothing was recorded there, #unchanged when every recorded
+answer still compares the same, #changed otherwise. Callers use that to decide
+whether to keep walking: #unchanged is the only outcome that licenses pruning,
+because #none means a descendant may still hold a stale answer.
+
+Each recompute goes through the recording query's OWN type, so a lookup cached
+under SelfType is recomputed under SelfType and keeps its access to private and
+protected members. An uncached answer counts as changed: error results are never
+cached, so that is how a lookup that previously failed presents itself.
+
+Recomputing is by far the expensive part, so it is done only when it can change
+the outcome. An answer that is NOT cached is already reported as changed, and a
+query recorded after an earlier invalidation that nothing has re-typechecked yet
+is exactly that case -- measured, it was most of them, since edges are retained
+while cached answers are dropped. Computing a fresh signature there produced a
+value that was compared against nothing and then discarded. For the same reason
+the loop stops at the first difference: one is enough to answer #changed. *)
+		
+		| queries <List[Query]> = List new. changed <Boolean> ::= false. |
+		
+		(* Snapshot: recomputing a signature can register queries of its own. *)
+		(dependentQueries at: lookup ifAbsent: [ Set new ]) do: [:q <Query> |
+				queries add: q
+			].
+		queries isEmpty ifTrue: [ ^#none ].
+		queries do: [:q <Query> |
+				changed ifFalse: [
+						| cached <Type | Nil> = cachedTypes at: q ifAbsent: [ nil ]. fresh <Type | Nil> |
+						cached isNil ifTrue: [ changed:: true ]
+							ifFalse: [
+								fresh:: [ signatureOfMember: selector asSeenFrom: q type ] on: Error
+									do: [:e | nil ].
+								(fresh isNil or: [ (cached sameSignatureAs: fresh) not ]) ifTrue: [
+										changed:: true
+									]
+							]
+					]
+			].
+		changed ifFalse: [ ^#unchanged ].
+		affected addAll: (invalidateDependenciesOn: lookup).
+		^#changed
+	)
 	recheckSeeded: seeds <Collection[Declaration]> ^<Map[Declaration, Set[TypeError]]> = (
 		(* Work-list re-typecheck: starting from the seed declarations, re-check each,
 	follow its dependents transitively, and return each re-checked declaration's
@@ -2510,6 +2876,29 @@ Otherwise, check the main namespace. *)
 					]
 			].
 		^results
+	)
+	recordSuperclassOf: klass <MixinMirror> is: superMixin <MixinMirror | Nil> ^<MixinMirror | Nil> = (
+		(* Record klass's superclass, and maintain the inverse index of DIRECT subclasses
+that incremental propagation walks downward.
+
+Edges are only ever added, never removed, and the index survives
+flushClassStructureCaches -- see the comment there. A stale edge left behind by a
+re-parent costs one recompute-and-compare in a later walk, which then prunes
+itself; a MISSING edge would silently leave a descendant's cached lookup stale.
+
+Completeness is adequate for a non-obvious reason: any class with a cached query
+had its whole superclass chain walked to answer that query, so it is already in
+this table and hence in the index. A class never queried is absent from the index,
+but has no cached answer that could go stale. The built-in seeds
+(seedBuiltinSuperclasses) deliberately bypass this: their subclasses are other
+built-ins, which are not editable. *)
+		
+		superclassTable at: klass put: superMixin.
+		superMixin isNil ifFalse: [
+				(subclassIndex at: superMixin
+					ifAbsent: [ subclassIndex at: superMixin put: Set new ]) add: klass
+			].
+		^superMixin
 	)
 	registerDependenciesOfQuery: q <Query> = (
 		(* Record, in both directions, that the current declaration's typecheck used q:
@@ -2688,6 +3077,70 @@ Otherwise, check the main namespace. *)
 		
 		(* This should never happen - all mirror types should be handled above *)
 		halt
+	)
+	public signatureOfMember: selector <Symbol> asSeenFrom: t <Type> ^<Type> = (
+		(* The signature of selector as the type t sees it: the result of the very lookup
+t performs, under t's own access rules. An ObjectType sees public members only;
+the pseudo types see what their send form is allowed to see (SelfType also
+private and protected of its own class, SuperType the public and protected of the
+superclass chain, and so on).
+
+This is the recompute primitive the incremental propagation needs, and it takes a
+TYPE rather than a class on purpose. A cached lookup answer was produced by one
+particular type asking, so the only answer comparable with it is the one that same
+type gives now. Recomputing a PRIVATE or PROTECTED member through an ObjectType
+answers an access error, which can never compare equal to the FunctionType a
+self-send cached -- so every edit to a non-public member would look like a change
+and would never prune. Asking through the query's own type removes that whole
+class of false positives.
+
+The visitor state must be established exactly as the typecheck entry points do:
+resolving an INHERITED member runs the superclass clause through the visitor, and
+without currentClass / typeBuilder / currentTopLevelClass that resolution fails and
+the lookup degrades to an error type -- which would make every inherited signature
+look changed and defeat the pruning this exists for. State is saved and restored,
+and errors go to a throwaway errorSet, so this stays a pure query. currentDeclaration
+is set to a throwaway #expression declaration so any namespace-name resolution
+records its edge here rather than against whatever was last typechecked. *)
+		
+		| mixin <MixinMirror | Nil> toplevel <MixinMirror> result <Type> savedClass savedBuilder savedTop savedErrors savedDeclaration |
+		[ mixin:: t mixin ] on: Exception do: [:ex | mixin:: nil ].
+		mixin isNil ifTrue: [ ^errorType ].
+		savedClass:: currentClass.
+		savedBuilder:: typeBuilder.
+		savedTop:: currentTopLevelClass.
+		savedErrors:: errorSet.
+		savedDeclaration:: currentDeclaration.
+		result:: [
+			toplevel:: mixin.
+			[ nil ~= toplevel enclosingMixin ] whileTrue: [
+					toplevel:: toplevel enclosingMixin
+				].
+			currentClass:: mixin.
+			typeBuilder:: typeBuilderFor: mixin.
+			currentTopLevelClass:: toplevel declaration.
+			errorSet:: Set new.
+			currentDeclaration:: declarationFor: mixin kind: #expression name: selector.
+			[ t at: selector ] on: Error do: [:e | errorType ]
+		] ensure: [
+				currentClass:: savedClass.
+				typeBuilder:: savedBuilder.
+				currentTopLevelClass:: savedTop.
+				errorSet:: savedErrors.
+				currentDeclaration:: savedDeclaration
+			].
+		^result
+	)
+	public signatureOfMember: selector <Symbol> inClass: c <Class | MixinMirror> ^<Type> = (
+		(* The signature of selector as an ORDINARY send to a c-typed receiver sees it:
+declared locally or inherited, public members only, and an error type when it does
+not resolve.
+
+Access-sensitive callers want signatureOfMember:asSeenFrom: instead, which takes
+the asking type and so honours self / super / here / outer visibility. This form
+remains the right one when the question really is 'what would a plain send see'. *)
+		
+		^signatureOfMember: selector asSeenFrom: (ObjectType forMixin: (mixinOf: c))
 	)
 	signatureWithDefVarsFor: selector <Symbol> on: receiverType <ObjectType> ^<MessagePatternAST | Nil> = (
 		(* The declared signature of selector on receiverType, IF its source mentions `def` (a cheap
@@ -3092,6 +3545,39 @@ Otherwise, check the main namespace. *)
 		| m <MethodAST> |
 		m:: parser parseMethodDeclaration: src.
 		^typecheckMethod: m ofClass: c
+	)
+	typeKindOf: t <Type> ^<Symbol> = (
+		(* A discriminating kind symbol for a type, used by sameTypeAs: to require that
+two types are of the same shape before comparing their parts. This exists because
+#class is NOT an ordinary message in this system -- an explicit-receiver `class`
+send raises MessageNotUnderstood -- so the isKindOf predicates, which are public
+and answer false by doesNotUnderstand: for any type that lacks them, are the only
+portable discriminator. Most specific first: AccessErrorType is a subclass of
+ErrorType, and the pseudo types and GenericType are all subclasses of ObjectType. *)
+		
+		t isKindOfFunctionType ifTrue: [ ^#function ].
+		t isKindOfUnionType ifTrue: [ ^#union ].
+		t isKindOfGenericType ifTrue: [ ^#generic ].
+		t isKindOfClosureType ifTrue: [ ^#closure ].
+		t isKindOfTypeVariable ifTrue: [ ^#typeVariable ].
+		t isKindOfSelfType ifTrue: [ ^#selfType ].
+		t isKindOfSuperType ifTrue: [ ^#superType ].
+		t isKindOfHereType ifTrue: [ ^#hereType ].
+		t isKindOfOuterType ifTrue: [ ^#outerType ].
+		t isKindOfPseudoType ifTrue: [ ^#pseudoType ].
+		t isKindOfAccessErrorType ifTrue: [ ^#accessError ].
+		t isKindOfErrorType ifTrue: [ ^#error ].
+		t isKindOfObjectType ifTrue: [ ^#objectType ].
+		^#other
+	)
+	typeList: a <List[Type]> sameAs: b <List[Type]> ^<Boolean> = (
+		(* Element-wise comparison of two type lists, written out because List>>#= is
+identity on this platform. *)
+		
+		a size = b size ifFalse: [ ^false ].
+		1 to: a size
+			do: [:i <Integer> | ((a at: i) sameTypeAs: (b at: i)) ifFalse: [ ^false ] ].
+		^true
 	)
 	typeOfHere ^<ObjectType> = (
 		^HereType forMixin: currentClass

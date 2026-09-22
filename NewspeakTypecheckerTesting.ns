@@ -1032,6 +1032,15 @@ public use ^ <Pair> = (^Pair new echo)
 				ifFalse: [ installer install: {builder. } into: namespace ].
 			^namespace at: nm
 		)
+		messagesOf: eset <Set[TypeError]> ^<String> = (
+			(* The error messages, joined, for a failure description. A Set of TypeErrors
+   prints as 'instance of Set', which tells the reader nothing about why a test
+   failed. *)
+			
+			| msgs <String> ::= ''. |
+			eset do: [:e | msgs:: msgs , ' | ' , e message ].
+			^msgs
+		)
 		namespaceAddType: t = (
 			namespace at: t name put: t
 		)
@@ -1272,6 +1281,36 @@ public use ^ <Pair> = (^Pair new echo)
 				ofClass: TupleTestClass. |
 			assert: [ eset isEmpty ]
 				description: 'Should create tuple with type {Number. Number. Number}'
+		)
+		public testDeeplyNestedClassDependentIsInvalidated = (
+			(* Two levels of nesting, with the dependent in the INNERMOST class and nothing
+   cached at the class between. That middle class is what exercises the 'no
+   recorded lookup here, but a descendant may have one' case: if the walk stopped
+   wherever it found nothing cached, it would never reach the inner class at all. *)
+			
+			| src1 <String> src2 <String> probe <String> probeDecl <Object> innerClass <Object> affected <Set> rInc <Set> |
+			src1:: 'class IncrD new = Object new () (public class IncrDMid new = Object new () (public class IncrDInner new = Object new () () : ()) : () private hidden ^ <Integer> = (^1)) : ()'.
+			src2:: 'class IncrD new = Object new () (public class IncrDMid new = Object new () (public class IncrDInner new = Object new () () : ()) : () private hidden ^ <String> = (^''x'')) : ()'.
+			probe:: 'innerDeepProbe ^ <Integer> = (^hidden)'.
+			installClass: src1 named: #IncrD.
+			innerClass:: (namespace at: #IncrD) new IncrDMid new IncrDInner.
+			assert: [
+					(typechecker typecheckMethodSource: probe ofClass: innerClass) isEmpty
+				]
+				description: 'baseline: two levels of lexical scope reach the private method'.
+			probeDecl:: typechecker declarationForMember: #innerDeepProbe
+				kind: #method
+				ofClass: innerClass.
+			installClass: src2 named: #IncrD.
+			innerClass:: (namespace at: #IncrD) new IncrDMid new IncrDInner.
+			affected:: typechecker invalidateDeclaration: (typechecker declarationForMember: #hidden
+					kind: #method
+					ofClass: (namespace at: #IncrD)).
+			assert: [ affected includes: probeDecl ]
+				description: 'the walk must pass through an uncached middle class to the inner dependent'.
+			rInc:: typechecker typecheckMethodSource: probe ofClass: innerClass.
+			assert: [ rInc isEmpty not ]
+				description: 'after hidden returns String the <Integer> dependent must break'
 		)
 		public testDefinedTypeAnnotationNotFalselyReported = (
 			(* A well-defined annotation (incl. tuple, closure, DoesNotMatter, and method
@@ -1600,6 +1639,37 @@ public use ^ <Pair> = (^Pair new echo)
 			assert: [ eset isEmpty ]
 				description: 'Should accept generic arguments in middle of type path'
 		)
+		public testHeaderSlotAdditionInvalidatesDependents = (
+			(* A header edit that does NOT re-parent anything still declares members: the
+   slots in the header generate accessors. Adding one must invalidate a dependent
+   that referenced the name while it was undefined.
+
+   This is the case the header walk's fast path must not skip. Propagation prunes
+   on an unchanged superclass chain, which makes an ordinary header edit cheap, so
+   the pruning has to happen per selector rather than by deciding up front that a
+   header edit which leaves the chain alone can change nothing. *)
+			
+			| src1 <String> src2 <String> probe <String> probeDecl <Object> affected <Set> rBefore <Set> rAfter <Set> |
+			src1:: 'class IncrS new = Object new () () : ()'.
+			src2:: 'class IncrS new = Object new (| public tag <Integer> = 1. |) () : ()'.
+			probe:: 'useIncrS: x <IncrS> ^ <Integer> = (^x tag)'.
+			installClass: src1 named: #IncrS.
+			rBefore:: typechecker typecheckMethodSource: probe ofClass: TestClass1.
+			assert: [ rBefore isEmpty not ]
+				description: 'baseline: tag is not defined before the header declares it'.
+			probeDecl:: typechecker declarationForMember: #useIncrS:
+				kind: #method
+				ofClass: TestClass1.
+			installClass: src2 named: #IncrS.
+			affected:: typechecker invalidateDeclaration: (typechecker declarationForMember: #IncrS
+					kind: #classHeader
+					ofClass: (namespace at: #IncrS)).
+			assert: [ affected includes: probeDecl ]
+				description: 'adding a header slot must report the dependents that referenced it'.
+			rAfter:: typechecker typecheckMethodSource: probe ofClass: TestClass1.
+			assert: [ rAfter isEmpty ]
+				description: 'once the header declares tag, the dependent must typecheck'
+		)
 		public testImmutableLocalAssignedStillRejected = (
 			(* regression: an immutable local (=) assigned must still error *)
 			
@@ -1710,6 +1780,39 @@ public use ^ <Pair> = (^Pair new echo)
 			assert: [ errorSet: rInc equivalentTo: rFresh ]
 				description: 'incremental result must equal a from-scratch re-check'
 		)
+		public testIncrementalAddOverrideInvalidatesInheritedLookup = (
+			(* Adding an override of an INHERITED method must invalidate the dependents of the
+   subclass lookup. The signature dependency is recorded only on the mixin that
+   defines the selector, so a newly added subclass declaration has no dependents and
+   the dependent keeps typechecking against the inherited signature. *)
+			
+			| src1 <String> src2 <String> probe <String> affected <Set> rInc <Set> rFresh <Set> useDecl <Object> subClass <Object> |
+			src1:: 'class IncrH new = Object new () (public class Base new = Object new () (public foo ^ <Integer> = (^1)) : () public class Sub new = Base new () () : ()) : ()'.
+			src2:: 'class IncrH new = Object new () (public class Base new = Object new () (public foo ^ <Integer> = (^1)) : () public class Sub new = Base new () (public foo ^ <String> = (^''x'')) : ()) : ()'.
+			probe:: 'useIncrHSub: x <IncrH Sub> ^ <Integer> = (^x foo)'.
+			installClass: src1 named: #IncrH.
+			assert: [
+					(typechecker typecheckMethodSource: probe ofClass: TestClass1) isEmpty
+				]
+				description: 'baseline: Sub inherits foo returning Integer, so the dependent is clean'.
+			useDecl:: typechecker declarationForMember: #useIncrHSub:
+				kind: #method
+				ofClass: TestClass1.
+			installClass: src2 named: #IncrH.
+			subClass:: (namespace at: #IncrH) new Sub.
+			affected:: typechecker invalidateDeclaration: (typechecker declarationForMember: #foo
+					kind: #method
+					ofClass: subClass).
+			assert: [ affected includes: useDecl ]
+				description: 'adding an override must report the dependent that used the inherited signature'.
+			rInc:: typechecker typecheckMethodSource: probe ofClass: TestClass1.
+			assert: [ rInc isEmpty not ]
+				description: 'after the override returns String the <Integer> dependent must break'.
+			typechecker clearQueryState.
+			rFresh:: typechecker typecheckMethodSource: probe ofClass: TestClass1.
+			assert: [ errorSet: rInc equivalentTo: rFresh ]
+				description: 'incremental result must equal a from-scratch re-check'
+		)
 		public testIncrementalRemoveNeededMethod = (
 			(* Removing foo (replacing it with an unrelated method) must make the
 		   dependent error, after invalidating foo. *)
@@ -1731,6 +1834,34 @@ public use ^ <Pair> = (^Pair new echo)
 				description: 'after removing foo, useIncrB errors (foo not defined)'.
 			typechecker clearQueryState.
 			rFresh:: typechecker typecheckMethodSource: src ofClass: TestClass1.
+			assert: [ errorSet: rInc equivalentTo: rFresh ]
+				description: 'incremental result must equal a from-scratch re-check'
+		)
+		public testIncrementalReparentInvalidatesSubtypeCache = (
+			(* Re-parenting an INTERMEDIATE class must invalidate cached subtype answers that
+   were derived through it. A <: C is memoized in the trail and keyed for
+   invalidation on the two endpoint headers only, and the class-structure flush does
+   not clear the trail, so A <: C survives B ceasing to inherit from C. *)
+			
+			| src1 <String> src2 <String> probe <String> rInc <Set> rFresh <Set> bClass <Object> |
+			src1:: 'class IncrT new = Object new () (public class C new = Object new () () : () public class B new = C new () () : () public class A new = B new () () : ()) : ()'.
+			src2:: 'class IncrT new = Object new () (public class C new = Object new () () : () public class B new = Object new () () : () public class A new = B new () () : ()) : ()'.
+			probe:: 'useIncrTA: x <IncrT A> ^ <IncrT C> = (^x)'.
+			installClass: src1 named: #IncrT.
+			assert: [
+					(typechecker typecheckMethodSource: probe ofClass: TestClass1) isEmpty
+				]
+				description: 'baseline: A inherits from B which inherits from C, so A is a subtype of C'.
+			installClass: src2 named: #IncrT.
+			bClass:: (namespace at: #IncrT) new B.
+			typechecker invalidateDeclaration: (typechecker declarationForMember: #B
+					kind: #classHeader
+					ofClass: bClass).
+			rInc:: typechecker typecheckMethodSource: probe ofClass: TestClass1.
+			assert: [ rInc isEmpty not ]
+				description: 'after B is re-parented off C, A is no longer a subtype of C'.
+			typechecker clearQueryState.
+			rFresh:: typechecker typecheckMethodSource: probe ofClass: TestClass1.
 			assert: [ errorSet: rInc equivalentTo: rFresh ]
 				description: 'incremental result must equal a from-scratch re-check'
 		)
@@ -2241,6 +2372,62 @@ public use ^ <Pair> = (^Pair new echo)
 			assert: [ affected includes: probeDecl ]
 				description: 'changing a referenced top-level class should invalidate referencing decls'
 		)
+		public testNamespaceNameInvalidationIsRepeatable = (
+			(* invalidateNamespaceName: must report the same dependents on a SECOND call for
+   the same name. The recorded edges used to be consumed by the first call and were
+   only rebuilt by an actual re-typecheck, so a second add/rename/delete of the same
+   top-level class invalidated nothing. A single-call test passes against that bug,
+   which is why the suite never saw it. *)
+			
+			| src <String> probeDecl <Object> first <Set> second <Set> |
+			src:: 'probeNSTwice: m <NewspeakASTs MethodAST> ^ <NewspeakASTs MethodAST> = (^m)'.
+			typechecker typecheckMethodSource: src ofClass: TestClass1.
+			probeDecl:: typechecker declarationForMember: #probeNSTwice:
+				kind: #method
+				ofClass: TestClass1.
+			first:: typechecker invalidateNamespaceName: #NewspeakASTs.
+			assert: [ first includes: probeDecl ]
+				description: 'first invalidation reports the referencing declaration'.
+			second:: typechecker invalidateNamespaceName: #NewspeakASTs.
+			assert: [ second includes: probeDecl ]
+				description: 'a second invalidation of the same name must still report it'
+		)
+		public testNestedClassDependentOnOuterPrivateIsInvalidated = (
+			(* A private member's callers are not confined to its own class: a lexically
+   NESTED class reaches it by implicit send, since lexical scope ignores access
+   modifiers. Its cached lookup is recorded against the nested class, not against
+   the definer, and a nested class is not a subclass -- so downward propagation has
+   to follow nesting edges as well as inheritance edges (descendantsOf:) or this
+   dependent is never re-checked.
+
+   The signature has to really change for this to assert anything: invalidating an
+   UNCHANGED member correctly reports nobody, which is what
+   testPrivateSignatureEditWithoutChangePrunesDependents pins down. *)
+			
+			| src1 <String> src2 <String> probe <String> probeDecl <Object> innerClass <Object> affected <Set> rInc <Set> |
+			src1:: 'class IncrN new = Object new () (public class IncrNInner new = Object new () () : () private hidden ^ <Integer> = (^1)) : ()'.
+			src2:: 'class IncrN new = Object new () (public class IncrNInner new = Object new () () : () private hidden ^ <String> = (^''x'')) : ()'.
+			probe:: 'innerHereProbe ^ <Integer> = (^hidden)'.
+			installClass: src1 named: #IncrN.
+			innerClass:: (namespace at: #IncrN) new IncrNInner.
+			assert: [
+					(typechecker typecheckMethodSource: probe ofClass: innerClass) isEmpty
+				]
+				description: 'baseline: the nested class reaches the outer private method by lexical scope'.
+			probeDecl:: typechecker declarationForMember: #innerHereProbe
+				kind: #method
+				ofClass: innerClass.
+			installClass: src2 named: #IncrN.
+			innerClass:: (namespace at: #IncrN) new IncrNInner.
+			affected:: typechecker invalidateDeclaration: (typechecker declarationForMember: #hidden
+					kind: #method
+					ofClass: (namespace at: #IncrN)).
+			assert: [ affected includes: probeDecl ]
+				description: 'changing a private method must report a nested class that here-sends it'.
+			rInc:: typechecker typecheckMethodSource: probe ofClass: innerClass.
+			assert: [ rInc isEmpty not ]
+				description: 'after hidden returns String the <Integer> dependent must break'
+		)
 		public testNestedClassTypeInParameter = (
 			(* Test that nested class types work as parameter types *)
 			
@@ -2448,6 +2635,78 @@ public use ^ <Pair> = (^Pair new echo)
 			assert: [ eset isEmpty ]
 				description: 'Should allow closure in outer class to access its own private slot'
 		)
+		public testOuterSendDependentIsInvalidated = (
+			(* The third route to an enclosing class's member, after the self send and the
+   implicit send: an explicit outer send. Its query is recorded against the
+   OuterType of the NAMED class, so the dependency lands on the edited class and
+   the walk finds it at its start node -- but only once outer sends typecheck at
+   all, which they did not before OuterType>>at: learned the class hop. *)
+			
+			| src1 <String> src2 <String> probe <String> probeDecl <Object> innerClass <Object> affected <Set> rInc <Set> |
+			src1:: 'class IncrO new = Object new () (public class IncrOInner new = Object new () () : () private hidden ^ <Integer> = (^1)) : ()'.
+			src2:: 'class IncrO new = Object new () (public class IncrOInner new = Object new () () : () private hidden ^ <String> = (^''x'')) : ()'.
+			probe:: 'innerOuterProbe ^ <Integer> = (^outer IncrO hidden)'.
+			installClass: src1 named: #IncrO.
+			innerClass:: (namespace at: #IncrO) new IncrOInner.
+			assert: [
+					(typechecker typecheckMethodSource: probe ofClass: innerClass) isEmpty
+				]
+				description: 'baseline: an outer send reaches the enclosing private method'.
+			probeDecl:: typechecker declarationForMember: #innerOuterProbe
+				kind: #method
+				ofClass: innerClass.
+			installClass: src2 named: #IncrO.
+			innerClass:: (namespace at: #IncrO) new IncrOInner.
+			affected:: typechecker invalidateDeclaration: (typechecker declarationForMember: #hidden
+					kind: #method
+					ofClass: (namespace at: #IncrO)).
+			assert: [ affected includes: probeDecl ]
+				description: 'changing the member must report an outer-send dependent'.
+			rInc:: typechecker typecheckMethodSource: probe ofClass: innerClass.
+			assert: [ rInc isEmpty not ]
+				description: 'after hidden returns String the <Integer> dependent must break'
+		)
+		public testOuterSendNestedClassAnswersTheClass = (
+			(* A nested class reached through an outer send is selected as an ordinary member
+   of the named class, so `outer C N` answers N -- the class -- and `new` is a
+   legitimate send to it. OuterType used to override signatureForNestedClass: to
+   answer N's INSTANCE type instead, which suited a reading of outer in which the
+   first hop itself selected a nested class; under that override this send failed
+   because instances do not understand new. *)
+			
+			| innerClass = LexicalScopeOuter new LexicalScopeMiddle new LexicalScopeInner. eset <Set> |
+			eset:: typechecker typecheckMethodSource: 'p ^ <LexicalScopeMiddle> = (^outer LexicalScopeOuter LexicalScopeMiddle new)'
+				ofClass: innerClass.
+			assert: [ eset isEmpty ]
+				description: 'outer send to a nested class should answer the class; got: ' , (messagesOf: eset)
+		)
+		public testOuterSendNonexistentMemberErrors = (
+			(* The class hop must not make outer sends permissive: a member the named class
+   does not have is still an error, reported once. *)
+			
+			| innerClass = LexicalScopeOuter new LexicalScopeMiddle new LexicalScopeInner. eset <Set> |
+			eset:: typechecker typecheckMethodSource: 'p ^ <Number> = (^outer LexicalScopeOuter noSuchOuterMember)'
+				ofClass: innerClass.
+			assert: [ eset size = 1 ]
+				description: 'expected exactly 1 error; got ' , eset size printString , ': ' , (messagesOf: eset).
+			assert: [
+					assertErrorSet: eset
+						containsMessageWith: 'noSuchOuterMember is not defined'
+				]
+				description: 'expected an undefined-member error; got: ' , (messagesOf: eset)
+		)
+		public testOuterSendReachesEnclosingPrivateMethod = (
+			(* An outer send sees members of the named class under ANY access modifier, so a
+   private method of the enclosing class is reachable from a class nested two
+   levels down. This is the whole point of the form, and nothing in the suite
+   exercised it before. *)
+			
+			| innerClass = LexicalScopeOuter new LexicalScopeMiddle new LexicalScopeInner. eset <Set> |
+			eset:: typechecker typecheckMethodSource: 'p ^ <Number> = (^outer LexicalScopeOuter outerPrivateMethod)'
+				ofClass: innerClass.
+			assert: [ eset isEmpty ]
+				description: 'outer send should reach the enclosing private method; got: ' , (messagesOf: eset)
+		)
 		public testParameterShadowsSlot = (
 			(* Test that parameter shadows slot of same name *)
 			
@@ -2525,6 +2784,34 @@ public use ^ <Pair> = (^Pair new echo)
 			assert: [ eset size = 1 ] description: 'Should produce exactly 1 error'.
 			assert: [ assertErrorSet: eset containsMessageWith: 'is not accessible' ]
 				description: 'Should reject ordinary send to private method of nested class'
+		)
+		public testPrivateSignatureEditWithoutChangePrunesDependents = (
+			(* The pruning must work for PRIVATE and PROTECTED members too, not just public
+   ones. A self-send caches its answer under SelfType, which sees private members;
+   recomputing the same lookup through an ObjectType answers an access error, which
+   can never compare equal, so before signatureOfMember:asSeenFrom: existed every
+   edit to a non-public member reported all its dependents and pruning never
+   applied to them. The comparison now re-asks through the query's own type. *)
+			
+			| probe <String> probeDecl <Object> privateDecl <Object> affected <Set> |
+			probe:: 'selfPrivateProbe ^ <String> = (^self privateMethod)'.
+			assert: [
+					(typechecker typecheckMethodSource: probe ofClass: InheritanceBase) isEmpty
+				]
+				description: 'baseline: a self-send of a private method typechecks cleanly'.
+			probeDecl:: typechecker declarationForMember: #selfPrivateProbe
+				kind: #method
+				ofClass: InheritanceBase.
+			privateDecl:: typechecker declarationForMember: #privateMethod
+				kind: #method
+				ofClass: InheritanceBase.
+			affected:: typechecker invalidateDeclaration: privateDecl.
+			assert: [ (affected includes: probeDecl) not ]
+				description: 'an unchanged private signature must not report its dependents'.
+			typechecker resetCacheStats.
+			typechecker typecheckMethodSource: probe ofClass: InheritanceBase.
+			assert: [ typechecker cacheHits > 0 ]
+				description: 'the unchanged private signature must still be cached'
 		)
 		public testProtectedImmutableSlotHasNoSetter = (
 			(* Test that protected immutable slots do not have setters *)
@@ -2639,6 +2926,44 @@ public use ^ <Pair> = (^Pair new echo)
 							ofClass: (namespace at: #DrvA))
 				]
 				description: 'driver result for the dependent must equal a from-scratch re-check'
+		)
+		public testReparentInvalidatesInheritedLookups = (
+			(* Re-parenting an intermediate class moves the superclass chain, so a lookup
+   that resolved THROUGH it to an ancestor's member now resolves elsewhere, or
+   nowhere. With A < B < C and foo declared on C, taking B off C must break a
+   dependent that called foo on an A.
+
+   The structure flush on a header change drops the subtype trail and the
+   superclass table but not the signature cache, so this used to keep answering
+   from the stale cached lookup; the header walk now rechecks the lookups cached
+   in the subtree. *)
+			
+			| src1 <String> src2 <String> probe <String> probeDecl <Object> bClass <Object> affected <Set> rInc <Set> rFresh <Set> |
+			src1:: 'class IncrHL new = Object new () (public class C new = Object new () (public foo ^ <Integer> = (^1)) : () public class B new = C new () () : () public class A new = B new () () : ()) : ()'.
+			src2:: 'class IncrHL new = Object new () (public class C new = Object new () (public foo ^ <Integer> = (^1)) : () public class B new = Object new () () : () public class A new = B new () () : ()) : ()'.
+			probe:: 'useIncrHLA: x <IncrHL A> ^ <Integer> = (^x foo)'.
+			installClass: src1 named: #IncrHL.
+			assert: [
+					(typechecker typecheckMethodSource: probe ofClass: TestClass1) isEmpty
+				]
+				description: 'baseline: A inherits foo through B from C'.
+			probeDecl:: typechecker declarationForMember: #useIncrHLA:
+				kind: #method
+				ofClass: TestClass1.
+			installClass: src2 named: #IncrHL.
+			bClass:: (namespace at: #IncrHL) new B.
+			affected:: typechecker invalidateDeclaration: (typechecker declarationForMember: #B
+					kind: #classHeader
+					ofClass: bClass).
+			assert: [ affected includes: probeDecl ]
+				description: 'a re-parent must report the dependents whose lookups went through it'.
+			rInc:: typechecker typecheckMethodSource: probe ofClass: TestClass1.
+			assert: [ rInc isEmpty not ]
+				description: 'after B leaves C, foo is no longer reachable from A'.
+			typechecker clearQueryState.
+			rFresh:: typechecker typecheckMethodSource: probe ofClass: TestClass1.
+			assert: [ errorSet: rInc equivalentTo: rFresh ]
+				description: 'incremental result must equal a from-scratch re-check'
 		)
 		public testReturnEmptyClosure = (
 			(* Test that a method can return an empty closure *)
@@ -2941,9 +3266,39 @@ public use ^ <Pair> = (^Pair new echo)
 				description: 'unchanged re-check should hit the persistent signature cache'
 		)
 		public testSignatureDependencyInvalidation = (
-			(* Editing InheritanceBase>>publicMethod must invalidate its dependent
-		   (probe:) and drop the cached (InheritanceBase, publicMethod) signature so
-		   the next check recomputes it. *)
+			(* The dependency a send records is on the #lookup of the RECEIVER's class, so
+   invalidating that lookup must report the dependent (probe:) and drop the cached
+   (InheritanceBase, publicMethod) signature so the next check recomputes it.
+
+   This test used to invalidate InheritanceBase>>publicMethod as a #method, because
+   the edge was recorded on the declaration that DEFINES the member. It is now
+   recorded on the class that was asked -- which is what makes an added override
+   visible -- and invalidating an unchanged #method deliberately reports nothing;
+   testSignatureEditWithoutChangePrunesDependents pins that down. *)
+			
+			| probeDecl <Object> lookupDecl <Object> affected <Set> |
+			typechecker typecheckMethodSource: incrementalProbeSource ofClass: TestClass1.
+			probeDecl:: typechecker declarationForMember: #probe:
+				kind: #method
+				ofClass: TestClass1.
+			lookupDecl:: typechecker declarationForMember: #publicMethod
+				kind: #lookup
+				ofClass: InheritanceBase.
+			affected:: typechecker invalidateDeclaration: lookupDecl.
+			assert: [ affected includes: probeDecl ]
+				description: 'invalidating the publicMethod lookup should report dependent probe: for re-check'.
+			typechecker resetCacheStats.
+			typechecker typecheckMethodSource: incrementalProbeSource ofClass: TestClass1.
+			assert: [ typechecker cacheMisses > 0 ]
+				description: 'after invalidation the publicMethod signature is recomputed (miss)'
+		)
+		public testSignatureEditWithoutChangePrunesDependents = (
+			(* Invalidating a member whose signature did NOT change must report no dependents
+   and leave their cached lookups in place. This is what comparison-based
+   propagation buys: a body-only edit cannot change any caller's answer, so no
+   caller is re-checked. A #method Declaration cannot tell a body edit from a
+   signature edit, so the decision is made by recomputing the lookup and comparing
+   it (sameSignatureAs:) rather than by inspecting the edit. *)
 			
 			| probeDecl <Object> baseMethodDecl <Object> affected <Set> |
 			typechecker typecheckMethodSource: incrementalProbeSource ofClass: TestClass1.
@@ -2954,12 +3309,35 @@ public use ^ <Pair> = (^Pair new echo)
 				kind: #method
 				ofClass: InheritanceBase.
 			affected:: typechecker invalidateDeclaration: baseMethodDecl.
-			assert: [ affected includes: probeDecl ]
-				description: 'invalidating publicMethod should report dependent probe: for re-check'.
+			assert: [ (affected includes: probeDecl) not ]
+				description: 'an unchanged signature must not report its dependents'.
 			typechecker resetCacheStats.
 			typechecker typecheckMethodSource: incrementalProbeSource ofClass: TestClass1.
-			assert: [ typechecker cacheMisses > 0 ]
-				description: 'after invalidation the publicMethod signature is recomputed (miss)'
+			assert: [ typechecker cacheHits > 0 ]
+				description: 'the unchanged signature must still be cached'.
+			assert: [ typechecker cacheMisses = 0 ]
+				description: 'nothing should have been dropped from the signature cache'
+		)
+		public testSignatureOfMemberIsStructurallyComparable = (
+			(* sameSignatureAs: must call two separate computations of an unchanged lookup the
+   same (this is what lets propagation prune), must call an INHERITED lookup the same
+   as the base one (so a walk stops at a subclass that did not change), and must call a
+   resolved signature different from an unresolved one (so an added or removed member
+   is never mistaken for no change). *)
+			
+			| base <Object> again <Object> inherited <Object> missing <Object> |
+			base:: typechecker signatureOfMember: #publicMethod inClass: InheritanceBase.
+			again:: typechecker signatureOfMember: #publicMethod inClass: InheritanceBase.
+			inherited:: typechecker signatureOfMember: #publicMethod
+				inClass: InheritanceDerived.
+			missing:: typechecker signatureOfMember: #noSuchSelectorForTesting
+				inClass: InheritanceBase.
+			assert: [ base sameSignatureAs: again ]
+				description: 'two computations of the same signature must compare the same'.
+			assert: [ base sameSignatureAs: inherited ]
+				description: 'an inherited lookup must match the defining class''s lookup'.
+			assert: [ (base sameSignatureAs: missing) not ]
+				description: 'a resolved signature must not compare the same as an unresolved one'
 		)
 		public testSingleElementTuple = (
 			(* Test creating a single-element tuple *)

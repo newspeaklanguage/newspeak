@@ -1,0 +1,1 @@
+import Newspeak.Properties

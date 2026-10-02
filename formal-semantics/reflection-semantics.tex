@@ -1,0 +1,1652 @@
+\section{Mirrors and reflective program change}
+\label{sec:reflection}
+
+This section refines the schematic transition in
+Equation~\eqref{eq:reflective-step}.  It deliberately specifies a semantic
+mirror protocol rather than a concrete library API: the Specification requires
+mirror-based capability control, transactional change, object-class change,
+and activation access, but explicitly leaves the VM-mirror selector set open.
+An implementation may choose selectors freely provided that each operation
+below is reached only through the corresponding mirror capability.
+
+\subsection{VM cohorts, mirror objects, and authority}
+
+One actor configuration in Equation~\eqref{eq:actor-configuration} is one VM
+cohort.  Define its complete object store by
+\begin{equation}\label{eq:vm-object-store}
+ \mathsf{vmStore}(\Omega)=
+ V\uplus\biguplus_{A\in\dom(\mathcal H)}\mathcal H(A).
+\end{equation}
+The disjointness condition in Equation~\eqref{eq:actor-heap-view} makes this a
+map.  Write $\mathsf{ownerActor}_{\Omega}(x)=A$ exactly when
+$x\in\dom(\mathcal H(A))$, and write
+$\mathsf{ownerActor}_{\Omega}(x)=\kw{shared}$ exactly when $x\in\dom(V)$.
+These two cases are disjoint.
+
+A mirror target and a reflective right are drawn from
+\begin{equation}\label{eq:mirror-targets-rights}
+\begin{split}
+ \zeta::={}&\kw{vmTarget}(w)\mid\kw{programTarget}
+  \mid\kw{mixinTarget}(M)\mid\kw{methodTarget}(i_f)\\
+ &\mid\kw{classTarget}(C)\mid\kw{objectTarget}(o)
+  \mid\kw{activationTarget}(a)\mid\kw{actorTarget}(A),\\
+ \varrho\in\mathit{ReflectRight}={}&
+ \{\kw{inspect},\kw{editCode},\kw{editClass},\kw{reclassifyObject},\\
+ &\quad\kw{editObjectSlots},\kw{editActivation},\kw{controlContinuation},\\
+ &\quad\kw{controlActorStack},\\
+ &\quad
+       \kw{primitive},\kw{delegate}\}.
+\end{split}
+\end{equation}
+Extend the heap-record grammar of Equation~\eqref{eq:heap-records} by
+\begin{equation}\label{eq:mirror-record}
+ H(g)=\kw{mirror}\langle C_g,w,\zeta,R\rangle,
+ \qquad R\in\mathcal P_{\mathrm{fin}}(\mathit{ReflectRight}),
+\end{equation}
+where $C_g$ is a platform mirror class.  Thus $\classof_H(g)=C_g$.
+Mirror identities are fresh and unforgeable.  A mirror is actor-local mutable
+state, never a value; ordinary cross-actor transfer therefore yields a far
+reference under Rules \rulelabel{RR-Near-Far} and \rulelabel{RR-Far-Pass}.
+Possession of such a reference can still confer authority, because the
+eventual request executes in the mirror's owning actor.
+
+Target containment is the least reflexive relation $\sqsubseteq_{P,H,w}$
+satisfying
+\begin{equation}\label{eq:mirror-target-containment}
+\begin{aligned}
+ \zeta&\sqsubseteq_{P,H,w}\kw{vmTarget}(w),\\
+ \kw{mixinTarget}(M)&\sqsubseteq_{P,H,w}\kw{programTarget},\\
+ \kw{methodTarget}(i_f)&\sqsubseteq_{P,H,w}\kw{mixinTarget}(M)
+   &&\text{if }\mathsf{methodOwner}_P(i_f)=M,\\
+ \kw{classTarget}(C)&\sqsubseteq_{P,H,w}
+       \kw{mixinTarget}(\mixin_H(C)),\\
+ \kw{objectTarget}(o)&\sqsubseteq_{P,H,w}
+       \kw{classTarget}(\classof_H(o)),\\
+ \kw{activationTarget}(a)&\sqsubseteq_{P,H,w}
+       \kw{objectTarget}(H(a).o).
+\end{aligned}
+\end{equation}
+The first, generic clause places an actor target occurring in this cohort below
+its VM target.  An actor target does not contain the actor's whole heap:
+activation and object mirrors remain separate capabilities.  It authorizes
+only the stack operations explicitly requiring \kw{controlActorStack} below.
+The method owner used here is the partial function
+\begin{equation}\label{eq:method-owner}
+ \mathsf{methodOwner}_P(i_f)=M
+ \quad\Longleftrightarrow\quad
+ \exists s,f.\;\methods_P(M)(s)=f\land\mathsf{methodId}(f)=i_f.
+\end{equation}
+Uniqueness follows from stable method identities.  VM containment includes all
+targets in Equation~\eqref{eq:mirror-targets-rights} that occur in the store of
+that VM; it does not include any target belonging to another VM.
+
+The platform may create an initial VM mirror only as part of the authority
+explicitly supplied to an application.  There is no operation that obtains it
+from an ambient global.  A holder may attenuate, but not amplify, authority:
+\[
+\dfrac{\begin{gathered}
+ H_A(g)=\kw{mirror}\langle C_g,w,\zeta,R\rangle\qquad
+ \kw{delegate}\in R\\
+ \zeta'\sqsubseteq_{P,\widehat H_A,w}\zeta\qquad R'\subseteq R
+ \qquad g'\text{ fresh}\\
+ H_A'=H_A[g'\mapsto\kw{mirror}\langle C_g,w,\zeta',R'\rangle]
+\end{gathered}}
+ {\Omega,A,g\vdash\mathsf{deriveMirror}(\zeta',R')
+       \Downarrow\langle\Omega[\mathcal H(A)\mapsto H_A'],g'\rangle}
+\quad(\rulelabel{Mirror-Derive})
+\]
+Access modifiers play no role in this rule.  A private method is visible to a
+method or enclosing-mixin mirror precisely because the mirror, rather than a
+source-level send, is the authority check.
+
+\subsection{Reified control and stack images}
+\label{sec:debugging}
+
+The sequential notation of Equation~\eqref{eq:configuration} stores the active
+term once, beside the activation stack.  Debugging requires a uniform
+per-frame view.  Let $b_c\in\mathit{CodeImageId}$ name an immutable source,
+bytecode, or native-code image and define a control location by
+\begin{equation}\label{eq:control-location-domain}
+ \lambda_c::=\kw{sourcePoint}(z)\mid
+   \kw{machinePoint}(b_c,n_c),\qquad n_c\in\mathbb N.
+\end{equation}
+Introduce the internal waiting term \kw{awaitResult} and the control-image
+domain
+\begin{equation}\label{eq:frame-control-domain}
+ \kappa::=\kw{activeControl}\langle\pi,t\rangle
+       \mid\kw{suspendedControl}\langle\pi\rangle.
+\end{equation}
+The current term and source-level control location of a frame are the total
+functions
+\begin{equation}\label{eq:frame-current-term-and-location}
+\begin{aligned}
+ \mathsf{currentTerm}(\kw{activeControl}\langle\pi,t\rangle)&=t,\\
+ \mathsf{controlLocation}(\kw{activeControl}\langle\pi,t\rangle)
+   &=\mathsf{site}(\pi,t),\\
+ \mathsf{currentTerm}(\kw{suspendedControl}\langle\pi\rangle)
+   &=\kw{awaitResult},\\
+ \mathsf{controlLocation}(\kw{suspendedControl}\langle\pi\rangle)
+   &=\mathsf{resumeSite}(\pi).
+\end{aligned}
+\end{equation}
+$\mathsf{site}$ and $\mathsf{resumeSite}$ are the control-map functions emitted
+by elaboration or compilation and return a $\lambda_c$.  A source evaluator
+normally returns \kw{sourcePoint}; a bytecode or native implementation returns
+\kw{machinePoint}, whose second component is its actual program counter.
+Materialized terms and frames are not changed by a later code
+install, so the map for a live or debugger-retained frame must be retained as
+long as that frame is resumable.
+
+For
+$\mathcal A=\langle a_1,\pi_1\rangle\cdots
+ \langle a_m,\pi_m\rangle$ with $m>0$, define its canonical control image by
+\begin{equation}\label{eq:stack-control-image}
+\begin{split}
+ \mathsf{controlImage}(\mathcal A,t)=
+ &\langle a_1,\kw{suspendedControl}\langle\pi_1\rangle\rangle\cdots\\[-1mm]
+ &\langle a_{m-1},\kw{suspendedControl}\langle\pi_{m-1}\rangle\rangle
+ \cdot\langle a_m,\kw{activeControl}\langle\pi_m,t\rangle\rangle.
+\end{split}
+\end{equation}
+Thus every live frame has a current term: a lower frame is explicitly waiting
+for its callee's result at the location determined by its continuation stack.
+The inverse partial function is
+\begin{equation}\label{eq:decode-control-image}
+ \mathsf{decodeControlImage}
+   (\mathsf{controlImage}(\mathcal A,t))=\langle\mathcal A,t\rangle.
+\end{equation}
+It is undefined for an empty image, for an active frame below the top, or for a
+suspended top frame.
+
+A reified frame contains both the activation record and its control image:
+\begin{equation}\label{eq:debug-frame-image}
+ \varphi=\kw{frameImage}\langle a,H(a),\kappa\rangle.
+\end{equation}
+The actor-stack snapshot is the immutable value
+\begin{equation}\label{eq:actor-stack-snapshot}
+\begin{split}
+ \mathsf{actorStackSnapshot}_{\Omega}(B)
+   &\simeq\langle\kw{running},
+      \mathsf{reifyFrames}_{U}(
+        \mathsf{controlImage}(\mathcal A,t))\rangle\\[-1mm]
+   &\hspace{30mm}\text{if }\mathcal X(B)=
+      \kw{runningTurn}\langle\mathcal A,t,p,u\rangle,\\
+ \mathsf{actorStackSnapshot}_{\Omega}(B)
+   &\simeq\langle\kw{paused}(r_s,d_s),
+      \mathsf{reifyFrames}_{U}(
+        \mathsf{controlImage}(\mathcal A,t))\rangle\\[-1mm]
+   &\hspace{30mm}\text{if }\mathcal X(B)=
+      \kw{pausedTurn}\langle\mathcal A,t,p,u,r_s,d_s\rangle,
+\end{split}
+\end{equation}
+where $U=\mathsf{vmStore}(\Omega)$ and $\mathsf{reifyFrames}$ replaces every
+$\langle a,\kappa\rangle$ by Equation~\eqref{eq:debug-frame-image}.  It is
+undefined for an idle actor.  The paused form exposes the unforgeable token
+that must accompany any later paused-stack mutation.
+
+The unique live control of an activation is
+\begin{equation}\label{eq:live-activation-control}
+\begin{split}
+ \mathsf{liveControl}_{\Omega}(a)=\kappa
+ \quad\Longleftrightarrow\quad&
+ \exists B,\bar\varphi_0,\bar\varphi_1,R.\\[-1mm]
+ &\mathsf{actorStackSnapshot}_{\Omega}(B)=
+ \langle m,\bar\varphi_0\cdot
+   \langle\kw{frameImage}\langle a,R,\kappa\rangle\rangle
+   \cdot\bar\varphi_1\rangle.
+\end{split}
+\end{equation}
+Uniqueness follows from actor ownership and the prohibition on duplicate live
+activation identities.  The function is undefined for a retained activation
+that is no longer on a stack.
+
+\paragraph{Editable stack templates.}
+A debugger constructs an immutable template before requesting an atomic
+install.  Template-local keys and frames are
+\begin{equation}\label{eq:stack-template-domain}
+ \eta::=\kw{retain}(a)\mid\kw{freshFrame}(u_f),
+ \qquad
+ \psi=\kw{frameTemplate}\langle\eta,R,\kappa\rangle,
+ \qquad
+ \mathcal S=\langle\psi_1,\ldots,\psi_m\rangle.
+\end{equation}
+$R$ is a complete activation-record template.  Its continuation, home, and
+lexical-environment activation references may name other keys in the same
+$\mathcal S$.  A retained key preserves an existing activation identity; a
+fresh-frame key allocates a new identity at installation.  Consequently a
+copied frame is never made live twice under one activation identity.
+
+The three basic stack-editing operations have distinct names.  First, promote
+and demote control without overloading either operation:
+\begin{equation}\label{eq:promote-demote-frame-control}
+\begin{aligned}
+ &\mathsf{promoteFrame}(\kw{frameTemplate}\langle
+      \eta,R,\kw{suspendedControl}\langle\pi\rangle\rangle,v)
+   \\[-1mm]&\qquad={}\kw{frameTemplate}\langle
+      \eta,R,\kw{activeControl}\langle\pi,v\rangle\rangle,\\
+ &\mathsf{demoteFrame}(\kw{frameTemplate}\langle
+      \eta,R,\kw{activeControl}\langle\pi,t\rangle\rangle)
+   \\[-1mm]&\qquad={}\kw{frameTemplate}\langle
+      \eta,R,\kw{suspendedControl}\langle\pi\rangle\rangle.
+\end{aligned}
+\end{equation}
+Popping $j$ frames supplies the chosen continuation value to the new top:
+\begin{equation}\label{eq:pop-stack-frames}
+ \mathsf{popStackFrames}
+   (\mathcal S_0\cdot\langle\psi\rangle\cdot\mathcal S_1,
+      |\mathcal S_1|,v)
+ =\mathcal S_0\cdot\langle\mathsf{promoteFrame}(\psi,v)\rangle,
+ \qquad |\mathcal S_1|<|\mathcal S|.
+\end{equation}
+Pushing a prepared active frame makes the old top wait for the pushed frame's
+result:
+\begin{equation}\label{eq:push-stack-frame}
+ \mathsf{pushStackFrame}
+  (\mathcal S_0\cdot\langle\psi\rangle,\psi')
+ =\mathcal S_0\cdot\langle\mathsf{demoteFrame}(\psi),\psi'\rangle,
+ \quad
+ \mathsf{currentTerm}(\psi'.\kappa)\ne\kw{awaitResult}.
+\end{equation}
+Finally, copying a contiguous segment allocates fresh template keys and rewires
+every stack-structural activation link internal to the copied segment:
+\begin{equation}\label{eq:copy-stack-frame-segment}
+\begin{aligned}
+ \mathsf{copyStackFrameSegment}(\mathcal S,i,j,\bar u)
+   &=\mathsf{rename}_{\nu}
+       (\langle\psi_i,\ldots,\psi_j\rangle),\\
+ \nu(\psi_k.\eta)&=\kw{freshFrame}(u_k)\qquad(i\le k\le j),
+ \qquad |\bar u|=j-i+1.
+\end{aligned}
+\end{equation}
+Continuation, home, and lexical-environment links outside the copied segment
+remain references to their original retained activations.  Parameter and local
+values are shallow-copied; an activation object stored there is not implicitly
+retargeted.  A debugger may concatenate the returned segment at any position,
+edit its records or controls, and submit the complete result for validation.
+These pure operations therefore express push, pop, single-frame copy, and
+multi-frame copy without making a partially edited live stack observable.
+
+\subsection{Inspection}
+
+Mirror queries are
+\begin{equation}\label{eq:mirror-query-grammar}
+\begin{split}
+ q_r::={}&\kw{programVersionQuery}\mid\kw{mixinDescriptorQuery}(M)\\
+ &\mid\kw{methodDescriptorQuery}(i_f)\mid\kw{classDescriptorQuery}(C)\\
+ &\mid\kw{objectDescriptorQuery}(o)\mid\kw{activationDescriptorQuery}(a)\\
+ &\mid\kw{activationControlQuery}(a)\mid\kw{currentActivationQuery}(A)\\
+ &\mid\kw{actorStackQuery}(A)\mid\kw{allInstancesOfQuery}(C)\\
+ &\mid\kw{mixinApplicationsQuery}(M).
+\end{split}
+\end{equation}
+For a running actor, the current activation is
+\begin{equation}\label{eq:current-activation}
+ \mathsf{currentActivation}_{\Omega}(A)=a
+ \quad\Longleftrightarrow\quad
+ \begin{aligned}[t]
+ \mathcal X(A)&=\kw{runningTurn}\langle
+   \mathcal A_0\mathbin{\cdot}\langle a,\pi\rangle,t,p,u\rangle
+ \quad\lor\\
+ \mathcal X(A)&=\kw{pausedTurn}\langle
+   \mathcal A_0\mathbin{\cdot}\langle a,\pi\rangle,t,p,u,r_s,d_s\rangle.
+ \end{aligned}
+\end{equation}
+It is undefined for an idle actor.  Descriptor construction is given by the
+following separate functions, each of which returns an immutable value object:
+\begin{equation}\label{eq:reflective-descriptors}
+\begin{aligned}
+ \mathsf{describeMixin}_{P}(M)&\simeq
+   \left\langle\begin{gathered}\decl_P(M),\methods_P(M),
+       \mathsf{ownSlots}_P(M),\\
+       P.\mathit{mixin}(M).\mathit{nestedDecls},\iota_P(M)
+   \end{gathered}\right\rangle,\\
+ \mathsf{describeMethod}_{P}(i_f)
+   &\simeq\langle M,f,P.\mathit{body}(i_f)\rangle,\\[-1mm]
+ &\quad\text{where }M=\mathsf{methodOwner}_P(i_f),\quad
+       \methods_P(M)(\selector(f))=f,\\
+ \mathsf{describeClass}_{H}(C)&\simeq
+   \left\langle\begin{gathered}\mixin_H(C),\super_H(C),H(C).eo,\\
+       H(C).C_m,H(C).q,H(C).\chi_C
+   \end{gathered}\right\rangle,\\
+ \mathsf{describeObject}_{H}(o)
+   &\simeq\langle\classof_H(o),H(o).\sigma,H(o).\eta\rangle,\\
+ \mathsf{describeActivation}_{H}(a)&\simeq
+   \left\langle\begin{gathered}H(a).p,H(a).\rho,H(a).\ell,H(a).o,H(a).C,\\
+       H(a).k,H(a).h,H(a).q_a,H(a).\gamma
+   \end{gathered}\right\rangle.
+\end{aligned}
+\end{equation}
+The complete debugger-facing activation descriptor adds its current control
+when the activation is live:
+\begin{equation}\label{eq:debug-activation-descriptor}
+ \mathsf{describeDebugActivation}_{\Omega}(a)
+  \simeq\langle
+    \mathsf{describeActivation}_{\mathsf{vmStore}(\Omega)}(a),
+    \mathsf{option}(\mathsf{liveControl}_{\Omega}(a))\rangle.
+\end{equation}
+$\mathsf{option}$ is \kw{none} when
+Equation~\eqref{eq:live-activation-control} is undefined.  Thus retained dead
+activations remain inspectable, while every live activation exposes both its
+current term and the source/PC location of
+Equation~\eqref{eq:frame-current-term-and-location}.
+The symbol $\simeq$ means an immutable, recursively reified snapshot, not a
+mutable alias to a metalevel record.  In particular, a continuation component
+is the activation identity specified in Section~3, reified as an activation
+mirror only if the caller has authority for that target.
+
+Fix an implementation-chosen total order $\prec$ on the object identities of
+one VM cohort.  The exact-instance query returns a snapshot sequence, not a
+live view:
+\begin{equation}\label{eq:all-instances-of}
+ \mathsf{allInstancesOf}_{\Omega}(C)=
+ \mathsf{sort}_{\prec}
+ \{x\in\dom(\mathsf{vmStore}(\Omega))
+       \mid \classof_{\mathsf{vmStore}(\Omega)}(x)=C\}.
+\end{equation}
+Thus subclasses are excluded.  Presence in the VM store is the abstract
+notion of liveness.  The optional garbage-collection layer makes this precise
+by removing eligible identities from that store; without that layer, the query
+observes every exact instance allocated so far.  The order is deliberately a
+platform choice because the mirror protocol promises no allocation order.
+
+The applications of a mixin are the live class objects whose class records
+name that exact static mixin identity:
+\begin{equation}\label{eq:mixin-applications}
+ \mathsf{mixinApplications}_{\Omega}(M)=
+ \mathsf{sort}_{\prec}
+ \{C\in\dom(\mathsf{vmStore}(\Omega))
+       \mid \mathsf{isClass}_{\mathsf{vmStore}(\Omega)}(C)
+       \land \mixin_{\mathsf{vmStore}(\Omega)}(C)=M\}.
+\end{equation}
+This is an exact-mixin query: applications of other mixins and ordinary
+instances of the resulting classes are excluded.  A metaclass is included
+when its class record applies $M$, so a class-side mixin is treated uniformly
+with an instance-side mixin.  As with Equation~\eqref{eq:all-instances-of}, the
+result is a snapshot in the fixed order $\prec$.  Working Specification 0.109
+requires both population queries.
+
+For $\Omega=\langle P,V,\mathcal H,\mathcal X,\mathcal Q,\mathcal N,
+\Pi,\Phi,\Gamma,\mathcal E,\mathcal D,w,n\rangle$, put
+$U=\mathsf{vmStore}(\Omega)$.  The authority target of every query is
+\begin{equation}\label{eq:mirror-query-target}
+\begin{aligned}
+ \mathsf{queryTarget}_{P,U,w}(\kw{programVersionQuery})
+   &=\kw{vmTarget}(w),\\
+ \mathsf{queryTarget}_{P,U,w}(\kw{mixinDescriptorQuery}(M))
+   &=\kw{mixinTarget}(M),\\
+ \mathsf{queryTarget}_{P,U,w}(\kw{methodDescriptorQuery}(i_f))
+   &=\kw{methodTarget}(i_f),\\
+ \mathsf{queryTarget}_{P,U,w}(\kw{classDescriptorQuery}(C))
+   &=\kw{classTarget}(C),\\
+ \mathsf{queryTarget}_{P,U,w}(\kw{objectDescriptorQuery}(o))
+   &=\kw{objectTarget}(o),\\
+ \mathsf{queryTarget}_{P,U,w}(\kw{activationDescriptorQuery}(a))
+   &=\kw{activationTarget}(a),\\
+ \mathsf{queryTarget}_{P,U,w}(\kw{activationControlQuery}(a))
+   &=\kw{activationTarget}(a),\\
+ \mathsf{queryTarget}_{P,U,w}(\kw{currentActivationQuery}(A))
+   &=\kw{actorTarget}(A),\\
+ \mathsf{queryTarget}_{P,U,w}(\kw{actorStackQuery}(A))
+   &=\kw{actorTarget}(A),\\
+ \mathsf{queryTarget}_{P,U,w}(\kw{allInstancesOfQuery}(C))
+   &=\kw{classTarget}(C),\\
+ \mathsf{queryTarget}_{P,U,w}(\kw{mixinApplicationsQuery}(M))
+   &=\kw{mixinTarget}(M).
+\end{aligned}
+\end{equation}
+Its result is the corresponding immutable snapshot:
+\begin{equation}\label{eq:mirror-query-result}
+\begin{aligned}
+ \mathsf{queryResult}_{\Omega}(\kw{programVersionQuery})&=n,\\
+ \mathsf{queryResult}_{\Omega}(\kw{mixinDescriptorQuery}(M))
+   &=\mathsf{describeMixin}_{P}(M),\\
+ \mathsf{queryResult}_{\Omega}(\kw{methodDescriptorQuery}(i_f))
+   &=\mathsf{describeMethod}_{P}(i_f),\\
+ \mathsf{queryResult}_{\Omega}(\kw{classDescriptorQuery}(C))
+   &=\mathsf{describeClass}_{U}(C),\\
+ \mathsf{queryResult}_{\Omega}(\kw{objectDescriptorQuery}(o))
+   &=\mathsf{describeObject}_{U}(o),\\
+ \mathsf{queryResult}_{\Omega}(\kw{activationDescriptorQuery}(a))
+   &=\mathsf{describeDebugActivation}_{\Omega}(a),\\
+ \mathsf{queryResult}_{\Omega}(\kw{activationControlQuery}(a))
+   &=\mathsf{liveControl}_{\Omega}(a),\\
+ \mathsf{queryResult}_{\Omega}(\kw{currentActivationQuery}(A))
+   &=\mathsf{currentActivation}_{\Omega}(A),\\
+ \mathsf{queryResult}_{\Omega}(\kw{actorStackQuery}(A))
+   &=\mathsf{actorStackSnapshot}_{\Omega}(A),\\
+ \mathsf{queryResult}_{\Omega}(\kw{allInstancesOfQuery}(C))
+   &=\mathsf{allInstancesOf}_{\Omega}(C),\\
+ \mathsf{queryResult}_{\Omega}(\kw{mixinApplicationsQuery}(M))
+   &=\mathsf{mixinApplications}_{\Omega}(M).
+\end{aligned}
+\end{equation}
+Inspection is the partial judgment
+\[
+\dfrac{\begin{gathered}
+ \widehat H_A(g)=\kw{mirror}\langle C_g,w,\zeta,R\rangle\qquad
+ \kw{inspect}\in R\\
+ \mathsf{queryTarget}_{P,U,w}(q_r)
+       \sqsubseteq_{P,U,w}\zeta\qquad
+ d=\mathsf{queryResult}_{\Omega}(q_r)
+\end{gathered}}
+ {\Omega,A,g\vdash\mathsf{inspectMirror}(q_r)\Downarrow d}
+\quad(\rulelabel{Mirror-Inspect})
+\]
+There is no failed-premise fallback that reveals a target.  The concrete
+mirror library may reify denial as an exception, but must not disclose the
+descriptor.
+
+\subsection{Reflective transactions}
+
+A transaction $\Delta$ is a finite sequence of commands, each explicitly
+carrying the mirror that authorizes it:
+\begin{equation}\label{eq:debug-stop-reasons}
+ d_s::=\kw{exceptionStop}(x)\mid\kw{breakpointStop}(\lambda_c)
+       \mid\kw{requestedStop}(o).
+\end{equation}
+\begin{equation}\label{eq:reflection-command-grammar}
+\begin{split}
+ \delta_{\mathrm{code}}::={}&
+ \kw{replaceMethodBody}(g,i_f,b)
+ \mid\kw{replaceMethodDefinition}(g,M,i_f,f)\\
+ &\mid\kw{addMethodDefinition}(g,M,f)
+ \mid\kw{removeMethodDefinition}(g,M,i_f)\\
+ &\mid\kw{replaceSlotDeclarations}(g,M,\delta_s)
+ \mid\kw{replaceNestedDeclarations}(g,M,\delta_n)\\
+ &\mid\kw{replaceMixinInitializer}(g,M,\iota),\\
+ \delta_{\mathrm{class}}::={}&
+ \kw{changeSuperclass}(g,C,S)
+ \mid\kw{changeClassEnclosingObject}(g,C,eo),\\
+ \delta_{\mathrm{objectClass}}::={}&
+ \kw{changeObjectClass}(g,o,C),\\
+ \delta_{\mathrm{objectSlot}}::={}&
+ \kw{writeObjectSlot}(g,o,j,v),\\
+ \delta_{\mathrm{activation}}::={}&
+ \kw{writeActivationParameter}(g,a,x,v)
+ \mid\kw{writeActivationLocal}(g,a,j,v)\\
+ &\mid\kw{changeActivationCurrentClass}(g,a,C)\\
+ &\mid\kw{changeActivationContinuation}(g,a,k)
+ \mid\kw{markActivationUncontinuable}(g,a),\\
+ \delta_{\mathrm{continuation}}::={}&
+ \kw{continueAtActivation}(g,A,a,v),\\
+ \delta_{\mathrm{debug}}::={}&
+ \kw{pauseActor}(g,B,d_s)\\
+ &\mid\kw{replaceCurrentActorStack}(g,B,\mathcal S)\\
+ &\mid\kw{replacePausedActorStack}(g,B,r_s,\mathcal S)\\
+ &\mid\kw{resumePausedActorAtFullSpeed}(g,B,r_s)\\
+ &\mid\kw{replaceAndResumePausedActorStack}(g,B,r_s,\mathcal S),\\
+ \delta_r::={}&\delta_{\mathrm{code}}
+ \mid\delta_{\mathrm{class}}
+ \mid\delta_{\mathrm{objectClass}}
+ \mid\delta_{\mathrm{objectSlot}}
+ \mid\delta_{\mathrm{activation}}
+ \mid\delta_{\mathrm{continuation}}
+ \mid\delta_{\mathrm{debug}},\\
+ \Delta::={}&\langle\delta_1,\ldots,\delta_m\rangle.
+\end{split}
+\end{equation}
+By definition, $\mathit{CodeCommand}$ is generated by
+$\delta_{\mathrm{code}}$, and $\mathit{ClassCommand}$ by
+$\delta_{\mathrm{class}}$.  The sets $\mathit{ObjectClassCommand}$ and
+$\mathit{ObjectSlotCommand}$ are generated by
+$\delta_{\mathrm{objectClass}}$ and $\delta_{\mathrm{objectSlot}}$,
+respectively.  Finally, $\mathit{ActivationCommand}$ is generated by
+$\delta_{\mathrm{activation}}$, and $\mathit{ContinuationCommand}$ by
+$\delta_{\mathrm{continuation}}$, and $\mathit{DebuggerCommand}$ by
+$\delta_{\mathrm{debug}}$.  These seven sets are disjoint by outer
+constructor and form an exhaustive partition of $\delta_r$.  In particular,
+a class command edits a runtime class record, an
+object-class command reclassifies one object, and an object-slot command
+changes state within that object's existing final layout.  These are distinct
+operations with distinct rights and distinct preparation phases.  The names
+are intentionally not overloaded: changing a whole method definition is also
+distinct from replacing only its body.
+
+Define $\mathsf{commandMirror}(\delta_r)$ as the first field of every command.
+The required right is the total function
+\begin{equation}\label{eq:reflection-command-right}
+ \mathsf{requiredRight}(\delta_r)=
+ \begin{cases}
+  \kw{editCode}&\delta_r\in\mathit{CodeCommand},\\
+  \kw{editClass}&\delta_r\in\mathit{ClassCommand},\\
+  \kw{reclassifyObject}&\delta_r\in\mathit{ObjectClassCommand},\\
+  \kw{editObjectSlots}&\delta_r\in\mathit{ObjectSlotCommand},\\
+  \kw{editActivation}&\delta_r\in\mathit{ActivationCommand},\\
+  \kw{controlContinuation}&\delta_r\in\mathit{ContinuationCommand},\\
+  \kw{controlActorStack}&\delta_r\in\mathit{DebuggerCommand}.
+ \end{cases}
+\end{equation}
+The target function is
+\begin{equation}\label{eq:reflection-command-target}
+ \mathsf{commandTarget}(\delta_r)=
+ \begin{cases}
+  \kw{methodTarget}(i_f)&\delta_r\text{ names an existing }i_f,\\
+  \kw{mixinTarget}(M)&\delta_r\text{ adds a method or edits mixin structure},\\
+  \kw{classTarget}(C)&\delta_r\in\mathit{ClassCommand},\\
+  \kw{objectTarget}(o)&\delta_r\in
+       \mathit{ObjectClassCommand}\cup\mathit{ObjectSlotCommand},\\
+  \kw{activationTarget}(a)&\delta_r\in
+       \mathit{ActivationCommand}\cup\mathit{ContinuationCommand},\\
+  \kw{actorTarget}(B)&\delta_r\in\mathit{DebuggerCommand}
+       \text{ and names actor }B.
+ \end{cases}
+\end{equation}
+For method addition the target is its mixin; for removal, definition
+replacement, and body replacement the method identity is the target.  The
+authorization predicate is
+\begin{equation}\label{eq:reflection-authorized}
+\begin{split}
+ \mathsf{authorized}_{\Omega,A}(\delta_r)\quad\Longleftrightarrow\quad{}
+ &\widehat H_A(g)=\kw{mirror}\langle C_g,w,\zeta,R\rangle\ \land\\
+ &g=\mathsf{commandMirror}(\delta_r)\ \land\
+ \mathsf{requiredRight}(\delta_r)\in R\ \land\\
+ &\mathsf{commandTarget}(\delta_r)
+   \sqsubseteq_{P,\mathsf{vmStore}(\Omega),w}\zeta.
+\end{split}
+\end{equation}
+Thus syntactic possession of a mirror variable is not sufficient: the
+unforgeable heap record, VM identity, target containment, and operation right
+must all agree.
+
+Transactions are simultaneous.  Let $\lambda$ range over the tagged write
+locations below, and define the complete write-footprint function
+$\mathsf{writes}$ by
+{\footnotesize
+\begin{equation}\label{eq:stack-template-record-locations}
+ \mathsf{templateRecordLocations}(\mathcal S)=
+ \{\kw{activationRecordLoc}(a)\mid
+   \kw{frameTemplate}\langle\kw{retain}(a),R,\kappa\rangle
+      \text{ occurs in }\mathcal S\}.
+\end{equation}
+}
+{\small
+\begin{equation}\label{eq:reflection-command-footprint}
+\begin{aligned}
+ &\mathsf{writes}(\kw{replaceMethodBody}(g,i_f,b))\\
+ &\qquad=\{\kw{methodBodyLoc}(i_f)\},\\
+ &\mathsf{writes}(\kw{replaceMethodDefinition}(g,M,i_f,f))\\
+ &\qquad=\{\kw{methodDefLoc}(i_f),\kw{methodBodyLoc}(i_f),
+       \kw{selectorLoc}(M,\selector(f))\},\\
+ &\mathsf{writes}(\kw{addMethodDefinition}(g,M,f))\\
+ &\qquad=\{\kw{methodDefLoc}(\mathsf{methodId}(f)),
+       \kw{selectorLoc}(M,\selector(f))\},\\
+ &\mathsf{writes}(\kw{removeMethodDefinition}(g,M,i_f))\\
+ &\qquad=\{\kw{methodDefLoc}(i_f),\kw{methodBodyLoc}(i_f)\},\\
+ &\mathsf{writes}(\kw{replaceSlotDeclarations}(g,M,\delta_s))
+  =\{\kw{slotDeclsLoc}(M)\},\\
+ &\mathsf{writes}(\kw{replaceNestedDeclarations}(g,M,\delta_n))
+  =\{\kw{nestedDeclsLoc}(M)\},\\
+ &\mathsf{writes}(\kw{replaceMixinInitializer}(g,M,\iota))
+  =\{\kw{mixinInitializerLoc}(M)\},\\
+ &\mathsf{writes}(\kw{changeSuperclass}(g,C,S))
+  =\{\kw{superclassLoc}(C)\},\\
+ &\mathsf{writes}(\kw{changeClassEnclosingObject}(g,C,eo))
+  =\{\kw{classEnclosingLoc}(C)\},\\
+ &\mathsf{writes}(\kw{changeObjectClass}(g,o,C))
+  =\{\kw{objectClassLoc}(o)\},\\
+ &\mathsf{writes}(\kw{writeObjectSlot}(g,o,j,v))
+  =\{\kw{objectSlotLoc}(o,j)\},\\
+ &\mathsf{writes}(\kw{writeActivationParameter}(g,a,x,v))\\
+ &\qquad=\{\kw{activationParameterLoc}(a,x)\},\\
+ &\mathsf{writes}(\kw{writeActivationLocal}(g,a,j,v))
+  =\{\kw{activationLocalLoc}(a,j)\},\\
+ &\mathsf{writes}(\kw{changeActivationCurrentClass}(g,a,C))\\
+ &\qquad=\{\kw{activationClassLoc}(a)\},\\
+ &\mathsf{writes}(\kw{changeActivationContinuation}(g,a,k))\\
+ &\qquad=\{\kw{activationContinuationLoc}(a)\},\\
+ &\mathsf{writes}(\kw{markActivationUncontinuable}(g,a))\\
+ &\qquad=\{\kw{activationContinuableLoc}(a)\},\\
+ &\mathsf{writes}(\kw{continueAtActivation}(g,A,a,v))\\
+ &\qquad=\{\kw{actorStackLoc}(A),\kw{activationContinuationLoc}(a)\},\\
+ &\mathsf{writes}(\kw{pauseActor}(g,B,d_s))
+   =\{\kw{actorStackLoc}(B)\},\\
+ &\mathsf{writes}(\kw{replaceCurrentActorStack}(g,B,\mathcal S))\\
+ &\qquad=\{\kw{actorStackLoc}(B)\}\cup
+      \mathsf{templateRecordLocations}(\mathcal S),\\
+ &\mathsf{writes}(\kw{replacePausedActorStack}(g,B,r_s,\mathcal S))\\
+ &\qquad=\{\kw{actorStackLoc}(B)\}\cup
+      \mathsf{templateRecordLocations}(\mathcal S),\\
+ &\mathsf{writes}(\kw{resumePausedActorAtFullSpeed}(g,B,r_s))
+   =\{\kw{actorStackLoc}(B)\},\\
+ &\mathsf{writes}(\kw{replaceAndResumePausedActorStack}
+        (g,B,r_s,\mathcal S))\\
+ &\qquad=\{\kw{actorStackLoc}(B)\}\cup
+      \mathsf{templateRecordLocations}(\mathcal S).
+\end{aligned}
+\end{equation}
+}
+Location overlap is the least reflexive, symmetric relation
+\begin{equation}\label{eq:reflection-location-overlap}
+\begin{aligned}
+ \lambda&\mathrel{\bowtie}\lambda,\\
+ \kw{activationRecordLoc}(a)&\mathrel{\bowtie}
+   \kw{activationFieldLoc}(a,\xi),\\
+ \kw{activationFieldLoc}(a,\xi)&\mathrel{\bowtie}
+   \kw{activationRecordLoc}(a).
+\end{aligned}
+\end{equation}
+Each concrete parameter, local, class, continuation, and continuability
+location above is the corresponding instance of
+$\kw{activationFieldLoc}(a,\xi)$.  All other distinct tagged locations are
+nonoverlapping.  This lets two edits
+to different fields of one activation coexist while making a whole-record
+stack installation conflict with either edit.
+For $\Delta=\langle\delta_1,\ldots,\delta_m\rangle$, conflict and
+nonconflict are therefore the predicates
+\begin{equation}\label{eq:reflection-conflict}
+\begin{aligned}
+ \mathsf{conflict}_{\Delta}(i,j)
+  &\Longleftrightarrow 1\le i<j\le m\ \land\
+  &\qquad\exists\lambda\in\mathsf{writes}(\delta_i),
+          \lambda'\in\mathsf{writes}(\delta_j).
+          \ \lambda\mathrel{\bowtie}\lambda',\\
+ \mathsf{nonconflicting}(\Delta)
+  &\Longleftrightarrow
+    \neg\exists i,j.\;\mathsf{conflict}_{\Delta}(i,j).
+\end{aligned}
+\end{equation}
+The multi-location cases make whole-method replacement overlap body
+replacement, and make continuation transfer overlap another transfer for the
+same actor or a direct mutation of the resumed continuation.
+
+\subsection{Source change and re-elaboration}
+
+The code-command projection is
+\begin{equation}\label{eq:code-command-projection}
+ \mathsf{codeCommands}(\Delta)=
+ \mathsf{filter}_{\mathit{CodeCommand}}(\Delta).
+\end{equation}
+Its direct source effect is the partial function $\mathsf{patchSource}$:
+\begin{equation}\label{eq:source-patch}
+\begin{array}{rcl}
+ \mathsf{patchSource}(Q,\kw{replaceMethodBody}(g,i_f,b))
+   &=&Q[\mathit{source}(i_f).\mathit{body}\mapsto b],\\
+ \mathsf{patchSource}(Q,\kw{replaceMethodDefinition}(g,M,i_f,f))
+   &=&Q[\mathit{source}(i_f)\mapsto f],\\
+ \mathsf{patchSource}(Q,\kw{addMethodDefinition}(g,M,f))
+   &=&\mathsf{insertMethodSource}(Q,\decl_Q(M),f),\\
+ \mathsf{patchSource}(Q,\kw{removeMethodDefinition}(g,M,i_f))
+   &=&\mathsf{deleteMethodSource}(Q,\decl_Q(M),i_f),\\
+ \mathsf{patchSource}(Q,\kw{replaceSlotDeclarations}(g,M,\delta_s))
+   &=&Q[\mathit{source}(\decl_Q(M)).\mathit{slots}\mapsto\delta_s],\\
+ \mathsf{patchSource}(Q,\kw{replaceNestedDeclarations}(g,M,\delta_n))
+   &=&Q[\mathit{source}(\decl_Q(M)).\mathit{nested}\mapsto\delta_n],\\
+ \mathsf{patchSource}(Q,\kw{replaceMixinInitializer}(g,M,\iota))
+   &=&Q[\mathit{source}(\decl_Q(M)).\mathit{initializer}\mapsto\iota].
+\end{array}
+\end{equation}
+$\mathsf{insertMethodSource}$ requires a fresh method identity and absent
+selector; $\mathsf{deleteMethodSource}$ requires that the identity is a direct
+method of the named mixin.  Definition and body replacement preserve the
+method identity; delete followed by add cannot reuse it.
+
+Because the transaction is nonconflicting, the fold
+\begin{equation}\label{eq:apply-source-commands}
+\begin{aligned}
+ \mathsf{applySourceCommands}(P,\epsilon)&=P,\\
+ \mathsf{applySourceCommands}(P,\delta\cdot\bar\delta)
+   &=\mathsf{applySourceCommands}(\mathsf{patchSource}(P,\delta),\bar\delta)
+\end{aligned}
+\end{equation}
+is independent of the chosen canonical locus order.  The patched source
+candidate is
+\begin{equation}\label{eq:patched-source-candidate}
+ Q=\mathsf{applySourceCommands}(P,\mathsf{codeCommands}(\Delta)).
+\end{equation}
+The ordinary elaborator is rerun on the complete affected dependency closure:
+\begin{equation}\label{eq:reflective-reelaboration}
+ \begin{aligned}
+ &\mathsf{reelaborateProgram}(P,Q)=P'
+ \quad\Longleftrightarrow\\[-1mm]
+ &\quad P'.\mathit{source}=Q.\mathit{source}\ \land\\
+ &\quad P'.\mathit{unit}=Q.\mathit{unit}\ \land\\
+ &\quad \forall K\in\dom(P.\mathit{declMixin})\cap\dom(Q.\mathit{source}).\;
+    P'.\mathit{declMixin}(K)=P.\mathit{declMixin}(K)\ \land\\
+ &\quad \forall f,f'\text{ denoting one surviving declaration}.\;
+    \mathsf{methodId}(f')=\mathsf{methodId}(f)\ \land\\
+ &\quad \mathsf{coreProgramOK}(P').
+ \end{aligned}
+\end{equation}
+The last clause is Equation~\eqref{eq:annotated-program-validity}; it
+recomputes all derived fields of
+Equation~\eqref{eq:program-definition}, including synthesized accessors,
+lexical parents, scope chains, activation members, owner maps, initializer
+normal forms, and method-body maps.  It is undefined on a parse, binding,
+access, arity, duplicate-selector, or other static error.  This is why a
+transaction cannot expose a half-elaborated program.
+
+\subsection{Class graphs, object layouts, and individual objects}
+
+Let the command projections be
+\begin{equation}\label{eq:class-command-projections}
+\begin{aligned}
+ \mathsf{classCommands}(\Delta)&=
+  \mathsf{filter}_{\mathit{ClassCommand}}(\Delta),\\
+ \mathsf{objectClassCommands}(\Delta)&=
+  \mathsf{filter}_{\mathit{ObjectClassCommand}}(\Delta),\\
+ \mathsf{objectSlotCommands}(\Delta)&=
+  \mathsf{filter}_{\mathit{ObjectSlotCommand}}(\Delta).
+\end{aligned}
+\end{equation}
+Their heap effects are the distinct partial functions
+\begin{equation}\label{eq:class-object-heap-effects}
+\begin{aligned}
+ \mathsf{applyClassCommand}(H,\kw{changeSuperclass}(g,C,S))
+   &=H[C.S\mapsto S],\\
+ \mathsf{applyClassCommand}(H,\kw{changeClassEnclosingObject}(g,C,eo))
+   &=H[C.eo\mapsto eo],\\
+ \mathsf{applyObjectClassCommand}(H,\kw{changeObjectClass}(g,o,C))
+   &=H[o.C\mapsto C].
+\end{aligned}
+\end{equation}
+The corresponding phases are
+\begin{equation}\label{eq:class-object-command-folds}
+\begin{aligned}
+ \mathsf{applyClassCommands}(H,\epsilon)&=H,\\
+ \mathsf{applyClassCommands}(H,\delta\cdot\bar\delta)
+   &=\mathsf{applyClassCommands}
+       (\mathsf{applyClassCommand}(H,\delta),\bar\delta),\\
+ \mathsf{applyObjectClassCommands}(H,\epsilon)&=H,\\
+ \mathsf{applyObjectClassCommands}(H,\delta\cdot\bar\delta)
+   &=\mathsf{applyObjectClassCommands}\\
+   &\quad(\mathsf{applyObjectClassCommand}(H,\delta),\bar\delta).
+\end{aligned}
+\end{equation}
+The command sequences are in canonical locus order.  Neither phase changes
+$H(C).\chi_C$: creation provenance records how the class was created, not its
+current superclass or enclosing object.
+
+The three projections in Equation~\eqref{eq:class-command-projections} must
+not be conflated.  A class command changes the graph or lexical context shared
+by all instances of $C$.  An object-class command changes only $o.C$ and then
+subjects that object to layout reconciliation.  An object-slot command leaves
+both the class graph and $o.C$ unchanged and writes one slot only after the
+final layout has been established.
+
+For every ordinary object, layout reconciliation against the final program
+and class graph is
+\begin{equation}\label{eq:reconcile-object-layout}
+\begin{aligned}
+ L_o&=\mathsf{set}(\mathsf{layout}_{P',H_c}(\classof_{H_c}(o))),\\
+ \mathsf{reconcileObjectLayout}(P',H_c,o)
+   &=H_c[o.\sigma\mapsto
+       [j\in L_o\mapsto
+          \begin{cases}H_c(o).\sigma(j)&j\in\dom(H_c(o).\sigma),\\
+                        \nil&j\notin\dom(H_c(o).\sigma),
+          \end{cases}]] .
+\end{aligned}
+\end{equation}
+Thus stable physical slot identities preserve retained state, newly introduced
+slots contain $\nil$, and removed slots become unreachable in the same atomic
+commit.  The operation applies to every object whose old and new layouts
+differ, including every instance affected transitively by a superclass or
+mixin-slot edit and an individual object named by \kw{changeObjectClass}.
+If $P.\mathit{mixin}(M)=\langle K,\phi,\delta,\nu,\iota\rangle$, define
+\begin{equation}\label{eq:nested-declaration-keys}
+\begin{aligned}
+ \mathsf{ownNestedKeys}_{P}(M)&=\dom(\nu),\\
+ \mathsf{nestedKeys}_{P,H}(C)
+  &=\bigcup_{R\in\mathsf{set}(\mathsf{chain}_H(C))\setminus\{\Top\}}
+       \mathsf{ownNestedKeys}_{P}(\mixin_H(R)).
+\end{aligned}
+\end{equation}
+Nested-class caches are reconciled separately using
+Equation~\eqref{eq:nested-declaration-keys}:
+\begin{equation}\label{eq:reconcile-nested-cache}
+ \mathsf{reconcileNestedCache}(P',H,o)=
+ H[o.\eta\mapsto H(o).\eta\mathbin{\upharpoonright}
+   \mathsf{nestedKeys}_{P',H}(\classof_H(o))].
+\end{equation}
+Removing a declaration therefore removes its memoized reachability; adding one
+does not eagerly create a class.  Existing class objects remain ordinary live
+objects if referenced elsewhere.
+
+Using the VM identity order $\prec$ fixed by
+Equation~\eqref{eq:all-instances-of}, define
+\begin{equation}\label{eq:reconciliation-phases}
+\begin{aligned}
+ \mathsf{objectIds}(H)
+   &=\mathsf{sort}_{\prec}
+       \{o\in\dom(H)\mid H(o)=\kw{object}\langle C,\sigma,\eta\rangle\},\\
+ \mathsf{reconcileObjectLayouts}(P',H,\epsilon)&=H,\\
+ \mathsf{reconcileObjectLayouts}(P',H,o\cdot\bar O)
+   &=\mathsf{reconcileObjectLayouts}\\
+   &\quad(P',\mathsf{reconcileObjectLayout}(P',H,o),\bar O),\\
+ \mathsf{reconcileAllObjectLayouts}(P',H)
+   &=\mathsf{reconcileObjectLayouts}(P',H,\mathsf{objectIds}(H)),\\
+ \mathsf{reconcileNestedCaches}(P',H,\epsilon)&=H,\\
+ \mathsf{reconcileNestedCaches}(P',H,o\cdot\bar O)
+   &=\mathsf{reconcileNestedCaches}\\
+   &\quad(P',\mathsf{reconcileNestedCache}(P',H,o),\bar O),\\
+ \mathsf{reconcileAllNestedCaches}(P',H)
+   &=\mathsf{reconcileNestedCaches}(P',H,\mathsf{objectIds}(H)).
+\end{aligned}
+\end{equation}
+
+After all reconciliations, an explicit mirror slot write is
+\begin{equation}\label{eq:reflective-object-slot-write}
+ \begin{aligned}
+ &\mathsf{applyObjectSlotWrite}(P',H,\kw{writeObjectSlot}(g,o,j,v))
+    =H[o.\sigma(j)\mapsto v]\\
+ &\hspace{28mm}\text{if }j\in
+    \mathsf{set}(\mathsf{layout}_{P',H}(\classof_H(o))).
+ \end{aligned}
+\end{equation}
+It is undefined otherwise.  This operation is different from the base setter
+and from initializer direct write; no source-level access check or synthesized
+method is involved.  All actor-isolation checks are nevertheless retained.
+
+The object-slot phase is
+\begin{equation}\label{eq:object-slot-command-fold}
+\begin{aligned}
+ \mathsf{applyObjectSlotWrites}(P',H,\epsilon)&=H,\\
+ \mathsf{applyObjectSlotWrites}(P',H,\delta\cdot\bar\delta)
+   &=\mathsf{applyObjectSlotWrites}
+       (P',\mathsf{applyObjectSlotWrite}(P',H,\delta),\bar\delta).
+\end{aligned}
+\end{equation}
+
+\subsection{Activations and continuations}
+
+The command projections for the remaining two phases are
+\begin{equation}\label{eq:control-command-projections}
+\begin{aligned}
+ \mathsf{activationCommands}(\Delta)&=
+  \mathsf{filter}_{\mathit{ActivationCommand}}(\Delta),\\
+ \mathsf{continuationCommands}(\Delta)&=
+  \mathsf{filter}_{\mathit{ContinuationCommand}}(\Delta).
+\end{aligned}
+\end{equation}
+
+For an activation command other than continuation transfer, define
+\begin{equation}\label{eq:activation-field-effects}
+\begin{aligned}
+ \mathsf{applyActivationCommand}(H,\kw{writeActivationParameter}(g,a,x,v))
+   &=H[a.\rho(x)\mapsto v],\\
+ \mathsf{applyActivationCommand}(H,\kw{writeActivationLocal}(g,a,j,v))
+   &=H[a.\ell(j)\mapsto v],\\
+ \mathsf{applyActivationCommand}(H,\kw{changeActivationCurrentClass}(g,a,C))
+   &=H[a.C\mapsto C],\\
+ \mathsf{applyActivationCommand}(H,\kw{changeActivationContinuation}(g,a,k))
+   &=H[a.k\mapsto k],\\
+ \mathsf{applyActivationCommand}(H,\kw{markActivationUncontinuable}(g,a))
+   &=\mathsf{markUncontinuable}(H,a).
+\end{aligned}
+\end{equation}
+The first case is reflectively permitted even though parameter slots are
+immutable at base level.  The second requires a physical local identity
+already present in $H(a).\ell$.  A changed current class must remain on the
+current instance's class chain.  A changed continuation is either $\nil$ or a
+strictly lower live stack activation, so continuation links remain acyclic.
+Marking uses Equations~\eqref{eq:dependents} and
+\eqref{eq:mark-uncontinuable}.
+
+The activation phase is
+\begin{equation}\label{eq:activation-command-fold}
+\begin{aligned}
+ \mathsf{applyActivationCommands}(H,\epsilon)&=H,\\
+ \mathsf{applyActivationCommands}(H,\delta\cdot\bar\delta)
+   &=\mathsf{applyActivationCommands}
+       (\mathsf{applyActivationCommand}(H,\delta),\bar\delta).
+\end{aligned}
+\end{equation}
+
+Equation~\eqref{eq:resume} supplies the stack operation used by reflective
+continuation transfer.  The corresponding state transformer is
+\begin{equation}\label{eq:reflective-continuation-transfer}
+\begin{aligned}
+ &\delta_c=\kw{continueAtActivation}(g,A,a,v),\\
+ &\mathsf{applyContinuationTransfer}(H,\mathcal X,\delta_c)
+      =\langle H',\mathcal X'\rangle,\\
+ &\mathcal X(A)=\kw{runningTurn}\langle\mathcal A,t,p,u\rangle,\qquad
+ H(a).q_a=\kw{true},\qquad
+ \mathsf{resume}(\mathcal A,a,v)=\langle\mathcal A',v\rangle,\\
+ &H'=H[a.k\mapsto\nil],\qquad
+ \mathcal X'=\mathcal X[A\mapsto
+       \kw{runningTurn}\langle\mathcal A',v,p,u\rangle].
+\end{aligned}
+\end{equation}
+It is undefined for an idle actor, a retained but no longer live activation,
+or an uncontinuable activation.  At most one continuation transfer per actor
+may occur in a transaction.  The discarded stack suffix remains in the heap,
+as in ordinary return, so debuggers may retain it; its continuation dependents
+are marked uncontinuable before commit.  This gives reflection continuation
+power without introducing a second, incompatible continuation representation.
+
+The continuation-transfer phase is
+\begin{equation}\label{eq:continuation-command-fold}
+\begin{aligned}
+ \mathsf{applyContinuationTransfers}(H,\mathcal X,\epsilon)
+   &=\langle H,\mathcal X\rangle,\\
+ \mathsf{applyContinuationTransfers}
+      (H,\mathcal X,\delta\cdot\bar\delta)
+   &=\mathsf{applyContinuationTransfers}(H',\mathcal X',\bar\delta)\\
+ &\quad\text{where }\langle H',\mathcal X'\rangle=
+       \mathsf{applyContinuationTransfer}(H,\mathcal X,\delta).
+\end{aligned}
+\end{equation}
+
+\subsection{Debugger stack installation and full-speed resumption}
+
+The debugger-command projection is
+\begin{equation}\label{eq:debugger-command-projection}
+ \mathsf{debuggerCommands}(\Delta)=
+   \mathsf{filter}_{\mathit{DebuggerCommand}}(\Delta).
+\end{equation}
+For a template $\mathcal S=\langle\psi_1,\ldots,\psi_m\rangle$, key
+resolution is the partial function
+\begin{equation}\label{eq:resolve-stack-template-keys}
+\begin{aligned}
+ \mathsf{resolveTemplateKeys}(H,\mathcal S)&=\nu,\\
+ \nu(\kw{retain}(a))&=a
+   &&\text{only if }H(a)\text{ is an activation record},\\
+ \nu(\kw{freshFrame}(u_i))&=a_i
+   &&a_i\text{ is fresh},\\
+ \nu(\eta_i)&\ne\nu(\eta_j)&&i\ne j.
+\end{aligned}
+\end{equation}
+Fresh choices are simultaneous.  Substitution $\nu(R)$ replaces every
+template-key occurrence in a continuation, home, or lexical environment by
+its resolved activation identity.
+
+The well-formedness predicate for a resolved stack image is
+{\footnotesize
+\begin{equation}\label{eq:debug-stack-image-validity}
+\begin{split}
+ \mathsf{debugStackOK}(P,H,
+    \langle a_1,\kappa_1\rangle\cdots\langle a_m,\kappa_m\rangle)
+ \quad\Longleftrightarrow\quad{}
+ &m>0\ \land\ \mathsf{pairwiseDistinct}(a_1,\ldots,a_m)\ \land\\
+ &\mathsf{decodeControlImage}
+    (\langle a_1,\kappa_1\rangle\cdots\langle a_m,\kappa_m\rangle)
+       \downarrow\ \land\\
+ &\forall i\le m.\ H(a_i)\text{ is an activation record}\ \land
+       H(a_i).q_a=\kw{true}\ \land\\
+ &\forall i\le m.\ \mathsf{controlLocation}(\kappa_i)\downarrow
+       \ \land\ \mathsf{controlRefs}(\kappa_i)\subseteq\dom(H)\ \land\\
+ &\forall i\le m.\ H(a_i).k=\nil\ \lor\
+       \exists j<i.\ H(a_i).k=a_j\ \land\\
+ &\forall i\le m.\ H(a_i).h=\nil\ \lor\ H(a_i).h\in\dom(H).
+\end{split}
+\end{equation}
+}
+$\mathsf{controlRefs}$ is the instance of the structural reference extractor
+of Equation~\eqref{eq:structural-reference-extractor} for terms and
+intra-activation frames.  The control-map definedness premise validates a
+source or machine location; a bytecode platform additionally requires the operand-stack and
+temporary layout encoded by $\pi_i$ to match the stack map at the corresponding
+PC.  This is the implementation representation of the same predicate, not a
+weaker alternate rule.
+
+Removed live activations remain available to retained mirrors but cease to be
+continuable:
+\begin{equation}\label{eq:retire-removed-stack-activations}
+ \mathsf{retireRemoved}(H,R)=
+ H[\,a.k\mapsto\nil,\ a.q_a\mapsto\kw{false}\mid a\in R\,].
+\end{equation}
+Define atomic template materialization by
+\begin{equation}\label{eq:materialize-stack-template}
+\begin{split}
+ &\mathsf{materializeStackTemplate}(P,H,\mathcal A,\mathcal S)
+      =\langle H',\mathcal A',t'\rangle
+ \quad\Longleftrightarrow\\
+ &\quad\nu=\mathsf{resolveTemplateKeys}(H,\mathcal S)\ \land\\
+ &\quad\mathcal K=
+   \langle\nu(\psi_1.\eta),\psi_1.\kappa\rangle\cdots
+   \langle\nu(\psi_m.\eta),\psi_m.\kappa\rangle\ \land\\
+ &\quad\mathsf{decodeControlImage}(\mathcal K)
+      =\langle\mathcal A',t'\rangle\ \land\\
+ &\quad R=\mathsf{set}(\mathsf{activationIds}(\mathcal A))
+       \setminus\mathsf{set}(\mathsf{activationIds}(\mathcal A'))\ \land\\
+ &\quad H_0=\mathsf{retireRemoved}(H,R)\ \land\\
+ &\quad H'=H_0[\,\nu(\psi_i.\eta)\mapsto\nu(\psi_i.R)
+          \mid1\le i\le m\,]\ \land\\
+ &\quad\mathsf{debugStackOK}(P,H',\mathcal K).
+\end{split}
+\end{equation}
+It is undefined if any key, record, control point, reference, continuation, or
+stack-shape condition fails.  Since only $H'$ and the reconstructed
+$\langle\mathcal A',t'\rangle$ leave the function, neither allocation nor
+retirement is visible on failure.
+
+The effect of one debugger command, issued by actor $A$, is the following
+partial function.  Pausing allocates a fresh token:
+\begin{equation}\label{eq:pause-actor-effect}
+\begin{aligned}
+ &\mathsf{applyDebuggerCommand}
+   (P,H,\mathcal X,A,\kw{pauseActor}(g,B,d_s))
+       =\langle H,\mathcal X'\rangle,\\
+ &\mathcal X(B)=\kw{runningTurn}\langle\mathcal A,t,p,u\rangle,
+ \quad A\ne B,\quad\mathcal A\ne\epsilon,\quad r_s\text{ fresh},\\
+ &\mathcal X'=\mathcal X[B\mapsto
+   \kw{pausedTurn}\langle\mathcal A,t,p,u,r_s,d_s\rangle].
+\end{aligned}
+\end{equation}
+A debugger running in the actor that it is editing uses the nonreturning
+current-stack replacement:
+\begin{equation}\label{eq:replace-current-actor-stack}
+\begin{aligned}
+ &\mathsf{applyDebuggerCommand}
+   (P,H,\mathcal X,A,\kw{replaceCurrentActorStack}(g,B,\mathcal S))
+       =\langle H',\mathcal X'\rangle,\\
+ &A=B,\quad
+ \mathcal X(B)=\kw{runningTurn}\langle\mathcal A,t,p,u\rangle,\\
+ &\mathsf{materializeStackTemplate}(P,H,\mathcal A,\mathcal S)
+       =\langle H',\mathcal A',t'\rangle,\\
+ &\mathcal X'=\mathcal X[B\mapsto
+       \kw{runningTurn}\langle\mathcal A',t',p,u\rangle].
+\end{aligned}
+\end{equation}
+The reflective invocation that requested this command is among the discarded
+or replaced frames, so it does not return.  This is the operation used by an
+in-actor debugger after a top-level resumable-exception handler has constructed
+the desired continuation.
+For the common resumable-exception case, the derived constructor is
+\begin{equation}\label{eq:resume-exception-stack-template}
+ \mathsf{resumeExceptionStack}
+  (\mathcal S_0\cdot\langle\psi_f\rangle\cdot\mathcal S_d,a_f,v)
+ =\mathcal S_0\cdot
+   \langle\mathsf{promoteFrame}(\psi_f,v)\rangle
+ \quad\text{if }\psi_f.\eta=\kw{retain}(a_f).
+\end{equation}
+It removes the handler and debugger suffix $\mathcal S_d$ and makes $v$ the
+result of the original \kws{signal} send.  Submitting this template through
+Equation~\eqref{eq:replace-current-actor-stack} therefore resumes precisely at
+the protected failure point under the normal VM relation.
+
+For a paused actor, replacement checks the exact pause token and issues a new
+one:
+\begin{equation}\label{eq:replace-paused-actor-stack}
+\begin{aligned}
+ &\mathsf{applyDebuggerCommand}
+  (P,H,\mathcal X,A,\kw{replacePausedActorStack}(g,B,r_s,\mathcal S))
+      =\langle H',\mathcal X'\rangle,\\
+ &\mathcal X(B)=\kw{pausedTurn}\langle
+      \mathcal A,t,p,u,r_s,d_s\rangle,\\
+ &\mathsf{materializeStackTemplate}(P,H,\mathcal A,\mathcal S)
+      =\langle H',\mathcal A',t'\rangle,\quad r_s'\text{ fresh},\\
+ &\mathcal X'=\mathcal X[B\mapsto\kw{pausedTurn}\langle
+      \mathcal A',t',p,u,r_s',d_s\rangle].
+\end{aligned}
+\end{equation}
+Resuming an unchanged paused stack selects ordinary VM execution:
+\begin{equation}\label{eq:resume-paused-actor-full-speed}
+\begin{aligned}
+ &\mathsf{applyDebuggerCommand}
+  (P,H,\mathcal X,A,\kw{resumePausedActorAtFullSpeed}(g,B,r_s))
+      =\langle H,\mathcal X'\rangle,\\
+ &\mathcal X(B)=\kw{pausedTurn}\langle
+      \mathcal A,t,p,u,r_s,d_s\rangle,\\
+ &\mathcal X'=\mathcal X[B\mapsto
+      \kw{runningTurn}\langle\mathcal A,t,p,u\rangle].
+\end{aligned}
+\end{equation}
+Replacement and full-speed resumption may instead be one atomic operation:
+\begin{equation}\label{eq:replace-resume-paused-actor-stack}
+\begin{aligned}
+ &\mathsf{applyDebuggerCommand}(P,H,\mathcal X,A,
+   \kw{replaceAndResumePausedActorStack}(g,B,r_s,\mathcal S))
+      =\langle H',\mathcal X'\rangle,\\
+ &\mathcal X(B)=\kw{pausedTurn}\langle
+      \mathcal A,t,p,u,r_s,d_s\rangle,\\
+ &\mathsf{materializeStackTemplate}(P,H,\mathcal A,\mathcal S)
+      =\langle H',\mathcal A',t'\rangle,\\
+ &\mathcal X'=\mathcal X[B\mapsto
+      \kw{runningTurn}\langle\mathcal A',t',p,u\rangle].
+\end{aligned}
+\end{equation}
+``Full speed'' is not a second language semantics: after either resume equation,
+Rule \rulelabel{Actor-Sequential} again lifts the ordinary sequential relation.
+An interpreter, baseline VM, or optimizing VM conforms by implementing that
+same relation from the installed control image.
+
+The debugger phase is the explicit fold
+\begin{equation}\label{eq:debugger-command-fold}
+\begin{aligned}
+ \mathsf{applyDebuggerCommands}(P,H,\mathcal X,A,\epsilon)
+   &=\langle H,\mathcal X\rangle,\\
+ \mathsf{applyDebuggerCommands}
+   (P,H,\mathcal X,A,\delta\cdot\bar\delta)
+   &=\mathsf{applyDebuggerCommands}
+       (P,H',\mathcal X',A,\bar\delta)\\
+ &\quad\text{where }\langle H',\mathcal X'\rangle={}\\[-1mm]
+ &\hspace{29mm}\mathsf{applyDebuggerCommand}(P,H,\mathcal X,A,\delta).
+\end{aligned}
+\end{equation}
+
+\paragraph{Simulator correspondence.}
+Let $D$ be a Simulator state represented by ordinary Newspeak objects and let
+$D\approx_{\mathsf{sim}}\Sigma$ mean that its bytecode frames and program
+counters decode to the stack and control image of
+Equation~\eqref{eq:stack-control-image}.  Write
+$\longmapsto_{\mathsf{Simulator}}^{+}$ for a nonempty finite Simulator
+execution and $\longmapsto^{*}$ for a possibly empty finite semantic
+execution.  An admitted compiler/Simulator pair supplies the three-part
+certificate
+\begin{equation}\label{eq:simulator-step-correspondence}
+\begin{aligned}
+ D\approx_{\mathsf{sim}}\Sigma\ \land\
+ D\longmapsto_{\mathsf{Simulator}}D'
+ &\Rightarrow
+ \exists\Sigma'.\ \Sigma\longmapsto^{*}\Sigma'
+       \land D'\approx_{\mathsf{sim}}\Sigma',\\
+ D\approx_{\mathsf{sim}}\Sigma\ \land\ \Sigma\longmapsto\Sigma'
+ &\Rightarrow
+ \exists D'.\ D\longmapsto_{\mathsf{Simulator}}^{+}D'
+       \land D'\approx_{\mathsf{sim}}\Sigma',\\
+ D\approx_{\mathsf{sim}}\Sigma
+ &\Rightarrow \mathsf{resumeAtFullSpeed}(D)=\Sigma.
+\end{aligned}
+\end{equation}
+The first clause permits bytecode-level stuttering while proving instruction
+soundness; the second prevents the Simulator from omitting a semantic step;
+the third closes the critical boundary back to native execution without a
+change of represented configuration.  The certificate lifts the first clause
+from one instruction to every finite Simulator execution.
+The Simulator can inspect, push, pop, and copy its ordinary frame-image values;
+Equations~\eqref{eq:replace-current-actor-stack} and
+\eqref{eq:replace-resume-paused-actor-stack} cross back to normal VM execution.
+Proving Equation~\eqref{eq:simulator-step-correspondence} for the actual
+Simulator and bytecode set is an implementation-refinement proof; the language
+semantics fixes the state and transfer contract it must implement.
+
+\subsection{Preparation, validation, and atomic commit}
+
+All phase ordering is semantic, not user-visible.  Define the partial
+preparation function
+\begin{equation}\label{eq:prepare-reflection}
+\begin{split}
+ &\mathsf{prepareReflection}(\Omega,A,\Delta)=\Omega'\\[-1mm]
+ &\quad\Longleftrightarrow\quad
+ P'=\mathsf{reelaborateProgram}(P,Q)\ \land\\
+ &H_1=\mathsf{applyClassCommands}
+       (\mathsf{vmStore}(\Omega),\mathsf{classCommands}(\Delta))\ \land\\
+ &H_c=\mathsf{applyObjectClassCommands}
+       (H_1,\mathsf{objectClassCommands}(\Delta))\ \land\\
+ &H_l=\mathsf{reconcileAllObjectLayouts}(P',H_c)\ \land\\
+ &H_n=\mathsf{reconcileAllNestedCaches}(P',H_l)\ \land\\
+ &H_o=\mathsf{applyObjectSlotWrites}
+       (P',H_n,\mathsf{objectSlotCommands}(\Delta))\ \land\\
+ &H_a=\mathsf{applyActivationCommands}
+       (H_o,\mathsf{activationCommands}(\Delta))\ \land\\
+ &\langle H_d,\mathcal X_d\rangle=
+     \mathsf{applyDebuggerCommands}
+       (P',H_a,\mathcal X,A,\mathsf{debuggerCommands}(\Delta))\ \land\\
+ &\langle H_t,\mathcal X'\rangle=
+     \mathsf{applyContinuationTransfers}
+       (H_d,\mathcal X_d,\mathsf{continuationCommands}(\Delta))\ \land\\
+ &\Omega_0=\Omega[P\mapsto P',\mathcal X\mapsto\mathcal X',n\mapsto n+1]\ \land\\
+ &\Omega'=\mathsf{repartitionVMStore}(\Omega_0,H_t).
+\end{split}
+\end{equation}
+The fresh activations introduced by stack installation are
+\begin{equation}\label{eq:fresh-installed-activations}
+ \mathsf{freshInstalled}_{\Omega}(\mathcal X',B)=
+ \mathsf{set}(\mathsf{stackActivationIds}_{\mathcal X'}(B))
+ \setminus\dom(\mathsf{vmStore}(\Omega)).
+\end{equation}
+$\mathsf{repartitionVMStore}$ returns every pre-existing identity to the same
+$V$ or $\mathcal H(A)$ domain from which it came, and places each member of
+Equation~\eqref{eq:fresh-installed-activations} in $\mathcal H(B)$.  The sets
+for distinct actors must be disjoint.  Actor-isolation validation below rejects
+any installed record containing an illegal near reference; reflection creates
+no cross-actor near reference.
+
+The validation predicates below are over tagged record sets, so their
+quantifiers have explicit domains:
+\begin{equation}\label{eq:reflective-record-id-sets}
+\begin{aligned}
+ \mathsf{classRecordIds}(H)
+  &=\{C\in\dom(H)\mid
+       H(C)=\kw{class}\langle M,S,eo,C_m,q,\chi_C\rangle\},\\
+ \mathsf{ordinaryObjectIds}(H)
+  &=\{o\in\dom(H)\mid H(o)=\kw{object}\langle C,\sigma,\eta\rangle\},\\
+ \mathsf{activationRecordIds}(H)
+  &=\{a\in\dom(H)\mid
+       H(a)=\kw{activation}\langle p,\rho,\ell,o,C,k,h,q_a,\gamma\rangle\}.
+\end{aligned}
+\end{equation}
+Class-chain termination is the predicate
+\begin{equation}\label{eq:reflective-class-chain-validity}
+\begin{split}
+ \mathsf{reachesTop}_{H}(C)\quad\Longleftrightarrow\quad{}
+ &\exists k\in\mathbb N,C_0,\ldots,C_k.\;
+ C_0=C\ \land\ C_k=\Top\ \land\\[-1mm]
+ &\mathsf{pairwiseDistinct}(C_0,\ldots,C_k)\ \land\\
+ &\forall i<k.\;C_i\in\mathsf{classRecordIds}(H)\ \land
+                  \super_H(C_i)=C_{i+1}.
+\end{split}
+\end{equation}
+Individual class-record consistency is
+\begin{equation}\label{eq:reflective-class-record-validity}
+\begin{split}
+ \mathsf{classRecordOK}(P,H,C)\quad\Longleftrightarrow\quad{}
+ &\mixin_H(C)\in\dom(P.\mathit{mixin})\ \land\\
+ &H(C).C_m\in\mathsf{classRecordIds}(H)\ \land\\
+ &H(C).eo\in\dom(H)\cup\{\nil\}\ \land
+   (C=\Object\ \lor\ \super_H(C)\ne\Top).
+\end{split}
+\end{equation}
+The complete class-graph check is
+\begin{equation}\label{eq:reflective-class-graph-validity}
+\begin{split}
+ \mathsf{classGraphOK}(P,H)\quad\Longleftrightarrow\quad{}
+ &\Object\in\mathsf{classRecordIds}(H)\ \land
+   \super_H(\Object)=\Top\ \land\\
+ &\forall C\in\mathsf{classRecordIds}(H).\;
+      \mathsf{reachesTop}_{H}(C)\ \land\\
+ &\forall C\in\mathsf{classRecordIds}(H)\setminus\{\Top\}.\;
+      \mathsf{classRecordOK}(P,H,C).
+\end{split}
+\end{equation}
+The declaration retained by class provenance and the complete ordinary-object
+check are defined by
+\begin{equation}\label{eq:class-origin-declaration}
+ \mathsf{originDecl}(\kw{expression}(K))=K,
+ \qquad \mathsf{originDecl}(\kw{actor}(K))=K.
+\end{equation}
+The cached class for one nested declaration is valid exactly when
+\begin{equation}\label{eq:cached-nested-class-validity}
+\begin{split}
+ \mathsf{cachedNestedClassOK}(H,o,d)\quad\Longleftrightarrow\quad{}
+ &H(o).\eta(d)\in\mathsf{classRecordIds}(H)\ \land\\
+ &H(H(o).\eta(d)).eo=o\ \land\\
+ &\mathsf{originDecl}(H(H(o).\eta(d)).\chi_C)=d.
+\end{split}
+\end{equation}
+An ordinary object record is valid when
+\begin{equation}\label{eq:reflective-object-record-validity}
+\begin{aligned}
+ \mathsf{objectRecordOK}(P,H,o)\quad\Longleftrightarrow\quad{}
+ &\classof_H(o)\in\mathsf{classRecordIds}(H)\ \land\\
+ &\dom(H(o).\sigma)=
+   \mathsf{set}(\mathsf{layout}_{P,H}(\classof_H(o)))\ \land\\
+ &\dom(H(o).\eta)\subseteq
+   \mathsf{nestedKeys}_{P,H}(\classof_H(o))\ \land\\
+ &\forall d\in\dom(H(o).\eta).\;\mathsf{cachedNestedClassOK}(H,o,d).
+\end{aligned}
+\end{equation}
+The store-wide object check is
+\begin{equation}\label{eq:reflective-object-validity}
+ \mathsf{objectStoreOK}(P,H)\quad\Longleftrightarrow\quad
+ \forall o\in\mathsf{ordinaryObjectIds}(H).\;
+   \mathsf{objectRecordOK}(P,H,o).
+\end{equation}
+
+For activation validation, first extract the activation identities from each
+actor's live stack:
+\begin{equation}\label{eq:live-activation-order}
+\begin{gathered}
+ \mathsf{activationIds}(\epsilon)=\epsilon,\\
+ \mathsf{activationIds}(\mathcal A\mathbin{\cdot}\langle a,\pi\rangle)
+   =\mathsf{activationIds}(\mathcal A)\mathbin{\cdot}\langle a\rangle,\\
+ \mathsf{stackActivationIds}_{\mathcal X}(A)=\epsilon
+   \quad\text{if }\mathcal X(A)=\kw{idle},\\
+ \mathsf{stackActivationIds}_{\mathcal X}(A)=\mathsf{activationIds}(\mathcal A),\\
+ \hfill\text{if }\mathcal X(A)=\kw{runningTurn}\langle\mathcal A,t,p,u\rangle,\\
+ \mathsf{stackActivationIds}_{\mathcal X}(A)=\mathsf{activationIds}(\mathcal A),\\
+ \hfill\text{if }\mathcal X(A)=
+   \kw{pausedTurn}\langle\mathcal A,t,p,u,r_s,d_s\rangle,\\
+ \mathsf{liveActivationIds}(\mathcal X)
+   =\bigcup_{A\in\dom(\mathcal X)}
+       \mathsf{set}(\mathsf{stackActivationIds}_{\mathcal X}(A)),\\
+ \mathsf{below}_{\mathcal X}(A,k,a)\Longleftrightarrow\exists i<j.\\
+ \mathsf{stackActivationIds}_{\mathcal X}(A)[i]=k\ \land
+ \mathsf{stackActivationIds}_{\mathcal X}(A)[j]=a.
+\end{gathered}
+\end{equation}
+Definedness of every partial expression below uses the notation
+\begin{equation}\label{eq:definedness-notation}
+ e_p\downarrow\ \Longleftrightarrow\ \exists v.\;e_p=v,
+ \qquad e_p\uparrow\ \Longleftrightarrow\ \neg(e_p\downarrow).
+\end{equation}
+Surviving method declarations determine the parameter domain of a live method
+activation:
+\begin{equation}\label{eq:method-formals}
+ \mathsf{methodFormals}_{P}(i_f)=\bar x
+ \Longleftrightarrow
+ \exists M,s,\alpha,\ell,b,K.\;
+ \methods_P(M)(s)=\langle i_f,s,\alpha,\bar x,\ell,b,K\rangle.
+\end{equation}
+The validity of one live activation is
+\begin{equation}\label{eq:live-activation-record-validity}
+\begin{aligned}
+ \mathsf{liveActivationRecordOK}(P,H,\mathcal X,a)
+ &\Longleftrightarrow
+ \exists p,\rho,\ell,o,C,k,h,q_a,\gamma.\;\\[-1mm]
+ &\quad H(a)=\kw{activation}\langle
+       p,\rho,\ell,o,C,k,h,q_a,\gamma\rangle\ \land\\
+ &\quad\bigl((p=\kw{top}\ \land\ \rho=\ell=\varnothing\ \land
+              o=C=h=\nil)\ \lor\\
+ &\qquad(p\ne\kw{top}\ \land\ o\in\dom(H)\ \land
+          C\preceq_H\classof_H(o)\ \land\\
+ &\hspace{39mm}h\in\mathsf{activationRecordIds}(H))\bigr)\ \land\\
+ &\quad\bigl(k=\nil\ \lor
+       \exists A.\;\mathsf{below}_{\mathcal X}(A,k,a)\bigr)\ \land\\
+ &\quad\bigl(\mathsf{methodFormals}_{P}(p)\uparrow\ \lor\\
+ &\hspace{22mm}\dom(\rho)=
+       \mathsf{set}(\mathsf{methodFormals}_{P}(p))\bigr).
+\end{aligned}
+\end{equation}
+The aggregate check is
+\begin{equation}\label{eq:live-activation-validity}
+\begin{split}
+ \mathsf{liveActivationsOK}(P,H,\mathcal X)
+ \quad\Longleftrightarrow\quad{}
+ &\forall a\in\mathsf{liveActivationIds}(\mathcal X).\\[-1mm]
+ &\mathsf{liveActivationRecordOK}(P,H,\mathcal X,a).
+\end{split}
+\end{equation}
+Equation~\eqref{eq:live-activation-validity} therefore permits an already
+materialized activation of a removed method, but requires the bound parameter
+domain to agree with every surviving edited signature.
+
+Let $H_0=\mathsf{vmStore}(\Omega)$ and let $H'=\mathsf{vmStore}(\Omega')$.
+The command-specific activation conditions are the following total predicate:
+\begin{equation}\label{eq:activation-parameter-edit-validity}
+\begin{split}
+ &\mathsf{activationEditOK}_{H_0,H',\mathcal X'}
+   (\kw{writeActivationParameter}(g,a,x,v))\\
+ &\qquad\Longleftrightarrow
+   a\in\mathsf{activationRecordIds}(H_0)\ \land x\in\dom(H_0(a).\rho).
+\end{split}
+\end{equation}
+\begin{equation}\label{eq:activation-local-edit-validity}
+\begin{split}
+ &\mathsf{activationEditOK}_{H_0,H',\mathcal X'}
+   (\kw{writeActivationLocal}(g,a,j,v))\\
+ &\qquad\Longleftrightarrow
+   a\in\mathsf{activationRecordIds}(H_0)\ \land j\in\dom(H_0(a).\ell).
+\end{split}
+\end{equation}
+\begin{equation}\label{eq:activation-class-edit-validity}
+\begin{split}
+ &\mathsf{activationEditOK}_{H_0,H',\mathcal X'}
+   (\kw{changeActivationCurrentClass}(g,a,C))\\
+ &\qquad\Longleftrightarrow
+   a\in\mathsf{activationRecordIds}(H')\ \land
+   C\preceq_{H'}\classof_{H'}(H'(a).o).
+\end{split}
+\end{equation}
+\begin{equation}\label{eq:activation-continuation-edit-validity}
+\begin{split}
+ &\mathsf{activationEditOK}_{H_0,H',\mathcal X'}
+   (\kw{changeActivationContinuation}(g,a,k))\\
+ &\qquad\Longleftrightarrow
+   a\in\mathsf{liveActivationIds}(\mathcal X')\ \land\\
+ &\hspace{34mm}(k=\nil\ \lor\
+      \exists A.\;\mathsf{below}_{\mathcal X'}(A,k,a)).
+\end{split}
+\end{equation}
+\begin{equation}\label{eq:activation-uncontinuable-edit-validity}
+\begin{split}
+ &\mathsf{activationEditOK}_{H_0,H',\mathcal X'}
+   (\kw{markActivationUncontinuable}(g,a))\\
+ &\qquad\Longleftrightarrow a\in\mathsf{activationRecordIds}(H_0),\\
+ &\mathsf{activationEditOK}_{H_0,H',\mathcal X'}(\delta)
+   \Longleftrightarrow\kw{true}
+   \quad\text{if }\delta\notin\mathit{ActivationCommand}.
+\end{split}
+\end{equation}
+Continuation transfer is already partial in
+Equation~\eqref{eq:reflective-continuation-transfer}; its transaction-level
+cardinality and the remaining activation edits are checked by
+\begin{equation}\label{eq:continuation-transfer-count}
+ \mathsf{transferCount}(\Delta,B)=
+ \left|\{\delta\in\Delta\mid\exists g,a,v.\;
+       \delta=\kw{continueAtActivation}(g,B,a,v)\}\right|.
+\end{equation}
+\begin{equation}\label{eq:activation-transaction-validity}
+\begin{aligned}
+ \mathsf{activationEditsOK}(\Omega,\Delta,\Omega')
+ \quad\Longleftrightarrow\quad{}
+ &\bigl(\forall\delta\in\Delta.\;
+   \mathsf{activationEditOK}_{H_0,H',\mathcal X'}(\delta)\bigr)\ \land\\
+ &\forall B\in\dom(\mathcal X').\;
+   \mathsf{transferCount}(\Delta,B)\le1.
+\end{aligned}
+\end{equation}
+
+Let $\mathsf{refs}$ be the structural reference extractor, defined for every
+runtime constructor, finite map, and sequence by
+\begin{equation}\label{eq:structural-reference-extractor}
+\begin{aligned}
+ \mathsf{refs}(x)&=\{x\}&&x\in\mathit{Ref},\\
+ \mathsf{refs}(z)&=\varnothing&&z\text{ is atomic and }z\notin\mathit{Ref},\\
+ \mathsf{refs}(\mathsf{ctor}(z_1,\ldots,z_k))
+   &=\bigcup_{i=1}^{k}\mathsf{refs}(z_i),\\
+ \mathsf{refs}([z_i\mapsto z_i']_{i\in I})
+   &=\bigcup_{i\in I}(\mathsf{refs}(z_i)\cup\mathsf{refs}(z_i')).
+\end{aligned}
+\end{equation}
+The actor-residency check is then
+\begin{equation}\label{eq:reflective-actor-isolation}
+\begin{aligned}
+ \mathsf{resident}_{\Omega}(A)
+  &=\dom(V)\cup\dom(\mathcal H(A))\cup\dom(\Pi)\cup\dom(\Phi),\\
+ \mathsf{actorIsolationOK}(\Omega)\quad\Longleftrightarrow\quad{}
+ &\forall A\in\dom(\mathcal H).\;
+   \mathsf{refs}(\mathcal X(A))\subseteq\mathsf{resident}_{\Omega}(A)\ \land\\
+ &\quad\forall x\in\dom(\mathcal H(A)).\;
+   \mathsf{refs}(\mathcal H(A)(x))\subseteq\mathsf{resident}_{\Omega}(A)\ \land\\
+ &\forall x\in\dom(V).\;
+   \mathsf{refs}(V(x))\subseteq\dom(V)\ \land
+   \mathsf{value}_{P,\mathsf{vmStore}(\Omega)}(x).
+\end{aligned}
+\end{equation}
+
+The finite validation-kind domain, its interpretation, and its fixed order are
+{\small
+\begin{equation}\label{eq:reflection-validation-kinds}
+\begin{gathered}
+ \kappa_r::=\kw{classGraphCheck}\mid\kw{objectStoreCheck}
+  \mid\kw{liveActivationCheck}\mid\kw{activationEditCheck}
+  \mid\kw{actorIsolationCheck},\\
+ \kw{classGraphCheck}\mathrel{\triangleleft_{\mathsf{check}}}
+ \kw{objectStoreCheck}\mathrel{\triangleleft_{\mathsf{check}}}
+ \kw{liveActivationCheck},\\
+ \kw{liveActivationCheck}\mathrel{\triangleleft_{\mathsf{check}}}
+ \kw{activationEditCheck}\mathrel{\triangleleft_{\mathsf{check}}}
+ \kw{actorIsolationCheck},\\
+ \mathsf{validationHolds}(\kw{classGraphCheck},\Omega,\Delta,\Omega')
+  \Longleftrightarrow\mathsf{classGraphOK}(P',H'),\\
+ \mathsf{validationHolds}(\kw{objectStoreCheck},\Omega,\Delta,\Omega')
+  \Longleftrightarrow\mathsf{objectStoreOK}(P',H'),\\
+ \mathsf{validationHolds}(\kw{liveActivationCheck},\Omega,\Delta,\Omega')
+  \Longleftrightarrow\mathsf{liveActivationsOK}(P',H',\mathcal X'),\\
+ \mathsf{validationHolds}(\kw{activationEditCheck},\Omega,\Delta,\Omega')
+  \Longleftrightarrow\mathsf{activationEditsOK}(\Omega,\Delta,\Omega'),\\
+ \mathsf{validationHolds}(\kw{actorIsolationCheck},\Omega,\Delta,\Omega')
+  \Longleftrightarrow\mathsf{actorIsolationOK}(\Omega').
+\end{gathered}
+\end{equation}
+}
+Define the failed validation set by
+\begin{equation}\label{eq:failed-reflection-validations}
+ \mathsf{failedValidations}(\Omega,\Delta,\Omega')=
+ \{\kappa_r\mid
+   \neg\mathsf{validationHolds}(\kappa_r,\Omega,\Delta,\Omega')\}.
+\end{equation}
+For $\Delta=\langle\delta_1,\ldots,\delta_m\rangle$, also define
+\begin{equation}\label{eq:reflection-error-index-sets}
+\begin{aligned}
+ \mathsf{unauthorizedIndices}(\Omega,A,\Delta)
+  &=\{i\mid1\le i\le m\ \land
+       \neg\mathsf{authorized}_{\Omega,A}(\delta_i)\},\\
+ \mathsf{conflictPairs}(\Delta)
+  &=\{(i,j)\mid\mathsf{conflict}_{\Delta}(i,j)\}.
+\end{aligned}
+\end{equation}
+The validity predicate now has no informal conjuncts:
+\begin{equation}\label{eq:reflection-validity}
+\begin{aligned}
+ \mathsf{validReflection}(\Omega,A,\Delta,\Omega')
+ \quad\Longleftrightarrow\quad{}
+ &\mathsf{prepareReflection}(\Omega,A,\Delta)=\Omega'\ \land\\
+ &\mathsf{unauthorizedIndices}(\Omega,A,\Delta)=\varnothing\ \land\\
+ &\mathsf{conflictPairs}(\Delta)=\varnothing\ \land\\
+ &\mathsf{failedValidations}(\Omega,\Delta,\Omega')=\varnothing.
+\end{aligned}
+\end{equation}
+
+Successful preparation commits in one VM step:
+\[
+\dfrac{\mathsf{validReflection}(\Omega,A,\Delta,\Omega')}
+ {\Omega\xrightarrow{\;\mathsf{commitReflection}(A,\Delta,n+1)\;}\Omega'}
+\quad(\rulelabel{Reflection-Commit})
+\]
+The rejection diagnostic domain is
+\begin{equation}\label{eq:reflection-failure-domain}
+\begin{aligned}
+ \xi_r::={}&\kw{unauthorizedCommand}(i)
+ \mid\kw{commandConflict}(i,j)
+ \mid\kw{sourcePatchFailure}\mid\kw{elaborationFailure}\\
+ &\mid\kw{statePreparationFailure}\mid\kw{invariantFailure}(\kappa_r).
+\end{aligned}
+\end{equation}
+For compactness, define the two partial candidates
+\begin{equation}\label{eq:reflection-diagnostic-candidates}
+\begin{aligned}
+ \mathsf{reflectionSourceCandidate}(P,\Delta)
+  &=\mathsf{applySourceCommands}(P,\mathsf{codeCommands}(\Delta)),\\
+ \mathsf{reflectionProgramCandidate}(P,\Delta)
+  &=\mathsf{reelaborateProgram}
+      (P,\mathsf{reflectionSourceCandidate}(P,\Delta)).
+\end{aligned}
+\end{equation}
+Writing
+$\mathcal U_r=\mathsf{unauthorizedIndices}(\Omega,A,\Delta)$ and
+$\mathcal C_r=\mathsf{conflictPairs}(\Delta)$, the previously implicit failure
+function is the following partial function:
+{\small
+\begin{equation}\label{eq:reflection-failure}
+\mathsf{reflectionFailure}(\Omega,A,\Delta)=
+\begin{cases}
+ \kw{unauthorizedCommand}(\min\mathcal U_r)
+   &\mathcal U_r\ne\varnothing,\\
+ \kw{commandConflict}(i,j)
+   &\begin{gathered}\mathcal U_r=\varnothing\ \land\
+       \mathcal C_r\ne\varnothing\ \land\\
+       (i,j)=\min_{\rm lex}\mathcal C_r,
+    \end{gathered}\\
+ \kw{sourcePatchFailure}
+   &\begin{gathered}\mathcal U_r=\mathcal C_r=\varnothing\ \land\\
+    \mathsf{reflectionSourceCandidate}(P,\Delta)\uparrow,
+    \end{gathered}\\
+ \kw{elaborationFailure}
+   &\begin{gathered}\mathcal U_r=\mathcal C_r=\varnothing\ \land\\
+    \mathsf{reflectionSourceCandidate}(P,\Delta)\downarrow\ \land\\
+    \mathsf{reflectionProgramCandidate}(P,\Delta)\uparrow,
+    \end{gathered}\\
+ \kw{statePreparationFailure}
+   &\begin{gathered}\mathcal U_r=\mathcal C_r=\varnothing\ \land\\
+    \mathsf{reflectionProgramCandidate}(P,\Delta)\downarrow\ \land\\
+    \mathsf{prepareReflection}(\Omega,A,\Delta)\uparrow,
+    \end{gathered}\\
+ \kw{invariantFailure}(\min_{\triangleleft_{\mathsf{check}}}\mathcal B_r)
+   &\begin{gathered}\mathcal U_r=\mathcal C_r=\varnothing\ \land\\
+    \mathsf{prepareReflection}(\Omega,A,\Delta)=\Omega'\ \land\\
+    \mathcal B_r=\mathsf{failedValidations}(\Omega,\Delta,\Omega')
+       \ne\varnothing.
+    \end{gathered}
+\end{cases}
+\end{equation}
+}
+It is undefined exactly when
+$\mathsf{validReflection}(\Omega,A,\Delta,\Omega')$ holds for some $\Omega'$.
+Failure leaves the state identical:
+\[
+\dfrac{\mathsf{reflectionFailure}(\Omega,A,\Delta)=\xi}
+ {\Omega\xrightarrow{\;\mathsf{rejectReflection}(A,\Delta,\xi)\;}\Omega}
+\quad(\rulelabel{Reflection-Reject})
+\]
+The case order in Equation~\eqref{eq:reflection-failure} affects only the
+diagnostic; it cannot expose an intermediate state.  Except for a successful
+Equation~\eqref{eq:replace-current-actor-stack}, whose requesting frame has
+itself been replaced, the mirror library reifies the commit receipt or failure
+as the return or exception of the primitive mirror message.  Current-stack
+replacement instead continues directly from the installed top control.
+
+\subsection{Causal connection, turns, and other VMs}
+
+A reflective transition is a VM safepoint transition: it may occur between any
+two actor, delivery, or sequential steps, but never inside one such step.  It
+replaces the single $P$ in Equation~\eqref{eq:actor-configuration}; hence every
+actor in the cohort observes the same version $n+1$ immediately.  The following
+definition fixes the boundary between old and new behavior:
+\begin{equation}\label{eq:reflection-version-observation}
+\begin{array}{c|c}
+\text{computation state at commit}&\text{program observed afterward}\\ \hline
+\text{already materialized control }t\text{ and frames }\pi
+  &\text{their existing terms, code image, and control map}\\
+\text{future method resolution or invocation}&P'\\
+\begin{gathered}\text{mailbox or network packet}\\[-1mm]
+ \text{not yet dispatched}\end{gathered}&P'\text{ at its later turn}\\
+\text{closure object already allocated}&\text{its captured body in }H(c)\\
+\text{class or object retaining stable }M,C,i_f&
+  \text{the updated records addressed by those identities.}
+\end{array}
+\end{equation}
+Thus an install never splices a new expression into a currently executing
+small step.  A method invocation that has already entered its body continues
+that body; the next dispatch through the same stable method identity uses its
+new definition.  In-flight asynchronous messages carry selectors and
+arguments, not resolved methods, so they naturally dispatch against the
+version current when Rule \rulelabel{Turn-Start} begins their turn.
+
+Let a distributed system be
+\begin{equation}\label{eq:vm-family}
+ \mathfrak F:\mathit{VMId}\rightharpoonup\mathit{ActorConfiguration},
+ \qquad \mathfrak F(w).w=w.
+\end{equation}
+Rule \rulelabel{Reflection-Commit} changes exactly one component
+$\mathfrak F(w)$.  No rule copies $P'$ into $\mathfrak F(w')$ for $w'\ne w$.
+Values in $V$ are shared by every actor of $w$, so their behavior changes with
+the cohort's code; a value transferred to another VM is copied under
+Equation~\eqref{eq:value-transfer-contract} and thereafter uses the recipient
+VM's independently versioned program.  A remote VM may be changed only by a
+separate, authorized mirror request delivered to that VM.  Its delivery is
+ordered like any other eventual message; the resulting local commit is atomic
+at the recipient safepoint.
+
+The same rule governs remote debugging.  An actor mirror transferred to
+another actor or VM remains a far capability.  Its \kw{actorStackQuery} result
+is transported by the remote-representation judgment; object references in a
+frame become values, far references, or authorized mirrors rather than raw
+near references.  A remote controller first applies
+Equation~\eqref{eq:pause-actor-effect}, reads the resulting paused stack
+snapshot, and then names its pause token in
+Equation~\eqref{eq:replace-paused-actor-stack},
+\eqref{eq:resume-paused-actor-full-speed}, or
+\eqref{eq:replace-resume-paused-actor-stack}.  Formally, a remote debugger step
+has the component-wise shape
+\begin{equation}\label{eq:remote-debugger-component-step}
+ \frac{\mathfrak F(w),A,g\vdash\mathsf{debugRequest}(\delta)
+          \Downarrow\mathfrak F'(w)}
+      {\mathfrak F\longmapsto_{\mathsf{remoteDebug}}
+       \mathfrak F[w\mapsto\mathfrak F'(w)]},
+ \qquad
+ \forall v\ne w.\ \mathfrak F'(v)=\mathfrak F(v).
+\end{equation}
+The request is delivered using the ordinary cross-VM transport and executes
+the corresponding local reflective command at $w$'s safepoint.  There is no
+distributed atomic transaction spanning several VMs: coordinated multi-actor
+debugging is a protocol of individually atomic pause, inspect, install, and
+resume operations.  Pause tokens reject delayed or replayed commands after
+either an intervening edit or a resume.
+
+Finally, VM primitives are ordinary messages to a mirror whose record has
+target $\kw{vmTarget}(w)$ and right $\kw{primitive}$.  Their platform-specific state
+transformers lie outside this language semantics, but the capability premise
+is mandatory:
+\[
+\dfrac{\begin{gathered}
+       \widehat H_A(g)=\kw{mirror}\langle C_g,w,\kw{vmTarget}(w),R\rangle
+       \qquad\kw{primitive}\in R\\
+       \mathsf{hostPrimitive}(\Omega,s,\bar o)=\langle\Omega',v\rangle
+       \end{gathered}}
+ {\Omega,A,g\vdash\mathsf{invokeVMPrimitive}(s,\bar o)
+       \Downarrow\langle\Omega',v\rangle}
+\quad(\rulelabel{VM-Primitive})
+\]
+There is no primitive-call syntax and no bypass around the mirror record.

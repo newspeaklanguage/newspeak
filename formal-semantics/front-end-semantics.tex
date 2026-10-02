@@ -1,0 +1,1896 @@
+\section{Source front ends and metacircular compilation}
+\label{sec:front-end}
+
+This section closes the boundary left abstract in
+Equation~\eqref{eq:compilation-unit}.  It has two separate purposes.  First,
+it defines the relation from source text through PEG recognition, surface AST
+construction, stable source identities, and elaboration to the annotated core
+used by the preceding rules.  Second, it makes the implementations of those
+stages ordinary Newspeak objects.  The latter introduces no new reflective
+command: changing a parser, elaborator, or compiler is an ordinary change to
+its methods or object graph under Section~\ref{sec:reflection}.
+
+\subsection{Source text and PEG recognition}
+\label{sec:peg-recognition}
+
+Let $u\in\mathit{SourceText}=\mathit{UnicodeScalar}^{*}$, let
+$0\le i\le |u|$ be a source offset, let $N\in\mathit{Nonterminal}$, and let
+$X\subseteq\mathit{UnicodeScalar}$.  Character ranges, optional expressions,
+positive closure, and the Specification's prefix \texttt{\textasciitilde}
+notation are abbreviations for the following PEG core:
+\begin{equation}\label{eq:peg-expression-domain}
+ r::=\epsilon\mid\kw{char}(c)\mid\kw{set}(X)\mid\kw{any}
+   \mid N\mid r_1r_2\mid r_1/r_2\mid r^{*}
+   \mid {!r}\mid {\&r}\mid\kw{capture}(n,r).
+\end{equation}
+A grammar is $G=\langle N_0,\rho_G\rangle$, where $N_0$ is its start symbol
+and $\rho_G:\mathit{Nonterminal}\rightharpoonup\mathit{PEGExpr}$ is finite.
+A concrete tree is
+\begin{equation}\label{eq:concrete-tree-domain}
+ t::=\kw{leaf}\langle i,j\rangle
+   \mid\kw{node}\langle n,i,j,\bar t\rangle,
+ \qquad \mathsf{span}(t)=[i,j).
+\end{equation}
+Uncaptured recognition returns an ordered forest.  Write
+$\mathsf{ok}(j,\bar t)$ for success and $\mathsf{fail}(i)$ for failure at
+offset $i$.  The deterministic function
+$\mathsf{peg}_{G}(r,u,i)$ is defined by the following exhaustive equations.
+The failure offset is diagnostic only; ordered choice always restarts its
+right alternative at the original offset.
+\begin{equation}\label{eq:peg-atomic-recognition}
+\begin{aligned}
+ \mathsf{peg}_{G}(\epsilon,u,i)&=\mathsf{ok}(i,\epsilon),\\
+ \mathsf{peg}_{G}(\kw{char}(c),u,i)&=
+  \begin{cases}\mathsf{ok}(i+1,\langle\kw{leaf}\langle i,i+1\rangle\rangle)
+       &i<|u|\land u_i=c,\\
+    \mathsf{fail}(i)&\text{otherwise,}\end{cases}\\
+ \mathsf{peg}_{G}(\kw{set}(X),u,i)&=
+  \begin{cases}\mathsf{ok}(i+1,\langle\kw{leaf}\langle i,i+1\rangle\rangle)
+       &i<|u|\land u_i\in X,\\
+    \mathsf{fail}(i)&\text{otherwise,}\end{cases}\\
+ \mathsf{peg}_{G}(\kw{any},u,i)&=
+  \begin{cases}\mathsf{ok}(i+1,\langle\kw{leaf}\langle i,i+1\rangle\rangle)
+       &i<|u|,\\
+    \mathsf{fail}(i)&i=|u|.\end{cases}
+\end{aligned}
+\end{equation}
+\begin{equation}\label{eq:peg-sequence-choice}
+\begin{aligned}
+ \mathsf{peg}_{G}(r_1r_2,u,i)&=
+  \begin{cases}
+   \mathsf{ok}(k,\bar t_1\bar t_2)&
+     \mathsf{peg}_{G}(r_1,u,i)=\mathsf{ok}(j,\bar t_1)\land
+     \mathsf{peg}_{G}(r_2,u,j)=\mathsf{ok}(k,\bar t_2),\\
+   \mathsf{fail}(h)&\mathsf{peg}_{G}(r_1,u,i)=\mathsf{fail}(h),\\
+   \mathsf{fail}(h)&\mathsf{peg}_{G}(r_1,u,i)=\mathsf{ok}(j,\bar t_1)\land
+                      \mathsf{peg}_{G}(r_2,u,j)=\mathsf{fail}(h),
+  \end{cases}\\
+ \mathsf{peg}_{G}(r_1/r_2,u,i)&=
+  \begin{cases}
+   q&\mathsf{peg}_{G}(r_1,u,i)=q=\mathsf{ok}(j,\bar t),\\
+   \mathsf{peg}_{G}(r_2,u,i)&
+      \mathsf{peg}_{G}(r_1,u,i)=\mathsf{fail}(h).
+  \end{cases}
+\end{aligned}
+\end{equation}
+Greedy repetition and lookahead are
+\begin{equation}\label{eq:peg-repetition-lookahead}
+\begin{aligned}
+ \mathsf{peg}_{G}(r^{*},u,i)&=
+  \begin{cases}
+   \mathsf{ok}(i,\epsilon)&\mathsf{peg}_{G}(r,u,i)=\mathsf{fail}(h),\\
+   \mathsf{ok}(k,\bar t\bar t')&
+     \mathsf{peg}_{G}(r,u,i)=\mathsf{ok}(j,\bar t)\land j>i\land
+     \mathsf{peg}_{G}(r^{*},u,j)=\mathsf{ok}(k,\bar t'),
+  \end{cases}\\
+ \mathsf{peg}_{G}(!r,u,i)&=
+  \begin{cases}\mathsf{ok}(i,\epsilon)&
+          \mathsf{peg}_{G}(r,u,i)=\mathsf{fail}(h),\\
+        \mathsf{fail}(i)&\mathsf{peg}_{G}(r,u,i)=\mathsf{ok}(j,\bar t),
+  \end{cases}\\
+ \mathsf{peg}_{G}(\&r,u,i)&=
+  \begin{cases}\mathsf{ok}(i,\epsilon)&
+          \mathsf{peg}_{G}(r,u,i)=\mathsf{ok}(j,\bar t),\\
+        \mathsf{fail}(i)&\mathsf{peg}_{G}(r,u,i)=\mathsf{fail}(h).
+  \end{cases}
+\end{aligned}
+\end{equation}
+Nonterminal invocation and capture are
+\begin{equation}\label{eq:peg-nonterminal-capture}
+\begin{aligned}
+ \mathsf{peg}_{G}(N,u,i)&=\mathsf{peg}_{G}(\rho_G(N),u,i),\\
+ \mathsf{peg}_{G}(\kw{capture}(n,r),u,i)&=
+  \begin{cases}
+   \mathsf{ok}(j,\langle\kw{node}\langle n,i,j,\bar t\rangle\rangle)&
+      \mathsf{peg}_{G}(r,u,i)=\mathsf{ok}(j,\bar t),\\
+   \mathsf{fail}(h)&\mathsf{peg}_{G}(r,u,i)=\mathsf{fail}(h).
+  \end{cases}
+\end{aligned}
+\end{equation}
+Undefined nonterminals are failures.  The grammar admissibility predicate is
+\begin{equation}\label{eq:peg-grammar-validity}
+\begin{split}
+ \mathsf{pegOK}(G)\Longleftrightarrow{}&
+ N_0\in\dom(\rho_G)\ \land\
+ \mathsf{refsNT}(\mathsf{range}(\rho_G))\subseteq\dom(\rho_G)\ \land\\
+ &\neg\exists N.\;N\mathrel{\mathsf{lead}_{G}^{+}}N\ \land\
+ \forall r^{*}\preceq\mathsf{range}(\rho_G).\;\neg\mathsf{nullable}_{G}(r).
+\end{split}
+\end{equation}
+Here $\mathsf{nullable}_{G}$ is the least predicate obtained by applying
+Equations~\eqref{eq:peg-atomic-recognition}--\eqref{eq:peg-nonterminal-capture}
+to empty input, and $N\mathrel{\mathsf{lead}_{G}}N'$ when $N'$ can be invoked
+from $\rho_G(N)$ without consuming a character.  Thus
+Equation~\eqref{eq:peg-grammar-validity} excludes left recursion and a nullable
+operand of repetition; the recursive calls above consequently terminate.
+The mechanization checks this relational predicate by a finite certificate.
+Let $\nu_G:N\to\mathbb B$ be the computed nullable upper approximation and
+let $r_G:N\to\mathbb N$ be the computed rank of leading nonterminal calls.
+Write $\mathsf{nullable}^{+}_{\nu}(q)$ for the structural Boolean
+approximation that interprets a nonterminal $N$ as $\nu(N)$, and write
+$\mathsf{lead}^{+}_{\nu}(q)$ for the finite set of nonterminals reachable at
+the head of $q$ under the same approximation.  The executable certificate is
+
+\begin{equation}\label{eq:peg-admissibility-certificate}
+\begin{split}
+ \mathsf{pegCertOK}(G)\Longleftrightarrow{}&
+ N_0\in\dom(\rho_G)\ \land\\
+ &\forall N\in\dom(\rho_G).\ \rho_G(N)=b\Rightarrow\\
+ &\quad \mathsf{refsNT}(b)\subseteq\dom(\rho_G)\ \land\\
+ &\quad(\mathsf{nullable}^{+}_{\nu_G}(b)\Rightarrow\nu_G(N))\ \land\\
+ &\quad\forall q^*\preceq b.\ \neg\mathsf{nullable}^{+}_{\nu_G}(q)\ \land\\
+ &\quad\forall N'\in\mathsf{lead}^{+}_{\nu_G}(b).\
+               r_G(N')<r_G(N).
+\end{split}
+\end{equation}
+In the fourth line $q$ is the operand of that particular occurrence $q^*$.
+Character-set
+predicates are erased only while computing this structural certificate: they
+cannot recognize empty input and therefore cannot affect any of its four
+analyses.  The certificate checker and its semantic consequence are
+
+\begin{equation}\label{eq:peg-certificate-soundness}
+ \mathsf{pegCertOK}(G)=\kw{true}\Rightarrow\mathsf{pegOK}(G),
+ \qquad
+ \mathsf{pegCertOK}(G_{\NS})=\kw{true}.
+\end{equation}
+Thus the normalized grammar below is not merely assumed admissible; its finite
+certificate is evaluated and the checker is proved sound for
+Equation~\eqref{eq:peg-grammar-validity}.
+Complete recognition is
+\begin{equation}\label{eq:peg-complete-parse}
+ \mathsf{parse}_{G}(u)=t
+ \quad\Longleftrightarrow\quad
+ \mathsf{pegOK}(G)\land
+ \mathsf{peg}_{G}(N_0,u,0)=\mathsf{ok}(|u|,\langle t\rangle).
+\end{equation}
+The remainder of this subsection gives the distinguished grammar explicitly.
+For compactness, the following are definitions, not additional PEG operators:
+\begin{equation}\label{eq:peg-derived-notation}
+ \begin{gathered}
+ r?\equiv r/\epsilon,\qquad r^+\equiv rr^*,\qquad
+ \lit{c_1\cdots c_n}\equiv
+   \kw{char}(c_1)\cdots\kw{char}(c_n),\\
+ \mathsf{triv}\equiv(\mathsf{white}/\mathsf{comment})^*,\qquad
+ \mathsf{tok}(w)\equiv\mathsf{triv}\,\lit w,\qquad
+ \mathsf{word}(w)\equiv\mathsf{triv}\,\lit w\,!\mathsf{idRest}.
+ \end{gathered}
+\end{equation}
+$\mathsf{white}$ recognizes one Unicode \texttt{White\_Space} scalar.
+The finite punctuation family is
+\begin{equation}\label{eq:newspeak-punctuation-peg}
+\begin{gathered}
+ \rho_{\NS}(T_p)=\mathsf{tok}(p),\qquad p\in\mathcal P,\\
+ \mathcal P=\{\texttt{:},\texttt{,},\texttt{.},\texttt{||},\texttt{=},
+ \texttt{\char94},\texttt{[},\{,\texttt{(},\texttt{<},\texttt{<:},\\
+ \texttt{\#},\texttt{>},\texttt{]},\},\texttt{)},\texttt{;},
+ \texttt{/},\texttt{|},\texttt{::=},\texttt{<-:}\}.
+\end{gathered}
+\end{equation}
+The longest member is selected before any of its prefixes.  This resolves the
+otherwise implicit lexical priority of \texttt{||}, \texttt{::=},
+\texttt{<:}, and \texttt{<-:}.
+
+Let $L,U,D$ be the ASCII lower-case, upper-case, and decimal-digit sets,
+$A=L\cup U$, and let $Q$ be the Specification's finite
+\emph{specialCharacter} set.  The lexical part of $G_{\NS}$ is
+\begin{equation}\label{eq:newspeak-lexical-peg}
+\begin{aligned}
+ \rho_{\NS}(\mathsf{idRest})&=\kw{set}(A\cup D)/\kw{char}(\texttt{\_}),\\
+ \rho_{\NS}(\mathsf{rawId})&=(\kw{set}(A)/\kw{char}(\texttt{\_}))
+   \mathsf{idRest}^*,\\
+ \rho_{\NS}(\mathsf{id})&=\mathsf{triv}\,!\mathsf{reservedWord}
+      \mathsf{rawId},\\
+ \rho_{\NS}(\mathsf{rawKeyword})&=\mathsf{rawId}\lit{:},\\
+ \rho_{\NS}(\mathsf{keyword})&=\mathsf{triv}\,\mathsf{rawKeyword},\\
+ \rho_{\NS}(\mathsf{setterKeyword})&=
+   \mathsf{triv}\,\mathsf{rawKeyword}\lit{:},\\
+ \rho_{\NS}(\mathsf{keywords})&=\mathsf{rawKeyword}^+,\\
+ \rho_{\NS}(\mathsf{rawBinary})&=(\kw{set}(Q)/\lit{-})\kw{set}(Q)^*,\\
+ \rho_{\NS}(\mathsf{binarySelector})&=
+   \mathsf{triv}\,\mathsf{rawBinary},\\
+ \rho_{\NS}(\mathsf{metadataTag})&=\lit{:}\mathsf{rawId}\lit{:},\\
+ \rho_{\NS}(\mathsf{commentItem})&=
+   (!\lit{*)}\,\kw{any})/\mathsf{comment},\\
+ \rho_{\NS}(\mathsf{comment})&=\lit{(*}\,\mathsf{metadataTag}?\\[-1mm]
+   &\quad\mathsf{commentItem}^*\lit{*)}.
+\end{aligned}
+\end{equation}
+Reserved words are recognized by the dedicated tokens
+$\mathsf{selfToken}$, $\mathsf{superToken}$, $\mathsf{outerToken}$,
+$\mathsf{trueToken}$, $\mathsf{falseToken}$, and $\mathsf{nilToken}$;
+$\mathsf{id}$ additionally has negative lookahead for those complete words.
+Thus the prose reservation is part of the grammar rather than a later
+implementation convention.
+The dedicated-word productions are
+\begin{equation}\label{eq:newspeak-word-tokens}
+\begin{aligned}
+ \rho_{\NS}(\mathsf{reservedWord})&=
+   \mathsf{word}(\texttt{self})/\mathsf{word}(\texttt{super})/
+   \mathsf{word}(\texttt{outer})/\\[-1mm]
+ &\quad\mathsf{word}(\texttt{true})/\mathsf{word}(\texttt{false})/
+   \mathsf{word}(\texttt{nil}),\\
+ \rho_{\NS}(\mathsf{selfToken})&=\mathsf{word}(\texttt{self}),\\
+ \rho_{\NS}(\mathsf{superToken})&=\mathsf{word}(\texttt{super}),\\
+ \rho_{\NS}(\mathsf{outerToken})&=\mathsf{word}(\texttt{outer}),\\
+ \rho_{\NS}(\mathsf{trueToken})&=\mathsf{word}(\texttt{true}),\\
+ \rho_{\NS}(\mathsf{falseToken})&=\mathsf{word}(\texttt{false}),\\
+ \rho_{\NS}(\mathsf{nilToken})&=\mathsf{word}(\texttt{nil}),\\
+ \rho_{\NS}(\mathsf{classToken})&=\mathsf{word}(\texttt{class}),\\
+ \rho_{\NS}(\mathsf{lazyModifier})&=\mathsf{word}(\texttt{lazy}).
+\end{aligned}
+\end{equation}
+
+Numeric, string, and symbol lexemes are defined by
+\begin{equation}\label{eq:newspeak-literal-peg}
+\begin{aligned}
+ \mathsf{digits}&=\kw{set}(D)^+,\\
+ \mathsf{extendedDigits}&=\kw{set}(D\cup U)^+,\\
+ \mathsf{fraction}&=T_{\texttt{.}}\mathsf{digits},\\
+ \mathsf{extendedFraction}&=T_{\texttt{.}}\mathsf{extendedDigits},\\
+ \mathsf{exponent}&=\lit e\lit{-}?\mathsf{digits},\\
+ \mathsf{decimalNum}&=\lit{-}?\mathsf{digits}
+       \mathsf{fraction}?\mathsf{exponent}?,\\
+ \mathsf{radixNum}&=\mathsf{digits}\lit r\lit{-}?
+       \mathsf{extendedDigits}\mathsf{extendedFraction}?
+       \mathsf{exponent}?,\\
+ \rho_{\NS}(\mathsf{number})&=\mathsf{triv}
+       (\mathsf{radixNum}/\mathsf{decimalNum}),\\
+ \rho_{\NS}(\mathsf{singleString})&=
+   \lit{' }((\lit{''})/(!\lit{' }\kw{any}))^*\lit{' },\\
+ \rho_{\NS}(\mathsf{doubleString})&=
+   \lit{"}((\lit{""})/(!\lit{"}\kw{any}))^*\lit{"},\\
+ \rho_{\NS}(\mathsf{string})&=\mathsf{triv}
+   (\mathsf{singleString}/\mathsf{doubleString}),\\
+ \rho_{\NS}(\mathsf{symbol})&=\mathsf{triv}\,T_{\texttt{\#}}\\[-1mm]
+  &\quad(\mathsf{string}/\mathsf{keywords}/
+          \mathsf{rawBinary}/\mathsf{rawId}).
+\end{aligned}
+\end{equation}
+The action in Equation~\eqref{eq:newspeak-literal-actions} below performs radix
+and escape decoding and NFC normalization; recognition itself loses no source
+spelling.
+
+Optional type annotations affect parsing, tooling, and reflection but not the
+untyped dynamic kernel.  Let
+\begin{equation}\label{eq:newspeak-type-word-set}
+\begin{split}
+ \mathcal W_T=\{&\texttt{arg},\texttt{for},\texttt{generic},
+ \texttt{inheritedTypeOf},\texttt{is},\texttt{message},\texttt{of},\\[-1mm]
+ &\texttt{receiverType},\texttt{subtypeOf},\texttt{typeArg},\texttt{where}\}.
+\end{split}
+\end{equation}
+Their complete PEG is
+\begin{equation}\label{eq:newspeak-type-peg}
+\begin{aligned}
+ \rho_{\NS}(T_w)&=\mathsf{word}(w)\quad(w\in\mathcal W_T),\\
+ \rho_{\NS}(\mathsf{returnType})&=T_{\texttt{\char94}}\mathsf{type},\\
+ \rho_{\NS}(\mathsf{type})&=T_{\texttt{<}}\mathsf{typeExpr}T_{\texttt{>}},\\
+ \rho_{\NS}(\mathsf{typePrimary})&=\mathsf{id}\mathsf{typeArguments}?,\\
+ \rho_{\NS}(\mathsf{typeFactor})&=\mathsf{typePrimary}/\mathsf{blockType}/\\[-1mm]
+ &\quad\mathsf{tupleType}/\mathsf{parenthesizedTypeExpression},\\
+ \rho_{\NS}(\mathsf{parenthesizedTypeExpression})&=
+      T_{\texttt{(}}\mathsf{typeExpr}T_{\texttt{)}},\\
+ \rho_{\NS}(\mathsf{typeTerm})&=\mathsf{typeFactor}\mathsf{id}^*,\\
+ \rho_{\NS}(\mathsf{typeExpr})&=\mathsf{typeTerm}\\[-1mm]
+ &\quad((T_{\texttt{|}}/T_{\texttt{;}}/T_{\texttt{/}})
+      \mathsf{typeExpr})?,\\
+ \rho_{\NS}(\mathsf{typeArguments})&=T_{\texttt{[}}\mathsf{typeExpr}
+      (T_{\texttt{,}}\mathsf{typeExpr})^*T_{\texttt{]}},\\
+ \rho_{\NS}(\mathsf{tupleType})&=T_{\{}(
+      \mathsf{typeExpr}(T_{\texttt{.}}\mathsf{typeExpr})^*)?T_{\}},\\
+ \rho_{\NS}(\mathsf{blockArgType})&=T_{\texttt{:}}\mathsf{typeTerm},\\
+ \rho_{\NS}(\mathsf{blockReturnType})&=\mathsf{typeExpr},\\
+ \rho_{\NS}(\mathsf{nonEmptyBlockArgList})&=
+      \mathsf{blockArgType}^+(T_{\texttt{|}}\mathsf{blockReturnType})?,\\
+ \rho_{\NS}(\mathsf{blockType})&=T_{\texttt{[}}
+      (\mathsf{nonEmptyBlockArgList}/\mathsf{blockReturnType}?)T_{\texttt{]}}.
+\end{aligned}
+\end{equation}
+Type parameters and inference patterns are
+\begin{equation}\label{eq:newspeak-type-pattern-peg}
+\begin{aligned}
+ \rho_{\NS}(\mathsf{typeParameterDecl})&=T_{\texttt{<}}T_{\texttt{[}}
+      \mathsf{id}(T_{\texttt{,}}\mathsf{id})^*T_{\texttt{]}}T_{\texttt{>}},\\
+ \rho_{\NS}(\mathsf{typePattern})&=T_{\texttt{<}}\mathsf{typeFormal}
+      (T_{\texttt{;}}\mathsf{typeFormal})^*T_{\texttt{>}},\\
+ \rho_{\NS}(\mathsf{typeFormal})&=T_{\texttt{where}}\mathsf{id}
+      \mathsf{typeParamConstraint}?T_{\texttt{is}}\mathsf{inferenceClause},\\
+ \rho_{\NS}(\mathsf{typeParamConstraint})&=T_{\texttt{<}}
+      \mathsf{typeBoundQualifier}?\mathsf{typeExpr}T_{\texttt{>}},\\
+ \rho_{\NS}(\mathsf{typeBoundQualifier})&=
+      T_{\texttt{subtypeOf}}/T_{\texttt{inheritedTypeOf}},\\
+ \rho_{\NS}(\mathsf{inferenceClause})&=T_{\texttt{receiverType}}/
+      (\mathsf{returnType}\mathsf{returnTypeInferenceClause})/
+      \mathsf{typeArgInferenceClause}/\\[-1mm]
+ &\quad(T_{\texttt{arg}}\mathsf{number}
+      (T_{\texttt{of}}\mathsf{msgSelector})?),\\
+ \rho_{\NS}(\mathsf{returnTypeInferenceClause})&=
+      T_{\texttt{of}}\mathsf{msgSelector},\\
+ \rho_{\NS}(\mathsf{msgSelector})&=
+      \mathsf{symbol}T_{\texttt{message}}T_{\texttt{of}}
+      \mathsf{inferenceClause},\\
+ \rho_{\NS}(\mathsf{typeArgInferenceClause})&=T_{\texttt{typeArg}}
+      \mathsf{number}T_{\texttt{for}}T_{\texttt{generic}}\\[-1mm]
+ &\quad\mathsf{symbol}T_{\texttt{of}}\mathsf{inferenceClause}.
+\end{aligned}
+\end{equation}
+
+Let $\mathcal T_I$ contain every nonterminal on the left of
+Equation~\eqref{eq:newspeak-type-peg} except $\mathsf{type}$, together with
+every left-hand nonterminal of Equation~\eqref{eq:newspeak-type-pattern-peg}
+except $\mathsf{typeParameterDecl}$ and $\mathsf{typePattern}$.  Type syntax is
+retained as source metadata by
+\begin{equation}\label{eq:newspeak-type-actions}
+\begin{aligned}
+ \mathsf{staticTypeToken}_{z}(n,w)&=
+   \langle\kw{staticType},\langle n,w\rangle,z\rangle,\\
+ \mathcal J_{\NS}(n,\bar v,w)&=\kw{erase}\\[-1mm]
+ &\quad(n\in\mathcal T_I\cup\{T_w\mid w\in\mathcal W_T\}),\\
+ \mathcal J_{\NS}(n,\bar v,w)&=
+   \kw{metadata}(\mathsf{staticTypeToken}_{z}(n,w))
+   \quad(n\in\{\mathsf{type},\mathsf{typeParameterDecl},
+                 \mathsf{typePattern}\}).
+\end{aligned}
+\end{equation}
+
+The message and precedence productions are the following PEG.  They include
+the asynchronous-send token required by Specification \S5.3.7, which the
+printed 0.109 grammar describes in prose but omits from its displayed
+productions.
+\begin{equation}\label{eq:newspeak-message-peg}
+\begin{aligned}
+ \rho_{\NS}(\mathsf{unarySelector})&=\mathsf{id},\\
+ \rho_{\NS}(\mathsf{binaryMessage})&=
+      \mathsf{binarySelector}\,\mathsf{unaryExpression},\\
+ \rho_{\NS}(\mathsf{keywordMessage})&=
+      (\mathsf{keyword}\,\mathsf{binaryExpression})^+,\\
+ \rho_{\NS}(\mathsf{message})&=
+      \mathsf{keywordMessage}/\mathsf{binaryMessage}/\mathsf{unarySelector},\\
+ \rho_{\NS}(\mathsf{receiverPrimary})&=
+      \mathsf{outerReceiver}/\mathsf{superToken}/\mathsf{primary},\\
+ \rho_{\NS}(\mathsf{unaryExpression})&=
+      \mathsf{receiverPrimary}\,\mathsf{unarySelector}^*,\\
+ \rho_{\NS}(\mathsf{binaryExpression})&=
+      \mathsf{unaryExpression}\,\mathsf{binaryMessage}^*,\\
+ \rho_{\NS}(\mathsf{keywordExpression})&=
+      \mathsf{binaryExpression}\,\mathsf{keywordMessage}?,\\
+ \rho_{\NS}(\mathsf{eventualExpression})&=
+      \mathsf{keywordExpression}\,T_{\texttt{<-:}}\,\mathsf{message},\\
+ \rho_{\NS}(\mathsf{cascadeMessage})&=
+      T_{\texttt{;}}(\mathsf{keywordMessage}/\mathsf{binaryMessage}/
+                       \mathsf{unarySelector}),\\
+ \rho_{\NS}(\mathsf{implicitKeywordSend})&=\mathsf{keywordMessage},\\
+ \rho_{\NS}(\mathsf{nontrivialUnaryMessages})&=
+      \mathsf{unarySelector}^+\mathsf{binaryMessage}^*
+      \mathsf{keywordMessage}?,\\
+ \rho_{\NS}(\mathsf{nontrivialBinaryMessages})&=
+      \mathsf{binaryMessage}^+\mathsf{keywordMessage}?,\\
+ \rho_{\NS}(\mathsf{keywordMessages})&=\mathsf{keywordMessage},\\
+ \rho_{\NS}(\mathsf{nonEmptyMessages})&=
+      \mathsf{nontrivialUnaryMessages}/\\[-1mm]
+ &\quad\mathsf{nontrivialBinaryMessages}/\mathsf{keywordMessages},\\
+ \rho_{\NS}(\mathsf{messageCascade})&=
+      \mathsf{nonEmptyMessages}\,\mathsf{cascadeMessage}^*,\\
+ \rho_{\NS}(\mathsf{cascadedExpression})&=
+      \mathsf{primary}\,\mathsf{messageCascade}?,\\
+ \rho_{\NS}(\mathsf{sendExpression})&=
+      \mathsf{eventualExpression}/\mathsf{implicitKeywordSend}/
+      \mathsf{cascadedExpression},\\
+ \rho_{\NS}(\mathsf{expression})&=
+      \mathsf{setterKeyword}?\,\mathsf{sendExpression}.
+\end{aligned}
+\end{equation}
+The first selector of a receiver-less unary or keyword expression is retained
+as an implicit send by the actions below.  Binary sends always have an
+explicit left operand.  A bare \kw{outer} or \kw{super} is rejected by
+Equation~\eqref{eq:surface-context-validity}; permitting it temporarily in
+$\mathsf{receiverPrimary}$ keeps the precedence grammar non-left-recursive.
+
+The literal, block, pattern, statement, and primary productions are
+\begin{equation}\label{eq:newspeak-expression-peg}
+\begin{aligned}
+ \rho_{\NS}(\mathsf{literal})&=\mathsf{pattern}/\mathsf{number}/
+   \mathsf{symbol}/\mathsf{string}/\\[-1mm]
+ &\quad\mathsf{tuple}/\mathsf{trueToken}/\mathsf{falseToken}/
+   \mathsf{nilToken},\\
+ \rho_{\NS}(\mathsf{tuple})&=T_{\{}
+   (\mathsf{expression}(T_{\texttt{.}}\mathsf{expression})^*
+      T_{\texttt{.}}?)?T_{\}},\\
+ \rho_{\NS}(\mathsf{blockParameter})&=T_{\texttt{:}}\mathsf{slotDecl},\\
+ \rho_{\NS}(\mathsf{blockParameters})&=
+      \mathsf{blockParameter}^+T_{\texttt{|}},\\
+ \rho_{\NS}(\mathsf{block})&=T_{\texttt{[}}
+      \mathsf{blockParameters}?\mathsf{codeBody}T_{\texttt{]}},\\
+ \rho_{\NS}(\mathsf{pattern})&=T_{\texttt{<}}\mathsf{patternLiteral}T_{\texttt{>}},\\
+ \rho_{\NS}(\mathsf{patternLiteral})&=\mathsf{wildcardPattern}/
+      \mathsf{literalPattern}/\mathsf{keywordPattern},\\
+ \rho_{\NS}(\mathsf{wildcardPattern})&=\mathsf{tok}(\texttt{\_}),\\
+ \rho_{\NS}(\mathsf{literalPattern})&=\mathsf{number}/\mathsf{symbol}/
+      \mathsf{string}/\mathsf{tuple},\\
+ \rho_{\NS}(\mathsf{keywordPattern})&=\mathsf{keywordPatternPair}^+,\\
+ \rho_{\NS}(\mathsf{keywordPatternPair})&=
+      \mathsf{keyword}\,\mathsf{keywordPatternValue}?,\\
+ \rho_{\NS}(\mathsf{keywordPatternValue})&=\mathsf{wildcardPattern}/
+      \mathsf{literalPattern}/\\[-1mm]
+ &\quad\mathsf{variablePattern}/\mathsf{nestedPattern},\\
+ \rho_{\NS}(\mathsf{variablePattern})&=
+      \mathsf{triv}\lit{?}\mathsf{rawId},\\
+ \rho_{\NS}(\mathsf{nestedPattern})&=\mathsf{triv}\mathsf{pattern},\\
+ \rho_{\NS}(\mathsf{parenthesized})&=
+      T_{\texttt{(}}\mathsf{expression}T_{\texttt{)}},\\
+ \rho_{\NS}(\mathsf{primary})&=\mathsf{literal}/\mathsf{block}/
+      \mathsf{classDeclaration}/\\[-1mm]
+ &\quad\mathsf{objectLiteral}/\mathsf{parenthesized}/\\[-1mm]
+ &\quad\mathsf{selfToken}/\mathsf{unarySelector},\\
+ \rho_{\NS}(\mathsf{returnStatement})&=T_{\texttt{\char94}}
+      \mathsf{expression}T_{\texttt{.}}?,\\
+ \rho_{\NS}(\mathsf{statements})&=\mathsf{returnStatement}/\\[-1mm]
+ &\quad(\mathsf{expression}(T_{\texttt{.}}\mathsf{statements})?)/\epsilon,\\
+ \rho_{\NS}(\mathsf{codeBody})&=\mathsf{slotDecls}?\mathsf{statements}.
+\end{aligned}
+\end{equation}
+
+Finally, class, member, and compilation-unit syntax is
+\begin{equation}\label{eq:newspeak-declaration-peg}
+\begin{aligned}
+ \rho_{\NS}(\mathsf{messagePattern})&=(\mathsf{keywordPatternDecl}/
+      \mathsf{binaryPatternDecl}/\mathsf{unarySelector})\mathsf{returnType}?,\\
+ \rho_{\NS}(\mathsf{keywordPatternDecl})&=
+      (\mathsf{keyword}\mathsf{slotDecl})^+,\\
+ \rho_{\NS}(\mathsf{binaryPatternDecl})&=
+      \mathsf{binarySelector}\mathsf{slotDecl},\\
+ \rho_{\NS}(\mathsf{accessModifier})&=
+      \mathsf{tok}(\texttt{private})/\mathsf{tok}(\texttt{public})/\\[-1mm]
+ &\quad\mathsf{tok}(\texttt{protected}),\\
+ \rho_{\NS}(\mathsf{methodDecl})&=\mathsf{accessModifier}?
+      \mathsf{messagePattern}T_{\texttt{=}}T_{\texttt{(}}
+      \mathsf{codeBody}T_{\texttt{)}},\\
+ \rho_{\NS}(\mathsf{slotDecl})&=\mathsf{id}\mathsf{type}?,\\
+ \rho_{\NS}(\mathsf{slotDef})&=\mathsf{accessModifier}?\mathsf{slotDecl}
+   (((T_{\texttt{=}}/T_{\texttt{::=}})\mathsf{expression}T_{\texttt{.}})/
+      T_{\texttt{.}})?,\\
+ \rho_{\NS}(\mathsf{sequentialSlots})&=T_{\texttt{|}}
+      \mathsf{slotDef}^*T_{\texttt{|}},\\
+ \rho_{\NS}(\mathsf{simultaneousSlots})&=T_{\texttt{||}}
+      \mathsf{slotDef}^*T_{\texttt{||}},\\
+ \rho_{\NS}(\mathsf{slotDecls})&=
+      \mathsf{sequentialSlots}/\mathsf{simultaneousSlots},\\
+ \rho_{\NS}(\mathsf{lazySlotDecl})&=
+   ((\mathsf{lazyModifier}\mathsf{accessModifier}?)/\\[-1mm]
+ &\quad(\mathsf{accessModifier}\mathsf{lazyModifier}))
+   \mathsf{slotDecl}(T_{\texttt{=}}/T_{\texttt{::=}})\\[-1mm]
+ &\quad\mathsf{expression}T_{\texttt{.}},\\
+ \rho_{\NS}(\mathsf{classHeader})&=T_{\texttt{(}}\mathsf{comment}?
+      \mathsf{slotDecls}?\mathsf{statements}T_{\texttt{)}},\\
+ \rho_{\NS}(\mathsf{nestedClassDecl})&=
+      \mathsf{accessModifier}?\mathsf{classDeclaration},\\
+ \rho_{\NS}(\mathsf{instanceSide})&=T_{\texttt{(}}\\[-1mm]
+ &\quad(\mathsf{nestedClassDecl}/\mathsf{lazySlotDecl}/
+      \mathsf{methodDecl})^*T_{\texttt{)}},\\
+ \rho_{\NS}(\mathsf{classSide})&=T_{\texttt{:}}T_{\texttt{(}}
+      \mathsf{methodDecl}^*T_{\texttt{)}},\\
+ \rho_{\NS}(\mathsf{classBody})&=\mathsf{classHeader}
+      \mathsf{instanceSide}\mathsf{classSide}?,\\
+ \rho_{\NS}(\mathsf{outerReceiver})&=\mathsf{outerToken}\mathsf{id},\\
+ \rho_{\NS}(\mathsf{inheritancePrefix})&=\mathsf{outerReceiver}/
+      \mathsf{selfToken}/\mathsf{superToken},\\
+ \rho_{\NS}(\mathsf{inheritanceClause})&=\mathsf{inheritancePrefix}?
+      \mathsf{unarySelector}\mathsf{message}?,\\
+ \rho_{\NS}(\mathsf{mixinSuffix})&=
+      (T_{\texttt{<:}}\mathsf{inheritanceClause})^+
+      (T_{\texttt{.}}/\mathsf{classBody}),\\
+ \rho_{\NS}(\mathsf{inheritanceAndBody})&=\mathsf{classBody}/\\[-1mm]
+ &\quad(\mathsf{inheritanceClause}
+        (\mathsf{classBody}/\mathsf{mixinSuffix})),\\
+ \rho_{\NS}(\mathsf{classDeclaration})&=\mathsf{classToken}\mathsf{id}
+      \mathsf{typeParameterDecl}?\\[-1mm]
+ &\quad\mathsf{messagePattern}?T_{\texttt{=}}
+      \mathsf{inheritanceAndBody},\\
+ \rho_{\NS}(\mathsf{objectLiteral})&=
+      (\mathsf{id}\mathsf{keywordMessage}?)?\mathsf{classBody},\\
+ \rho_{\NS}(\mathsf{compilationUnit})&=\mathsf{id}\mathsf{string}?
+      \mathsf{classDeclaration}\,\mathsf{triv}.
+\end{aligned}
+\end{equation}
+$G_{\NS}=\langle\mathsf{compilationUnit},\rho_{\NS}\rangle$ with every
+syntactic right-hand side in
+Equations~\eqref{eq:newspeak-message-peg}--\eqref{eq:newspeak-declaration-peg}
+wrapped in a same-named capture.  Equations~\eqref{eq:peg-derived-notation}--
+\eqref{eq:newspeak-declaration-peg} are the normalized 0.109 grammar.  They
+make explicit four facts left to prose or typography in the printed grammar:
+Unicode whitespace, reserved-word exclusion, asynchronous sends, and the use
+of class declarations, object literals, and \kw{self} as primaries.  No
+unimplemented chain production is included.
+
+\subsection{Concrete trees, metadata, and stable AST identities}
+\label{sec:ast-construction}
+
+Let $z=[i,j)$ be the span of a captured node.  Message clauses and patterns are
+not expressions; their complete surface domains are
+\begin{equation}\label{eq:surface-message-pattern-domain}
+\begin{aligned}
+ c&::=\kw{clause}_{z}(s,\bar R),\\
+ p&::=\kw{wild}_{z}\mid\kw{literalPat}_{z}(R)
+   \mid\kw{variablePat}_{z}(x)\mid\kw{nestedPat}_{z}(p)
+   \mid\kw{keywordPat}_{z}(\langle k_i,p_i?\rangle_{i=1}^{n}).
+\end{aligned}
+\end{equation}
+The complete executable surface AST is
+\begin{equation}\label{eq:surface-expression-domain}
+\begin{aligned}
+ R::={}&\kw{atom}_{z}(\omega)\mid\kw{identifier}_{z}(x)
+  \mid\kw{self}_{z}\mid\kw{outer}_{z}(x)\mid\kw{super}_{z}
+  \mid\kw{paren}_{z}(R)\\
+ &\mid\kw{implicit}_{z}(s,\bar R)
+  \mid\kw{message}_{z}(R,s,\bar R)
+  \mid\kw{eventual}_{z}(R,s,\bar R)
+  \mid\kw{cascade}_{z}(R,\bar c_0,\bar c)\\
+ &\mid\kw{setter}_{z}(x,R)\mid\kw{tuple}_{z}(\bar R)
+  \mid\kw{pattern}_{z}(p)\mid\kw{closure}_{z}(\bar d,\bar g,\bar s)\\
+ &\mid\kw{object}_{z}(o_h)\mid\kw{classExpr}_{z}(d)
+  \mid\kw{sequence}_{z}(\bar s),\\
+ s_R::={}&\kw{exprStmt}_{z}(R)\mid\kw{returnStmt}_{z}(R).
+\end{aligned}
+\end{equation}
+Declarations and class structure are
+\begin{equation}\label{eq:surface-declaration-domain}
+\begin{aligned}
+ d::={}&\kw{formal}_{z}(x)\mid
+  \kw{slot}_{z}(\alpha?,x,m,e?)\mid
+  \kw{lazySlot}_{z}(\alpha?,x,m,e)\\
+ &\mid\kw{method}_{z}(\alpha?,s,\bar d,\bar g,\bar s)
+  \mid\kw{nestedClass}_{z}(\alpha?,d)
+  \mid\kw{classDecl}_{z}(x,s_f,\bar d,b),\\
+ g::={}&\kw{sequentialGroup}_{z}(\bar d)\mid
+         \kw{simultaneousGroup}_{z}(\bar d),\\
+ h::={}&\kw{classStructure}_{z}(g?,\bar s,\bar d,\bar d_c),\\
+ o_h::={}&\kw{implicitObjectHeader}_{z}(h)\mid
+       \kw{explicitObjectHeader}_{z}(R,c,h),\\
+ b::={}&\kw{defaultInheritance}_{z}(h)\mid
+  \kw{explicitInheritance}_{z}(R,c,h)\mid
+  \kw{mixinChain}_{z}(R,c,\langle c_i\rangle_{i=1}^{n},h?),\\
+ U::={}&\kw{unit}_{z}(\lambda,\gamma?,d).
+\end{aligned}
+\end{equation}
+Here $m\in\{\kw{immutable},\kw{mutable}\}$ records \texttt{=} versus
+\texttt{::=}; $\gamma$ is the optional category string; and absent access
+remains absent until elaboration supplies the protected default.  Every
+declaration and expression constructor carries its captured source span and,
+after Equation~\eqref{eq:stable-ast-identification}, its stable identity.
+
+The grammar carries a finite semantic-action map
+\begin{equation}\label{eq:peg-action-map}
+\begin{aligned}
+ \mathcal J_G:
+   \mathit{CaptureName}\times\mathit{ActionValue}^{*}\times
+   \mathit{SourceSlice}&\rightharpoonup\mathit{ActionResult},\\
+ a&::=\kw{emit}(v)\mid\kw{erase}\mid\kw{metadata}(m).
+\end{aligned}
+\end{equation}
+Projection returns an ordered sequence because punctuation contributes no
+semantic child.  Metadata likewise leaves the semantic-child sequence but is
+accumulated separately.  Put
+\begin{equation}\label{eq:ast-tree-projection}
+\begin{aligned}
+ \mathsf{project}_{G,u}(\kw{leaf}\langle i,j\rangle)
+   &=\langle\langle\kw{token}(u[i:j],[i,j))\rangle,\epsilon\rangle,\\
+ \bar v&=\bar v_1\cdots\bar v_r,
+ &\bar m&=\bar m_1\cdots\bar m_r,\\[-1mm]
+ \mathsf{project}_{G,u}(t_k)&=\langle\bar v_k,\bar m_k\rangle
+   \quad(1\le k\le r),\\
+ \mathsf{project}_{G,u}(\kw{node}\langle n,i,j,\bar t\rangle)
+   &=\mathsf{emitResult}
+      (\mathcal J_G(n,\bar v,u[i:j]),\bar m),\\
+ \mathsf{emitResult}(\kw{emit}(v),\bar m)&=\langle\langle v\rangle,\bar m\rangle,\\
+ \mathsf{emitResult}(\kw{erase},\bar m)&=\langle\epsilon,\bar m\rangle,\\
+ \mathsf{emitResult}(\kw{metadata}(m),\bar m)&=
+      \langle\epsilon,\bar m\cdot\langle m\rangle\rangle,\\
+ \mathsf{ast}_{G,u}(t)&=\langle R,\bar m\rangle
+   \quad\Longleftrightarrow\quad
+   \mathsf{project}_{G,u}(t)=\langle\langle R\rangle,\bar m\rangle.
+\end{aligned}
+\end{equation}
+The metadata sequence $\bar m$ is attached by
+Equation~\eqref{eq:metadata-association}; it is not an executable AST child.
+Below, an equation $\mathcal J_G(\cdots)=v$ abbreviates
+$\mathcal J_G(\cdots)=\kw{emit}(v)$.
+To define $\mathcal J_{G_{\NS}}$ without a production-sized prose gap, first
+define the message folds.  If $c_i=\kw{clause}(s_i,\bar R_i)$, then
+\begin{equation}\label{eq:surface-message-folds}
+\begin{aligned}
+ \mathsf{asClause}_{z}(\kw{selector}(s))&=\kw{clause}_{z}(s,\epsilon),\\
+ \mathsf{asClause}_{z}(c)&=c
+   \quad(c=\kw{clause}_{z'}(s,\bar R)),\\
+ \mathsf{flattenClauses}_{z}(\epsilon)&=\epsilon,\\
+ \mathsf{flattenClauses}_{z}(v\cdot\bar v)&=
+   \mathsf{asClause}_{z}(v)\cdot\mathsf{flattenClauses}_{z}(\bar v)
+   \quad(v\notin\mathit{Sequence}),\\
+ \mathsf{flattenClauses}_{z}(\bar c\cdot\bar v)&=
+   \bar c\cdot\mathsf{flattenClauses}_{z}(\bar v)
+   \quad(\bar c\in\mathit{Clause}^{*}),\\
+ \mathsf{foldExplicit}_{z}(R,\epsilon)&=R,\\
+ \mathsf{foldExplicit}_{z}(R,v_1\cdot\bar v)&=
+   \mathsf{foldExplicit}_{z}
+     (\kw{message}_{z}(R,s_1,\bar R_1),\bar v),\\[-1mm]
+ &\qquad\mathsf{asClause}_{z}(v_1)=\kw{clause}(s_1,\bar R_1),\\
+ \mathsf{foldImplicit}_{z}(v_1\cdot\bar v)&=
+   \mathsf{foldExplicit}_{z}
+     (\kw{implicit}_{z}(s_1,\bar R_1),\bar v),\\[-1mm]
+ &\qquad\mathsf{asClause}_{z}(v_1)=\kw{clause}(s_1,\bar R_1),\\
+ \mathsf{makeCascade}_{z}(R,\bar c_0,\epsilon)&=
+   \mathsf{foldExplicit}_{z}(R,\bar c_0),\\
+ \mathsf{makeCascade}_{z}(R,\bar c_0,c_1\cdot\bar c)&=
+   \kw{cascade}_{z}(R,\bar c_0,c_1\cdot\bar c).
+\end{aligned}
+\end{equation}
+The first two equations preserve unary-before-binary-before-keyword order
+already imposed by Equation~\eqref{eq:newspeak-message-peg}; the third retains
+one receiver and every cascade clause.
+
+Lexical actions are
+\begin{equation}\label{eq:newspeak-literal-actions}
+\begin{aligned}
+ \mathcal J_{\NS}(\mathsf{id},\bar v,w)&=
+   \kw{name}(\mathsf{decodeId}(w)),\\
+ \mathcal J_{\NS}(\mathsf{unarySelector},\langle\kw{name}(x)\rangle,w)
+   &=\kw{selector}_{z}(\#x),\\
+ \mathcal J_{\NS}(\mathsf{binarySelector},\bar v,w)&=
+   \kw{selector}_{z}(\mathsf{decodeBinary}(w)),\\
+ \mathcal J_{\NS}(\mathsf{keyword},\bar v,w)&=
+   \kw{keyword}_{z}(\mathsf{decodeKeyword}(w)),\\
+ \mathcal J_{\NS}(\mathsf{setterKeyword},\bar v,w)&=
+   \kw{name}(\mathsf{decodeSetterName}(w)),\\
+ \mathcal J_{\NS}(\mathsf{selfToken},\bar v,w)&=\kw{self}_{z},\\
+ \mathcal J_{\NS}(\mathsf{superToken},\bar v,w)&=\kw{super}_{z},\\
+ \mathcal J_{\NS}(\mathsf{outerReceiver},
+      \langle\kw{name}(x)\rangle,w)&=\kw{outer}_{z}(x),\\
+ \mathcal J_{\NS}(\mathsf{comment},\bar v,w)&=
+   \kw{metadata}(\mathsf{metadataToken}_{z}(\mathsf{tag}(\bar v),
+      \mathsf{payload}(w))),\\
+ \mathcal J_{\NS}(\mathsf{number},\bar v,w)&=
+   \kw{atom}_{z}(\mathsf{decodeNumber}(w)),\\
+ \mathcal J_{\NS}(\mathsf{string},\bar v,w)&=
+   \kw{atom}_{z}(\mathsf{NFC}(\mathsf{decodeString}(w))),\\
+ \mathcal J_{\NS}(\mathsf{symbol},\bar v,w)&=
+   \kw{atom}_{z}(\mathsf{decodeSymbol}(w)),\\
+ \mathcal J_{\NS}(\mathsf{trueToken},\bar v,w)&=\kw{atom}_{z}(\kw{true}),\\
+ \mathcal J_{\NS}(\mathsf{falseToken},\bar v,w)&=\kw{atom}_{z}(\kw{false}),\\
+ \mathcal J_{\NS}(\mathsf{nilToken},\bar v,w)&=\kw{atom}_{z}(\kw{nil}).
+\end{aligned}
+\end{equation}
+$\mathsf{decodeNumber}$ is the positional interpretation in Specification
+\S5.1.1; it rejects a digit outside the stated radix.
+
+Punctuation and lexical scaffolding are erased only after their enclosing
+capture has used its source slice.  Pure wrapper productions pass their unique
+semantic child through:
+\begin{equation}\label{eq:newspeak-structural-actions}
+\begin{aligned}
+ \mathcal E_{\NS}={}&\{T_p\mid p\in\mathcal P\}\cup\{\mathsf{white},
+   \mathsf{reservedWord},\mathsf{idRest},\mathsf{rawId},\\[-1mm]
+ &\mathsf{rawKeyword},\mathsf{keywords},\mathsf{rawBinary},
+   \mathsf{metadataTag},\mathsf{commentItem},\\[-1mm]
+ &\mathsf{classToken},\mathsf{lazyModifier},\mathsf{outerToken}\},\\
+ \mathcal I_{\NS}={}&\{\mathsf{literal},\mathsf{receiverPrimary},
+   \mathsf{sendExpression},\\[-1mm]
+ &\mathsf{slotDecls},\mathsf{blockParameter},\mathsf{inheritancePrefix},
+   \mathsf{patternLiteral},\\[-1mm]
+ &\mathsf{keywordPatternValue}\},\\
+ \mathcal J_{\NS}(n,\bar v,w)&=\kw{erase}
+      \quad(n\in\mathcal E_{\NS}),\\
+ \mathcal J_{\NS}(n,\langle v\rangle,w)&=v
+      \quad(n\in\mathcal I_{\NS}).
+\end{aligned}
+\end{equation}
+
+Sequence normalization used by the expression actions is
+\begin{equation}\label{eq:newspeak-action-sequence-helpers}
+\begin{aligned}
+ \mathsf{orEmpty}(\kw{none})&=\epsilon,\\
+ \mathsf{orEmpty}(v)&=\langle v\rangle\quad(v\ne\kw{none}),\\
+ \mathsf{orEmptySeq}(\kw{none})&=\epsilon,\\
+ \mathsf{orEmptySeq}(\bar v)&=\bar v\quad(\bar v\ne\kw{none}),\\
+ \mathsf{asStatement}(R)&=\kw{exprStmt}(R)
+      \quad(R\in\mathit{SurfaceExpression}),\\
+ \mathsf{asStatement}(s_R)&=s_R
+      \quad(s_R\in\mathit{SurfaceStatement}),\\
+ \mathsf{flattenStatements}(\epsilon)&=\epsilon,\\
+ \mathsf{flattenStatements}(v\cdot\bar v)&=
+      \mathsf{asStatement}(v)\cdot\mathsf{flattenStatements}(\bar v)
+      \quad(v\notin\mathit{Sequence}),\\
+ \mathsf{flattenStatements}(\kw{sequence}(\bar s)\cdot\bar v)&=
+      \bar s\cdot\mathsf{flattenStatements}(\bar v),\\
+\end{aligned}
+\end{equation}
+The message and expression actions are exhaustive:
+\begin{equation}\label{eq:newspeak-expression-actions}
+\begin{aligned}
+ \mathcal J_{\NS}(\mathsf{binaryMessage},
+      \langle\kw{selector}(s),R\rangle,w)
+   &=\kw{clause}_{z}(s,\langle R\rangle),\\
+ \mathcal J_{\NS}(\mathsf{keywordMessage},
+      \langle\kw{keyword}(k_i),R_i\rangle_{i=1}^{n},w)
+   &=\kw{clause}_{z}(k_1\cdots k_n,\langle R_i\rangle_{i=1}^{n}),\\
+ \mathcal J_{\NS}(\mathsf{message},
+      \langle\kw{selector}(s)\rangle,w)&=\kw{clause}_{z}(s,\epsilon),\\
+ \mathcal J_{\NS}(\mathsf{message},\langle c\rangle,w)&=c
+      \quad(c=\kw{clause}_{z'}(s,\bar R)),\\
+ \mathcal J_{\NS}(\mathsf{cascadeMessage},
+      \langle\kw{selector}(s)\rangle,w)&=\kw{clause}_{z}(s,\epsilon),\\
+ \mathcal J_{\NS}(\mathsf{cascadeMessage},\langle c\rangle,w)&=c,\\
+\end{aligned}
+\end{equation}
+The productions that normalize to an ordered sequence of message clauses are
+\begin{equation}\label{eq:newspeak-message-sequence-names}
+ \mathcal N_M=\{\mathsf{nontrivialUnaryMessages},
+   \mathsf{nontrivialBinaryMessages},
+   \mathsf{keywordMessages},\mathsf{nonEmptyMessages}\}.
+\end{equation}
+\begin{equation}\label{eq:newspeak-send-fold-actions}
+\begin{aligned}
+ \mathcal J_{\NS}(\mathsf{primary},
+      \langle\kw{selector}_{z'}(\#x)\rangle,w)&=\kw{identifier}_{z}(x),\\
+ \mathcal J_{\NS}(\mathsf{primary},
+      \langle\kw{classDecl}_{z'}(\bar v)\rangle,w)&=
+      \kw{classExpr}_{z}(\kw{classDecl}_{z'}(\bar v)),\\
+ \mathcal J_{\NS}(\mathsf{primary},\langle R\rangle,w)&=R
+      \quad\text{for every other primary},\\
+ \mathcal J_{\NS}(\mathsf{unaryExpression},\langle R,\bar c\rangle,w)
+   &=\mathsf{foldExplicit}_{z}(R,\bar c),\\
+ \mathcal J_{\NS}(\mathsf{binaryExpression},\langle R,\bar c\rangle,w)
+   &=\mathsf{foldExplicit}_{z}(R,\bar c),\\
+ \mathcal J_{\NS}(\mathsf{keywordExpression},\langle R,c?\rangle,w)
+   &=\mathsf{foldExplicit}_{z}(R,c?),\\
+ \mathcal J_{\NS}(\mathsf{eventualExpression},\langle R,c\rangle,w)
+   &=\kw{eventual}_{z}(R,\selector(c),\mathsf{arguments}(c)),\\
+ \mathcal J_{\NS}(\mathsf{implicitKeywordSend},\langle c\rangle,w)
+   &=\kw{implicit}_{z}(\selector(c),\mathsf{arguments}(c)),\\
+ \mathcal J_{\NS}(n,\bar v,w)&=
+      \mathsf{flattenClauses}_{z}(\bar v)
+      \quad(n\in\mathcal N_M),\\
+ \mathcal J_{\NS}(\mathsf{messageCascade},
+      \langle\bar c_0,\bar c\rangle,w)
+   &=\kw{cascadeParts}_{z}(\bar c_0,\bar c),\\
+ \mathcal J_{\NS}(\mathsf{cascadedExpression},\langle R\rangle,w)&=R,\\
+ \mathcal J_{\NS}(\mathsf{cascadedExpression},
+      \langle R,\kw{cascadeParts}(\bar c_0,\bar c)\rangle,w)
+   &=\mathsf{makeCascade}_{z}(R,\bar c_0,\bar c),\\
+\end{aligned}
+\end{equation}
+\begin{equation}\label{eq:newspeak-compound-expression-actions}
+\begin{aligned}
+ \mathcal J_{\NS}(\mathsf{expression},
+      \langle\kw{name}(x),R\rangle,w)&=\kw{setter}_{z}(x,R),\\
+ \mathcal J_{\NS}(\mathsf{expression},\langle R\rangle,w)&=R,\\
+ \mathcal J_{\NS}(\mathsf{parenthesized},\langle R\rangle,w)&=\kw{paren}_{z}(R),\\
+ \mathcal J_{\NS}(\mathsf{tuple},\bar R,w)&=\kw{tuple}_{z}(\bar R),\\
+ \mathcal J_{\NS}(\mathsf{blockParameters},\bar d,w)&=\bar d,\\
+ \mathcal J_{\NS}(\mathsf{codeBody},
+      \langle g?,\kw{sequence}(\bar s)\rangle,w)
+   &=\kw{body}_{z}(g?,\bar s),\\
+ \mathcal J_{\NS}(\mathsf{block},
+      \langle\bar d?,\kw{body}(g?,\bar s)\rangle,w)
+   &=\kw{closure}_{z}(\mathsf{orEmptySeq}(\bar d?),
+       \mathsf{orEmpty}(g?),\bar s),\\
+ \mathcal J_{\NS}(\mathsf{returnStatement},\langle R\rangle,w)
+   &=\kw{returnStmt}_{z}(R),\\
+ \mathcal J_{\NS}(\mathsf{statements},\bar v,w)&=
+      \kw{sequence}_{z}(\mathsf{flattenStatements}(\bar v)).
+\end{aligned}
+\end{equation}
+A unary selector in primary position becomes $\kw{identifier}_{z}(x)$;
+Equation~\eqref{eq:expression-elaboration} later makes it an implicit nullary
+send.  An implicit keyword message instead takes the explicit
+$\mathsf{implicitKeywordSend}$ branch.  Thus neither form introduces a
+variable-read node.
+
+Pattern actions are
+\begin{equation}\label{eq:newspeak-pattern-actions}
+\begin{aligned}
+ \mathcal J_{\NS}(\mathsf{wildcardPattern},\epsilon,w)&=\kw{wild}_{z},\\
+ \mathcal J_{\NS}(\mathsf{literalPattern},\langle R\rangle,w)&=
+      \kw{literalPat}_{z}(R),\\
+ \mathcal J_{\NS}(\mathsf{variablePattern},\langle\kw{name}(x)\rangle,w)&=
+      \kw{variablePat}_{z}(x),\\
+ \mathcal J_{\NS}(\mathsf{nestedPattern},\langle p\rangle,w)&=
+      \kw{nestedPat}_{z}(p),\\
+ \mathcal J_{\NS}(\mathsf{keywordPatternPair},
+      \langle\kw{keyword}(k),p?\rangle,w)&=\langle k,p?\rangle,\\
+ \mathcal J_{\NS}(\mathsf{keywordPattern},\bar v,w)&=
+      \kw{keywordPat}_{z}(\bar v),
+      \quad\bar v=\langle k_i,p_i?\rangle_{i=1}^{n},\\
+ \mathcal J_{\NS}(\mathsf{pattern},\langle p\rangle,w)&=\kw{pattern}_{z}(p).
+\end{aligned}
+\end{equation}
+
+For an inheritance clause define
+\begin{equation}\label{eq:newspeak-inheritance-actions}
+\begin{aligned}
+ \mathsf{inheritanceReceiver}_{z}(\kw{none},\kw{selector}(s))
+   &=\kw{implicit}_{z}(s,\epsilon),\\
+ \mathsf{inheritanceReceiver}_{z}(R,\kw{selector}(s))
+   &=\kw{message}_{z}(R,s,\epsilon),\\
+ \mathsf{initializerClause}_{z}(\kw{none})&=
+   \kw{clause}_{z}(\#\kw{new},\epsilon),\\
+ \mathsf{initializerClause}_{z}(c)&=c,\\
+ R_I&=\mathsf{inheritanceReceiver}_{z}(R?,\kw{selector}(s)),\\
+ c_I&=\mathsf{initializerClause}_{z}(c?),\\
+ \mathcal J_{\NS}(\mathsf{inheritanceClause},
+      \langle R?,\kw{selector}(s),c?\rangle,w)
+   &=\kw{inheritanceHead}_{z}(R_I,c_I).
+\end{aligned}
+\end{equation}
+For compactness in the remaining action equations, define the non-overloaded
+abbreviation
+\begin{equation}\label{eq:newspeak-action-abbreviation}
+ \mathsf{act}_{[i,j)}(n,\bar v,u[i:j])
+   =\mathcal J_{\NS}(n,\bar v,u[i:j]).
+\end{equation}
+The complete declaration actions are
+\begin{equation}\label{eq:newspeak-declaration-actions}
+\begin{aligned}
+ N_I&=\mathsf{inheritanceAndBody},\\
+ \mathsf{sel}(\kw{patDecl}(s,\bar d))&=s,\\
+ \mathsf{formals}(\kw{patDecl}(s,\bar d))&=\bar d,\\
+ \mathsf{factorySel}(\kw{none})&=\#\kw{new},\\
+ \mathsf{factorySel}(\kw{patDecl}(s,\bar d))&=s,\\
+ \mathsf{factoryFormals}(\kw{none})&=\epsilon,\\
+ \mathsf{factoryFormals}(\kw{patDecl}(s,\bar d))&=\bar d,\\
+ \mathsf{act}_{z}(\mathsf{keywordPatternDecl},
+      \langle\kw{keyword}(k_i),d_i\rangle_{i=1}^{n},w)&=\\[-1mm]
+ &\quad\kw{patDecl}_{z}(k_1\cdots k_n,\langle d_i\rangle_{i=1}^{n}),\\
+ \mathsf{act}_{z}(\mathsf{binaryPatternDecl},
+      \langle\kw{selector}(s),d\rangle,w)&=
+      \kw{patDecl}_{z}(s,\langle d\rangle),\\
+ \mathsf{act}_{z}(\mathsf{messagePattern},
+      \langle\kw{selector}(s)\rangle,w)&=\kw{patDecl}_{z}(s,\epsilon),\\
+ \mathsf{act}_{z}(\mathsf{messagePattern},\langle p\rangle,w)&=p
+      \quad(p=\kw{patDecl}_{z'}(s,\bar d)),\\
+ \mathsf{act}_{z}(\mathsf{accessModifier},\bar v,w)&=
+      \mathsf{decodeAccess}(w),\\
+ \mathsf{act}_{z}(\mathsf{slotDecl},\langle\kw{name}(x)\rangle,w)&=
+      \kw{formal}_{z}(x),\\
+ \mathsf{act}_{z}(\mathsf{slotDef},\langle\alpha?,d,R?\rangle,w)&=\\[-1mm]
+ &\quad\kw{slot}_{z}(\alpha?,\mathsf{name}(d),
+      \mathsf{mutability}(w),R?),\\
+ \mathsf{act}_{z}(\mathsf{sequentialSlots},\bar d,w)&=
+      \kw{sequentialGroup}_{z}(\bar d),\\
+ \mathsf{act}_{z}(\mathsf{simultaneousSlots},\bar d,w)&=
+      \kw{simultaneousGroup}_{z}(\bar d),\\
+ \mathsf{act}_{z}(\mathsf{lazySlotDecl},
+      \langle\alpha?,d,R\rangle,w)&=\\[-1mm]
+ &\quad\kw{lazySlot}_{z}(\alpha?,\mathsf{name}(d),
+      \mathsf{mutability}(w),R),\\
+ \mathsf{act}_{z}(\mathsf{methodDecl},
+      \langle\alpha?,p,\kw{body}(g?,\bar s)\rangle,w)&=\\[-1mm]
+ &\quad\kw{method}_{z}(\alpha?,\mathsf{sel}(p),
+      \mathsf{formals}(p),\mathsf{orEmpty}(g?),\bar s),\\
+ \mathsf{act}_{z}(\mathsf{nestedClassDecl},\langle\alpha?,d\rangle,w)&=
+      \kw{nestedClass}_{z}(\alpha?,d),\\
+ \mathsf{act}_{z}(\mathsf{classHeader},
+      \langle g?,\kw{sequence}(\bar s)\rangle,w)&=
+      \kw{header}_{z}(g?,\bar s),\\
+ \mathsf{act}_{z}(\mathsf{instanceSide},\bar d,w)&=\bar d,\\
+ \mathsf{act}_{z}(\mathsf{classSide},\bar d_c,w)&=\bar d_c,\\
+ \mathsf{act}_{z}(\mathsf{classBody},
+      \langle\kw{header}(g?,\bar s),\bar d,\bar d_c?\rangle,w)&=\\[-1mm]
+ &\quad\kw{classStructure}_{z}
+      (g?,\bar s,\bar d,\mathsf{orEmptySeq}(\bar d_c?)),\\
+ \mathsf{act}_{z}(\mathsf{mixinSuffix},\langle\bar h,h?\rangle,w)&=
+      \kw{mixinTail}_{z}(\bar h,h?),\\
+ \mathsf{act}_{z}(N_I,\langle h\rangle,w)&=
+      \kw{defaultInheritance}_{z}(h),\\
+ \mathsf{act}_{z}(N_I,
+      \langle\kw{inheritanceHead}(R,c),h\rangle,w)&=
+      \kw{explicitInheritance}_{z}(R,c,h),\\
+ h_I&=\kw{inheritanceHead}(R,c),\\
+ t_I&=\kw{mixinTail}(\bar c,h?),\\
+ \mathsf{act}_{z}(N_I,\langle h_I,t_I\rangle,w)&=\\[-1mm]
+ &\quad\kw{mixinChain}_{z}(R,c,\bar c,h?),\\
+ \mathsf{act}_{z}(\mathsf{classDeclaration},
+      \langle\kw{name}(x),p?,b\rangle,w)&=
+      \kw{classDecl}_{z}(x,\mathsf{factorySel}(p?),
+         \mathsf{factoryFormals}(p?),b),\\
+ \mathsf{act}_{z}(\mathsf{objectLiteral},\langle h\rangle,w)&=
+      \kw{object}_{z}(\kw{implicitObjectHeader}_{z}(h)),\\
+ R_o&=\kw{identifier}_{z}(x),\\
+ c_o&=\mathsf{initializerClause}_{z}(c?),\\
+ o_h&=\kw{explicitObjectHeader}_{z}(R_o,c_o,h),\\
+ \mathsf{act}_{z}(\mathsf{objectLiteral},
+      \langle\kw{name}(x),c?,h\rangle,w)&=\\[-1mm]
+ &\quad\kw{object}_{z}(o_h),\\
+ \mathsf{act}_{z}(\mathsf{compilationUnit},
+      \langle\lambda,\gamma?,d\rangle,w)&=\\[-1mm]
+ &\quad\kw{unit}_{z}(\lambda,\gamma?,d).
+\end{aligned}
+\end{equation}
+$\mathsf{mutability}(w)$ is immutable exactly when the slot definition's
+source slice $w$ contains \texttt{=} rather than \texttt{::=}; either
+assignment operator makes a lazy slot mutable or immutable in the same way,
+and omission is mutable.
+The inheritance actions construct exactly the three $b$ alternatives in
+Equation~\eqref{eq:surface-declaration-domain}, in source order.  All
+punctuation, trivia, and wrapper productions have either
+the discard action or the unique-child action.  Equations
+\eqref{eq:newspeak-literal-actions}--\eqref{eq:newspeak-declaration-actions},
+together with those two structural actions, define $\mathcal J_{G_{\NS}}$ on
+every successful captured production; there is no residual action case.
+
+A metadata token is $m=\langle\tau,w,[i,j)\rangle$, where $\tau$ is its tag
+and $w$ its uninterpreted payload; an ordinary comment has tag $\kw{comment}$.
+Let $\mathsf{triviaOnly}_{u}(i,j)$ mean that $u[i:j]$ contains only whitespace
+and comments, and define
+\begin{equation}\label{eq:metadata-trivia-gap}
+ \mathsf{triviaBetween}_{u}(X,Y)\Longleftrightarrow
+ \mathsf{end}(X)\le\mathsf{start}(Y)\land
+ \mathsf{triviaOnly}_{u}(\mathsf{end}(X),\mathsf{start}(Y)).
+\end{equation}
+The association relation is
+\begin{equation}\label{eq:metadata-association}
+\begin{aligned}
+ m\mathrel{\mathsf{before}_{u}}R
+ &\Longleftrightarrow
+   \mathsf{triviaBetween}_{u}(m,R)\land\\[-1mm]
+ &\qquad R\in\mathit{Expression}\uplus\mathit{FormalDeclaration}
+                    \uplus\mathit{SlotDeclaration},\\
+ m\mathrel{\mathsf{afterPattern}_{u}}R
+ &\Longleftrightarrow
+   \mathsf{triviaBetween}_{u}(\mathsf{pattern}(R),m)\land\\[-1mm]
+ &\qquad R\in\mathit{MethodDeclaration}
+                   \uplus\mathit{FactoryDeclaration},\\
+ m\mathrel{\mathsf{afterHeader}_{u}}R
+ &\Longleftrightarrow
+   \mathsf{triviaBetween}_{u}(\mathsf{header}(R),m)\land
+   R\in\mathit{ClassDeclaration},\\
+ m\mathrel{\mathsf{staticTypeOf}_{u}}R
+ &\Longleftrightarrow
+   \mathsf{tag}(m)=\kw{staticType}\land
+   \mathsf{span}(m)\subseteq\mathsf{span}(R)\land\\[-1mm]
+ &\qquad R=\min_{\subseteq}\{R'\mid
+      \mathsf{span}(m)\subseteq\mathsf{span}(R')\land
+      R'\in\mathit{TypedDeclaration}\}.
+\end{aligned}
+\end{equation}
+The applicable relation is selected by node kind in displayed order.  Metadata
+attachment and its insertion into the tree are the functions
+\begin{equation}\label{eq:metadata-attachment}
+\begin{aligned}
+ \mathsf{related}_{u}(m,R)&=
+  \begin{cases}
+   m\mathrel{\mathsf{staticTypeOf}_{u}}R&\mathsf{tag}(m)=\kw{staticType},\\
+   m\mathrel{\mathsf{afterHeader}_{u}}R
+      &R\in\mathit{ClassDeclaration},\\
+   m\mathrel{\mathsf{afterPattern}_{u}}R
+      &R\in\mathit{MethodDeclaration}\uplus\mathit{FactoryDeclaration},\\
+   m\mathrel{\mathsf{before}_{u}}R&\text{otherwise,}
+  \end{cases}\\
+ \mathsf{metadata}_{u,\bar m}(R)&=
+   \mathsf{sourceOrder}(\langle m\in\bar m\mid
+      \mathsf{related}_{u}(m,R)\rangle),\\
+ \mathsf{attachMetadata}_{u}(R,\bar m)&=
+   R[\mathsf{meta}(n)\mapsto\mathsf{metadata}_{u,\bar m}(n)
+       \mid n\in\mathsf{nodes}(R)].
+\end{aligned}
+\end{equation}
+Punctuation, whitespace, and metadata tokens therefore do not become
+executable AST children.
+
+Parsed nodes next receive identities.  Let
+$\kappa:\mathit{NodeKey}\rightharpoonup
+ (\mathit{DeclId}\uplus\mathit{SiteId})$ be an optional identity-retention map,
+where a key contains a source-unit identity, structural path, constructor kind,
+and declared name when one exists.  Define
+\begin{equation}\label{eq:stable-ast-identification}
+ \mathsf{identify}_{\kappa}(R)=\langle S,\kappa'\rangle
+ \quad\Longleftrightarrow\quad
+ \begin{cases}
+  \mathsf{id}_{S}(n)=\kappa(\mathsf{key}_{R}(n))
+    &\mathsf{key}_{R}(n)\in\dom(\kappa),\\
+  \mathsf{id}_{S}(n)\text{ is fresh of the required sort}
+    &\mathsf{key}_{R}(n)\notin\dom(\kappa),
+ \end{cases}
+\end{equation}
+for every declaration or expression node $n$, with $\kappa'$ extending
+$\kappa$ by the chosen keys.  The result must satisfy
+\begin{equation}\label{eq:stable-ast-identity-validity}
+ \mathsf{idsOK}(S)\Longleftrightarrow
+ \mathsf{id}_{S}\text{ is injective}\ \land\
+ \mathsf{id}_{S}(n)\in
+ \begin{cases}\mathit{DeclId}&n\in\mathit{DeclarationNode}(S),\\
+               \mathit{SiteId}&n\in\mathit{ExpressionNode}(S).
+ \end{cases}
+\end{equation}
+An initial compilation uses $\kappa=\varnothing$.  A source-preserving editor
+may supply a retained map; mirror changes that directly edit identified AST
+nodes preserve identities according to Equation~\eqref{eq:source-patch} and do
+not reparse text.
+
+\subsection{Binding, elaboration, and static well-formedness}
+\label{sec:static-elaboration}
+
+An elaboration context is
+\begin{equation}\label{eq:elaboration-context}
+ \Gamma=\langle K,q,D_0,\bar B,r_t,h_t\rangle,
+\end{equation}
+where $K$ is the enclosing class-body declaration or $\kw{top}$, $q$ is the
+enclosing activation declaration or $\kw{none}$, $D_0$ is the immediately
+enclosing named class or $\kw{none}$, $\bar B$ is the innermost-first sequence
+of lexical binder maps, and $r_t,h_t$ record whether local and non-local return
+are permitted.  Lexical binding is the partial function
+\begin{equation}\label{eq:static-binding-function}
+ \mathsf{bind}_{\Gamma}(x)=d
+ \quad\Longleftrightarrow\quad
+ j=\min\{i\mid x\in\dom(B_i)\}\land d=B_j(x),
+ \qquad \bar B=\langle B_0,\ldots,B_m\rangle.
+\end{equation}
+An absent set on the right makes the function undefined.  Class-name binding
+uses the same definition restricted to class declarations; write
+$\mathsf{classBind}_{\Gamma}(x)=D_t$.
+The total annotation used by an ordinary implicit send is
+\begin{equation}\label{eq:implicit-binding-annotation}
+ \mathsf{bindingAnnotation}_{\Gamma}(x)=
+ \begin{cases}
+  \mathsf{bind}_{\Gamma}(x)&\mathsf{bind}_{\Gamma}(x)\ne\undef,\\
+  \kw{none}&\mathsf{bind}_{\Gamma}(x)=\undef.
+ \end{cases}
+\end{equation}
+
+Parentheses do not erase receiver authority.  Define
+\begin{equation}\label{eq:surface-receiver-kind}
+\begin{aligned}
+ \mathsf{receiverKind}_{\Gamma}((R))&=\mathsf{receiverKind}_{\Gamma}(R),\\
+ \mathsf{receiverKind}_{\Gamma}(\kw{self})&=\kw{selfReceiver}(D_0),\\
+ \mathsf{receiverKind}_{\Gamma}(\kw{outer}(x))
+   &=\kw{outerReceiver}(\mathsf{classBind}_{\Gamma}(x),D_0),\\
+ \mathsf{receiverKind}_{\Gamma}(\kw{super})&=\kw{superReceiver},\\
+ \mathsf{receiverKind}_{\Gamma}(R)&=\kw{ordinaryReceiver}
+   \quad\text{otherwise.}
+\end{aligned}
+\end{equation}
+For already elaborated arguments $\bar e$, put
+$r_k=\mathsf{receiverKind}_{\Gamma}(R)$.  Send construction is the distinct
+partial function
+\begin{equation}\label{eq:elaborated-send-construction}
+\begin{aligned}
+ \mathsf{makeSend}_{\Gamma}(R,s,\bar e)&=
+ \begin{cases}
+  \kw{selfSend}(s,\bar e,D_0)&
+    r_k=\kw{selfReceiver}(D_0),\\
+  \kw{outerSend}(s,\bar e,D_t,D_0)&
+    r_k=\kw{outerReceiver}(D_t,D_0),\\
+  \kw{superSend}(s,\bar e)&
+    r_k=\kw{superReceiver},\\
+  \kw{send}(e_R,s,\bar e)&
+    r_k=\kw{ordinaryReceiver}\land
+      \mathsf{elabExpr}_{\Gamma}(R)=e_R.
+ \end{cases}
+\end{aligned}
+\end{equation}
+It is undefined if $D_0=\kw{none}$ in a self or outer case, if the named outer
+class does not bind, or if super occurs outside a method activation.  Notice
+again that the super case receives no declaration annotation.
+
+Use distinct functions for a single expression, an expression list, a
+statement sequence, a declaration, and a complete unit:
+\begin{equation}\label{eq:elaboration-function-signatures}
+\begin{aligned}
+ \mathsf{elabExpr}_{\Gamma}&:\mathit{SurfaceExpression}\rightharpoonup
+     \mathit{CoreExpression},\\
+ \mathsf{elabExprList}_{\Gamma}&:\mathit{SurfaceExpression}^{*}
+     \rightharpoonup\mathit{CoreExpression}^{*},\\
+ \mathsf{elabStatements}_{\Gamma}&:\mathit{SurfaceStatement}^{*}
+     \rightharpoonup\mathit{CoreStatement}^{*},\\
+ \mathsf{elabDecl}_{\Gamma}&:\mathit{SurfaceDeclaration}
+     \rightharpoonup\mathit{DerivedDeclaration},\\
+ \mathsf{deriveProgram}&:\mathit{IdentifiedUnit}\rightharpoonup
+     (\mathit{Program}\times\mathit{CoreExpression}).
+\end{aligned}
+\end{equation}
+The list and optional functions, selector annotations, and activation contexts
+are defined by
+\begin{equation}\label{eq:elaboration-helper-functions}
+\begin{aligned}
+ \mathsf{elabExprList}_{\Gamma}(\epsilon)&=\epsilon,\\
+ \mathsf{elabExprList}_{\Gamma}(R\cdot\bar R)&=
+   \mathsf{elabExpr}_{\Gamma}(R)\cdot
+   \mathsf{elabExprList}_{\Gamma}(\bar R),\\
+ \mathsf{elabOptionalExpr}_{\Gamma}(\kw{none})&=\kw{none},\\
+ \mathsf{elabOptionalExpr}_{\Gamma}(R)&=\mathsf{elabExpr}_{\Gamma}(R),\\
+ \mathsf{elabOptionalPattern}_{\Gamma}(\kw{none})&=\_,\\
+ \mathsf{elabOptionalPattern}_{\Gamma}(p)&=\mathsf{elabPattern}_{\Gamma}(p),\\
+ \mathsf{selectorBindingAnnotation}_{\Gamma}(s)&=
+  \begin{cases}
+   \mathsf{bindingAnnotation}_{\Gamma}(x)&s=\#x,\\
+   \kw{none}&\mathsf{arity}(s)>0.
+  \end{cases}
+\end{aligned}
+\end{equation}
+For a declaration sequence, let
+\begin{equation}\label{eq:elaboration-context-extension}
+\begin{aligned}
+ \mathsf{groupDecls}(\epsilon)&=\epsilon,\\
+ \mathsf{groupDecls}(g\cdot\bar g)&=
+     \mathsf{members}(g)\cdot\mathsf{groupDecls}(\bar g),\\
+ \mathsf{binder}(\bar d)&=
+     \{\mathsf{name}(d)\mapsto\mathsf{id}(d)\mid d\in\bar d\},\\
+ \mathsf{returnFlags}_{\Gamma}(q)&=
+  \begin{cases}
+   \langle\mathsf{true},\mathsf{false}\rangle&q\in\mathit{MethodDeclId},\\
+   \langle\mathsf{false},\Gamma.r_t\lor\Gamma.h_t\rangle
+       &q\in\mathit{ClosureDeclId},
+  \end{cases}\\
+ \mathsf{activationContext}_{\Gamma}(q,\bar d,\bar g)&=
+   \langle\Gamma.K,q,\Gamma.D_0,
+     \mathsf{binder}(\bar d\cdot\mathsf{groupDecls}(\bar g))
+       \cdot\Gamma.\bar B,r_q,h_q\rangle,\\[-1mm]
+ &\qquad\langle r_q,h_q\rangle=\mathsf{returnFlags}_{\Gamma}(q).
+\end{aligned}
+\end{equation}
+Thus $\Gamma_q=\mathsf{activationContext}_{\Gamma}(q,\bar d,\bar g)$ in every
+closure or method case below.  The atomic and send cases are
+\begin{equation}\label{eq:expression-elaboration}
+\begin{aligned}
+ \mathsf{elabExpr}_{\Gamma}(\kw{identifier}_{z}(x))
+   &=\kw{implicit}(\#x,\epsilon,
+      \mathsf{bindingAnnotation}_{\Gamma}(x)),\\
+ \mathsf{elabExpr}_{\Gamma}(\kw{implicit}_{z}(s,\bar R))
+   &=\kw{implicit}(s,\mathsf{elabExprList}_{\Gamma}(\bar R),
+      \mathsf{selectorBindingAnnotation}_{\Gamma}(s)),\\
+ \mathsf{elabExpr}_{\Gamma}(\kw{message}_{z}(R,s,\bar R'))
+   &=\mathsf{makeSend}_{\Gamma}
+       (R,s,\mathsf{elabExprList}_{\Gamma}(\bar R')),\\
+ \mathsf{elabExpr}_{\Gamma}(\kw{eventual}_{z}(R,s,\bar R'))
+   &=\kw{asyncSend}(\mathsf{elabExpr}_{\Gamma}(R),s,
+                    \mathsf{elabExprList}_{\Gamma}(\bar R')),\\
+ \mathsf{elabExpr}_{\Gamma}(\kw{atom}_{z}(\omega))&=\kw{atom}(\omega),\\
+ \mathsf{elabExpr}_{\Gamma}(\kw{self}_{z})&=\kw{self},\\
+ \mathsf{elabExpr}_{\Gamma}(\kw{paren}_{z}(R))&=\mathsf{elabExpr}_{\Gamma}(R),\\
+ \mathsf{elabExpr}_{\Gamma}(\kw{tuple}_{z}(\bar R))
+   &=\kw{tuple}(\mathsf{elabExprList}_{\Gamma}(\bar R)),\\
+ \mathsf{elabExpr}_{\Gamma}(\kw{pattern}_{z}(p))
+   &=\kw{pattern}(\mathsf{elabPattern}_{\Gamma}(p),
+       \mathsf{bindingAnnotation}_{\Gamma}(\kw{Pattern})),\\
+ \mathsf{elabExpr}_{\Gamma}(\kw{setter}_{z}(x,R))
+   &=\mathsf{elabExpr}_{\Gamma}(\mathsf{setterExpansion}_{z}(x,R)),\\
+ \mathsf{elabExpr}_{\Gamma}(\kw{cascade}_{z}(R,\bar c_0,\bar c))
+   &=\mathsf{elabExpr}_{\Gamma}
+      (\mathsf{cascadeExpansion}_{z}(R,\bar c_0,\bar c)).
+\end{aligned}
+\end{equation}
+Here $\mathsf{selectorBindingAnnotation}_{\Gamma}$ is
+Equation~\eqref{eq:implicit-binding-annotation} for a unary activation member
+and is $\kw{none}$ otherwise.  Tuple and pattern nodes are retained because
+their dynamic expansions are Equations~\eqref{eq:tuple-expansion} and
+\eqref{eq:pattern-components}--\eqref{eq:variable-pattern-parameter}.
+
+Pattern elaboration recursively elaborates only embedded expressions:
+\begin{equation}\label{eq:pattern-elaboration}
+\begin{aligned}
+ \mathsf{elabPattern}_{\Gamma}(\kw{wild}_{z})&=\_,\\
+ \mathsf{elabPattern}_{\Gamma}(\kw{literalPat}_{z}(R))&=
+      \mathsf{elabExpr}_{\Gamma}(R),\\
+ \mathsf{elabPattern}_{\Gamma}(\kw{variablePat}_{z}(x))&=?x_z,\\
+ \mathsf{elabPattern}_{\Gamma}(\kw{nestedPat}_{z}(p))&=
+      \langle\mathsf{elabPattern}_{\Gamma}(p)\rangle,\\
+ \mathsf{elabPattern}_{\Gamma}
+    (\kw{keywordPat}_{z}(\langle k_i,p_i?\rangle_i))&=
+      \langle k_i,
+        \mathsf{elabOptionalPattern}_{\Gamma}(p_i?)\rangle_i.
+\end{aligned}
+\end{equation}
+An absent keyword component denotes a wildcard.  The resulting forms are
+exactly the arguments of Equations~\eqref{eq:pattern-components}--
+\eqref{eq:keyword-pattern-expansion}.
+
+The setter expansion, with fresh $p\ne x$, is
+\begin{equation}\label{eq:setter-expansion}
+\begin{aligned}
+ \mathsf{setterBody}_{z}(x,p)&=
+   \langle\kw{exprStmt}(\kw{implicit}(\#x{:},
+      \langle\kw{identifier}(p)\rangle)),
+      \kw{exprStmt}(\kw{identifier}(p))\rangle,\\
+ \mathsf{setterExpansion}_{z}(x,R)&=
+   \kw{message}_{z}\bigl(\kw{closure}_{z}
+      (\langle\kw{formal}(p)\rangle,\epsilon,
+       \mathsf{setterBody}_{z}(x,p)),\\[-1mm]
+ &\hspace{38mm}\selsym{value:},\langle R\rangle\bigr).
+\end{aligned}
+\end{equation}
+It therefore evaluates $R$ once, sends the setter, and returns the argument.
+
+A cascade receiver is evaluated once.  For fresh synthetic closure identity
+$q_c$, formal declaration $d_c$, and identifier $x_c$, define
+\begin{equation}\label{eq:cascade-expansion}
+\begin{aligned}
+ &\mathsf{cascadeExpansion}_{z}
+   (R,\bar c_0,
+      \langle\kw{clause}(s_1,\bar R_1),\ldots,
+             \kw{clause}(s_m,\bar R_m)\rangle)\\
+ &\quad=\kw{message}_{z}\bigl(
+   \kw{closure}_{q_c}(\langle\kw{formal}_{d_c}(x_c)\rangle,\epsilon,\\[-1mm]
+ &\hspace{31mm}\langle
+   \kw{exprStmt}(\mathsf{foldExplicit}_{z}
+      (\kw{identifier}(x_c),\bar c_0))\rangle\cdot\\[-1mm]
+ &\hspace{31mm}\langle
+   \kw{exprStmt}(\kw{message}(\kw{identifier}(x_c),s_i,\bar R_i))
+   \mid1\le i\le m\rangle),\\[-1mm]
+ &\hspace{31mm}\selsym{value:},\langle R\rangle\bigr).
+\end{aligned}
+\end{equation}
+The binding map inside the synthesized closure maps $x_c$ to $d_c$.
+
+The remaining expression cases and statement elaboration are
+preceded by normalization of local declarations:
+\begin{equation}\label{eq:local-group-elaboration}
+\begin{aligned}
+ \mathsf{elabLocalDecl}_{\Gamma}
+  (\kw{slot}_{d}(\alpha?,x,\kw{immutable},R))
+   &=\kw{immutable}(d,\mathsf{elabExpr}_{\Gamma}(R)),\\
+ \mathsf{elabLocalDecl}_{\Gamma}
+  (\kw{slot}_{d}(\alpha?,x,\kw{mutable},R?))
+   &=\kw{mutable}(d,\mathsf{elabOptionalExpr}_{\Gamma}(R?)),\\
+ \mathsf{elabLocalGroup}_{\Gamma}(\kw{sequentialGroup}(\bar d))
+   &=\langle\mathsf{elabLocalDecl}_{\Gamma}(d)\mid d\in\bar d\rangle,\\
+ \mathsf{elabLocalGroup}_{\Gamma}(\kw{simultaneousGroup}(\bar d))
+   &=\langle\kw{simultaneous}
+      (\langle\mathsf{elabLocalDecl}_{\Gamma}(d)\mid d\in\bar d\rangle)\rangle,\\
+ \mathsf{elabLocalGroups}_{\Gamma}(\epsilon)&=\epsilon,\\
+ \mathsf{elabLocalGroups}_{\Gamma}(g\cdot\bar g)&=
+   \mathsf{elabLocalGroup}_{\Gamma}(g)\cdot
+   \mathsf{elabLocalGroups}_{\Gamma}(\bar g).
+\end{aligned}
+\end{equation}
+\begin{equation}\label{eq:compound-expression-elaboration}
+\begin{aligned}
+ \Gamma_q&=\mathsf{activationContext}_{\Gamma}(q,\bar d,\bar g),\\
+ \ell_q&=\mathsf{elabLocalGroups}_{\Gamma_q}(\bar g),\\
+ b_q&=\mathsf{elabStatements}_{\Gamma_q}(\bar s),\\
+ \mathsf{elabExpr}_{\Gamma}(\kw{closure}_{q}(\bar d,\bar g,\bar s))
+   &=\kw{closureLiteral}(q,\mathsf{names}(\bar d),\ell_q,b_q),\\
+ \mathsf{elabExpr}_{\Gamma}(\kw{object}_{L}(o_h))
+   &=\kw{objectLiteral}(\mathsf{objectDescriptor}_{\Gamma}(L,o_h),
+       \mathsf{objectSuperclass}_{\Gamma}(o_h)),\\
+ \mathsf{elabExpr}_{\Gamma}(\kw{classExpr}_{D}(d))
+   &=\mathsf{elabClass}_{\Gamma}(D,d),\\
+ \mathsf{elabStatements}_{\Gamma}
+   (\langle\kw{exprStmt}(R_i)\rangle_i)&=\\[-1mm]
+ &\quad\langle\kw{expr}(\mathsf{elabExpr}_{\Gamma}(R_i))\rangle_i,\\
+ \mathsf{elabStatements}_{\Gamma}
+   (\bar s\cdot\langle\kw{returnStmt}(R)\rangle)
+   &=\mathsf{elabStatements}_{\Gamma}(\bar s)\cdot\langle e_r\rangle,\\
+ e_r&=\kw{return}(\mathsf{elabExpr}_{\Gamma}(R)).
+\end{aligned}
+\end{equation}
+$\Gamma_q$ prepends the formal and local binder maps, sets the activation to
+$q$, and enables a non-local return exactly when $q$ is a closure with an
+enclosing method.  A return can only be the final surface statement by
+Equation~\eqref{eq:newspeak-expression-peg}.
+
+Access defaulting and the declaration cases are explicit:
+\begin{equation}\label{eq:declaration-elaboration}
+\begin{aligned}
+ \mathsf{accessOf}(\kw{none})&=\Protected,\\
+ \mathsf{accessOf}(\kw{public})&=\Public,\\
+ \mathsf{accessOf}(\kw{protected})&=\Protected,\\
+ \mathsf{accessOf}(\kw{private})&=\Private,\\
+ \Gamma_f&=\mathsf{activationContext}_{\Gamma}(i_f,\bar d,\bar g),\\
+ \ell_f&=\mathsf{elabLocalGroups}_{\Gamma_f}(\bar g),\\
+ b_f&=\mathsf{elabStatements}_{\Gamma_f}(\bar s),\\
+ a_f&=\mathsf{accessOf}(\alpha?),\\
+ d_f&=\kw{method}_{i_f}(\alpha?,s,\bar d,\bar g,\bar s),\\
+ d_s&=\kw{slot}_{d}(\alpha?,x,m,R?),\\
+ d_l&=\kw{lazySlot}_{d}(\alpha?,x,m,R),\\
+ d_n&=\kw{nestedClass}_{d}(\alpha?,D),\\
+ \mathsf{elabDecl}_{\Gamma}(d_f)
+   &=\langle i_f,s,a_f,\mathsf{names}(\bar d),
+       \ell_f,b_f,\Gamma.K\rangle,\\
+ \mathsf{elabDecl}_{\Gamma}(d_s)&=\\[-1mm]
+ &\quad\mathsf{ordinarySlotDef}(d,x,a_f,m,
+       \mathsf{elabOptionalExpr}_{\Gamma}(R?)),\\
+ \mathsf{elabDecl}_{\Gamma}(d_l)&=\\[-1mm]
+ &\quad\mathsf{lazySlotDef}(d,x,a_f,m,
+       \mathsf{elabExpr}_{\Gamma}(R)),\\
+ \mathsf{elabDecl}_{\Gamma}(d_n)&=\mathsf{nestedClassDef}(d,a_f,
+       \mathsf{elabClass}_{\Gamma}(D,D)).
+\end{aligned}
+\end{equation}
+$\Gamma_f$ prepends the method's formal and local declarations and enables
+local return.  The ordinary- and lazy-slot constructors produce the physical
+slot and the exact getter/setter bodies of
+Section~\ref{sec:synthesized-methods}.  The nested-class constructor produces
+its memoizing getter.  These constructors have different domains and names.
+
+Class and object elaboration uses the message-template domain in
+Equation~\eqref{eq:message-template-domain}.  Define
+\begin{equation}\label{eq:front-end-message-template}
+ \mathsf{elabMessageTemplate}_{\Gamma}
+   (\kw{clause}(s,\bar R))=
+   \langle s,\mathsf{elabExprList}_{\Gamma}(\bar R)\rangle.
+\end{equation}
+For a named class declaration $D$ with structure $h$, let $M_D$ and $M_D^c$
+be the stable instance- and class-side mixins induced by $h$.  Its descriptor
+constructor is
+\begin{equation}\label{eq:front-end-body-descriptor}
+\begin{aligned}
+ \mathsf{bodyDescriptor}_{\Gamma}
+   (D,x,u,s_f,\bar d,h,c)
+   =\langle D,x,u,s_f,\mathsf{names}(\bar d),
+      M_D,M_D^c,\mathsf{elabMessageTemplate}_{\Gamma}(c)\rangle.
+\end{aligned}
+\end{equation}
+This is exactly the tuple $\chi_b$ of Equation~\eqref{eq:body-descriptor}.
+Omitted inheritance is
+\begin{equation}\label{eq:front-end-default-superclass}
+\begin{aligned}
+ \mathsf{defaultSuperclass}_{\Gamma}&=
+  \begin{cases}
+   \Object&\Gamma.K=\kw{top},\\
+   \kw{implicit}(\#\kw{Object},\epsilon,
+      \mathsf{bindingAnnotation}_{\Gamma}(\kw{Object}))&\text{otherwise,}
+  \end{cases}\\
+ \mathsf{defaultInitializer}&=\kw{clause}(\#\kw{new},\epsilon).
+\end{aligned}
+\end{equation}
+The two non-application class cases are therefore
+\begin{equation}\label{eq:front-end-class-body-elaboration}
+\begin{aligned}
+ &\mathsf{elabClass}_{\Gamma}
+  (D,\kw{classDecl}(x,s_f,\bar d,\kw{defaultInheritance}(h)))\\
+ &\quad=\kw{classBody}(\chi_b,\mathsf{defaultSuperclass}_{\Gamma}),\\[-1mm]
+ &\qquad\chi_b=\mathsf{bodyDescriptor}_{\Gamma}
+      (D,x,\kw{implicitSuperclass},s_f,\bar d,h,
+       \mathsf{defaultInitializer}),\\
+ &\mathsf{elabClass}_{\Gamma}
+  (D,\kw{classDecl}(x,s_f,\bar d,
+       \kw{explicitInheritance}(R,c,h)))\\
+ &\quad=\kw{classBody}
+   (\chi_b,\mathsf{elabExpr}_{\Gamma}(R)),\\[-1mm]
+ &\qquad\chi_b=\mathsf{bodyDescriptor}_{\Gamma}
+      (D,x,\kw{explicitSuperclass},s_f,\bar d,h,c).
+\end{aligned}
+\end{equation}
+
+For a mixin chain, write its first inheritance head as
+$h_0=\kw{inheritanceHead}(R_0,c_0)$ and its nonempty suffix as
+$\bar h=\langle h_1,\ldots,h_k\rangle$, where
+$h_j=\kw{inheritanceHead}(R_j,c_j)$.  Each application uses $c_{j-1}$ to
+initialize its superclass and $c_j$ to initialize the newly applied mixin.
+The synthetic identities and names required for an intermediate application
+are deterministic injections of the enclosing declaration identity and its
+one-based position:
+\begin{equation}\label{eq:front-end-application-identities}
+\begin{aligned}
+ D_{A,j}&=\mathsf{applicationDeclId}(D,j),&
+ i_{A,j}&=\mathsf{applicationInitId}(D,j),\\
+ n_{A,j}&=\mathsf{applicationName}(D,j),&
+ \bar x_{A,j}&=\mathsf{applicationFormals}(D,j,\selector(c_j)).
+\end{aligned}
+\end{equation}
+The names in $\bar x_{A,j}$ are pairwise fresh, and their number is the arity
+of $\selector(c_j)$.  Let $M^c_{A,j}$ be the stable class-side mixin containing
+only the synthesized public primary factory for that signature.  The complete
+descriptor of an intermediate application is
+\begin{equation}\label{eq:front-end-anonymous-application-descriptor}
+\begin{aligned}
+ \mathsf{anonAppDesc}_{\Gamma}(D,j,c_{j-1},c_j)
+   &=\langle D_{A,j},n_{A,j},\selector(c_j),\bar x_{A,j},\\[-1mm]
+   &\quad M^c_{A,j},i_{A,j},m_{j-1},m_j\rangle,\\
+ m_{j-1}&=\mathsf{elabMessageTemplate}_{\Gamma}(c_{j-1}),\\
+ m_j&=\mathsf{elabMessageTemplate}_{\Gamma}(c_j).
+\end{aligned}
+\end{equation}
+For the last application of a body-less named class, the declaration's own
+identity, name, factory formals, and class-side mixin replace those synthetic
+components:
+\begin{equation}\label{eq:front-end-named-application-descriptor}
+\begin{aligned}
+ &\mathsf{namedAppDesc}_{\Gamma}
+   (D,x,s_f,\bar d,c_{k-1},c_k)={}\\
+ &\quad\langle D,x,s_f,\mathsf{names}(\bar d),M_D^c,i_{A,k},
+   \mathsf{elabMessageTemplate}_{\Gamma}(c_{k-1}),
+   \mathsf{elabMessageTemplate}_{\Gamma}(c_k)\rangle.
+\end{aligned}
+\end{equation}
+The anonymous prefix fold returns both the resulting class expression and the
+last initializer clause; retaining the latter makes the next superclass
+initializer explicit:
+\begin{equation}\label{eq:front-end-mixin-fold}
+\begin{aligned}
+ \mathsf{foldAnonymous}_{\Gamma,D}(E,c_0,\epsilon)&=\langle E,c_0\rangle,\\
+ \mathsf{foldAnonymous}_{\Gamma,D}
+  (E,c_{j-1},\langle h_j\rangle\cdot\bar h)
+   &=\mathsf{foldAnonymous}_{\Gamma,D}(E_j,c_j,\bar h),\\
+ E_j&=\kw{mixinApply}(\chi_{A,j},E,
+       \mathsf{elabExpr}_{\Gamma}(R_j)),\\
+ \chi_{A,j}&=\mathsf{anonAppDesc}_{\Gamma}(D,j,c_{j-1},c_j).
+\end{aligned}
+\end{equation}
+A body-less chain reserves its last application for the named descriptor.  Put
+\begin{equation}\label{eq:front-end-bodyless-prefix}
+ \mathsf{foldAnonymous}_{\Gamma,D}
+  (\mathsf{elabExpr}_{\Gamma}(R_0),c_0,
+   \langle h_1,\ldots,h_{k-1}\rangle)
+   =\langle E_{k-1},c_{k-1}\rangle.
+\end{equation}
+Then
+\begin{equation}\label{eq:front-end-bodyless-mixin-elaboration}
+\begin{aligned}
+ &\mathsf{elabClass}_{\Gamma}
+  (D,\kw{classDecl}(x,s_f,\bar d,
+     \kw{mixinChain}(R_0,c_0,\bar h,\kw{none})))={}\\
+ &\quad\kw{mixinApply}(
+   \mathsf{namedAppDesc}_{\Gamma}
+      (D,x,s_f,\bar d,c_{k-1},c_k),
+   E_{k-1},\mathsf{elabExpr}_{\Gamma}(R_k)).
+\end{aligned}
+\end{equation}
+This equation is defined only when $s_f=\selector(c_k)$ and $k\ge1$, as the
+grammar requires.  If the chain ends in a body, put
+\begin{equation}\label{eq:front-end-bodied-prefix}
+ \mathsf{foldAnonymous}_{\Gamma,D}
+  (\mathsf{elabExpr}_{\Gamma}(R_0),c_0,\bar h)=\langle E_k,c_k\rangle.
+\end{equation}
+Then
+\begin{equation}\label{eq:front-end-bodied-mixin-elaboration}
+\begin{aligned}
+ &\mathsf{elabClass}_{\Gamma}
+  (D,\kw{classDecl}(x,s_f,\bar d,
+     \kw{mixinChain}(R_0,c_0,\bar h,h)))={}\\
+ &\quad\kw{classBody}
+   (\mathsf{bodyDescriptor}_{\Gamma}
+      (D,x,\kw{explicitSuperclass},s_f,\bar d,h,c_k),E_k).
+\end{aligned}
+\end{equation}
+Equations~\eqref{eq:front-end-anonymous-application-descriptor} and
+\eqref{eq:front-end-named-application-descriptor} are instances of the complete
+application tuple $\chi_a$ in Equation~\eqref{eq:application-descriptor}; no
+descriptor component is supplied informally.
+
+An object literal uses the same body derivation with an object-literal identity
+$L$, the public nullary synthetic class-side factory, and the optional header's
+inheritance receiver and initializer clause:
+\begin{equation}\label{eq:front-end-object-elaboration}
+\begin{aligned}
+ m_0&=\mathsf{elabMessageTemplate}_{\Gamma}
+         (\mathsf{defaultInitializer}),\\
+ m_1&=\mathsf{elabMessageTemplate}_{\Gamma}(c),\\
+ \mathsf{objectDescriptor}_{\Gamma}
+  (L,\kw{implicitObjectHeader}(h))
+   &=\langle L,\kw{implicitSuperclass},M_{L,h},M^c_{L,h},m_0\rangle,\\
+ \mathsf{objectDescriptor}_{\Gamma}
+  (L,\kw{explicitObjectHeader}(R,c,h))
+   &=\langle L,\kw{explicitSuperclass},M_{L,h},M^c_{L,h},m_1\rangle,\\
+ \mathsf{objectSuperclass}_{\Gamma}(\kw{implicitObjectHeader}(h))
+   &=\mathsf{defaultSuperclass}_{\Gamma},\\
+ \mathsf{objectSuperclass}_{\Gamma}(\kw{explicitObjectHeader}(R,c,h))
+   &=\mathsf{elabExpr}_{\Gamma}(R).
+\end{aligned}
+\end{equation}
+Equation~\eqref{eq:front-end-object-elaboration} is exactly the descriptor
+$\chi_o$ in Equation~\eqref{eq:object-literal-descriptor}.
+
+For an identified unit $S$, the maps consumed by $P$ are now defined directly.
+Let $\mathsf{ancestors}_{S}(n)$ be the strict lexical-ancestor sequence of
+node $n$, nearest first.  Let $M_K$ be the stable mixin identity derived from
+class-body identity $K$.  Then
+\begin{equation}\label{eq:derived-program-indexes}
+\begin{aligned}
+ \mathsf{sourceMap}_{S}(d)&=\mathsf{subtree}_{S}(d),\\
+ \mathsf{declMixinMap}_{S}(K)&=M_K,\\
+ \mathsf{lexParentMap}_{S}(D)&=
+   \mathsf{firstClass}(\mathsf{ancestors}_{S}(D)),\\
+ \mathsf{bodyMap}_{S}(i_f)&=
+   \mathsf{elabStatements}_{\Gamma_{i_f}}(\mathsf{surfaceBody}_{S}(i_f)),\\
+ \mathsf{scopeChainMap}_{S}(z)&=
+   \langle d\in\mathsf{ancestors}_{S}(z)\mid
+      d\in\mathit{ClassBodyDeclId}\uplus\mathit{ActDeclId}\rangle,\\
+ \mathsf{activationMemberMap}_{S}(q)&=
+   \{\#x\mid x\text{ is a formal or local declared directly by }q\},\\
+ \mathsf{ownerMap}_{S}(K)&=
+  \begin{cases}
+   \kw{activationOwner}&\mathsf{firstOwner}_{S}(K)\in\mathit{ActDeclId},\\
+   \kw{classOwner}&\mathsf{firstOwner}_{S}(K)\in\mathit{ClassDeclId},\\
+   \kw{objectLiteralOwner}&\mathsf{firstOwner}_{S}(K)\in\mathit{ObjLitDeclId},\\
+   \kw{topOwner}&\mathsf{firstOwner}_{S}(K)=\kw{none}.
+  \end{cases}
+\end{aligned}
+\end{equation}
+The mixin entry itself is
+\begin{equation}\label{eq:derived-mixin-entry}
+\begin{aligned}
+ \phi_K&=\mathsf{explicitMethods}_{S}(K)
+          \uplus\mathsf{synthMethods}_{S}(K),\\
+ \delta_K&=\mathsf{physicalSlots}_{S}(K),
+ &\nu_K&=\mathsf{nestedDecls}_{S}(K),\\
+ \iota_K&=\mathsf{initializer}_{S}(K),
+ &\mathsf{mixinMap}_{S}(M_K)&=
+   \langle K,\phi_K,\delta_K,\nu_K,\iota_K\rangle.
+\end{aligned}
+\end{equation}
+The disjoint union is defined only when selectors are unique.
+$\mathsf{initializer}_{S}(K)$ is the tuple in
+Equation~\eqref{eq:mixin-initializer}: its factory selector and formals come
+from the class header, its source-ordered groups are transformed by
+Equation~\eqref{eq:declaration-elaboration}, and its body by
+Equation~\eqref{eq:compound-expression-elaboration}.
+
+Top-level actor seeds and the one underspecified pattern form are
+\begin{equation}\label{eq:derived-auxiliary-indexes}
+\begin{aligned}
+ \mathsf{actorSeedMap}_{S}(M_K)&=
+   \langle K,M_K,\mathsf{factoryDescriptor}_{S}(K)\rangle
+   &&\mathsf{ownerMap}_{S}(K)=\kw{topOwner},\\
+ \mathsf{patternVariableMap}_{S}(z)&=
+   \mathsf{patternVariableParameter}_{S}(z)
+   &&\kw{variablePat}_{z}(x)\in S.
+\end{aligned}
+\end{equation}
+The latter is precisely the explicit parameter isolated by
+Equation~\eqref{eq:variable-pattern-parameter}; it is not used for any other
+surface form.
+
+Collecting Equations~\eqref{eq:derived-program-indexes}--
+\eqref{eq:derived-auxiliary-indexes}, define
+\begin{equation}\label{eq:declaration-derivation}
+\begin{aligned}
+ \mathsf{deriveProgram}(S)=\langle P,e\rangle
+ \Longleftrightarrow{}&
+ &P.\mathit{unit}=S\land\\
+ &P.\mathit{source}=\mathsf{sourceMap}_{S}\land\\
+ &P.\mathit{declMixin}=\mathsf{declMixinMap}_{S}\land\\
+ &P.\mathit{mixin}=\mathsf{mixinMap}_{S}\land\\
+ &P.\mathit{lexParent}=\mathsf{lexParentMap}_{S}\land\\
+ &P.\mathit{body}=\mathsf{bodyMap}_{S}\land\\
+ &P.\mathit{scopeChain}=\mathsf{scopeChainMap}_{S}\land\\
+ &P.\mathit{activationMembers}=\mathsf{activationMemberMap}_{S}\land\\
+ &P.\mathit{owner}=\mathsf{ownerMap}_{S}\land\\
+ &P.\mathit{actorSeed}=\mathsf{actorSeedMap}_{S}\land\\
+ &P.\mathit{patternVariable}=\mathsf{patternVariableMap}_{S}\land\\
+ &e=\mathsf{elabTop}_{S}(S).
+\end{aligned}
+\end{equation}
+The unchanged atom and platform maps are supplied as parameters to
+$\mathsf{deriveProgram}$ when a program is installed.
+
+The static predicates are defined without an informal residual clause:
+\begin{equation}\label{eq:static-well-formedness-components}
+\begin{aligned}
+ \mathsf{bindingsOK}(S)&\Longleftrightarrow
+   \bigl(\forall\Gamma,B_i\in\Gamma.\bar B.\;
+      \mathsf{declaredNames}(B_i)\text{ are pairwise distinct}\bigr)\land\\[-1mm]
+ &\quad\bigl(\forall\kw{outer}_{z}(x)\in S.\;
+      \mathsf{classBind}_{\Gamma_z}(x)\ne\undef\land
+      \Gamma_z.D_0\ne\kw{none}\bigr)\land\\[-1mm]
+ &\quad\bigl(\forall\kw{self}_{z}\text{ used as receiver in }S.\;
+      \Gamma_z.D_0\ne\kw{none}\bigr),\\
+ \mathsf{membersOK}(S)&\Longleftrightarrow
+   \forall K,s.\;|\{f\mid f\text{ is induced directly in }K\land
+                         \selector(f)=s\}|\le1,\\
+ \mathsf{arityOK}(S)&\Longleftrightarrow
+   \forall f.\;|f.\bar x|=\mathsf{arity}(\selector(f)),\\
+ \mathsf{returnsOK}(S)&\Longleftrightarrow
+   \forall R\in\mathit{ReturnNode}(S).\;
+   (\mathsf{local}(R)\Rightarrow r_t(R))\land
+   (\mathsf{nonlocal}(R)\Rightarrow h_t(R)),\\
+ \mathsf{contextsOK}(S)&\Longleftrightarrow
+   \mathsf{bindingsOK}(S)\land\mathsf{returnsOK}(S)\land
+   \forall R\in\mathit{SuperSendNode}(S).\;q(R)\ne\kw{none},\\
+ \mathsf{surfaceOK}(S)&\Longleftrightarrow
+   \mathsf{idsOK}(S)\land\mathsf{membersOK}(S)\land
+   \mathsf{arityOK}(S)\land\mathsf{contextsOK}(S)\land
+   \mathsf{shapesOK}(S).
+\end{aligned}
+\end{equation}
+The surface-shape condition is
+\begin{equation}\label{eq:surface-context-validity}
+\begin{split}
+ \mathsf{lastClause}
+  (\langle h_1,\ldots,h_k\rangle)&=c_k
+   \quad\text{when }h_k=\kw{inheritanceHead}(R_k,c_k),\\
+ \mathsf{shapesOK}(S)\Longleftrightarrow{}&
+  \text{every }\kw{outer}_{z}(x)\text{ or }\kw{super}_{z}
+     \text{ is the receiver of a message}\ \land\\
+ &\text{every return is final in its statement sequence}\ \land\\
+ &\text{every immutable slot has an initializer}\ \land\\
+ &\text{every lazy slot has an initializer}\ \land\\
+ &\forall\kw{classDecl}(x,s_f,\bar d,
+       \kw{mixinChain}(R_0,c_0,\bar h,\kw{none}))\in S.\;
+       s_f=\selector(\mathsf{lastClause}(\bar h)).
+\end{split}
+\end{equation}
+Ordinary unbound implicit sends are permitted by
+Equation~\eqref{eq:implicit-binding-annotation}; named outer targets and
+duplicate declarations in one binder map are rejected by the first predicate.
+
+The source-to-core judgment is
+\begin{equation}\label{eq:source-to-annotated-core}
+ \begin{gathered}
+ G,\kappa,u\vdash\mathsf{frontEnd}\Downarrow
+   \langle P,e,\kappa'\rangle\\[-1mm]
+ \Longleftrightarrow\\[-1mm]
+  \mathsf{parse}_{G}(u)=t,\quad
+  \mathsf{ast}_{G,u}(t)=\langle R_0,\bar m\rangle,\quad
+  R=\mathsf{attachMetadata}_{u}(R_0,\bar m),\quad
+  \mathsf{identify}_{\kappa}(R)=\langle S,\kappa'\rangle,\\
+  \mathsf{surfaceOK}(S),\quad
+  \mathsf{deriveProgram}(S)=\langle P,e\rangle,\quad
+  \mathsf{TL}_{P}(e).
+ \end{gathered}
+\end{equation}
+Core validity must cover expressions stored throughout $P$, not only the
+top-level expression.  Let $\mathsf{coreRoots}(P,e)$ be the least finite set
+containing $e$ and every expression occurring in method and closure bodies,
+their local initializers, mixin initializer groups and bodies, pattern-variable
+expansions, and the deferred superclass or mixin messages stored in class,
+mixin-application, object-literal, and actor-seed descriptors:
+\begin{equation}\label{eq:annotated-core-roots}
+\begin{split}
+ \mathsf{coreRoots}(P,e)=\mathsf{sub}\bigl(&\{e\}
+   \cup P.\mathit{methodBodies}\cup P.\mathit{methodLocals}\\
+ &\cup P.\mathit{closureBodies}\cup P.\mathit{closureLocals}\\
+ &\cup P.\mathit{mixinInitializers}\cup P.\mathit{patternExpansions}\\
+ &\cup P.\mathit{classMessages}\cup P.\mathit{mixinMessages}\\
+ &\cup P.\mathit{objectMessages}\cup P.\mathit{actorMessages}\bigr).
+\end{split}
+\end{equation}
+Here $\mathsf{sub}$ recursively includes tuple, pattern, cascade, send, lazy,
+class, mixin-application, object-literal, and nested-class subexpressions.  For
+Equation~\eqref{eq:annotated-core-roots}, $P.\mathit{mixinInitializers}$
+projects the groups and bodies of all mixin initializers,
+$P.\mathit{patternExpansions}$ is the range of the finite pattern-variable
+table, and the four $\mathit{Messages}$ projections collect the message
+templates in the corresponding finite descriptor tables.  These are
+abbreviations for existing Program fields, not new semantic stores.  For
+fuel $k$, $\mathsf{annOK}^{k}_{P}(r,b)$ checks every declaration and scope
+annotation in $r$, where $b$ says whether a super send is permitted.  In
+particular, it checks that named class and closure declarations occur in the
+appropriate finite Program table, that an annotated implicit send is declared
+by its recorded scope, and that a super send occurs only in installed class
+code.  The executable gate is
+\begin{equation}\label{eq:annotated-core-checker}
+\begin{split}
+ \mathsf{coreCheck}_{k}(P,e)=\kw{true}\Longleftrightarrow{}&
+ P.\mathit{declMixin}\text{ is injective}\ \land\\
+ &\forall r\in\mathsf{coreRoots}(P,e)\setminus\{e\}.\;
+       \mathsf{annOK}^{k}_{P}(r,\kw{true})\ \land\\
+ &\mathsf{annOK}^{k}_{P}(e,\kw{false})\ \land\ \mathsf{TL}_{P}(e).
+\end{split}
+\end{equation}
+Core validity, used by loaders and reflective validation, is therefore the
+independently checkable predicate
+\begin{equation}\label{eq:annotated-core-validity}
+\begin{split}
+ \mathsf{coreOK}(P,e)\Longleftrightarrow{}&
+ \exists k>0.\ \mathsf{coreCheck}_{k}(P,e)=\kw{true}\ \land\\
+ &\mathsf{deriveProgram}(P.\mathit{unit})=\langle P,e\rangle\ \land
+   \mathsf{surfaceOK}(P.\mathit{unit}).
+\end{split}
+\end{equation}
+For reflective validation, which replaces a program but does not itself start
+its top-level expression, define the projection
+\begin{equation}\label{eq:annotated-program-validity}
+ \mathsf{coreProgramOK}(P)
+ \Longleftrightarrow
+ \exists e.\;\mathsf{deriveProgram}(P.\mathit{unit})=\langle P,e\rangle
+              \land\mathsf{coreOK}(P,e).
+\end{equation}
+Equations~\eqref{eq:source-to-annotated-core} and
+\eqref{eq:annotated-core-validity} are the promised static connection from the
+Specification's PEG AST to every declaration and send annotation consumed by
+the dynamic semantics.  Moreover, determinism of PEG recognition and the
+functional equations above give the front-end uniqueness property
+\begin{equation}\label{eq:front-end-uniqueness}
+ \frac{G_{\NS},\kappa,u\vdash\mathsf{frontEnd}\Downarrow X\qquad
+       G_{\NS},\kappa,u\vdash\mathsf{frontEnd}\Downarrow Y}{X=Y}.
+\end{equation}
+Totality holds on exactly the inputs that parse completely and satisfy
+$\mathsf{surfaceOK}$; failure at any earlier partial function is a static
+error, never a stuck core term.
+
+\subsection{Reified language services}
+\label{sec:reified-front-ends}
+
+The host registry already introduced in Equation~\eqref{eq:compilation-unit}
+now has the concrete type
+\begin{equation}\label{eq:language-registry}
+ \mathcal L:\mathit{LanguageId}\rightharpoonup\mathit{ObjRef}.
+\end{equation}
+$\mathcal L(\lambda)$ is an ordinary Newspeak language object.  It answers the
+public message \texttt{frontEndImage} with an immutable value
+\begin{equation}\label{eq:front-end-image}
+ I_L=\kw{frontEndImage}\langle o_p,o_e,o_c,o_s,G,v_L\rangle,
+\end{equation}
+whose components are parser, elaborator, compiler, and Simulator objects, the
+declarative PEG value, and a language-defined revision value.  This record is
+a protocol value, not a new privileged heap-record kind.  Its component
+objects have ordinary classes, methods, enclosing objects, and slots.
+
+For a caller actor $A$, write
+\begin{equation}\label{eq:ordinary-service-call}
+ \Omega,A\vdash\mathsf{call}(o,s,\bar v)
+    \Downarrow\langle\Omega',v\rangle
+\end{equation}
+iff the ordinary public send of $\langle s,\bar v\rangle$ to $o$ starts in
+$A$, follows the actor and sequential transition relations already defined,
+and returns $v$ to its caller.  A signaled exception or broken reply produces
+the corresponding failure rather than a successful judgment.  Thus
+Equation~\eqref{eq:ordinary-service-call} is notation for the reflexive
+transitive closure of existing rules, not a second evaluator.
+
+Surface ASTs and annotated-core images are ordinary immutable Newspeak value
+graphs.  Executable artifacts are immutable values as well.  The VM boundary
+supplies injective partial
+decoders
+\begin{equation}\label{eq:front-end-value-decoders}
+\begin{aligned}
+ \mathsf{decodeSurface}&:\mathit{ObjRef}\rightharpoonup\mathit{SurfaceAST},\\
+ \mathsf{decodeCore}&:\mathit{ObjRef}\rightharpoonup
+        (\mathit{Program}\times\mathit{CoreExpression}),\\
+ \mathsf{decodeArtifact}&:\mathit{ObjRef}\rightharpoonup\mathit{Artifact}.
+\end{aligned}
+\end{equation}
+They inspect representation and allocate no object, invoke no user method, and
+accept only finite immutable graphs.  Their inverses are ordinary constructors
+provided by the language implementation.
+
+Admission is attached to the values obtained at a use boundary, not to the
+permanent identity of a component object.  A front-end image is admitted when
+all four component references are live ordinary Newspeak objects, its grammar
+passes Equation~\eqref{eq:peg-admissibility-certificate}, and successful
+elaboration satisfies the complete checker:
+\begin{equation}\label{eq:front-end-artifact-admission}
+\begin{split}
+ \mathsf{frontEndAdmitted}_{\Omega}(I_L)\Longleftrightarrow{}&
+ I_L=\kw{frontEndImage}\langle o_p,o_e,o_c,o_s,G,v_L\rangle\ \land\\
+ &\bigwedge_{o\in\{o_p,o_e,o_c,o_s\}}\mathsf{liveOrdinary}_{\Omega}(o)
+ \ \land\ \mathsf{pegCertOK}(G)=\kw{true}\ \land\\
+ &\forall S,P,e.\;
+   \mathsf{surfaceOK}(S)\land
+   \mathsf{deriveProgram}(S)=\langle P,e\rangle\\
+ &\hspace{24mm}\Rightarrow\exists k>0.\;
+       \mathsf{coreCheck}_{k}(P,e)=\kw{true}.
+\end{split}
+\end{equation}
+Here $\mathsf{liveOrdinary}_{\Omega}(o)$ means that $o$ is present in the
+ordinary-object component of the appropriate heap in $\Omega$.
+The compiler's product is separately admitted by
+Equation~\eqref{eq:artifact-validity}; the Simulator's code/PC representation
+is separately admitted by the certificate in
+Equation~\eqref{eq:simulator-step-correspondence}.  Replacing a component
+therefore grants no authority to bypass the fixed core boundary.
+
+Capture one front-end image and run its three stages by ordinary sends:
+\begin{equation}\label{eq:metacircular-compilation-pipeline}
+\begin{split}
+ &\Omega_0,A,\lambda,u\vdash\mathsf{compileUnit}
+      \Downarrow\langle\Omega_4,B,P,e,I_L\rangle
+ \quad\Longleftrightarrow\\
+ &\quad o_L=\mathcal L(\lambda)\ \land\
+ \Omega_0,A\vdash\mathsf{call}(o_L,\selsym{frontEndImage},\epsilon)
+      \Downarrow\langle\Omega_1,I_L\rangle\ \land\\
+ &\quad I_L=\kw{frontEndImage}\langle o_p,o_e,o_c,o_s,G,v_L\rangle\ \land\\
+ &\quad \mathsf{frontEndAdmitted}_{\Omega_1}(I_L)\ \land\
+ \Omega_1,A\vdash\mathsf{call}(o_p,\selsym{parse:},\langle u\rangle)
+      \Downarrow\langle\Omega_2,v_s\rangle\ \land\\
+ &\quad \mathsf{decodeSurface}(v_s)=S\ \land\mathsf{idsOK}(S)\ \land\
+ \Omega_2,A\vdash\mathsf{call}(o_e,\selsym{elaborate:},\langle v_s\rangle)
+      \Downarrow\langle\Omega_3,v_k\rangle\ \land\\
+ &\quad \mathsf{decodeCore}(v_k)=\langle P,e\rangle\ \land
+       \mathsf{coreOK}(P,e)\ \land\
+ \Omega_3,A\vdash\mathsf{call}(o_c,\selsym{compile:},\langle v_k\rangle)
+      \Downarrow\langle\Omega_4,v_b\rangle\ \land\\
+ &\quad \mathsf{decodeArtifact}(v_b)=B\ \land
+       \mathsf{artifactOK}(B,P,e).
+\end{split}
+\end{equation}
+The source string $u$ is represented by the platform's immutable String value;
+the notation passes its contents rather than granting the compiler a raw host
+pointer.  A language implementation may combine stages internally, but its
+observable result must refine Equation~\eqref{eq:metacircular-compilation-pipeline}.
+
+An artifact contains the core image, concrete code images, relocation data,
+source/control maps, and the captured language revision:
+\begin{equation}\label{eq:artifact-domain}
+ B=\langle P,e,\mathcal B,\mathsf{reloc},\mathsf{controlMap},v_L\rangle.
+\end{equation}
+Its validity is
+\begin{equation}\label{eq:artifact-validity}
+\begin{split}
+ \mathsf{artifactOK}(B,P,e)\Longleftrightarrow{}&
+ \mathsf{coreOK}(P,e)\land B.P=P\land B.e=e\land\\
+ &\dom(B.\mathsf{controlMap})=\mathsf{pcs}(B.\mathcal B)\land\\
+ &\mathsf{targetsOK}(B.\mathcal B,B.\mathsf{reloc})\land
+ \mathsf{codeRefinesCore}(B.\mathcal B,P,e).
+\end{split}
+\end{equation}
+The final conjunct of Equation~\eqref{eq:artifact-validity} is the
+compiler-correctness obligation.  Concrete execution, observed at the
+source/control map, must weakly simulate the sequential and actor semantics.
+A changed compiler may accept new surface forms or omit old conveniences by
+changing parsing and elaboration, but an artifact admitted by the VM must
+still satisfy the fixed core contract.  Changing the instruction set or
+primitive meanings requires a VM refinement, not merely a language front-end
+change.
+
+The earlier compilation-unit judgment is therefore the projection
+\begin{equation}\label{eq:compilation-unit-projection}
+ \mathcal L,\Omega,A\vdash\langle\lambda,u\rangle
+      \mathsf{compilesTo}\langle P,e,B\rangle
+ \quad\Longleftrightarrow\quad
+ \exists\Omega',I_L.\;
+ \Omega,A,\lambda,u\vdash\mathsf{compileUnit}
+      \Downarrow\langle\Omega',B,P,e,I_L\rangle.
+\end{equation}
+
+\subsection{Ordinary change, phase behavior, and bootstrap}
+\label{sec:metacircular-change}
+
+Let $\mathsf{components}_{\Omega}(\lambda)$ be the value obtained by the first
+call in Equation~\eqref{eq:metacircular-compilation-pipeline}.  A successful
+existing reflective commit may change methods of $o_L,o_p,o_e,o_c,o_s$, or may
+change ordinary slots from which \texttt{frontEndImage} constructs its result.
+Its effect on the next compilation is simply
+\begin{equation}\label{eq:front-end-reflective-change}
+ \Omega\xrightarrow{\kw{commitReflection}(A,\Delta,n+1)}\Omega'
+ \ \land\
+ \mathsf{components}_{\Omega}(\lambda)\ne
+ \mathsf{components}_{\Omega'}(\lambda).
+\end{equation}
+Equation~\eqref{eq:front-end-reflective-change} is a consequence that an
+ordinary reflection transition may have; it is not a new transition rule and
+there is no $\mathsf{installParser}$ or $\mathsf{installCompiler}$ command.
+Likewise, assigning a new component object through the language object's
+ordinary mutable protocol needs no reflection at all when the caller already
+has that authority.
+
+The phase behavior follows from existing activation and dispatch rules:
+\begin{equation}\label{eq:front-end-phase-behavior}
+\begin{aligned}
+ \mathsf{capturedImage}(c)&=I_L
+   &&\text{for a compilation }c\text{ already past its first call},\\
+ \mathsf{currentTerm}_{\Omega'}(a)&=\mathsf{currentTerm}_{\Omega}(a)
+   &&\text{for every materialized stage activation }a,\\
+ \mathsf{dispatchProgram}(a')&=P'
+   &&\text{for a later send dispatched after the commit.}
+\end{aligned}
+\end{equation}
+Thus self-replacement needs no circular premise.  Source defining a replacement
+parser is parsed and compiled by the currently executing language objects; an
+ordinary commit changes their code or references; subsequent compilation sees
+the replacement.  A replacement not expressible in the old accepted language
+must enter as an artifact already satisfying Equation~\eqref{eq:artifact-validity}.
+
+Finally, metacircularity has a finite base.  An initial image supplies
+\begin{equation}\label{eq:bootstrap-basis}
+ \mathsf{bootstrap}=\langle
+   \Omega_0,\mathcal L_0,
+   \mathsf{decodeSurface},\mathsf{decodeCore},\mathsf{decodeArtifact},
+   \mathsf{loadCode},\mathsf{primitiveStep}\rangle.
+\end{equation}
+After bootstrap, every object reachable through $\mathcal L_0$ is an ordinary
+Newspeak object and can be changed by the mechanisms above.  The decoders,
+artifact loader, concrete instruction dispatch, allocation, and host I/O remain
+VM parameters unless a particular implementation supplies a Newspeak
+refinement of them.  This boundary states what is not metacircular without
+preventing a more completely bootstrapped VM from discharging those parameters.

@@ -1,0 +1,2641 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage{booktabs,longtable,array}
+\usepackage{textcomp}
+\usepackage[hidelinks]{hyperref}
+\numberwithin{equation}{section}
+
+\newcommand{\NS}{\textsc{Newspeak}}
+\newcommand{\kw}[1]{\ensuremath{\mathsf{#1}}}
+\newcommand{\sel}{s}
+\newcommand{\undef}{\mathord{\uparrow}}
+\newcommand{\nil}{\kw{nil}}
+\newcommand{\Top}{\kw{Top}}
+\newcommand{\Object}{\kw{Object}}
+\newcommand{\Public}{\kw{public}}
+\newcommand{\Protected}{\kw{protected}}
+\newcommand{\Private}{\kw{private}}
+\newcommand{\dom}{\mathop{\mathrm{dom}}}
+\newcommand{\classof}{\mathop{\mathrm{classOf}}}
+\newcommand{\super}{\mathop{\mathrm{super}}}
+\newcommand{\mixin}{\mathop{\mathrm{mixin}}}
+\newcommand{\decl}{\mathop{\mathrm{decl}}}
+\newcommand{\access}{\mathop{\mathrm{access}}}
+\newcommand{\selector}{\mathop{\mathrm{selector}}}
+\newcommand{\methods}{\mathop{\mathrm{methods}}}
+\newcommand{\lookup}{\mathop{\mathrm{lookup}}}
+\newcommand{\definingClass}{\mathop{\mathrm{definingClass}}}
+\newcommand{\kws}[1]{\ensuremath{\mathsf{#1\mathord{:}}}}
+\newcommand{\selsym}[1]{\ensuremath{\mathord{\#}\text{\texttt{#1}}}}
+\newcommand{\lit}[1]{\ensuremath{\mathsf{lit}(#1)}}
+\newcommand{\dnu}{\kws{doesNotUnderstand}}
+\newcommand{\PastFuture}{\ensuremath{\text{\texttt{Past\textasciigrave Future}}}}
+\newcommand{\rulelabel}[1]{\textsc{#1}}
+
+\title{A Formal Dynamic Semantics for Newspeak\\\large Design draft 0.14: Machine-checked companion}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This document develops a complete dynamic semantics for \NS.  ``Complete''
+means that surface conveniences, nested classes, mixin application, all access
+levels and send forms, initialization, closures and non-local return, actors,
+eventual references, and causally connected reflective program change must
+either have rules or appear as explicit outstanding obligations.  This
+draft fixes the semantic domains and the access-controlled method-dispatch
+kernel, the complete sequential machine, its lifting to isolated actors with
+asynchronous sends and E-ordered delivery, and the mirror-capability layer for
+transactional program, object, activation, continuation, and complete actor-
+stack change.  Reified per-frame control, paused actors, atomic stack
+installation, and ordinary-VM resumption provide the machinery required by an
+integrated debugger.  The reflection rules make VM-cohort propagation and the ordering of installs with
+active turns and in-flight messages explicit.  An optional final layer makes
+garbage collection, \kw{WeakArray}, \kw{WeakMap}, and their observable
+interaction with exact-instance and mixin-application enumeration explicit
+without changing the preceding transition rules.  A source-front-end layer
+now defines PEG recognition, AST construction, stable source identities,
+static elaboration, and a metacircular compilation pipeline whose parser,
+elaborator, compiler, and Simulator are ordinary reflectively changeable
+Newspeak objects.  A Lean companion formalizes every layer, proves the
+determinism, preservation, equivalence, fixed-point, transaction, and
+refinement obligations summarized in the final section, and contains no
+admitted theorem or additional axiom.  The remaining compiler/Simulator work
+is implementation verification: a concrete installed pair must supply the
+mandatory artifact-admission and frame-representation certificate already
+specified here.
+This draft intentionally does not replace the language specification yet.
+\end{abstract}
+
+\clearpage
+\begingroup
+\footnotesize
+\tableofcontents
+\endgroup
+\clearpage
+
+\section{Authority, scope, and method}
+
+The normative source is working version 0.109 of the \NS{} Programming
+Language Draft Specification (henceforth \emph{the Specification})
+\cite{newspeak-spec-0.109}.
+Section 3.3 of \emph{Modules as Objects in Newspeak} \cite{bracha10a} is
+explanatory prior art.  If the sources disagree, the Specification governs.
+
+The surface language is parsed by the PEG in Specification \S4--\S7.
+Section~\ref{sec:front-end} gives that PEG a recognition semantics, maps its
+concrete trees to stable AST identities, and defines the static elaboration
+judgment that rejects ill-formed uses of \kw{self}, \kw{outer}, \kw{super},
+returns, and class names.
+
+The semantics is a small-step transition system.  This choice makes evaluation
+order, abrupt control transfer, actors, and transactions visible without
+encoding them as host-language accidents.  Metalevel records below are not a
+claim that runtime entities are inaccessible: Section~\ref{sec:reflection}
+reifies them through mirror capabilities and preserves that causal connection.
+
+\paragraph{Base/reflective separation.}
+The base relation holds the program definition $P$ fixed.  In a machine
+configuration, $P$ is the static program, $H$ is the heap, and $\mathcal A$ is
+the activation stack.  The latter includes the active activations and their
+continuation links.  At the sequential boundary a reflective step has the
+schematic form
+\begin{equation}\label{eq:reflective-step}
+  \langle P,H,\mathcal A\rangle
+    \xrightarrow{\;\mathsf{reflectiveStep}(\Delta)\;}
+  \langle P',H',\mathcal A'\rangle,
+\end{equation}
+where validation and commit are atomic; Section~\ref{sec:reflection} refines
+this schema for the actor/VM state.  This separation is methodological,
+not semantic simplification: the base domains already carry stable declaration,
+mixin, class, object, and activation identities needed by reflection.
+
+\section{Surface and core phrases}
+\label{sec:surface}
+
+Let $x$ range over identifiers, $s$ over selector symbols, and $\bar e$ over
+ordered expression lists.  The dispatch-relevant core expressions are
+\begin{equation}\label{eq:core-expressions}
+\begin{array}{rcl}
+ e &::=& v \mid \kw{self} \mid \kw{atom}(\omega)
+          \mid \kw{tuple}(\bar e) \mid \kw{pattern}(p,d) \\
+   &\mid& \kw{objectLiteral}(\chi_o,e_S)
+          \mid \kw{closureLiteral}(q,\bar x,\ell,b) \\
+   &\mid& \kw{send}(e,s,\bar e)
+          \mid \kw{implicit}(s,\bar e,d) \\
+   &\mid& \kw{selfSend}(s,\bar e,D) \mid
+          \kw{outerSend}(s,\bar e,D_t,D_0) \\
+   &\mid& \kw{superSend}(s,\bar e) \mid
+          \kw{asyncSend}(e,s,\bar e) \mid \cdots
+\end{array}
+\end{equation}
+There is deliberately no variable-reference case $x$.  A standalone identifier
+$x$ is a unary message clause with an implicit receiver and elaborates to
+$\kw{implicit}(\#x,\epsilon,d)$, where $d$ is the lexical declaration selected
+for that send.  This remains true when $d$ declares a parameter or local slot;
+the resulting send is directed to the appropriate activation.  The
+metavariable $x$ is retained only for binding occurrences such as formal
+parameters and slot declarations.
+
+Here $d$ records the innermost lexical declaration selected for an implicit
+send, if any; $D_0$ is the immediately enclosing class declaration and $D_t$
+is the named lexical target of an outer send.  These annotations are computed
+from the AST, not guessed dynamically.  Retaining distinct send nodes is
+essential: ordinary, self, outer, and super sends grant different authority.
+
+A super send deliberately carries no declaration parameter.  Its receiver is
+the current instance, and its lookup start is the superclass of the current
+activation's runtime current class.  That current class is installed by method
+dispatch and captured by closures.  A lexical declaration identity would not
+identify the particular runtime application of its mixin from which super
+lookup must continue; using it for that purpose would be incorrect when one
+declaration has multiple applications.
+
+Elaboration may remove syntax whose specified expansion preserves all
+observable behavior.  For example, a cascade evaluates by the specified
+closure expansion, which evaluates its receiver exactly once.  Elaboration
+must not turn a self send into an ordinary send, including when \kw{self} is
+parenthesized.
+
+Slot declarations and nested-class declarations induce methods before runtime
+evaluation:
+\begin{itemize}
+\item an immutable slot induces a getter with the slot's access;
+\item a mutable slot induces a getter and a one-argument setter, both with the
+      slot's access; the setter returns its receiver;
+\item a lazy slot induces a getter with the slot's access and is physically
+      initialized to $\nil$.  On a read, the getter returns the stored value if
+      it is non-$\nil$; otherwise it evaluates the slot initializer, writes the
+      result directly into the slot, and returns it.  The $\kw{::=}$ form also
+      induces the same-access setter described above, whereas the $\kw{=}$ form
+      induces no setter;
+\item a nested class induces a memoizing getter with the declaration's access.
+\end{itemize}
+Initialization writes slots directly and therefore does not invoke or dispatch
+through these synthesized setters.  Because $\nil$ is the lazy-state sentinel,
+an initializer that returns $\nil$ is evaluated again on the next read.
+Resetting a lazy slot to $\nil$ for orthogonal synchronization will be modeled
+as reflective change rather than ordinary initialization or mutation.
+
+\section{Semantic domains}
+
+We assume pairwise disjoint, countably infinite metalevel identity sets
+\begin{equation}\label{eq:runtime-identities}
+\begin{aligned}
+  o&\in\mathit{ObjId}, & C&\in\mathit{ClassId}, &
+  M&\in\mathit{MixinId}, & a&\in\mathit{ActId},\\
+  c&\in\mathit{ClosureId}, & g&\in\mathit{MirrorId}, &
+  A&\in\mathit{ActorId}. &&
+\end{aligned}
+\end{equation}
+Their tagged union is $\mathit{ObjRef}$.  Every member of $\mathit{ObjRef}$ is
+a Newspeak object and, when live, has a class.  The disjoint tags prevent a
+semantic rule from confusing (for example) the identity of a class object with
+the identity of one of its ordinary instances; they do not introduce
+non-object runtime values.
+Pause tokens $r_s\in\mathit{PauseToken}$ are drawn from a separate countably
+infinite set.  They are unforgeable protocol tokens rather than Newspeak
+objects: entering a paused actor state allocates a fresh token, and every
+successful paused-stack edit allocates another.  A stale debugger request
+therefore cannot mutate a stack that has since been edited or resumed.
+Continuation links are not a separate identity domain: throughout,
+$k\in\mathit{ActId}\uplus\{\nil\}$.  In accordance with the Specification, a
+non-$\nil$ continuation object is the sender activation at which execution
+will resume.  Mirror identities are included in $\mathit{ObjRef}$; their
+unforgeable heap records are introduced in Section~\ref{sec:reflection}.
+Source declarations also have stable AST identities.  We write
+$d\in\mathit{DeclId}$ for an arbitrary declaration,
+$K\in\mathit{ClassBodyDeclId}\subseteq\mathit{DeclId}$ for a declaration that
+induces a mixin, with the disjoint partition
+$\mathit{ClassBodyDeclId}=\mathit{ClassDeclId}\uplus\mathit{ObjLitDeclId}$.
+Write $D\in\mathit{ClassDeclId}$ for a named class declaration,
+$L\in\mathit{ObjLitDeclId}$ for an object-literal declaration, and
+$q\in\mathit{ActDeclId}\subseteq\mathit{DeclId}$ for a method or closure
+declaration.  The domains $\mathit{ClassBodyDeclId}$ and
+$\mathit{ActDeclId}$ are disjoint.  Finally, $z\in\mathit{SiteId}$ is an
+expression site and
+$i_f\in\mathit{MethodId}\subseteq\mathit{ActDeclId}$ is a method declaration.
+A class-declaration identity is not a class name: evaluation of one declaration
+may produce many distinct runtime classes.
+Class creation provenance is the tagged domain
+\begin{equation}\label{eq:class-origin}
+ \chi_C\in\mathit{ClassOrigin}::=
+   \kw{expression}(K)\mid\kw{actor}(K).
+\end{equation}
+The tag distinguishes evaluation of a source expression from application of a
+top-level mixin while seeding a new actor.  Both retain the inducing source
+declaration for reflection.
+
+An access level is $\alpha\in\{\Public,\Protected,\Private\}$.  Absence of an
+access modifier elaborates to $\Protected$; a top-level class declaration is
+always public.
+
+A message is $\mu=\langle s,\bar o\rangle$.  A method definition is
+\begin{equation}\label{eq:method-definition}
+ f=\langle i_f,s,\alpha,\bar x,\ell,b,K\rangle,
+\end{equation}
+where $\ell$ are local-slot declarations, $b$ is the body, and $K$ is the
+lexically enclosing class or object-literal declaration.  The identity $i_f$ names the method
+declaration independently of its selector and current body.  This lets
+$P.\mathit{body}$ and, later, method mirrors refer to the same declaration when
+its body is reflectively replaced.  The reflective rules will specify when an
+edit preserves $i_f$ and when deletion followed by addition allocates a fresh
+identity.  Elaboration assigns each synthesized getter, setter, or nested-class
+getter a method identity derived from its inducing declaration and selector.
+Each mixin contains at most one direct method per selector after synthesized
+members have been installed.
+
+The program definition $P$ contains immutable source structure:
+\begin{equation}\label{eq:program-definition}
+\begin{array}{rcl}
+ P.\mathit{source} &: & \mathit{DeclId}\rightharpoonup\mathit{AST},\\
+ P.\mathit{unit} &: & \mathit{AST},\\
+ P.\mathit{declMixin} &: & \mathit{ClassBodyDeclId}\to\mathit{MixinId},\\
+ P.\mathit{mixin} &: & M \rightharpoonup
+   \langle K,\mathit{methodMap},\mathit{slotDecls},
+                 \mathit{nestedDecls},\mathit{initializer}\rangle,\\
+ P.\mathit{lexParent} &: & D \rightharpoonup D,\\
+P.\mathit{body} &: & \mathit{MethodId}\to\mathit{AST},\\
+P.\mathit{scopeChain} &: & \mathit{SiteId}\to\mathit{DeclId}^{*},\\
+P.\mathit{activationMembers} &: & \mathit{ActDeclId}\to
+  \mathcal P_{\mathrm{fin}}(\mathit{Selector}),\\
+P.\mathit{owner} &: & \mathit{ClassBodyDeclId}\to
+ \left\{\begin{gathered}\kw{activationOwner},\kw{classOwner},\\[-1mm]
+   \kw{objectLiteralOwner},\kw{topOwner}\end{gathered}\right\},\\
+P.\mathit{actorSeed} &: & \mathit{MixinId}\rightharpoonup
+ \langle\mathit{ClassBodyDeclId},\mathit{MixinId},
+        \mathit{FactoryDescriptor}\rangle,\\
+P.\mathit{atom} &: & \mathit{Atom}\to\mathit{ObjRef},\\
+P.\mathit{platform} &: & \mathit{PlatformName}\rightharpoonup\mathit{ObjRef},\\
+P.\mathit{patternVariable} &: & \mathit{SiteId}\rightharpoonup\mathit{AST}.
+\end{array}
+\end{equation}
+In the base relation these maps are immutable; reflective installation replaces
+the complete $P$ atomically.  The map $P.\mathit{declMixin}$ is injective and
+the first component of $P.\mathit{mixin}(P.\mathit{declMixin}(K))$ is $K$.
+Every subsequent occurrence of a field such as $P.\mathit{mixin}$,
+$P.\mathit{scopeChain}$, $P.\mathit{owner}$, or $P.\mathit{actorSeed}$ refers to
+the maps collected in
+Equation~\eqref{eq:program-definition}.
+More precisely, if
+\begin{equation}\label{eq:mixin-record}
+  P.\mathit{mixin}(M)
+    =\langle K,\phi,\delta,\nu,\iota\rangle,
+\end{equation}
+then $\methods_P(M)=\phi$, where
+$\phi:\mathit{Selector}\rightharpoonup\mathit{MethodDef}$ is the finite map
+of methods defined directly by $M$, including methods introduced by
+elaboration.  The remaining components are the slot declarations $\delta$,
+nested-class declarations $\nu$, and normalized mixin initializer
+$\iota$, whose form is
+\begin{equation}\label{eq:mixin-initializer}
+ \iota=\langle i_I,s_I,\bar x_I,\bar g,b_I\rangle.
+\end{equation}
+Here $i_I$ is its stable
+synthetic method identity, $s_I$ and $\bar x_I$ are its selector and formals,
+$\bar g$ is an ordered list of sequential or simultaneous slot groups, and
+$b_I$ is its initializer body.  For an $f$ having the form in
+Equation~\eqref{eq:method-definition}, the projections are
+\begin{equation}\label{eq:method-projections}
+\begin{aligned}
+ \iota_P(M)&=\iota, & \mathsf{methodId}(f)&=i_f,
+   & \selector(f)&=s,\\
+ \access(f)&=\alpha, & \mathsf{ownerDecl}(f)&=K.
+\end{aligned}
+\end{equation}
+Write $\mathsf{ownSlots}_P(M)$ for the source-ordered sequence of every
+physical slot identity declared by $\delta$, including the backing slots of
+lazy declarations.  The groups in $\iota$ refer to the non-lazy members of
+that sequence; lazy backing slots have no eager initializer group.
+
+The heap $H$ is a finite map from the identities in
+Equation~\eqref{eq:runtime-identities} to tagged records.  A factory descriptor
+is
+\begin{equation}\label{eq:factory-descriptor}
+ q=\langle i_I,s_f,\bar x,\kappa\rangle,
+ \qquad
+ \kappa::=\kw{bodyInitializer}(m_S)\mid
+            \kw{appliedMixinInitializer}(m_S,m_M),
+\end{equation}
+where $i_I$ identifies the class's synthesized instance initializer, $s_f$ and
+$\bar x$ describe its primary factory, $m_S$ is the deferred superclass
+initializer message, and $m_M$ is the deferred message for an applied mixin.
+The records relevant to the base sequential semantics are:
+\begin{equation}\label{eq:heap-records}
+\begin{array}{rcl}
+H(o)&=&\kw{object}\langle C,\sigma,\eta\rangle,\\
+H(C)&=&\kw{class}\langle M,S,eo,C_m,q,\chi_C\rangle,\\
+H(a)&=&\kw{activation}\langle p,\rho,\ell,o,C,k,h,q_a,\gamma\rangle,\\
+H(c)&=&\kw{closure}\langle q,\bar x,\ell,b,a,o,C,h\rangle.
+\end{array}
+\end{equation}
+$\sigma$ maps physical slot identities to values, and $\eta$ maps nested-class
+declaration identities to the class objects already created for this receiver.
+A class record contains its mixin $M$, superclass $S$, enclosing object $eo$,
+metaclass $C_m$, primary factory description $q$, and stable creation
+provenance $\chi_C$ from Equation~\eqref{eq:class-origin};
+$q=\kw{none}$ only for a
+non-instantiable platform class such as a metaclass.  An activation
+records its method/closure provenance $p$, parameter environment $\rho$, local
+slots $\ell$, current instance $o$, current class $C$, continuation object $k$,
+home method activation $h$, continuability flag $q_a$, and lexical environment
+$\gamma$.  The latter maps an enclosing method or closure declaration to its
+current activation and an enclosing object-literal declaration to that
+literal's runtime value; write $\mathsf{scope}_H(a)=\gamma$.  A closure captures
+its source declaration $q$, the instantiating activation, current instance,
+current class, and home method activation.
+In particular, $\classof_H(C)=C_m$ for a class object.  The standard platform
+classes of mixins, activations, closures, and continuations supply the
+corresponding cases of $\classof_H$; their identities are left as platform
+parameters until their reflective protocols are formalized.
+
+We write $\classof_H(o)=C$, $\mixin_H(C)=M$, $\super_H(C)=S$, and
+$\decl_P(M)=D$ for the corresponding projections of
+Equations~\eqref{eq:mixin-record} and~\eqref{eq:heap-records}.  The distinguished
+class $\Top$ terminates lookup and is not an instantiable Newspeak class.  In
+the non-reflective semantics, every live class chain is finite and ends at
+$\Top$.
+The distinguished names used throughout abbreviate platform entries; in
+particular,
+\begin{equation}\label{eq:distinguished-platform-classes}
+ P.\mathit{platform}(\kw{Object})=\Object,
+ \qquad P.\mathit{platform}(\kw{Top})=\Top.
+\end{equation}
+
+\section{Class-chain operations}
+\label{sec:class-chain}
+
+Direct method selection, using the mixin map in
+Equation~\eqref{eq:mixin-record}, is
+\begin{equation}\label{eq:direct}
+ \mathsf{direct}_{P,H}(C,s)=
+ \begin{cases}
+   f & \methods_P(\mixin_H(C))(s)=f,\\
+   \undef & \text{otherwise.}
+ \end{cases}
+\end{equation}
+Unrestricted definition lookup follows the superclass chain and ignores
+accessibility.  Its named rules use direct selection from
+Equation~\eqref{eq:direct}:
+\[
+\begin{array}{c}
+\dfrac{C=\Top}{P,H\vdash \lookup_U(s,C)=\undef}
+\quad(\rulelabel{U-Top})\\[2ex]
+\dfrac{\mathsf{direct}(C,s)=f}{P,H\vdash \lookup_U(s,C)=\langle f,C\rangle}
+\quad(\rulelabel{U-Here})\\[2ex]
+\dfrac{C\ne\Top\quad \mathsf{direct}(C,s)=\undef\quad
+       P,H\vdash\lookup_U(s,\super_H(C))=r}
+      {P,H\vdash\lookup_U(s,C)=r}
+\quad(\rulelabel{U-Super})
+\end{array}
+\]
+The defining class is independently defined by the following partial
+function:
+\[
+\begin{array}{c}
+\dfrac{C=\Top}
+      {P,H\vdash\definingClass(s,C)=\undef}
+\quad(\rulelabel{Defining-Top})\\[2ex]
+\dfrac{\mathsf{direct}(C,s)=f}
+      {P,H\vdash\definingClass(s,C)=C}
+\quad(\rulelabel{Defining-Here})\\[2ex]
+\dfrac{C\ne\Top\quad \mathsf{direct}(C,s)=\undef\quad
+       P,H\vdash\definingClass(s,\super_H(C))=C_f}
+      {P,H\vdash\definingClass(s,C)=C_f}
+\quad(\rulelabel{Defining-Super})
+\end{array}
+\]
+It follows directly from these rules and the unrestricted-lookup rules that
+$P,H\vdash\lookup_U(s,C)=\langle f,C_f\rangle$ implies
+$P,H\vdash\definingClass(s,C)=C_f$.
+
+\subsection{Public lookup}
+\label{sec:public-lookup}
+
+Public lookup implements ordinary sends.  A protected direct declaration is a
+\emph{barrier}: it makes lookup fail rather than exposing a public superclass
+method.  A private direct declaration is not inherited and is transparent to
+this lookup.  Every occurrence of $\mathsf{direct}$ below denotes
+Equation~\eqref{eq:direct}.
+\[
+\begin{array}{c}
+\dfrac{C=\Top}{P,H\vdash\lookup_{pub}(s,C)=\undef}
+\quad(\rulelabel{Pub-Top})\\[2ex]
+\dfrac{\mathsf{direct}(C,s)=f\quad\access(f)=\Public}
+      {P,H\vdash\lookup_{pub}(s,C)=\langle f,C\rangle}
+\quad(\rulelabel{Pub-Hit})\\[2ex]
+\dfrac{\mathsf{direct}(C,s)=f\quad\access(f)=\Protected}
+      {P,H\vdash\lookup_{pub}(s,C)=\undef}
+\quad(\rulelabel{Pub-Protected-Barrier})\\[2ex]
+\dfrac{\substack{C\ne\Top\quad
+       (\mathsf{direct}(C,s)=\undef\ \lor\
+        \access(\mathsf{direct}(C,s))=\Private)\quad
+       P,H\vdash\lookup_{pub}(s,\super_H(C))=r}}
+      {P,H\vdash\lookup_{pub}(s,C)=r}
+\quad(\rulelabel{Pub-Super})
+\end{array}
+\]
+
+\subsection{Protected lookup}
+\label{sec:protected-lookup}
+
+Protected lookup implements the virtual part of self, outer, and super sends.
+Both public and protected methods participate; private declarations remain
+lexical and therefore are transparent.  These rules likewise use direct
+selection from Equation~\eqref{eq:direct}.
+\[
+\begin{array}{c}
+\dfrac{C=\Top}{P,H\vdash\lookup_{prot}(s,C)=\undef}
+\quad(\rulelabel{Prot-Top})\\[2ex]
+\dfrac{\mathsf{direct}(C,s)=f\quad
+       \access(f)\in\{\Public,\Protected\}}
+      {P,H\vdash\lookup_{prot}(s,C)=\langle f,C\rangle}
+\quad(\rulelabel{Prot-Hit})\\[2ex]
+\dfrac{\substack{C\ne\Top\quad
+       (\mathsf{direct}(C,s)=\undef\ \lor\
+        \access(\mathsf{direct}(C,s))=\Private)\quad
+       P,H\vdash\lookup_{prot}(s,\super_H(C))=r}}
+      {P,H\vdash\lookup_{prot}(s,C)=r}
+\quad(\rulelabel{Prot-Super})
+\end{array}
+\]
+
+\section{Lexical classes and enclosing receivers}
+
+For a well-formed heap $H$, define the finite superclass-chain sequence by
+primitive recursion:
+\begin{equation}\label{eq:class-chain}
+\begin{aligned}
+ \mathsf{chain}_H(\Top) &= \langle\Top\rangle,\\
+ \mathsf{chain}_H(R) &=
+   \langle R\rangle\mathbin{\cdot}\mathsf{chain}_H(\super_H(R))
+   &&\text{if }R\ne\Top.
+\end{aligned}
+\end{equation}
+Here $\cdot$ is sequence concatenation and indices are zero-based.  The base
+invariant that superclass links are acyclic and reach $\Top$ makes this
+definition total and gives a unique finite sequence for every live class.
+Superclass membership and depth are then, from the chain in
+Equation~\eqref{eq:class-chain},
+\begin{equation}\label{eq:class-membership-depth}
+\begin{aligned}
+ C\preceq_H R
+ &\iff \exists j\,.
+   0\le j<|\mathsf{chain}_H(R)|\ \land\
+   \mathsf{chain}_H(R)[j]=C,\\
+ \mathsf{depth}_H(C,R)
+ &=\min\{j\mid \mathsf{chain}_H(R)[j]=C\},
+\end{aligned}
+\end{equation}
+where depth is undefined when $C\not\preceq_H R$.
+
+The lexical-class chain is the corresponding static construction.  Define the
+partial function
+\begin{equation}\label{eq:lex-ancestor}
+\begin{aligned}
+ \mathsf{lexAncestor}_P(D,0)&=D,\\
+ \mathsf{lexAncestor}_P(D,n+1)&=
+   P.\mathit{lexParent}(\mathsf{lexAncestor}_P(D,n)),
+\end{aligned}
+\end{equation}
+where the second clause is undefined if either operand on its right is
+undefined.  Using Equation~\eqref{eq:lex-ancestor}, define for a lexical
+ancestor $D_t$ of $D_0$
+\begin{equation}\label{eq:lex-depth}
+ \mathsf{lexDepth}_P(D_t,D_0)=
+   \min\{k\mid \mathsf{lexAncestor}_P(D_0,k)=D_t\}.
+\end{equation}
+
+For a declaration $D$, let the indices of its applications in $R$'s chain
+from Equation~\eqref{eq:class-chain} be
+\begin{equation}\label{eq:application-indices}
+ \mathsf{appIndices}_{P,H}(R,D)=
+ \left\{j\ \middle|\
+ \begin{array}{l}
+ 0\le j<|\mathsf{chain}_H(R)|,\quad
+ \mathsf{chain}_H(R)[j]\ne\Top,\\
+ \decl_P(\mixin_H(\mathsf{chain}_H(R)[j]))=D
+ \end{array}\right\}.
+\end{equation}
+Using Equation~\eqref{eq:application-indices}, the nearest application is the
+partial function
+\begin{equation}\label{eq:nearest-application}
+ \mathsf{nearestApp}_{P,H}(R,D)=
+ \begin{cases}
+  \mathsf{chain}_H(R)[\min I]
+    & I=\mathsf{appIndices}_{P,H}(R,D)\ne\varnothing,\\
+  \undef & I=\varnothing.
+ \end{cases}
+\end{equation}
+Minimal index means most specific.  This is significant when the same mixin
+occurs repeatedly in one hierarchy.
+
+For a runtime receiver $o_t$ and lexical target declaration $D_t$, define the
+target application from Equation~\eqref{eq:nearest-application}:
+\begin{equation}\label{eq:target-application}
+  \mathsf{targetApp}_{P,H}(o_t,D_t)
+    =\mathsf{nearestApp}_{P,H}(\classof_H(o_t),D_t).
+\end{equation}
+Well-formed outer sends preserve the invariant that this application exists.
+
+The partial relation
+$P,H\vdash \mathsf{enc}(o,C,n)=o_n$ formalizes the Specification's $n$th
+enclosing object of $o$ with respect to $C$.  Its premises use superclass
+membership from Equation~\eqref{eq:class-membership-depth}, lexical ancestry
+from Equation~\eqref{eq:lex-ancestor}, and nearest application from
+Equation~\eqref{eq:nearest-application}:
+\[
+\begin{array}{c}
+\dfrac{C\preceq_H\classof_H(o)}
+      {P,H\vdash\mathsf{enc}(o,C,0)=o}
+\quad(\rulelabel{Enc-Zero})\\[2ex]
+\dfrac{C\preceq_H\classof_H(o)\quad H(C).eo=o_1}
+      {P,H\vdash\mathsf{enc}(o,C,1)=o_1}
+\quad(\rulelabel{Enc-One})\\[2ex]
+\dfrac{\substack{n>1\quad P,H\vdash\mathsf{enc}(o,C,n-1)=o_{n-1}\quad
+       D_{n-1}=\mathsf{lexAncestor}_P(\decl_P(\mixin_H(C)),n-1)\\
+       S_{n-1}=\mathsf{nearestApp}(\classof_H(o_{n-1}),D_{n-1})\quad
+       H(S_{n-1}).eo=o_n}}
+      {P,H\vdash\mathsf{enc}(o,C,n)=o_n}
+\quad(\rulelabel{Enc-Step})
+\end{array}
+\]
+The separate $n=1$ rule is intentional.  It preserves the Specification's
+behavior under repeated mixin application rather than recomputing a possibly
+different application from the receiver's dynamic class.
+
+\section{Dispatch}
+
+A dispatch result is $\kw{invoke}(f,o,C_f,\mu)$,
+$\kw{missing}(o,C_0,\mu)$, or
+$\kw{runtimeError}(\kw{invalidSuper}(C))$.  $C_f$ is the current class to
+install in the new method activation; $C_0$ is the class at which DNU lookup
+must begin.  The third form is an internal failure, deliberately not a DNU
+request; Section~\ref{sec:exception-boundary} reifies it as a platform
+exception and signals it through ordinary dispatch.
+For compact rules, $\mathsf{outerDispatch}_a$ denotes outer dispatch in activation $a$.
+
+\subsection{Ordinary sends}
+
+After receiver and arguments have evaluated left-to-right to $o$ and $\bar o$,
+let $\mu=\langle s,\bar o\rangle$ and $R=\classof_H(o)$.  Dispatch uses the
+public lookup of Section~\ref{sec:public-lookup}:
+\[
+\dfrac{P,H\vdash\lookup_{pub}(s,R)=\langle f,C_f\rangle}
+      {P,H\vdash\mathsf{ordinaryDispatch}(o,\mu)
+       \Downarrow\kw{invoke}(f,o,C_f,\mu)}
+\quad(\rulelabel{Send-Public})
+\]
+\[
+\dfrac{P,H\vdash\lookup_{pub}(s,R)=\undef}
+      {P,H\vdash\mathsf{ordinaryDispatch}(o,\mu)
+       \Downarrow\kw{missing}(o,R,\mu)}
+\quad(\rulelabel{Send-Missing})
+\]
+
+\subsection{Outer and self sends}
+\label{sec:outer-self}
+
+Private selection is a static operation on the program.  Define
+\begin{equation}\label{eq:private-method}
+ \mathsf{privateMethod}_P(D,s)=
+ \begin{cases}
+  f & \begin{array}{l}
+        \text{if there exists }M\in\dom(P.\mathit{mixin})\text{ such that}\\[-1mm]
+        \decl_P(M)=D,\quad \methods_P(M)(s)=f,\quad
+        \access(f)=\Private,
+      \end{array}\\[3mm]
+  \undef & \text{otherwise.}
+ \end{cases}
+\end{equation}
+Well-formedness gives each class declaration one static mixin identity, and
+each mixin at most one direct method per selector, so the first case determines
+a unique $f$.  Thus this operation selects only a private method declared
+directly by $D$; it does not search a runtime superclass chain.  In particular,
+a direct public or protected method of selector $s$ makes
+$\mathsf{privateMethod}_P(D,s)=\undef$.
+
+Suppose the current activation has current instance $o_0$ and current class
+$C_0$.  If the immediately enclosing class declaration is $D_0$ and target
+$D_t$ is its $k$th lexical class ancestor, obtain $o_t$ from
+$\mathsf{enc}(o_0,C_0,k)$.  Let $N_t$ be the corresponding class
+$N_t=\mathsf{targetApp}(o_t,D_t)$ from
+Equation~\eqref{eq:target-application}, and let
+$\mu=\langle s,\bar o\rangle$.
+
+If Equation~\eqref{eq:private-method} selects a private method $f$ directly
+declared by $D_t$, dispatch is lexically bound:
+\[
+\dfrac{P,H\vdash\mathsf{enc}(o_0,C_0,k)=o_t\quad
+       \mathsf{privateMethod}_P(D_t,s)=f}
+      {P,H\vdash\mathsf{outerDispatch}_a(D_t,D_0,\mu)
+       \Downarrow\kw{invoke}(f,o_t,N_t,\mu)}
+\quad(\rulelabel{Outer-Private})
+\]
+Otherwise dispatch remains virtual and sees public or protected methods via
+Section~\ref{sec:protected-lookup}:
+{\small
+\[
+\dfrac{\substack{P,H\vdash\mathsf{enc}(o_0,C_0,k)=o_t\quad
+       \mathsf{privateMethod}_P(D_t,s)=\undef\quad
+       R=\classof_H(o_t)\quad
+       P,H\vdash\lookup_{prot}(s,R)=\langle f,C_f\rangle}}
+      {P,H\vdash\mathsf{outerDispatch}_a(D_t,D_0,\mu)
+       \Downarrow\kw{invoke}(f,o_t,C_f,\mu)}
+\quad(\rulelabel{Outer-Protected})
+\]
+}
+A failed protected lookup yields $\kw{missing}(o_t,R,\mu)$.
+
+A self send lexically enclosed immediately by $D_0$ is the depth-zero case
+\begin{equation}\label{eq:self-send-derived}
+  \mathsf{selfDispatch}_a(\mu)
+    \equiv \mathsf{outerDispatch}_a(D_0,D_0,\mu).
+\end{equation}
+It is therefore not an ordinary send: it can select a private method declared
+in $D_0$ and can dynamically select protected methods.
+
+\paragraph{Clarification obligation.}
+The $N_t$ current class in \rulelabel{Outer-Private} is the actual class
+application on the enclosing path, not merely the class found by unrestricted
+lookup of $s$ on $o_t$.  Otherwise a more-derived declaration of the same
+selector could cause a statically selected private method to execute with the
+wrong current class.  The Specification appears to require this result but does
+not state it directly.
+
+\subsection{Super sends}
+
+For current instance $o$, current class $C\notin\{\Object,\Top\}$,
+$S=\super_H(C)$, and $\mu=\langle s,\bar o\rangle$, dispatch uses the protected
+lookup of Section~\ref{sec:protected-lookup}:
+\[
+\dfrac{P,H\vdash\lookup_{prot}(s,S)=\langle f,C_f\rangle}
+      {P,H,a\vdash\mathsf{superDispatch}(\mu)
+       \Downarrow\kw{invoke}(f,o,C_f,\mu)}
+\quad(\rulelabel{Super-Hit})
+\]
+\[
+\dfrac{P,H\vdash\lookup_{prot}(s,S)=\undef}
+      {P,H,a\vdash\mathsf{superDispatch}(\mu)
+       \Downarrow\kw{missing}(o,S,\mu)}
+\quad(\rulelabel{Super-Missing})
+\]
+The $\kw{missing}$ result is processed by the DNU fallback of
+Section~\ref{sec:dnu}; in particular, $S$ is the class at which DNU lookup
+begins.
+
+The two excluded current classes have explicit error rules:
+\[
+\dfrac{C=\Object}
+      {P,H,a\vdash\mathsf{superDispatch}(\mu)
+       \Downarrow\kw{runtimeError}(\kw{invalidSuper}(\Object))}
+\quad(\rulelabel{Super-Object-Error})
+\]
+\[
+\dfrac{C=\Top}
+      {P,H,a\vdash\mathsf{superDispatch}(\mu)
+       \Downarrow\kw{runtimeError}(\kw{invalidSuper}(\Top))}
+\quad(\rulelabel{Super-Top-Error})
+\]
+Neither error proceeds to DNU fallback.
+
+\subsection{Implicit receiver selection}
+\label{sec:implicit}
+
+Lexical resolution precedes dynamic inheritance.  If
+\begin{equation}\label{eq:scope-chain}
+ P.\mathit{scopeChain}(z)=\langle d_0,\ldots,d_n\rangle,
+\end{equation}
+then the declarations are ordered from the construct immediately surrounding
+site $z$ outwards.  The static predicate $\mathsf{declares}_P(d,s)$ is
+\begin{equation}\label{eq:declares}
+\begin{array}{rcl}
+ \mathsf{declares}_P(K,s)
+ &\Longleftrightarrow&
+   \exists M\in\dom(P.\mathit{mixin})\,.
+   \decl_P(M)=K\land s\in\dom(\methods_P(M)),\\
+ \mathsf{declares}_P(q,s)
+ &\Longleftrightarrow&
+   s\in P.\mathit{activationMembers}(q).
+\end{array}
+\end{equation}
+The method maps include accessors synthesized for class or object-literal slots
+and nested classes; activation members include accessors for parameters and
+locals.  Using the scope sequence in Equation~\eqref{eq:scope-chain} and the
+predicate in Equation~\eqref{eq:declares}, define
+\begin{equation}\label{eq:lexical-binding}
+\begin{aligned}
+ J_{P,z,s}&=\{j\mid 0\le j\le n\land
+                         \mathsf{declares}_P(d_j,s)\},\\
+ \mathsf{bind}_P(z,s)&=
+ \begin{cases}
+   d_{\min J_{P,z,s}} & J_{P,z,s}\ne\varnothing,\\
+   \undef & J_{P,z,s}=\varnothing.
+ \end{cases}
+\end{aligned}
+\end{equation}
+Thus $\mathsf{bind}$ selects the innermost lexical declaration, independently
+of access level.  Elaboration annotates the core send with
+$d=\mathsf{bind}_P(z,s)$ as defined by
+Equation~\eqref{eq:lexical-binding}.  It also retains the immediately enclosing class
+declaration $D_0$ as static context.  This context is written on the judgment
+rather than repeated inside the core node below.
+
+Suppose the message clause has evaluated to $\mu=\langle s,\bar o\rangle$ and
+the current activation is $a$.  The judgment
+\begin{equation}\label{eq:implicit-judgment}
+ P,H,a,D_0\vdash\mathsf{implicitDispatch}(d,\mu)\Downarrow r
+\end{equation}
+is defined by the following four rules, where $r$ ranges over dispatch results.
+For a class declaration, implicit dispatch is exactly outer dispatch:
+\[
+\dfrac{d=D_t\in\mathit{ClassDeclId}\quad
+       P,H\vdash\mathsf{outerDispatch}_a(D_t,D_0,\mu)\Downarrow r}
+      {P,H,a,D_0\vdash\mathsf{implicitDispatch}(d,\mu)\Downarrow r}
+\quad(\rulelabel{Implicit-Class})
+\]
+For an enclosing object literal, its lexical environment supplies the literal
+value and the statically selected direct method is invoked without an access
+check:
+\[
+\dfrac{\substack{d=L\in\mathit{ObjLitDeclId}\\
+       \mathsf{scope}_H(a)(L)=o_L\\
+       P,H\vdash\lookup_U(s,\classof_H(o_L))=\langle f,C_f\rangle\\
+       \decl_P(\mixin_H(C_f))=L}}
+      {P,H,a,D_0\vdash\mathsf{implicitDispatch}(d,\mu)
+       \Downarrow\kw{invoke}(f,o_L,C_f,\mu)}
+\quad(\rulelabel{Implicit-Literal})
+\]
+For a method or closure declaration, the lexical environment supplies that
+declaration's current activation, and the specified send to the activation is
+an ordinary send:
+\[
+\dfrac{\substack{d=q\in\mathit{ActDeclId}\\
+       \mathsf{scope}_H(a)(q)=a_q\\
+       P,H\vdash\mathsf{ordinaryDispatch}(a_q,\mu)\Downarrow r}}
+      {P,H,a,D_0\vdash\mathsf{implicitDispatch}(d,\mu)\Downarrow r}
+\quad(\rulelabel{Implicit-Activation})
+\]
+Finally, failure of lexical binding is a self send:
+\[
+\dfrac{d=\undef\quad
+       P,H\vdash\mathsf{outerDispatch}_a(D_0,D_0,\mu)\Downarrow r}
+      {P,H,a,D_0\vdash\mathsf{implicitDispatch}(d,\mu)\Downarrow r}
+\quad(\rulelabel{Implicit-Self})
+\]
+These rules are mutually exclusive because the declaration-identity domains
+are disjoint.  Their premises are total for a well-formed annotation.  A
+reflective edit that changes a scope chain or member map must rebuild the
+affected $\mathsf{bind}$ annotations and lexical environments in the same
+atomic install transaction.
+
+\paragraph{ECOOP-style derived presentation.}
+After nearer activation and object-literal scopes have failed to declare $s$,
+the class-only part of the search can instead be written recursively using
+Equation~\eqref{eq:declares}:
+\begin{equation}\label{eq:class-scan}
+ \mathsf{scan}_P(D,s)=
+ \begin{cases}
+  D & \mathsf{declares}_P(D,s),\\
+  \mathsf{scan}_P(D',s) & \neg\mathsf{declares}_P(D,s)\ \land\
+                           P.\mathit{lexParent}(D)=D',\\
+  \undef & \neg\mathsf{declares}_P(D,s)\ \land\
+            P.\mathit{lexParent}(D)=\undef.
+ \end{cases}
+\end{equation}
+Unlike the 2010 algorithm, the result must retain both the receiver and the
+declaration that granted lexical authority.  Write $\mathsf{irecv}$ for this
+access-aware form of \emph{implicitReceiver}.  Using
+Equations~\eqref{eq:class-scan} and~\eqref{eq:lex-depth}, define
+\begin{equation}\label{eq:implicit-receiver}
+ \mathsf{irecv}_{P,H}(o_0,C_0,D_0,s)=
+ \begin{cases}
+  \langle o_t,D_t\rangle &
+    \begin{array}{l}
+      \mathsf{scan}_P(D_0,s)=D_t,\\[-1mm]
+      k=\mathsf{lexDepth}_P(D_t,D_0),\quad
+      P,H\vdash\mathsf{enc}(o_0,C_0,k)=o_t,
+    \end{array}\\[3mm]
+  \langle o_0,\undef\rangle & \mathsf{scan}_P(D_0,s)=\undef.
+ \end{cases}
+\end{equation}
+The first result dispatches by $\mathsf{outerDispatch}_a(D_t,D_0,\mu)$; the second by
+$\mathsf{outerDispatch}_a(D_0,D_0,\mu)$.  Consequently a private method is considered
+only as the direct declaration at the selected lexical target.  If that check
+fails, $\lookup_{prot}$ performs virtual lookup and skips every private method
+encountered on the runtime class chain.
+
+\paragraph{Equivalence obligation.}
+For a well-formed fixed $P,H$, and after ruling out a nearer activation or
+object-literal binding, the elaborated rules and the ECOOP-style presentation
+must produce the same dispatch result.  In terms of
+Equations~\eqref{eq:lexical-binding} and~\eqref{eq:class-scan}, the static part
+reduces to
+\begin{equation}\label{eq:binding-equivalence}
+ \mathsf{bind}_P(z,s)=D_t
+ \quad\Longleftrightarrow\quad
+ \mathsf{scan}_P(D_0,s)=D_t,
+\end{equation}
+with $D_0$ the first class scope at $z$; the receiver equality follows from
+$\mathsf{lexDepth}$ in Equation~\eqref{eq:lex-depth} and the rules for
+$\mathsf{enc}$.  A full proof is deferred
+until the static well-formedness judgment fixes the precise correspondence
+between $P.\mathit{scopeChain}$ and $P.\mathit{lexParent}$.
+
+\subsection{DNU fallback}
+\label{sec:dnu}
+
+Missing dispatch does not perform an ordinary send of \dnu.  It uses
+unrestricted lookup from Section~\ref{sec:class-chain}, starting at the supplied
+class $C_0$, and invokes the result
+on the original receiver with a freshly reified mirror of the original message:
+\[
+\dfrac{P,H\vdash\lookup_U(\dnu,C_0)=\langle f,C_f\rangle\quad
+       H' = H[m\mapsto\mathsf{messageMirror}(\mu)]}
+      {P,H\vdash\kw{missing}(o,C_0,\mu)
+       \longrightarrow
+       P,H'\vdash\kw{invoke}(f,o,C_f,\langle\dnu,m\rangle)}
+\quad(\rulelabel{DNU})
+\]
+Consequently a class's DNU implementation is honored regardless of its access
+modifier.  The required protected implementation on \Object{} ensures that
+unrestricted lookup succeeds in every well-formed base program and ultimately
+throws \kw{MessageNotUnderstood} unless overridden.
+
+\section{Sequential abstract machine}
+\label{sec:machine}
+
+This section closes the dispatch loop with a deterministic small-step machine.
+It covers left-to-right message construction, sequencing, closure creation,
+method and closure invocation, tail-call-observable continuation links, and
+local and non-local return.  Simultaneous slot clauses remain with the class
+initialization layer; their absence is stated explicitly below.
+
+\subsection{Configurations and frames}
+
+A request records the authority of a send after its receiver, if any, has been
+evaluated:
+\begin{equation}\label{eq:request-grammar}
+ \begin{aligned}
+ \theta ::={}&\kw{ordinaryRequest}(o)\mid\kw{implicitRequest}(d,D_0)\\
+ &\mid\kw{outerRequest}(D_t,D_0)\mid\kw{selfRequest}(D_0)
+ \mid\kw{superRequest}.
+ \end{aligned}
+\end{equation}
+An intra-activation frame stack $\pi$ is built from
+\begin{equation}\label{eq:frame-grammar}
+\begin{array}{rcl}
+ F ::=&& \kw{recv}(s,\bar e)
+ \mid \kw{args}(\theta,s,\bar o,\bar e)
+ \mid \kw{seq}(\tau,\bar s)\\
+ &&\mid \kw{returnFrame}
+ \mid \kw{init}(j,\bar\ell,b,\tau),\\
+ \pi ::=&& \epsilon\mid\pi\mathbin{\cdot}F,
+ \qquad
+ \tau ::= \kw{methodBody}(o)\mid\kw{closureBody}.
+\end{array}
+\end{equation}
+Here $\bar s$ is a statement list, $\bar\ell$ is a normalized local-slot list,
+and $j$ is a physical local-slot identity.  An activation stack and machine
+configuration are
+\begin{equation}\label{eq:configuration}
+ \mathcal A::=\epsilon\mid\mathcal A\mathbin{\cdot}\langle a,\pi\rangle,
+ \qquad
+ \Sigma=\langle P,H,\mathcal A,t\rangle.
+\end{equation}
+We abbreviate the configuration of Equation~\eqref{eq:configuration} as
+$\langle H;\mathcal A;t\rangle_P$ when this improves the layout.
+The rightmost activation is current; $t$ is its control term.  Suspended
+evaluation frames live in $\pi$, while the corresponding activation and its
+observable continuation link live in $H$.  We write $\longmapsto$ for one
+machine step and omit unchanged $P$ below.
+
+\subsection{Expression and message order}
+
+Evaluation of an ordinary send begins with its receiver:
+\[
+ \langle P,H,\mathcal A\cdot\langle a,\pi\rangle,
+        \kw{send}(e,s,\bar e)\rangle
+ \longmapsto
+ \langle P,H,\mathcal A\cdot\langle a,\pi\cdot\kw{recv}(s,\bar e)\rangle,
+        e\rangle.
+ \tag{Send-Receiver}
+\]
+Once the receiver is $o$, the request is $\kw{ordinaryRequest}(o)$.  All other send
+forms in Equation~\eqref{eq:core-expressions} determine their request without
+evaluating a receiver:
+\begin{equation}\label{eq:request-construction}
+\begin{array}{rcl}
+ \mathsf{request}_{D_0}(\kw{implicit}(s,\bar e,d))
+   &=&\langle\kw{implicitRequest}(d,D_0),s,\bar e\rangle,\\
+ \mathsf{request}_{D_0}(\kw{selfSend}(s,\bar e,D_0))
+   &=&\langle\kw{selfRequest}(D_0),s,\bar e\rangle,\\
+ \mathsf{request}_{D_0}(\kw{outerSend}(s,\bar e,D_t,D_0))
+   &=&\langle\kw{outerRequest}(D_t,D_0),s,\bar e\rangle,\\
+ \mathsf{request}_{D_0}(\kw{superSend}(s,\bar e))
+   &=&\langle\kw{superRequest},s,\bar e\rangle.
+\end{array}
+\end{equation}
+The following rules use Equation~\eqref{eq:request-construction} to start an
+argument list; $e_s$ ranges over its four non-ordinary send forms:
+\[
+\dfrac{\mathsf{request}_{D_0}(e_s)=\langle\theta,s,\epsilon\rangle}
+ {\langle P,H,\mathcal A\cdot\langle a,\pi\rangle,e_s\rangle
+  \longmapsto
+  \langle P,H,\mathcal A\cdot\langle a,\pi\rangle,
+          \kw{dispatch}(\theta,\langle s,\epsilon\rangle)\rangle}
+\quad(\rulelabel{Send-No-Args})
+\]
+\[
+\dfrac{\mathsf{request}_{D_0}(e_s)=
+       \langle\theta,s,\langle e_1,\bar e\rangle\rangle}
+ {\langle P,H,\mathcal A\cdot\langle a,\pi\rangle,e_s\rangle
+  \longmapsto
+  \langle P,H,\mathcal A\cdot
+    \langle a,\pi\cdot\kw{args}(\theta,s,\epsilon,\bar e)\rangle,e_1\rangle}
+\quad(\rulelabel{Send-First-Arg})
+\]
+The receiver frame from Equation~\eqref{eq:frame-grammar} uses the same two
+continuations:
+\begin{equation}\label{eq:receiver-continuations}
+\begin{array}{c}
+\langle P,H,\mathcal A\cdot\langle a,\pi\cdot\kw{recv}(s,\epsilon)\rangle,o\rangle
+\longmapsto
+\langle P,H,\mathcal A\cdot\langle a,\pi\rangle,
+        \kw{dispatch}(\kw{ordinaryRequest}(o),\langle s,\epsilon\rangle)\rangle,
+\\[2ex]
+\langle P,H,\mathcal A\cdot
+ \langle a,\pi\cdot\kw{recv}(s,\langle e_1,\bar e\rangle)\rangle,o\rangle
+\longmapsto
+\langle P,H,\mathcal A\cdot
+ \langle a,\pi\cdot\kw{args}(\kw{ordinaryRequest}(o),s,\epsilon,\bar e)\rangle,e_1\rangle.
+\end{array}
+\end{equation}
+Argument values are accumulated on the left, so these rules enforce source
+order:
+\begin{equation}\label{eq:argument-continuations}
+\begin{array}{c}
+\langle P,H,\mathcal A\cdot
+ \langle a,\pi\cdot\kw{args}(\theta,s,\bar o,
+                              \langle e,\bar e\rangle)\rangle,o'\rangle
+\longmapsto
+\langle P,H,\mathcal A\cdot
+ \langle a,\pi\cdot\kw{args}(\theta,s,
+                 \bar o\cdot\langle o'\rangle,\bar e)\rangle,e\rangle,
+\\[2ex]
+\langle P,H,\mathcal A\cdot
+ \langle a,\pi\cdot\kw{args}(\theta,s,\bar o,\epsilon)\rangle,o'\rangle
+\longmapsto
+\langle P,H,\mathcal A\cdot\langle a,\pi\rangle,
+ \kw{dispatch}(\theta,\langle s,\bar o\cdot\langle o'\rangle\rangle)\rangle.
+\end{array}
+\end{equation}
+Standalone $\kw{self}$ reduces to the current instance recorded in $H(a)$;
+parentheses have already been eliminated without changing a parenthesized self
+send's syntactic classification.
+Formally,
+\[
+ \dfrac{H(a).o=o}
+ {\langle P,H,\mathcal A\cdot\langle a,\pi\rangle,\kw{self}\rangle
+  \longmapsto
+  \langle P,H,\mathcal A\cdot\langle a,\pi\rangle,o\rangle}
+ \quad(\rulelabel{Self-Value}).
+\]
+
+\subsection{From requests to invocation}
+
+For $n\geq0$, let $\mathsf{valueSelector}(n)$ be $\#\kw{value}$ for $n=0$
+and the symbol consisting of $n$ repetitions of the keyword \kws{value}
+otherwise.  Let $\mathsf{closureCall}_H(o,\mu)$ hold exactly when $H(o)$ is a
+closure with $n$ parameters and
+$\selector(\mu)=\mathsf{valueSelector}(n)$.  Define the partial
+request-resolution function, over the requests of
+Equation~\eqref{eq:request-grammar}, by the existing dispatch judgments:
+\begin{equation}\label{eq:request-resolution}
+\begin{aligned}
+ &\mathsf{resolve}_{P,H,a}(\kw{ordinaryRequest}(o),\mu)=r\\[-1mm]
+ &\quad\Longleftrightarrow
+   \neg\mathsf{closureCall}_H(o,\mu)\ \land\
+   P,H\vdash\mathsf{ordinaryDispatch}(o,\mu)\Downarrow r,\\
+ &\mathsf{resolve}_{P,H,a}(\kw{implicitRequest}(d,D_0),\mu)=r\\[-1mm]
+ &\quad\Longleftrightarrow
+   P,H,a,D_0\vdash\mathsf{implicitDispatch}(d,\mu)\Downarrow r,\\
+ &\mathsf{resolve}_{P,H,a}(\kw{outerRequest}(D_t,D_0),\mu)=r\\[-1mm]
+ &\quad\Longleftrightarrow
+   P,H\vdash\mathsf{outerDispatch}_a(D_t,D_0,\mu)\Downarrow r,\\
+ &\mathsf{resolve}_{P,H,a}(\kw{selfRequest}(D_0),\mu)=r\\[-1mm]
+ &\quad\Longleftrightarrow
+   P,H\vdash\mathsf{outerDispatch}_a(D_0,D_0,\mu)\Downarrow r,\\
+ &\mathsf{resolve}_{P,H,a}(\kw{superRequest},\mu)=r\\[-1mm]
+ &\quad\Longleftrightarrow
+   P,H,a\vdash\mathsf{superDispatch}(\mu)\Downarrow r.
+\end{aligned}
+\end{equation}
+The request-resolution step applies Equation~\eqref{eq:request-resolution}:
+\[
+\dfrac{\mathsf{resolve}_{P,H,a}(\theta,\mu)=r}
+ {\langle P,H,\mathcal A\cdot\langle a,\pi\rangle,
+             \kw{dispatch}(\theta,\mu)\rangle
+  \longmapsto
+  \langle P,H,\mathcal A\cdot\langle a,\pi\rangle,r\rangle}
+\quad(\rulelabel{Resolve})
+\]
+and the DNU rule of Section~\ref{sec:dnu} rewrites a $\kw{missing}$ control
+term to $\kw{invoke}$ while allocating its message mirror.  A
+$\kw{runtimeError}$ control term is reified and signaled at the standard-library
+boundary in Section~\ref{sec:exception-boundary}.
+
+Before ordinary request resolution, a closure receiver has the specified
+invocation case
+\[
+\dfrac{H(c)=\kw{closure}\langle q,\bar x,\ell,b,a_c,o,C,h\rangle\quad
+       \mu=\langle\mathsf{valueSelector}(|\bar x|),\bar o\rangle}
+ {\begin{aligned}
+  &\langle H;\mathcal A\cdot\langle a,\pi\rangle;
+       \kw{dispatch}(\kw{ordinaryRequest}(c),\mu)\rangle_P\\[-1mm]
+  &\qquad\longmapsto
+   \langle H;\mathcal A\cdot\langle a,\pi\rangle;
+       \kw{invokeClosure}(c,\mu)\rangle_P
+  \end{aligned}}
+\quad(\rulelabel{Closure-Value})
+\]
+which is disjoint from \rulelabel{Resolve} for that request.
+
+\subsection{Closure creation and activation allocation}
+
+Evaluating a closure literal allocates a fresh closure object and captures the
+current activation state.  Let
+\begin{equation}\label{eq:home-activation}
+ \mathsf{home}_H(a)=
+ \begin{cases}
+  a & H(a).p\in\mathit{MethodId},\\
+  H(a).h & \text{otherwise.}
+\end{cases}
+\end{equation}
+For fresh $c$, the allocation rule uses $\mathsf{home}_H$ from
+Equation~\eqref{eq:home-activation}:
+\[
+\dfrac{H(a).o=o\quad H(a).C=C\quad h=\mathsf{home}_H(a)}
+ {\begin{aligned}
+  &\langle H;\mathcal A\cdot\langle a,\pi\rangle;
+       \kw{closureLiteral}(q,\bar x,\ell,b)\rangle_P\\[-1mm]
+  &\quad\longmapsto
+   \langle H[c\mapsto\kw{closure}\langle q,\bar x,\ell,b,a,o,C,h\rangle];
+       \mathcal A\cdot\langle a,\pi\rangle;c\rangle_P
+  \end{aligned}}
+\quad(\rulelabel{Closure-New})
+\]
+
+The continuation installed in a callee is
+\begin{equation}\label{eq:callee-continuation}
+ \mathsf{calleeKont}_H(a,\pi)=
+ \begin{cases}a&\pi\ne\epsilon,\\H(a).k&\pi=\epsilon.\end{cases}
+\end{equation}
+Thus an observable continuation points to the sender exactly when the sender
+has further computation.  Define method-activation allocation for
+$f=\langle i_f,s,\alpha,\bar x,\ell,b,K\rangle$ and
+$\mu=\langle s,\bar o\rangle$, with $|\bar x|=|\bar o|$, by
+\begin{equation}\label{eq:method-activation}
+\begin{aligned}
+ \rho'&=[\bar x\mapsto\bar o],&
+ \lambda'&=[\bar\ell\mapsto\kw{uninit}],\\
+ \gamma'&=\{i_f\mapsto a'\}\cup
+   \begin{cases}\{K\mapsto o\}&K\in\mathit{ObjLitDeclId},\\
+                 \varnothing&\text{otherwise,}\end{cases}\\
+ \mathsf{newM}(P,H,a',f,o,C_f,\mu,k)
+   &=H[a'\mapsto\kw{activation}\langle
+       i_f,\rho',\lambda',o,C_f,k,a',\kw{true},\gamma'\rangle].
+\end{aligned}
+\end{equation}
+where $a'$ is fresh and $\bar\ell$ lists the physical local-slot identities.
+Allocation itself does not evaluate local initializers.  The non-tail and tail
+invocation rules implement Equations~\eqref{eq:callee-continuation}
+and~\eqref{eq:method-activation}:
+\[
+\dfrac{\pi\ne\epsilon\quad k=a\quad
+       H'=\mathsf{newM}(P,H,a',f,o,C_f,\mu,k)}
+ {\begin{aligned}
+  &\langle H;\mathcal A\cdot\langle a,\pi\rangle;
+      \kw{invoke}(f,o,C_f,\mu)\rangle_P\\[-1mm]
+  &\quad\longmapsto
+   \langle H';\mathcal A\cdot\langle a,\pi\rangle
+                    \cdot\langle a',\epsilon\rangle;
+      \kw{initialize}(a',\ell,b,\kw{methodBody}(o))\rangle_P
+  \end{aligned}}
+\quad(\rulelabel{Invoke-NonTail})
+\]
+\[
+\dfrac{\pi=\epsilon\quad k=H(a).k\quad
+       H'=\mathsf{newM}(P,H,a',f,o,C_f,\mu,k)}
+ {\begin{aligned}
+  &\langle H;\mathcal A\cdot\langle a,\epsilon\rangle;
+      \kw{invoke}(f,o,C_f,\mu)\rangle_P\\[-1mm]
+  &\quad\longmapsto
+   \langle H';\mathcal A\cdot\langle a',\epsilon\rangle;
+      \kw{initialize}(a',\ell,b,\kw{methodBody}(o))\rangle_P
+  \end{aligned}}
+\quad(\rulelabel{Invoke-Tail})
+\]
+The old activation remains in $H$ for mirrors and debugging even when its
+dynamic stack entry is replaced.
+
+For closure activation, suppose the captured data satisfy
+\begin{equation}\label{eq:closure-invocation-data}
+ H(c)=\kw{closure}\langle q,\bar x,\ell,b,a_c,o,C,h\rangle,
+ \qquad
+ \mu=\langle\mathsf{valueSelector}(|\bar x|),\bar o\rangle.
+\end{equation}
+Under Equation~\eqref{eq:closure-invocation-data}, with $a'$ fresh, define
+\begin{equation}\label{eq:closure-activation}
+\begin{aligned}
+ \rho_c&=[\bar x\mapsto\bar o],&
+ \lambda_c&=[\bar\ell\mapsto\kw{uninit}],\\
+ \gamma_c&=\mathsf{scope}_H(a_c)[q\mapsto a'],\\
+ \mathsf{newC}(H,a',c,\bar o,k)
+   &=H[a'\mapsto\kw{activation}\langle
+       c,\rho_c,\lambda_c,o,C,k,h,\kw{true},\gamma_c\rangle].
+\end{aligned}
+\end{equation}
+The two closure invocation cases use the activation allocated by
+Equation~\eqref{eq:closure-activation}:
+\[
+\dfrac{\pi\ne\epsilon\quad k=a\quad
+       H'=\mathsf{newC}(H,a',c,\bar o,k)}
+ {\begin{aligned}
+  &\langle H;\mathcal A\cdot\langle a,\pi\rangle;
+      \kw{invokeClosure}(c,\mu)\rangle_P\\[-1mm]
+  &\quad\longmapsto
+   \langle H';\mathcal A\cdot\langle a,\pi\rangle
+                    \cdot\langle a',\epsilon\rangle;
+      \kw{initialize}(a',\ell,b,\kw{closureBody})\rangle_P
+  \end{aligned}}
+\quad(\rulelabel{Closure-Invoke-NonTail})
+\]
+\[
+\dfrac{\pi=\epsilon\quad k=H(a).k\quad
+       H'=\mathsf{newC}(H,a',c,\bar o,k)}
+ {\begin{aligned}
+  &\langle H;\mathcal A\cdot\langle a,\epsilon\rangle;
+      \kw{invokeClosure}(c,\mu)\rangle_P\\[-1mm]
+  &\quad\longmapsto
+   \langle H';\mathcal A\cdot\langle a',\epsilon\rangle;
+      \kw{initialize}(a',\ell,b,\kw{closureBody})\rangle_P
+  \end{aligned}}
+\quad(\rulelabel{Closure-Invoke-Tail})
+\]
+
+\subsection{Local initialization and bodies}
+
+Normalize a sequential local declaration as
+\begin{equation}\label{eq:local-declaration}
+ \lambda::=\kw{immutable}(j,e)\mid\kw{mutable}(j,e)\mid
+ \kw{mutable}(j,\kw{none})\mid
+ \kw{lazyImmutable}(j,e)\mid\kw{lazyMutable}(j,e).
+\end{equation}
+The normalized sequence may also contain a simultaneous group:
+\begin{equation}\label{eq:local-declaration-sequence}
+ \bar\ell::=\epsilon\mid\lambda\cdot\bar\ell
+       \mid\kw{simultaneous}(\bar\lambda)\cdot\bar\ell.
+\end{equation}
+Empty initialization of the declaration sequence in
+Equation~\eqref{eq:local-declaration-sequence} enters the body:
+\begin{equation}\label{eq:local-init-empty}
+ \langle P,H,\mathcal A\cdot\langle a,\pi\rangle,
+   \kw{initialize}(a,\epsilon,b,\tau)\rangle
+ \longmapsto
+ \langle P,H,\mathcal A\cdot\langle a,\pi\rangle,
+   \kw{body}(\tau,b)\rangle.
+\end{equation}
+An immutable or initialized mutable local evaluates its initializer in the new
+activation and then writes directly:
+\begin{equation}\label{eq:local-init-start}
+\dfrac{\lambda\in\{\kw{immutable}(j,e),\kw{mutable}(j,e)\}}
+ {\langle P,H,\mathcal A\cdot\langle a,\pi\rangle,
+       \kw{initialize}(a,\lambda\cdot\bar\ell,b,\tau)\rangle
+  \longmapsto
+  \langle P,H,\mathcal A\cdot
+       \langle a,\pi\cdot\kw{init}(j,\bar\ell,b,\tau)\rangle,e\rangle}
+\end{equation}
+\begin{equation}\label{eq:local-init-commit}
+ \langle P,H,\mathcal A\cdot
+       \langle a,\pi\cdot\kw{init}(j,\bar\ell,b,\tau)\rangle,o\rangle
+ \longmapsto
+ \langle P,H[a.\ell(j)\mapsto o],
+       \mathcal A\cdot\langle a,\pi\rangle,
+       \kw{initialize}(a,\bar\ell,b,\tau)\rangle.
+\end{equation}
+An uninitialized mutable local and either lazy form write $\nil$ without
+evaluating the lazy initializer:
+\begin{equation}\label{eq:local-init-nil}
+\dfrac{\lambda\in\{\kw{mutable}(j,\kw{none}),
+        \kw{lazyImmutable}(j,e),\kw{lazyMutable}(j,e)\}}
+ {\langle P,H,\mathcal A\cdot\langle a,\pi\rangle,
+       \kw{initialize}(a,\lambda\cdot\bar\ell,b,\tau)\rangle
+  \longmapsto
+  \langle P,H[a.\ell(j)\mapsto\nil],
+       \mathcal A\cdot\langle a,\pi\rangle,
+       \kw{initialize}(a,\bar\ell,b,\tau)\rangle.}
+\end{equation}
+
+Simultaneous locals use direct activation-slot operations, just as instance
+initialization uses the direct object-slot operations of
+Equation~\eqref{eq:slot-operations}.  Extend the frame grammar in
+Equation~\eqref{eq:frame-grammar} with $\kw{localWrite}(a,j)$ and define
+\begin{equation}\label{eq:local-slot-operations}
+\begin{array}{c}
+\dfrac{H(a_0).\ell(j)=v}
+ {\langle P,H,\mathcal A\cdot\langle a,\pi\rangle,
+       \kw{readLocal}(a_0,j)\rangle
+  \longmapsto
+  \langle P,H,\mathcal A\cdot\langle a,\pi\rangle,v\rangle},\\[3mm]
+ \langle P,H,\mathcal A\cdot\langle a,\pi\rangle,
+       \kw{writeLocal}(a_0,j,e)\rangle
+ \longmapsto
+ \langle P,H,\mathcal A\cdot
+       \langle a,\pi\cdot\kw{localWrite}(a_0,j)\rangle,e\rangle,\\[3mm]
+ \langle P,H,\mathcal A\cdot
+       \langle a,\pi\cdot\kw{localWrite}(a_0,j)\rangle,v\rangle
+ \longmapsto
+ \langle P,H[a_0.\ell(j)\mapsto v],
+       \mathcal A\cdot\langle a,\pi\rangle,v\rangle.
+\end{array}
+\end{equation}
+Let $e_F$ be the annotated core send denoting \PastFuture{} in activation $a$.
+For a declaration in a simultaneous group, define its installation term by
+\begin{equation}\label{eq:local-simultaneous-install}
+\begin{array}{rcl}
+ \mathsf{localInstall}_a(\kw{immutable}(j,e))
+  &=&\kw{writeLocal}(a,j,\kw{send}(e_F,\kws{computing},[e])),\\
+ \mathsf{localInstall}_a(\kw{mutable}(j,e))
+  &=&\kw{writeLocal}(a,j,\kw{send}(e_F,\kws{computing},[e])),\\
+ \mathsf{localInstall}_a(\kw{mutable}(j,\kw{none}))
+  &=&\kw{writeLocal}(a,j,\nil),\\
+ \mathsf{localInstall}_a(\kw{lazyImmutable}(j,e))
+  &=&\kw{writeLocal}(a,j,\nil),\\
+ \mathsf{localInstall}_a(\kw{lazyMutable}(j,e))
+  &=&\kw{writeLocal}(a,j,\nil).
+\end{array}
+\end{equation}
+Suppose the declarations with eager right-hand sides in $\bar\lambda$, in
+source order, are $j_1=e_1,\ldots,j_n=e_n$.  Using the installation terms of
+Equation~\eqref{eq:local-simultaneous-install}, define
+\begin{equation}\label{eq:local-simultaneous-expansion}
+\begin{split}
+ \mathsf{localSimCode}_a(\bar\lambda)=\langle{}
+ &\mathsf{localInstall}_a(\lambda_1),\ldots,
+   \mathsf{localInstall}_a(\lambda_m),\\
+ &\kw{send}(\kw{readLocal}(a,j_1),\#\kw{resolve},\epsilon),\ldots,
+  \kw{send}(\kw{readLocal}(a,j_n),\#\kw{resolve},\epsilon)\rangle.
+\end{split}
+\end{equation}
+Using the internal sequence defined in
+Equation~\eqref{eq:internal-sequence}, the group rule is
+\begin{equation}\label{eq:local-simultaneous-start}
+\begin{split}
+ &\kw{initialize}(a,
+     \kw{simultaneous}(\bar\lambda)\cdot\bar\ell,b,\tau)\\
+ &\quad\longmapsto
+ \kw{internalSeq}(\mathsf{localSimCode}_a(\bar\lambda),
+                  \kw{initialize}(a,\bar\ell,b,\tau)).
+\end{split}
+\end{equation}
+Equations~\eqref{eq:local-slot-operations}--\eqref{eq:local-simultaneous-start}
+therefore install every future before the first resolution and choose source
+order for resolution, exactly as the instance-slot expansion in
+Equation~\eqref{eq:simultaneous-expansion}.
+
+Statements are $\kw{expr}(e)$ or $\kw{return}(e)$.  Define
+\begin{equation}\label{eq:body-results}
+\begin{array}{rclcrcl}
+ \mathsf{empty}(\kw{methodBody}(o))&=&o,&\quad&
+ \mathsf{last}(\kw{methodBody}(o),v)&=&o,\\
+ \mathsf{empty}(\kw{closureBody})&=&\nil,&&
+ \mathsf{last}(\kw{closureBody},v)&=&v.
+\end{array}
+\end{equation}
+For a frame stack $\pi$, define
+\begin{equation}\label{eq:statement-start}
+ \mathsf{start}(\pi,\kw{expr}(e))=\langle\pi,e\rangle,
+ \qquad
+ \mathsf{start}(\pi,\kw{return}(e))
+    =\langle\pi\cdot\kw{returnFrame},e\rangle.
+\end{equation}
+Thus Equation~\eqref{eq:statement-start} installs the return frame before its
+expression is evaluated.  Using the result functions in
+Equation~\eqref{eq:body-results}, the empty-body rule is
+\begin{equation}\label{eq:empty-body}
+ \kw{body}(\tau,\epsilon)\longmapsto\kw{finish}(\mathsf{empty}(\tau)).
+\end{equation}
+A nonempty body uses Equation~\eqref{eq:statement-start} to start its first
+statement and save the remainder:
+\begin{equation}\label{eq:nonempty-body}
+\dfrac{\mathsf{start}(\pi\cdot\kw{seq}(\tau,\bar s),s_1)
+       =\langle\pi',e_1\rangle}
+ {
+ \langle P,H,\mathcal A\cdot\langle a,\pi\rangle,
+       \kw{body}(\tau,\langle s_1,\bar s\rangle)\rangle
+ \longmapsto
+ \langle P,H,\mathcal A\cdot\langle a,\pi'\rangle,e_1\rangle}.
+\end{equation}
+On an ordinary statement value,
+\begin{equation}\label{eq:statement-continuations}
+\begin{array}{rcl}
+ \langle\pi\cdot\kw{seq}(\tau,\epsilon),v\rangle
+ &\longmapsto&\langle\pi,\kw{finish}(\mathsf{last}(\tau,v))\rangle,\\
+ \mathsf{start}(\pi\cdot\kw{seq}(\tau,\bar s),s)
+   =\langle\pi',e\rangle
+ &\Longrightarrow&
+ \langle\pi\cdot\kw{seq}(\tau,\langle s,\bar s\rangle),v\rangle
+   \longmapsto\langle\pi',e\rangle.
+\end{array}
+\end{equation}
+The abbreviated pairs above leave $P,H,\mathcal A$ and current $a$ unchanged.
+The installed return frame transfers control non-locally:
+\[
+ \langle P,H,\mathcal A\cdot\langle a,\pi\cdot\kw{returnFrame}\rangle,v\rangle
+ \longmapsto
+ \langle P,H,\mathcal A\cdot\langle a,\pi\rangle,
+    \kw{transfer}(\mathsf{returnTarget}_H(a),v)\rangle.
+ \tag{Return-Value}
+\]
+
+\subsection{Completion and return}
+
+For a stack containing $c$, define
+\begin{equation}\label{eq:resume}
+ \mathsf{resume}(\mathcal A_0\cdot\langle c,\pi_c\rangle
+                    \cdot\mathcal A_1,c,v)
+   =\langle\mathcal A_0\cdot\langle c,\pi_c\rangle,v\rangle.
+\end{equation}
+It discards dynamic stack entries above the continuation but retains their heap
+records.  Normal completion uses Equation~\eqref{eq:resume}; it first saves
+$c=H(a).k$, then severs the link:
+\[
+\dfrac{c=H(a).k\ne\nil\quad
+       \mathsf{resume}(\mathcal A\cdot\langle a,\pi\rangle,c,v)
+          =\langle\mathcal A',v\rangle}
+ {\langle P,H,\mathcal A\cdot\langle a,\pi\rangle,\kw{finish}(v)\rangle
+  \longmapsto
+  \langle P,H[a.k\mapsto\nil],\mathcal A',v\rangle}
+\quad(\rulelabel{Finish-Resume})
+\]
+If $H(a).k=\nil$, normal completion yields a terminal result rather than
+\kw{cannotReturn}:
+\[
+ \dfrac{H(a).k=\nil}
+ {\langle P,H,\mathcal A\cdot\langle a,\pi\rangle,\kw{finish}(v)\rangle
+  \longmapsto
+  \langle P,H[a.k\mapsto\nil],\epsilon,\kw{halt}(v)\rangle}
+ \quad(\rulelabel{Finish-Halt}).
+\]
+
+Let the target of an explicit return from $a$ be
+\begin{equation}\label{eq:return-target}
+ \mathsf{returnTarget}_H(a)=
+ \begin{cases}a&H(a).p\in\mathit{MethodId},\\H(a).h&\text{otherwise.}\end{cases}
+\end{equation}
+After the return expression evaluates to $v$, its frame produces
+$\kw{transfer}(\mathsf{returnTarget}_H(a),v)$ using
+Equation~\eqref{eq:return-target}.  Define
+$\mathsf{dependents}_H(t)$ as the least set $X$ such that
+\begin{equation}\label{eq:dependents}
+ t\in X\quad\land\quad
+ \forall x\in\mathit{ActId}.\;(H(x).k\in X\Rightarrow x\in X).
+\end{equation}
+Let $H'=\mathsf{markUncontinuable}(H,t)$ be $H$ updated, for every
+$x\in\mathsf{dependents}_H(t)$, by
+\begin{equation}\label{eq:mark-uncontinuable}
+ H'(x).k=\nil,\qquad H'(x).q_a=\kw{false}.
+\end{equation}
+Using Equations~\eqref{eq:dependents} and~\eqref{eq:mark-uncontinuable}, for
+$c=H(t).k\ne\nil$, explicit return resumes $c$ with $v$ after this marking:
+\[
+\dfrac{\substack{t=\mathsf{returnTarget}_H(a)\quad c=H(t).k\ne\nil\\
+       H'=\mathsf{markUncontinuable}(H,t)\\
+       \mathsf{resume}(\mathcal A\cdot\langle a,\pi\rangle,c,v)
+          =\langle\mathcal A',v\rangle}}
+ {\begin{aligned}
+  &\langle H;\mathcal A\cdot\langle a,\pi\rangle;
+       \kw{transfer}(t,v)\rangle_P\\[-1mm]
+  &\qquad\longmapsto\langle H';\mathcal A';v\rangle_P
+  \end{aligned}}
+\quad(\rulelabel{Return-Transfer})
+\]
+If the saved $c$ is $\nil$, the machine instead produces an exception after
+marking $t$ uncontinuable:
+\[
+\dfrac{t=\mathsf{returnTarget}_H(a)\quad H(t).k=\nil\quad
+       H'=\mathsf{markUncontinuable}(H,t)}
+ {\begin{aligned}
+  &\langle H;\mathcal A\cdot\langle a,\pi\rangle;
+       \kw{transfer}(t,v)\rangle_P\\[-1mm]
+  &\qquad\longmapsto
+   \langle H';\mathcal A\cdot\langle a,\pi\rangle;
+       \kw{throw}(\kw{cannotReturn})\rangle_P
+  \end{aligned}}
+\quad(\rulelabel{Return-Cannot})
+\]
+This applies
+both to a repeated method return and to a non-local return whose home method has
+already completed.  Section~\ref{sec:exception-boundary} reifies this abrupt
+term without discarding its frames; the standard exception library determines
+whether signaling unwinds them or resumes at the failure point.
+
+\section{Class construction and initialization}
+\label{sec:classes}
+
+This section separates three times that the surface notation intentionally
+interleaves: elaboration creates and shares mixins, evaluation of a class
+expression determines a superclass and allocates a fresh class, and a later
+primary-factory invocation initializes a fresh instance.  In particular, the
+superclass expression is not re-evaluated when an instance is made, while its
+initializer message is not evaluated when the class is made.
+
+\subsection{Normalized class expressions}
+
+Elaboration gives every class body a descriptor
+\begin{equation}\label{eq:body-descriptor}
+ \chi_b=\langle D,n,u,s_f,\bar x,M,M_c,m_S\rangle.
+\end{equation}
+$D$ is the class declaration identity, $n$ its name, $u$ records whether the
+superclass was implicit, $s_f,\bar x$ are the primary-factory signature, $M$
+and $M_c$ are the instance- and class-side mixins, and $m_S$ is the deferred
+superclass-initializer message template.  A mixin application has descriptor
+\begin{equation}\label{eq:application-descriptor}
+ \chi_a=\langle D,n,s_f,\bar x,M_c,i_A,m_S,m_M\rangle,
+\end{equation}
+where $i_A$ is the stable identity of its synthesized instance initializer and
+$m_M$ is the deferred initializer message for the applied mixin.  From
+Equations~\eqref{eq:body-descriptor} and~\eqref{eq:application-descriptor}, the
+core forms are
+\begin{equation}\label{eq:class-forms}
+ \kw{classBody}(\chi_b,e_S),
+ \qquad
+ \kw{mixinApply}(\chi_a,e_S,e_M).
+\end{equation}
+Chained surface applications elaborate to left-associated
+$\kw{mixinApply}$ nodes.
+
+The surrounding-object annotation on $D$ determines
+\begin{equation}\label{eq:class-enclosing-object}
+ \mathsf{classEO}_{P,H}(a,D)=
+ \begin{cases}
+  a & P.\mathit{owner}(D)=\kw{activationOwner},\\
+  H(a).o & P.\mathit{owner}(D)\in
+      \{\kw{classOwner},\kw{objectLiteralOwner}\},\\
+  \nil & P.\mathit{owner}(D)=\kw{topOwner}.
+ \end{cases}
+\end{equation}
+Thus a class expression directly in a method or closure is enclosed by its
+activation, while a member class is enclosed by the receiver of its synthesized
+getter.  Top-level evaluation supplies $\nil$ without an activation.
+
+Write $\mathsf{isClass}_H(C)$ when the corresponding record in
+Equation~\eqref{eq:heap-records} has tag \kw{class}, and define
+\begin{equation}\label{eq:factory-selector}
+ \mathsf{factorySel}_H(C)=s_f
+ \quad\text{when}\quad
+ H(C).q=\langle i_I,s_f,\bar x,\kappa\rangle.
+\end{equation}
+Write $\mathsf{hasFactory}_H(C)$ when $H(C).q$ is a factory descriptor rather
+than \kw{none}; ``factory descriptor'' means the form in
+Equation~\eqref{eq:factory-descriptor}.  Using the selector projection in
+Equation~\eqref{eq:factory-selector}, validation of an inheritance clause is
+the total function
+\begin{equation}\label{eq:inheritance-error}
+ \mathsf{inhErr}_H(v,m)=
+ \begin{cases}
+  \kw{classExpected} & \neg\mathsf{isClass}_H(v),\\
+  \kw{classNotInstantiable} & \mathsf{isClass}_H(v)\ \land\
+       \neg\mathsf{hasFactory}_H(v),\\
+  \kw{wrongFactory} & \mathsf{hasFactory}_H(v)\ \land\
+       \selector(m)\ne\mathsf{factorySel}_H(v),\\
+  \undef & \text{otherwise.}
+ \end{cases}
+\end{equation}
+The following allocation is defined only for fresh $C,C_m$, a class $S$, and a
+descriptor whose class-side mixin contains the synthesized public primary
+factory:
+\begin{equation}\label{eq:allocate-class}
+\begin{aligned}
+ \mathsf{allocClass}(H,C,C_m,\chi_C,M,S,eo,M_c,q)
+   =H[&C_m\mapsto\kw{class}\langle
+        M_c,\kw{Class},eo,\kw{Metaclass},\kw{none},\chi_C\rangle,\\[-1mm]
+      &C\mapsto\kw{class}\langle M,S,eo,C_m,q,\chi_C\rangle].
+\end{aligned}
+\end{equation}
+This makes every created class's metaclass fresh, a direct subclass of the
+platform class \kw{Class}, an instance of \kw{Metaclass}, and enclosed by the
+same object as its class.
+
+Extend the base frame grammar of Equation~\eqref{eq:frame-grammar} by
+\begin{equation}\label{eq:class-construction-frames}
+ F ::= \cdots\mid\kw{makeBody}(\chi_b,eo)
+       \mid\kw{mixLeft}(\chi_a,e_M)
+       \mid\kw{mixRight}(\chi_a,S).
+\end{equation}
+Class-body evaluation uses Equation~\eqref{eq:class-enclosing-object} to fix the
+enclosing object, then evaluates the superclass expression:
+\[
+\dfrac{eo=\mathsf{classEO}_{P,H}(a,D)}
+ {\begin{aligned}
+  &\langle H;\mathcal A\cdot\langle a,\pi\rangle;
+       \kw{classBody}(\chi_b,e_S)\rangle_P\\[-1mm]
+  &\quad\longmapsto
+   \langle H;\mathcal A\cdot\langle a,
+       \pi\cdot\kw{makeBody}(\chi_b,eo)\rangle;e_S\rangle_P
+ \end{aligned}}
+\quad(\rulelabel{Class-Super})
+\]
+Let $\iota_P(M)=\langle i_I,s_f,\bar x,\bar g,b_I\rangle$ as in
+Equations~\eqref{eq:mixin-initializer} and~\eqref{eq:method-projections}.  Once $e_S$
+has produced $S$, class creation uses Equation~\eqref{eq:allocate-class}:
+\[
+\dfrac{\substack{\mathsf{inhErr}_H(S,m_S)=\undef\\
+       eo\ne\nil\ \lor\ (u=\kw{implicitSuperclass}\land S=\Object)\\
+       q=\langle i_I,s_f,\bar x,\kw{bodyInitializer}(m_S)\rangle\\
+       H'=\mathsf{allocClass}(H,C,C_m,\kw{expression}(D),M,S,eo,M_c,q)}}
+ {\begin{aligned}
+  &\langle H;\mathcal A\cdot\langle a,
+       \pi\cdot\kw{makeBody}(\chi_b,eo)\rangle;S\rangle_P\\[-1mm]
+  &\qquad\longmapsto
+   \langle H';\mathcal A\cdot\langle a,\pi\rangle;C\rangle_P
+ \end{aligned}}
+\quad(\rulelabel{Class-Commit})
+\]
+where $C,C_m$ are fresh.  A non-class or invalid factory produces
+$\kw{runtimeError}$ by the error function in
+Equation~\eqref{eq:inheritance-error} and the schema below.  A top-level class with an
+explicit superclass produces $\kw{runtimeError}(\kw{topSuperclass})$.
+An omitted superclass elaborates to the class \Object{} and the message
+$\langle\#\kw{new},\epsilon\rangle$.
+For any construction frame $F$ whose associated inheritance template is $m$,
+\begin{equation}\label{eq:inheritance-error-step}
+\dfrac{\mathsf{inhErr}_H(v,m)=\xi\ne\undef}
+ {\langle P,H,\mathcal A\cdot\langle a,\pi\cdot F\rangle,v\rangle
+  \longmapsto
+  \langle P,H,\mathcal A\cdot\langle a,\pi\rangle,
+       \kw{runtimeError}(\xi)\rangle}.
+\end{equation}
+This schema applies to \kw{makeBody}, \kw{mixLeft}, and \kw{mixRight}.  The
+remaining top-level error is
+\begin{equation}\label{eq:top-superclass-error}
+\dfrac{\mathsf{inhErr}_H(S,m_S)=\undef\quad eo=\nil\quad
+       (u\ne\kw{implicitSuperclass}\ \lor\ S\ne\Object)}
+ {\langle P,H,\mathcal A\cdot\langle a,
+    \pi\cdot\kw{makeBody}(\chi_b,eo)\rangle,S\rangle
+  \longmapsto
+  \langle P,H,\mathcal A\cdot\langle a,\pi\rangle,
+       \kw{runtimeError}(\kw{topSuperclass})\rangle}.
+\end{equation}
+
+\subsection{Mixin application}
+
+Using the class forms in Equation~\eqref{eq:class-forms} and the construction
+frames in Equation~\eqref{eq:class-construction-frames}, the superclass side is
+evaluated before the class supplying the mixin:
+\begin{equation}\label{eq:mixin-start}
+ \langle P,H,\mathcal A\cdot\langle a,\pi\rangle,
+   \kw{mixinApply}(\chi_a,e_S,e_M)\rangle
+ \longmapsto
+ \langle P,H,\mathcal A\cdot
+   \langle a,\pi\cdot\kw{mixLeft}(\chi_a,e_M)\rangle,e_S\rangle,
+\end{equation}
+\begin{equation}\label{eq:mixin-right}
+\dfrac{\mathsf{inhErr}_H(S,m_S)=\undef}
+ {\langle P,H,\mathcal A\cdot
+    \langle a,\pi\cdot\kw{mixLeft}(\chi_a,e_M)\rangle,S\rangle
+  \longmapsto
+  \langle P,H,\mathcal A\cdot
+    \langle a,\pi\cdot\kw{mixRight}(\chi_a,S)\rangle,e_M\rangle}.
+\end{equation}
+For a class record $H(R)=\kw{class}\langle M_R,S_R,eo_R,C_{mR},q_R,K_R\rangle$ of
+the form in Equation~\eqref{eq:heap-records}, commit uses
+Equation~\eqref{eq:allocate-class}:
+\[
+\dfrac{\substack{\mathsf{inhErr}_H(R,m_M)=\undef\quad
+       \mathsf{factorySel}_H(R)=s_f\\
+       \iota_P(M_R)=\langle i_M,s_f,\bar y,\bar g,b_M\rangle\\
+       q=\langle i_A,s_f,\bar x,\kw{appliedMixinInitializer}(m_S,m_M)\rangle\\
+       H'=\mathsf{allocClass}(H,I,I_m,\kw{expression}(D),M_R,S,eo_R,M_c,q)}}
+ {\begin{aligned}
+  &\langle H;\mathcal A\cdot\langle a,
+       \pi\cdot\kw{mixRight}(\chi_a,S)\rangle;R\rangle_P\\[-1mm]
+  &\qquad\longmapsto
+   \langle H';\mathcal A\cdot\langle a,\pi\rangle;I\rangle_P
+ \end{aligned}}
+\quad(\rulelabel{Mixin-Commit})
+\]
+for fresh $I,I_m$.  Hence every application shares $M_R$ and any later
+reflective edit to that mixin, but has a fresh class, metaclass, superclass
+link, and primary factory.  Its enclosing object is copied from $R$, not from
+the activation evaluating the application.  Non-class operands and either
+selector mismatch produce the corresponding runtime errors above.
+
+\subsection{Message templates and primary factories}
+
+A deferred message template is
+\begin{equation}\label{eq:message-template-domain}
+ m=\langle s,\bar e\rangle.
+\end{equation}
+The control term
+$\kw{message}(m)$ evaluates only its arguments, left to right, using
+$\kw{msgArgs}(s,\bar o,\bar e)$ frames analogous to the receiver and argument
+continuations in Equations~\eqref{eq:receiver-continuations}
+and~\eqref{eq:argument-continuations}:
+\begin{equation}\label{eq:message-evaluation}
+\begin{array}{c}
+ \kw{message}(\langle s,\epsilon\rangle)
+      \longmapsto\langle s,\epsilon\rangle,\\[1mm]
+ \kw{message}(\langle s,\langle e_1,\bar e\rangle\rangle)
+      \longmapsto
+      \langle\kw{msgArgs}(s,\epsilon,\bar e),e_1\rangle,\\[1mm]
+ \langle\kw{msgArgs}(s,\bar o,\langle e,\bar e\rangle),o'\rangle
+      \longmapsto
+      \langle\kw{msgArgs}(s,\bar o\cdot\langle o'\rangle,\bar e),e\rangle,\\[1mm]
+ \langle\kw{msgArgs}(s,\bar o,\epsilon),o'\rangle
+      \longmapsto\langle s,\bar o\cdot\langle o'\rangle\rangle.
+\end{array}
+\end{equation}
+These abbreviated transitions preserve the surrounding machine components.
+They explain precisely why factory parameters are unavailable while $e_S$ is
+evaluated but are available when $m_S$ is evaluated.
+
+Elaboration installs in $M_c$ a public method with selector $s_f$, formals
+$\bar x$, and body equivalent to
+\begin{equation}\label{eq:primary-factory-body}
+ \kw{return}\bigl(\kw{newInstanceCurrent}
+   (\langle s_f,\bar x\rangle)\bigr),
+\end{equation}
+where each binding occurrence in $\bar x$ elaborates to its activation send.
+Thus primary factories participate in ordinary public method lookup;
+$\kw{newInstanceCurrent}$ is an internal primitive occurring only in this
+synthesized body; it obtains the class from the factory activation's current
+instance.  Rule \rulelabel{Factory-New} below is reached from the synthesized
+body in Equation~\eqref{eq:primary-factory-body}.
+
+Define the root-to-leaf physical layout by
+\begin{equation}\label{eq:slot-layout}
+ \mathsf{layout}_{P,H}(\Top)=\epsilon,
+ \qquad
+ \mathsf{layout}_{P,H}(C)=
+   \mathsf{layout}_{P,H}(\super_H(C))\cdot
+   \mathsf{ownSlots}_P(\mixin_H(C)).
+\end{equation}
+Physical slot identities make the concatenation disjoint even when source
+names override one another.  For
+$H(C).q=\langle i_I,s_f,\bar x,\kappa\rangle$ and
+$\mu=\langle s_f,\bar o\rangle$, define, with fresh $a_I$,
+\begin{equation}\label{eq:instance-initializer-activation}
+ \mathsf{newI}(H,a_I,C,o,\mu,k)=
+ H[a_I\mapsto\kw{activation}\langle
+ i_I,[\bar x\mapsto\bar o],\varnothing,o,C,k,a_I,\kw{true},
+ \{i_I\mapsto a_I\}\rangle].
+\end{equation}
+If the current factory activation is $a$ and its return frame is already
+installed, instance allocation uses Equation~\eqref{eq:slot-layout} and
+initializer activation allocation uses
+Equation~\eqref{eq:instance-initializer-activation}:
+\[
+\dfrac{\substack{H(a).o=C\quad
+       H(C).q=\langle i_I,s_f,\bar x,\kappa\rangle\\
+       \mu=\langle s_f,\bar o\rangle\quad |\bar x|=|\bar o|\\
+       \sigma_0=[\mathsf{layout}_{P,H}(C)\mapsto\nil]\\
+       H_0=H[o\mapsto\kw{object}\langle C,\sigma_0,\varnothing\rangle]\quad
+       H'=\mathsf{newI}(H_0,a_I,C,o,\mu,a)}}
+ {\begin{aligned}
+  &\langle H;\mathcal A\cdot\langle a,
+       \pi\cdot\kw{returnFrame}\rangle;\kw{newInstanceCurrent}(\mu)\rangle_P\\[-1mm]
+  &\quad\longmapsto
+   \langle H';\mathcal A\cdot\langle a,\pi\cdot\kw{returnFrame}\rangle
+                    \cdot\langle a_I,\epsilon\rangle;
+       \kw{initClass}(C,o,\mu)\rangle_P
+ \end{aligned}}
+\quad(\rulelabel{Factory-New})
+\]
+where $o,a_I$ are fresh.  All inherited and direct physical slots therefore
+contain $\nil$ before any superclass initializer runs.  Normal completion of
+$a_I$ resumes the factory's return frame with $o$; the existing return rule then
+returns $o$ from the primary factory.
+
+\subsection{Superclass and mixin initialization}
+
+Extend the frame grammar with the initialization frames
+\begin{equation}\label{eq:init-frames}
+\begin{split}
+ F::=\cdots&\mid\kw{superMsg}(C,o,\mu)
+ \mid\kw{afterSuper}(C,o,\mu)\\
+ &\mid\kw{mixinMsg}(C,o)
+ \mid\kw{afterMixin}(C,o).
+\end{split}
+\end{equation}
+The transitions below use the frames of Equation~\eqref{eq:init-frames}.  If
+$\super_H(C)=\Top$, necessarily $C=\Object$ and initialization proceeds
+directly to this mixin.  Otherwise the deferred superclass message is evaluated
+by Equation~\eqref{eq:message-evaluation} in the new initializer activation:
+\begin{equation}\label{eq:init-class}
+\begin{array}{c}
+\dfrac{\super_H(C)=\Top}
+ {\langle P,H,\mathcal A\cdot\langle a,\pi\rangle,
+    \kw{initClass}(C,o,\mu)\rangle
+  \longmapsto
+  \langle P,H,\mathcal A\cdot\langle a,\pi\rangle,
+    \kw{ownInit}(C,o,\mu)\rangle},\\[4mm]
+\dfrac{\super_H(C)=S\ne\Top\quad H(C).q=\langle i,s,\bar x,\kappa\rangle
+       \quad \mathsf{superMsg}(\kappa)=m_S}
+ {\langle P,H,\mathcal A\cdot\langle a,\pi\rangle,
+    \kw{initClass}(C,o,\mu)\rangle
+  \longmapsto
+  \langle P,H,\mathcal A\cdot
+    \langle a,\pi\cdot\kw{superMsg}(C,o,\mu)\rangle,
+    \kw{message}(m_S)\rangle}.
+\end{array}
+\end{equation}
+After that message becomes $\mu_S$, the superclass initializer is invoked on
+the same object, but with current class $S$, using the activation constructor
+of Equation~\eqref{eq:instance-initializer-activation}:
+\[
+\dfrac{\substack{S=\super_H(C)\quad
+       \selector(\mu_S)=\mathsf{factorySel}_H(S)\\
+       H'=\mathsf{newI}(H,a_S,S,o,\mu_S,a)}}
+ {\begin{aligned}
+  &\langle H;\mathcal A\cdot\langle a,
+       \pi\cdot\kw{superMsg}(C,o,\mu)\rangle;\mu_S\rangle_P\\[-1mm]
+  &\quad\longmapsto
+   \langle H';\mathcal A\cdot
+       \langle a,\pi\cdot\kw{afterSuper}(C,o,\mu)\rangle
+       \cdot\langle a_S,\epsilon\rangle;
+       \kw{initClass}(S,o,\mu_S)\rangle_P
+ \end{aligned}}
+\quad(\rulelabel{Init-Super})
+\]
+with fresh $a_S$.  Arity mismatch produces $\kw{wrongFactory}$.  When $a_S$
+finishes, the ordinary
+completion rule resumes the saved frame, and
+\begin{equation}\label{eq:after-super}
+ \langle\pi\cdot\kw{afterSuper}(C,o,\mu),o\rangle
+ \longmapsto\langle\pi,\kw{ownInit}(C,o,\mu)\rangle.
+\end{equation}
+
+For a body class, its own initializer runs in that same activation, using the
+slot-group form of Equation~\eqref{eq:slot-group}:
+\begin{equation}\label{eq:body-own-init}
+\dfrac{H(C).q=\langle i,s,\bar x,\kw{bodyInitializer}(m_S)\rangle\quad
+       \iota_P(\mixin_H(C))=\langle i,s,\bar x,\bar g,b_I\rangle}
+ {\kw{ownInit}(C,o,\mu)
+  \longmapsto\kw{initGroups}(o,\bar g,b_I)}.
+\end{equation}
+For an applied mixin, $m_M$ is first evaluated in the coordinator activation:
+\begin{equation}\label{eq:applied-own-init}
+\dfrac{H(C).q=\langle i_A,s,\bar x,\kw{appliedMixinInitializer}(m_S,m_M)\rangle}
+ {\langle\pi,\kw{ownInit}(C,o,\mu)\rangle
+  \longmapsto
+  \langle\pi\cdot\kw{mixinMsg}(C,o),\kw{message}(m_M)\rangle}.
+\end{equation}
+Suppose $M=\mixin_H(C)$.  Using the initializer form and mixin projection in
+Equations~\eqref{eq:mixin-initializer} and~\eqref{eq:method-projections}, write
+its initializer as
+$\iota_P(M)=\langle i_M,s_M,\bar x_M,\bar g,b_M\rangle$.  Define
+\begin{equation}\label{eq:mixin-initializer-activation}
+\begin{aligned}
+ &\mathsf{newMixin}(H,a_M,M,C,o,
+                    \langle s_M,\bar o\rangle,k)\\
+ &\qquad=H[a_M\mapsto\kw{activation}\langle
+ i_M,[\bar x_M\mapsto\bar o],\varnothing,o,C,k,a_M,\kw{true},
+ \{i_M\mapsto a_M\}\rangle].
+\end{aligned}
+\end{equation}
+Then, using the activation allocated by
+Equation~\eqref{eq:mixin-initializer-activation},
+\[
+\dfrac{\substack{\mu_M=\langle s_M,\bar o\rangle\quad
+       |\bar x_M|=|\bar o|\\
+       H'=\mathsf{newMixin}(H,a_M,M,C,o,\mu_M,a)}}
+ {\begin{aligned}
+  &\langle H;\mathcal A\cdot\langle a,
+       \pi\cdot\kw{mixinMsg}(C,o)\rangle;\mu_M\rangle_P\\[-1mm]
+  &\quad\longmapsto
+   \langle H';\mathcal A\cdot
+       \langle a,\pi\cdot\kw{afterMixin}(C,o)\rangle
+       \cdot\langle a_M,\epsilon\rangle;
+       \kw{initGroups}(o,\bar g,b_M)\rangle_P
+ \end{aligned}}
+\quad(\rulelabel{Init-Applied-Mixin})
+\]
+for fresh $a_M$.  Its current class is the new application $C$, not the class
+from which $M$ was obtained.  Finally,
+\begin{equation}\label{eq:after-mixin}
+ \langle\pi\cdot\kw{afterMixin}(C,o),o\rangle
+ \longmapsto\langle\pi,\kw{finish}(o)\rangle.
+\end{equation}
+This yields the specified order: superclass message, superclass initializer,
+applied-mixin message if any, mixin slots and body, and factory return.
+
+\subsection{Slot groups}
+\label{sec:slot-groups}
+
+Normalize an initializer group as
+\begin{equation}\label{eq:slot-group}
+\begin{aligned}
+ g&::=\kw{sequential}(\bar d)\mid\kw{simultaneous}(\bar d),\\
+ d&::=\kw{immutable}(j,e,i_t)\mid\kw{mutable}(j,e,i_t)
+       \mid\kw{mutable}(j,\kw{none}).
+\end{aligned}
+\end{equation}
+For an eager declaration, $i_t$ is the stable activation-declaration identity
+assigned by elaboration to the zero-argument closure used when that declaration
+occurs in a simultaneous group.  Sequential initialization ignores $i_t$.
+Extend the frame grammar of Equation~\eqref{eq:frame-grammar} by
+\begin{equation}\label{eq:slot-frames}
+ F::=\cdots\mid\kw{slotWrite}(o,j)
+   \mid\kw{slotStore}(o,j,\bar d,\bar g,b)
+   \mid\kw{internal}(\bar e,t)
+   \mid\kw{lazyStore}(o,j)
+   \mid\kw{nestedStore}(o,N).
+\end{equation}
+The internal $\kw{readSlot}(o,j)$ and $\kw{writeSlot}(o,j,e)$ operations use
+physical identity $j$ and do not send accessors.  They are emitted only by
+elaboration of the declaration inducing $j$.  Their rules are
+\begin{equation}\label{eq:slot-operations}
+\begin{array}{c}
+\dfrac{H(o).\sigma(j)=v}
+ {\langle P,H,\mathcal A\cdot\langle a,\pi\rangle,
+    \kw{readSlot}(o,j)\rangle
+  \longmapsto
+  \langle P,H,\mathcal A\cdot\langle a,\pi\rangle,v\rangle},\\[4mm]
+ \langle P,H,\mathcal A\cdot\langle a,\pi\rangle,
+    \kw{writeSlot}(o,j,e)\rangle
+ \longmapsto
+ \langle P,H,\mathcal A\cdot
+    \langle a,\pi\cdot\kw{slotWrite}(o,j)\rangle,e\rangle,\\[3mm]
+ \langle P,H,\mathcal A\cdot
+    \langle a,\pi\cdot\kw{slotWrite}(o,j)\rangle,v\rangle
+ \longmapsto
+ \langle P,H[o.\sigma(j)\mapsto v],
+    \mathcal A\cdot\langle a,\pi\rangle,v\rangle.
+\end{array}
+\end{equation}
+Empty initialization enters the initializer body:
+\begin{equation}\label{eq:init-groups-empty}
+ \kw{initGroups}(o,\epsilon,b)
+   \longmapsto\kw{body}(\kw{methodBody}(o),b).
+\end{equation}
+Groups are taken in source order.  A sequential group is replaced by its
+declaration state machine:
+\begin{equation}\label{eq:init-group-sequential}
+ \kw{initGroups}(o,\kw{sequential}(\bar d)\cdot\bar g,b)
+ \longmapsto\kw{initSeq}(o,\bar d,\bar g,b).
+\end{equation}
+An uninitialized mutable declaration advances without a write, because every
+slot was already set to $\nil$ by \rulelabel{Factory-New}.  A declaration with
+an initializer evaluates it before writing:
+\begin{equation}\label{eq:init-sequential}
+\begin{array}{c}
+ \kw{initSeq}(o,\kw{mutable}(j,\kw{none})\cdot\bar d,\bar g,b)
+ \longmapsto\kw{initSeq}(o,\bar d,\bar g,b),\\[1mm]
+\dfrac{d\in\{\kw{immutable}(j,e,i_t),\kw{mutable}(j,e,i_t)\}}
+ {\langle\pi,\kw{initSeq}(o,d\cdot\bar d,\bar g,b)\rangle
+  \longmapsto
+  \langle\pi\cdot\kw{slotStore}(o,j,\bar d,\bar g,b),e\rangle},\\[1mm]
+ \langle H;\mathcal A\cdot\langle a,
+    \pi\cdot\kw{slotStore}(o,j,\bar d,\bar g,b)\rangle;v\rangle_P
+ \longmapsto
+ \langle H[o.\sigma(j)\mapsto v];\mathcal A\cdot\langle a,\pi\rangle;
+    \kw{initSeq}(o,\bar d,\bar g,b)\rangle_P,\\[1mm]
+ \kw{initSeq}(o,\epsilon,\bar g,b)
+ \longmapsto\kw{initGroups}(o,\bar g,b).
+\end{array}
+\end{equation}
+
+Simultaneous groups are specified by an elaboration into the ordinary
+\NS{} library protocol.  If the declarations with right-hand sides, in source
+order, are
+$j_1=e_1\ @\ i_{t_1},\ldots,j_n=e_n\ @\ i_{t_n}$, let $e_F$ be the annotated
+core send that
+denotes \PastFuture{} in this initializer's lexical context.  Using the direct
+slot operations of Equation~\eqref{eq:slot-operations}, define
+\begin{equation}\label{eq:simultaneous-expansion}
+\begin{split}
+ \mathsf{simCode}_a(o,\bar d)=\langle{}
+ &\kw{writeSlot}(o,j_1,
+      \kw{send}(e_F,\kws{computing},[e_1]_{i_{t_1}})),\ldots,\\
+ &\kw{writeSlot}(o,j_n,
+      \kw{send}(e_F,\kws{computing},[e_n]_{i_{t_n}})),\\
+ &\kw{send}(\kw{readSlot}(o,j_1),\#\kw{resolve},\epsilon),\ldots,
+  \kw{send}(\kw{readSlot}(o,j_n),\#\kw{resolve},\epsilon)\rangle,
+\end{split}
+\end{equation}
+where $[e_i]_{i_{t_i}}$ denotes the zero-argument closure with declaration
+identity $i_{t_i}$ created in activation $a$, and
+uninitialized mutable declarations contribute no term.  Then, using the
+expansion of Equation~\eqref{eq:simultaneous-expansion},
+\begin{equation}\label{eq:init-group-simultaneous}
+ \kw{initGroups}(o,\kw{simultaneous}(\bar d)\cdot\bar g,b)
+ \longmapsto
+ \kw{internalSeq}(\mathsf{simCode}_a(o,\bar d),
+                  \kw{initGroups}(o,\bar g,b)).
+\end{equation}
+$\kw{internalSeq}$ in Equation~\eqref{eq:init-group-simultaneous} is not a new
+evaluation mechanism.  It is defined by
+\begin{equation}\label{eq:internal-sequence}
+\begin{array}{rcl}
+ \kw{internalSeq}(\epsilon,t)&\longmapsto&t,\\
+ \langle\pi,\kw{internalSeq}(e\cdot\bar e,t)\rangle
+   &\longmapsto&
+   \langle\pi\cdot\kw{internal}(\bar e,t),e\rangle,\\
+ \langle\pi\cdot\kw{internal}(\bar e,t),v\rangle
+   &\longmapsto&\langle\pi,\kw{internalSeq}(\bar e,t)\rangle.
+\end{array}
+\end{equation}
+As elsewhere, the pair notation leaves $P,H,\mathcal A$, and the current
+activation unchanged.  By Equation~\eqref{eq:internal-sequence}, consequently
+every future is installed before the first is resolved, and all
+evaluation, forwarding, recursive resolution, and failure behavior is that of
+the specified \PastFuture{} class under the ordinary send rules.  The draft
+chooses source order for the final \kw{resolve} sends; whether the Specification
+intends this order to be observable is recorded as an explicit question in the
+coverage ledger.
+
+\subsection{Synthesized slot and nested-class methods}
+\label{sec:synthesized-methods}
+
+Ordinary immutable and mutable getters elaborate to
+$\kw{return}(\kw{currentRead}(j))$.  The activation-relative primitives reduce
+to the direct slot operations of Equation~\eqref{eq:slot-operations}:
+\begin{equation}\label{eq:current-slot-operations}
+\begin{gathered}
+\dfrac{H(a).o=o}
+ {\kw{currentRead}(j)\longmapsto\kw{readSlot}(o,j)},
+\\[1.1ex]
+\dfrac{H(a).o=o}
+ {\kw{currentWrite}(j,e)\longmapsto\kw{writeSlot}(o,j,e)}.
+\end{gathered}
+\end{equation}
+The abbreviated rules preserve the surrounding configuration.  A mutable
+setter invokes \kw{currentWrite} with slot identifier $j$ and argument $x$, then
+returns \kw{self}.  Getter and setter both retain the declared access level.
+Thus initialization never invokes an overridable accessor.
+
+A lazy declaration also allocates physical slot $j$, initially $\nil$, and its
+getter body contains $\kw{lazyRead}(j,e)$.  In a getter activation whose current
+instance is $o$, the $\kw{lazyStore}$ frame declared in
+Equation~\eqref{eq:slot-frames} completes the direct write:
+\begin{equation}\label{eq:lazy-read}
+\begin{array}{c}
+\dfrac{H(a).o=o\quad H(o).\sigma(j)=v\ne\nil}
+ {\langle P,H,\mathcal A\cdot\langle a,\pi\rangle,
+    \kw{lazyRead}(j,e)\rangle
+  \longmapsto
+  \langle P,H,\mathcal A\cdot\langle a,\pi\rangle,v\rangle},\\[4mm]
+\dfrac{H(a).o=o\quad H(o).\sigma(j)=\nil}
+ {\langle P,H,\mathcal A\cdot\langle a,\pi\rangle,
+    \kw{lazyRead}(j,e)\rangle
+  \longmapsto
+  \langle P,H,\mathcal A\cdot
+    \langle a,\pi\cdot\kw{lazyStore}(o,j)\rangle,e\rangle},\\[4mm]
+ \langle P,H,\mathcal A\cdot
+    \langle a,\pi\cdot\kw{lazyStore}(o,j)\rangle,v\rangle
+ \longmapsto
+ \langle P,H[o.\sigma(j)\mapsto v],
+    \mathcal A\cdot\langle a,\pi\rangle,v\rangle.
+\end{array}
+\end{equation}
+There is deliberately no in-progress sentinel: a recursive read while the slot
+is still $\nil$ starts another evaluation, and an initializer returning $\nil$
+causes the next read to evaluate it again.  A mutable lazy setter is the same
+direct setter as Equation~\eqref{eq:current-slot-operations} and may reset the
+slot to $\nil$.
+
+Finally, a nested declaration $N$ induces a getter whose body contains
+$\kw{nestedClass}(N,E_C)$, where $E_C$ is one of the normalized class forms in
+Equation~\eqref{eq:class-forms}.  For
+current receiver $o$, the $\kw{nestedStore}$ frame from
+Equation~\eqref{eq:slot-frames} records a newly evaluated class:
+\begin{equation}\label{eq:nested-class-cache}
+\begin{array}{c}
+\dfrac{H(a).o=o\quad H(o).\eta(N)=C}
+ {\langle H;\mathcal A\cdot\langle a,\pi\rangle;
+    \kw{nestedClass}(N,E_C)\rangle_P
+  \longmapsto
+  \langle H;\mathcal A\cdot\langle a,\pi\rangle;C\rangle_P},\\[4mm]
+\dfrac{H(a).o=o\quad N\notin\dom(H(o).\eta)}
+ {\begin{aligned}
+  &\langle H;\mathcal A\cdot\langle a,\pi\rangle;
+    \kw{nestedClass}(N,E_C)\rangle_P\\[-1mm]
+  \longmapsto
+  &\quad\langle H;\mathcal A\cdot
+    \langle a,\pi\cdot\kw{nestedStore}(o,N)\rangle;
+    \kw{classWithEO}(E_C,o)\rangle_P
+  \end{aligned}},\\[4mm]
+ \langle H;\mathcal A\cdot
+    \langle a,\pi\cdot\kw{nestedStore}(o,N)\rangle;C\rangle_P
+ \longmapsto
+ \langle H[o.\eta(N)\mapsto C];
+    \mathcal A\cdot\langle a,\pi\rangle;C\rangle_P.
+\end{array}
+\end{equation}
+$\kw{classWithEO}$ used by Equation~\eqref{eq:nested-class-cache} is precisely
+\begin{equation}\label{eq:class-with-enclosing-object}
+\begin{aligned}
+ &\langle\pi,\kw{classWithEO}
+       (\kw{classBody}(\chi_b,e_S),o)\rangle
+   \longmapsto\langle\pi\cdot\kw{makeBody}(\chi_b,o),e_S\rangle,\\
+ &\kw{classWithEO}(\kw{mixinApply}(\chi_a,e_S,e_M),o)
+   \longmapsto\kw{mixinApply}(\chi_a,e_S,e_M).
+\end{aligned}
+\end{equation}
+The second clause of Equation~\eqref{eq:class-with-enclosing-object} ignores the
+forced object because the enclosing object of a
+mixin application is, by definition, copied from its mixin-source class.  The
+cache belongs to the receiver, so two
+instances obtain distinct nested classes, while repeated sends to one receiver
+return the identical class even if inputs used by its superclass expression
+subsequently change.
+
+\section{Remaining sequential language}
+\label{sec:remaining-sequential}
+
+This section closes the sequential surface-language layer.  Its rules do not
+add special cases to dispatch: compound literals elaborate to sends, an object
+literal reuses class and factory construction, and top-level execution merely
+supplies a distinguished activation.  The fixed platform entries introduced
+below are the current specified meaning of literals; they are not implicit
+receivers and consequently cannot be shadowed by user declarations.
+
+\subsection{Atomic and tuple literals}
+\label{sec:literals}
+
+An atomic literal payload is
+\begin{equation}\label{eq:atom-payload}
+\begin{split}
+ \omega::={}&\kw{integer}(n)\mid\kw{fixed}(q)\mid
+ \kw{boolean}(b)\mid\kw{nilAtom}\mid
+ \kw{string}(u)\mid\kw{symbol}(u),
+\end{split}
+\end{equation}
+where $n\in\mathbb Z$, $q\in\mathbb Q$, $b$ is a mathematical Boolean, and
+$u$ is a Unicode-normal-form-C string.  The decoder
+for a digit character $c$ is $\mathsf{dig}(c)\in\{0,\ldots,35\}$, with letters
+denoting 10 through 35.  If the integer digits are
+$u_0\ldots u_{n-1}$, the fractional digits are $f_1\ldots f_m$, the radix is
+$r$ (10 when omitted), the sign is $\varepsilon\in\{-1,1\}$, and the decimal
+exponent is $z$ (zero when omitted), define
+\begin{equation}\label{eq:number-decoding}
+ \mathsf{num}(r,\varepsilon,u,f,z)=
+ \varepsilon\left(
+   \sum_{i=0}^{n-1}\mathsf{dig}(u_i)r^{n-1-i}+
+   \sum_{i=1}^{m}\mathsf{dig}(f_i)r^{-i}
+ \right)10^z.
+\end{equation}
+Every digit must be smaller than $r$.  A numeral with neither a fraction nor
+an exponent elaborates to
+$\kw{atom}(\kw{integer}(\mathsf{num}(r,\varepsilon,u,\epsilon,0)))$;
+every other numeral elaborates to the corresponding $\kw{fixed}$ payload.
+Thus the exponent is decimal even for a radix numeral, matching the specified
+grammar and parser behavior, and integer magnitude is unbounded.
+
+The static map $P.\mathit{atom}$ of
+Equation~\eqref{eq:program-definition} is canonical:
+\begin{equation}\label{eq:atom-canonicality}
+ P.\mathit{atom}(\omega_1)=P.\mathit{atom}(\omega_2)
+ \quad\Longleftrightarrow\quad \omega_1=\omega_2.
+\end{equation}
+The initial heap contains all referenced atomic objects with the platform
+classes required by their payloads.  String decoding applies Unicode NFC
+before Equation~\eqref{eq:atom-canonicality}; symbol spelling is decoded by
+the symbol grammar and canonicalized in the same way.  Boolean and nil syntax
+maps to the three distinguished payloads.  Specification 0.109 removes both
+character-literal syntax and the \kw{Character} platform class; neither occurs
+in the semantic domains.  The atomic evaluation rule is
+\[
+ \langle P,H,\mathcal A\cdot\langle a,\pi\rangle,
+          \kw{atom}(\omega)\rangle
+ \longmapsto
+ \langle P,H,\mathcal A\cdot\langle a,\pi\rangle,
+          P.\mathit{atom}(\omega)\rangle.
+ \tag{Atom}
+\]
+Numeric, Boolean, nil, string, and symbol atoms are value objects.
+The mapping is an implementation freedom only as to representation: it must
+preserve the exact payload, the specified class protocol, and the identity
+condition in Equation~\eqref{eq:atom-canonicality}.
+
+Tuple literals use the fixed platform bindings
+\begin{equation}\label{eq:tuple-platform-bindings}
+ R=P.\mathit{platform}(\kw{ReadOnlyTuple}),\qquad
+ B=P.\mathit{platform}(\kw{Array}).
+\end{equation}
+Let $\underline n$ abbreviate the integer atom for $n$.  Using the bindings in
+Equation~\eqref{eq:tuple-platform-bindings}, their specified expansion is
+\begin{equation}\label{eq:tuple-expansion}
+\begin{array}{rcl}
+ \mathsf{tupleElab}_P(\epsilon)
+  &=&\kw{send}(R,\kws{new},\langle\underline0\rangle),\\[1mm]
+ \mathsf{tupleElab}_P(\langle e_1,\ldots,e_n\rangle)
+  &=&\kw{send}\bigl(R,\kws{fromArray},
+       \langle\mathsf{cascade}(A_n,\bar m_n)\rangle\bigr),\\
+ A_n&=&\kw{send}(B,\kws{new},\langle\underline n\rangle),\\
+ \bar m_n&=&\langle
+   \langle\selsym{at:put:},\langle\underline1,e_1\rangle\rangle,\ldots,
+   \langle\selsym{at:put:},\langle\underline n,e_n\rangle\rangle,
+   \langle\selsym{yourself},\epsilon\rangle\rangle.
+\end{array}
+\end{equation}
+Here $\mathsf{cascade}$ is exactly the single-receiver surface cascade whose
+closure elaboration is fixed in Section~\ref{sec:surface}.  Hence $A_n$ is
+evaluated once and the $e_i$ are evaluated in source order by the ordinary
+send rules of Section~\ref{sec:machine}.  Formally,
+\begin{equation}\label{eq:tuple-step}
+ \kw{tuple}(\bar e)\longmapsto\mathsf{tupleElab}_P(\bar e).
+\end{equation}
+The surrounding configuration is unchanged.  Tuple objects are shallowly
+immutable; unlike the atomic literals above, the Specification does not make
+them deeply immutable merely by virtue of being literal tuples.
+
+\subsection{Pattern literals}
+\label{sec:patterns}
+
+Pattern literals are syntax-directed library expressions.  Let
+\begin{equation}\label{eq:pattern-binding}
+ \mathsf{Pattern}_d=
+   \kw{implicit}(\#\kw{Pattern},\epsilon,d),
+\end{equation}
+where $d$ is the lexical annotation selected during elaboration as in
+Equation~\eqref{eq:core-expressions}.  For a wildcard, a literal, and a nested
+pattern, respectively, define
+\begin{equation}\label{eq:pattern-components}
+\begin{array}{rcl}
+ \mathsf{pat}_P(\_,d)&=&
+   \kw{send}(\mathsf{Pattern}_d,\#\kw{wildcard},\epsilon),\\
+ \mathsf{pat}_P(l,d)&=&
+   \kw{send}(\mathsf{Pattern}_d,\kws{literal},\langle l\rangle),\\
+ \mathsf{pat}_P(\langle p\rangle,d)&=&\kw{pattern}(p,d).
+\end{array}
+\end{equation}
+For keyword pairs $k_1p_1\ldots k_np_n$, let $\bar k$ be the tuple of symbol
+atoms $\#k_1,\ldots,\#k_n$ and let $\bar p$ be the tuple of the corresponding
+component expansions from Equation~\eqref{eq:pattern-components}.  Then
+\begin{equation}\label{eq:keyword-pattern-expansion}
+\begin{split}
+ &\mathsf{pat}_P(k_1p_1\ldots k_np_n,d)=\\[-1mm]
+ &\quad\kw{send}\bigl(\mathsf{Pattern}_d,
+      \selsym{keywords:patterns:},
+      \langle\kw{tuple}(\bar k),\kw{tuple}(\bar p)\rangle\bigr).
+\end{split}
+\end{equation}
+The tuples in Equation~\eqref{eq:keyword-pattern-expansion} are ordered
+collections; a conforming Pattern library may copy them into its preferred
+list representation.  Pattern evaluation is now only the expansion
+\begin{equation}\label{eq:pattern-step}
+ \kw{pattern}(p,d)\longmapsto\mathsf{pat}_P(p,d),
+\end{equation}
+after which ordinary lookup, access control, and argument order apply.  In
+particular, rebinding \kw{Pattern} changes the meaning of the literal, and a
+pattern literal is therefore not a top-level-independent literal.
+
+The Specification gives syntax for a variable component $?x$ but gives no
+expression that constructs it and no required representation beyond its role
+in a later binding object.  For a variable occurrence at site $z$, this draft
+therefore uses the explicit elaboration parameter
+\begin{equation}\label{eq:variable-pattern-parameter}
+ \mathsf{pat}_P(?x_z,d)=P.\mathit{patternVariable}(z).
+\end{equation}
+Equation~\eqref{eq:variable-pattern-parameter} is not implementation latitude
+for the other pattern forms: it isolates the one missing normative clause.
+Once that constructor protocol is specified, the map is replaced by its
+ordinary-send expansion.  The current library's \kw{NamedPattern} suggests an
+implementation, but does not determine language semantics.
+
+\subsection{Object literals}
+\label{sec:object-literals}
+
+Elaboration assigns an object literal the descriptor
+\begin{equation}\label{eq:object-literal-descriptor}
+ \chi_o=\langle L,u,M,M_c,m_S\rangle.
+\end{equation}
+$L$ is its stable object-literal declaration, $u$ records whether its
+superclass clause was implicit, $M$ is the shared body mixin, $M_c$ is a
+synthetic class-side mixin containing a public nullary \kw{new} factory, and
+$m_S$ is the deferred superclass initializer message.  Its own initializer
+has the normalized form
+$\iota_P(M)=\langle i_I,\#\kw{new},\epsilon,\bar g,b_I\rangle$ from
+Equations~\eqref{eq:mixin-initializer} and~\eqref{eq:method-projections}.
+Thus each evaluation will allocate a class,
+but every evaluation of the same $L$ applies the identical $M$.
+
+The current activation itself encloses a non-top-level object literal.  A
+top-level activation is deliberately excluded because top-level expressions
+have no enclosing object:
+\begin{equation}\label{eq:object-literal-enclosing-object}
+ \mathsf{literalEO}_H(a)=
+ \begin{cases}
+   \nil & H(a).p=\kw{top},\\
+   a & \text{otherwise.}
+ \end{cases}
+\end{equation}
+Extend the frame grammar in Equation~\eqref{eq:frame-grammar} by
+\begin{equation}\label{eq:object-literal-frame}
+ F::=\cdots\mid\kw{makeObject}(\chi_o,eo).
+\end{equation}
+Evaluation first fixes the enclosing object using
+Equation~\eqref{eq:object-literal-enclosing-object}, then evaluates the
+normalized superclass expression:
+\[
+\dfrac{eo=\mathsf{literalEO}_H(a)}
+ {\begin{aligned}
+  &\langle H;\mathcal A\cdot\langle a,\pi\rangle;
+       \kw{objectLiteral}(\chi_o,e_S)\rangle_P\\[-1mm]
+  &\quad\longmapsto
+   \langle H;\mathcal A\cdot\langle a,
+       \pi\cdot\kw{makeObject}(\chi_o,eo)\rangle;e_S\rangle_P
+ \end{aligned}}
+\quad(\rulelabel{Object-Super})
+\]
+If $eo=\nil$, omission elaborates $e_S$ to the fixed
+$P.\mathit{platform}(\kw{Object})$.  Otherwise omission elaborates $e_S$ to
+the annotated implicit send \kw{Object}; hence a surrounding module may
+rebind the default.  In both cases omission supplies the deferred message
+$\langle\#\kw{new},\epsilon\rangle$.
+
+After a valid superclass result, class allocation uses
+Equation~\eqref{eq:allocate-class}; evaluation immediately continues as an
+ordinary send of \kw{new} to that fresh class:
+\[
+\dfrac{\substack{\mathsf{inhErr}_H(S,m_S)=\undef\\
+       eo\ne\nil\ \lor\ (u=\kw{implicitSuperclass}\land
+          S=P.\mathit{platform}(\kw{Object}))\\
+       \iota_P(M)=\langle i_I,\#\kw{new},\epsilon,\bar g,b_I\rangle\\
+       q=\langle i_I,\#\kw{new},\epsilon,\kw{bodyInitializer}(m_S)\rangle\\
+       H'=\mathsf{allocClass}(H,C,C_m,\kw{expression}(L),M,S,eo,M_c,q)}}
+ {\begin{aligned}
+  &\langle H;\mathcal A\cdot\langle a,
+       \pi\cdot\kw{makeObject}(\chi_o,eo)\rangle;S\rangle_P\\[-1mm]
+  &\qquad\longmapsto
+   \langle H';\mathcal A\cdot\langle a,\pi\rangle;
+       \kw{dispatch}(\kw{ordinaryRequest}(C),
+          \langle\#\kw{new},\epsilon\rangle)\rangle_P
+ \end{aligned}}
+\quad(\rulelabel{Object-Commit})
+\]
+where $C,C_m$ are fresh.  The ordinary dispatch reaches the synthesized
+factory body in Equation~\eqref{eq:primary-factory-body}, so
+\rulelabel{Factory-New} allocates the fresh result object and all superclass
+and mixin initialization rules apply unchanged.  Consequently the result
+object, its implicit class, and that class's metaclass are fresh on every
+evaluation, while the mixin named by $L$ is shared.
+
+The invalid-inheritance schema for object literals is
+\begin{equation}\label{eq:object-inheritance-error}
+\dfrac{\mathsf{inhErr}_H(v,m_S)=\xi\ne\undef}
+ {\langle P,H,\mathcal A\cdot\langle a,
+       \pi\cdot\kw{makeObject}(\chi_o,eo)\rangle,v\rangle
+  \longmapsto
+  \langle P,H,\mathcal A\cdot\langle a,\pi\rangle,
+       \kw{runtimeError}(\xi)\rangle}.
+\end{equation}
+When the inheritance itself is valid but a top-level object literal has an
+explicit superclass, the corresponding rule is
+\begin{equation}\label{eq:object-top-superclass-error}
+\dfrac{\mathsf{inhErr}_H(S,m_S)=\undef\quad eo=\nil\quad
+       (u\ne\kw{implicitSuperclass}\ \lor\
+        S\ne P.\mathit{platform}(\kw{Object}))}
+ {\langle P,H,\mathcal A\cdot\langle a,
+       \pi\cdot\kw{makeObject}(\chi_o,eo)\rangle,S\rangle
+  \longmapsto
+  \langle P,H,\mathcal A\cdot\langle a,\pi\rangle,
+       \kw{runtimeError}(\kw{topSuperclass})\rangle}.
+\end{equation}
+
+\subsection{Modules and value status}
+\label{sec:modules}
+
+The creation provenance retained by every class record in
+Equation~\eqref{eq:heap-records} makes the module distinction stable and
+heap-local.  Define
+\begin{equation}\label{eq:module-definition}
+\begin{split}
+ \mathsf{moduleDefinition}_{P,H}(C)\quad\Longleftrightarrow\quad{}
+ &\mathsf{isClass}_H(C)\ \land\ \mathsf{hasFactory}_H(C)\ \land\\[-1mm]
+ &H(C).\chi_C=\kw{expression}(D)\ \land\
+   P.\mathit{owner}(D)=\kw{topOwner}.
+\end{split}
+\end{equation}
+The factory test excludes the metaclass allocated at the same declaration.
+Equation~\eqref{eq:module-definition} includes a top-level mixin application:
+its class retains the application declaration $D$ even though it shares the
+source class's mixin.  A module instance is exactly
+\begin{equation}\label{eq:module-instance}
+ \mathsf{module}_{P,H}(o)\quad\Longleftrightarrow\quad
+ \mathsf{moduleDefinition}_{P,H}(\classof_H(o)).
+\end{equation}
+Every module definition satisfies the Specification's primitive value-object
+clause, irrespective of reflective mutability.  This does not make its module
+instances values.  More generally, base-level value status is the greatest
+fixed point containing the specified atomic objects and module definitions and
+closed under the structural value conditions (initialized immutable slots,
+value contents and enclosing objects, inheritance from \kw{Value}, and no
+direct identity-method override).  Reflection may alter behavior without
+altering this base-level classification; its causal effect is deferred to the
+reflective layer.
+
+\subsection{Top-level programs, compilation units, and entry}
+\label{sec:top-level}
+
+The least top-level-expression predicate is
+\begin{equation}\label{eq:top-level-expression}
+\begin{array}{@{}rcl@{}}
+ \mathsf{TL}_P(\kw{atom}(\omega))&\Leftarrow&\kw{true},\\
+ \mathsf{TL}_P(\kw{closureLiteral}(q,\bar x,\ell,b))&\Leftarrow&\kw{true},\\
+ \mathsf{TL}_P(\kw{tuple}(\bar e))&\Leftarrow&
+   \forall e_i\in\bar e.\ \mathsf{TL}_P(e_i),\\
+ \mathsf{TL}_P(\kw{objectLiteral}(\chi_o,e_S))
+   &\Leftarrow&\chi_o=\langle L,u,M,M_c,m_S\rangle\ \land\
+     P.\mathit{owner}(L)=\kw{topOwner},\\
+ \mathsf{TL}_P(E_C)&\Leftarrow&
+   E_C\text{ is a class form induced by }D\ \land\
+   P.\mathit{owner}(D)=\kw{topOwner},\\
+ \mathsf{TL}_P(\kw{send}(e,s,\bar e))&\Leftarrow&
+   \mathsf{TL}_P(e)\ \land\
+   \forall e_i\in\bar e.\ \mathsf{TL}_P(e_i),\\
+ \mathsf{TL}_P((e))&\Leftarrow&\mathsf{TL}_P(e).
+\end{array}
+\end{equation}
+There are no other clauses.  Thus implicit, self, outer, super, and eventual
+sends are rejected at top level.  Pattern literals are also excluded because
+their expansion in Equation~\eqref{eq:pattern-binding} depends on an implicit
+send.  The ownership premises exclude a class
+or object literal lexically nested in another body, even if its AST is
+considered in isolation.  Parentheses disappear after this judgment.
+
+A top-level activation has no parameters or slots and has nil current
+instance, current class, continuation, and home.  With fresh $a_T$, define
+\begin{equation}\label{eq:new-top-activation}
+ \mathsf{newTop}(H,a_T)=H[a_T\mapsto\kw{activation}\langle
+ \kw{top},\varnothing,\varnothing,\nil,\nil,\nil,\nil,
+ \kw{true},\varnothing\rangle].
+\end{equation}
+For a well-formed source program, execution begins at
+\begin{equation}\label{eq:run-program}
+ \mathsf{run}(P,H,e)=
+ \langle P,\mathsf{newTop}(H,a_T),
+   \epsilon\cdot\langle a_T,\epsilon\rangle,e\rangle
+ \quad\text{if }\mathsf{TL}_P(e),
+\end{equation}
+where $a_T$ is fresh.  A value with no pending top-level frame halts:
+\[
+\dfrac{H(a).p=\kw{top}}
+ {\langle P,H,\epsilon\cdot\langle a,\epsilon\rangle,v\rangle
+  \longmapsto
+  \langle P,H[a.q_a\mapsto\kw{false}],\epsilon,
+       \kw{halt}(v)\rangle}.
+\quad(\rulelabel{Top-Halt})
+\]
+Closures created during Equation~\eqref{eq:run-program} capture nil current
+instance and class through the ordinary closure-creation rule; the top
+activation remains their lexical activation record.
+
+A compilation unit is source text paired with a language id:
+\begin{equation}\label{eq:compilation-unit}
+ U=\langle\lambda,u\rangle
+ \in\mathit{LanguageId}\times\mathit{SourceText}.
+\end{equation}
+Section~\ref{sec:front-end} defines PEG recognition, language-specific
+elaboration, compilation by reified Newspeak objects, and the resulting
+$\langle P,e\rangle$.  The current implementation's restriction of
+Equation~\eqref{eq:compilation-unit} to one top-level class is a temporary
+accepted-syntax restriction, not a different dynamic semantics.  Serialization
+must preserve the stable identities in $P$, the referenced atomic values, and
+all reachable heap records.
+
+Finally, if $p=P.\mathit{platform}(\kw{platform})$ is the supplied platform
+object and $r$ is the host's argument-list object, application entry is the
+top-level expression
+\begin{equation}\label{eq:application-entry}
+ \mathsf{entry}(o,p,r)=
+   \kw{send}(o,\selsym{main:args:},\langle p,r\rangle).
+\end{equation}
+It is admitted exactly when
+\begin{equation}\label{eq:application-object}
+ \mathsf{application}_{P,H}(o)\quad\Longleftrightarrow\quad
+ \exists f,C_f.\ P,H\vdash
+ \lookup_{pub}(\selsym{main:args:},\classof_H(o))=\langle f,C_f\rangle
+ \ \land\ |f.\bar x|=2.
+\end{equation}
+Execution of Equation~\eqref{eq:application-entry} is then
+Equation~\eqref{eq:run-program}.  Linking and module instantiation performed
+by that method are ordinary sends.
+
+\subsection{The exception-library boundary}
+\label{sec:exception-boundary}
+
+Newspeak has no exception declaration, throw expression, catch expression, or
+handler stack in its core syntax.  Signaling, catching, passing, returning,
+and resuming are library operations implemented with ordinary objects and
+reflective access to activations and continuations.  Adding built-in handler
+rules here would therefore duplicate, and potentially contradict, that
+library semantics.
+
+The VM can nevertheless detect failures such as those produced by
+Equations~\eqref{eq:inheritance-error-step},
+\eqref{eq:top-superclass-error}, \eqref{eq:object-inheritance-error}, and the
+failed return in \rulelabel{Return-Cannot}.  The platform supplies a total
+reification operation
+\begin{equation}\label{eq:exception-reification}
+ \mathsf{reifyError}_P(H,\xi)=\langle H',x\rangle,
+\end{equation}
+where $H'$ extends $H$ without changing an existing record, $x$ is a near
+exception object representing $\xi$, and ordinary public dispatch of
+$\langle\#\kw{signal},\epsilon\rangle$ to $x$ is defined.  Reification may
+allocate a fresh exception and its immutable diagnostic data; it may not
+invoke user code.
+
+Both internal control terms cross the boundary in the same way:
+\[
+\dfrac{\mathsf{reifyError}_P(H,\xi)=\langle H',x\rangle}
+ {\begin{aligned}
+  &\langle H;\mathcal A\cdot\langle a,\pi\rangle;
+       \kw{runtimeError}(\xi)\rangle_P\\[-1mm]
+  &\quad\longmapsto
+   \langle H';\mathcal A\cdot\langle a,\pi\rangle;
+       \kw{dispatch}(\kw{ordinaryRequest}(x),
+          \langle\#\kw{signal},\epsilon\rangle)\rangle_P
+ \end{aligned}}
+\quad(\rulelabel{Runtime-Error-Signal})
+\]
+\[
+\dfrac{\mathsf{reifyError}_P(H,\xi)=\langle H',x\rangle}
+ {\begin{aligned}
+  &\langle H;\mathcal A\cdot\langle a,\pi\rangle;
+       \kw{throw}(\xi)\rangle_P\\[-1mm]
+  &\quad\longmapsto
+   \langle H';\mathcal A\cdot\langle a,\pi\rangle;
+       \kw{dispatch}(\kw{ordinaryRequest}(x),
+          \langle\#\kw{signal},\epsilon\rangle)\rangle_P
+ \end{aligned}}
+\quad(\rulelabel{Throw-Signal})
+\]
+The original frames $\pi$ remain in place.  If the library resumes the
+exception, the \kw{signal} send returns a value at the failure point; if it
+handles, passes, or returns from it, its ordinary sends and reflective
+continuation operations determine the transfer.  In particular, no base rule
+silently discards sequence frames.  The activation and stack-mirror operations
+in Equations~\eqref{eq:actor-stack-snapshot},
+\eqref{eq:replace-current-actor-stack}, and
+\eqref{eq:replace-resume-paused-actor-stack} provide the control primitives
+used by the standard library; they do not add a second notion of exception
+handling.
+
+\input{actor-semantics}
+
+\input{reflection-semantics}
+
+\input{gc-semantics}
+
+\input{front-end-semantics}
+
+\section{Established invariants and mechanization status}
+
+The following are semantic invariants, admissibility conditions for reflective
+transactions, and the principal claims tracked by the machine-checked
+companion:
+\begin{enumerate}
+\item every ordinary object has exactly one live class;
+\item every base class chain is finite and ends in \Top;
+\item each class retains the identity of its applied mixin and enclosing object;
+\item each class retains a tagged creation origin and its inducing source
+      declaration;
+\item each created class has a fresh metaclass, while repeated applications may
+      deliberately share an instance-side mixin;
+\item each mixin retains its inducing declaration identity;
+\item an object's physical layout contains exactly the disjoint root-to-leaf
+      slot layouts of its class chain, all initialized to $\nil$ before any
+      instance initializer executes;
+\item a nested-class cache is per receiver and contains at most one class for
+      each inducing declaration identity;
+\item equal atomic payloads denote the same canonical literal object;
+\item each object-literal evaluation creates a fresh object, class, and
+      metaclass but reuses the literal declaration's mixin;
+\item a module definition is precisely an instantiable class created by a
+      top-level class expression and is a value object;
+\item direct method selectors are unique within a mixin after elaboration;
+\item a dispatch result determines both the method and the activation's current
+      class---method bodies never recompute the latter from the receiver alone;
+\item private methods participate only in lexical private selection and
+      unrestricted system lookup, never inherited public/protected lookup;
+\item failed user dispatch invokes DNU exactly once for the original message;
+      failure inside the chosen DNU body is an ordinary new computation;
+\item mutable objects and active computations belong to exactly one actor;
+      cross-actor arguments contain only values, far references, or promise
+      identities;
+\item no actor observes a far reference into its own heap, because transfer
+      back to the target actor normalizes it to the near referent;
+\item every actor executes at most one turn, takes mailbox entries in FIFO
+      order, and receives causally related packets in E-order;
+\item each promise is settled at most once, by fulfillment or breaking, and
+      every dependent eventual send is resumed only after settlement;
+\item reflective source-structure changes and all required re-elaboration are
+      committed atomically.
+\item every reflective read or change is authorized by an unforgeable mirror
+      whose target and rights cover that exact operation;
+\item a successful reflective transaction advances exactly one VM program
+      version, and a failed transaction changes no program, heap, activation,
+      continuation, or version component;
+\item reflective layout migration preserves retained physical slot identities,
+      initializes new slots to $\nil$, and makes removed slots unreachable;
+\item every actor in one VM cohort observes the same committed program version,
+      while a distinct VM changes only through its own authorized transaction;
+\item already materialized control is not rewritten by a code install, whereas
+      later dispatch---including dispatch of an in-flight message---uses the
+      version current when that dispatch occurs;
+\item every running or paused nonempty actor stack has exactly one active
+      control image at its top; each lower activation has an explicit suspended
+      term and resumable control location;
+\item every copied live frame has a fresh activation identity, while retained
+      frames preserve identity and stack-structural links internal to a copied
+      segment are consistently renamed;
+\item a paused-stack mutation succeeds only for its current unforgeable pause
+      token, and every successful mutation invalidates that token;
+\item stack replacement is atomic, makes discarded activations
+      uncontinuable, and exposes no partially materialized frame;
+\item full-speed resumption continues the ordinary sequential relation from
+      the installed control image rather than introducing a second execution
+      semantics.
+\item a weak array does not retain its elements; collection atomically replaces
+      every cell whose target is reclaimed by $\nil$;
+\item a weak map does not retain its keys, while the value of an entry is
+      conditionally strong exactly when both the map and its key are strongly
+      reachable; a value-to-key cycle cannot retain that key;
+\item every retained weak-container reference resolves after collection,
+      because entries or cells naming a selected identity are cleared in the
+      same safepoint transition.
+\item every accepted compilation unit has a successful PEG parse, injective
+      source identities, a statically well-formed surface AST, and an
+      independently checkable annotated-core image;
+\item parser, elaborator, compiler, and Simulator components are ordinary
+      Newspeak objects: existing reflection and mutation change them, while
+      every executable artifact admitted by the VM refines the fixed core
+      semantics.
+\end{enumerate}
+
+\subsection{Machine-checked status}
+
+The companion development in \texttt{formal-semantics/lean} formalizes the
+domains and transition relations above in Lean.  Its
+\texttt{Newspeak.Properties} module exports only established results, and its
+\texttt{THEOREMS.md} ledger records every item below as checked.  The
+development contains no \texttt{sorry}, \texttt{admit}, or additional axiom.
+At the language-semantics boundary it establishes:
+\begin{itemize}
+\item uniqueness of class chains; determinism of unrestricted, public, and
+      protected lookup; equivalence of the executable and named-rule lookup
+      formulations; and both the static and dynamic forms of the
+      elaborated/ECOOP-style implicit-binding equivalence;
+\item determinism and well-formedness preservation of the complete sequential
+      relation through evaluation order, DNU, invocation, closures, local and
+      non-local return, slots, class and instance construction, initialization,
+      object literals, nested classes, exception reification, tuples, patterns,
+      and top-level execution;
+\item exact finite heap and environment domains, exact duplicate-free
+      \kw{allInstancesOf} and mixin-application enumeration, unique physical
+      layouts, stable provenance, and the object/module invariants listed
+      above;
+\item deterministic selected actor turns, isolation and transfer
+      normalization, FIFO dequeue, causal delivery constraints, terminal
+      promise persistence, at-most-once settlement, and notification only
+      after terminal commitment, while leaving actor and network scheduling
+      relational;
+\item authorization, atomic success/failure, exact version advancement,
+      validation preservation, materialized-control stability, debugger stack
+      imaging and replacement, full-speed resumption, and commutation of
+      pairwise independent reflective commands;
+\item exact strong and conditional reachability, stabilization and least
+      fixed-point results for weak-map ephemerons, atomic WeakArray and WeakMap
+      clearing, post-collection validity, well-formedness preservation, and a
+      finite stuttering refinement of the base semantics; and
+\item determinism of PEG recognition, projection, stable identification, and
+      elaboration; soundness of the finite grammar certificate; complete
+      derivation and validation of the annotated core; and finite-execution
+      refinement from an admitted compiled artifact to annotated-core
+      execution.
+\end{itemize}
+
+\paragraph{Remaining implementation verification.}\leavevmode\par
+Equation~\eqref{eq:simulator-step-correspondence} is proved generically from a
+mandatory compiler/Simulator admission certificate.  The currently shipped
+V5 compiler and Simulator must still be verified against that boundary:
+concrete bytecode artifacts, PCs, operand stacks, and frame objects must supply
+the certificate and representation relation.  A replacement implementation
+has the same obligation.  This is not a missing rule of the language
+semantics; it is the implementation-refinement project that instantiates the
+proved abstract theorem.  A useful further strengthening, also outside the
+language definition, is a provenance theorem tracing every dequeued wake
+packet to its unique earlier promise-settlement event.
+
+\bibliographystyle{alpha}
+\bibliography{references}
+
+\end{document}

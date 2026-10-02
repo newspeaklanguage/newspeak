@@ -1,0 +1,565 @@
+\section{Actors and eventual references}
+\label{sec:actors}
+
+This section lifts the sequential relation of Section~\ref{sec:machine} to a
+system of isolated, single-threaded actors.  The lift does not make an
+asynchronous send an ordinary send in disguise: evaluation returns a promise
+immediately, the request becomes a mailbox item, and ordinary dispatch begins
+only when the target actor starts a later turn.
+
+\subsection{Global domains and isolation}
+
+Let the following identity sets be pairwise disjoint and disjoint from those in
+Equation~\eqref{eq:runtime-identities}:
+\begin{equation}\label{eq:eventual-identities}
+ p\in\mathit{PromiseId},\qquad r\in\mathit{FarRefId},\qquad
+ u\in\mathit{EventId},\qquad
+ \mathit{Ref}=\mathit{ObjRef}\uplus\mathit{PromiseId}\uplus
+                 \mathit{FarRefId}.
+\end{equation}
+Promises and far references are Newspeak objects with platform-supplied
+classes, but their routing state is recorded globally below.  An ordinary send
+to such a handle invokes its local platform protocol; only
+$\kw{asyncSend}$ dereferences it for remote delivery.
+
+An actor has a private heap $H_A$.  A platform may additionally maintain a
+value heap $V$ shared by actors managed by one virtual machine.  The heap visible to the
+sequential machine running actor $A$ is
+\begin{equation}\label{eq:actor-heap-view}
+ \widehat H_A=V\uplus H_A,\qquad
+ A\ne B\Longrightarrow
+ \dom(H_A)\cap\dom(H_B)=\varnothing,\qquad
+ \dom(V)\cap\dom(H_A)=\varnothing.
+\end{equation}
+Only objects satisfying the value predicate of Section~\ref{sec:modules} may
+enter $V$.  A distributed implementation may instead copy their complete
+immutable reachable graph.  We write
+\begin{equation}\label{eq:value-transfer-contract}
+ \Omega\vdash\mathsf{valTransfer}_{A\Rightarrow B}(x)
+   \Downarrow\langle\Omega',y\rangle
+\end{equation}
+for either permitted choice; it is defined only for a fully initialized value
+$x$, preserves its class and immutable reachable graph up to identity
+isomorphism, and neither aliases nor modifies mutable actor-local state.
+Sharing is the identity case.  The reflective layer will distinguish actors in
+one VM, which may share values and observe common code change, from actors in
+different VMs, which must use the copying case.
+
+A far-reference table and promise table have the forms
+\begin{equation}\label{eq:eventual-tables}
+\begin{aligned}
+ \Phi(r)&=\langle A,o\rangle,\\
+ \Pi(p)&::=\kw{pending}(A,W)
+       \mid\kw{fulfilled}(A,x)\mid\kw{broken}(A,x),\\
+ W&::=\epsilon\mid W\mathbin{\cdot}
+       \langle B,\mu,p_r,\kappa\rangle.
+\end{aligned}
+\end{equation}
+$\Phi(r)=\langle A,o\rangle$ means that $r$ designates $o$ in $H_A$.
+The actor in a promise state is the actor relative to whose heap its result is
+represented.  Pending sends are retained in registration order; a waiter
+$\langle B,\mu,p_r,\kappa\rangle$ requests that, after settlement, actor $B$
+route $\mu$ to the result and settle $p_r$.  The causal history $\kappa$ is
+defined below.
+
+Remote representation is an actor-relative relation
+$\Omega\vdash\mathsf{rr}_{A\Rightarrow B}(x)
+\Downarrow\langle\Omega',y\rangle$.  It is the least relation given by the
+following rules:
+\[
+\dfrac{A=B}
+ {\Omega\vdash\mathsf{rr}_{A\Rightarrow B}(x)
+   \Downarrow\langle\Omega,x\rangle}
+\quad(\rulelabel{RR-Same})
+\]
+\[
+\dfrac{A\ne B\quad \mathsf{value}_{P,\widehat H_A}(x)\quad
+       \Omega\vdash\mathsf{valTransfer}_{A\Rightarrow B}(x)
+         \Downarrow\langle\Omega',y\rangle}
+ {\Omega\vdash\mathsf{rr}_{A\Rightarrow B}(x)
+   \Downarrow\langle\Omega',y\rangle}
+\quad(\rulelabel{RR-Value})
+\]
+\[
+\dfrac{A\ne B\quad \Phi(r)=\langle B,o\rangle}
+ {\Omega\vdash\mathsf{rr}_{A\Rightarrow B}(r)
+   \Downarrow\langle\Omega,o\rangle}
+\quad(\rulelabel{RR-Far-Home})
+\qquad
+\dfrac{A\ne B\quad \Phi(r)=\langle C,o\rangle\quad C\ne B}
+ {\Omega\vdash\mathsf{rr}_{A\Rightarrow B}(r)
+   \Downarrow\langle\Omega,r\rangle}
+\quad(\rulelabel{RR-Far-Pass})
+\]
+\[
+\dfrac{A\ne B\quad p\in\dom(\Pi)}
+ {\Omega\vdash\mathsf{rr}_{A\Rightarrow B}(p)
+   \Downarrow\langle\Omega,p\rangle}
+\quad(\rulelabel{RR-Promise})
+\]
+\[
+\dfrac{A\ne B\quad o\in\dom(H_A)\quad
+       \neg\mathsf{value}_{P,\widehat H_A}(o)\quad r\text{ fresh}\quad
+       \Omega'=\Omega[\Phi(r)\mapsto\langle A,o\rangle]}
+ {\Omega\vdash\mathsf{rr}_{A\Rightarrow B}(o)
+   \Downarrow\langle\Omega',r\rangle}
+\quad(\rulelabel{RR-Near-Far})
+\]
+Thus a far reference passed back to its target actor becomes the near referent,
+and a far reference passed to a third actor does not acquire a proxy chain.
+Promise identities are monotonic eventual capabilities and likewise pass
+without a proxy layer.  Applying remote representation componentwise defines
+message transport:
+\begin{equation}\label{eq:message-transfer}
+ \dfrac{\Omega_0=\Omega\quad
+   \Omega_{i-1}\vdash\mathsf{rr}_{A\Rightarrow B}(o_i)
+      \Downarrow\langle\Omega_i,o_i'\rangle\ (1\le i\le n)}
+ {\Omega\vdash\mathsf{msgRR}_{A\Rightarrow B}
+      (\langle s,\langle o_1,\ldots,o_n\rangle\rangle)
+   \Downarrow
+      \langle\Omega_n,\langle s,\langle o_1',\ldots,o_n'\rangle\rangle\rangle}.
+\end{equation}
+The selector is a symbol value and is therefore unchanged.
+
+\subsection{Actor configurations and causal delivery}
+
+A mailbox or network packet is
+\begin{equation}\label{eq:packet-grammar}
+\begin{split}
+ b::={}&\kw{app}\langle u,A,B,o,\mu,p,\kappa\rangle\\
+  \mid{}&\kw{settlementPacket}\langle u,A,B,p,\chi,x,\kappa\rangle\\
+  \mid{}&\kw{wake}\langle u,A,B,p,p_r,\chi,x,\mu,\kappa_w,\kappa\rangle,
+ \qquad \chi\in\{\kw{ok},\kw{error}\}.
+\end{split}
+\end{equation}
+The first two actor fields are source and destination.  Every packet has a
+fresh event identity $u$ and carries the source actor's causally prior event
+set $\kappa$.  A wake names both the settled promise $p$ that caused the wake
+and the dependent result promise $p_r$; it also retains $\kappa_w$, the
+history at which its dependent send was originally issued.
+
+An actor is idle, is executing one sequential configuration on behalf of an
+application packet, or is suspended at a debugger safepoint:
+\begin{equation}\label{eq:actor-run-state}
+ \begin{aligned}
+ \mathcal X(A)::={}&\kw{idle}\mid
+   \kw{runningTurn}\langle\mathcal A,t,p,u\rangle\mid\\
+ &\kw{pausedTurn}\langle\mathcal A,t,p,u,r_s,d_s\rangle.
+ \end{aligned}
+\end{equation}
+Here $d_s\in\mathit{StopReason}$.  The ordinary actor rules have no premise
+for \kw{pausedTurn}; deliveries may still append to its mailbox, but the actor
+executes no turn step until an authorized debugger operation resumes it.
+Section~\ref{sec:debugging} defines suspension, stack replacement, and
+resumption.
+The global state is
+\begin{equation}\label{eq:actor-configuration}
+ \Omega=\langle P,V,\mathcal H,\mathcal X,\mathcal Q,\mathcal N,
+              \Pi,\Phi,\Gamma,\mathcal E,\mathcal D,w,n\rangle,
+ \qquad w\in\mathit{VMId},\quad n\in\mathbb N.
+\end{equation}
+$w$ identifies the VM cohort and $n$ is its committed program version.  Every
+actor in $\dom(\mathcal H)$ is managed by $w$ and observes the same $P$ and
+$V$.  Section~\ref{sec:reflection} changes $P$ and $n$ atomically.  A system of
+multiple VMs is a map from distinct $w$ to configurations of this form; its
+program components evolve independently.
+$\Gamma_\Omega$, $\Pi_\Omega$, and analogous subscripts name a component of a
+particular configuration when more than one configuration occurs in a rule;
+the subscript is omitted otherwise.
+$\mathcal Q(A)$ is a FIFO mailbox, $\mathcal N$ is the multiset of undelivered
+cross-actor packets, and $\Gamma(A)$ is a finite downward-closed causal
+history.  The permanent event ledger records
+\begin{equation}\label{eq:event-ledger}
+ \mathcal E(u)=\langle A,B,\kappa\rangle,\qquad
+ \mathsf{dst}_{\Omega}(u)=B,\qquad
+ \mathcal D(B)\in\mathit{EventId}^{*}.
+\end{equation}
+$\mathcal D(B)$ lists, in arrival order, events delivered to $B$; a failed
+network event is marked retired at the same position.  Processed event records
+are retained because later causal histories may still mention them.
+
+All application and system packets are emitted by the helper
+\begin{equation}\label{eq:emit-packet}
+\begin{split}
+ &\mathsf{emit}(\Omega,A,B,\beta,\kappa)=\Omega_2,\\
+ &u\text{ fresh},\quad b=\beta(u,A,B,\kappa),\quad
+ \Omega_1=\Omega[\mathcal E(u)\mapsto\langle A,B,\kappa\rangle,
+                  \Gamma(A)\mapsto\Gamma(A)\cup\{u\}],\\
+ &\Omega_2=
+ \begin{cases}
+  \Omega_1[\mathcal Q(B)\mapsto\mathcal Q(B)\cdot b,
+           \mathcal D(B)\mapsto\mathcal D(B)\cdot u] & A=B,\\
+  \Omega_1[\mathcal N\mapsto\mathcal N\uplus\{b\}] & A\ne B.
+ \end{cases}
+\end{split}
+\end{equation}
+Here $\beta$ is a packet template supplying every field except
+$u,A,B,\kappa$.  A same-actor asynchronous send arrives immediately at the
+tail of its own mailbox, but cannot start until the current turn finishes.
+
+A network packet $b$ with identity $u$, destination $B$, and history $\kappa$
+is eligible precisely when
+\begin{equation}\label{eq:e-order-eligibility}
+ \mathsf{eligible}_{\Omega}(b)\quad\Longleftrightarrow\quad
+ \{u'\in\kappa\mid\mathsf{dst}_{\Omega}(u')=B\}
+       \subseteq\mathsf{set}(\mathcal D(B)).
+\end{equation}
+An eligible packet may arrive:
+\[
+\dfrac{b\in\mathcal N\quad \mathsf{id}(b)=u\quad
+       \mathsf{destination}(b)=B\quad
+       \mathsf{eligible}_{\Omega}(b)}
+ {\Omega\longrightarrow_{\mathsf{act}}
+  \Omega[\mathcal N\mapsto\mathcal N\setminus\{b\},
+         \mathcal Q(B)\mapsto\mathcal Q(B)\cdot b,
+         \mathcal D(B)\mapsto\mathcal D(B)\cdot u]}
+\quad(\rulelabel{Network-Deliver})
+\]
+Because mailboxes are FIFO and an actor runs at most one turn, delivery
+in this order implies processing in this order.
+
+Equation~\eqref{eq:e-order-eligibility} is a constructive form of E-order.
+After $A_1$ emits $u_1$ to $A_2$, $u_1\in\Gamma(A_1)$, so a later $u_2$ from
+$A_1$ to $A_2$ carries $u_1$ and cannot arrive first.  If the later packet
+instead passes a far reference for $A_2$ to $A_3$, delivery merges its history
+into $\Gamma(A_3)$; a subsequent send by $A_3$ to that referent therefore also
+carries $u_1$ and cannot arrive at $A_2$ first.  These are exactly the two
+ordering clauses in Specification \S5.6, generalized by transitive causal
+history.
+
+Maximal executions are required to be weakly fair:
+\begin{equation}\label{eq:actor-fairness}
+ \mathsf{continuouslyEnabled}(\alpha,i)
+   \Longrightarrow\exists j\ge i.\ \mathsf{taken}(\alpha,j),
+\end{equation}
+for packet delivery, dequeue of the head of a nonempty idle mailbox, and an
+enabled step of a running actor.  Fairness does not rescue an actor whose
+current turn diverges; its later mailbox entries may consequently remain
+unprocessed.
+
+\subsection{Asynchronous-send evaluation and routing}
+
+Extend the request and frame grammars in
+Equations~\eqref{eq:request-grammar} and~\eqref{eq:frame-grammar} by
+\begin{equation}\label{eq:async-frames}
+ \theta::=\cdots\mid\kw{eventualRequest}(x),\qquad
+ F::=\cdots\mid\kw{asyncRecv}(s,\bar e).
+\end{equation}
+The receiver is evaluated first:
+\[
+ \langle P,H,\mathcal A\cdot\langle a,\pi\rangle,
+        \kw{asyncSend}(e,s,\bar e)\rangle
+ \longmapsto
+ \langle P,H,\mathcal A\cdot
+        \langle a,\pi\cdot\kw{asyncRecv}(s,\bar e)\rangle,e\rangle
+ \quad(\rulelabel{Async-Receiver}).
+\]
+After it yields $x$, the existing argument frames of
+Equation~\eqref{eq:argument-continuations} evaluate the arguments from left to
+right:
+\begin{equation}\label{eq:async-receiver-continuations}
+\begin{array}{c}
+ \langle\pi\cdot\kw{asyncRecv}(s,\epsilon),x\rangle
+  \longmapsto
+ \langle\pi,\kw{dispatch}(\kw{eventualRequest}(x),
+                          \langle s,\epsilon\rangle)\rangle,\\[2mm]
+ \langle\pi\cdot\kw{asyncRecv}(s,\langle e_1,\bar e\rangle),x\rangle
+  \longmapsto
+ \langle\pi\cdot\kw{args}(\kw{eventualRequest}(x),s,\epsilon,\bar e),e_1\rangle.
+\end{array}
+\end{equation}
+
+For a non-promise receiver, define its target by
+\begin{equation}\label{eq:eventual-target}
+ \mathsf{target}_{\Omega,A}(x)=
+ \begin{cases}
+  \langle A,x\rangle & x\in\dom(\widehat H_A),\\
+  \langle B,o\rangle & \Phi(x)=\langle B,o\rangle.
+ \end{cases}
+\end{equation}
+The routing judgment
+$\Omega,A\vdash\mathsf{route}(x,\mu,p_r,\kappa)\Downarrow\Omega'$ is
+defined by the following four cases.  A known target transports the arguments
+and emits an application packet:
+{\small
+\[
+\dfrac{\begin{gathered}
+ \mathsf{target}_{\Omega,A}(x)=\langle B,o\rangle\\
+ \Omega\vdash\mathsf{msgRR}_{A\Rightarrow B}(\mu)
+    \Downarrow\langle\Omega_1,\mu'\rangle\\
+ \Omega'=\mathsf{emit}(\Omega_1,A,B,
+    \lambda u,A,B,\kappa.\kw{app}\langle
+       u,A,B,o,\mu',p_r,\kappa\rangle,\kappa)
+\end{gathered}}
+ {\Omega,A\vdash\mathsf{route}(x,\mu,p_r,\kappa)\Downarrow\Omega'}
+\quad(\rulelabel{Route-Target})
+\]}
+An unresolved promise records the send without blocking its actor:
+\[
+\dfrac{\Pi(p)=\kw{pending}(C,W)\quad
+       \Omega'=\Omega[\Pi(p)\mapsto
+          \kw{pending}(C,W\cdot\langle A,\mu,p_r,\kappa\rangle)]}
+ {\Omega,A\vdash\mathsf{route}(p,\mu,p_r,\kappa)\Downarrow\Omega'}
+\quad(\rulelabel{Route-Pending})
+\]
+For a fulfilled promise, its result is first represented in the requesting
+actor and routing repeats:
+{\small\[
+\dfrac{\Pi(p)=\kw{fulfilled}(C,x)\quad
+       \Omega\vdash\mathsf{rr}_{C\Rightarrow A}(x)
+          \Downarrow\langle\Omega_1,y\rangle\quad
+       \Omega_1,A\vdash\mathsf{route}(y,\mu,p_r,\kappa)
+          \Downarrow\Omega'}
+ {\Omega,A\vdash\mathsf{route}(p,\mu,p_r,\kappa)\Downarrow\Omega'}
+\quad(\rulelabel{Route-Fulfilled})
+\]}
+For a broken promise, the result promise is broken with the same represented
+exception:
+{\small\[
+\dfrac{\begin{gathered}\Pi(p)=\kw{broken}(C,x)\\
+       \Omega\vdash\mathsf{rr}_{C\Rightarrow A}(x)
+          \Downarrow\langle\Omega_1,y\rangle\\
+       \Omega_1,A\vdash\mathsf{settlePromise}(p_r,\kw{error},A,y,\kappa)
+          \Downarrow\Omega'\end{gathered}}
+ {\Omega,A\vdash\mathsf{route}(p,\mu,p_r,\kappa)\Downarrow\Omega'}
+\quad(\rulelabel{Route-Broken})
+\]}
+The last rule makes explicit the otherwise unspecified meaning of sends to a
+broken promise: break propagation is the conventional eventual-send behavior,
+but is recorded as a language-design choice in the coverage ledger.
+
+Routing is an actor-level action.  The asynchronous expression itself
+allocates its result promise and immediately leaves that promise as the value
+of the expression:
+{\small
+\[
+\dfrac{\begin{gathered}
+ \mathcal X(A)=\kw{runningTurn}\langle\mathcal A\cdot\langle a,\pi\rangle,
+   \kw{dispatch}(\kw{eventualRequest}(x),\mu),p_0,u_0\rangle\\
+ p_r\text{ fresh}\qquad
+ \Omega_0=\Omega[\Pi(p_r)\mapsto\kw{pending}(A,\epsilon)]\\
+ \Omega_0,A\vdash\mathsf{route}(x,\mu,p_r,\Gamma(A))\Downarrow\Omega_1
+\end{gathered}}
+ {\begin{aligned}
+  \Omega\longrightarrow_{\mathsf{act}}\Omega_1[\mathcal X(A)\mapsto{}&
+   \kw{runningTurn}\langle\mathcal A\cdot\langle a,\pi\rangle,\\[-1mm]
+   &p_r,p_0,u_0\rangle]
+ \end{aligned}}
+\quad(\rulelabel{Async-Return})
+\]}
+The displayed run record in the conclusion abbreviates replacement of its
+control component by $p_r$; its reply promise and triggering event remain
+$p_0,u_0$.
+
+\subsection{Turns and promise settlement}
+
+When an application packet reaches the head of an idle actor's mailbox, it
+starts a turn.  With fresh top activation $a_T$ and
+$H' =\mathsf{newTop}(\widehat H_B,a_T)$ from
+Equation~\eqref{eq:new-top-activation}:
+{\small
+\[
+\dfrac{\mathcal X(B)=\kw{idle}\quad
+ \mathcal Q(B)=\kw{app}\langle u,A,B,o,\mu,p,\kappa\rangle\cdot Q}
+ {\begin{aligned}
+  \Omega\longrightarrow_{\mathsf{act}}\Omega[&\mathcal X(B)\mapsto
+    \kw{runningTurn}\langle\epsilon\cdot\langle a_T,\epsilon\rangle,
+       \kw{dispatch}(\kw{ordinaryRequest}(o),\mu),p,u\rangle,\\[-1mm]
+   &\mathcal Q(B)\mapsto Q,
+    \Gamma(B)\mapsto\Gamma(B)\cup\kappa\cup\{u\},
+    \mathcal H(B)\mapsto H'\setminus V]
+ \end{aligned}}
+\quad(\rulelabel{Turn-Start})
+\]}
+While $B$ is running, each applicable sequential step is lifted pointwise:
+\[
+\dfrac{\langle P,\widehat H_B,\mathcal A,t\rangle
+          \longmapsto\langle P,H',\mathcal A',t'\rangle}
+ {\Omega\longrightarrow_{\mathsf{act}}
+  \Omega[\mathcal H(B)\mapsto H'\setminus V,
+         \mathcal X(B)\mapsto
+          \kw{runningTurn}\langle\mathcal A',t',p,u\rangle]}
+\quad(\rulelabel{Actor-Sequential})
+\]
+It is inapplicable to the eventual dispatch intercepted by
+\rulelabel{Async-Return}.  No second packet can start in $B$ until this turn
+ends.
+
+Settlement wakes every recorded dependent send.  Define the ordered helper
+{\small
+\begin{equation}\label{eq:wake-all}
+\begin{aligned}
+ \mathsf{wakeAll}(\Omega,B,p,\chi,y,\epsilon)&=\Omega,\\
+ \mathsf{wakeAll}(\Omega,B,p,\chi,y,
+    \langle C,\mu,p_r,\kappa_w\rangle\cdot W)
+   &=\mathsf{wakeAll}(\Omega_1,B,p,\chi,y,W),\\
+ \Omega_1&=\mathsf{emit}(\Omega,B,C,
+   \lambda u,B,C,\kappa.\kw{wake}\langle
+      u,B,C,p,p_r,\chi,y,\mu,\kappa_w,\kappa\rangle,\Gamma(B)).
+\end{aligned}
+\end{equation}}
+Earlier waiters for the same actor are emitted first and therefore ordered by
+Equation~\eqref{eq:e-order-eligibility}.  Promise settlement is the partial
+judgment
+{\small
+\begin{equation}\label{eq:promise-settlement}
+\dfrac{\begin{gathered}
+ \Pi(p)=\kw{pending}(B,W)\qquad \kappa\subseteq\Gamma(B)\\
+ \Omega\vdash\mathsf{rr}_{A\Rightarrow B}(x)
+    \Downarrow\langle\Omega_0,y\rangle\\
+ \Omega_1=
+ \begin{cases}
+  \Omega_0[\Pi(p)\mapsto\kw{fulfilled}(B,y)]&\chi=\kw{ok},\\
+  \Omega_0[\Pi(p)\mapsto\kw{broken}(B,y)]&\chi=\kw{error}
+ \end{cases}
+ \qquad \Omega'=\mathsf{wakeAll}(\Omega_1,B,p,\chi,y,W)
+\end{gathered}}
+ {\Omega,B\vdash\mathsf{settlePromise}(p,\chi,A,x,\kappa)
+    \Downarrow\Omega'}.
+\end{equation}}
+There is no rule for settling an already settled promise, so fulfillment and
+breaking are mutually exclusive and occur at most once.
+
+When a turn returns normally, a promise owned by the same actor settles
+immediately; a remote owner's settlement is sent subsequently:
+{\small\[
+\dfrac{\begin{gathered}
+ \mathcal X(B)=\kw{runningTurn}\langle\epsilon,\kw{halt}(v),p,u\rangle
+ \qquad \Pi(p)=\kw{pending}(B,W)\\
+ \Omega,B\vdash\mathsf{settlePromise}(p,\kw{ok},B,v,\Gamma(B))
+    \Downarrow\Omega'
+\end{gathered}}
+ {\Omega\longrightarrow_{\mathsf{act}}
+  \Omega'[\mathcal X(B)\mapsto\kw{idle}]}
+\quad(\rulelabel{Turn-Fulfill-Local})
+\]}
+{\small\[
+\dfrac{\begin{gathered}
+ \mathcal X(B)=\kw{runningTurn}\langle\epsilon,\kw{halt}(v),p,u\rangle\\
+ \Pi(p)=\kw{pending}(A,W)\qquad A\ne B\\
+ \Omega'=\mathsf{emit}(\Omega,B,A,
+  \lambda u,B,A,\kappa.\kw{settlementPacket}\langle
+     u,B,A,p,\kw{ok},v,\kappa\rangle,\Gamma(B))
+\end{gathered}}
+ {\Omega\longrightarrow_{\mathsf{act}}
+  \Omega'[\mathcal X(B)\mapsto\kw{idle}]}
+\quad(\rulelabel{Turn-Fulfill-Remote})
+\]}
+If exception signaling escapes the turn's top activation, the
+exception-library boundary produces $\kw{abort}(x)$ instead of
+$\kw{halt}(v)$.  A local owner's promise is broken immediately:
+{\small\[
+\dfrac{\begin{gathered}
+ \mathcal X(B)=\kw{runningTurn}\langle\epsilon,\kw{abort}(x),p,u\rangle
+ \qquad \Pi(p)=\kw{pending}(B,W)\\
+ \Omega,B\vdash\mathsf{settlePromise}(p,\kw{error},B,x,\Gamma(B))
+    \Downarrow\Omega'
+\end{gathered}}
+ {\Omega\longrightarrow_{\mathsf{act}}
+  \Omega'[\mathcal X(B)\mapsto\kw{idle}]}
+\quad(\rulelabel{Turn-Break-Local})
+\]}
+A remote owner receives an error settlement subsequently:
+{\small\[
+\dfrac{\begin{gathered}
+ \mathcal X(B)=\kw{runningTurn}\langle\epsilon,\kw{abort}(x),p,u\rangle\\
+ \Pi(p)=\kw{pending}(A,W)\qquad A\ne B\\
+ \Omega'=\mathsf{emit}(\Omega,B,A,
+  \lambda u,B,A,\kappa.\kw{settlementPacket}\langle
+     u,B,A,p,\kw{error},x,\kappa\rangle,\Gamma(B))
+\end{gathered}}
+ {\Omega\longrightarrow_{\mathsf{act}}
+  \Omega'[\mathcal X(B)\mapsto\kw{idle}]}
+\quad(\rulelabel{Turn-Break-Remote})
+\]}
+These rules are the only additional obligation placed on the resumable
+exception library by actors.
+
+An idle promise owner processes a settlement packet at the head of its FIFO
+mailbox by merging the packet history and applying
+Equation~\eqref{eq:promise-settlement}:
+{\small\[
+\dfrac{\begin{gathered}
+ \mathcal X(B)=\kw{idle}\qquad
+ \mathcal Q(B)=\kw{settlementPacket}\langle
+    u,A,B,p,\chi,x,\kappa\rangle\cdot Q\\
+ \Omega_0=\Omega[\mathcal Q(B)\mapsto Q,
+                  \Gamma(B)\mapsto\Gamma(B)\cup\kappa\cup\{u\}]\\
+ \Omega_0,B\vdash\mathsf{settlePromise}(p,\chi,A,x,\Gamma_0(B))
+    \Downarrow\Omega'
+\end{gathered}}
+ {\Omega\longrightarrow_{\mathsf{act}}\Omega'}
+\quad(\rulelabel{Settlement-Packet-Dequeue})
+\]}
+A fulfilled wake represents the result in the waiting actor and resumes the
+stored routing operation; a broken wake settles the dependent promise as
+broken:
+{\small\[
+\dfrac{\begin{gathered}
+ \mathcal X(C)=\kw{idle}\qquad
+ \mathcal Q(C)=\kw{wake}\langle
+  u,B,C,p,p_r,\kw{ok},x,\mu,\kappa_w,\kappa\rangle\cdot Q\\
+ \Omega_0=\Omega[\mathcal Q(C)\mapsto Q,
+   \Gamma(C)\mapsto\Gamma(C)\cup\kappa\cup\kappa_w\cup\{u\}]\\
+ \Omega_0\vdash\mathsf{rr}_{B\Rightarrow C}(x)
+    \Downarrow\langle\Omega_1,y\rangle\\
+ \Omega_1,C\vdash\mathsf{route}(y,\mu,p_r,\Gamma_1(C))
+    \Downarrow\Omega'
+\end{gathered}}
+ {\Omega\longrightarrow_{\mathsf{act}}\Omega'}
+\quad(\rulelabel{Wake-Fulfilled})
+\]}
+{\small\[
+\dfrac{\begin{gathered}
+ \mathcal X(C)=\kw{idle}\qquad
+ \mathcal Q(C)=\kw{wake}\langle
+  u,B,C,p,p_r,\kw{error},x,\mu,\kappa_w,\kappa\rangle\cdot Q\\
+ \Omega_0=\Omega[\mathcal Q(C)\mapsto Q,
+   \Gamma(C)\mapsto\Gamma(C)\cup\kappa\cup\kappa_w\cup\{u\}]\\
+ \Omega_0,C\vdash\mathsf{settlePromise}(p_r,\kw{error},B,x,\Gamma_0(C))
+    \Downarrow\Omega'
+\end{gathered}}
+ {\Omega\longrightarrow_{\mathsf{act}}\Omega'}
+\quad(\rulelabel{Wake-Broken})
+\]}
+These system packets are handled only between user turns, so remote settlement
+cannot mutate an actor's heap or promise observations during an executing turn.
+A communication subsystem may retire an undelivered application event and
+emit an error settlement instead of delivering it.  Its failure object must
+satisfy the same remote-representation boundary, the event is entered in
+$\mathcal D$ as retired so it cannot block causal successors, and delivery and
+failure of the same event are mutually exclusive.
+
+\subsection{Actor creation}
+
+Actor creation is a platform primitive rather than a new surface expression.
+Elaboration supplies, for a top-level mixin, the class-side mixin and factory
+descriptor needed to apply it to \Object:
+\begin{equation}\label{eq:actor-seed}
+ P.\mathit{actorSeed}(M)=\langle D,M_c,q\rangle
+ \Longrightarrow
+ \decl_P(M)=D\ \land\ P.\mathit{owner}(D)=\kw{topOwner}.
+\end{equation}
+Let $\mathsf{base}_P(B)$ be a fresh actor's platform heap, containing the
+distinguished classes and canonical values but no user-created mutable object.
+For fresh $B,C,C_m,r$, actor creation is
+{\small
+\begin{equation}\label{eq:create-actor}
+\dfrac{\begin{gathered}
+ P.\mathit{actorSeed}(M)=\langle D,M_c,q\rangle\qquad
+ H_0=\mathsf{base}_P(B)\\
+ H_1=\mathsf{allocClass}(H_0,C,C_m,\kw{actor}(D),M,
+          P.\mathit{platform}(\kw{Object}),\nil,M_c,q)\\
+ \Omega'=\Omega[\mathcal H(B)\mapsto H_1,
+   \mathcal X(B)\mapsto\kw{idle},\mathcal Q(B)\mapsto\epsilon,
+   \Gamma(B)\mapsto\varnothing,\\[-1mm]
+ \hspace{27mm}\mathcal D(B)\mapsto\epsilon,
+   \Phi(r)\mapsto\langle B,C\rangle]
+\end{gathered}}
+ {\Omega,A\vdash\mathsf{spawn}(M)\Downarrow\langle\Omega',r\rangle}.
+\end{equation}}
+The result is explicitly a far reference to the new class, as required by the
+Specification.  The $\kw{actor}(D)$ provenance distinguishes that class from
+evaluation of the top-level class expression itself, so it is not accidentally
+classified as a module definition by Equation~\eqref{eq:module-definition}.
+Its primary factory can then be invoked asynchronously in the ordinary way.

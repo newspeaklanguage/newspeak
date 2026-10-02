@@ -233,7 +233,7 @@ export default function Home() {
       <header className="masthead">
         <div className="masthead-inner">
           <div>
-            <p className="eyebrow">Design draft 0.12 · Companion index</p>
+            <p className="eyebrow">Design draft 0.14 · Companion index</p>
             <h1 className="site-title">Newspeak Semantics Reference</h1>
           </div>
           <label className="search-wrap">

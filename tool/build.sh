@@ -199,6 +199,11 @@ grep -qF "${BUILT}" BuildInfo.ns || {
     exit 1
 }
 
+# Same reason, worse failure: the compile globs ./*.ns, so if two sources declare
+# the SAME top-level class one silently replaces the other. See
+# tool/check-duplicate-modules.py for what that cost us before it was caught.
+python3 ${NEWSPEAK}/tool/check-duplicate-modules.py . || exit 1
+
 # ${PRIMORDIALSOUP}/out/ReleaseX64/primordialsoup \
 #     ${PRIMORDIALSOUP}/primordialsoup/out/snapshots/WebCompiler.vfuel \
 #     *.ns \

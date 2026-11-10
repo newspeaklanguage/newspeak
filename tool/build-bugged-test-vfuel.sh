@@ -55,6 +55,11 @@ class BuildInfo packageUsing: manifest = Object new (
 NSEOF
 
 cd "$STAGE"
+
+# The compile below globs ./*.ns, so two sources declaring the same top-level
+# class silently replace one another. See tool/check-duplicate-modules.py.
+python3 "${NEWSPEAK}"/tool/check-duplicate-modules.py . || exit 1
+
 "${PRIMORDIALSOUP}"/out/ReleaseX64/primordialsoup \
     "${PRIMORDIALSOUP}"/out/snapshots/WebCompiler.vfuel \
     ./*.ns \

@@ -368,6 +368,8 @@ handle table, V8 stack).
 ## 11. Proposed next steps
 
 1. Agree on sections 2, 3 and 8 (the layering, operation categories, natives).
+   *2026-11-10:* sections 2 and 8 agreed. Section 3 is pending a review
+   with a colleague who has implemented replay in Wasmtime.
 2. Write the kernel operation list: today's 161 psoup primitives, classified,
    with duplicates and host-specific ones separated out (done:
    `VM_KERNEL_PRIMITIVE_CLASSIFICATION_2026-11-09.md`). Host-specific

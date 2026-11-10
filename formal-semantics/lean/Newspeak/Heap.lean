@@ -36,8 +36,8 @@ inductive WeakContainer where
 
 structure ObjectDef where
   classId : ClassId
-  slots : FiniteStore SlotId ObjRef
-  nestedClasses : FiniteStore ClassDeclId ClassId
+  slots : FiniteStore PhysicalSlotId ObjRef
+  nestedClasses : FiniteStore NestedCacheId ClassId
   weakContainer : Option WeakContainer := none
 
 inductive ActivationProvenance where
@@ -120,27 +120,27 @@ def installObject (h : Heap) (id : ObjectId) (objectDef : ObjectDef) : Heap :=
   { h with objects := h.objects.install id objectDef }
 
 def readObjectSlot (h : Heap) (object : ObjectId)
-    (slot : SlotId) : Option ObjRef := do
+    (slot : PhysicalSlotId) : Option ObjRef := do
   let objectDef ← h.objects object
   objectDef.slots slot
 
-@[simp] def objectSlotTransform (slot : SlotId) (value : ObjRef)
+@[simp] def objectSlotTransform (slot : PhysicalSlotId) (value : ObjRef)
     (objectDef : ObjectDef) : ObjectDef :=
   { objectDef with slots := objectDef.slots.install slot value }
 
-def writeObjectSlot (h : Heap) (object : ObjectId) (slot : SlotId)
+def writeObjectSlot (h : Heap) (object : ObjectId) (slot : PhysicalSlotId)
     (value : ObjRef) : Option Heap := do
   let objectDef ← h.objects object
   let _ ← objectDef.slots slot
   some (h.installObject object (objectSlotTransform slot value objectDef))
 
 def readNestedClass (h : Heap) (object : ObjectId)
-    (declaration : ClassDeclId) : Option ClassId := do
+    (declaration : NestedCacheId) : Option ClassId := do
   let objectDef ← h.objects object
   objectDef.nestedClasses declaration
 
 def writeNestedClass (h : Heap) (object : ObjectId)
-    (declaration : ClassDeclId) (classId : ClassId) : Option Heap := do
+    (declaration : NestedCacheId) (classId : ClassId) : Option Heap := do
   let objectDef ← h.objects object
   let updated : ObjectDef :=
     { objectDef with

@@ -809,7 +809,7 @@ theorem Heap.markUncontinuable_preserves_absence (h : Heap)
     simp [Heap.markUncontinuable, dependent, absent]
 
 theorem Heap.writeObjectSlot_preserves_classOf {h h' : Heap}
-    {object : ObjectId} {slot : SlotId} {value : ObjRef}
+    {object : ObjectId} {slot : PhysicalSlotId} {value : ObjRef}
     (write : h.writeObjectSlot object slot value = some h') :
     ∀ reference, h'.classOf reference = h.classOf reference := by
   intro reference
@@ -835,7 +835,7 @@ theorem Heap.writeObjectSlot_preserves_classOf {h h' : Heap}
           | actorObject candidate => rfl
 
 theorem Heap.writeObjectSlot_preserves_absence {h h' : Heap}
-    {object candidate : ObjectId} {slot : SlotId} {value : ObjRef}
+    {object candidate : ObjectId} {slot : PhysicalSlotId} {value : ObjRef}
     (write : h.writeObjectSlot object slot value = some h')
     (absent : h.objects candidate = none) : h'.objects candidate = none := by
   cases objectLive : h.objects object with
@@ -854,7 +854,7 @@ theorem Heap.writeObjectSlot_preserves_absence {h h' : Heap}
           simpa [Heap.installObject, away] using absent
 
 theorem Heap.writeObjectSlot_retainsActivations {h h' : Heap}
-    {object : ObjectId} {slot : SlotId} {value : ObjRef}
+    {object : ObjectId} {slot : PhysicalSlotId} {value : ObjRef}
     (write : h.writeObjectSlot object slot value = some h') :
     ∀ id activation, h.activations id = some activation →
       ∃ activation', h'.activations id = some activation' := by
@@ -870,7 +870,7 @@ theorem Heap.writeObjectSlot_retainsActivations {h h' : Heap}
           exact ⟨activation, live⟩
 
 theorem WellFormed.writeObjectSlot_wellFormed {p : Program} {h h' : Heap}
-    (wf : p.WellFormed h) {object : ObjectId} {slot : SlotId}
+    (wf : p.WellFormed h) {object : ObjectId} {slot : PhysicalSlotId}
     {value : ObjRef}
     (write : h.writeObjectSlot object slot value = some h') :
     p.WellFormed h' := by
@@ -920,7 +920,7 @@ theorem WellFormed.writeObjectSlot_wellFormed {p : Program} {h h' : Heap}
 
 theorem AllocationState.writeObjectSlot_preserves_supplies
     {state : AllocationState} {heap : Heap} {object : ObjectId}
-    {slot : SlotId} {value : ObjRef} (fresh : state.SuppliesFresh)
+    {slot : PhysicalSlotId} {value : ObjRef} (fresh : state.SuppliesFresh)
     (write : state.heap.writeObjectSlot object slot value = some heap) :
     ({state with heap := heap} : AllocationState).SuppliesFresh := by
   refine ⟨?_, ?_, ?_, ?_, ?_⟩

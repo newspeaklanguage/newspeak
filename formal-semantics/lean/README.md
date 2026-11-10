@@ -1,10 +1,145 @@
 # Newspeak semantics in Lean
 
+Instance-slot declaration IDs (`SlotId`) and runtime addresses (`PhysicalSlotId`)
+are now different types. The latter pairs a class application with a declaration;
+`NestedCacheId` does the same for nested classes. This corrects the repeated-mixin
+storage defect in LaTeX Equation (8.16). See `Newspeak/ApplicationStorage.lean`
+for the isolation theorems and kernel-checked examples, including accepted
+repeated-stateful-mixin layouts and reflective migration.
+
 This directory is the machine-checked companion to `../newspeak-semantics.tex`.
 It is not a second, simplified language definition.  The development proceeds
 in vertical slices, and each slice must preserve the identities, access rules,
 reflection boundaries, actors, debugger state, and optional GC observations of
 the complete semantics.
+
+`../prolog/newspeak.pl` is the auditable relational bridge from the labeled
+LaTeX rules to this development.  Its generated clause manifest is imported as
+`Newspeak.GeneratedPrologManifest`; `Newspeak.PrologLookupCorrespondence`
+proves the completed lookup and dispatch bridge---through lexical depth,
+enclosing receivers, outer/self/implicit dispatch, and allocation-bearing DNU
+fallback---sound and complete with respect to the Lean relations.  The next
+slice also covers the positive complement of direct closure invocation and
+the full request-resolution/completion layer, method-activation allocation,
+tail/non-tail method invocation, and the request-completion machine step.
+It also covers ordinary and cascade closure creation, direct closure-value
+dispatch, closure-activation allocation, both closure invocation modes, and
+the closure-machine union.  The current slice additionally covers ordinary
+and eventual receiver evaluation, all non-ordinary send forms, and exact
+left-to-right argument accumulation for sends and deferred messages.  It also
+checks simultaneous-local expansion and its installation-before-resolution
+ordering, the complete body/local machine (including normal halt and
+resumption), canonical atoms, and all direct/current/lazy object-slot
+transitions.  Return targets, dependent continuations, heap-wide
+uncontinuable marking, successful transfer, and both `cannotReturn` branches
+are likewise connected bidirectionally.  Sequential and simultaneous
+instance-slot groups, including their PastFuture expansion and internal
+continuation sequence, are covered as well.  `Factory-New` now has checked
+coverage from parameter extraction and root-to-leaf physical layout through
+object/initializer allocation and the resulting machine transition.  The
+superclass/mixin coordinator, including wrong-factory failures and applied-
+mixin activation allocation, is connected too; a final union theorem covers
+all three instance-initialization phases.  Run
+`python3 ../prolog/tools/check_relational_spec.py` before building to reject a
+stale manifest or a construct outside the proof-facing Prolog subset.
+
+Class construction is connected next: inheritance errors, enclosing-object
+selection, factory descriptors, class/metaclass-pair allocation, and all nine
+operational clauses have checked correspondence.  This slice also records a
+real boundary discrepancy.  The LaTeX/Prolog commit rules contain only
+operational premises, whereas Lean's present commit constructors additionally
+carry global post-allocation well-formedness.  The bridge isolates that proof
+as `PrologClassConstructionCommitSafe` instead of pretending it is a Prolog
+runtime check.
+Both exception-boundary transitions are connected bidirectionally as well.
+The abstract platform reifier is represented by a proof-carrying application
+witness, which corresponds exactly to the reification equality in each LaTeX
+premise.
+The bridge now reaches the end of the sequential machine: object literals and
+nested-class caching, tuple/cascade/pattern expansion, exception staging, and
+top-level halt all have checked bidirectional correspondence.  Explicit raw
+relations mirror every Horn union; admissible counterparts add only the class
+and object-literal allocation certificates already required by Lean.  The
+final theorem, `prologSequentialStepWithTopLevel_iff`, identifies that complete
+admissible union with the full Lean sequential relation.
+
+`Newspeak.PrologActorCorrespondence` continues the bridge across the actor
+boundary.  It proves bidirectional correspondence for same/value/far/promise
+remote representation, recursive argument and message transport, eventual
+target selection, all four routing cases, promise settlement, asynchronous
+return, application-turn entry, lifted sequential execution, all four turn
+completion cases, settlement and wake dequeue, and eligible network delivery.
+The component theorems compose through `prologSelectedActorStep_iff` and
+`prologActorActionStep_iff` to `prologActorSystemStep_iff`, covering the full
+scheduler-visible actor relation.  The platform contracts for value copying,
+local eventual-handle interpretation, promise-handle installation, and
+application-message materialization remain explicit relation parameters.
+
+`Newspeak.PrologReflectionCorrespondence` next covers authorized mirror
+inspection, authority-attenuating mirror derivation, atomic reflection
+commit/reject, installation into exactly one selected VM, and
+capability-checked host primitives.  It introduces explicit Lean relations
+for the two operations that previously existed only as LaTeX rules
+(`MirrorDerivationStep` and `VMPrimitiveInvocation`) and proves their Horn
+presentations equivalent.  Front-end patching, re-elaboration, runtime
+preparation, validation, rejection diagnosis, and host execution remain
+parameters rather than hidden implementations.
+
+`Newspeak.PrologGCCorrespondence` closes the named-rule layer with the optional
+global collection wrapper.  `prologGCLiftStep_iff` covers the identity-history
+freshness check and monotone history extension around an existing actor or
+reflection transition; `prologGCCollectStep_iff` covers independently enabled
+atomic pruning without shrinking that history.  The underlying transition,
+new-identity projection, admissibility relation, and pruning function remain
+parameters exactly as in the modular LaTeX presentation.
+
+`Newspeak.PrologFrontEndCorrespondence` now bridges the complete fixed
+source-to-core pipeline as well.  Separate relations expose complete PEG
+recognition, concrete-tree projection, Newspeak semantic actions, stable
+identification, the surface-validity gate, Program derivation, and both the
+executable annotated-core checker and its semantic certificate.  The theorem
+`prologFrontEndDerivation_iff` identifies their Horn composition with
+`FrontEndDerivation`; `PrologFrontEndDerivation.deterministic` then rules out
+phase-composition ambiguity.  This retains the grammar, decoders, and
+derivation services as explicit values rather than baking the current parser
+or compiler into the bridge.
+The lower layer is not opaque: `Newspeak.PrologPEGCorrespondence` mirrors all
+PEG recognition constructors and both mutually recursive projection
+functions.  `prologPEGRecognizes_iff`, `prologPEGProjects_iff`, and the
+tree/forest soundness and completeness theorems show that these readable
+clauses denote exactly the existing Lean relations and functions.
+`Newspeak.PrologIdentificationCorrespondence` similarly exposes source-node
+enumeration, retained-versus-fresh identity selection, recursive
+identification, the identified-node validity check, and ordered retention-map
+extension.  Soundness and completeness of both recursive relations compose to
+`prologSurfaceIdentification_iff` rather than leaving identification as an
+opaque graph premise.
+`Newspeak.PrologStaticElaborationCorrespondence` adds graph theorems for the
+fuel-bounded expression, expression-list, send, clause-list, pattern,
+pattern-pair, object-superclass, and class-superclass elaborators.  The Prolog
+source expands those graphs into constructor-specific Horn clauses, making
+the placement of binding annotations and retained identities inspectable.
+`Newspeak.PrologDeclarationCorrespondence` then handles statements and local
+declarations structurally: return permission, every ordinary or lazy local
+form, declaration-list recursion, and both local-group forms have soundness
+and completeness proofs.  Formal-parameter derivation, physical-slot
+collection, eager initializer declarations, and optional initializer groups
+are separately exposed and equated to their executable functions.
+The same module now pins access defaulting, synthesized ordinary/lazy slot
+methods, derived-method installation, explicit-method derivation, and the
+single/recursive member derivation graphs.  The Prolog source distinguishes
+the method, ordinary-slot, lazy-slot, and deferred nested-class branches;
+explicit-method identities, context construction, local/body elaboration, and
+both image updates are individually visible.
+`Newspeak.PrologProgramDerivationCorrespondence` covers the outer construction
+layer: direct and object-header projections, superclass syntax/expression/
+message selection, object-literal ownership, anonymous application folding,
+class/object and structural-artifact builders, bodyless and bodied mixin
+programs, and the final declaration-shape dispatch.  The final relation is
+proved equivalent to `deriveCompleteClassProgram` and deterministic.
+`prologCompleteClassProgram_services_iff` then identifies it with the
+`deriveProgram` field of `completeClassProgramDerivationServices`, closing the
+connection to `PrologFrontEndDerivation`.
 
 The first slice formalizes the identity domains, method access, the separation
 of static program `P` from heap `H`, runtime class records, finite superclass

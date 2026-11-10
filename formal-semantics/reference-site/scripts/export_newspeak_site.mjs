@@ -21,6 +21,8 @@ const definitions = JSON.parse(
 );
 
 const mathMacros = {
+  '\\NS': '\\text{Newspeak}',
+  '\\lit': '\\mathsf{lit}(#1)',
   '\\kw': '\\mathsf{#1}',
   '\\undef': '\\mathord{\\uparrow}',
   '\\nil': '\\mathsf{nil}',
@@ -77,7 +79,7 @@ const readableNotation = (value) => notationReplacements.reduce(
 
 const renderMath = (formula, displayMode = false) => katex.renderToString(formula, {
   displayMode,
-  throwOnError: false,
+  throwOnError: true,
   strict: 'ignore',
   output: 'htmlAndMathml',
   macros: mathMacros,
@@ -143,6 +145,10 @@ function definitionCard(entry) {
         </div>
         <h2 class="card-title">${escapeHtml(entry.title)}</h2>
         <p class="card-summary">${escapeHtml(entry.summary)}</p>
+        ${entry.relatedDefinitions.length ? `<p class="related-definitions">Related: ${
+          entry.relatedDefinitions.map((related) => `<a href="#${escapeHtml(related.id)}">${
+            escapeHtml(related.title)} (${escapeHtml(related.number)})</a>`).join(' · ')
+        }</p>` : ''}
         <a class="anchor-link" href="#${escapeHtml(entry.id)}" aria-label="Link to ${escapeHtml(entry.title)}" title="Permanent link">#</a>
       </header>
       <div class="formal-source">
@@ -270,7 +276,7 @@ const landingHtml = `<!doctype html>
 :root{color-scheme:light;--ink:#142b3d;--blue:#175ea8;--pale:#edf5fc;--line:#c8d8e7}*{box-sizing:border-box}body{margin:0;background:linear-gradient(135deg,#f5f9fd,#e8f2fb);color:var(--ink);font:17px/1.6 system-ui,-apple-system,sans-serif}main{max-width:980px;margin:auto;padding:8vh 24px}.eyebrow{color:var(--blue);font-size:.78rem;font-weight:800;letter-spacing:.13em;text-transform:uppercase}h1{max-width:760px;margin:.2rem 0 1rem;font:clamp(2.6rem,7vw,5rem)/1.02 Georgia,serif}.lead{max-width:760px;color:#496174;font-size:1.18rem}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px;margin-top:3rem}.card{display:block;border:1px solid var(--line);border-radius:14px;background:#fff;padding:24px;box-shadow:0 12px 34px #193f6210;color:inherit;text-decoration:none}.card:hover{border-color:#4e91cc;transform:translateY(-2px)}.card strong{display:block;margin-bottom:.4rem;color:#153f65;font:1.45rem Georgia,serif}.card span{color:#607486}.primary{grid-column:1/-1;background:#163f67;color:#fff}.primary strong,.primary span{color:inherit}.foot{margin-top:2.5rem;color:#63788a;font-size:.85rem}@media(max-width:680px){.grid{grid-template-columns:1fr}.primary{grid-column:auto}}
 </style></head><body><main><p class="eyebrow">Newspeak programming language</p><h1>Formal semantics</h1>
 <p class="lead">A complete operational account of Newspeak, accompanied by an executable Lean formalization and navigable references for readers.</p>
-<div class="grid"><a class="card primary" href="newspeak-semantics.pdf"><strong>Read the semantics</strong><span>The current 90-page quasi-formal specification (PDF).</span></a>
+<div class="grid"><a class="card primary" href="newspeak-semantics.pdf"><strong>Read the semantics</strong><span>The current quasi-formal specification (PDF).</span></a>
 <a class="card" href="reference/"><strong>Definition reference</strong><span>Rendered definitions and explanations of every parameter, with full-text search and stable anchors.</span></a>
 <a class="card" href="lean-guide/"><strong>Guide to the Lean formalization</strong><span>A top-down interactive essay with collapsible code and links to complete source files.</span></a></div>
 <p class="foot">Design draft 0.14 · The Lean development builds without <code>sorry</code>, <code>admit</code>, or additional axioms.</p></main></body></html>`;

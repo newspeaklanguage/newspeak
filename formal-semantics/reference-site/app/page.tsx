@@ -23,11 +23,14 @@ type DefinitionEntry = {
   summary: string;
   formula: string;
   parameters: Parameter[];
+  relatedDefinitions: { id: string; title: string; number: string }[];
 };
 
 const definitions = rawDefinitions as DefinitionEntry[];
 
 const mathMacros = {
+  '\\NS': '\\text{Newspeak}',
+  '\\lit': '\\mathsf{lit}(#1)',
   '\\kw': '\\mathsf{#1}',
   '\\undef': '\\mathord{\\uparrow}',
   '\\nil': '\\mathsf{nil}',
@@ -306,6 +309,18 @@ export default function Home() {
                     </div>
                     <h2 className="card-title">{entry.title}</h2>
                     <p className="card-summary">{entry.summary}</p>
+                    {entry.relatedDefinitions.length > 0 && (
+                      <p className="related-definitions">
+                        Related: {entry.relatedDefinitions.map((related, index) => (
+                          <span key={related.id}>
+                            {index > 0 && ' · '}
+                            <a href={`#${related.id}`} onClick={() => setQuery('')}>
+                              {related.title} ({related.number})
+                            </a>
+                          </span>
+                        ))}
+                      </p>
+                    )}
                     <a
                       className="anchor-link"
                       href={`#${entry.id}`}

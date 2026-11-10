@@ -1,0 +1,296 @@
+;; Section 7: sequential controls and allocation. Stack sequences grow right.
+;; Runtime-specific state is explicit; no source bodies are uninterpreted tokens.
+
+;; @equation eq:request-grammar
+syntax request =
+  | ORDINARYREQUEST objref | IMPLICITREQUEST scopeoption classdecl
+  | OUTERREQUEST classdecl classdecl | SELFREQUEST classdecl | SUPERREQUEST
+;; @equation eq:frame-grammar
+syntax bodytarget = METHODBODY objref | CLOSUREBODY
+syntax constructionerror = CLASSEXPECTED | CLASSNOTINSTANTIABLE | WRONGFACTORY | TOPSUPERCLASS
+;; @equation eq:class-construction-frames
+syntax constructionframe =
+  | MAKEBODYFRAME bodydescriptor objref
+  | MIXLEFTFRAME applicationdescriptor coreexpr
+  | MIXRIGHTFRAME applicationdescriptor classid
+syntax control
+syntax frame =
+  | RECVFRAME selector coreexpr*
+  | ARGSFRAME request selector objref* coreexpr*
+  | SEQFRAME bodytarget statement* | RETURNFRAME
+  | INITFRAME localslotid localgroup* statement* bodytarget
+  | LOCALWRITEFRAME actid localslotid
+  ;; Provenance labels for these extensions accompany their rule modules.
+  | constructionframe | NEWINSTANCEFRAME
+  | MSGARGSFRAME selector objref* coreexpr*
+  | SUPERMSGFRAME classid objectid message | AFTERSUPERFRAME classid objectid message
+  | MIXINMSGFRAME classid objectid | AFTERMIXINFRAME classid objectid
+  | SLOTWRITEFRAME objectid physicalslot
+  | SLOTSTOREFRAME objectid physicalslot slotdecl* slotgroup* statement*
+  | INTERNALFRAME coreexpr* control | LAZYSTOREFRAME objectid physicalslot
+  | NESTEDSTOREFRAME objectid nestedcacheid
+syntax dispatchcontrol =
+  | CALLMETHOD fullmethod objref classid message
+  | MISSINGCONTROL objref classid message
+  | INVALIDSUPERCONTROL classid
+syntax control =
+  | coreexpr | DISPATCH request message | dispatchcontrol
+  | CALLCLOSURE closureid message
+  | INITIALIZE actid localgroup* statement* bodytarget
+  | BODYCONTROL bodytarget statement* | FINISH objref
+  | TRANSFER continuation objref | CANNOTRETURN | HALT objref
+  | CONSTRUCTIONERROR constructionerror
+  | MESSAGECONTROL messagetemplate | MESSAGEVALUE message
+  | INITCLASS classid objectid message | OWNINIT classid objectid message
+  | INITGROUPS objectid slotgroup* statement*
+  | INITSEQUENTIAL objectid slotdecl* slotgroup* statement*
+  | INTERNALSEQUENCE coreexpr* control | CLASSWITHEO coreexpr objref
+  | NEWINSTANCECONTROL message
+;; @equation eq:configuration
+syntax activationstack = (actid, frame*)*
+syntax machine = { HEAP runtimeHeap, STACK (actid, frame*)*, CONTROL control }
+
+var theta : request
+var tau : bodytarget
+var F : frame
+var pi : frame*
+var AS : (actid, frame*)*
+var t : control
+var sigma : machine
+var binding : scopeoption
+var dt : dispatchcontrol
+
+;; @equation eq:request-construction
+def $constructRequest(coreexpr) : (request, selector, coreexpr*)
+def $constructRequest(IMPLICITSEND s e* binding DECLFOUND D) = (IMPLICITREQUEST binding D, s, e*)
+def $constructRequest(SELFSEND s e* D) = (SELFREQUEST D, s, e*)
+def $constructRequest(OUTERSEND s e* D_t D_0) = (OUTERREQUEST D_t D_0, s, e*)
+def $constructRequest(SUPERSEND s e*) = (SUPERREQUEST, s, e*)
+;; Distinguishes the partial construction domain from all other expressions.
+def $isRequestExpression(coreexpr) : bool
+def $isRequestExpression(IMPLICITSEND s e* binding DECLFOUND D) = true
+def $isRequestExpression(SELFSEND s e* D) = true
+def $isRequestExpression(OUTERSEND s e* D_t D_0) = true
+def $isRequestExpression(SUPERSEND s e*) = true
+def $isRequestExpression(IMPLICITSEND s e* binding NODECL) = false
+def $isRequestExpression(VALUE o) = false
+def $isRequestExpression(SELF) = false
+def $isRequestExpression(ATOM atompayload) = false
+def $isRequestExpression(TUPLE e*) = false
+def $isRequestExpression(PATTERN corepattern binding dopt) = false
+def $isRequestExpression(OBJECTLITERAL literaldescriptor e) = false
+def $isRequestExpression(CLOSURELITERAL q param* lg* st*) = false
+def $isRequestExpression(SEND e s e'*) = false
+def $isRequestExpression(ASYNCSEND e s e'*) = false
+def $isRequestExpression(CLASSBODY bodydescriptor e) = false
+def $isRequestExpression(MIXINAPPLY applicationdescriptor e e') = false
+def $isRequestExpression(CASCADE e messagetemplate*) = false
+def $isRequestExpression(READLOCAL a j) = false
+def $isRequestExpression(WRITELOCAL a j e) = false
+def $isRequestExpression(READSLOT oid pslot) = false
+def $isRequestExpression(WRITESLOT oid pslot e) = false
+def $isRequestExpression(CURRENTREAD slot) = false
+def $isRequestExpression(CURRENTWRITE slot e) = false
+def $isRequestExpression(LAZYREAD slot e) = false
+def $isRequestExpression(NESTEDCLASS D e) = false
+def $isRequestExpression(NEWINSTANCECURRENT s e*) = false
+
+def $putActivation(runtimeHeap, actid, activationrecord) : runtimeHeap
+def $putActivation(RH, a, ra) = RH[.ACTIVATIONS = $mapPut(actid, activationrecord, RH.ACTIVATIONS, a, ra)]
+def $putClosure(runtimeHeap, closureid, closurerecord) : runtimeHeap
+def $putClosure(RH, c, rb) = RH[.CLOSURES = $mapPut(closureid, closurerecord, RH.CLOSURES, c, rb)]
+def $putMessageMirror(runtimeHeap, mirrorid, messagemirror) : runtimeHeap
+def $putMessageMirror(RH, g, mm) = RH[.MIRRORS = $mapPut(mirrorid, messagemirror, RH.MIRRORS, g, mm)]
+
+;; DNU reifies the ORIGINAL message, preserves the receiver, and searches from
+;; the supplied class (including the superclass start of a failed super send).
+relation DnuAllocation: (runtimeProgram, runtimeHeap) |- (objref, classid, message, mirrorid) => (runtimeHeap, control)
+;; @rule DNU
+rule DnuAllocation/DNU:
+  (RP, RH) |- (o, C_0, mu, g) => (RH', t)
+  -- if t = CALLMETHOD mf o C_f ("doesNotUnderstand:" (MIRRORREF g))
+  -- if f = $projectMethod(mf)
+  -- if ~$runtimeLive(RH, MIRRORREF g)
+  -- if RH' = $putMessageMirror(RH, g, { CLASS $platformClass(RP, "MessageMirror"), MESSAGE mu })
+  -- if mf = $recoverMethod(RP, RH, f, C_f)
+  -- Unrestricted: ($lookupProgramView(RP), $lookupHeapView(RP, RH)) |-
+       ("doesNotUnderstand:", C_0) => (FOUND f C_f)
+
+def $captureDispatch(runtimeProgram, runtimeHeap, dispatchresult) : dispatchcontrol
+def $captureDispatch(RP, RH, INVOKE f o C mu) = CALLMETHOD $recoverMethod(RP, RH, f, C) o C mu
+def $captureDispatch(RP, RH, MISSING o C mu) = MISSINGCONTROL o C mu
+def $captureDispatch(RP, RH, INVALIDSUPER C) = INVALIDSUPERCONTROL C
+def $dispatchControlView(dispatchcontrol) : dispatchresult
+def $dispatchControlView(CALLMETHOD mf o C mu) = INVOKE $projectMethod(mf) o C mu
+def $dispatchControlView(MISSINGCONTROL o C mu) = MISSING o C mu
+def $dispatchControlView(INVALIDSUPERCONTROL C) = INVALIDSUPER C
+
+;; The method-provenance test is structural, not an unchecked ID cast.
+def $methodProvenance(provenance) : bool
+def $methodProvenance(methodid) = true
+def $methodProvenance(TOPPROVENANCE) = false
+def $methodProvenance(closureid) = false
+def $methodProvenance(INITIALIZERPROVENANCE q) = false
+;; @equation eq:home-activation
+def $home(runtimeHeap, actid) : continuation
+def $home(RH, a) = CONT a -- if $methodProvenance($runtimeActivationAt(RH, a).PROVENANCE)
+def $home(RH, a) = $runtimeActivationAt(RH, a).HOME
+  -- if ~$methodProvenance($runtimeActivationAt(RH, a).PROVENANCE)
+;; @equation eq:callee-continuation
+def $calleeContinuation(runtimeHeap, actid, frame*) : continuation
+def $calleeContinuation(RH, a, eps) = $runtimeActivationAt(RH, a).CONTINUATION
+def $calleeContinuation(RH, a, F pi) = CONT a
+
+def $localIdentity(localdecl) : localslotid
+def $localIdentity(LOCALIMMUTABLE j e) = j
+def $localIdentity(LOCALMUTABLE j e) = j
+def $localIdentity(LOCALUNINITIALIZED j) = j
+def $localIdentity(LOCALLAZYIMMUTABLE j e) = j
+def $localIdentity(LOCALLAZYMUTABLE j e) = j
+def $groupIdentities(localgroup) : localslotid*
+def $groupIdentities(LOCALSEQUENTIAL ld) = $localIdentity(ld)
+def $groupIdentities(LOCALSIMULTANEOUS ld*) = $localIdentity(ld)*
+def $localIdentities(localgroup*) : localslotid*
+def $localIdentities(eps) = eps
+def $localIdentities(lg lg'*) = $groupIdentities(lg) $localIdentities(lg'*)
+def $uninitializedLocals(localslotid*) : (localslotid, localcell)*
+def $uninitializedLocals(j*) = (j, UNINITCELL)*
+def $parameterBindings(parameterid*, objref*) : (parameterid, objref)*
+def $parameterBindings(eps, eps) = eps
+def $parameterBindings(param param'*, o o'*) = (param, o) $parameterBindings(param'*, o'*)
+def $methodScopes(methodid, classbodydecl, actid, objref) : (scopedecl, objref)*
+def $methodScopes(methodid, D, a, o) = (methodid, ACTIVATIONREF a)
+def $methodScopes(methodid, L, a, o) = (methodid, ACTIVATIONREF a) (L, o)
+
+;; @equation eq:method-activation
+def $newMethodActivation(runtimeHeap, actid, fullmethod, objref, classid, message, continuation) : runtimeHeap
+def $newMethodActivation(RH, a, mf, o, C, (s o'*), kont) =
+  $putActivation(RH, a, {
+    PROVENANCE mf.ID, PARAMETERS $parameterBindings(mf.FORMALS, o'*),
+    LOCALS $uninitializedLocals($localIdentities(mf.LOCALS)), RECEIVER o,
+    CURRENT CLASSFOUND C, CONTINUATION kont, HOME CONT a,
+    CONTINUABLE true, SCOPES $methodScopes(mf.ID, mf.OWNER, a, o)
+  })
+  -- if ~$runtimeLive(RH, ACTIVATIONREF a)
+  -- if s = mf.SELECTOR /\ |mf.FORMALS| = |o'*|
+def $methodMessageCompatible(fullmethod, message) : bool
+def $methodMessageCompatible(mf, (s o*)) = s = mf.SELECTOR /\ |mf.FORMALS| = |o*|
+
+;; SpecTec's text sort has no concatenation operator. This pure primitive
+;; denotes concatenation of Unicode scalar-value sequences, not list concat.
+;; It is an explicit backend obligation (and is not a Newspeak runtime hook).
+def $textConcatenate(text, text) : text
+def $closureKeywords(nat) : text
+def $closureKeywords(0) = ""
+def $closureKeywords(1) = "value:"
+def $closureKeywords(n) = $textConcatenate("value:", $closureKeywords($(n - 1))) -- if n > 1
+def $valueSelector(nat) : selector
+def $valueSelector(0) = "value"
+def $valueSelector(n) = $closureKeywords(n) -- if n > 0
+def $isClosureReference(objref) : bool
+def $isClosureReference(CLOSUREREF c) = true
+def $isClosureReference(OBJECTREF oid) = false
+def $isClosureReference(CLASSREF C) = false
+def $isClosureReference(ACTIVATIONREF a) = false
+def $isClosureReference(MIRRORREF g) = false
+def $isClosureReference(MIXINREF M) = false
+def $isClosureReference(ACTORREF actorid) = false
+def $closureReferenceValue(objref) : closureid
+def $closureReferenceValue(CLOSUREREF c) = c
+def $closureCall(runtimeHeap, objref, message) : bool
+def $closureCall(RH, o, mu) = false -- if ~$isClosureReference(o)
+def $closureCall(RH, CLOSUREREF c, mu) = false -- if ~$runtimeLive(RH, CLOSUREREF c)
+def $closureCall(RH, CLOSUREREF c, (s o'*)) =
+  s = $valueSelector(|$runtimeClosureAt(RH, c).FORMALS|)
+  -- if $runtimeLive(RH, CLOSUREREF c)
+
+;; @equation eq:closure-invocation-data
+def $checkedClosureCall(runtimeHeap, closureid, message) : closurerecord
+def $checkedClosureCall(RH, c, (s o'*)) = $runtimeClosureAt(RH, c)
+  -- if s = $valueSelector(|$runtimeClosureAt(RH, c).FORMALS|)
+;; @equation eq:closure-activation
+def $newClosureActivation(runtimeHeap, actid, closureid, objref*, continuation) : runtimeHeap
+def $newClosureActivation(RH, a, c, o*, kont) =
+  $installClosureActivation(RH, a, c, $runtimeClosureAt(RH, c), o*, kont)
+  -- if ~$runtimeLive(RH, ACTIVATIONREF a)
+  -- if |$runtimeClosureAt(RH, c).FORMALS| = |o*|
+def $installClosureActivation(runtimeHeap, actid, closureid, closurerecord, objref*, continuation) : runtimeHeap
+def $installClosureActivation(RH, a, c, rb, o*, kont) =
+  $putActivation(RH, a, {
+    PROVENANCE c, PARAMETERS $parameterBindings(rb.FORMALS, o*),
+    LOCALS $uninitializedLocals($localIdentities(rb.LOCALS)),
+    RECEIVER rb.RECEIVER, CURRENT rb.CURRENT, CONTINUATION kont, HOME rb.HOME,
+    CONTINUABLE true, SCOPES $mapPut(scopedecl, objref,
+      $runtimeActivationAt(RH, rb.DEFINING).SCOPES, rb.DECL, ACTIVATIONREF a)
+  })
+def $captureClosure(runtimeHeap, actid, actdecl, parameterid*, localgroup*, statement*) : closurerecord
+def $captureClosure(RH, a, q, param*, lg*, st*) = {
+  DECL q, FORMALS param*, LOCALS lg*, BODY st*, DEFINING a,
+  RECEIVER $runtimeActivationAt(RH, a).RECEIVER,
+  CURRENT $runtimeActivationAt(RH, a).CURRENT, HOME $home(RH, a)
+}
+
+;; @equation eq:local-slot-operations
+def $writeLocalValue(runtimeHeap, actid, localslotid, objref) : runtimeHeap
+def $writeLocalValue(RH, a, j, o) = $putActivation(RH, a,
+  $runtimeActivationAt(RH, a)[.LOCALS = $mapPut(localslotid, localcell,
+    $runtimeActivationAt(RH, a).LOCALS, j, LOCALVALUE o)])
+def $readLocalValue(runtimeHeap, actid, localslotid) : localcell
+def $readLocalValue(RH, a, j) = $require(localcell,
+  $mapGet(localslotid, localcell, $runtimeActivationAt(RH, a).LOCALS, j))
+
+;; @equation eq:body-results
+def $emptyBodyResult(runtimeProgram, bodytarget) : objref
+def $emptyBodyResult(RP, METHODBODY o) = o
+def $emptyBodyResult(RP, CLOSUREBODY) = $nilValue(RP)
+def $lastBodyResult(bodytarget, objref) : objref
+def $lastBodyResult(METHODBODY o, o') = o
+def $lastBodyResult(CLOSUREBODY, o) = o
+;; @equation eq:statement-start
+def $startStatement(frame*, statement) : (frame*, coreexpr)
+def $startStatement(pi, EXPRSTMT e) = (pi, e)
+def $startStatement(pi, RETURNSTMT e) = (pi RETURNFRAME, e)
+;; @equation eq:return-target
+def $returnTarget(runtimeHeap, actid) : continuation
+def $returnTarget(RH, a) = $home(RH, a)
+
+;; @equation eq:resume
+def $resumeStack((actid, frame*)*, actid) : (actid, frame*)*
+def $resumeStack(AS, a) = $resumePrefix(AS, a, eps)
+def $resumePrefix((actid, frame*)*, actid, (actid, frame*)*) : (actid, frame*)*
+def $resumePrefix((a, pi) AS, a_0, AS_0) = AS_0 (a, pi) -- if a = a_0
+def $resumePrefix((a, pi) AS, a_0, AS_0) = $resumePrefix(AS, a_0, AS_0 (a, pi)) -- if a =/= a_0
+def $severContinuation(runtimeHeap, actid) : runtimeHeap
+def $severContinuation(RH, a) = $putActivation(RH, a,
+  $runtimeActivationAt(RH, a)[.CONTINUATION = NOCONT])
+
+;; Finite-set representations use duplicate-free sequences. Growth stops
+;; precisely at the least predecessor-closed set; there is no fuel bound.
+var aRecords : (actid, activationrecord)*
+def $linkIn(continuation, actid*) : bool
+def $linkIn(NOCONT, a*) = false
+def $linkIn(CONT a, a'*) = a <- a'*
+def $newPredecessors((actid, activationrecord)*, actid*) : actid*
+def $newPredecessors(eps, a*) = eps
+def $newPredecessors((a, ra) aRecords, a'*) = a $newPredecessors(aRecords, a'*)
+  -- if ~(a <- a'*) /\ $linkIn(ra.CONTINUATION, a'*)
+def $newPredecessors((a, ra) aRecords, a'*) = $newPredecessors(aRecords, a'*)
+  -- if (a <- a'*) \/ ~$linkIn(ra.CONTINUATION, a'*)
+;; @equation eq:dependents
+def $dependents(runtimeHeap, actid) : actid*
+def $dependents(RH, a) = $closeDependents(RH, a)
+def $closeDependents(runtimeHeap, actid*) : actid*
+def $closeDependents(RH, a*) = $growDependents(RH, a*, $newPredecessors(RH.ACTIVATIONS, a*))
+def $growDependents(runtimeHeap, actid*, actid*) : actid*
+def $growDependents(RH, a*, eps) = a*
+def $growDependents(RH, a*, a' a''*) = $closeDependents(RH, a* a' a''*)
+;; @equation eq:mark-uncontinuable
+def $markUncontinuable(runtimeHeap, actid) : runtimeHeap
+def $markUncontinuable(RH, a) = RH[.ACTIVATIONS = $markRecords(RH.ACTIVATIONS, $dependents(RH, a))]
+def $markRecords((actid, activationrecord)*, actid*) : (actid, activationrecord)*
+def $markRecords(eps, a*) = eps
+def $markRecords((a, ra) aRecords, a'*) =
+  (a, ra[.CONTINUATION = NOCONT][.CONTINUABLE = false]) $markRecords(aRecords, a'*)
+  -- if a <- a'*
+def $markRecords((a, ra) aRecords, a'*) = (a, ra) $markRecords(aRecords, a'*)
+  -- if ~(a <- a'*)

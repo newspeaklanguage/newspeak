@@ -8,6 +8,22 @@ still outstanding.  Numbered invariant entries refer to the order in section
 
 ## Static structure and lookup
 
+- [x] Distinct applications have distinct slot and nested-cache addresses
+  (`physicalSlots_separate_applications`, `nestedCaches_separate_applications`).
+- [x] A successful write cannot change another application's cell, even for
+  the same declaration (`writeObjectSlot_otherApplication`). Repeated-mixin
+  layout acceptance, selected-context access, initialization, caches, closure
+  capture, and reflective migration also have kernel-checked examples in
+  `ApplicationStorage.lean`.
+- [x] Application qualification preserves declaration distinctness, and a
+  duplicate-free class chain with duplicate-free own layouts has a
+  duplicate-free combined layout (`applicationSlots_nodup`,
+  `layoutForChain_nodup`). Such an executable chain is accepted by instance
+  layout validation (`instanceLayout?_accepts_disjointApplications`), without
+  requiring different mixins at different positions in the chain. This proves
+  structural acceptance, not normal factory completion; factory execution can
+  raise an exception. It is not a full progress theorem for factory execution.
+
 - [x] S1. Direct method selection is functional (`direct_unique`).
 - [x] S2. A class-chain witness from a fixed class is unique
   (`ClassChain.unique`).
@@ -532,6 +548,219 @@ still outstanding.  Numbered invariant entries refer to the order in section
   `CompiledProgramAdmission.execution_refines_annotatedCore` lifts every
   finite compiled execution to a finite annotated-core execution ending in a
   represented configuration.
+
+## Auditable Prolog correspondence
+
+- [x] P1. The proof-facing Prolog source is checked to contain only definite
+  clauses and `dif/2`, and every clause has a resolvable LaTeX rule/equation,
+  Lean declaration, and mode annotation.  Its generated manifest records a
+  normalized clause rendering and the SHA-256 of the actual source.
+  Every numbered LaTeX equation also has a checked disposition: encoded status
+  is inferred only from clauses, while non-encoded equations must be classified
+  with a rationale as term representation, abstract contract, theorem-only, or
+  deferred.  Missing and contradictory classifications fail the checker.  The
+  current generated ledger accounts for all 361 equations (291 encoded, 51
+  term representations, 10 abstract contracts, and 9 theorem-only statements)
+  with zero deferred equations, and represents all 86 named rules.
+- [x] P2. Prolog class-chain, unrestricted lookup, public lookup, and protected
+  lookup are sound and complete with respect to the named Lean relations.
+  Composed theorems connect all three lookup modes to executable
+  `Program.Lookup` (`prologUnrestricted_iff_lookup`,
+  `prologPublic_iff_lookup`, `prologProtected_iff_lookup`).
+- [x] P3. The independent defining-class clauses agree with unrestricted
+  lookup for both success and failure
+  (`prologDefiningClass_of_unrestrictedSome`,
+  `prologUnrestrictedSome_of_definingClass`,
+  `prologDefiningNone_iff_unrestrictedNone`).
+- [x] P4. Prolog ordinary-dispatch and super-dispatch clauses are sound and
+  complete with respect to `Program.OrdinaryDispatch` and
+  `Program.SuperDispatch` (`prologOrdinaryDispatch_iff`,
+  `prologSuperDispatch_iff`).
+- [x] P5. Prolog lexical-depth, enclosing-receiver, outer/self/implicit
+  dispatch, DNU selection, and the allocation-bearing DNU transition are
+  sound and complete with respect to their named Lean relations
+  (`prologLexicalDepth_iff`, `prologEnclosingReceiver_iff`,
+  `prologOuterDispatch_iff`, `prologSelfDispatch_iff`,
+  `prologImplicitDispatch_iff`, `prologDnuSelection_iff`, and
+  `prologDnuFallback_iff`).  The allocation subgraph is separately exposed by
+  `prologAllocateMessageMirror_iff` and `prologFinishDnu_iff`, rather than
+  treating allocation as an opaque premise.
+- [x] P6. Extend it through the complete sequential transition relation.
+  - [x] P6a. The positive complement of direct closure invocation, all five
+    non-eventual request-resolution branches, and request completion (direct
+    invocation, invalid super, or exactly one DNU fallback) correspond
+    bidirectionally (`prologNotClosureCall_iff`,
+    `prologResolveRequest_iff`, `prologCompleteRequest_iff`).
+  - [x] P6b. Method/closure activation allocation and invocation.
+    - [x] Method activation construction/allocation and both tail and non-tail
+      method invocation rules (`prologAllocateMethodActivation_iff`,
+      `prologMethodInvocationStep_iff`).
+    - [x] Ordinary and cascade closure construction, direct closure-value
+      dispatch, closure-activation allocation, tail/non-tail invocation, and
+      the closure-machine union (`prologAllocateClosureObject_iff`,
+      `prologClosureCreationStep_iff`, `prologClosureDispatchStep_iff`,
+      `prologAllocateClosureActivation_iff`,
+      `prologClosureInvocationStep_iff`, `prologClosureMachineStep_iff`).
+  - [x] P6r. Installation of completed request results into machine control,
+    including invalid-super reification (`prologRequestCompletionStep_iff`).
+  - [x] P6c. Expression order, locals, slots, initialization, returns, and the
+    complete sequential-rule union.
+    - [x] Literal/self values, ordinary and eventual receivers, all four
+      non-ordinary request forms, empty/nonempty argument starts, and
+      left-to-right argument accumulation correspond bidirectionally
+      (`prologNonOrdinaryRequest_iff`, `prologStartPendingSend_iff`,
+      `prologContinueReceiver_iff`, `prologContinueEventualReceiver_iff`,
+      `prologContinueArguments_iff`, `prologExpressionOrderStep_iff`).
+      Deferred superclass and mixin message templates have the same checked
+      left-to-right argument correspondence (`prologMessageEvaluationStep_iff`).
+    - [x] Simultaneous-local expansion installs every future or `nil` before
+      resolving eager declarations in source order, and its empty/nonempty
+      machine entry corresponds bidirectionally (`prologLocalSimCode_iff`,
+      `prologStartSimultaneousLocals_iff`).
+    - [x] All local-initialization forms, direct local reads and writes,
+      statement sequencing, body completion, activation resumption, and
+      normal halt/resume correspond bidirectionally
+      (`prologBodyMachineStep_iff`).
+    - [x] Canonical atoms and direct/current/lazy instance-slot reads and
+      writes correspond bidirectionally (`prologObjectSlotStep_iff`).
+    - [x] Return targets, continuation dependents, heap-wide uncontinuable
+      marking, return-frame transfer, successful return, and both
+      `cannotReturn` branches correspond bidirectionally
+      (`prologReturnTarget_iff`, `prologDependentActivation_iff`,
+      `prologMarkUncontinuable_iff`, `prologReturnMachineStep_iff`).
+    - [x] Sequential and simultaneous instance-slot groups, including the
+      PastFuture installation-before-resolution expansion and its internal
+      continuation sequence, correspond bidirectionally
+      (`prologSlotSimCode_iff`, `prologSlotInitializationStep_iff`).
+    - [x] `Factory-New`, including parameter extraction, unique root-to-leaf
+      layout, nil-filled slot allocation, initializer-activation allocation,
+      and the combined machine transition, corresponds bidirectionally
+      (`prologInstanceLayout_iff`, `prologAllocateInitialInstance_iff`,
+      `prologFactoryNewStep_iff`).
+    - [x] The superclass/mixin coordinator, initializer-message validation,
+      applied-mixin activation allocation, wrong-factory outcomes, and the
+      complete three-phase instance-initialization union correspond
+      bidirectionally (`prologInitializationCoordinatorStep_iff`,
+      `prologInstanceInitializationStep_iff`).
+    - [x] All nine class-construction clauses and their support equations are
+      related to Lean (`prologClassConstructionStep_iff`).  The theorem makes
+      the current mismatch explicit: the raw LaTeX/Prolog commit step must be
+      paired with `PrologClassConstructionCommitSafe`, because Lean's two
+      commit constructors contain an additional global well-formedness proof.
+    - [x] Runtime errors and internal throws cross the exception-library
+      boundary through an exact proof-carrying application of the abstract
+      error reifier (`prologErrorReification_iff`,
+      `prologExceptionBoundaryStep_iff`).
+    - [x] Object-literal evaluation and commit, receiver-local nested-class
+      cache hit/miss/store, and `classWithEO` correspond bidirectionally
+      (`prologObjectLiteralStep_iff`, `prologNestedClassStep_iff`,
+      `prologObjectAndNestedClassStep_iff`).  Object commit exposes the same
+      existing Lean-only allocation certificate as named admissibility data.
+    - [x] Tuple, cascade, and recursive pattern expansion correspond through
+      their support equations and complete compound-literal relation
+      (`prologTupleExpansion_iff`, `prologPatternExpansion_iff`,
+      `prologCompoundLiteralStep_iff`).
+    - [x] Every staged union is an explicit Horn union, through exception
+      signaling, compound literals, and `Top-Halt`; the final admissible
+      relation corresponds to `SequentialStepWithTopLevel`
+      (`prologSequentialStepWithTopLevel_iff`).  The parallel raw relations
+      retain the literal Prolog clauses, while the admissible relations carry
+      only the two allocation certificates already present in Lean.
+- [ ] P7. Extend it through actors, reflection, optional collection, and the
+  PEG/elaboration front end.
+  - [x] P7a. The complete actor transition layer corresponds bidirectionally:
+    remote references and componentwise message transport; target selection;
+    pending, fulfilled, and broken routing; promise settlement and ordered
+    wake emission; `Async-Return`; turn entry and lifted sequential execution;
+    local/remote fulfillment and breakage; settlement and wake dequeue;
+    network delivery; and the complete selected-actor, labeled-action, and
+    existential system-step unions (`prologRemoteRepresentation_iff`,
+    `prologRouteEventualMessage_iff`, `prologActorEventualSendStep_iff`,
+    `prologActorTurnCompletionStep_iff`, `prologSelectedActorStep_iff`,
+    `prologActorActionStep_iff`, `prologActorSystemStep_iff`).
+  - [ ] P7b. Reflection, including debugger actions and VM selection.
+    - [x] Authorized inspection, attenuated mirror derivation, atomic
+      reflection commit/reject, single-VM network installation, and
+      capability-checked host primitives correspond bidirectionally
+      (`prologAuthorizedReflectionRead_iff`,
+      `prologMirrorDerivationStep_iff`, `prologReflectionStep_iff`,
+      `prologVMReflectionStep_iff`, `prologVMPrimitiveInvocation_iff`).
+    - [ ] Connect the individual reflection command folds, debugger stack
+      edits, and validation equations rather than only their already-formal
+      `ValidReflection` composition.
+  - [ ] P7c. Optional collection and weak-reference observation.
+    - [x] The global identity-history wrapper, ordinary-transition lift, and
+      independently enabled atomic collection rule correspond
+      bidirectionally (`prologGCLiftStep_iff`,
+      `prologGCCollectStep_iff`).  Collector admissibility, pruning, and the
+      underlying actor/reflection union remain explicit parameters, matching
+      the modular LaTeX rules.
+    - [ ] Connect the individual reachability, ephemeron closure, pruning, and
+      weak-observation support equations to their existing Lean functions.
+  - [ ] P7d. PEG projection, identification, and elaboration.
+    - [x] Complete recognition, tree projection, Newspeak action semantics,
+      stable identification, the surface-validity gate, Program derivation,
+      annotated-core checking, and their source-to-core composition correspond
+      bidirectionally (`prologPEGParsesAST_iff`,
+      `prologPEGParsesNewspeakUnit_iff`,
+      `prologSurfaceIdentification_iff`,
+      `prologDerivedAnnotatedProgram_iff`,
+      `prologAnnotatedCoreCheck_iff`,
+      `prologFrontEndDerivation_iff`).  The composed Horn relation is
+      deterministic (`PrologFrontEndDerivation.deterministic`).
+    - [x] The PEG core and concrete projection are connected below the phase
+      boundary: every constructor of `PEGRecognizes` corresponds
+      bidirectionally (`prologPEGRecognizes_iff`), and the mutually recursive
+      tree/forest clauses are sound and complete for `projectConcreteTree` and
+      `projectConcreteForest`.  Complete parse and single-root AST projection
+      then compose from those structural clauses.
+    - [x] Stable identification is connected structurally below the phase
+      boundary.  Retained identities take priority over sort-specific fresh
+      identities; recursive node identification and ordered retention-map
+      extension have separate soundness and completeness proofs
+      (`prologIdentifySourceNodesFrom_iff`,
+      `prologExtendIdentityRetention_iff`), which compose to
+      `prologIdentifySourceNodes_iff` and
+      `prologSurfaceIdentification_iff`.
+    - [x] Every successful branch of the fuel-bounded expression, send,
+      clause-list, pattern, pattern-pair, class-superclass, and
+      object-superclass elaborators has a source-visible Horn clause.  Graph
+      correspondence theorems fix their denotation to the existing executable
+      Lean functions (`prologElaborateExpressionWithFuel_iff` through
+      `prologElaborateClassSuperclassWithFuel_iff`); complete expression
+      elaboration is deterministic.
+    - [x] Statement and local-declaration elaboration is connected below the
+      phase boundary.  Return permission, all ordinary and lazy local forms,
+      recursive declaration lists, and sequential/simultaneous groups have
+      structural soundness and completeness theorems
+      (`prologElaborateStatement_iff` through
+      `prologElaborateLocalGroups_iff`).  Formal parameters, physical slots,
+      eager slot initializers, and optional initializer groups have explicit
+      Horn clauses pinned to their executable graphs
+      (`prologFormalParameterId_iff` through
+      `prologElaborateInitializerGroups_iff`).
+    - [x] Access defaulting and member installation have source-visible Horn
+      branches for explicit methods, ordinary slots, lazy slots, and deferred
+      nested classes, plus recursive member-list installation.  Graph
+      correspondence extends through `prologDeriveMemberDeclarations_iff`.
+      Explicit-method declaration/activation identities, parameter and local
+      identities, declaration flattening, activation context, local/body
+      elaboration, definition construction, and both image updates are
+      separate checked premises.
+    - [x] Class and object header projections, superclass syntax/expression/
+      message selection, lexical object ownership, the recursive anonymous
+      mixin-application fold, class/object image builders, bodyless and bodied
+      mixin programs, structural completion, image installation, and final
+      bodyless/bodied/ordinary declaration dispatch have graph correspondence
+      theorems in `PrologProgramDerivationCorrespondence`.  The complete
+      relation is equivalent to `deriveCompleteClassProgram`, deterministic,
+      and connected to `completeClassProgramDerivationServices` by
+      `prologCompleteClassProgram_services_iff`.
+    - [ ] Connect the individual Newspeak grammar/action productions and the
+      constructor-level internals of the large class-body, mixin, object, and
+      structural-artifact image builders,
+      and strengthen the recursive elaboration graph correspondence to a
+      constructor-by-constructor inductive correspondence like the PEG layer.
 
 ## Immediate next slice
 

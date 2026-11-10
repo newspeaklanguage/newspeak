@@ -11,7 +11,8 @@ structure MixinDef where
   ownSlots : List SlotId
   /-- Stable identities of the mixin's directly declared nested classes.
       Their run-time class objects remain lazily memoized per enclosing
-      object; reflection uses this list to discard obsolete cache entries. -/
+      object AND mixin application; reflection qualifies these declaration
+      identities when discarding obsolete cache entries. -/
   nestedDeclarations : List ClassDeclId
   initializerDeclaration : ActivationDeclId
   initializerSelector : Selector

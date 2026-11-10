@@ -28,6 +28,24 @@ def nearestApplicationOnChain (p : Program) (h : Heap)
       else
         p.nearestApplicationOnChain h target rest
 
+/-- Equation (5.4), retaining every matching position rather than only the
+    most-specific one.  `position` is an accumulator used by the Horn form. -/
+def applicationIndicesFrom (p : Program) (h : Heap)
+    (target : ClassDeclId) : Nat → List ClassId → List Nat
+  | _, [] => []
+  | position, classId :: rest =>
+      let later := p.applicationIndicesFrom h target (position + 1) rest
+      if classId = p.top then later
+      else if p.namedClassDeclaration? h classId = some target then
+        position :: later
+      else later
+
+def ApplicationIndices (p : Program) (h : Heap) (receiverClass : ClassId)
+    (target : ClassDeclId) (indices : List Nat) : Prop :=
+  ∃ chain,
+    p.ClassChain h receiverClass chain ∧
+    p.applicationIndicesFrom h target 0 chain = indices
+
 def NearestApplication (p : Program) (h : Heap) (receiverClass : ClassId)
     (target : ClassDeclId) (result : Option ClassId) : Prop :=
   ∃ chain,

@@ -3,22 +3,26 @@ import Newspeak.SequentialWellFormed
 namespace Newspeak
 namespace Program
 
-def ownSlots (p : Program) (h : Heap) (classId : ClassId) : List SlotId :=
+/-- Qualify declaration identities by the application owning their cells. -/
+def applicationSlots (classId : ClassId) (declarations : List SlotId) :
+    List PhysicalSlotId := declarations.map (fun slot => ⟨classId, slot⟩)
+
+def ownSlots (p : Program) (h : Heap) (classId : ClassId) : List PhysicalSlotId :=
   match h.classes classId with
   | none => []
   | some classDef =>
       match p.mixins classDef.mixin with
       | none => []
-      | some mixinDef => mixinDef.ownSlots
+      | some mixinDef => applicationSlots classId mixinDef.ownSlots
 
 /-- Root-to-leaf layout for a class chain represented leaf-to-root. -/
-def layoutForChain (p : Program) (h : Heap) : List ClassId → List SlotId
+def layoutForChain (p : Program) (h : Heap) : List ClassId → List PhysicalSlotId
   | [] => []
   | classId :: ancestors =>
       p.layoutForChain h ancestors ++ p.ownSlots h classId
 
 def InstanceLayout (p : Program) (h : Heap) (classId : ClassId)
-    (slots : List SlotId) : Prop :=
+    (slots : List PhysicalSlotId) : Prop :=
   ∃ chain, p.ClassChain h classId chain ∧
     p.layoutForChain h chain = slots ∧ slots.Nodup
 
@@ -34,7 +38,7 @@ theorem layoutForChain_of_classes_eq {p : Program} {h h' : Heap}
     activation allocation cannot change the layout later used by Factory-New. -/
 theorem InstanceLayout.of_classes_eq {p : Program} {h h' : Heap}
     (classesEq : h'.classes = h.classes) {classId : ClassId}
-    {slots : List SlotId} (layout : p.InstanceLayout h classId slots) :
+    {slots : List PhysicalSlotId} (layout : p.InstanceLayout h classId slots) :
     p.InstanceLayout h' classId slots := by
   rcases layout with ⟨chain, chainWitness, layoutResult, noDuplicates⟩
   refine ⟨chain, classChain_of_classes_eq classesEq chainWitness, ?_,
@@ -42,7 +46,7 @@ theorem InstanceLayout.of_classes_eq {p : Program} {h h' : Heap}
   exact (layoutForChain_of_classes_eq classesEq chain).trans layoutResult
 
 theorem instanceLayout_unique {p : Program} {h : Heap} {classId : ClassId}
-    {left right : List SlotId} (leftLayout : p.InstanceLayout h classId left)
+    {left right : List PhysicalSlotId} (leftLayout : p.InstanceLayout h classId left)
     (rightLayout : p.InstanceLayout h classId right) : left = right := by
   rcases leftLayout with ⟨leftChain, leftChainWitness, leftResult, _⟩
   rcases rightLayout with ⟨rightChain, rightChainWitness, rightResult, _⟩
@@ -50,12 +54,12 @@ theorem instanceLayout_unique {p : Program} {h : Heap} {classId : ClassId}
   subst rightChain
   exact leftResult.symm.trans rightResult
 
-def containsSlot : List SlotId → SlotId → Bool
+def containsSlot : List PhysicalSlotId → PhysicalSlotId → Bool
   | [], _ => false
   | candidate :: remaining, slot =>
       if candidate = slot then true else containsSlot remaining slot
 
-theorem containsSlot_eq_true_iff (layout : List SlotId) (slot : SlotId) :
+theorem containsSlot_eq_true_iff (layout : List PhysicalSlotId) (slot : PhysicalSlotId) :
     containsSlot layout slot = true ↔ slot ∈ layout := by
   induction layout with
   | nil => simp [containsSlot]
@@ -65,8 +69,8 @@ theorem containsSlot_eq_true_iff (layout : List SlotId) (slot : SlotId) :
         simp [containsSlot]
       · simp [containsSlot, equal, ih, Ne.symm equal]
 
-def slotsInitializedTo (layout : List SlotId) (value : ObjRef) :
-    FiniteStore SlotId ObjRef :=
+def slotsInitializedTo (layout : List PhysicalSlotId) (value : ObjRef) :
+    FiniteStore PhysicalSlotId ObjRef :=
   { lookup := fun slot =>
       if containsSlot layout slot then some value else none
     domain := FiniteStore.deduplicated layout
@@ -75,69 +79,69 @@ def slotsInitializedTo (layout : List SlotId) (value : ObjRef) :
       intro slot
       simp [containsSlot_eq_true_iff, FiniteStore.mem_deduplicated] }
 
-@[simp] theorem slotsInitializedTo_domain (layout : List SlotId)
+@[simp] theorem slotsInitializedTo_domain (layout : List PhysicalSlotId)
     (value : ObjRef) :
     (slotsInitializedTo layout value).domain =
       FiniteStore.deduplicated layout := by
   rfl
 
-@[simp] theorem mem_slotsInitializedTo_domain_iff (layout : List SlotId)
-    (value : ObjRef) (slot : SlotId) :
+@[simp] theorem mem_slotsInitializedTo_domain_iff (layout : List PhysicalSlotId)
+    (value : ObjRef) (slot : PhysicalSlotId) :
     slot ∈ (slotsInitializedTo layout value).domain ↔ slot ∈ layout := by
   simp [FiniteStore.mem_deduplicated]
 
 def allocateInstance (_p : Program) (state : AllocationState)
-    (classId : ClassId) (layout : List SlotId) (nilObject : ObjRef) :
+    (classId : ClassId) (layout : List PhysicalSlotId) (nilObject : ObjRef) :
     AllocationState × ObjectId :=
   let id : ObjectId := ⟨state.nextObject⟩
   let objectDef : ObjectDef :=
     { classId := classId
       slots := slotsInitializedTo layout nilObject
-      nestedClasses := FiniteStore.empty ClassDeclId ClassId }
+      nestedClasses := FiniteStore.empty NestedCacheId ClassId }
   ({ state with heap := state.heap.installObject id objectDef
                 nextObject := state.nextObject + 1 }, id)
 
 @[simp] theorem allocateInstance_reference (p : Program)
-    (state : AllocationState) (classId : ClassId) (layout : List SlotId)
+    (state : AllocationState) (classId : ClassId) (layout : List PhysicalSlotId)
     (nilObject : ObjRef) :
     (p.allocateInstance state classId layout nilObject).2 =
       ⟨state.nextObject⟩ := by rfl
 
 @[simp] theorem allocateInstance_installs (p : Program)
-    (state : AllocationState) (classId : ClassId) (layout : List SlotId)
+    (state : AllocationState) (classId : ClassId) (layout : List PhysicalSlotId)
     (nilObject : ObjRef) :
     (p.allocateInstance state classId layout nilObject).1.heap.objects
         ⟨state.nextObject⟩ =
       some { classId := classId
              slots := slotsInitializedTo layout nilObject
-             nestedClasses := FiniteStore.empty ClassDeclId ClassId } := by
+             nestedClasses := FiniteStore.empty NestedCacheId ClassId } := by
   simp [allocateInstance]
 
 theorem allocatedInstance_slot_iff (p : Program) (state : AllocationState)
-    (classId : ClassId) (layout : List SlotId) (nilObject : ObjRef)
-    (slot : SlotId) :
+    (classId : ClassId) (layout : List PhysicalSlotId) (nilObject : ObjRef)
+    (slot : PhysicalSlotId) :
     ((p.allocateInstance state classId layout nilObject).1.heap.objects
       ⟨state.nextObject⟩).bind (fun objectDef => objectDef.slots slot) =
       some nilObject ↔ slot ∈ layout := by
   simp [allocateInstance, slotsInitializedTo, containsSlot_eq_true_iff]
 
 theorem allocatedInstance_nested_empty (p : Program) (state : AllocationState)
-    (classId : ClassId) (layout : List SlotId) (nilObject : ObjRef)
-    (declaration : ClassDeclId) :
+    (classId : ClassId) (layout : List PhysicalSlotId) (nilObject : ObjRef)
+    (declaration : NestedCacheId) :
     ((p.allocateInstance state classId layout nilObject).1.heap.objects
       ⟨state.nextObject⟩).bind
         (fun objectDef => objectDef.nestedClasses declaration) = none := by
   simp [allocateInstance]
 
 @[simp] theorem allocatedInstance_has_no_weakContainer (p : Program)
-    (state : AllocationState) (classId : ClassId) (layout : List SlotId)
+    (state : AllocationState) (classId : ClassId) (layout : List PhysicalSlotId)
     (nilObject : ObjRef) :
     ((p.allocateInstance state classId layout nilObject).1.heap.objects
       ⟨state.nextObject⟩).map ObjectDef.weakContainer = some none := by
   simp [allocateInstance]
 
 theorem allocatedInstance_realizes_layout (p : Program)
-    (state : AllocationState) (classId : ClassId) (layout : List SlotId)
+    (state : AllocationState) (classId : ClassId) (layout : List PhysicalSlotId)
     (nilObject : ObjRef) (layoutWitness : p.InstanceLayout state.heap classId layout) :
     (∀ slot,
       ((p.allocateInstance state classId layout nilObject).1.heap.objects
@@ -151,14 +155,14 @@ theorem allocatedInstance_realizes_layout (p : Program)
 
 theorem allocateInstance_was_fresh (p : Program) {state : AllocationState}
     (fresh : state.ObjectSupplyFresh) (classId : ClassId)
-    (layout : List SlotId) (nilObject : ObjRef) :
+    (layout : List PhysicalSlotId) (nilObject : ObjRef) :
     state.heap.objects (p.allocateInstance state classId layout nilObject).2 = none :=
   by simpa [allocateInstance] using
     fresh ⟨state.nextObject⟩ (Nat.le_refl _)
 
 theorem allocateInstance_preserves_supplies (p : Program)
     {state : AllocationState} (fresh : state.SuppliesFresh) (classId : ClassId)
-    (layout : List SlotId) (nilObject : ObjRef) :
+    (layout : List PhysicalSlotId) (nilObject : ObjRef) :
     (p.allocateInstance state classId layout nilObject).1.SuppliesFresh := by
   refine ⟨?_, ?_, ?_, ?_, ?_⟩
   · intro id bound
@@ -179,7 +183,7 @@ theorem allocateInstance_preserves_supplies (p : Program)
       state.heap.installObject ⟨state.nextObject⟩
         { classId := classId
           slots := slotsInitializedTo layout nilObject
-          nestedClasses := FiniteStore.empty ClassDeclId ClassId } by rfl]
+          nestedClasses := FiniteStore.empty NestedCacheId ClassId } by rfl]
     rw [Heap.installObject_away _ _ away]
     exact fresh.2.2.2.1 id (by omega)
   · intro id bound
@@ -234,7 +238,7 @@ theorem WellFormed.installObject_wellFormed {p : Program} {h : Heap}
 theorem allocateInstance_wellFormed (p : Program)
     {state : AllocationState} (wf : p.WellFormed state.heap)
     (fresh : state.SuppliesFresh) (classId : ClassId)
-    (classLive : p.IsLiveClass state.heap classId) (layout : List SlotId)
+    (classLive : p.IsLiveClass state.heap classId) (layout : List PhysicalSlotId)
     (nilObject : ObjRef) :
     p.WellFormed (p.allocateInstance state classId layout nilObject).1.heap ∧
       (p.allocateInstance state classId layout nilObject).1.SuppliesFresh := by

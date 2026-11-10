@@ -239,7 +239,7 @@ theorem objectLiteralStep_deterministic {p : Program}
     object and therefore ignores the forced value. -/
 def evaluateNestedClassMiss (p : Program) (state : AllocationState)
     (rest : ActivationStack) (current : ActivationId) (frames : EvalStack)
-    (object : ObjectId) (declaration : ClassDeclId)
+    (object : ObjectId) (declaration : NestedCacheId)
     (classExpression : CoreExpr) : Option SequentialConfig :=
   match classExpression with
   | .classBody classDeclaration superclassExpression => do
@@ -260,11 +260,12 @@ inductive NestedClassStep (p : Program) :
   | hit {state : AllocationState} {rest : ActivationStack}
       {current : ActivationId} {frames : EvalStack}
       {activation : ActivationDef} {object : ObjectId}
-      {declaration : ClassDeclId} {classExpression : CoreExpr}
+      {declaration : ClassDeclId} {application : ClassId} {classExpression : CoreExpr}
       {classId : ClassId}
       (currentActivation : state.heap.activations current = some activation)
       (receiver : activation.currentReceiver = .ordinaryObject object)
-      (cached : state.heap.readNestedClass object declaration = some classId) :
+      (selectedClass : activation.currentClass = some application)
+      (cached : state.heap.readNestedClass object ⟨application, declaration⟩ = some classId) :
       NestedClassStep p
         ⟨state, .push rest ⟨current, frames⟩,
           .evaluate (.nestedClass declaration classExpression)⟩
@@ -273,19 +274,20 @@ inductive NestedClassStep (p : Program) :
   | miss {state : AllocationState} {rest : ActivationStack}
       {current : ActivationId} {frames : EvalStack}
       {activation : ActivationDef} {object : ObjectId}
-      {declaration : ClassDeclId} {classExpression : CoreExpr}
+      {declaration : ClassDeclId} {application : ClassId} {classExpression : CoreExpr}
       {after : SequentialConfig}
       (currentActivation : state.heap.activations current = some activation)
       (receiver : activation.currentReceiver = .ordinaryObject object)
-      (absent : state.heap.readNestedClass object declaration = none)
+      (selectedClass : activation.currentClass = some application)
+      (absent : state.heap.readNestedClass object ⟨application, declaration⟩ = none)
       (next : p.evaluateNestedClassMiss state rest current frames object
-        declaration classExpression = some after) :
+        ⟨application, declaration⟩ classExpression = some after) :
       NestedClassStep p
         ⟨state, .push rest ⟨current, frames⟩,
           .evaluate (.nestedClass declaration classExpression)⟩ after
   | store {state : AllocationState} {rest : ActivationStack}
       {current : ActivationId} {frames : EvalStack} {object : ObjectId}
-      {declaration : ClassDeclId} {classId : ClassId} {heap : Heap}
+      {declaration : NestedCacheId} {classId : ClassId} {heap : Heap}
       (written : state.heap.writeNestedClass object declaration classId =
         some heap) :
       NestedClassStep p
@@ -300,45 +302,49 @@ theorem nestedClassStep_deterministic {p : Program}
     (step₁ : p.NestedClassStep before after₁)
     (step₂ : p.NestedClassStep before after₂) : after₁ = after₂ := by
   cases step₁ with
-  | hit activation₁ receiver₁ cached₁ =>
+  | hit activation₁ receiver₁ selectedClass₁ cached₁ =>
       cases step₂ with
-      | hit activation₂ receiver₂ cached₂ =>
+      | hit activation₂ receiver₂ selectedClass₂ cached₂ =>
           have activationEqual := Option.some.inj
             (activation₁.symm.trans activation₂)
           subst activationEqual
           have objectEqual := ObjRef.ordinaryObject.inj
             (receiver₁.symm.trans receiver₂)
           subst objectEqual
+          cases selectedClass₁.symm.trans selectedClass₂
           have equal := Option.some.inj (cached₁.symm.trans cached₂)
           subst equal
           rfl
-      | miss activation₂ receiver₂ absent₂ next₂ =>
+      | miss activation₂ receiver₂ selectedClass₂ absent₂ next₂ =>
           have activationEqual := Option.some.inj
             (activation₁.symm.trans activation₂)
           subst activationEqual
           have objectEqual := ObjRef.ordinaryObject.inj
             (receiver₁.symm.trans receiver₂)
           subst objectEqual
+          cases selectedClass₁.symm.trans selectedClass₂
           rw [absent₂] at cached₁
           contradiction
-  | miss activation₁ receiver₁ absent₁ next₁ =>
+  | miss activation₁ receiver₁ selectedClass₁ absent₁ next₁ =>
       cases step₂ with
-      | hit activation₂ receiver₂ cached₂ =>
+      | hit activation₂ receiver₂ selectedClass₂ cached₂ =>
           have activationEqual := Option.some.inj
             (activation₁.symm.trans activation₂)
           subst activationEqual
           have objectEqual := ObjRef.ordinaryObject.inj
             (receiver₁.symm.trans receiver₂)
           subst objectEqual
+          cases selectedClass₁.symm.trans selectedClass₂
           rw [absent₁] at cached₂
           contradiction
-      | miss activation₂ receiver₂ absent₂ next₂ =>
+      | miss activation₂ receiver₂ selectedClass₂ absent₂ next₂ =>
           have activationEqual := Option.some.inj
             (activation₁.symm.trans activation₂)
           subst activationEqual
           have objectEqual := ObjRef.ordinaryObject.inj
             (receiver₁.symm.trans receiver₂)
           subst objectEqual
+          cases selectedClass₁.symm.trans selectedClass₂
           exact Option.some.inj (next₁.symm.trans next₂)
   | store written₁ =>
       cases step₂ with
@@ -348,14 +354,14 @@ theorem nestedClassStep_deterministic {p : Program}
           rfl
 
 theorem readNestedClass_singleValued {h : Heap} {object : ObjectId}
-    {declaration : ClassDeclId} {left right : ClassId}
+    {declaration : NestedCacheId} {left right : ClassId}
     (leftRead : h.readNestedClass object declaration = some left)
     (rightRead : h.readNestedClass object declaration = some right) :
     left = right :=
   Option.some.inj (leftRead.symm.trans rightRead)
 
 theorem WellFormed.writeNestedClass_wellFormed {p : Program} {h h' : Heap}
-    (wf : p.WellFormed h) {object : ObjectId} {declaration : ClassDeclId}
+    (wf : p.WellFormed h) {object : ObjectId} {declaration : NestedCacheId}
     {classId : ClassId}
     (write : h.writeNestedClass object declaration classId = some h') :
     p.WellFormed h' := by
@@ -370,7 +376,7 @@ theorem WellFormed.writeNestedClass_wellFormed {p : Program} {h h' : Heap}
 
 theorem AllocationState.writeNestedClass_preserves_supplies
     {state : AllocationState} {heap : Heap} {object : ObjectId}
-    {declaration : ClassDeclId} {classId : ClassId}
+    {declaration : NestedCacheId} {classId : ClassId}
     (fresh : state.SuppliesFresh)
     (write : state.heap.writeNestedClass object declaration classId = some heap) :
     ({state with heap := heap} : AllocationState).SuppliesFresh := by
@@ -399,7 +405,7 @@ theorem AllocationState.writeNestedClass_preserves_supplies
         exact fresh.2.2.2.2 id frontier
 
 theorem Heap.writeNestedClass_retainsActivations {h h' : Heap}
-    {object : ObjectId} {declaration : ClassDeclId} {classId : ClassId}
+    {object : ObjectId} {declaration : NestedCacheId} {classId : ClassId}
     (write : h.writeNestedClass object declaration classId = some h') :
     ∀ id activation, h.activations id = some activation →
       ∃ activation', h'.activations id = some activation' := by
@@ -439,8 +445,8 @@ theorem nestedClassStep_preserves_wellFormed {p : Program}
     SequentialWellFormed p after := by
   cases step with
   | hit => exact ⟨wf.heap, wf.supplies, wf.stack, trivial⟩
-  | @miss state rest current frames activation object declaration expression
-      after currentActivation receiver absent next =>
+  | @miss state rest current frames activation object declaration application expression
+      after currentActivation receiver selectedClass absent next =>
       cases expression <;> simp [evaluateNestedClassMiss] at next
       all_goals
         try
@@ -584,7 +590,7 @@ theorem sequentialStep_objectAndNestedClass_disjoint {p : Program}
 @[simp] theorem initializationCoordinatorNext_nestedClassStoreFrame_none
     (p : Program) (state : AllocationState) (rest : ActivationStack)
     (current : ActivationId) (frames : EvalStack) (value : ObjRef)
-    (object : ObjectId) (declaration : ClassDeclId) :
+    (object : ObjectId) (declaration : NestedCacheId) :
     p.initializationCoordinatorNext
       ⟨state, .push rest ⟨current,
         .push frames (.nestedClassStore object declaration)⟩,
@@ -604,7 +610,7 @@ theorem sequentialStep_objectAndNestedClass_disjoint {p : Program}
 @[simp] theorem slotInitializationNext_nestedClassStoreFrame_none
     (p : Program) (state : AllocationState) (rest : ActivationStack)
     (current : ActivationId) (frames : EvalStack) (value : ObjRef)
-    (object : ObjectId) (declaration : ClassDeclId) :
+    (object : ObjectId) (declaration : NestedCacheId) :
     p.slotInitializationNext
       ⟨state, .push rest ⟨current,
         .push frames (.nestedClassStore object declaration)⟩,
@@ -982,7 +988,7 @@ theorem allocatedObjectLiteral_factoryNew_allocatesFreshInstance (p : Program)
     (current : ActivationId) (frames : EvalStack)
     (implementation :
       ObjectLiteralFactoryImplementation p descriptor instanceMixin)
-    (layout : List SlotId)
+    (layout : List PhysicalSlotId)
     (layoutWitness :
       let allocation := p.allocateClassPair state
         (.expression (.objectLiteral descriptor.declaration))
@@ -1011,7 +1017,7 @@ theorem allocatedObjectLiteral_factoryNew_allocatesFreshInstance (p : Program)
       after.allocation.heap.objects object = some
         { classId := allocation.2.1
           slots := slotsInitializedTo layout p.nilObject
-          nestedClasses := FiniteStore.empty ClassDeclId ClassId } := by
+          nestedClasses := FiniteStore.empty NestedCacheId ClassId } := by
   let allocation := p.allocateClassPair state
     (.expression (.objectLiteral descriptor.declaration))
     descriptor.instanceMixin descriptor.classMixin superclass enclosingObject
@@ -1072,7 +1078,7 @@ theorem allocatedObjectLiteral_factoryNew_allocatesFreshInstance (p : Program)
   have objectInstalled : after.allocation.heap.objects object = some
       { classId := allocation.2.1
         slots := slotsInitializedTo layout p.nilObject
-        nestedClasses := FiniteStore.empty ClassDeclId ClassId } := by
+        nestedClasses := FiniteStore.empty NestedCacheId ClassId } := by
     simpa [after, object, factoryNewResult] using
       p.allocateInitialInstance_installs_object factoryState allocation.2.1
         layout (objectLiteralFactory descriptor instanceMixin)
@@ -1106,7 +1112,7 @@ theorem objectLiteralCommit_allocatesFreshInstance (p : Program)
         descriptor.instanceMixin descriptor.classMixin superclass
         enclosingObject (objectLiteralFactory descriptor instanceMixin)
       p.WellFormed allocation.1.heap)
-    (layout : List SlotId)
+    (layout : List PhysicalSlotId)
     (layoutWitness :
       let allocation := p.allocateClassPair state
         (.expression (.objectLiteral descriptor.declaration))
@@ -1133,7 +1139,7 @@ theorem objectLiteralCommit_allocatesFreshInstance (p : Program)
       after.allocation.heap.objects object = some
         { classId := allocation.2.1
           slots := slotsInitializedTo layout p.nilObject
-          nestedClasses := FiniteStore.empty ClassDeclId ClassId } := by
+          nestedClasses := FiniteStore.empty NestedCacheId ClassId } := by
   let allocation := p.allocateClassPair state
     (.expression (.objectLiteral descriptor.declaration))
     descriptor.instanceMixin descriptor.classMixin superclass enclosingObject

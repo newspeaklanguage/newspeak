@@ -18,13 +18,13 @@ inductive EvalFrame where
       (remaining : List LocalDeclarationGroup) (body : List Statement)
       (target : InitializationTarget)
   | localWrite (activation : ActivationId) (slot : LocalSlotId)
-  | slotWrite (object : ObjectId) (slot : SlotId)
-  | lazySlotStore (object : ObjectId) (slot : SlotId)
+  | slotWrite (object : ObjectId) (slot : PhysicalSlotId)
+  | lazySlotStore (object : ObjectId) (slot : PhysicalSlotId)
   | makeClassBody (descriptor : ClassBodyDescriptor)
       (enclosingObject : ObjRef)
   | makeObjectLiteral (descriptor : ObjectLiteralDescriptor)
       (enclosingObject : ObjRef)
-  | nestedClassStore (object : ObjectId) (declaration : ClassDeclId)
+  | nestedClassStore (object : ObjectId) (declaration : NestedCacheId)
   | mixinSuperclass (descriptor : MixinApplicationDescriptor)
       (mixinSource : CoreExpr)
   | mixinSource (descriptor : MixinApplicationDescriptor)
@@ -37,7 +37,7 @@ inductive EvalFrame where
       (original : Message)
   | mixinMessage (classId : ClassId) (object : ObjectId)
   | afterMixin (classId : ClassId) (object : ObjectId)
-  | storeInitializedSlot (object : ObjectId) (slot : SlotId)
+  | storeInitializedSlot (object : ObjectId) (slot : PhysicalSlotId)
       (remainingDeclarations : List SlotDeclaration)
       (remainingGroups : List SlotDeclarationGroup) (body : List Statement)
   | simultaneousSlots (remainingCode : List CoreExpr) (object : ObjectId)
@@ -59,6 +59,16 @@ structure ActivationFrame where
   activation : ActivationId
   frames : EvalStack
 deriving Repr
+
+/-- Equation (8.7): retain the caller exactly when it has pending evaluation
+    frames; otherwise inherit the caller's continuation. -/
+inductive Program.CalleeContinuation (heap : Heap) (current : ActivationId) :
+    EvalStack → Option ActivationId → Prop where
+  | nonTail {frames : EvalStack} {top : EvalFrame} :
+      Program.CalleeContinuation heap current (.push frames top) (some current)
+  | tail {activation : ActivationDef} :
+      heap.activations current = some activation →
+      Program.CalleeContinuation heap current .empty activation.continuation
 
 /-- Snoc-shaped stack matching the prose notation `A · ⟨a,π⟩`. -/
 inductive ActivationStack where

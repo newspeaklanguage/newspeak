@@ -10,35 +10,35 @@ def eagerSlotInitializer : SlotDeclaration →
   | .mutableUninitialized _ => none
 
 def Program.slotFutureInstallExpression (p : Program)
-    (activation : ActivationId) (object : ObjectId) :
+    (activation : ActivationId) (object : ObjectId) (application : ClassId) :
     SlotDeclaration → Option CoreExpr
   | .immutable slot _ thunk
   | .mutableInitialized slot _ thunk =>
-      some (.writeSlot object slot
+      some (.writeSlot object ⟨application, slot⟩
         (.ordinarySend (p.pastFutureExpression activation) computingSelector
           [.closureLiteral thunk]))
   | .mutableUninitialized _ => none
 
-def slotFutureResolveExpression (object : ObjectId) :
+def slotFutureResolveExpression (object : ObjectId) (application : ClassId) :
     SlotDeclaration → Option CoreExpr
   | .immutable slot _ _
   | .mutableInitialized slot _ _ =>
-      some (.ordinarySend (.readSlot object slot) resolveSelector [])
+      some (.ordinarySend (.readSlot object ⟨application, slot⟩) resolveSelector [])
   | .mutableUninitialized _ => none
 
 /-- Equation (9.25): every eager slot gets its future before any future is
     resolved; both subsequences retain declaration source order. -/
 def Program.slotSimCode (p : Program) (activation : ActivationId)
-    (object : ObjectId) (declarations : List SlotDeclaration) : List CoreExpr :=
-  declarations.filterMap (p.slotFutureInstallExpression activation object) ++
-    declarations.filterMap (slotFutureResolveExpression object)
+    (object : ObjectId) (application : ClassId) (declarations : List SlotDeclaration) : List CoreExpr :=
+  declarations.filterMap (p.slotFutureInstallExpression activation object application) ++
+    declarations.filterMap (slotFutureResolveExpression object application)
 
 theorem Program.slotSimCode_installationPrefix (p : Program)
-    (activation : ActivationId) (object : ObjectId)
+    (activation : ActivationId) (object : ObjectId) (application : ClassId)
     (declarations : List SlotDeclaration) :
     let installations := declarations.filterMap
-      (p.slotFutureInstallExpression activation object)
-    (p.slotSimCode activation object declarations).take installations.length =
+      (p.slotFutureInstallExpression activation object application)
+    (p.slotSimCode activation object application declarations).take installations.length =
       installations := by
   simp [Program.slotSimCode]
 
@@ -46,10 +46,10 @@ namespace Program
 
 def startSimultaneousSlots (p : Program) (state : AllocationState)
     (rest : ActivationStack) (current : ActivationId) (frames : EvalStack)
-    (object : ObjectId) (declarations : List SlotDeclaration)
+    (object : ObjectId) (application : ClassId) (declarations : List SlotDeclaration)
     (remainingGroups : List SlotDeclarationGroup) (body : List Statement) :
     SequentialConfig :=
-  match p.slotSimCode current object declarations with
+  match p.slotSimCode current object application declarations with
   | [] => ⟨state, .push rest ⟨current, frames⟩,
       .initializeSlotGroups object remainingGroups body⟩
   | first :: later =>
@@ -73,8 +73,10 @@ def slotInitializationNext (p : Program)
       | .sequential declarations :: remaining =>
           some ⟨state, config.stack,
             .initializeSequentialSlots object declarations remaining body⟩
-      | .simultaneous declarations :: remaining =>
-          some (p.startSimultaneousSlots state rest current frames object
+      | .simultaneous declarations :: remaining => do
+          let activation ← state.heap.activations current
+          let application ← activation.currentClass
+          some (p.startSimultaneousSlots state rest current frames object application
             declarations remaining body)
   | .initializeSequentialSlots object declarations remainingGroups body =>
       match declarations with
@@ -84,9 +86,11 @@ def slotInitializationNext (p : Program)
           some ⟨state, config.stack,
             .initializeSequentialSlots object later remainingGroups body⟩
       | .immutable slot initializer _ :: later
-      | .mutableInitialized slot initializer _ :: later =>
+      | .mutableInitialized slot initializer _ :: later => do
+          let activation ← state.heap.activations current
+          let application ← activation.currentClass
           some ⟨state, .push rest ⟨current,
-            .push frames (.storeInitializedSlot object slot later
+            .push frames (.storeInitializedSlot object ⟨application, slot⟩ later
               remainingGroups body)⟩,
             .evaluate initializer⟩
   | .object value =>
@@ -146,15 +150,17 @@ theorem slotInitializationStep_preserves_wellFormed {p : Program}
                       subst after
                       exact ⟨wf.heap, wf.supplies, wf.stack, trivial⟩
                   | simultaneous declarations =>
-                      cases codeResult : p.slotSimCode current object declarations with
+                      simp [slotInitializationNext, Option.bind_eq_some_iff] at next
+                      rcases next with ⟨activation, _, application, _, next⟩
+                      cases codeResult : p.slotSimCode current object application declarations with
                       | nil =>
-                          simp [slotInitializationNext, startSimultaneousSlots,
+                          simp [startSimultaneousSlots,
                             codeResult] at next
                           subst after
                           exact ⟨wf.heap, wf.supplies, by
                             simpa [StackLive] using wf.stack, trivial⟩
                       | cons first later =>
-                          simp [slotInitializationNext, startSimultaneousSlots,
+                          simp [startSimultaneousSlots,
                             codeResult] at next
                           subst after
                           exact ⟨wf.heap, wf.supplies, by
@@ -172,12 +178,14 @@ theorem slotInitializationStep_preserves_wellFormed {p : Program}
                       subst after
                       exact ⟨wf.heap, wf.supplies, wf.stack, trivial⟩
                   | immutable slot initializer thunk =>
-                      simp [slotInitializationNext] at next
+                      simp [slotInitializationNext, Option.bind_eq_some_iff] at next
+                      rcases next with ⟨activation, _, application, _, next⟩
                       subst after
                       exact ⟨wf.heap, wf.supplies, by
                         simpa [StackLive] using wf.stack, trivial⟩
                   | mutableInitialized slot initializer thunk =>
-                      simp [slotInitializationNext] at next
+                      simp [slotInitializationNext, Option.bind_eq_some_iff] at next
+                      rcases next with ⟨activation, _, application, _, next⟩
                       subst after
                       exact ⟨wf.heap, wf.supplies, by
                         simpa [StackLive] using wf.stack, trivial⟩

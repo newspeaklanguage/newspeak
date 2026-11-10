@@ -27,7 +27,7 @@ deriving Repr, DecidableEq, BEq
 inductive SuperclassSyntax where
   | implicitSuperclass
   | explicitSuperclass
-deriving Repr, DecidableEq, BEq
+deriving Repr, DecidableEq, BEq, ReflBEq, LawfulBEq
 
 /-- Exact semantic payload of an atomic literal.  Character is deliberately
     absent, as required by Specification 0.109. -/
@@ -137,8 +137,8 @@ inductive CoreExpr where
       expands to its statically identified closure. -/
   | cascade (descriptor : CascadeDescriptor) (receiver : CoreExpr)
       (clauses : List (Selector × List CoreExpr))
-  | readSlot (object : ObjectId) (slot : SlotId)
-  | writeSlot (object : ObjectId) (slot : SlotId) (expression : CoreExpr)
+  | readSlot (object : ObjectId) (slot : PhysicalSlotId)
+  | writeSlot (object : ObjectId) (slot : PhysicalSlotId) (expression : CoreExpr)
   | currentRead (slot : SlotId)
   | currentWrite (slot : SlotId) (expression : CoreExpr)
   | lazyRead (slot : SlotId) (initializer : CoreExpr)

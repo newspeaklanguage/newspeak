@@ -106,6 +106,10 @@ def lazySlotMethods (declaration : DeclId) (owner : ClassBodyDecl)
   | .immutable => [getter]
   | .mutable => [getter, synthesizedSetter declaration owner name access slot]
 
+def primaryFactoryBody (selector : Selector) (parameters : List ParameterId) :
+    List Statement :=
+  [.return (.newInstanceCurrent selector parameters)]
+
 def primaryFactoryMethod (declaration : DeclId) (owner : ClassBodyDecl)
     (selector : Selector) (parameters : List ParameterId) : DerivedMethod :=
   { definition :=
@@ -118,7 +122,7 @@ def primaryFactoryMethod (declaration : DeclId) (owner : ClassBodyDecl)
         owner := owner
         body := ⟨declaration.index⟩ }
     locals := []
-    body := [.return (.newInstanceCurrent selector parameters)] }
+    body := primaryFactoryBody selector parameters }
 
 theorem ordinarySlotMethods_mutable_setter_same_access
     (declaration : DeclId) (owner : ClassBodyDecl) (name : String)

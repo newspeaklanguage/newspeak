@@ -24,7 +24,7 @@ namespace Program
 
 @[simp] theorem initializationCoordinatorNext_slotWriteFrame_none (p : Program)
     (state : AllocationState) (rest : ActivationStack) (current : ActivationId)
-    (frames : EvalStack) (value : ObjRef) (object : ObjectId) (slot : SlotId) :
+    (frames : EvalStack) (value : ObjRef) (object : ObjectId) (slot : PhysicalSlotId) :
     p.initializationCoordinatorNext
       ⟨state, .push rest ⟨current, .push frames (.slotWrite object slot)⟩,
         .object value⟩ = none := by
@@ -33,7 +33,7 @@ namespace Program
 @[simp] theorem initializationCoordinatorNext_lazySlotStoreFrame_none
     (p : Program) (state : AllocationState) (rest : ActivationStack)
     (current : ActivationId) (frames : EvalStack) (value : ObjRef)
-    (object : ObjectId) (slot : SlotId) :
+    (object : ObjectId) (slot : PhysicalSlotId) :
     p.initializationCoordinatorNext
       ⟨state, .push rest ⟨current, .push frames (.lazySlotStore object slot)⟩,
         .object value⟩ = none := by

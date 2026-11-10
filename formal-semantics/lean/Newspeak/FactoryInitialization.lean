@@ -194,7 +194,7 @@ structure InitialInstanceAllocation where
 /-- Allocate the object first, so every physical slot exists and contains nil,
     then allocate the initializer activation that coordinates its class chain. -/
 def allocateInitialInstance (p : Program) (state : AllocationState)
-    (classId : ClassId) (layout : List SlotId) (factory : FactoryDef)
+    (classId : ClassId) (layout : List PhysicalSlotId) (factory : FactoryDef)
     (message : Message) (continuation : Option ActivationId) :
     InitialInstanceAllocation :=
   let objectAllocation := p.allocateInstance state classId layout p.nilObject
@@ -205,7 +205,7 @@ def allocateInitialInstance (p : Program) (state : AllocationState)
     initializer := initializerAllocation.2 }
 
 @[simp] theorem allocateInitialInstance_object (p : Program)
-    (state : AllocationState) (classId : ClassId) (layout : List SlotId)
+    (state : AllocationState) (classId : ClassId) (layout : List PhysicalSlotId)
     (factory : FactoryDef) (message : Message)
     (continuation : Option ActivationId) :
     (p.allocateInitialInstance state classId layout factory message
@@ -213,7 +213,7 @@ def allocateInitialInstance (p : Program) (state : AllocationState)
   rfl
 
 @[simp] theorem allocateInitialInstance_initializer (p : Program)
-    (state : AllocationState) (classId : ClassId) (layout : List SlotId)
+    (state : AllocationState) (classId : ClassId) (layout : List PhysicalSlotId)
     (factory : FactoryDef) (message : Message)
     (continuation : Option ActivationId) :
     (p.allocateInitialInstance state classId layout factory message
@@ -221,7 +221,7 @@ def allocateInitialInstance (p : Program) (state : AllocationState)
   rfl
 
 theorem allocateInitialInstance_installs_object (p : Program)
-    (state : AllocationState) (classId : ClassId) (layout : List SlotId)
+    (state : AllocationState) (classId : ClassId) (layout : List PhysicalSlotId)
     (factory : FactoryDef) (message : Message)
     (continuation : Option ActivationId) :
     let allocation := p.allocateInitialInstance state classId layout factory
@@ -229,12 +229,12 @@ theorem allocateInitialInstance_installs_object (p : Program)
     allocation.state.heap.objects allocation.object =
       some { classId := classId
              slots := slotsInitializedTo layout p.nilObject
-             nestedClasses := FiniteStore.empty ClassDeclId ClassId } := by
+             nestedClasses := FiniteStore.empty NestedCacheId ClassId } := by
   simp [allocateInitialInstance, allocateInitializerActivation,
     allocateInstance, Heap.installActivation]
 
 theorem allocateInitialInstance_installs_initializer (p : Program)
-    (state : AllocationState) (classId : ClassId) (layout : List SlotId)
+    (state : AllocationState) (classId : ClassId) (layout : List PhysicalSlotId)
     (factory : FactoryDef) (message : Message)
     (continuation : Option ActivationId) :
     let allocation := p.allocateInitialInstance state classId layout factory
@@ -247,7 +247,7 @@ theorem allocateInitialInstance_installs_initializer (p : Program)
 
 theorem allocateInitialInstance_preserves_supplies (p : Program)
     {state : AllocationState} (fresh : state.SuppliesFresh)
-    (classId : ClassId) (layout : List SlotId) (factory : FactoryDef)
+    (classId : ClassId) (layout : List PhysicalSlotId) (factory : FactoryDef)
     (message : Message) (continuation : Option ActivationId) :
     (p.allocateInitialInstance state classId layout factory message
       continuation).state.SuppliesFresh := by
@@ -258,7 +258,7 @@ theorem allocateInitialInstance_preserves_supplies (p : Program)
 theorem allocateInitialInstance_wellFormed (p : Program)
     {state : AllocationState} (wf : p.WellFormed state.heap)
     (fresh : state.SuppliesFresh) (classId : ClassId)
-    (classLive : p.IsLiveClass state.heap classId) (layout : List SlotId)
+    (classLive : p.IsLiveClass state.heap classId) (layout : List PhysicalSlotId)
     (factory : FactoryDef) (message : Message)
     (continuation : Option ActivationId) :
     let allocation := p.allocateInitialInstance state classId layout factory
@@ -278,7 +278,7 @@ theorem allocateInitialInstance_wellFormed (p : Program)
 
 def factoryNewResult (p : Program) (state : AllocationState)
     (rest : ActivationStack) (factoryActivation : ActivationId)
-    (frames : EvalStack) (classId : ClassId) (layout : List SlotId)
+    (frames : EvalStack) (classId : ClassId) (layout : List PhysicalSlotId)
     (factory : FactoryDef) (message : Message) : SequentialConfig :=
   let allocation := p.allocateInitialInstance state classId layout factory
     message (some factoryActivation)
@@ -297,7 +297,7 @@ inductive FactoryNewStep (p : Program) :
       {activation : ActivationDef} {classId : ClassId} {classDef : ClassDef}
       {factory : FactoryDef} {selector : Selector}
       {parameters : List ParameterId} {arguments : List ObjRef}
-      {layout : List SlotId}
+      {layout : List PhysicalSlotId}
       (activationLive : state.heap.activations current = some activation)
       (receiver : activation.currentReceiver = .classObject classId)
       (classLive : state.heap.classes classId = some classDef)
@@ -347,7 +347,7 @@ theorem factoryNewStep_deterministic {p : Program}
 
 theorem allocateInitialInstance_retains_activations (p : Program)
     {state : AllocationState} (fresh : state.SuppliesFresh)
-    (classId : ClassId) (layout : List SlotId) (factory : FactoryDef)
+    (classId : ClassId) (layout : List PhysicalSlotId) (factory : FactoryDef)
     (message : Message) (continuation : Option ActivationId) :
     ∀ id activation, state.heap.activations id = some activation →
       ∃ activation',
@@ -413,7 +413,7 @@ theorem factoryNewStep_allocates_fresh_instance {p : Program}
       after.allocation.heap.objects object = some
         { classId := classId
           slots := slotsInitializedTo layout p.nilObject
-          nestedClasses := FiniteStore.empty ClassDeclId ClassId } := by
+          nestedClasses := FiniteStore.empty NestedCacheId ClassId } := by
   cases step with
   | @allocate state rest current frames activation classId classDef factory
       selector parameters arguments layout activationLive receiver classLive

@@ -67,7 +67,7 @@ inductive ReflectionCommand where
   | changeObjectClass (mirror : MirrorId) (object : ObjectId)
       (classId : ClassId)
   | objectSlotWrite (mirror : MirrorId) (object : ObjectId)
-      (slot : SlotId) (value : ObjRef)
+      (slot : PhysicalSlotId) (value : ObjRef)
   | activationParameterWrite (mirror : MirrorId) (activation : ActivationId)
       (parameter : ParameterId) (value : ObjRef)
   | activationLocalWrite (mirror : MirrorId) (activation : ActivationId)
@@ -211,7 +211,7 @@ inductive ReflectionWriteLocation where
   | superclass (classId : ClassId)
   | classEnclosingObject (classId : ClassId)
   | objectClass (object : ObjectId)
-  | objectSlot (object : ObjectId) (slot : SlotId)
+  | objectSlot (object : ObjectId) (slot : PhysicalSlotId)
   /-- The continuation-dependency graph as a whole.  Operations that pop or
       retire frames can update a state-dependent set of activation records,
       so their static footprint must conservatively overlap every activation

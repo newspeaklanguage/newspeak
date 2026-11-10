@@ -18,6 +18,13 @@ FRONTEND = SEMANTICS / "front-end-semantics.tex"
 AUX = SEMANTICS / "newspeak-semantics.aux"
 OUTPUT = ROOT / "app" / "definitions.generated.json"
 
+# Keep the declaration/storage distinction directly navigable in both the
+# interactive reference and the standalone HTML export.
+RELATED_DEFINITIONS = {
+    "eq:own-slots": ["eq:mixin-record", "eq:slot-layout", "eq:derived-mixin-entry"],
+    "eq:slot-layout": ["eq:own-slots", "eq:heap-records"],
+}
+
 
 def symbol(pattern: str, notation: str, description: str) -> tuple[re.Pattern[str], str, str]:
     return re.compile(pattern), notation, description
@@ -27,6 +34,9 @@ def symbol(pattern: str, notation: str, description: str) -> tuple[re.Pattern[st
 # phrased so they remain correct wherever a metavariable is reused by a family
 # of closely related definitions.
 PARAMETERS = [
+    symbol(r"d_j", "d_j", "Identified physical slot declaration whose stable declaration identity is j, including a lazy slot's backing declaration."),
+    symbol(r"\\xi_s", "\\xi_s", "Physical slot address (C,j): runtime mixin application C and stable slot declaration j; repeated applications have separate cells."),
+    symbol(r"\\xi_n", "\\xi_n", "Nested-class cache key (C,N): runtime mixin application C and inducing declaration N; the cache is per receiver and application."),
     symbol(r"\\mathcal\s*(?:\{A\}|A)", "\\mathcal A", "Activation stack: the ordered stack of active activations and their continuation links."),
     symbol(r"\\mathcal\s*(?:\{X\}|X)", "\\mathcal X", "Actor run-state map, recording whether each actor is idle, executing a turn, or paused with a resumable stack."),
     symbol(r"\\mathcal\s*(?:\{Q\}|Q)", "\\mathcal Q", "Mailbox map; \\mathcal Q(A) is actor A's FIFO queue."),
@@ -162,10 +172,10 @@ PARAMETERS = [
     symbol(r"\\theta", "\\theta", "Evaluated receiver/request descriptor used while constructing or routing a send."),
     symbol(r"\\gamma", "\\gamma", "Lexical-scope map from enclosing declaration identities to runtime activations."),
     symbol(r"\\rho", "\\rho", "Activation environment mapping formal-parameter identities to argument values."),
-    symbol(r"\\sigma", "\\sigma", "Object slot store mapping physical slot identities to values."),
-    symbol(r"\\eta", "\\eta", "Per-object cache of nested-class values."),
+    symbol(r"\\sigma", "\\sigma", "Object slot store mapping qualified (application class, slot declaration) addresses to values."),
+    symbol(r"\\eta", "\\eta", "Per-object cache mapping (application class, nested declaration) to nested-class values; in debugger contexts it instead denotes a frame key."),
     symbol(r"\\phi", "\\phi", "Finite selector-to-method map defined directly by a mixin."),
-    symbol(r"\\delta", "\\delta", "Source-ordered physical slot declarations of a mixin."),
+    symbol(r"\\delta", "\\delta", "Static, source-ordered physical slot declarations stored once per mixin in the current program P, including lazy backing declarations; not runtime cells. Reflection may replace this metadata by replacing P."),
     symbol(r"\\nu", "\\nu", "Nested-class declarations of a mixin."),
     symbol(r"\\iota", "\\iota", "Normalized mixin initializer, or its projection from the static program."),
     symbol(r"\\tau", "\\tau", "Initialization continuation tag describing what should happen after local initialization."),
@@ -220,7 +230,7 @@ PARAMETERS = [
     symbol(r"(?<![A-Za-z])y(?![A-Za-z])", "y", "Value after remote representation or another helper transformation."),
     symbol(r"(?<![A-Za-z])z(?![A-Za-z])", "z", "Auxiliary result value."),
     symbol(r"(?<![A-Za-z])d(?![A-Za-z])", "d", "Stable declaration selected by initial elaboration, or a pattern descriptor."),
-    symbol(r"(?<![A-Za-z])j(?![A-Za-z])", "j", "Physical local-slot or instance-slot identity."),
+    symbol(r"(?<![A-Za-z])j(?![A-Za-z])", "j", "Local-slot identity or stable instance-slot declaration identity; an instance cell additionally needs its class application C."),
     symbol(r"(?<![A-Za-z])i(?![A-Za-z])", "i", "Natural-number index, depth, or execution position."),
     symbol(r"(?<![A-Za-z])n(?![A-Za-z])", "n", "Arity, finite length, normalized source name, or VM program version, according to the definition."),
     symbol(r"(?<![A-Za-z])m(?![A-Za-z])", "m", "Message template, method identity, or finite count determined by context."),
@@ -267,6 +277,10 @@ def clean_formula(formula: str) -> str:
     formula = re.sub(r"\\label\{[^}]+\}", "", formula)
     formula = re.sub(r"\\quad\(\\rulelabel\{[^}]+\}\)\.?", "", formula)
     formula = re.sub(r"\\(?:small|footnotesize|scriptsize)\b", "", formula)
+    # Empty array inter-column material controls TeX padding only. KaTeX
+    # does not accept this column syntax; removing it preserves the equation.
+    formula = formula.replace("@{}", "")
+    formula = formula.replace(r"\hfill", r"\qquad")
     formula = re.sub(r"^\s*\\begin\{equation\}\s*", "", formula)
     formula = re.sub(r"\s*\\end\{equation\}\s*$", "", formula)
     lines = [line.rstrip() for line in formula.strip().splitlines()]
@@ -352,6 +366,18 @@ def refine_descriptions(
 ) -> list[dict[str, str]]:
     """Resolve the few one-letter metavariables whose domains vary by section."""
     replacements: dict[str, str] = {}
+    if identifier == "eq:own-slots":
+        replacements.update(
+            {
+                "P": "Current static program containing the mixin record; a reflective install replaces P atomically.",
+                "M": "Static mixin identity whose own physical slot declarations are projected; not a runtime application class.",
+                "j": "Stable physical slot declaration identity projected from d_j. The same j is reused by every application of M; its distinct runtime addresses are (C,j).",
+                "K": "Stable class-body declaration identity inducing M.",
+                "\\phi": "Finite map of methods defined directly by M, another field of its static mixin record.",
+                "\\nu": "Static nested-class declarations of M, another field of its mixin record.",
+                "\\iota": "Normalized initializer of M, another field of its mixin record; lazy backing slots have no eager initializer group.",
+            }
+        )
     if section.startswith("10 "):
         replacements.update(
             {
@@ -625,6 +651,10 @@ def refine_descriptions(
             }
         )
 
+    if identifier in {"eq:slot-layout", "eq:slot-frames", "eq:nested-class-cache",
+                      "eq:nested-declaration-keys", "eq:cached-nested-class-validity"}:
+        replacements["N"] = "Stable inducing nested-class declaration identity, shared across applications of its mixin."
+        replacements["R"] = "Selected runtime mixin application owning the nested-class cache entry."
     for parameter in parameters:
         replacement = replacements.get(parameter["notation"])
         if replacement:
@@ -687,7 +717,10 @@ def build_entries() -> list[dict[str, object]]:
                 "kind": kind,
                 "section": section,
                 "subsection": subsection,
-                "summary": summary(title, kind),
+                "summary": (
+                    "Projects the static declaration identities in source order, including lazy backing slots. Runtime layout separately qualifies each identity by its mixin application."
+                    if identifier == "eq:own-slots" else summary(title, kind)
+                ),
                 "formula": formula,
                 "parameters": refine_descriptions(parameter_list(formula), identifier, section),
                 "order": match.start(),
@@ -723,8 +756,14 @@ def build_entries() -> list[dict[str, object]]:
         )
 
     entries.sort(key=lambda entry: int(entry["order"]))
+    by_id = {entry["sourceId"]: entry for entry in entries}
     for entry in entries:
         entry.pop("order")
+        entry["relatedDefinitions"] = [
+            {"id": by_id[target]["id"], "title": by_id[target]["title"],
+             "number": by_id[target]["number"]}
+            for target in RELATED_DEFINITIONS.get(entry["sourceId"], [])
+        ]
     return entries
 
 

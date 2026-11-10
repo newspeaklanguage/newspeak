@@ -4151,7 +4151,7 @@ theorem debuggerTransactionIndependent_of_nonconflicting
 theorem Heap.writeObjectSlot_distinct_objects_commutes
     (heap : Heap) {firstObject secondObject : ObjectId}
     (different : firstObject ≠ secondObject)
-    (firstSlot secondSlot : SlotId) (firstValue secondValue : ObjRef)
+    (firstSlot secondSlot : PhysicalSlotId) (firstValue secondValue : ObjRef)
     {firstDefinition secondDefinition : ObjectDef}
     {oldFirstValue oldSecondValue : ObjRef}
     (firstObjectPresent : heap.objects firstObject = some firstDefinition)
@@ -4181,7 +4181,7 @@ theorem Heap.writeObjectSlot_distinct_objects_commutes
       slots := secondDefinition.slots.install secondSlot secondValue }]
 
 theorem Heap.writeObjectSlot_same_object_distinct_slots_commutes
-    (heap : Heap) (object : ObjectId) {firstSlot secondSlot : SlotId}
+    (heap : Heap) (object : ObjectId) {firstSlot secondSlot : PhysicalSlotId}
     (different : firstSlot ≠ secondSlot) (firstValue secondValue : ObjRef)
     {definition : ObjectDef} {oldFirstValue oldSecondValue : ObjRef}
     (objectPresent : heap.objects object = some definition)
@@ -4216,10 +4216,10 @@ theorem Heap.writeObjectSlot_same_object_distinct_slots_commutes
 theorem Heap.reflectWriteObjectSlot_distinct_objects_commutes
     (program : Program) (heap : Heap) {firstObject secondObject : ObjectId}
     (different : firstObject ≠ secondObject)
-    (firstSlot secondSlot : SlotId) (firstValue secondValue : ObjRef)
+    (firstSlot secondSlot : PhysicalSlotId) (firstValue secondValue : ObjRef)
     {firstDefinition secondDefinition : ObjectDef}
     {oldFirstValue oldSecondValue : ObjRef}
-    {firstLayout secondLayout : List SlotId}
+    {firstLayout secondLayout : List PhysicalSlotId}
     (firstObjectPresent : heap.objects firstObject = some firstDefinition)
     (secondObjectPresent : heap.objects secondObject = some secondDefinition)
     (firstSlotPresent : firstDefinition.slots firstSlot = some oldFirstValue)
@@ -4264,9 +4264,9 @@ theorem Heap.reflectWriteObjectSlot_distinct_objects_commutes
 
 theorem Heap.reflectWriteObjectSlot_same_object_distinct_slots_commutes
     (program : Program) (heap : Heap) (object : ObjectId)
-    {firstSlot secondSlot : SlotId} (different : firstSlot ≠ secondSlot)
+    {firstSlot secondSlot : PhysicalSlotId} (different : firstSlot ≠ secondSlot)
     (firstValue secondValue : ObjRef) {definition : ObjectDef}
-    {oldFirstValue oldSecondValue : ObjRef} {layout : List SlotId}
+    {oldFirstValue oldSecondValue : ObjRef} {layout : List PhysicalSlotId}
     (objectPresent : heap.objects object = some definition)
     (firstSlotPresent : definition.slots firstSlot = some oldFirstValue)
     (secondSlotPresent : definition.slots secondSlot = some oldSecondValue)
@@ -4426,7 +4426,7 @@ theorem compatibleObjectClassCommands_have_distinct_objects
 
 theorem compatibleObjectSlotCommands_separate_locations
     {firstMirror secondMirror : MirrorId}
-    {firstObject secondObject : ObjectId} {firstSlot secondSlot : SlotId}
+    {firstObject secondObject : ObjectId} {firstSlot secondSlot : PhysicalSlotId}
     {firstValue secondValue : ObjRef}
     (compatible : ReflectionCommandsCompatible
       (.objectSlotWrite firstMirror firstObject firstSlot firstValue)
@@ -4630,10 +4630,10 @@ theorem objectSlotCommands_distinct_objects_commuteAt
     (program : Program) (heap : Heap)
     {firstMirror secondMirror : MirrorId}
     {firstObject secondObject : ObjectId} (different : firstObject ≠ secondObject)
-    (firstSlot secondSlot : SlotId) (firstValue secondValue : ObjRef)
+    (firstSlot secondSlot : PhysicalSlotId) (firstValue secondValue : ObjRef)
     {firstDefinition secondDefinition : ObjectDef}
     {oldFirstValue oldSecondValue : ObjRef}
-    {firstLayout secondLayout : List SlotId}
+    {firstLayout secondLayout : List PhysicalSlotId}
     (firstObjectPresent : heap.objects firstObject = some firstDefinition)
     (secondObjectPresent : heap.objects secondObject = some secondDefinition)
     (firstSlotPresent : firstDefinition.slots firstSlot = some oldFirstValue)
@@ -4656,7 +4656,7 @@ theorem objectSlotCommands_distinct_objects_commuteAt
 theorem Heap.reflectWriteObjectSlot_distinct_objects_commutes_total
     (program : Program) (heap : Heap)
     {firstObject secondObject : ObjectId} (different : firstObject ≠ secondObject)
-    (firstSlot secondSlot : SlotId) (firstValue secondValue : ObjRef) :
+    (firstSlot secondSlot : PhysicalSlotId) (firstValue secondValue : ObjRef) :
     (do
       let afterFirst ← heap.reflectWriteObjectSlot program firstObject
         firstSlot firstValue
@@ -4767,9 +4767,9 @@ theorem Heap.reflectWriteObjectSlot_distinct_objects_commutes_total
 theorem objectSlotCommands_same_object_commuteAt
     (program : Program) (heap : Heap)
     {firstMirror secondMirror : MirrorId} (object : ObjectId)
-    {firstSlot secondSlot : SlotId} (firstValue secondValue : ObjRef)
+    {firstSlot secondSlot : PhysicalSlotId} (firstValue secondValue : ObjRef)
     {definition : ObjectDef} {oldFirstValue oldSecondValue : ObjRef}
-    {layout : List SlotId}
+    {layout : List PhysicalSlotId}
     (compatible : ReflectionCommandsCompatible
       (.objectSlotWrite firstMirror object firstSlot firstValue)
       (.objectSlotWrite secondMirror object secondSlot secondValue))
@@ -4796,7 +4796,7 @@ theorem objectSlotCommands_same_object_commuteAt
 
 theorem Heap.reflectWriteObjectSlot_same_object_distinct_slots_commutes_total
     (program : Program) (heap : Heap) (object : ObjectId)
-    {firstSlot secondSlot : SlotId} (different : firstSlot ≠ secondSlot)
+    {firstSlot secondSlot : PhysicalSlotId} (different : firstSlot ≠ secondSlot)
     (firstValue secondValue : ObjRef) :
     (do
       let afterFirst ← heap.reflectWriteObjectSlot program object firstSlot
@@ -4857,7 +4857,7 @@ theorem compatibleObjectSlotCommands_commute
         program firstObject slotsDifferent firstValue secondValue
 
 theorem Heap.writeObjectSlot_preserves_containsObjectId
-    {heap updated : Heap} (object : ObjectId) (slot : SlotId)
+    {heap updated : Heap} (object : ObjectId) (slot : PhysicalSlotId)
     (value : ObjRef) (query : ObjectId)
     (result : heap.writeObjectSlot object slot value = some updated) :
     updated.containsObjectId query = heap.containsObjectId query := by
@@ -4877,7 +4877,7 @@ theorem Heap.writeObjectSlot_preserves_containsObjectId
 
 theorem Heap.reflectWriteObjectSlot_preserves_containsObjectId
     (program : Program) {heap updated : Heap} (object : ObjectId)
-    (slot : SlotId) (value : ObjRef) (query : ObjectId)
+    (slot : PhysicalSlotId) (value : ObjRef) (query : ObjectId)
     (result : heap.reflectWriteObjectSlot program object slot value =
       some updated) :
     updated.containsObjectId query = heap.containsObjectId query := by

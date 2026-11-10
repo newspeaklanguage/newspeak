@@ -19,7 +19,7 @@ This ledger tracks semantic behavior, not merely grammar productions.
 | 3.1.2 | Near, far, and promised eventual references | Defined | Actor-relative remote representation normalizes homeward far references, transports values, and preserves promise capabilities. |
 | 3.2 | Classes, metaclasses, mixins, inheritance | Defined | Each evaluation creates a class and unique metaclass; applications share their instance-side mixin. |
 | 3.3 | Enclosing objects, including relative/kth enclosing object | Defined | The relation is used directly by outer sends. |
-| 3.4 | Messages and message mirrors | Scaffolded | Messages are defined; allocation/reification rules remain. |
+| 3.4 | Messages and message mirrors | Defined | Message payloads, fresh mirror allocation, heap installation, DNU reification, and reflective descriptors are explicit. |
 | 3.5 | Methods and defining classes | Defined | Direct definition, unrestricted lookup, and defining class are defined. |
 | 3.6 | Method, closure, and top-level activations | Defined | Method, closure, and top-level activation rules, per-frame current control, retained dead activations, and reflective continuation invocation are explicit. |
 | 3.7 | Actors, heaps, mailboxes, turns, E-order | Defined | Disjoint mutable heaps, FIFO mailboxes, one active turn per actor, weak fairness, and causal-envelope delivery are explicit. |
@@ -32,11 +32,11 @@ This ledger tracks semantic behavior, not merely grammar productions.
 | 5.1.9 | Object literals | Defined | Each evaluation allocates a fresh implicit class, metaclass, and instance while sharing the literal's mixin. |
 | 5.2-5.3 | `self` value and parentheses | Defined | `self` reduces to the activation's current instance; elaboration preserves parenthesized self-send authority. |
 | 5.4 | Receiver/argument order and message construction | Defined | Frames enforce receiver first and arguments left-to-right. |
-| 5.4.4 | Cascades | Scaffolded | Elaboration is stated; proof of single receiver evaluation remains. |
+| 5.4.4 | Cascades | Defined | Elaboration creates a one-argument closure, evaluates the receiver once, and sends every cascade clause through the captured receiver parameter. |
 | 5.4.4 | Chains | Pending | Marked unimplemented/proposed by the spec; tracked, not silently included. |
 | 5.5 | Ordinary sends and public lookup | Defined | Protected declarations are barriers; private declarations are transparent. |
 | 5.6 | Asynchronous sends and promise settlement | Defined | Receiver/argument order, immediate result promises, routing, fulfillment, breaking, pipelined sends, communication failure, and E-order are explicit. |
-| 5.7 | Implicit receiver sends | Defined | Lexical binding precedes inherited self lookup. Activation-local dispatch needs completion. |
+| 5.7 | Implicit receiver sends | Defined | Lexical binding precedes inherited self lookup; activation-local, object-literal, class, and self fallback cases are explicit. |
 | 5.8 | Self sends | Defined | Reduced to depth-zero outer dispatch, not to ordinary send. |
 | 5.9 | Outer sends and protected/private access | Defined | Private dispatch is lexical; public/protected dispatch remains virtual. |
 | 5.10 | Super sends | Defined | Lookup starts above the activation's current class. |

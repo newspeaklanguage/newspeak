@@ -79,7 +79,7 @@ theorem executableClassChain_sound {p : Program} {h : Heap}
 
 /-- Executable, validation-aware instance layout. -/
 def instanceLayout? (p : Program) (h : Heap)
-    (classId : ClassId) : Option (List SlotId) := do
+    (classId : ClassId) : Option (List PhysicalSlotId) := do
   let chain ← p.executableClassChain h classId
   let layout := p.layoutForChain h chain
   if layout.Nodup then some layout else none
@@ -98,7 +98,7 @@ theorem instanceLayout?_of_classes_eq (p : Program) {left right : Heap}
       simp [layoutEqual]
 
 theorem instanceLayout?_sound {p : Program} {h : Heap}
-    {classId : ClassId} {layout : List SlotId}
+    {classId : ClassId} {layout : List PhysicalSlotId}
     (result : p.instanceLayout? h classId = some layout) :
     p.InstanceLayout h classId layout := by
   unfold instanceLayout? at result
@@ -112,21 +112,21 @@ theorem instanceLayout?_sound {p : Program} {h : Heap}
         exact ⟨chain, executableClassChain_sound chainResult, rfl, noDuplicates⟩
       · simp [noDuplicates] at result
 
-def ownNestedKeys (p : Program) (h : Heap) (classId : ClassId) : List ClassDeclId :=
+def ownNestedKeys (p : Program) (h : Heap) (classId : ClassId) : List NestedCacheId :=
   match h.classes classId with
   | none => []
   | some classDefinition =>
       match p.mixins classDefinition.mixin with
       | none => []
-      | some mixinDefinition => mixinDefinition.nestedDeclarations
+      | some mixinDefinition => mixinDefinition.nestedDeclarations.map (fun declaration => ⟨classId, declaration⟩)
 
-def nestedKeysForChain (p : Program) (h : Heap) : List ClassId → List ClassDeclId
+def nestedKeysForChain (p : Program) (h : Heap) : List ClassId → List NestedCacheId
   | [] => []
   | classId :: ancestors =>
       p.nestedKeysForChain h ancestors ++ p.ownNestedKeys h classId
 
 def nestedKeys? (p : Program) (h : Heap)
-    (classId : ClassId) : Option (List ClassDeclId) := do
+    (classId : ClassId) : Option (List NestedCacheId) := do
   let chain ← p.executableClassChain h classId
   some (FiniteStore.deduplicated (p.nestedKeysForChain h chain))
 
@@ -342,7 +342,7 @@ def reconcileAllNestedCaches (program : Program) (heap : Heap) : Option Heap :=
   reconcileNestedCaches program heap heap.objects.domain
 
 def reflectWriteObjectSlot (program : Program) (heap : Heap)
-    (object : ObjectId) (slot : SlotId) (value : ObjRef) : Option Heap := do
+    (object : ObjectId) (slot : PhysicalSlotId) (value : ObjRef) : Option Heap := do
   let definition ← heap.objects object
   let layout ← program.instanceLayout? heap definition.classId
   if Program.containsSlot layout slot then
@@ -420,7 +420,7 @@ theorem reconcileAllNestedCaches_of_program_lookupEquivalent
 
 theorem reflectWriteObjectSlot_of_program_lookupEquivalent
     {left right : Program} (equivalent : left.LookupEquivalent right)
-    (heap : Heap) (object : ObjectId) (slot : SlotId) (value : ObjRef) :
+    (heap : Heap) (object : ObjectId) (slot : PhysicalSlotId) (value : ObjRef) :
     heap.reflectWriteObjectSlot left object slot value =
       heap.reflectWriteObjectSlot right object slot value := by
   unfold reflectWriteObjectSlot

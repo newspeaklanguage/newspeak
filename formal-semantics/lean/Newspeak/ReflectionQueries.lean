@@ -114,6 +114,16 @@ def Program.findMethodDefinition (program : Program) (method : MethodId) :
           | none => program.findMethodDefinition method remaining
       | none => program.findMethodDefinition method remaining
 
+def Program.methodOwner? (program : Program) (method : MethodId) :
+    Option MixinId :=
+  (program.findMethodDefinition method program.mixins.domain).map Prod.fst
+
+def Program.methodFormals? (program : Program) (method : MethodId) :
+    Option (List ParameterId) := do
+  let (_, definition) ←
+    program.findMethodDefinition method program.mixins.domain
+  some definition.parameters
+
 def ActorWorld.actorApplicationsOf (world : ActorWorld) (mixin : MixinId) :
     List ActorId → List LocatedClass
   | [] => []
@@ -124,6 +134,23 @@ def ActorWorld.actorApplicationsOf (world : ActorWorld) (mixin : MixinId) :
             (allocation.heap.allApplicationsOf mixin).map fun classId =>
               ⟨.actor actor, classId⟩
       current ++ world.actorApplicationsOf mixin remaining
+
+def ActorWorld.actorInstancesOf (world : ActorWorld) (classId : ClassId) :
+    List ActorId → List ObjRef
+  | [] => []
+  | actor :: remaining =>
+      let current := match world.actorAllocations actor with
+        | none => []
+        | some allocation => allocation.heap.allInstancesOf classId
+      current ++ world.actorInstancesOf classId remaining
+
+/-- Exact instances range over the complete VM cohort, matching
+    `vmStore(Ω)` in the prose semantics rather than merely the heap that owns
+    the queried class record. -/
+def ActorWorld.allCohortInstancesOf (world : ActorWorld)
+    (classId : ClassId) : List ObjRef :=
+  world.valueHeap.allInstancesOf classId ++
+    world.actorInstancesOf classId world.actorAllocations.domain
 
 def ActorWorld.allCohortApplicationsOf (world : ActorWorld) (mixin : MixinId) :
     List LocatedClass :=
@@ -162,9 +189,8 @@ def ReflectionQuery.execute (world : ActorWorld) :
       let allocation ← world.actorAllocations actor
       some (.actor ⟨allocation, world.runStates actor⟩)
   | .enumerateInstancesOf _ classId => do
-      let location ← world.locateClassId classId
-      let heap ← world.heapAt location
-      some (.instances (heap.allInstancesOf classId))
+      let _ ← world.locateClassId classId
+      some (.instances (world.allCohortInstancesOf classId))
   | .enumerateApplicationsOf _ mixin => do
       let _ ← world.program.mixins mixin
       some (.applications (world.allCohortApplicationsOf mixin))

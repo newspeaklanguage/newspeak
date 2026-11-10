@@ -17,7 +17,7 @@ inductive ObjectSlotStep (p : Program) :
         ⟨state, .push rest ⟨current, frames⟩, .object (p.atoms payload)⟩
   | read {state : AllocationState} {rest : ActivationStack}
       {current : ActivationId} {frames : EvalStack} {object : ObjectId}
-      {slot : SlotId} {value : ObjRef}
+      {slot : PhysicalSlotId} {value : ObjRef}
       (found : state.heap.readObjectSlot object slot = some value) :
       ObjectSlotStep p
         ⟨state, .push rest ⟨current, frames⟩,
@@ -25,7 +25,7 @@ inductive ObjectSlotStep (p : Program) :
         ⟨state, .push rest ⟨current, frames⟩, .object value⟩
   | writeStart {state : AllocationState} {rest : ActivationStack}
       {current : ActivationId} {frames : EvalStack} {object : ObjectId}
-      {slot : SlotId} {expression : CoreExpr} :
+      {slot : PhysicalSlotId} {expression : CoreExpr} :
       ObjectSlotStep p
         ⟨state, .push rest ⟨current, frames⟩,
           .evaluate (.writeSlot object slot expression)⟩
@@ -33,7 +33,7 @@ inductive ObjectSlotStep (p : Program) :
           .push frames (.slotWrite object slot)⟩, .evaluate expression⟩
   | writeCommit {state : AllocationState} {rest : ActivationStack}
       {current : ActivationId} {frames : EvalStack} {object : ObjectId}
-      {slot : SlotId} {value : ObjRef} {heap : Heap}
+      {slot : PhysicalSlotId} {value : ObjRef} {heap : Heap}
       (written : state.heap.writeObjectSlot object slot value = some heap) :
       ObjectSlotStep p
         ⟨state, .push rest ⟨current,
@@ -42,31 +42,34 @@ inductive ObjectSlotStep (p : Program) :
           .object value⟩
   | currentRead {state : AllocationState} {rest : ActivationStack}
       {current : ActivationId} {frames : EvalStack} {activation : ActivationDef}
-      {object : ObjectId} {slot : SlotId}
+      {object : ObjectId} {slot : SlotId} {application : ClassId}
       (currentActivation : state.heap.activations current = some activation)
-      (receiver : activation.currentReceiver = .ordinaryObject object) :
+      (receiver : activation.currentReceiver = .ordinaryObject object)
+      (selectedClass : activation.currentClass = some application) :
       ObjectSlotStep p
         ⟨state, .push rest ⟨current, frames⟩,
           .evaluate (.currentRead slot)⟩
         ⟨state, .push rest ⟨current, frames⟩,
-          .evaluate (.readSlot object slot)⟩
+          .evaluate (.readSlot object ⟨application, slot⟩)⟩
   | currentWrite {state : AllocationState} {rest : ActivationStack}
       {current : ActivationId} {frames : EvalStack} {activation : ActivationDef}
-      {object : ObjectId} {slot : SlotId} {expression : CoreExpr}
+      {object : ObjectId} {slot : SlotId} {application : ClassId} {expression : CoreExpr}
       (currentActivation : state.heap.activations current = some activation)
-      (receiver : activation.currentReceiver = .ordinaryObject object) :
+      (receiver : activation.currentReceiver = .ordinaryObject object)
+      (selectedClass : activation.currentClass = some application) :
       ObjectSlotStep p
         ⟨state, .push rest ⟨current, frames⟩,
           .evaluate (.currentWrite slot expression)⟩
         ⟨state, .push rest ⟨current, frames⟩,
-          .evaluate (.writeSlot object slot expression)⟩
+          .evaluate (.writeSlot object ⟨application, slot⟩ expression)⟩
   | lazyHit {state : AllocationState} {rest : ActivationStack}
       {current : ActivationId} {frames : EvalStack} {activation : ActivationDef}
-      {object : ObjectId} {slot : SlotId} {initializer : CoreExpr}
+      {object : ObjectId} {slot : SlotId} {application : ClassId} {initializer : CoreExpr}
       {value : ObjRef}
       (currentActivation : state.heap.activations current = some activation)
       (receiver : activation.currentReceiver = .ordinaryObject object)
-      (found : state.heap.readObjectSlot object slot = some value)
+      (selectedClass : activation.currentClass = some application)
+      (found : state.heap.readObjectSlot object ⟨application, slot⟩ = some value)
       (notNil : value ≠ p.nilObject) :
       ObjectSlotStep p
         ⟨state, .push rest ⟨current, frames⟩,
@@ -74,18 +77,19 @@ inductive ObjectSlotStep (p : Program) :
         ⟨state, .push rest ⟨current, frames⟩, .object value⟩
   | lazyMiss {state : AllocationState} {rest : ActivationStack}
       {current : ActivationId} {frames : EvalStack} {activation : ActivationDef}
-      {object : ObjectId} {slot : SlotId} {initializer : CoreExpr}
+      {object : ObjectId} {slot : SlotId} {application : ClassId} {initializer : CoreExpr}
       (currentActivation : state.heap.activations current = some activation)
       (receiver : activation.currentReceiver = .ordinaryObject object)
-      (found : state.heap.readObjectSlot object slot = some p.nilObject) :
+      (selectedClass : activation.currentClass = some application)
+      (found : state.heap.readObjectSlot object ⟨application, slot⟩ = some p.nilObject) :
       ObjectSlotStep p
         ⟨state, .push rest ⟨current, frames⟩,
           .evaluate (.lazyRead slot initializer)⟩
         ⟨state, .push rest ⟨current,
-          .push frames (.lazySlotStore object slot)⟩, .evaluate initializer⟩
+          .push frames (.lazySlotStore object ⟨application, slot⟩)⟩, .evaluate initializer⟩
   | lazyCommit {state : AllocationState} {rest : ActivationStack}
       {current : ActivationId} {frames : EvalStack} {object : ObjectId}
-      {slot : SlotId} {value : ObjRef} {heap : Heap}
+      {slot : PhysicalSlotId} {value : ObjRef} {heap : Heap}
       (written : state.heap.writeObjectSlot object slot value = some heap) :
       ObjectSlotStep p
         ⟨state, .push rest ⟨current,
@@ -113,59 +117,65 @@ theorem objectSlotStep_deterministic {p : Program}
           have equal := Option.some.inj (written₁.symm.trans written₂)
           subst equal
           rfl
-  | currentRead activation₁ receiver₁ =>
+  | currentRead activation₁ receiver₁ selectedClass₁ =>
       cases step₂ with
-      | currentRead activation₂ receiver₂ =>
+      | currentRead activation₂ receiver₂ selectedClass₂ =>
           have equal := Option.some.inj (activation₁.symm.trans activation₂)
           subst equal
           cases receiver₁.symm.trans receiver₂
+          cases selectedClass₁.symm.trans selectedClass₂
           rfl
-  | currentWrite activation₁ receiver₁ =>
+  | currentWrite activation₁ receiver₁ selectedClass₁ =>
       cases step₂ with
-      | currentWrite activation₂ receiver₂ =>
+      | currentWrite activation₂ receiver₂ selectedClass₂ =>
           have equal := Option.some.inj (activation₁.symm.trans activation₂)
           subst equal
           cases receiver₁.symm.trans receiver₂
+          cases selectedClass₁.symm.trans selectedClass₂
           rfl
-  | lazyHit activation₁ receiver₁ found₁ notNil₁ =>
+  | lazyHit activation₁ receiver₁ selectedClass₁ found₁ notNil₁ =>
       cases step₂ with
-      | lazyHit activation₂ receiver₂ found₂ notNil₂ =>
+      | lazyHit activation₂ receiver₂ selectedClass₂ found₂ notNil₂ =>
           have activationEqual := Option.some.inj
             (activation₁.symm.trans activation₂)
           subst activationEqual
           have objectEqual := ObjRef.ordinaryObject.inj
             (receiver₁.symm.trans receiver₂)
           subst objectEqual
+          cases selectedClass₁.symm.trans selectedClass₂
           have equal := Option.some.inj (found₁.symm.trans found₂)
           subst equal
           rfl
-      | lazyMiss activation₂ receiver₂ found₂ =>
+      | lazyMiss activation₂ receiver₂ selectedClass₂ found₂ =>
           have activationEqual := Option.some.inj
             (activation₁.symm.trans activation₂)
           subst activationEqual
           have objectEqual := ObjRef.ordinaryObject.inj
             (receiver₁.symm.trans receiver₂)
           subst objectEqual
+          cases selectedClass₁.symm.trans selectedClass₂
           have equal := Option.some.inj (found₁.symm.trans found₂)
           exact (notNil₁ equal).elim
-  | lazyMiss activation₁ receiver₁ found₁ =>
+  | lazyMiss activation₁ receiver₁ selectedClass₁ found₁ =>
       cases step₂ with
-      | lazyHit activation₂ receiver₂ found₂ notNil₂ =>
+      | lazyHit activation₂ receiver₂ selectedClass₂ found₂ notNil₂ =>
           have activationEqual := Option.some.inj
             (activation₁.symm.trans activation₂)
           subst activationEqual
           have objectEqual := ObjRef.ordinaryObject.inj
             (receiver₁.symm.trans receiver₂)
           subst objectEqual
+          cases selectedClass₁.symm.trans selectedClass₂
           have equal := Option.some.inj (found₁.symm.trans found₂)
           exact (notNil₂ equal.symm).elim
-      | lazyMiss activation₂ receiver₂ found₂ =>
+      | lazyMiss activation₂ receiver₂ selectedClass₂ found₂ =>
           have activationEqual := Option.some.inj
             (activation₁.symm.trans activation₂)
           subst activationEqual
           have objectEqual := ObjRef.ordinaryObject.inj
             (receiver₁.symm.trans receiver₂)
           subst objectEqual
+          cases selectedClass₁.symm.trans selectedClass₂
           rfl
   | lazyCommit written₁ =>
       cases step₂ with

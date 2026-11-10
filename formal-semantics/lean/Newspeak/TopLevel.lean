@@ -1,4 +1,5 @@
 import Newspeak.CompoundLiterals
+import Newspeak.LookupRules
 
 namespace Newspeak
 namespace Program
@@ -32,6 +33,16 @@ inductive TopLevelExpression (p : Program) : CoreExpr → Prop where
       (∀ expression, expression ∈ arguments →
         p.TopLevelExpression expression) →
       p.TopLevelExpression (.ordinarySend receiver selector arguments)
+
+def applicationMainSelector : Selector := ⟨"main:args:"⟩
+
+/-- Equation (13.12): an application object publicly understands
+    `main:args:` with exactly two formal parameters. -/
+def ApplicationObject (p : Program) (heap : Heap) (object : ObjRef) : Prop :=
+  ∃ classId result,
+    heap.classOf object = some classId ∧
+    p.PublicLookupRules heap applicationMainSelector classId (some result) ∧
+    result.method.parameters.length = 2
 
 /-- Equation (13.9): top-level code has a distinguished activation with no
     parameters, locals, runtime current class, continuation, home method, or

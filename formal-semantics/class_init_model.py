@@ -9,7 +9,8 @@ from itertools import count
 from typing import Any, Callable, Dict, Iterable, Optional, Tuple
 
 
-Initializer = Callable[["Runtime", "ObjectRecord", Tuple[Any, ...]], None]
+Initializer = Callable[["Runtime", "ObjectRecord", "ClassRecord", Tuple[Any, ...]], None]
+StorageKey = Tuple[str, str]
 
 
 @dataclass(frozen=True)
@@ -34,8 +35,8 @@ class ClassRecord:
 class ObjectRecord:
     identity: str
     cls: ClassRecord
-    slots: Dict[str, Any]
-    nested_classes: Dict[str, ClassRecord] = field(default_factory=dict)
+    slots: Dict[StorageKey, Any]
+    nested_classes: Dict[StorageKey, ClassRecord] = field(default_factory=dict)
 
 
 class PullFuture:
@@ -99,10 +100,10 @@ class Runtime:
             source.factory_arity,
         )
 
-    def layout(self, cls: Optional[ClassRecord]) -> Tuple[str, ...]:
+    def layout(self, cls: Optional[ClassRecord]) -> Tuple[StorageKey, ...]:
         if cls is None:
             return ()
-        return self.layout(cls.superclass) + cls.mixin.slots
+        return self.layout(cls.superclass) + tuple((cls.identity, slot) for slot in cls.mixin.slots)
 
     def basic_new(self, cls: ClassRecord) -> ObjectRecord:
         return ObjectRecord(
@@ -118,7 +119,7 @@ class Runtime:
             self.initialize(obj, cls.superclass, ())
         self.trace.append(f"init:{cls.mixin.identity}")
         if cls.mixin.initializer is not None:
-            cls.mixin.initializer(self, obj, args)
+            cls.mixin.initializer(self, obj, cls, args)
 
     def new_instance(self, cls: ClassRecord, args: Tuple[Any, ...] = ()) -> ObjectRecord:
         obj = self.basic_new(cls)
@@ -128,39 +129,44 @@ class Runtime:
     def sequential_slots(
         self,
         obj: ObjectRecord,
+        application: ClassRecord,
         initializers: Iterable[Tuple[str, Callable[[], Any]]],
     ) -> None:
         for slot, initializer in initializers:
-            obj.slots[slot] = initializer()
+            obj.slots[(application.identity, slot)] = initializer()
 
     def simultaneous_slots(
         self,
         obj: ObjectRecord,
+        application: ClassRecord,
         initializers: Iterable[Tuple[str, Callable[[], Any]]],
     ) -> None:
         installed = []
         for slot, initializer in initializers:
             future = PullFuture(initializer, self.trace, slot)
-            obj.slots[slot] = future
+            obj.slots[(application.identity, slot)] = future
             installed.append(future)
         for future in installed:
             future.resolve()
 
-    def lazy_read(self, obj: ObjectRecord, slot: str, initializer: Callable[[], Any]) -> Any:
-        value = obj.slots[slot]
+    def lazy_read(self, obj: ObjectRecord, application: ClassRecord, slot: str, initializer: Callable[[], Any]) -> Any:
+        address = (application.identity, slot)
+        value = obj.slots[address]
         if value is None:
             value = initializer()
-            obj.slots[slot] = value
+            obj.slots[address] = value
         return value
 
     def nested_class(
         self,
         receiver: ObjectRecord,
+        application: ClassRecord,
         declaration: str,
         constructor: Callable[[Any], ClassRecord],
     ) -> ClassRecord:
-        cached = receiver.nested_classes.get(declaration)
+        key = (application.identity, declaration)
+        cached = receiver.nested_classes.get(key)
         if cached is None:
             cached = constructor(receiver)
-            receiver.nested_classes[declaration] = cached
+            receiver.nested_classes[key] = cached
         return cached

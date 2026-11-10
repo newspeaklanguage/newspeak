@@ -110,12 +110,15 @@ if [ "${RESTART}" = yes ]; then
         printf "ERROR: reflector not found at %s -- not restarting.\n" "${REFLECTOR}"
         exit 1
     fi
-    # Emscripten's node, not the system one (broken node@12; see run-croquet-reflector.sh).
-    NODE_BIN="$(ls -d "${EMSDK}"/node/*/bin 2>/dev/null | tail -1)"
-    if [ -n "${NODE_BIN}" ] && [ -x "${NODE_BIN}/node" ]; then
-        PATH="${NODE_BIN}:${PATH}"
-        export PATH
-    fi
+    # As run-croquet-reflector.sh: node on PATH, else fnm's default, else emsdk's.
+    for NODE_BIN in "$HOME/.local/share/fnm/aliases/default/bin" "$(ls -d "${EMSDK}"/node/*/bin 2>/dev/null | tail -1)"; do
+        node --version > /dev/null 2>&1 && break
+        if [ -n "${NODE_BIN}" ] && [ -x "${NODE_BIN}/node" ]; then
+            PATH="${NODE_BIN}:${PATH}"
+            export PATH
+            hash -r  # forget the node already looked up on the old PATH
+        fi
+    done
     printf "Starting reflector (log: %s/reflector.log)...\n" "${REFLECTOR}"
     ( cd "${REFLECTOR}" && nohup node reflector.js --standalone --storage=none --no-loglatency > reflector.log 2>&1 & )
     sleep 1

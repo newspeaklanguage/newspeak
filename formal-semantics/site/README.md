@@ -7,7 +7,7 @@ the landing page, the definition reference and the Lean guide.
     npm install                                # once: KaTeX, the only dependency
     node export_newspeak_site.mjs OUTPUT_DIR   # OUTPUT_DIR must be empty or absent
 
-Node 22 or later is required (emsdk's `node/22.*/bin` will do).
+Node 22 or later is required (the fnm default on PATH is fine).
 `generate_reference.py` reads `../newspeak-semantics.aux`, so build the PDF first.
 
 `assets/reference.css` and `assets/fonts/` are static. They were compiled once by

@@ -1,6 +1,6 @@
 #!/bin/sh
-# Run a probe from croquet-probes/ with the emsdk node 22 (the system node is
-# broken - missing icu4c dylib). Leading VAR=value arguments become environment
+# Run a probe from croquet-probes/ with a working node (see NODE= below).
+# Leading VAR=value arguments become environment
 # for the probe, so every recipe is one invocation of this ONE script:
 #
 #   croquet-probes/run.sh setup-latejoin-probe.js
@@ -12,7 +12,11 @@
 # prompt; a bare `VAR=x /path/to/node probe.js` has no stable prefix to allow.
 # Runs from the repository root regardless of the caller's directory.
 cd "$(dirname "$0")/.." || exit 1
-NODE=/Users/gbracha/software/emsdk-main/node/22.16.0_64bit/bin/node
+# A working node on PATH (fnm's native default, from ~/.bash_profile); else
+# fnm's default by its stable path; else, as a last resort, emsdk's own.
+NODE="$(command -v node)"
+"${NODE:-false}" --version > /dev/null 2>&1 || NODE="$HOME/.local/share/fnm/aliases/default/bin/node"
+"${NODE}" --version > /dev/null 2>&1 || NODE="$(ls -d "${EMSDK:-$HOME/software/emsdk-main}"/node/*/bin 2>/dev/null | tail -1)/node"
 # The probes require 'ws', which this repository does not vendor; the Croquet
 # reflector's checkout has it. Some probes set this for themselves, the older
 # ones never did. A NODE_PATH given on the command line still wins.

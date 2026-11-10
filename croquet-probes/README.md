@@ -8,11 +8,12 @@ replay, late join — that no offline test can reach.
 
 ```
 NODE_PATH=<croquet>/packages/reflector/node_modules \
-  ~/software/emsdk-main/node/22.16.0_64bit/bin/node croquet-probes/<probe>.js
+  node croquet-probes/<probe>.js
 ```
 
-emsdk's node 22, not the system one: the node on PATH here is a broken
-homebrew node@12. `NODE_PATH` is only needed by probes that use `ws`.
+`node` is the native default that fnm installs (see ~/.bash_profile). `run.sh`
+finds it even without a login shell, and falls back to emsdk's own node.
+`NODE_PATH` is only needed by probes that use `ws`.
 
 Prerequisites, depending on the probe:
 

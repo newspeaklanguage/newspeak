@@ -35,15 +35,18 @@ if [ ! -f "${REFLECTOR}/reflector.js" ]; then
     exit 1
 fi
 
-# Emscripten's node, not the system one: the system node here is a broken node@12
-# (missing icu4c dylib) and the reflector needs a modern runtime anyway.
-NODE_BIN="$(ls -d "${EMSDK}"/node/*/bin 2>/dev/null | tail -1)"
-if [ -n "${NODE_BIN}" ] && [ -x "${NODE_BIN}/node" ]; then
-    PATH="${NODE_BIN}:${PATH}"
-    export PATH
-fi
+# The node on PATH if it works (fnm's native default, from ~/.bash_profile); else
+# fnm's default by its stable path; else, as a last resort, emsdk's own.
+for NODE_BIN in "$HOME/.local/share/fnm/aliases/default/bin" "$(ls -d "${EMSDK}"/node/*/bin 2>/dev/null | tail -1)"; do
+    node --version > /dev/null 2>&1 && break
+    if [ -n "${NODE_BIN}" ] && [ -x "${NODE_BIN}/node" ]; then
+        PATH="${NODE_BIN}:${PATH}"
+        export PATH
+        hash -r  # forget the node already looked up on the old PATH
+    fi
+done
 if ! node --version > /dev/null 2>&1; then
-    printf "\nERROR: no usable node found (looked in %s/node/*/bin and on PATH).\n\n" "${EMSDK}"
+    printf "\nERROR: no usable node found (looked on PATH, in fnm's default and in %s/node/*/bin).\n\n" "${EMSDK}"
     exit 1
 fi
 

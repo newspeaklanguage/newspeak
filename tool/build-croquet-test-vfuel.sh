@@ -16,7 +16,7 @@
 # instrumented variants for a probe run, without touching the working tree.
 #
 # Then, e.g.:
-#   NS_SUFFIX=-TEST <emsdk node 22> croquet-probes/setup-latejoin-probe.js
+#   croquet-probes/run.sh NS_SUFFIX=-TEST setup-latejoin-probe.js
 if [ ! -f ./newspeak_util.sh ]; then
     printf "\nERROR: Run this command from the Newspeak 'tool' directory.\n\n"
     exit 1

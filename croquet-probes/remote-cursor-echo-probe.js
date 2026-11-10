@@ -40,10 +40,8 @@
  *     (the editor was 87x a bare one).
  *   - what does mark churn COST on a large buffer?
  *
- * Run (emsdk's node 22 -- the node on PATH is a broken homebrew node@12):
- *   NODE_PATH=<croquet>/packages/reflector/node_modules \
- *     ~/software/emsdk-main/node/22.16.0_64bit/bin/node \
- *     croquet-probes/remote-cursor-echo-probe.js
+ * Run:
+ *   croquet-probes/run.sh remote-cursor-echo-probe.js
  *
  * Needs the front door on :8080 and the reflector on :9090.
  */

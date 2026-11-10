@@ -64,6 +64,9 @@ Ultimately, we hope to go beyond the above, and be able to diff the saved model 
 			
 			(* JS access *)
 			js = p js.
+			
+			(* True while a synchronized event's handler runs (subscribeFragment:...). What happens then is replicated computation, the same on every client, not this client's user acting - so a signal it provokes locally, an editor losing focus to a menu the event opened above all, must not be published as though the user had made it. nil (false) until the first dispatch, and in a module live when this was hot-loaded. *)
+			applyingSynchronizedEvent <Boolean>
 		|
 	) (
 		lazy coordinatedFetchers <Map[String, [:[:Alien[ArrayBuffer] | Object] :[:String | Object] | Object]]> = Map new.
@@ -167,13 +170,15 @@ Ultimately, we hope to go beyond the above, and be able to diff the saved model 
 				scope_slot <String>
 				reflecting <Boolean> ::= true.
 				
-				(* Editors publish EDITS, never text (CROQUET_EDITOR_DIFF_SYNC_DESIGN_2026-09-18.md). The records of user edits not yet published are kept by the JavaScript glue, under our fragment id (nsPendingAdd and friends); here: selectionMoved, whether the user moved the selection in the current window; changeFlushTimer, the JS timer that will publish the window (nil when none is set); lastChangeSeq, the ordinal of this client's latest published edit event for this editor, and lastEchoedSeq, of the latest that came back; echoDeadline, this client's clock time after which an edit that has not come back is given up (local use only); dirty, whether the visible editor may differ from the shadow and must be brought back to it once we have caught up. All start out nil, deliberately: an editor that was live when this code was hot-loaded has them as nil too. *)
-				selectionMoved <Boolean>
+				(* Editors publish EDITS, never text (CROQUET_EDITOR_DIFF_SYNC_DESIGN_2026-09-18.md). The records of user edits not yet published are kept by the JavaScript glue, under our fragment id (nsPendingAdd and friends); here: changeFlushTimer, the JS timer that will publish the window (nil when none is set); lastChangeSeq, the ordinal of this client's latest published edit event for this editor, and lastEchoedSeq, of the latest that came back; echoDeadline, this client's clock time after which an edit that has not come back is given up (local use only); dirty, whether the visible editor may differ from the shadow and must be brought back to it once we have caught up. All start out nil, deliberately: an editor that was live when this code was hot-loaded has them as nil too. *)
 				changeFlushTimer <Alien>
 				lastChangeSeq <Integer>
 				lastEchoedSeq <Integer>
 				echoDeadline <Integer>
 				dirty <Boolean>
+				
+				(* The selection of record's POSITIONS, as the event that set it carried them ({anchor. head}, JavaScript). The glue keeps the same record (nsShadowSelSet) but offers only its text; a command that REPLACES the selection needs the range. Set by the same recorded event on every client, so it is the same everywhere. nil until the first such event - and for an editor live when this was hot-loaded, until its next one. *)
+				selectionOfRecord <Alien>
 			|
 		) (
 			acceptFromKeydown: event <Alien> = (
@@ -197,23 +202,16 @@ old text (#removed field) *)
 					ch: nil
 					options: croquetOrigin
 			)
-			adjustSelection: selection <Alien[Range]> = (
-				editor setSelection: (selection at: #anchor)
-					head: (selection at: #head)
-					options: croquetOrigin
-			)
 			adoptChangeStateFrom: oldFragment <CodeMirrorFragment> = (
 				(* The editor passes to us (see the base updateVisualsFromSameKind:), and with it the old fragment's place in the conversation with the session: what it published and what came back, so that an echo still on its way is recognized here. Its timer is cancelled; ours takes over whatever the window still holds. *)
 				
 				| state <Array> = oldFragment releaseChangeState. |
-				selectionMoved:: state at: 1.
-				lastChangeSeq:: state at: 2.
-				lastEchoedSeq:: state at: 3.
-				echoDeadline:: state at: 4.
-				dirty:: state at: 5.
-				(hasPendingEdits or: [ true = selectionMoved ]) ifTrue: [
-						scheduleChangeFlush
-					]
+				lastChangeSeq:: state at: 1.
+				lastEchoedSeq:: state at: 2.
+				echoDeadline:: state at: 3.
+				dirty:: state at: 4.
+				selectionOfRecord:: state at: 5.
+				hasPendingEdits ifTrue: [ scheduleChangeFlush ]
 			)
 			applyEdits: e <Alien[JSObject]> = (
 				(* One published window of edits. The shadow takes it, on every client, in session order. The visible editor takes it on the clients that did not send it; the SENDER's already holds these edits, or later ones, and is left alone - no setValue, no cursor jump. A client with edits of its own pending or on their way does not take it either: the records' positions are the shadow's, and its editor is ahead of the shadow. It is marked dirty instead (see resyncIfCaughtUp). *)
@@ -279,10 +277,23 @@ old text (#removed field) *)
 				(* The shadow starts from the text the editor was built with: the same on every client at this event position. Always overwritten; a freshly built editor owes nothing to an earlier holder of the id. *)
 				js global nsShadowInitFrom: fragmentId cm: editor.
 				
+				(* The glue draws the other participants' cursors into this editor and cannot find it on its own: no fragment id reaches the DOM. Registered here, and dropped at disposal - unlike the shadow, which deliberately outlives the visual. *)
+				js global nsEditorRegister: fragmentId cm: editor.
+				
+				(* Entering this editor is a focus change - the coarse layer of presence - and is published at once, where a caret move within an editor waits for the caret to rest. CodeMirror calls the handler as handler(cm, event); the block names both. *)
+				editor on: 'focus'
+					do: [:codeMirror :ev |
+						js global nsPresenceFocus: fragmentId cm: editor.
+						nil
+					].
+				
 				(* Losing focus flushes a change waiting in the coalescing window: a button clicked right after typing takes focus first, and its synchronized action reads each client's own editor - which must hold the text by then. The blur is local, so the flush is too; every client then sees the change event ahead of the click. CodeMirror calls the handler as handler(cm, event); the block names both. *)
 				editor on: 'blur'
 					do: [:codeMirror :ev |
 						flushPendingChange.
+						
+						(* Not when the blur is the work of a synchronized event - a menu it opened taking the focus, say. That happens on every client, and each would publish ITS OWN user's selection over the one the command's initiator set (2026-09-28, scratch/selection-commands-check.js: B's caret replaced A's between opening the actions menu and choosing Pretty Print). The pending edits still go: they are this user's typing. *)
+						true = applyingSynchronizedEvent ifFalse: [ publishSelection ].
 						nil
 					].
 				^v
@@ -299,11 +310,18 @@ old text (#removed field) *)
 				opts at: #scroll put: false.
 				^opts
 			)
+			public currentLineBeingAccepted ^<String> = (
+				(* The line of the selection of record's head, read from the SHADOW: the same line on every client, where the visible cursor is each participant's own. Without a selection of record, as the base. *)
+				
+				| range |
+				range:: selectionOfRecordRange.
+				nil = range ifTrue: [ ^super currentLineBeingAccepted ].
+				^shadowDocument getLine: ((range at: 2) at: #line)
+			)
 			discardPendingChange = (
-				(* Forget the window: its records, its selection, its timer. *)
+				(* Forget the window: its records and its timer. *)
 				
 				js global nsPendingDrop: fragmentId.
-				selectionMoved:: false.
 				cancelChangeFlush
 			)
 			echoedChangeSeq ^<Integer> = (
@@ -323,33 +341,24 @@ old text (#removed field) *)
 					]
 			)
 			flushPendingChange = (
-				(* Publish the window now, if it holds anything: the change records, in order, and the selection if the user moved it - read from the editor now, when it holds exactly the text the records lead to. A selection that moved with no edits goes out as a selection event: an edit event would run the change response. Sent by the timer, and ahead of anything that reads the other clients' editors (accept, evaluate, a button that takes the focus). The event names its sender and ordinal, so that the sender knows its own echoes, and when the last of them is in. *)
+				(* Publish the window now, if it holds any edit records: in order, as one event. Sent by the timer, and ahead of anything that reads the other clients' editors (accept, evaluate, a button that takes the focus). The event names its sender and ordinal, so that the sender knows its own echoes, and when the last of them is in.
 				
-				| moved <Boolean> = true = selectionMoved. edited <Boolean> = hasPendingEdits. data <Alien[JSObject]> |
+   The user's SELECTION no longer rides it, and a window that moved the selection without editing publishes nothing at all. A caret is presence, not shared state: it goes out on the ephemeral presence channel (see respondToBeforeSelectionChange:), which the model republishes without recording, instead of onto the synchronized stream - where publishEventAndData calls addEvent and every caret move a user made was retained in newspeakEvents and persisted forever. *)
+				
 				cancelChangeFlush.
-				selectionMoved:: false.
 				hasVisual ifFalse: [
 						js global nsPendingDrop: fragmentId.
 						^self
 					].
-				edited ifFalse: [
-						moved ifTrue: [
-								publish: 'nscodemirror_'
-									event: #codeMirror_beforeSelectionChange
-									data: (js global newspeakFragmentData: fragmentId
-										data: (js global nsCurrentSelection: editor sender: localViewId))
-							].
-						^self
-					].
+				hasPendingEdits ifFalse: [ ^self ].
 				lastChangeSeq:: publishedChangeSeq + 1.
 				echoDeadline:: js global nsNowPlus: echoPatience.
-				data:: js global nsCodeMirrorEdits: (js global nsPendingTake: fragmentId)
-					cm: (moved ifTrue: [ editor ] ifFalse: [ nil ])
-					sender: localViewId
-					seq: lastChangeSeq.
 				publish: 'nscodemirror_'
 					event: #codeMirror_change
-					data: (js global newspeakFragmentData: fragmentId data: data)
+					data: (js global newspeakFragmentData: fragmentId
+						data: (js global nsCodeMirrorEdits: (js global nsPendingTake: fragmentId)
+							sender: localViewId
+							seq: lastChangeSeq))
 			)
 			hasPendingEdits ^<Boolean> = (
 				^js global nsPendingHas: fragmentId
@@ -363,6 +372,11 @@ old text (#removed field) *)
 				lastEchoedSeq:: publishedChangeSeq.
 				dirty:: true.
 				^false
+			)
+			isPosition: p <Alien> atOrBefore: q <Alien> ^<Boolean> = (
+				(p at: #line) < (q at: #line) ifTrue: [ ^true ].
+				(p at: #line) > (q at: #line) ifTrue: [ ^false ].
+				^(p at: #ch) <= (q at: #ch)
 			)
 			isSyncOrigin: origin ^<Boolean> = (
 				(* Selection/cursor signals originating from applying a synchronized event: our tagged programmatic operations ('croquet') and the selection fallout of a full-buffer setValue. CodeMirror may deliver these at the END of its operation - after the reflecting flag has been restored - so the flag alone cannot suppress their echo, which stormed the reflector (see croquetOrigin). The change/beforeChange publishers consult it too, through isUserOrigin:: a setValue-originated change is handled locally rather than published. (It used to be published so that the change response would run on the echo; the response now runs directly, on every client, from its own re-render.) *)
@@ -427,9 +441,9 @@ old text (#removed field) *)
 						js global nsShadowInitFrom: fragmentId cm: editor
 					]
 					ifFalse: [
-						| records <Alien[JSArray]> = js global nsNewList. |
-						js global nsListAdd: records item: (js global nsCodeMirrorChange: change).
-						js global nsShadowApply: fragmentId changes: records
+						
+						(* The raw CodeMirror record, which the glue applies as is. This used to build a one-record list through nsNewList and nsListAdd, which no script has ever defined: every untagged partial edit raised NoSuchMethod here, opened a debugger on that client alone, and never reached the shadow (2026-09-28, scratch/selection-commands-check.js). *)
+						js global nsShadowApplyOne: fragmentId change: change
 					]
 			)
 			public noticeDisposal = (
@@ -441,7 +455,20 @@ old text (#removed field) *)
 						dirty:: false.
 						resyncFromShadow
 					].
+				
+				(* The visible editor is going away, and the cursors drawn into it go with it. The SHADOW is kept (above) because it is deterministic state; this registry is only a handle on a live DOM object. *)
+				js global nsEditorDrop: fragmentId.
 				super noticeDisposal
+			)
+			positionAfter: text <String> insertedAt: start <Alien> ^<Alien> = (
+				(* Where the caret lands after text is inserted at start. The lines are CodeMirror's own, from a throwaway document; the last line's length is counted in characters, which matches CodeMirror's columns except for characters outside the Basic Multilingual Plane. *)
+				
+				| inserted = ((js global at: 'CodeMirror') at: 'Doc') new: text. last <Integer> = inserted lastLine. lastSize <Integer> = (inserted getLine: last) size. pos = JSObject new. |
+				pos at: #line put: (start at: #line) + last;
+					at: #ch
+						put: (last = 0 ifTrue: [ (start at: #ch) + lastSize ]
+							ifFalse: [ lastSize ]).
+				^pos
 			)
 			preventDefault: event <Alien> = (
 				(* Only the initiating client has an event to manage, and others have no access to this event; it cannot be serialized, so cannot be passed via croquet to other clients, and it would not be a valid event if it was. *)
@@ -450,13 +477,65 @@ old text (#removed field) *)
 			publishedChangeSeq ^<Integer> = (
 				^lastChangeSeq isNil ifTrue: [ 0 ] ifFalse: [ lastChangeSeq ]
 			)
+			publishSelection = (
+				(* Publish the selection of record. Sent where a synchronized command might be about to read it - losing focus to a button, and a keydown that carries an action - and NOT when the user merely moves the caret, which is presence and goes on the ephemeral channel. So the synchronized stream carries a selection about as often as a person clicks a button, rather than once per cursor move as it did until 2026-09-21. *)
+				
+				hasVisual ifFalse: [ ^self ].
+				publish: 'nscodemirror_'
+					event: #codeMirror_beforeSelectionChange
+					data: (js global newspeakFragmentData: fragmentId
+						data: (js global nsCurrentSelection: editor sender: localViewId))
+			)
 			public releaseChangeState ^<Array> = (
 				(* See adoptChangeStateFrom:. Public, because the adopting fragment is another object. The unpublished records stay where they are, in the glue, under the id the adopter takes over. *)
 				
-				| state = {selectionMoved. lastChangeSeq. lastEchoedSeq. echoDeadline. dirty. }. |
+				| state = {lastChangeSeq. lastEchoedSeq. echoDeadline. dirty. selectionOfRecord. }. |
 				cancelChangeFlush.
-				selectionMoved:: false.
 				^state
+			)
+			public replace: withFragment <Fragment> = (
+				(* Put the widget over the selection of record rather than over this client's own selection: Make DoIt Button runs on every client. The widget changes no text, so the shadow is untouched. Its visual is made on every client regardless, so the fragment exists everywhere; a client whose editor is ahead of the shadow shows no widget rather than one over the wrong text. *)
+				
+				| range replaced visual |
+				range:: selectionOfRecordRange.
+				nil = range ifTrue: [ ^super replace: withFragment ].
+				visual:: withFragment visual.
+				hasVisual ifFalse: [ ^self ].
+				(js global nsShadowMatches: fragmentId cm: editor) ifFalse: [ ^self ].
+				replaced:: JSObject new.
+				replaced at: 'replacedWith' put: visual;
+					at: 'clearWhenEmpty' put: false.
+				editor markText: (range at: 1) end: (range at: 2) replacedWith: replaced
+			)
+			public replaceSelectionBeingAcceptedWith: text <String> = (
+				(* Replace the selection of record, on every client alike: a command that replaces "the selection" runs everywhere, and each client's visible selection is its own user's. Where the visible editor holds exactly the shadow's text - the usual case, the command's initiator having flushed on blur - the edit is made there, untagged, and reaches the shadow as any programmatic change does (noteProgrammaticChange:), its response running here as on every other client. A client whose editor is ahead of the shadow edits the shadow alone, and is brought back to it once caught up (resyncIfCaughtUp).
+
+	Afterwards the selection of record is the caret after the new text, where CodeMirror leaves the visible one after replaceSelection. *)
+				
+				| range start end change lines caret sel |
+				range:: selectionOfRecordRange.
+				nil = range ifTrue: [ ^super replaceSelectionBeingAcceptedWith: text ].
+				start:: range at: 1.
+				end:: range at: 2.
+				(hasVisual and: [ js global nsShadowMatches: fragmentId cm: editor ]) ifTrue: [
+						editor replaceRange: text from: start to: end
+					]
+					ifFalse: [
+						lines:: (js global at: 'Array') new.
+						lines push: text.
+						change:: JSObject new.
+						change at: #from put: start;
+							at: #to put: end;
+							at: #text put: lines.
+						js global nsShadowApplyOne: fragmentId change: change.
+						dirty:: true
+					].
+				caret:: positionAfter: text insertedAt: start.
+				sel:: JSObject new.
+				sel at: #anchor put: caret;
+					at: #head put: caret.
+				js global nsShadowSelSet: fragmentId selection: sel.
+				selectionOfRecord:: sel
 			)
 			respondToAccept: event <Alien[Event]> = (
 				reflecting ifTrue: [
@@ -477,16 +556,12 @@ The model_codeMirror_beforeChange subscription stays, for sessions recorded whil
 					]
 			)
 			respondToBeforeSelectionChange: event <Alien[Event]> = (
-				(* Published only for a selection the USER moved ('*mouse', '+move',
-		   the selection that accompanies '+input' ...). A programmatic
-		   setCursor/setSelection, tagged or not, is every client's own
-		   business, exactly as a programmatic change is - see isUserOrigin:. *)
+				(* A selection the USER moved ('*mouse', '+move', the selection that accompanies '+input' ...). A programmatic setCursor/setSelection, tagged or not, is every client's own business, exactly as a programmatic change is - see isUserOrigin:.
+				
+   Nothing goes onto the synchronized stream for it any more. The caret is reported to the presence channel instead, which DEBOUNCES it: the position is published once the caret has come to REST, so continuous typing publishes no presence at all and a pause publishes one event. Presence is never recorded, so unlike the selection events this replaces it costs the session no retained volume - and the reflector's limit is retained-message volume, not rate. *)
 				
 				(reflecting and: [ isUserOrigin: (event at: #origin) ]) ifTrue: [
-						
-						(* The selection rides the window's edit event (flushPendingChange), where it is applied after the window's records, to the text it belongs to. Until 2026-09-19 it was an event of its own per keystroke, and forced the pending change out ahead of it, which largely defeated the coalescing. Only THAT it moved is noted: the selection itself is read from the editor at publication - this event describes one CodeMirror may still adjust. *)
-						selectionMoved:: true.
-						scheduleChangeFlush
+						js global nsPresenceCaret: fragmentId cm: editor
 					]
 			)
 			respondToCancel = (
@@ -508,6 +583,9 @@ The model_codeMirror_beforeChange subscription stays, for sessions recorded whil
 				
 				(* Published at most once per changeCoalescingWindow, not once per keystroke: the reflector drops a client that exceeds about 20 messages a second. The first unpublished change starts the timer and later ones do not restart it, so the delay is bounded by the window however fast the typing. What is published is the window's change RECORDS, about a hundred bytes a keystroke whatever the size of the text. *)
 				js global nsPendingAdd: fragmentId change: change.
+				
+				(* Typing moves the caret, and CodeMirror does NOT report that through beforeSelectionChange: measured, 20 keystrokes produced zero calls there, while cursor keys and mouse selection produce one each (presence-cursor-probe.js, 2026-09-22). Reported here instead, or a participant's cursor would sit frozen at wherever they last moved it by some means other than typing - which is the commonest way a caret moves of all. Debounced like every other caret report, so a burst of typing still publishes exactly once, when the typist pauses. *)
+				js global nsPresenceCaret: fragmentId cm: editor.
 				scheduleChangeFlush
 			)
 			respondToKeyDown: event <Alien[Event]> = (
@@ -526,6 +604,7 @@ The model_codeMirror_beforeChange subscription stays, for sessions recorded whil
 				
 				(* Accept and evaluate read each client's own editor, so the text must get there first. *)
 				flushPendingChange.
+				publishSelection.
 				publish: 'nscodemirror_'
 					event: #codeMirror_keydown
 					data: (js global newspeakFragmentData: fragmentId
@@ -562,6 +641,45 @@ The model_codeMirror_beforeChange subscription stays, for sessions recorded whil
 			public scope ^<String> = (
 				scope_slot isNil ifTrue: [ scope_slot: 'nscodemirror_' , fragmentId ].
 				^scope_slot
+			)
+			public selectCurrentLineBeingAccepted = (
+				(* Make the line of the selection of record the selection of record, on every client alike. Without one, as the base. *)
+				
+				| range line text start end sel |
+				range:: selectionOfRecordRange.
+				nil = range ifTrue: [ ^super selectCurrentLineBeingAccepted ].
+				line:: (range at: 2) at: #line.
+				text:: currentLineBeingAccepted.
+				start:: JSObject new.
+				start at: #line put: line;
+					at: #ch put: 0.
+				end:: JSObject new.
+				end at: #line put: line;
+					at: #ch put: text size.
+				sel:: JSObject new.
+				sel at: #anchor put: start;
+					at: #head put: end.
+				js global nsShadowSelSet: fragmentId selection: sel.
+				selectionOfRecord:: sel
+			)
+			public selectedTextBeingAccepted ^<String> = (
+				(* The selection of record's text, computed from the SHADOW: identical on every client at every event position, which is what a synchronized command must read. Exactly the role textBeingAccepted plays for the whole document. An editor whose selection the session has never been told of - nobody has blurred it or pressed an action key - answers the visible editor, as does one with no shadow. *)
+				
+				(js global nsShadowSelHas: fragmentId) ifFalse: [
+						^super selectedTextBeingAccepted
+					].
+				^js global nsShadowSelText: fragmentId
+			)
+			selectionOfRecordRange ^<Array | UndefinedObject> = (
+				(* The selection of record as {start. end}, in document order - a published selection may run backwards. nil when this fragment knows of none, or the shadow or the glue's record is gone. *)
+				
+				| anchor head |
+				nil = selectionOfRecord ifTrue: [ ^nil ].
+				(js global nsShadowSelHas: fragmentId) ifFalse: [ ^nil ].
+				anchor:: selectionOfRecord at: #anchor.
+				head:: selectionOfRecord at: #head.
+				^(isPosition: anchor atOrBefore: head) ifTrue: [ {anchor. head. } ]
+					ifFalse: [ {head. anchor. } ]
 			)
 			setupCroquetView = (
 				subscribe: #model_codeMirror_change
@@ -624,14 +742,18 @@ The model_codeMirror_beforeChange subscription stays, for sessions recorded whil
 						reflecting ifTrue: [
 								reflecting:: false.
 								
-								(* A selection the user moved in a window with no edits (one that came with edits rides their event; see applyEdits:). A client leaves its OWN selection alone. Its editor already holds that selection, or a newer one: by the time the echo is back the user may have moved on, and re-applying the old selection put it back under the cursor - select all, paste, click elsewhere, type, and the first character replaced the whole buffer (the typing probe, 2026-09-18: 9007 characters selected on a client whose cursor had been put at 0:0). Nor does a client that is editing take another's selection: its positions are the shadow's, not this editor's. Skipping is safe for lockstep because this handler does nothing but set the editor's selection: no response, no render, no ids. Every other client applies the event, and so does a replaying joiner, whose view id is fresh. An event recorded before selections named their sender is applied as before. *)
-								((e at: #sender) = localViewId or: [ isAhead or: [ true = dirty ] ]) ifFalse: [
-										hasVisual ifTrue: [ adjustSelection: e ]
-									].
+								(* The SELECTION OF RECORD: what a synchronized command reads when it reads a selection, kept beside the shadow and stored by every client alike. The VISIBLE editor is deliberately untouched - a remote selection used to be applied as this client's own, which is exactly why every participant shared one cursor. A session recorded before multiple cursors (2026-09-21) published this event on every caret move rather than only where a command might read it; storing those is harmless, since each simply supersedes the last. *)
+								js global nsShadowSelSet: fragmentId selection: e.
+								selectionOfRecord:: e.
 								reflecting:: true
 							]
 							ifFalse: [ reflecting:: true ]
 					]
+			)
+			shadowDocument ^<Alien> = (
+				(* The shadow's text as a CodeMirror document, for reading lines. A copy: the shadow itself lives in the glue, out of reach. *)
+				
+				^((js global at: 'CodeMirror') at: 'Doc') new: textBeingAccepted
 			)
 			public textBeingAccepted ^<String> = (
 				(* The SHADOW's text: the document as the ordered event stream defines it, identical on every client at every event position, which is what a synchronized response must read. The visible editor of a client that is typing may be ahead of it. An editor without a shadow (live when this code was hot-loaded) answers its visible text. *)
@@ -662,10 +784,14 @@ The model_codeMirror_beforeChange subscription stays, for sessions recorded whil
 				(* This fragment may have attached under its OWN id before being adopted (see adoptCroquetIdentityFrom:); what the glue holds under that id is dropped while fragmentId still names it. The lineage's shadow and unpublished records are held under the id we adopt, so they need no handoff. *)
 				js global nsShadowDrop: fragmentId.
 				js global nsPendingDrop: fragmentId.
+				js global nsEditorDrop: fragmentId.
 				adoptCroquetIdentityFrom: oldFragment.
 				adoptChangeStateFrom: oldFragment.
 				v:: super updateVisualsFromSameKind: oldFragment.
 				ensureShadow.
+				
+				(* Under the id just adopted, and after super: the lineage keeps its id, but the editor that now exists is this fragment's. Registering only where the shadow is created would leave the glue drawing into the retired editor. *)
+				js global nsEditorRegister: fragmentId cm: editor.
 				^v
 			)
 		) : ()
@@ -2331,7 +2457,9 @@ The replacement lives in the Croquet support script (nsPatchSelectAll), in JavaS
 			(* Routed through nsSubscribe (croquet-post.js), which wraps the handler to resolve detoured (oversized) payloads - see #publish:event:data: - records the wrapped handler so it is available for replay after rejoining the session, and subscribes it. The label (Fragment>>croquetLabel, or nil) is registered for the address there, for the divergence alarm's label check. *)
 			
 			| handler = [:e |
-				blk value: e.
+				| was = applyingSynchronizedEvent. |
+				applyingSynchronizedEvent:: true.
+				[ blk value: e ] ensure: [ applyingSynchronizedEvent:: was ].
 				(js global at: #eventProcessed) apply: nil.
 				nil
 			]. |

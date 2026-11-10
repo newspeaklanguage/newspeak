@@ -66,6 +66,12 @@ async function launchBrowser({ port, tag, session, initScript }) {
     ws.send(JSON.stringify({ id: i, method: meth, params: par || {} }));
   });
   await send('Runtime.enable'); await send('Page.enable');
+  /* A headless page never has focus, so cm.focus() does nothing and no editor
+     ever blurs - and the Croquet editor publishes its selection of record on
+     BLUR (or an action key). Without this, every synchronized command that
+     reads the selection runs on the clicking client only, and a probe blames
+     the system for the harness (2026-09-28, scratch/focus-eval-check.js). */
+  await send('Emulation.setFocusEmulationEnabled', { enabled: true });
   if (initScript) await send('Page.addScriptToEvaluateOnNewDocument', { source: initScript });
   const v = async e => {
     const r = await send('Runtime.evaluate', { expression: e, returnByValue: true });
@@ -118,6 +124,12 @@ async function evalDoIt(b, src, flag, secs) {
   await sleep(1500);
   await b.v("(function(){var c=document.querySelectorAll('.CodeMirror');var cm=c[c.length-1].CodeMirror;" +
             "cm.focus();cm.execCommand('selectAll');return 1})()");
+  /* The blur a real mouse-down on the button causes: it publishes the
+     selection of record, which every client's Evaluate Selection reads. A
+     synthetic click moves no focus, so it is done explicitly. */
+  await b.v("(function(){var c=document.querySelectorAll('.CodeMirror');var cm=c[c.length-1].CodeMirror;" +
+            "cm.getInputField().blur();return 1})()");
+  await sleep(800);
   await b.v(click('Evaluate Selection'));
   for (let i = 0; i < (secs || 30); i++) {
     await sleep(1000);

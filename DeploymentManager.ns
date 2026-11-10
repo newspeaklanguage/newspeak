@@ -736,7 +736,47 @@ function nsShadowInitFrom(fid, cm) { return nsShadowInit(fid, cm.getValue()); }
 
 function nsShadowHas(fid) { return nsShadows.has(fid); }
 
-function nsShadowDrop(fid) { if (nsShadows.has(fid)) nsShadowNote(''drop'', fid, ''''); return nsShadows.delete(fid); }
+/* ------------------------------------------- the SELECTION OF RECORD
+
+   A synchronized command may READ the selection: "Evaluate Selection" does
+   (Debugging.ns evaluateResponse), and like every synchronized action it runs
+   on every client. Until multiple cursors that worked by accident -- every
+   client held the same selection, because a remote one was applied as its own.
+   That is exactly the behaviour multiple cursors removes, and removing it
+   stopped Evaluate Selection working anywhere but the client that invoked it
+   (typing-test''s syncRandom phase caught it, 2026-09-22).
+
+   So the selection a COMMAND reads is kept here, deterministically, exactly as
+   the shadow keeps the text a command reads. The range is published only at the
+   moments a command might be about to read it -- on blur, and before a keydown
+   action -- never on a caret move, so presence keeps its volume win. Every
+   client stores it, and the TEXT is computed from the SHADOW document, so every
+   client answers the same string at the same event position no matter what its
+   own user has selected meanwhile.
+
+   The visible editor''s selection is never touched. That is the user''s cursor,
+   and it is now theirs alone. */
+const nsShadowSels = new Map();
+
+function nsShadowSelSet(fid, sel) {
+    if (!sel || !sel.anchor || !sel.head) return false;
+    nsShadowSels.set(fid, {anchor: sel.anchor, head: sel.head});
+    return true;
+}
+
+function nsShadowSelHas(fid) { return nsShadowSels.has(fid); }
+
+// Empty when nothing is selected, so the caller falls back to the current
+// line exactly as it always did.
+function nsShadowSelText(fid) {
+    const doc = nsShadows.get(fid), sel = nsShadowSels.get(fid);
+    if (!doc || !sel) return '''';
+    const a = sel.anchor, h = sel.head;
+    const forward = a.line < h.line || (a.line === h.line && a.ch <= h.ch);
+    return doc.getRange(forward ? a : h, forward ? h : a);
+}
+
+function nsShadowDrop(fid) { if (nsShadows.has(fid)) nsShadowNote(''drop'', fid, ''''); nsShadowSels.delete(fid); return nsShadows.delete(fid); }
 
 // null when there is no shadow: the caller falls back to the visible editor.
 function nsShadowText(fid) {
@@ -825,35 +865,39 @@ function nsPendingTake(fid) {
 // of sessions recorded before 2026-09-19 (textBeingAccepted + change).
 function nsIsEditEvent(e) { return !!e && Array.isArray(e.changes); }
 
-// One published edit event applied to a VISIBLE editor that did not send it:
-// the records, then the sender''s selection if it moved, as one operation.
+/* One published edit event applied to a VISIBLE editor that did not send it:
+   the records, as one operation.
+
+   The sender''s selection is NOT applied. Until multiple cursors (2026-09-21) it
+   was, which is why every participant shared one cursor: a remote selection
+   became the receiving client''s own. A remote caret is now DRAWN instead, off
+   the ephemeral presence channel (nsPresenceDraw), and this client''s own cursor
+   is left where its user put it. An event recorded before the change still
+   carries e.selection; ignoring it is safe for lockstep by the same argument
+   that let the sender skip its own echo -- applying a selection sets the
+   visible editor''s selection and nothing else: no response, no render, no
+   minted ids. */
 function nsApplyEdits(cm, e) {
     cm.operation(() => {
 	nsReplaceRanges(cm, e.changes, ''croquet'');
-	if (e.selection) {
-	    cm.setSelection(e.selection.anchor, e.selection.head, {origin: ''croquet'', scroll: false});
-	}
     });
     return true;
 }
 
-// The payload of one published edit event. cm is the editor when the user''s
-// selection moved in the window, null when it did not: the selection is READ
-// here, at publication, when the editor holds exactly the document the records
-// lead to, rather than collected from beforeSelectionChange events, which
-// describe a selection CodeMirror may still adjust. Nothing here is ever
-// undefined, which would not survive publication.
-function nsCodeMirrorEdits(changes, cm, sender, seq) {
-    const d = {changes: changes, sender: sender, seq: seq};
-    if (cm) {
-	const r = cm.listSelections()[0];
-	d.selection = {anchor: nsSelectionPos(r.anchor), head: nsSelectionPos(r.head)};
-    }
-    return d;
+/* The payload of one published edit event: the records, and who sent them.
+
+   It no longer carries the sender''s selection. Carrying it put every caret
+   move a user made onto the SYNCHRONIZED stream, where publishEventAndData
+   calls addEvent and the event is retained in newspeakEvents and persisted
+   forever -- and the only thing that read it was the code that made everybody
+   share one cursor. Carets now travel on the ephemeral presence channel, which
+   retains nothing, so multiple cursors cost the session LESS than one did. */
+function nsCodeMirrorEdits(changes, sender, seq) {
+    return {changes: changes, sender: sender, seq: seq};
 }
 
-// The payload of a selection published on its own: the user moved the cursor
-// and edited nothing in the window. Read at publication, as above.
+// The payload of the selection of record (see nsShadowSelSet). Read at
+// publication, when the editor holds exactly the document the records lead to.
 function nsCurrentSelection(cm, sender) {
     const r = cm.listSelections()[0];
     return {anchor: nsSelectionPos(r.anchor), head: nsSelectionPos(r.head), sender: sender};
@@ -874,6 +918,228 @@ function nsSelectionPos(p) {
 function nsCodeMirrorSelectionChange(change) {
     return {anchor: nsSelectionPos(change.ranges[0].anchor),
 	    head: nsSelectionPos(change.ranges[0].head)};
+}
+
+/* ---------------------------------------------------------------- presence
+
+   Multiple cursors (CROQUET_PRESENCE_DESIGN_2026-09-21.md). Each participant
+   has at most ONE presence record: the editor they are focused in (layer a)
+   and their caret or selection inside it (layer b). A focus change MOVES that
+   record; it never adds a second cursor for the same participant.
+
+   Nothing here is ever recorded. The model''s presence handler republishes
+   without addEvent, exactly like the dormant mouse family, so presence crosses
+   the reflector, reaches every client, and leaves newspeakEvents untouched.
+   That matters because the reflector''s limit is retained-message VOLUME since
+   the last snapshot (REQU_SNAPSHOT 60000, MAX_MESSAGES 100000), not a rate.
+
+   Presence is drawn HERE, in raw DOM, and never through Hopscotch. Fragment
+   ids are minted from per-type counters and ARE the Croquet event addresses,
+   so a presenter tree whose shape varied with client-local state would diverge
+   the session (chat-id-divergence-probe.js asserts it does not). markText and
+   setBookmark touch only CodeMirror''s own decoration layer, and the echo probe
+   showed that neither publishes anything. */
+
+// viewId -> {fid, anchor, head, marks}. Remote participants only; this
+// client''s own caret is the real one CodeMirror already draws.
+const nsPresence = new Map();
+
+/* fid -> the VISIBLE CodeMirror of that editor. No fragment id reaches the
+   DOM, so the glue cannot find an editor on its own. Kept current by
+   HopscotchForCroquet''s CodeMirrorFragment: createVisual and
+   updateVisualsFromSameKind: register, noticeDisposal drops. Registering at
+   shadow creation instead would go stale, because an adopting fragment keeps
+   the lineage''s id but builds a NEW editor while the shadow is left alone.
+   Unlike the shadow, this IS dropped at disposal: the visible editor is gone. */
+const nsEditors = new Map();
+
+function nsEditorRegister(fid, cm) {
+    nsEditors.set(fid, cm);
+    // A participant may already be sitting in this editor: an editor rebuilt
+    // by a re-render must come back with the cursors it had.
+    nsPresenceRedraw();
+    return true;
+}
+
+function nsEditorDrop(fid) {
+    // The marks belong to the departing editor''s document. Forget them, or a
+    // later redraw would clear marks that by then belong to another editor.
+    for (const r of nsPresence.values()) if (r.fid === fid) r.marks = [];
+    return nsEditors.delete(fid);
+}
+
+// Client-local rendering, so this does not have to agree between clients --
+// but it costs nothing to make it agree, and a participant keeps one colour.
+function nsPresenceHue(viewId) {
+    let h = 0;
+    for (let i = 0; i < viewId.length; i++) h = (h * 31 + viewId.charCodeAt(i)) >>> 0;
+    return h % 360;
+}
+
+function nsPresenceCaretWidget(viewId, hue) {
+    const el = document.createElement(''span'');
+    el.className = ''ns-presence-caret'';
+    el.style.cssText = ''position:relative;display:inline-block;width:0;'';
+    const bar = document.createElement(''span'');
+    bar.style.cssText = ''position:absolute;top:-0.1em;height:1.2em;left:-1px;width:2px;''
+	+ ''background:hsl('' + hue + '',70%,45%);'';
+    bar.title = ''participant '' + viewId.slice(0, 6);
+    el.appendChild(bar);
+    return el;
+}
+
+function nsPresenceClear(r) {
+    for (const m of r.marks) { try { m.clear(); } catch (err) { /* editor gone */ } }
+    r.marks = [];
+}
+
+function nsPresenceDraw(viewId, r) {
+    const cm = nsEditors.get(r.fid);
+    if (!cm || !r.head) return;
+    const hue = nsPresenceHue(viewId);
+    const a = r.anchor, h = r.head;
+    if (a && (a.line !== h.line || a.ch !== h.ch)) {
+	const forward = a.line < h.line || (a.line === h.line && a.ch <= h.ch);
+	r.marks.push(cm.markText(forward ? a : h, forward ? h : a,
+				 {css: ''background:hsla('' + hue + '',70%,55%,0.28)''}));
+    }
+    // insertLeft so that text typed AT a remote caret lands after it rather
+    // than pushing the caret along.
+    r.marks.push(cm.setBookmark(h, {widget: nsPresenceCaretWidget(viewId, hue), insertLeft: true}));
+}
+
+// Layer (a): a ring around each editor somebody is focused in, nested when
+// several are. The wrapper element is CodeMirror''s own, outside the presenter
+// tree.
+function nsPresenceDrawFocus() {
+    for (const cm of nsEditors.values()) {
+	const w = cm.getWrapperElement();
+	if (!w) continue;
+	const rings = [];
+	for (const [viewId, r] of nsPresence) {
+	    if (nsEditors.get(r.fid) === cm) {
+		rings.push(''inset 0 0 0 '' + (2 * (rings.length + 1)) + ''px hsl(''
+			   + nsPresenceHue(viewId) + '',70%,45%)'');
+	    }
+	}
+	w.style.boxShadow = rings.join('', '');
+    }
+}
+
+/* Every cursor update for one arriving event goes inside cm.operation, for
+   every editor touched: measured, an un-batched create+clear cycle cost 41.2ms
+   on a FORTY-line document and 1.6ms inside an operation. Batching is a
+   correctness-of-performance requirement here, not a refinement. The redraw
+   itself is coalesced into a promise turn so that a burst of arrivals repaints
+   once. */
+let nsPresenceRedrawPending = false;
+
+function nsPresenceRedraw() {
+    if (nsPresenceRedrawPending) return true;
+    nsPresenceRedrawPending = true;
+    Promise.resolve().then(() => {
+	nsPresenceRedrawPending = false;
+	try { nsPresenceRedrawNow(); }
+	catch (err) { console.error(''Presence redraw failed:'', err); }
+    });
+    return true;
+}
+
+function nsPresenceRedrawNow() {
+    // Nested operations, one per live editor: a record''s OLD marks may live in
+    // a different editor from its new ones, and both must batch.
+    const cms = Array.from(new Set(nsEditors.values()));
+    const body = () => {
+	for (const [viewId, r] of nsPresence) {
+	    nsPresenceClear(r);
+	    nsPresenceDraw(viewId, r);
+	}
+	nsPresenceDrawFocus();
+    };
+    const nest = i => (i === cms.length) ? body() : cms[i].operation(() => nest(i + 1));
+    nest(0);
+}
+
+function nsPresenceChanged(p) {
+    // Our own record would draw a second caret on top of the real one.
+    if (!p || !p.viewId || p.viewId === localViewId) return;
+    let r = nsPresence.get(p.viewId);
+    if (!r) { r = {fid: null, anchor: null, head: null, marks: []}; nsPresence.set(p.viewId, r); }
+    r.fid = p.fid;
+    r.anchor = p.anchor;
+    r.head = p.head;
+    nsPresenceRedraw();
+}
+
+// A participant left. No heartbeat and no timeout: the model hears view-exit
+// from Croquet itself (see viewExited).
+function nsPresenceGone(viewId) {
+    const r = nsPresence.get(viewId);
+    if (!r) return;
+    nsPresenceClear(r);
+    nsPresence.delete(viewId);
+    nsPresenceRedraw();
+}
+
+// View ids do not survive a snapshot restore, and the view constructor runs
+// again on one. Records kept across it would be cursors for nobody.
+function nsPresenceReset() {
+    for (const r of nsPresence.values()) nsPresenceClear(r);
+    nsPresence.clear();
+    nsPresenceRedraw();
+    return true;
+}
+
+function nsPresenceCount() { return nsPresence.size }
+
+/* Outbound. A focus change goes out AT ONCE -- it is rare, bounded by how fast
+   a person navigates. A caret movement is DEBOUNCED: it goes out only once the
+   caret has come to REST, so continuous typing publishes nothing at all and a
+   pause publishes one event. Traffic is therefore proportional to pauses, not
+   to keystrokes, which is the whole reason presence can afford to exist (see
+   the volume limit above). An unchanged record publishes nothing. */
+const NS_PRESENCE_DWELL_MS = 300;
+let nsPresenceDwellTimer = null;
+let nsPresenceLastSent = '''';
+
+function nsPresenceSend(fid, anchor, head) {
+    const p = {viewId: localViewId, fid: fid, anchor: anchor, head: head};
+    const key = JSON.stringify(p);
+    if (key === nsPresenceLastSent) return false;
+    nsPresenceLastSent = key;
+    nsPublish(''nspresence_'', ''presence_post'', p);
+    return true;
+}
+
+function nsPresenceCancelDwell() {
+    if (nsPresenceDwellTimer !== null) {
+	clearTimeout(nsPresenceDwellTimer);
+	nsPresenceDwellTimer = null;
+    }
+    return true;
+}
+
+// The caret moved inside the editor the user is already in. The selection is
+// read when the timer fires, not now: what is worth publishing is where the
+// caret came to rest.
+function nsPresenceCaret(fid, cm) {
+    nsPresenceCancelDwell();
+    nsPresenceDwellTimer = setTimeout(() => {
+	nsPresenceDwellTimer = null;
+	try {
+	    const r = cm.listSelections()[0];
+	    nsPresenceSend(fid, nsSelectionPos(r.anchor), nsSelectionPos(r.head));
+	} catch (err) { console.warn(''Presence caret publish skipped:'', err); }
+    }, NS_PRESENCE_DWELL_MS);
+    return true;
+}
+
+// The user moved INTO this editor. Published immediately, folding in any caret
+// update still waiting in the dwell timer.
+function nsPresenceFocus(fid, cm) {
+    nsPresenceCancelDwell();
+    const r = cm.listSelections()[0];
+    return nsPresenceSend(fid, nsSelectionPos(r.anchor), nsSelectionPos(r.head));
 }
 
 /* CodeMirror''s own selectAll command - Cmd-A, and execCommand(''selectAll'') -
@@ -1534,7 +1800,16 @@ Only afterward is the snapshot state restored in the new model. Next a new root 
 	this.subscribe(this.sessionId, ''onTouchMove'', this.touchMove);
 	this.subscribe(this.sessionId, ''onTouchStart'', this.touchStart);
 	this.subscribe(this.sessionId, ''onWheel'', this.wheel);
-	
+
+	// Presence (multiple cursors), ephemeral exactly as the mouse family
+	// above: the handlers republish WITHOUT addEvent, so presence crosses
+	// the reflector to every client and leaves nothing in newspeakEvents to
+	// persist or replay. view-exit is published publishFromModelOnly, so
+	// only a MODEL handler ever sees it -- a view subscription silently
+	// never fires (view-exit-shape-probe.js).
+	this.subscribe(''nspresence_'', ''presence_post'', this.presence_post);
+	this.subscribe(this.sessionId, ''view-exit'', this.viewExited);
+
 	this.subscribe(''nsbutton_'', ''button_click'', this.button_click);
 	this.subscribe(''nsImagebutton_'', ''image_button_click'', this.image_button_click);
 	this.subscribe(''nshyperlink_'', ''hyperlink_click'', this.hyperlink_click);
@@ -1617,6 +1892,26 @@ Only afterward is the snapshot state restored in the new model. Next a new root 
 	    }
 	}
     }
+    // Where a participant is looking and where their caret sits. Republished
+    // to the views and DELIBERATELY not recorded: addEvent is what pushes onto
+    // newspeakEvents, and presence must cost the session no retained volume.
+    presence_post(p){
+	this.publish(''nspresence_'', ''presence_changed'', p);
+    }
+
+    /* A participant left; their cursor goes everywhere it was drawn, with no
+       heartbeat and no timeout. Croquet hands this handler the bare viewId
+       STRING unless the client supplied viewData at Session.join -- neither
+       platform does (meta/croquet-post.js and tool/croquet-glue-js/startup.js
+       both join without it) -- but presence is exactly the feature that would
+       tempt someone to start passing a display name or colour, at which point
+       the payload silently becomes {viewId, viewData}. Both shapes accepted so
+       that the day someone does, cursors do not quietly stop being cleaned up. */
+    viewExited(p){
+	this.publish(''nspresence_'', ''presence_gone'',
+		     (p && typeof p === ''object'') ? p.viewId : p);
+    }
+
     // same issues with scope for these methods
     mouseDown(fid){
 	console.log(''MouseDown '' + fid);
@@ -1895,6 +2190,13 @@ class NewspeakCroquetView extends Croquet.View {
 	this.presenter = presenter;
         storeModelAndView(model, this);
 	this.subscribe(this.sessionId, ''nsEventRecorded'', nsCheckDelivery);
+	// Presence is the glue''s own business, not a fragment''s, so it does not
+	// go through nsSubscribe: no Newspeak handler, nothing to replay, and
+	// nothing for the divergence alarm to account for. Records from before
+	// a snapshot restore are cursors for view ids that no longer exist.
+	nsPresenceReset();
+	this.subscribe(''nspresence_'', ''presence_changed'', nsPresenceChanged);
+	this.subscribe(''nspresence_'', ''presence_gone'', nsPresenceGone);
         replaySubscriptions();
 	this.replay();   	
     }

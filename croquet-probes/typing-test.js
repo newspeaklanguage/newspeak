@@ -35,6 +35,8 @@ async function browser(port, tag) {
   ws.on('message',raw=>{try{const m=JSON.parse(raw); if(m.id&&pending.has(m.id)){pending.get(m.id)(m.result);pending.delete(m.id);return;}
     if(m.method==='Runtime.consoleAPICalled'){const a=m.params.args.map(x=>x.value!==undefined?String(x.value):(x.description||x.type)).join(' ');log.push('['+m.params.type+'] '+a);}}catch(e){}});
   await send('Runtime.enable'); await send('Page.enable');
+  // A headless page has no focus otherwise, so no editor ever blurs (see harness.js).
+  await send('Emulation.setFocusEmulationEnabled', { enabled: true });
   const ev = async e => { const r = await send('Runtime.evaluate',{expression:e,returnByValue:true}); return r&&r.result&&r.result.value; };
   return { proc, ev, log, navigate: u => send('Page.navigate',{url:u}) };
 }
@@ -85,6 +87,10 @@ async function main() {
   console.log('--- syncRandom determinism ---');
   await A.ev(`(function(){var cm=${LASTCM};cm.focus();cm.execCommand('selectAll');cm.replaceSelection("platform js global at: 'rnd' put: platform hopscotch syncRandom printString", null, '+input');cm.execCommand('selectAll');return 'SET'})()`);
   await new Promise(r=>setTimeout(r,2500));
+  // The blur a real mouse-down on the button causes: it publishes the selection
+  // of record every client's Evaluate Selection reads (see harness.js).
+  await A.ev(`(function(){var cm=${LASTCM};cm.execCommand('selectAll');cm.getInputField().blur();return 1})()`);
+  await new Promise(r=>setTimeout(r,800));
   await A.ev(click('Evaluate Selection'));
   await waitFor(A, "typeof window.rnd === 'string'", 20000);
   await waitFor(B, "typeof window.rnd === 'string'", 20000);

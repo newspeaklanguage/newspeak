@@ -10,7 +10,10 @@
 # (staging: psoup sources first, repo sources over them) and 8 (compile), in a
 # fresh scratch directory each time so nothing stale is captured.
 #
-#   cd tool && ./build-croquet-test-vfuel.sh
+#   cd tool && ./build-croquet-test-vfuel.sh [OVERLAY_DIR]
+#
+# OVERLAY_DIR, if given, holds .ns files copied over the staged sources last:
+# instrumented variants for a probe run, without touching the working tree.
 #
 # Then, e.g.:
 #   NS_SUFFIX=-TEST <emsdk node 22> croquet-probes/setup-latejoin-probe.js
@@ -25,6 +28,10 @@ STAGE=${NEWSPEAK}/scratch/croquet-test-stage
 rm -rf "$STAGE" && mkdir -p "$STAGE"
 cp "${PRIMORDIALSOUP}"/newspeak/*.ns "$STAGE"/
 cp "${NEWSPEAK}"/*.ns "${NEWSPEAK}"/*.png "$STAGE"/
+if [ -n "$1" ]; then
+    echo "Overlaying $(ls "$1"/*.ns | wc -l | tr -d ' ') file(s) from $1"
+    cp "$1"/*.ns "$STAGE"/
+fi
 
 # Stamp BuildInfo in the STAGE only; the tree's placeholder is left alone.
 IDE_SHA=$(git -C "${NEWSPEAK}" rev-parse --short HEAD 2>/dev/null || echo unknown)
@@ -37,11 +44,21 @@ Newspeak3
 'Root'
 class BuildInfo packageUsing: manifest = Object new (
 	(* Build/version stamp -- GENERATED for a TEST vfuel by
-	tool/build-croquet-test-vfuel.sh. *)
+	tool/build-croquet-test-vfuel.sh. Must answer everything the tracked
+	placeholder does: version and dirty describe the SOURCES, builtAt is when
+	this artifact was built and is what platform buildTime answers. Answering
+	only version made every TEST image die during startup with
+	'BuildInfo class doesNotUnderstand: #builtAt' (2026-09-21). *)
 ) (
 ) : (
+	public builtAt = (
+		^'${BUILT}'
+	)
+	public dirty = (
+		^'${DIRTY}'
+	)
 	public version = (
-		^'${IDE_SHA} ${IDE_DATE}, VM ${VM_SHA}, built ${BUILT}${DIRTY} TEST'
+		^'${IDE_SHA} ${IDE_DATE}, VM ${VM_SHA} TEST'
 	)
 )
 NSEOF

@@ -67,7 +67,7 @@ efficiency (section 8).
 | **reflective** | Program change and populations; only at a safepoint. | Install class and method records, atomic commit of a prepared change set, `adoptInstance` (reclassification), `allInstances`, mixin applications, bulk become (`elementsForwardIdentity`), cache flush. |
 | **turn** | Actors and the message loop. | Spawn, ports, send, `finish:`, await signal, exit. |
 | **input** | Nondeterministic: a value enters from outside the VM. | Clocks, FFI calls (files and the JS bridge today), host callbacks and their arguments, messages from other VMs, randomness. |
-| **output** | Only sends data out of the VM. Replay need not record it but must divert or suppress it. | Print, writing files, sending to a port, host calls made only for their effect. |
+| **output** | Only sends data out of the VM. Replay suppresses or diverts it. It is also recorded, and replay compares what it produces against the record to detect divergence. | Print, writing files, sending to a port, host calls made only for their effect. |
 | **resource** | Observes or controls the VM's resources. | Collect garbage, identity hash, weak clearing (as observed), snapshot save. |
 
 **Failure.** psoup's convention, where a failed primitive falls through to the
@@ -167,7 +167,14 @@ deterministic function of earlier state or is recorded as input. The ledger:
 | Identity hash | Deterministic (allocation order) or recorded. |
 
 A **checkpoint** is a snapshot (section 6); replay is checkpoint plus the
-input log.
+input log. *Decided 2026-11-10:*
+- Checkpoints are taken during turns, not only between them, so they include
+  paused stacks (consistent with section 6).
+- Checkpoint frequency is a parameter. It can be adjusted, and may change
+  dynamically during execution.
+- Outputs are recorded as well as inputs. On replay, a produced output that
+  differs from the recorded one signals divergence. (Recording a digest
+  instead of the full output would keep the log small; not decided.)
 
 ## 6. Snapshots
 
@@ -368,8 +375,8 @@ handle table, V8 stack).
 ## 11. Proposed next steps
 
 1. Agree on sections 2, 3 and 8 (the layering, operation categories, natives).
-   *2026-11-10:* sections 2 and 8 agreed. Section 3 is pending a review
-   with a colleague who has implemented replay in Wasmtime.
+   *2026-11-10:* sections 2, 3 and 8 agreed (section 3 after review with a
+   colleague who has implemented replay in Wasmtime).
 2. Write the kernel operation list: today's 161 psoup primitives, classified,
    with duplicates and host-specific ones separated out (done:
    `VM_KERNEL_PRIMITIVE_CLASSIFICATION_2026-11-09.md`). Host-specific

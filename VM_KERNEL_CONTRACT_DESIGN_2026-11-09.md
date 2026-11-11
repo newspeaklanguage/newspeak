@@ -81,11 +81,15 @@ sources have fallback bodies of these shapes:
 | Shape | Sites | Replacement |
 |---|---|---|
 | `halt` (cannot fail in practice) | 104 | None. The native has no body. |
-| Signal an exception (`ArgumentError`, `numArgsError:`) | 77 | The native fails with a reason. The VM sends one **failure role**, a method the mirror holder designates at bootstrap, with the native's name, receiver, arguments and reason. That method raises the specific exception. One place, not 77 copies. |
+| Signal an exception (`ArgumentError`, `numArgsError:`) | 77 | The native fails with a reason. The VM instantiates one **failure exception class**, designated at bootstrap, with the native's name, receiver, arguments and reason, and sends it `signal` (the semantics' `runtimeError` path, rule Native-Fail); its `signal` raises the specific exception. One place, not 77 copies. |
 | Double dispatch for mixed arithmetic (`^x addFromInteger: self`) | 10 | Part of the native's contract: on an argument kind it does not handle, it *answers the result of a defined send* (`x addFromInteger: self`). This is a tail send, not arbitrary code. |
 | Argument coercion and retry (122, 124) | 2 | The native accepts the wider argument, or the library converts before calling. |
 | Marker primitives (ensure:, on:do:, dispatch boundary) | ~5 | Not fallbacks: the body *is* the implementation. They become roles (classification doc). |
 | JS-bridge retry (157) | 1 | Disappears with the call-based FFI. |
+
+Correction (2026-11-10): one fallback is real code. `Integer>>/` builds a
+Fraction for an inexact quotient. It becomes an ordinary Newspeak method
+over natives (`VM_KERNEL_OPERATIONS_2026-11-10.md` section 3.1).
 
 So a native method is **total by contract**: it answers a value, makes its
 defined tail send, or invokes the failure role. The Simulator models exactly
@@ -219,7 +223,10 @@ The formal semantics has no semantics for saving and restoring a heap
   gives a smaller saved state, which matters when a snapshot is the
   synchronized state (for example, a Croquet model). It is sound only under
   rules that the alien-only rule does not need:
-  - *"Reset" means uninitialized, not nil*, since nil is a legitimate value.
+  - *Reset means writing nil.* In Newspeak nil is the lazy-slot sentinel
+    (formal semantics, section 2): an initializer that returns nil already
+    reruns on the next read. (An earlier draft said "uninitialized, not
+    nil"; that was wrong.)
   - *Mutation after initialization is lost.* `lazy registry = Map new`, later
     filled, comes back empty. So lazy slots must be recomputable caches, and
     state belongs in ordinary slots. This is a discipline, possibly a
@@ -380,7 +387,20 @@ handle table, V8 stack).
 2. Write the kernel operation list: today's 161 psoup primitives, classified,
    with duplicates and host-specific ones separated out (done:
    `VM_KERNEL_PRIMITIVE_CLASSIFICATION_2026-11-09.md`). Host-specific
-   operations become FFI calls, not kernel operations.
+   operations become FFI calls, not kernel operations. The detailed list,
+   with signatures, failures and categories, is
+   `VM_KERNEL_OPERATIONS_2026-11-10.md` (draft). Decided there on
+   2026-11-10: the formal semantics takes precedence over psoup (one shared
+   program per cohort, a heap per actor, unhandled exceptions pause the
+   actor); layouts are a hybrid (contract layouts for methods, mixins,
+   classes and messages, frozen once installed; activations and closures
+   hidden); identity hash is
+   deterministic; floats are bit-identical across hosts. One refinement of
+   section 2: the library *computes* layout reconciliation, but the VM
+   *applies* it, since it must touch every heap.
 3. Add the kernel as a new layer of the formal semantics (a refinement of
    `VM-Primitive`), with Lean/Prolog/SpecTec counterparts as the oracle.
+   *2026-11-10:* LaTeX layer drafted as `formal-semantics/kernel-semantics.tex`
+   (section 13, optional like the GC layer); coverage.md 8.3 and 8.5 updated.
+   Lean, Prolog and SpecTec counterparts not started.
 4. Start the new VM against that list, V5 only.

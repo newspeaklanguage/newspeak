@@ -1,0 +1,356 @@
+\section{Optional VM kernel layer}
+\label{sec:vm-kernel}
+
+This section is an optional refinement of the VM parameters left open by the
+preceding sections.  Like the garbage-collection layer, it is kept in its own
+source file; omitting the single \verb|\input{kernel-semantics}| line restores
+the opaque $\mathsf{hostPrimitive}$ of Rule~\rulelabel{VM-Primitive}.  Including
+it does four things:
+\begin{enumerate}
+\item it adds \emph{native methods}, whose bodies are entries of a closed,
+      versioned catalog, and states how they are invoked and how they fail;
+\item it fixes platform choices that the base semantics leaves open, so that
+      execution is deterministic apart from explicitly labelled inputs;
+\item it gives the host interface, including synchronous callbacks, as
+      labelled transitions of the waiting actor;
+\item it defines snapshots, restore, and resource exhaustion.
+\end{enumerate}
+The layer adds no Newspeak syntax.  Its catalog of operations, with their
+selectors and failure reasons, is the companion document
+\texttt{VM\_KERNEL\_OPERATIONS\_2026-11-10.md}; the rules below are stated for
+an arbitrary catalog.
+
+\subsection{Native methods}
+
+Extend method bodies with a native form:
+\begin{equation}\label{eq:native-body}
+ b::=\cdots\mid\kw{native}(\nu),
+ \qquad \nu\in\mathcal N_k,
+\end{equation}
+where $\mathcal N_k$ is the finite catalog of kernel version $k$.  No phrase of
+the surface or core grammar elaborates to a native body, so the front end of
+Section~\ref{sec:front-end} never produces one.  Each catalog entry has an
+arity $|\nu|$, one of two scopes, and an effect class
+\[\mathsf{eff}(\nu)\in\{\kw{pure},\kw{heap},\kw{control},\kw{reflective},
+\kw{turn},\kw{input},\kw{output},\kw{resource}\}.\]
+
+A \emph{local} native has a total transformer on one actor's sequential state,
+\begin{equation}\label{eq:native-outcome}
+ \delta_\nu(P,H,o,\bar o)\in\{
+   \kw{answer}(H',v),\
+   \kw{tailSend}(H',o',\mu'),\
+   \kw{fail}(r)\},
+\end{equation}
+where $r$ ranges over the kernel's failure reasons.  Totality is the point of
+the design: there is no fallback body, so every argument combination has
+exactly one of the three outcomes.  A $\kw{tailSend}$ is a fixed message the
+entry names, for instance a double-dispatch send for an argument kind the
+native does not handle; it is not arbitrary code.
+
+When dispatch selects a native method, no activation is allocated.  For
+\[f=\langle i_f,s,\alpha,\bar x,\ell,\kw{native}(\nu),K\rangle,
+ \qquad\mu=\langle s,\bar o\rangle,\]
+the following rules take precedence over \rulelabel{Invoke-NonTail} and
+\rulelabel{Invoke-Tail}:
+\[
+\dfrac{\delta_\nu(P,H,o,\bar o)=\kw{answer}(H',v)}
+ {\langle H;\mathcal A\cdot\langle a,\pi\rangle;
+      \kw{invoke}(f,o,C_f,\mu)\rangle_P
+  \longmapsto
+  \langle H';\mathcal A\cdot\langle a,\pi\rangle;v\rangle_P}
+\quad(\rulelabel{Native-Answer})
+\]
+\[
+\dfrac{\delta_\nu(P,H,o,\bar o)=\kw{tailSend}(H',o',\mu')}
+ {\begin{aligned}
+  &\langle H;\mathcal A\cdot\langle a,\pi\rangle;
+      \kw{invoke}(f,o,C_f,\mu)\rangle_P\\[-1mm]
+  &\quad\longmapsto
+  \langle H';\mathcal A\cdot\langle a,\pi\rangle;
+      \kw{dispatch}(\kw{ordinaryRequest}(o'),\mu')\rangle_P
+ \end{aligned}}
+\quad(\rulelabel{Native-Tail})
+\]
+\[
+\dfrac{\delta_\nu(P,H,o,\bar o)=\kw{fail}(r)}
+ {\begin{aligned}
+  &\langle H;\mathcal A\cdot\langle a,\pi\rangle;
+      \kw{invoke}(f,o,C_f,\mu)\rangle_P\\[-1mm]
+  &\quad\longmapsto
+  \langle H;\mathcal A\cdot\langle a,\pi\rangle;
+      \kw{runtimeError}(\kw{nativeFailure}(\nu,o,\bar o,r))\rangle_P
+ \end{aligned}}
+\quad(\rulelabel{Native-Fail})
+\]
+A failure changes no heap record.  It then crosses the exception-library
+boundary by Rule~\rulelabel{Runtime-Error-Signal}.  The kernel fixes the
+platform's reification of Equation~\eqref{eq:exception-reification} for this
+case: $\mathsf{reifyError}$ allocates an instance of one exception class
+designated at bootstrap, carrying $\nu$, $o$, $\bar o$ and $r$, and invokes no
+user code.  That class's \kw{signal} method chooses the specific exception;
+this is the single failure path that replaces the per-method fallback bodies of
+earlier VMs.  Because a native leaves no activation, it never appears in a
+continuation, a stack snapshot, or an activation descriptor.  The Simulator
+refinement obligation of Section~\ref{sec:reflection} applies unchanged: the
+Simulator steps a native method by these three rules.
+
+A \emph{cohort} native acts on the whole configuration $\Omega$.  Each one is
+an existing rule of the actor or reflection semantics, reached through
+Rule~\rulelabel{VM-Primitive}: the kernel defines $\mathsf{hostPrimitive}$ for
+it as that rule's effect.  Table~\ref{tab:cohort-natives} lists the
+correspondence.  Natives that only read the configuration are queries of
+Equation~\eqref{eq:mirror-query-grammar}.
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{ll}
+\hline
+Kernel operation & Existing rule or definition\\
+\hline
+\texttt{commit:} & Rule~\rulelabel{Reflection-Commit}\\
+\texttt{programVersion} & \kw{programVersionQuery}\\
+\texttt{allInstancesOf:} & Equation~\eqref{eq:all-instances-of}\\
+\texttt{mixinApplicationsOf:} & Equation~\eqref{eq:mixin-applications}\\
+\texttt{currentActivation} & \kw{currentActivationQuery}\\
+\texttt{continueAt:with:} & \kw{continueAtActivation}\\
+\texttt{tempOf:at:put:} & \kw{writeActivationLocal}, \kw{writeActivationParameter}\\
+\texttt{senderOf:put:} & \kw{changeActivationContinuation}\\
+\texttt{markUncontinuable:} & \kw{markActivationUncontinuable}\\
+\texttt{slotOf:at:put:} & \kw{writeObjectSlot}, as a one-command commit\\
+\texttt{reclassify:as:} & \kw{changeObjectClass}, as a one-command commit\\
+\texttt{pause:reason:} & \kw{pauseActor}\\
+\texttt{stackOf:} & \kw{actorStackQuery}\\
+\texttt{replaceStackOf:with:} & \kw{replacePausedActorStack}\\
+\texttt{resume:} & \kw{resumePausedActorAtFullSpeed}\\
+\texttt{spawn:} & $\mathsf{spawn}(M)$, Equation~\eqref{eq:create-actor}\\
+\hline
+\end{tabular}
+\caption{Cohort natives and the rules that define them.}
+\label{tab:cohort-natives}
+\end{table}
+
+\paragraph{Installation authority.}
+A native body enters a program only through a reflective commit.  The kernel
+strengthens the authorization premise of Rule~\rulelabel{Reflection-Commit}:
+\begin{equation}\label{eq:native-install-right}
+ \mathsf{introducesNative}(\delta_r,P)
+ \;\Longrightarrow\;
+ \kw{primitive}\in R_{\mathsf{commandMirror}(\delta_r)},
+\end{equation}
+where $\mathsf{introducesNative}(\delta_r,P)$ holds when the method definition
+written by $\delta_r$ has a native body and the method it replaces, if any,
+does not have the same one.  Together with the front-end property above, no
+source text and no mirror without the \kw{primitive} right can produce a
+native method.  The kernel operations themselves are native methods of the
+VM-mirror class, so holding the VM mirror is exactly holding them.
+
+\subsection{Platform choices fixed by the kernel}
+
+The base semantics deliberately leaves several choices to the platform.  The
+kernel fixes them, which removes transitions and never adds one:
+\begin{enumerate}
+\item \emph{Identity order.}  The order $\prec$ of
+      Equation~\eqref{eq:all-instances-of} is allocation order within the
+      cohort.  Every rule that chooses a fresh identity chooses the
+      $\prec$-least unused one, so allocation is deterministic.  Population
+      queries are then deterministic snapshots.
+\item \emph{Identity hash.}  $\mathsf{identityHash}(o)=h(\mathsf{rank}_\prec(o))$
+      for a fixed function $h$ into SmallIntegers.  It is never an input.
+\item \emph{Floating point.}  Every Float native is a fixed function of IEEE~754
+      binary64 values with one canonical NaN; transcendental functions are
+      fixed functions supplied with the kernel, not host functions.
+\item \emph{Lazy-slot sentinel.}  As in Section~\ref{sec:surface}, $\nil$
+      is the sentinel; the restore rule below resets a lazy slot by writing
+      $\nil$, which is the reflective reset that section anticipates.
+\end{enumerate}
+
+\subsection{Effects, labels, and replay}
+
+Every cohort transition carries a label
+\begin{equation}\label{eq:kernel-labels}
+ \lambda::=\tau\mid\kw{in}(\iota)\mid\kw{out}(\omega).
+\end{equation}
+Steps of local natives whose effect class is \kw{pure}, \kw{heap},
+\kw{control}, \kw{reflective}, \kw{turn} or \kw{resource}, and all steps of
+the base semantics, are labelled $\tau$, with two exceptions that become
+inputs: the choice of which actor or packet the actor relation steps next is
+$\kw{in}(\kw{sched}(\cdot))$, and, when the garbage-collection layer is
+included, each collection step is $\kw{in}(\kw{gc}(\cdot))$, recording the
+identities it removes and the weak entries it clears.\footnote{Logging
+collections rather than scheduling them deterministically is the leading
+proposal; it is not yet decided.}  An \kw{input} native's result is supplied
+by the environment and its step is labelled $\kw{in}(\nu,v)$; an \kw{output}
+native's step is labelled $\kw{out}(\nu,\bar o)$.  Host calls and callbacks
+below carry both kinds.
+
+\paragraph{Determinism obligation.}
+For every configuration $\Omega$ and label $\lambda$ there is at most one
+$\Omega'$ with $\Omega\xrightarrow{\lambda}\Omega'$.  The base sequential
+rules satisfy this once freshness is fixed as above; the actor relation
+satisfies it once its choices are the labels $\kw{sched}$.  A consequence is
+the \emph{replay property}: a run is determined by its initial configuration
+and its sequence of $\kw{in}$ labels.  Replay feeds the recorded inputs,
+suppresses the effect of $\kw{out}$ steps, and compares each produced
+$\kw{out}$ label with the recorded one; the first difference is a divergence.
+
+\paragraph{Checkpoints.}
+A checkpoint is any reachable configuration, including one in which an actor is
+in \kw{runningTurn} or \kw{pausedTurn}: checkpoints may be taken during a turn.
+How often they are taken is a parameter of the implementation and may change
+during a run; it has no semantic effect.
+
+\subsection{Host references and synchronous callbacks}
+
+Extend the configuration with a cohort-wide host table
+\begin{equation}\label{eq:host-tables}
+ \Lambda:\mathit{AlienId}\rightharpoonup\mathit{HostRef},
+ \qquad
+ \Xi:\mathit{ExpatId}\rightharpoonup\langle A,c\rangle,
+\end{equation}
+where an alien $x$ is a Newspeak object standing for the host value
+$\Lambda(x)$, and an expat $e$ is a host-callable function whose calls run
+closure $c$ in its owner actor $A$.  A host call by actor $B$ suspends its
+sequential state in the control term $\kw{hostWait}(\kappa)$, with call record
+$\kappa$, and a callback depth $d$.  The environment then chooses one of the
+following, each an input:
+\[
+\dfrac{\mathcal X(B)=\kw{runningTurn}\langle\mathcal A,\kw{hostWait}(\kappa),p,u\rangle}
+ {\Omega\xrightarrow{\kw{in}(\kw{hostReturn}(\kappa,v))}
+  \Omega[\mathcal X(B)\mapsto\kw{runningTurn}\langle\mathcal A,v,p,u\rangle]}
+\quad(\rulelabel{Host-Return})
+\]
+\[
+\dfrac{\mathcal X(B)=\kw{runningTurn}\langle\mathcal A,\kw{hostWait}(\kappa),p,u\rangle}
+ {\begin{aligned}
+  \Omega\xrightarrow{\kw{in}(\kw{hostThrow}(\kappa,x))}
+  \Omega[\mathcal X(B)\mapsto{}&\kw{runningTurn}\langle\mathcal A,
+     t_x,p,u\rangle],\\[-1mm]
+  t_x={}&\kw{runtimeError}(\kw{nativeFailure}(\kappa,\kw{host}(x)))
+ \end{aligned}}
+\quad(\rulelabel{Host-Throw})
+\]
+A callback from the host while $B$ waits is a \emph{sub-step of $B$'s current
+turn}.  For $\Xi(e)=\langle B,c\rangle$, a closure $c$ with parameters
+$\bar x$, host arguments $\bar v$, and depth $d<N_{\mathrm{cb}}$, let
+$\bar v'$ be $\bar v$ truncated or padded with $\nil$ to length $|\bar x|$:
+\[
+\dfrac{\begin{gathered}
+ \mathcal X(B)=\kw{runningTurn}\langle\mathcal A,\kw{hostWait}(\kappa),p,u\rangle\\
+ \Xi(e)=\langle B,c\rangle\qquad d<N_{\mathrm{cb}}\qquad
+ \mu=\langle\mathsf{valueSelector}(|\bar x|),\bar v'\rangle
+ \end{gathered}}
+ {\begin{aligned}
+  \Omega\xrightarrow{\kw{in}(\kw{callback}(e,\bar v))}
+  \Omega[\mathcal X(B)\mapsto\kw{runningTurn}\langle
+     &\mathcal A\cdot\langle\beta_\kappa,\epsilon\rangle,\\[-1mm]
+     &\kw{invokeClosure}(c,\mu),p,u\rangle]
+ \end{aligned}}
+\quad(\rulelabel{Callback-Enter})
+\]
+Here $\beta_\kappa$ is a boundary frame for the waiting call.  A value
+returning to $\beta_\kappa$ ends the callback:
+\[
+\dfrac{\mathcal X(B)=\kw{runningTurn}\langle
+   \mathcal A\cdot\langle\beta_\kappa,\epsilon\rangle,v,p,u\rangle}
+ {\Omega\xrightarrow{\kw{out}(\kw{callbackResult}(\kappa,v))}
+  \Omega[\mathcal X(B)\mapsto\kw{runningTurn}\langle
+     \mathcal A,\kw{hostWait}(\kappa),p,u\rangle]}
+\quad(\rulelabel{Callback-Return})
+\]
+Three consequences follow from these rules rather than needing rules of their
+own:
+\begin{itemize}
+\item \emph{No other turn of $B$ starts during a callback.}  $B$ is in
+      \kw{runningTurn} throughout, and Rule~\rulelabel{Turn-Start} requires
+      \kw{idle}.  The queue is never drained inside a callback.  Other actors
+      may still step, as isolation permits; an implementation with all actors
+      on one thread simply does not schedule them.
+\item \emph{Non-local return across the boundary fails.}  A return whose home
+      activation lies below $\beta_\kappa$ finds no continuation in the
+      current segment and takes Rule~\rulelabel{Return-Cannot}.
+\item \emph{Atomicity of turns is preserved}, with callbacks counted as part
+      of the turn that made the host call.
+\end{itemize}
+A callback to another actor's expat, or one beyond the nesting bound, never
+runs synchronously:
+\[
+\dfrac{\begin{gathered}
+ \mathcal X(B)=\kw{runningTurn}\langle\mathcal A,\kw{hostWait}(\kappa),p,u\rangle\\
+ \Xi(e)=\langle C,c\rangle\qquad C\ne B\qquad
+ \Omega'=\mathsf{emit}(\Omega,B,C,\beta_e(c,\bar v),\Gamma(B))
+ \end{gathered}}
+ {\Omega\xrightarrow{\kw{in}(\kw{callback}(e,\bar v))\cdot
+     \kw{out}(\kw{callbackResult}(\kappa,\nil))}\Omega'}
+\quad(\rulelabel{Callback-Foreign})
+\]
+where $\beta_e$ is the packet template of an ordinary eventual send of the
+closure's \kw{value} message.  The rule \rulelabel{Callback-Too-Deep} is the
+same with premise $d\ge N_{\mathrm{cb}}$, no packet, and output
+$\kw{callbackRefused}(\kappa)$.
+
+\paragraph{Unhandled exceptions.}
+Exception handling is library code (Section~\ref{sec:exception-boundary}).
+When the library finds no handler, it does one of two things through the
+kernel.  Outside a callback it applies \kw{pauseActor} to its own actor, so
+the actor enters \kw{pausedTurn} and runs nothing until a debugger resumes it
+or replaces its stack.  Inside a callback it cannot pause, because the host is
+waiting on it; it uses the cohort native \texttt{abandonCallback:}, which takes
+the stack snapshot of the frames above the nearest boundary $\beta_\kappa$
+(Equation~\eqref{eq:actor-stack-snapshot}), delivers it to the actor's
+designated debugger as an ordinary packet, removes those frames, and returns
+to $\kw{hostWait}(\kappa)$ with output $\kw{callbackFailed}(\kappa)$.  The
+snapshot is immutable and records no resumable state.
+
+\paragraph{Events with no turn running.}
+A host event for an expat whose owner $A$ is idle is an input that appends an
+ordinary packet to $\mathcal Q(A)$; Rule~\rulelabel{Turn-Start} then begins
+its turn.
+
+\subsection{Snapshots and restore}
+
+A snapshot of cohort $w$ is its configuration $\Omega$, including $\Lambda$,
+$\Xi$ and every \kw{pausedTurn}.  Restoring it into a new host is not a step
+of $\Omega$; it creates a new cohort.  For a fresh $w'$,
+\begin{equation}\label{eq:restore}
+\begin{aligned}
+ \mathsf{restore}(\Omega,w')=\Omega_3,\quad
+ \Omega_1&=\Omega[w\mapsto w',\ \Lambda\mapsto\varnothing,\
+   \Xi\mapsto\varnothing],\\
+ \Omega_2&=\Omega_1\text{ with each lazy slot holding an alien set to }\nil,\\
+ \Omega_3&=\Omega_2\text{ with a restore packet in }\mathcal Q(A)
+   \text{ for each actor }A\text{ with a restore role.}
+\end{aligned}
+\end{equation}
+Every other alien in $\Omega_3$ is dead: a host operation on it fails with
+reason $\kw{dead}$.  A lazy slot that was reset recomputes its value on the next
+read, so a host object obtained by lookup is found again in the new host.
+Because $w'$ is fresh, every start yields a new VM identity; the snapshot may
+record $w$ as its lineage, which grants nothing.  Replay within a live session
+does not use $\mathsf{restore}$: it resumes the checkpoint itself, with the same
+$w$, $\Lambda$ and $\Xi$, and takes host results from the input log.
+
+\subsection{Resource exhaustion}
+
+Each resource has a bound that is a parameter of the kernel version: heap size,
+stack depth, callback depth $N_{\mathrm{cb}}$, and host-table size.  A step that
+would exceed a bound is replaced by the control term
+\[\kw{runtimeError}(\kw{exhausted}(\varrho))\]
+for the resource $\varrho$, with no other change; it never yields an undefined or corrupted state.  Whether a
+bound is reached depends only on the configuration, so exhaustion is
+deterministic and needs no label.
+
+\subsection{Obligations}
+
+The layer states obligations; none is mechanized yet.
+\begin{enumerate}
+\item \emph{Determinism}: the determinism obligation above.
+\item \emph{Library refinement}: the mirror library submits to \texttt{commit:}
+      only command lists $\Delta$ for which $\mathsf{validReflection}$ holds;
+      the VM checks only the structural part needed for its own safety.
+\item \emph{Implementation refinement}: every trace of the VM, with its
+      labels, is a trace of this layer.
+\item \emph{Simulator}: the Simulator's treatment of native methods is
+      \rulelabel{Native-Answer}, \rulelabel{Native-Tail} and
+      \rulelabel{Native-Fail}.
+\end{enumerate}

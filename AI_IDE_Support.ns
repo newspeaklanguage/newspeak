@@ -883,8 +883,15 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 			^pname
 		)
 		public reloadApiKey = (
+			(* A missing key reads as nil without error; a storage failure is logged
+		   (never the key). *)
+			
 			| key <String | UndefinedObject> |
-			key:: [ js localStorage getItem: storageKey ] on: Exception do: [:e | nil ].
+			key:: [ js localStorage getItem: storageKey ] on: Exception
+				do: [:e |
+					ide noteSwallowed: e in: 'reading the API key setting'.
+					nil
+				].
 			key isNil ifTrue: [ key:: '' ].
 			apiKey:: key
 		)
@@ -903,7 +910,11 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 
 	   The discovery call is a safety net for callers reaching here without
 	   having rendered the form; when the form was on screen its render already
-	   made the attempt and the guard makes this a no-op. *)
+	   made the attempt and the guard makes this a no-op.
+
+	   A failed save of the key, base URL or active-chat setting is logged:
+	   swallowed, the user would believe it saved and lose it on reload. The key
+	   itself is never logged. *)
 			
 			| doc <Document> |
 			providerName = 'bus-agent' ifTrue: [
@@ -929,14 +940,25 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 					errorMessage:: 'An entry named "' , docName , '" already exists in Root.'.
 					^nil
 				].
-			[ js localStorage setItem: storageKey to: apiKey ] on: Exception do: [:e |].
+			[ js localStorage setItem: storageKey to: apiKey ] on: Exception
+				do: [:e |
+					ide noteSwallowed: e
+						in: 'saving the API key for ' , providerName , ' (NOT saved)'
+				].
 			providerName = 'openai-compat' ifTrue: [
 					[
 						js localStorage setItem: (baseUrlStorageKeyFor: providerName) to: baseUrl
-					] on: Exception do: [:e |]
+					] on: Exception
+						do: [:e |
+							ide noteSwallowed: e
+								in: 'saving the base URL for ' , providerName , ' (NOT saved)'
+						]
 				].
 			[ js localStorage setItem: 'ns_ai_active_chat_doc' to: docName ] on: Exception
-				do: [:e |].
+				do: [:e |
+					ide noteSwallowed: e
+						in: 'saving the active chat document setting (NOT saved)'
+				].
 			ensureModelCacheRefreshedFor: createProvider onRefreshed: [].
 			doc:: createChatNamed: docName provider: providerName model: modelName.
 			Root at: docName asSymbol put: doc.
@@ -1011,10 +1033,15 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 						   live, as propose_changes promises it - the document-backed chat
 						   queues the same line from its own hook. The presenter's "no
 						   longer pending" banner is the transcript's record. Guarded: a
-						   failure here must never undo a successful install. *)
+						   failure here must never undo a successful install -- but it is
+						   logged, since the model would then not know it is live. *)
 							[
 								subj session addSystemNotice: 'The user applied your proposed changeset ' , csId , ' (' , recCount printString , ' records) via the Apply button; it is now live. Do NOT call apply_changeset on it.'
-							] on: Exception do: [:e | nil ].
+							] on: Exception
+								do: [:e |
+									ide noteSwallowed: e
+										in: 'telling the inline chat that changeset ' , csId , ' was applied'
+								].
 							nil
 						]
 						onCanceled: [
@@ -1223,11 +1250,15 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 		^aiWorkspaceSubject_slot
 	)
 	answerReachability: k <[:Boolean | Object]> with: able <Boolean> = (
-		(* Run the continuation and swallow anything it raises: most call sites are
+		(* Run the continuation and contain anything it raises: most call sites are
 	   inside a JS promise continuation, where a raise is lost on the alien
-	   bridge and can leave the bridge in a bad state. *)
+	   bridge and can leave the bridge in a bad state. Contained, but logged. *)
 		
-		[ k value: able ] on: Exception do: [:e | nil ]
+		[ k value: able ] on: Exception
+			do: [:e |
+				ide noteSwallowed: e in: 'a reachability continuation'.
+				nil
+			]
 	)
 	apiKeyForProvider: pn <String> ^<String> = (
 		| key |
@@ -1304,26 +1335,30 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 	)
 	applyBusEvent: dataStr <String> = (
 		(* One inbound bus message, as delivered by the synchronized inbox.
-	   Resolve the target chat by name; drop silently if it is unknown (an
-	   external agent may address a chat that does not exist here). A 'notice'
-	   is folded into the target's next turn out of band; a 'message' drives a
-	   real turn, stamped so the model knows it came from outside and cannot be
-	   mistaken for the human user. *)
+	   Resolve the target chat by name; drop it if it is unknown (an external
+	   agent may address a chat that does not exist here) -- the drop is logged
+	   via logBus:. A 'notice' is folded into the target's next turn out of
+	   band; a 'message' drives a real turn, stamped so the model knows it came
+	   from outside and cannot be mistaken for the human user. Faults in parsing
+	   or reading the message are logged. *)
 		
 		| msg to targetDoc text from kind |
-		msg:: [ (js global at: 'JSON') parse: dataStr ] on: Exception do: [:e | nil ].
+		msg:: busJSON: dataStr in: 'parsing an inbound bus message'.
 		msg isNil ifTrue: [ ^self ].
-		kind:: [ msg at: 'kind' ] on: Exception do: [:e | 'message' ].
-		to:: [ msg at: 'to' ] on: Exception do: [:e | nil ].
+		kind:: busField: 'kind' of: msg default: 'message' in: 'inbound bus message'.
+		to:: busField: 'to' of: msg default: nil in: 'inbound bus message'.
 		to isNil ifTrue: [ ^self ].
 		targetDoc:: chatDocNamed: to.
 		targetDoc isNil ifTrue: [
 				logBus: 'dropped: no chat named ' , to.
 				^self
 			].
-		text:: [ msg at: 'text' ] on: Exception do: [:e | '' ].
+		text:: busField: 'text' of: msg default: '' in: 'inbound bus message'.
 		text isNil ifTrue: [ text:: '' ].
-		from:: [ msg at: 'from' ] on: Exception do: [:e | 'external agent' ].
+		from:: busField: 'from'
+			of: msg
+			default: 'external agent'
+			in: 'inbound bus message'.
 		(from isNil or: [ from isEmpty ]) ifTrue: [ from:: 'external agent' ].
 		kind = 'notice' ifTrue: [
 				deliverExternalNotice: text to: targetDoc from: from.
@@ -1531,11 +1566,15 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 	baseUrlForProvider: pn <String> ^<String> = (
 		(* Read the configured base URL for pn; if nothing is stored, fall
 	   back to defaultBaseUrlForProvider:. Returns '' for providers that
-	   don't use a base URL. *)
+	   don't use a base URL. A storage failure is logged and treated as
+	   nothing stored. *)
 		
 		| stored |
 		stored:: [ js localStorage getItem: (baseUrlStorageKeyFor: pn) ] on: Exception
-			do: [:e | nil ].
+			do: [:e |
+				ide noteSwallowed: e in: 'reading the base URL for ' , pn.
+				nil
+			].
 		(stored isNil or: [ stored isEmpty ]) ifTrue: [
 				^defaultBaseUrlForProvider: pn
 			].
@@ -1547,6 +1586,28 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 	   for other provider names but unused there. *)
 		
 		^'ns_ai_baseurl_' , (providerClassFor: pn) name
+	)
+	busField: key <String> of: obj <Alien> default: default in: context <String> = (
+		(* Read a field of a JS object from the bus, answering default if the read
+	   raises. A missing field reads as the undefined-Alien without raising, so the
+	   default only applies to genuine faults -- which are logged. Never raises. *)
+		
+		^[ obj at: key ] on: Exception
+			do: [:e |
+				ide noteSwallowed: e in: context , ' (reading field ' , key , ')'.
+				default
+			]
+	)
+	busJSON: s <String> in: context <String> ^<Alien | Nil> = (
+		(* Parse a bus frame's JSON. A malformed frame answers nil, as before, but is
+	   logged rather than silently dropped. Never raises (bus code runs in JS
+	   callbacks, where a raise is lost on the alien bridge). *)
+		
+		^[ (js global at: 'JSON') parse: s ] on: Exception
+			do: [:e |
+				ide noteSwallowed: e in: context.
+				nil
+			]
 	)
 	busTokenFrom: origin <String> ^<Alien[Promise]> = (
 		(* The /_ns token. EventSource cannot set a header, so for the SSE
@@ -1621,14 +1682,19 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 					   to apply a changeset that is already live. The generic codebase-
 					   changed notice from the install choke point names classes, not
 					   changeset ids, so add a specific one. Guarded: a failure here must
-					   never undo a successful install. *)
+					   never undo a successful install -- but it is logged, since the
+					   model would then not know its changeset is live. *)
 						[
 							| subj |
 							subj:: doc chatSubjectSlot.
 							subj isNil ifFalse: [
 									subj session addSystemNotice: 'The user applied your proposed changeset ' , csId , ' (' , recCount printString , ' records) via the Apply button; it is now live. Do NOT call apply_changeset on it.'
 								]
-						] on: Exception do: [:e | nil ]
+						] on: Exception
+							do: [:e |
+								ide noteSwallowed: e
+									in: 'telling chat ' , doc name , ' that changeset ' , csId , ' was applied'
+							]
 					]
 					onCanceled: [
 						forgetCachedChangesetSubject: id for: doc.
@@ -1981,10 +2047,15 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 	   Also makes sure the agent bus is being listened to: not every entry point
 	   (e.g. the AmpleforthViewer snapshot) runs HopscotchWebIDE's startup, which
 	   is otherwise the only caller of startAgentBusListening. Idempotent and
-	   fail-closed, so harmless where the bus is already up or absent. *)
+	   fail-closed, so harmless where the bus is already up or absent; a failure
+	   is logged. *)
 		
 		| pn mn cls key provider session |
-		[ startAgentBusListening ] on: Exception do: [:e | nil ].
+		[ startAgentBusListening ] on: Exception
+			do: [:e |
+				ide noteSwallowed: e
+					in: 'starting agent bus listening for a new chat session'
+			].
 		pn:: chatProviderOf: doc.
 		mn:: chatModelOf: doc.
 		key:: pn = 'openai-compat' ifTrue: [
@@ -2039,13 +2110,22 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 		^''
 	)
 	public defaultChatDocumentOrCreate ^<Document | UndefinedObject> = (
+		(* A missing setting reads as nil without error; storage failures are
+	   logged. *)
+		
 		| activeName entry key doc |
 		activeName:: [ js localStorage getItem: 'ns_ai_active_chat_doc' ] on: Exception
-			do: [:e | nil ].
+			do: [:e |
+				ide noteSwallowed: e in: 'reading the active chat document setting'.
+				nil
+			].
 		activeName isNil ifTrue: [
 				activeName:: 'Chat'.
 				[ js localStorage setItem: 'ns_ai_active_chat_doc' to: 'Chat' ] on: Exception
-					do: [:e |]
+					do: [:e |
+						ide noteSwallowed: e
+							in: 'saving the active chat document setting (NOT saved)'
+					]
 			].
 		entry:: Root at: activeName asSymbol ifAbsent: [ nil ].
 		entry isNil ifFalse: [
@@ -2122,19 +2202,22 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 	   frame for a request still pending counts; it reaches the chat's session,
 	   which pushes its watchdog out and shows the text as the turn's phase.
 	   Nothing is recorded and no turn is driven: a heartbeat is per-client
-	   status, like the watchdog it feeds. *)
+	   status, like the watchdog it feeds. Faults are logged. *)
 		
 		| corrId to doc text |
-		corrId:: [ msg at: 'corr_id' ] on: Exception do: [:e | nil ].
+		corrId:: busField: 'corr_id' of: msg default: nil in: 'completion progress'.
 		corrId isNil ifTrue: [ ^self ].
 		(pendingCompletions includesKey: corrId) ifFalse: [ ^self ].
-		to:: [ msg at: 'to' ] on: Exception do: [:e | nil ].
+		to:: busField: 'to' of: msg default: nil in: 'completion progress'.
 		to isNil ifTrue: [ ^self ].
 		doc:: chatDocNamed: to.
 		doc isNil ifTrue: [ ^self ].
-		text:: [ msg at: 'text' ] on: Exception do: [:e | '' ].
+		text:: busField: 'text' of: msg default: '' in: 'completion progress'.
 		text isNil ifTrue: [ text:: '' ].
-		[ doc session noteProviderProgress: text ] on: Exception do: [:e | nil ]
+		[ doc session noteProviderProgress: text ] on: Exception
+			do: [:e |
+				ide noteSwallowed: e in: 'reporting completion progress to chat ' , to
+			]
 	)
 	deliverCompletionResponse: msg <Alien> = (
 		(* Route an external agent's completion_response back to the BusProvider
@@ -2142,30 +2225,45 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 	   'request'-shaped 'response' field and is handed through unchanged - it is
 	   an Anthropic-style reply the provider's inherited extractors understand.
 	   Unknown or missing ids are dropped; a reply arriving twice finds no
-	   pending entry the second time. *)
+	   pending entry the second time. A provider callback that raises is
+	   contained (this runs in a JS callback) but logged: swallowed, it would
+	   leave the chat turn hanging until its watchdog fires, with no clue why. *)
 		
 		| corrId entry response |
-		corrId:: [ msg at: 'corr_id' ] on: Exception do: [:e | nil ].
+		corrId:: busField: 'corr_id' of: msg default: nil in: 'completion response'.
 		corrId isNil ifTrue: [ ^self ].
 		entry:: pendingCompletions at: corrId ifAbsent: [ nil ].
 		entry isNil ifTrue: [ ^self ].
 		pendingCompletions removeKey: corrId ifAbsent: [ nil ].
-		response:: [ msg at: 'response' ] on: Exception do: [:e | nil ].
+		response:: busField: 'response' of: msg default: nil in: 'completion response'.
 		response isNil ifTrue: [
 				[ (entry at: 2) value: 'The external agent returned no response object.' ] on: Exception
-					do: [:e | nil ]
+					do: [:e |
+						ide noteSwallowed: e
+							in: 'reporting a missing completion response for ' , corrId
+					]
 			]
-			ifFalse: [ [ (entry at: 1) value: response ] on: Exception do: [:e | nil ] ]
+			ifFalse: [
+				[ (entry at: 1) value: response ] on: Exception
+					do: [:e |
+						ide noteSwallowed: e
+							in: 'handing a completion response to its provider (' , corrId , ')'
+					]
+			]
 	)
 	deliverExternalNotice: text <String> to: targetDoc <Document> from: from <String> = (
 		(* An out-of-band notice: folded into the target session's next turn as a
 	   system notice, with no turn of its own, so it is context the model sees
 	   when it next runs rather than something that provokes a reply. Uses the
-	   document's public session forwarder, which materializes the session. *)
+	   document's public session forwarder, which materializes the session. A
+	   failure to deliver is logged. *)
 		
 		[
 			targetDoc session addSystemNotice: '[from external agent ''' , from , '''] ' , text
-		] on: Exception do: [:e | nil ]
+		] on: Exception
+			do: [:e |
+				ide noteSwallowed: e in: 'delivering an external notice from ' , from
+			]
 	)
 	deliverPeerMessage: stamped <String> to: doc <Document> hop: hop <Integer> = (
 		(* Deliver by driving a REAL turn on the target's session: materialize
@@ -2177,7 +2275,8 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 	   recorded FIRST so a send_to_chat made during the driven turn inherits
 	   it; it is cleared when the turn settles (drainPeerMessagesFor:). The
 	   callbacks cross the JS bridge: they must never raise and must return
-	   marshalable values, hence the guards and the trailing nils. *)
+	   marshalable values, hence the guards and the trailing nils. Failures in
+	   them are logged. *)
 		
 		| subj promise |
 		subj:: chatSubjectFor: doc.
@@ -2188,7 +2287,10 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 				^self
 			].
 		promise then: [:reply |
-				[ subj markComplete ] on: Exception do: [:e | nil ].
+				[ subj markComplete ] on: Exception
+					do: [:e |
+						ide noteSwallowed: e in: 'completing a driven turn in chat ' , doc name
+					].
 				
 				(* A driven turn has no presenter to updateGUI: for it; markComplete's
 			   own refresh repaints the current top-level presenter only, and a chat
@@ -2197,7 +2299,11 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 				nil
 			]
 			onError: [:err |
-				[ subj markError: err printString ] on: Exception do: [:e | nil ].
+				[ subj markError: err printString ] on: Exception
+					do: [:e |
+						ide noteSwallowed: e
+							in: 'marking a failed driven turn in chat ' , doc name
+					].
 				hopscotch updateAllGUIs.
 				nil
 			]
@@ -2216,7 +2322,8 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 	   then delivers at most ONE queued peer message — that delivery's own
 	   settle drains the next, keeping turns ordered and interleaving fairly
 	   with the human user. Fully guarded: a drain failure must never break
-	   markComplete for the human path. *)
+	   markComplete for the human path -- but it is logged, since it means a
+	   queued peer message was not delivered. *)
 		
 		[
 			| queue entry |
@@ -2229,7 +2336,11 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 				].
 			entry:: queue removeFirst.
 			deliverPeerMessage: (entry at: 1) to: doc hop: (entry at: 2)
-		] on: Exception do: [:e | nil ]
+		] on: Exception
+			do: [:e |
+				ide noteSwallowed: e
+					in: 'draining queued peer messages for chat ' , doc name
+			]
 	)
 	enqueueOrDeliver: stamped <String> to: targetDoc <Document> hop: hop <Integer> ^<String> = (
 		(* Shared tail of every peer delivery — the in-image send_to_chat and the
@@ -2287,13 +2398,15 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 	   machine's bus - another machine's, or a late joiner replaying - still
 	   applies the inbound messages the record carries, and on the Croquet
 	   platform a recorded delivery without a subscriber is lost. Guarded, as
-	   the handler runs as a stored callback: it must never raise. *)
+	   the handler runs as a stored callback: it must never raise. A failure to
+	   apply a message is logged. *)
 		
 		busInboxSubscribed ifTrue: [ ^self ].
 		busInboxSubscribed:: true.
 		hopscotch synchronizedInbox: 'bus'
 			do: [:dataStr |
-				[ applyBusEvent: dataStr ] on: Exception do: [:e | nil ].
+				[ applyBusEvent: dataStr ] on: Exception
+					do: [:e | ide noteSwallowed: e in: 'applying an inbound bus message' ].
 				nil
 			]
 	)
@@ -2332,16 +2445,25 @@ class AI_IDE_Support usingPlatform: platform ide: webIde = Object new (
 	     reload instead of resuming the last one.)
 	   - Otherwise we need a configured provider. If the Anthropic API key is still
 	     empty, return the setup Subject; if a key is stored, fall through to
-	     startChat which builds the doc + subject. *)
+	     startChat which builds the doc + subject.
+	   Storage failures and failing type probes are logged. *)
 		
 		| activeName entry setup <IDEChatSetupSubject> chat |
 		currentChatSubject_slot isNil ifFalse: [ ^currentChatSubject_slot ].
 		activeName:: [ js localStorage getItem: 'ns_ai_active_chat_doc' ] on: Exception
-			do: [:e | nil ].
+			do: [:e |
+				ide noteSwallowed: e in: 'reading the active chat document setting'.
+				nil
+			].
 		activeName isNil ifFalse: [
 				entry:: Root at: activeName asSymbol ifAbsent: [ nil ].
 				(entry isNil not and: [
-						[ entry isKindOfChatDocument ] on: Exception do: [:e | false ]
+						[ entry isKindOfChatDocument ] on: Exception
+							do: [:e |
+								ide noteSwallowed: e
+									in: 'checking whether ' , activeName , ' is a chat document'.
+								false
+							]
 					]) ifTrue: [ ^makeCurrentChat: entry ]
 			].
 		setup:: IDEChatSetupSubject onModel: AnthropicProvider.
@@ -2387,16 +2509,23 @@ Side-effecting expressions (collection mutations, slot assignments via setters, 
 			   is no associated presenter to update; the AI sees the result
 			   via its returned id and tools, which is enough for v1.
 			   All best-effort — never let an exposure failure mask the
-			   actual evaluation result. *)
+			   actual evaluation result; such failures are logged. *)
 				inId = 'workspace' ifTrue: [
-						[ aiWorkspaceSubject evaluator results add: thread ] on: Error do: [:e |].
+						[ aiWorkspaceSubject evaluator results add: thread ] on: Error
+							do: [:e |
+								ide noteSwallowed: e
+									in: 'evaluate: adding the result to the AI workspace'
+							].
 						ide browsing updateCurrentDisplay
 					]
 					ifFalse: [
 						inId = 'focus' ifTrue: [
 								focusEvaluatorSubject_slot isNil ifFalse: [
 										[ focusEvaluatorSubject_slot results add: thread ] on: Error
-											do: [:e |]
+											do: [:e |
+												ide noteSwallowed: e
+													in: 'evaluate: adding the result to the focused evaluator'
+											]
 									].
 								ide browsing updateCurrentDisplay
 							]
@@ -2404,11 +2533,20 @@ Side-effecting expressions (collection mutations, slot assignments via setters, 
 				thread isBroken ifTrue: [
 						| ex topFrame frameId frameNote |
 						ex:: [ thread result reflectee printString ] on: Error
-							do: [:e | '(broken; unprintable)' ].
+							do: [:e |
+								ide noteSwallowed: e
+									in: 'evaluate: printing the exception of a broken evaluation'.
+								'(broken; unprintable: ' , e printString , ')'
+							].
 						
 						(* Register the top stack frame so the AI can immediately
 				   inspect the failure. *)
-						topFrame:: [ thread suspendedActivation ] on: Error do: [:e | nil ].
+						topFrame:: [ thread suspendedActivation ] on: Error
+							do: [:e |
+								ide noteSwallowed: e
+									in: 'evaluate: getting the top frame of a broken evaluation'.
+								nil
+							].
 						frameId:: topFrame isNil ifTrue: [ nil ]
 							ifFalse: [ registerActivation: topFrame ].
 						frameNote:: frameId isNil ifTrue: [ '' ]
@@ -2711,8 +2849,15 @@ Side-effecting expressions (collection mutations, slot assignments via setters, 
 				id:: input at: 'activation_id'.
 				activation:: activationForId: id.
 				source:: [ activation method source ] on: Exception
-					do: [:e | '(source unavailable)' ].
-				range:: [ activation sourceRange ] on: Exception do: [:e | nil ].
+					do: [:e |
+						ide noteSwallowed: e in: 'get_current_expression reading method source'.
+						'(source unavailable: ' , e printString , ')'
+					].
+				range:: [ activation sourceRange ] on: Exception
+					do: [:e |
+						ide noteSwallowed: e in: 'get_current_expression reading the source range'.
+						nil
+					].
 				'Frame [' , id , '] ' , (formatMethodNameOf: activation) , String lf , (formatSourceWithRange: source
 					range: range)
 			]
@@ -2815,7 +2960,16 @@ Side-effecting expressions (collection mutations, slot assignments via setters, 
 						id:: registerActivation: frame.
 						result:: result , '  ' , depth printString , '. ' , (formatActivationLine: frame
 							id: id) , String lf.
-						frame:: [ frame sender ] on: Error do: [:e | nil ].
+						
+						(* A failure to read the sender ends the walk, as before -- but is
+						   logged and marked, so a truncated trace is not mistaken for a
+						   complete one. *)
+						frame:: [ frame sender ] on: Error
+							do: [:e |
+								ide noteSwallowed: e in: 'get_stack_trace reading a sender'.
+								result:: result , '  (trace truncated: reading the next sender failed: ' , e printString , ')' , String lf.
+								nil
+							].
 						depth:: depth + 1
 					].
 				result
@@ -2875,14 +3029,15 @@ Side-effecting expressions (collection mutations, slot assignments via setters, 
 	   message (the SSE event id), and applied - once, everywhere, at the same
 	   position in the shared history - by applyBusEvent: when the inbox
 	   delivers it. Before this, each client applied its own stream's frames
-	   when they arrived and a joiner never saw them (2026-09-14). *)
+	   when they arrived and a joiner never saw them (2026-09-14). Faults in
+	   reading or parsing a frame are logged (busJSON:in:, busField:...). *)
 		
 		| dataStr msg kind id to |
-		dataStr:: [ event at: 'data' ] on: Exception do: [:e | nil ].
+		dataStr:: busField: 'data' of: event default: nil in: 'bus event'.
 		dataStr isNil ifTrue: [ ^self ].
-		msg:: [ (js global at: 'JSON') parse: dataStr ] on: Exception do: [:e | nil ].
+		msg:: busJSON: dataStr in: 'parsing a bus frame'.
 		msg isNil ifTrue: [ ^self ].
-		kind:: [ msg at: 'kind' ] on: Exception do: [:e | 'message' ].
+		kind:: busField: 'kind' of: msg default: 'message' in: 'bus frame'.
 		kind = 'completion_response' ifTrue: [ ^deliverCompletionResponse: msg ].
 		kind = 'completion_progress' ifTrue: [ ^deliverCompletionProgress: msg ].
 		
@@ -2893,12 +3048,16 @@ Side-effecting expressions (collection mutations, slot assignments via setters, 
 	   safe to make locally and spares the history a recorded copy of every
 	   request body. *)
 		(kind = 'message' or: [ kind = 'notice' ]) ifFalse: [ ^self ].
-		to:: [ msg at: 'to' ] on: Exception do: [:e | nil ].
+		to:: busField: 'to' of: msg default: nil in: 'bus frame'.
 		(to isNil or: [ (chatDocNamed: to) isNil ]) ifTrue: [ ^self ].
-		id:: [ event at: 'lastEventId' ] on: Exception do: [:e | nil ].
-		(id isNil or: [ [ id isEmpty ] on: Exception do: [:e | true ] ]) ifTrue: [
-				id:: dataStr
-			].
+		id:: busField: 'lastEventId' of: event default: nil in: 'bus event'.
+		(id isNil or: [
+				[ id isEmpty ] on: Exception
+					do: [:e |
+						ide noteSwallowed: e in: 'checking a bus event id'.
+						true
+					]
+			]) ifTrue: [ id:: dataStr ].
 		hopscotch synchronizedInbox: 'bus' post: id payload: dataStr
 	)
 	implementorsTool ^<Tool> = (
@@ -3339,13 +3498,16 @@ Side-effecting expressions (collection mutations, slot assignments via setters, 
 	   and it is recorded as the default-on-reload chat doc in localStorage. This is
 	   the ONLY render-independent retarget (used by the presenter chat switcher);
 	   building the subject (chatSubjectFor:) no longer retargets, so other live
-	   chats are left alone. *)
+	   chats are left alone. A failure to record the default is logged. *)
 		
 		| subject |
 		subject:: doc chatSubject.
 		currentChatSubject_slot:: subject.
 		[ js localStorage setItem: 'ns_ai_active_chat_doc' to: doc name ] on: Exception
-			do: [:e |].
+			do: [:e |
+				ide noteSwallowed: e
+					in: 'saving the active chat document setting (NOT saved)'
+			].
 		^subject
 	)
 	maxPeerHops ^<Integer> = (
@@ -3395,17 +3557,20 @@ Side-effecting expressions (collection mutations, slot assignments via setters, 
 	)
 	namesIn: body <Alien> include: agentName <String> ^<Boolean> = (
 		(* Search the agents array of a /_ns/bus/agents body by index: a JS array
-	   arriving in Newspeak is an Alien, not a collection, so it has no do:. *)
+	   arriving in Newspeak is an Alien, not a collection, so it has no do:.
+	   Faults reading the body are logged; the fallbacks are unchanged. *)
 		
 		| names count index |
-		names:: [ body at: 'agents' ] on: Exception do: [:e | nil ].
+		names:: busField: 'agents' of: body default: nil in: 'bus agents list'.
 		names isNil ifTrue: [ ^false ].
-		count:: [ names at: 'length' ] on: Exception do: [:e | 0 ].
+		count:: busField: 'length' of: names default: 0 in: 'bus agents list'.
 		index:: 0.
 		[ index < count ] whileTrue: [
-				([ names at: index ] on: Exception do: [:e | nil ]) = agentName ifTrue: [
-						^true
-					].
+				([ names at: index ] on: Exception
+					do: [:e |
+						ide noteSwallowed: e in: 'reading an entry of the bus agents list'.
+						nil
+					]) = agentName ifTrue: [ ^true ].
 				index:: index + 1
 			].
 		^false
@@ -3845,13 +4010,19 @@ When the user asks about an entity in their system, use the IDE tools to look it
 	   the IDE learns its proposal is now live (its model context otherwise
 	   never hears about a user-click apply). The notice rides each
 	   recipient's NEXT-turn system prompt (Session>>addSystemNotice:) —
-	   model context only, not a visible chat bubble. *)
+	   model context only, not a visible chat bubble. Failures are logged:
+	   a chat that misses the notice works from stale knowledge. *)
 		
 		| names desc |
 		names:: List new.
 		builders do: [:b |
 				| n |
-				n:: [ b name ] on: Exception do: [:e | nil ].
+				n:: [ b name ] on: Exception
+					do: [:e |
+						ide noteSwallowed: e
+							in: 'reading a builder name for the codebase-changed notice'.
+						nil
+					].
 				(n isNil not and: [ (names includes: n) not ]) ifTrue: [ names add: n ]
 			].
 		desc:: names isEmpty ifTrue: [ 'unspecified classes' ]
@@ -3871,14 +4042,18 @@ When the user asks about an entity in their system, use the IDE tools to look it
 					subj isNil ifFalse: [
 							subj session addSystemNotice: 'The codebase just changed (' , desc , '). If you did not make this change yourself, anything you read earlier may be stale — re-read any class or member you rely on before acting. If you have a proposed changeset pending in these classes, the user may have just applied it, or it may now conflict.'
 						]
-				] on: Exception do: [:e | nil ]
+				] on: Exception
+					do: [:e |
+						ide noteSwallowed: e in: 'sending the codebase-changed notice to a chat'
+					]
 			]
 	)
 	openBusEventSourceAt: origin <String> token: tok <String> = (
 		(* Open the SSE stream. The browser reconnects it on its own (and replays
 	   what was missed via Last-Event-ID), so there is no retry logic here. The
 	   onmessage callback is an expat closure: it must never raise and must
-	   return a marshalable value, hence the guard and the trailing nil. *)
+	   return a marshalable value, hence the guard and the trailing nil. A
+	   failure to handle a frame is logged. *)
 		
 		| EventSourceClass es |
 		EventSourceClass:: js global at: 'EventSource'.
@@ -3886,7 +4061,8 @@ When the user asks about an entity in their system, use the IDE tools to look it
 		es:: EventSourceClass new: origin , '/_ns/bus?token=' , tok.
 		es at: 'onmessage'
 			put: [:event |
-				[ handleBusEvent: event ] on: Exception do: [:e | nil ].
+				[ handleBusEvent: event ] on: Exception
+					do: [:e | ide noteSwallowed: e in: 'handling a bus frame' ].
 				nil
 			]
 	)
@@ -4028,21 +4204,38 @@ When the user asks about an entity in their system, use the IDE tools to look it
 		(* Called after any step/return: report the new thread state, register
 	   the result if fulfilled, register the new top frame if still suspended,
 	   prune dead activation ids, and clear focus if it pointed at a frame
-	   that's gone. Returns a human-readable status fragment. *)
+	   that's gone. Returns a human-readable status fragment. Failures probing
+	   the thread are logged; the fallbacks are unchanged. *)
 		
 		| status |
 		status:: 'thread state: ' , (threadStateName: thread).
-		([ thread isFulfilled ] on: Exception do: [:e | false ]) ifTrue: [
+		([ thread isFulfilled ] on: Exception
+			do: [:e |
+				ide noteSwallowed: e in: 'post-step report: isFulfilled'.
+				false
+			]) ifTrue: [
 				| result resultId |
-				result:: [ thread result ] on: Exception do: [:e | nil ].
+				result:: [ thread result ] on: Exception
+					do: [:e |
+						ide noteSwallowed: e in: 'post-step report: result'.
+						nil
+					].
 				result isNil ifFalse: [
 						resultId:: registerResult: result withName: nil.
 						status:: status , '; result registered as ' , resultId
 					]
 			].
-		([ thread isSuspended ] on: Exception do: [:e | false ]) ifTrue: [
+		([ thread isSuspended ] on: Exception
+			do: [:e |
+				ide noteSwallowed: e in: 'post-step report: isSuspended'.
+				false
+			]) ifTrue: [
 				| topFrame topId |
-				topFrame:: [ thread suspendedActivation ] on: Exception do: [:e | nil ].
+				topFrame:: [ thread suspendedActivation ] on: Exception
+					do: [:e |
+						ide noteSwallowed: e in: 'post-step report: suspendedActivation'.
+						nil
+					].
 				topFrame isNil ifFalse: [
 						topId:: registerActivation: topFrame.
 						status:: status , '; top frame now [' , topId , '] ' , (formatMethodNameOf: topFrame)
@@ -4053,7 +4246,11 @@ When the user asks about an entity in their system, use the IDE tools to look it
 				focusEvaluatorMirror_slot isNil not and: [
 						focusEvaluatorMirror_slot isKindOfActivationMirror and: [
 								[ focusEvaluatorMirror_slot isUncontinuable ] on: Exception
-									do: [:e | true ]
+									do: [:e |
+										ide noteSwallowed: e
+											in: 'post-step report: isUncontinuable of the focused frame'.
+										true
+									]
 							]
 					]
 			]) ifTrue: [ clearFocus ].
@@ -4065,7 +4262,8 @@ When the user asks about an entity in their system, use the IDE tools to look it
 	   routes it to whatever is subscribed under that name; the agent's reply,
 	   if any, returns through the ordinary receive path as a [from external
 	   agent 'X'] turn. Fail-closed: no cached origin/token means the
-	   subscription has not settled, so there is nothing to post through. *)
+	   subscription has not settled, so there is nothing to post through. A
+	   failure to issue the request is logged. *)
 		
 		| options headers |
 		(busOrigin isNil or: [ busToken isNil ]) ifTrue: [ ^self ].
@@ -4077,7 +4275,10 @@ When the user asks about an entity in their system, use the IDE tools to look it
 		options at: 'headers' put: headers.
 		options at: 'body' put: ((js global at: 'JSON') stringify: fields).
 		[ js global fetch: busOrigin , '/_ns/bus' with: options ] on: Exception
-			do: [:e | nil ]
+			do: [:e |
+				ide noteSwallowed: e in: 'posting to the agent bus'.
+				nil
+			]
 	)
 	postToBusCoordinated: fields <Alien> canPerformHere: able <Boolean> = (
 		(* The coordinated half of #postToBusOnce:. Only a client that can reach the
@@ -4085,11 +4286,15 @@ When the user asks about an entity in their system, use the IDE tools to look it
 	   abstaining, because the coordination key carries a per-digest ordinal and
 	   a client that skipped minting it would disagree with everyone else about
 	   every later key for this request. They discard the recorded outcome - the
-	   post is fire-and-forget and there is nothing to hand back. *)
+	   post is fire-and-forget and there is nothing to hand back. A failure to
+	   obtain the performer is logged and treated as no performer. *)
 		
 		| perf |
 		perf:: [ host isNil ifTrue: [ nil ] ifFalse: [ host performer ] ] on: Exception
-			do: [:e | nil ].
+			do: [:e |
+				ide noteSwallowed: e in: 'getting the host performer for a bus post'.
+				nil
+			].
 		perf isNil ifTrue: [
 				able ifTrue: [ postToBus: fields ].
 				^self
@@ -4132,7 +4337,7 @@ When the user asks about an entity in their system, use the IDE tools to look it
 	   have the elected client wait on an election nested in its own. *)
 		
 		| target |
-		target:: [ fields at: 'to' ] on: Exception do: [:e | nil ].
+		target:: busField: 'to' of: fields default: nil in: 'outbound bus message'.
 		target isNil ifTrue: [ ^postToBus: fields ].
 		agentReachableHere: target
 			then: [:able |
@@ -4289,14 +4494,21 @@ Top-level class DELETION is not supported by this tool (different mechanism, not
 	   invoke onError at once rather than leaving the turn hung (Session's
 	   watchdog would eventually fire, but a clear reason is better) - but first
 	   kick off bus discovery, so a retry can succeed on entry points that never
-	   started it. *)
+	   started it. Faults in those two steps are logged. *)
 		
 		| corrId fields |
 		(busOrigin isNil or: [ busToken isNil ]) ifTrue: [
-				[ startAgentBusListening ] on: Exception do: [:e | nil ].
+				[ startAgentBusListening ] on: Exception
+					do: [:e |
+						ide noteSwallowed: e
+							in: 'starting agent bus discovery for a completion request'
+					].
 				[
 					onError value: 'No agent bus is connected yet (discovery has now been started - try again in a moment; if it persists, check the front door was started with --bus).'
-				] on: Exception do: [:e | nil ].
+				] on: Exception
+					do: [:e |
+						ide noteSwallowed: e in: 'reporting a disconnected bus to the provider'
+					].
 				^self
 			].
 		completionSeq:: completionSeq + 1.
@@ -4426,10 +4638,14 @@ Top-level class DELETION is not supported by this tool (different mechanism, not
 	runTestsForCases: testCases <Object> tester: tester <Object> = (
 		(* Run each test case in turn through tester run:, which mutates the
 	   tester''s errors / failures / successes lists. Iterate over a copy
-	   because run: removes-then-adds. *)
+	   because run: removes-then-adds. The tester records a test's own
+	   failures and errors itself, so an exception escaping run: means the
+	   runner broke; it is contained, so the remaining cases still run, but
+	   logged -- otherwise that test silently vanishes from the results. *)
 		
 		(testCases copyFrom: 1 to: testCases size) do: [:tc |
-				[ tester run: tc ] on: Error do: [:e |]
+				[ tester run: tc ] on: Error
+					do: [:e | ide noteSwallowed: e in: 'running test case ' , tc printString ]
 			]
 	)
 	runTestsTool ^<Tool> = (
@@ -4552,13 +4768,24 @@ The Tester instance is captured for subsequent calls to get_test_results, run_fa
 	   raise; the tool loop turns them into is_error results. Fire-and-forget:
 	   the bus is best-effort with no delivery receipt, so the status is
 	   optimistic. Bus discovery is kicked off first (idempotent), so on entry
-	   points that never started it a retry can succeed. *)
+	   points that never started it a retry can succeed. Faults in the discovery
+	   kick-off and the availability probe are logged; the latter counts as
+	   unavailable, which the tool then reports. *)
 		
 		| senderDoc senderName fields |
 		agentName isEmpty ifTrue: [ Error signal: 'agent_name must not be empty.' ].
 		message isEmpty ifTrue: [ Error signal: 'message must not be empty.' ].
-		[ startAgentBusListening ] on: Exception do: [:e | nil ].
-		(host isNil or: [ ([ host busAvailable ] on: Exception do: [:e | false ]) not ]) ifTrue: [
+		[ startAgentBusListening ] on: Exception
+			do: [:e |
+				ide noteSwallowed: e in: 'starting agent bus discovery for send_to_agent'
+			].
+		(host isNil or: [
+				([ host busAvailable ] on: Exception
+					do: [:e |
+						ide noteSwallowed: e in: 'checking agent bus availability'.
+						false
+					]) not
+			]) ifTrue: [
 				Error signal: 'No agent bus is available here — the front door was not started with --bus (or discovery has not settled; try again in a moment).'
 			].
 		busToken isNil ifTrue: [
@@ -4640,17 +4867,31 @@ The Tester instance is captured for subsequent calls to get_test_results, run_fa
 	   There is a real cost per search on the provider's side, which is why
 	   the cap exists and why turning it off is one localStorage entry. Any
 	   read failure or unparseable value falls back to the default rather
-	   than breaking session construction. *)
+	   than breaking session construction -- and is logged, so a mistyped
+	   setting does not silently stay at the default. *)
 		
 		| raw <String | UndefinedObject> n |
 		raw:: [ js localStorage getItem: 'ns_ai_server_web_tools' ] on: Exception
-			do: [:e | nil ].
+			do: [:e |
+				ide noteSwallowed: e in: 'reading ns_ai_server_web_tools'.
+				nil
+			].
 		(raw isNil or: [ raw isEmpty ]) ifTrue: [ ^5 ].
 		raw = 'off' ifTrue: [ ^0 ].
-		n:: [ raw asInteger ] on: Exception do: [:e | nil ].
-		(n isNil or: [ ([ n asString = raw ] on: Exception do: [:e | false ]) not ]) ifTrue: [
-				^5
+		n:: [ raw asInteger ] on: Exception
+			do: [:e |
+				ide noteSwallowed: e
+					in: 'parsing ns_ai_server_web_tools value ' , raw printString , ' (using 5)'.
+				nil
 			].
+		(n isNil or: [
+				([ n asString = raw ] on: Exception
+					do: [:e |
+						ide noteSwallowed: e
+							in: 'checking ns_ai_server_web_tools value ' , raw printString.
+						false
+					]) not
+			]) ifTrue: [ ^5 ].
 		^n
 	)
 	setAmpletExpressionTool ^<Tool> = (
@@ -4885,7 +5126,8 @@ The Tester instance is captured for subsequent calls to get_test_results, run_fa
 	   installer covers (e.g. an add_top_level_class whose name already
 	   exists raises in the installer; here we simply mark the class as
 	   #changed). The presenter's role is to show the user what will
-	   change; the actual install path still validates. *)
+	   change; the actual install path still validates. A failure to read a
+	   class's current source is logged; the diff is shown without it. *)
 		
 		| snapsByTop newClasses sourcesByTop classDiffs |
 		snapsByTop:: Map new.
@@ -4917,7 +5159,11 @@ The Tester instance is captured for subsequent calls to get_test_results, run_fa
 								(repositories diffIsEmpty: diff) ifFalse: [
 										| headSrc |
 										headSrc:: [ (classDeclarationNamed: topName asString) source ] on: Exception
-											do: [:e | nil ].
+											do: [:e |
+												ide noteSwallowed: e
+													in: 'reading the current source of ' , topName asString , ' for a changeset diff'.
+												nil
+											].
 										classDiffs at: topName
 											put: (Map new at: #status put: #changed;
 												at: #diff put: diff;
@@ -4940,7 +5186,7 @@ The Tester instance is captured for subsequent calls to get_test_results, run_fa
 	   once after IDE launch. Fire-and-forget and fail-closed: no host, no bus
 	   enabled, or any error, and we simply never subscribe. The bus is off
 	   unless the front door was started with --bus, so this is inert by
-	   default. *)
+	   default. Errors (as opposed to the bus simply being off) are logged. *)
 		
 		ensureBusInboxSubscribed.
 		busStarted ifTrue: [ ^self ].
@@ -4948,10 +5194,15 @@ The Tester instance is captured for subsequent calls to get_test_results, run_fa
 		[
 			host whenReady: [:h |
 					[ h busAvailable ifTrue: [ subscribeToBusAt: h serviceOrigin ] ] on: Exception
-						do: [:e | nil ].
+						do: [:e |
+							ide noteSwallowed: e in: 'checking for and subscribing to the agent bus'
+						].
 					nil
 				]
-		] on: Exception do: [:e | nil ]
+		] on: Exception
+			do: [:e |
+				ide noteSwallowed: e in: 'waiting for the host to start the agent bus'
+			]
 	)
 	stepTool ^<Tool> = (
 		^Tool name: 'step'
@@ -4974,16 +5225,23 @@ The Tester instance is captured for subsequent calls to get_test_results, run_fa
 			]
 	)
 	subscribeToBusAt: origin <String> = (
+		(* Failures to open the stream or to obtain a bus token are logged; the
+	   latter also re-arms busStarted so a later attempt can retry. *)
+		
 		busStarted ifTrue: [ ^self ].
 		busStarted:: true.
 		busOrigin:: origin.
 		(busTokenFrom: origin) then: [:tok |
 				busToken:: tok.
-				[ openBusEventSourceAt: origin token: tok ] on: Exception do: [:e | nil ].
+				[ openBusEventSourceAt: origin token: tok ] on: Exception
+					do: [:e | ide noteSwallowed: e in: 'opening the bus event stream' ].
 				nil
 			]
-			onError: [:e |
+			onError: [:err |
 				busStarted:: false.
+				[
+					('[IDE] obtaining a bus token from ' , origin , ' failed: ' , err printString) out
+				] on: Exception do: [:ignored |].
 				nil
 			]
 	)
@@ -5101,10 +5359,17 @@ The Tester instance is captured for subsequent calls to get_test_results, run_fa
 		^ChatStatusPresenter onSubject: (chatSubjectFor: doc)
 	)
 	threadStateName: thread ^<String> = (
-		[ thread isFulfilled ifTrue: [ ^'fulfilled' ] ] on: Exception do: [:e |].
-		[ thread isBroken ifTrue: [ ^'broken' ] ] on: Exception do: [:e |].
-		[ thread isSuspended ifTrue: [ ^'suspended' ] ] on: Exception do: [:e |].
-		[ thread isTerminated ifTrue: [ ^'terminated' ] ] on: Exception do: [:e |].
+		(* Failing probes are logged; a thread none of them recognises is
+	   'unknown', as before. *)
+		
+		[ thread isFulfilled ifTrue: [ ^'fulfilled' ] ] on: Exception
+			do: [:e | ide noteSwallowed: e in: 'thread state: isFulfilled' ].
+		[ thread isBroken ifTrue: [ ^'broken' ] ] on: Exception
+			do: [:e | ide noteSwallowed: e in: 'thread state: isBroken' ].
+		[ thread isSuspended ifTrue: [ ^'suspended' ] ] on: Exception
+			do: [:e | ide noteSwallowed: e in: 'thread state: isSuspended' ].
+		[ thread isTerminated ifTrue: [ ^'terminated' ] ] on: Exception
+			do: [:e | ide noteSwallowed: e in: 'thread state: isTerminated' ].
 		^'unknown'
 	)
 	toolResultMediaB64: b64 <String> mime: mime <String> name: name <String> ^<Alien> = (

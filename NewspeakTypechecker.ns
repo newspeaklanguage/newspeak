@@ -158,6 +158,13 @@ Use and distribution of this software is subject to the terms of the attached so
 	arrayMixin:: (kernelMixin nestedClasses findMirrorNamed: #_Array) instanceSide.
 	seedBuiltinSuperclasses.
 ) (
+	lazy public lastNotedChanges <Map[Declaration, Set[TypeError]]> ::= (* The dependents re-checked by the most recent install (noteTypeChangesFor:from:in:),
+each with its fresh error set. Reset by typeSnapshotsFor:in: at the start of every
+install. Later re-checks do not touch it, so it remains the authoritative answer to
+'what did that edit do to its dependents' -- which a second recheckFrom: cannot give,
+since the hook has already brought the cached signatures up to date and the
+re-check prunes the dependents. Lazy, like subclassIndex, so hot-loading cannot
+leave a live typechecker with it unset. *) Map new.
 	lazy subclassIndex <Map[MixinMirror, Set[MixinMirror]]> ::= (* The inverse of superclassTable: for each mixin, its DIRECT subclasses. Incremental
 propagation walks this downward, because a member lookup is recorded against the
 class that was asked rather than the class that answers.
@@ -792,7 +799,7 @@ ObjectType over the same mixin. *)
 				ifFalse: 
 				(* parse the method header *)
 				[
-					m isKindOfSlotDeclarationMirror ifTrue: [
+					(m isKindOfSlotDeclarationMirror or: [ m isKindOfLazySlotMirror ]) ifTrue: [
 							signatureForSlot: m withSelector: selector
 						]
 						ifFalse: [
@@ -829,11 +836,24 @@ ObjectType over the same mixin. *)
 				accessModifier: m accessModifier;
 				yourself
 		)
-		signatureForSlot: m <SlotDeclarationMirror> withSelector: selector <Symbol> ^<MessagePatternAST> = (
-			| ast <SlotDefAST> = parser parseSlotDeclaration: m source. slotType <AST> params |
-			slotType:: ast slotDecl type.
+		signatureForSlot: m <SlotDeclarationMirror | LazySlotMirror> withSelector: selector <Symbol> ^<MessagePatternAST> = (
+			(* Eager and lazy slots give the same getter/setter signatures; only the
+		   parser entry differs, since a lazy slot's source starts with 'lazy'.
+		   An unannotated slot must not keep a nil type: a nil return type defaults
+		   to Self, as for methods, which is wrong for a slot. It is given the type
+		   name DoesNotMatter, which TypeBuilder>>typeIdNode: currently resolves to
+		   errorType -- the checker's silent 'unknown' type, compatible both ways --
+		   so neither readers nor writers of the slot are blamed for the missing
+		   annotation, which is the declaration's error. (If DoesNotMatter is ever
+		   made to resolve to BottomType instead, this must change: a BottomType
+		   setter parameter would reject every argument.) *)
 			
-			(* If no type annotation, leave slotType as nil - it will be handled by type inference *)
+			| ast <SlotDefAST> = m isKindOfLazySlotMirror ifTrue: [
+					parser parseLazySlotDeclaration: m source
+				]
+				ifFalse: [ parser parseSlotDeclaration: m source ]. slotType <AST> params |
+			slotType:: ast slotDecl type.
+			slotType isNil ifTrue: [ slotType:: TypeIdAST new name: #DoesNotMatter ].
 			params:: selector last = ':' last ifTrue: [
 					{VarDeclAST name: m name type: slotType. }
 				]
@@ -1331,6 +1351,15 @@ bound. *)
 			^TypeIdAST new name: ot name;
 				yourself
 		)
+		public typeIdNode: node <TypeIdAST> ^<TypeIdAST> = (
+			(* A type AST is already an AST; pass it through, as unaryTypeOpNode: does.
+		   Reached when ObjectType>>selfSubstitution binds Self to the selfIdAST of a
+		   TOP-LEVEL class, which is a bare TypeIdAST (a nested class's is a
+		   UnaryTypeOpAST path). Without this, any ordinary send to a method with no
+		   declared return type on a top-level class raised doesNotUnderstand. *)
+			
+			^node
+		)
 		public typeParameterType: tp <TypeParameterType> ^<TypeIdAST> = (
 			^TypeIdAST new name: tp name;
 				yourself
@@ -1436,7 +1465,7 @@ bound. *)
 			^TupleType elementTypes: tupleActuals arrayType: arrayType
 		)
 		public typeIdNode: node <TypeIdAST> ^<ObjectType> = (
-			| m <MixinMirror | MethodMirror | ClassDeclarationMirror | SlotDeclarationMirror | TypeVariable | Nil> s <MessagePatternAST | SlotDefAST | ClassHeaderAST | Nil> |
+			| m <MixinMirror | MethodMirror | ClassDeclarationMirror | SlotDeclarationMirror | LazySlotMirror | TypeVariable | Nil> s <MessagePatternAST | SlotDefAST | ClassHeaderAST | Nil> |
 			m:: type: node name at: surroundingClass.
 			m isKindOfTypeVariable ifTrue: [ ^m ].
 			m isKindOfTypeParameterType ifTrue: [ ^m ].
@@ -1444,7 +1473,7 @@ bound. *)
 			m isKindOfClassDeclarationMirror ifTrue: [
 					^ObjectType forMixin: m instanceSide
 				].
-			m isKindOfSlotDeclarationMirror ifTrue: [
+			(m isKindOfSlotDeclarationMirror or: [ m isKindOfLazySlotMirror ]) ifTrue: [
 					| slotType |
 					s:: signatureFor: m.
 					slotType:: s type.
@@ -1752,14 +1781,16 @@ walk to distinguish a genuine not-found from a transient cycle break first. *)
 		^lastStatementType
 	)
 	computeSuperclassOf: klass <MixinMirror> ^<MixinMirror | Nil> = (
-		| header = klass declaration header. headerAst = parser parseClassHeader: header source. superclassClause <SendAST> = headerAst superclassCall. superclassClauseType <ObjectType> enclosing <MixinMirror | Nil> = klass enclosingMixin. resolved <Boolean> ::= false. result |
+		(* The superclass of klass, for the inheritance walk. Never reports: this runs
+	lazily from whatever check first needs it, and its result is cached, so an
+	error here would land in an arbitrary member's error set at a position in
+	another class's header, and only once. A superclass clause without a class type
+	is reported by typecheckClassHeader:ofClass:, against the header. Here such a
+	clause falls back to the runtime superclass if klass has one, else Object. *)
 		
-		(* ('computing superclass of : ', klass name) out.
-	klass out. *)
+		| header = klass declaration header. headerAst = parser parseClassHeader: header source. superclassClause <SendAST> = headerAst superclassCall. superclassClauseType <ObjectType> enclosing <MixinMirror | Nil> = klass enclosingMixin. resolved <Boolean> ::= false. result |
 		^enclosing isNil ifTrue: [
 				recordSuperclassOf: klass is: objectMixin.
-				
-				(* 'Found Object for top level class' out. *)
 				objectMixin
 			]
 			ifFalse: [
@@ -1797,48 +1828,15 @@ walk to distinguish a genuine not-found from a transient cycle break first. *)
 						resolved ifFalse: [ superclassTable removeKey: klass ifAbsent: [] ]
 					].
 				setClass: klass.
-				
-				(* reset lexical level *)
-				superclassClauseType mixin = nil ifTrue: [
-						
-						(* 'Error, superclass mixin is nil, returning object mixin' out. *)
-						recordSuperclassOf: klass is: objectMixin.
-						^objectMixin
+				(isClassType: superclassClauseType) ifTrue: [
+						result:: superclassClauseType mixin declaration instanceSide
+					]
+					ifFalse: [
+						result:: runtimeSuperclassOf: klass.
+						result isNil ifTrue: [ result:: objectMixin ]
 					].
-				superclassClauseType mixin isMeta ifFalse: [
-						
-						(* Static analysis couldn't infer a meta type. This commonly happens
-		     when the superclass clause is an implicit-receiver send to a slot
-		     whose type isn't annotated (e.g. CollectionsForPrimordialSoup's
-		     `Collection = ik Collection.`), making the result default to
-		     SelfType / a Self-bound TypeVariable. In that case the user code
-		     is fine; we just lack the annotation. Fall back to the runtime
-		     superclass via the mirror rather than emitting a spurious error. *)
-						superclassClauseType isKindOfTypeVariable ifTrue: [
-								| runtimeSuper <MixinMirror | Nil> |
-								runtimeSuper:: [
-									| apps |
-									apps:: klass applications.
-									apps isEmpty ifTrue: [ nil ] ifFalse: [ apps first superclass mixin ]
-								] on: Error do: [:e | nil ].
-								runtimeSuper isNil ifFalse: [
-										recordSuperclassOf: klass is: runtimeSuper.
-										^runtimeSuper
-									]
-							].
-						error: 'Class type expected'
-							at: {superclassClause start. superclassClause end. }.
-						
-						(* 'Error, non meta, returning object mixin' out. *)
-						recordSuperclassOf: klass is: objectMixin.
-						^objectMixin
-					].
-				
-				(* the type should be of the form T class *)
-				result:: superclassClauseType mixin declaration instanceSide.
-				
-				(* 'found: ' out. result out. *)
-				recordSuperclassOf: klass is: result
+				recordSuperclassOf: klass is: result.
+				result
 			]
 	)
 	currentConflictNamespace = (
@@ -2368,6 +2366,13 @@ referencing the name, which merely re-checks it once more than needed. *)
 			].
 		^affected
 	)
+	isClassType: t <Type | Nil> ^<Boolean> = (
+		(* Does t denote a class (a metatype), as a superclass clause must? False for
+	ErrorType, type variables, instance types, and anything that cannot answer. *)
+		
+		^[ t isNil not and: [ t mixin isNil not and: [ t mixin isMeta ] ] ] on: Error
+			do: [:e | false ]
+	)
 	isFactoryTypeVarName: name <Symbol> inScopeOf: mixin <MixinMirror> ^<Boolean> = (
 		(* True if name is a <def E> factory type variable of some enclosing class (so a
 	   reference to it from the class side, where it is out of scope, is a scoping error). *)
@@ -2429,7 +2434,11 @@ type's classDeclaration. First check scope of mixin , otherwise climb the enclos
 	literal: typeName <Symbol> ^<ObjectType> = (
 		^(TypeIdAST new name: typeName) apply: typeBuilder
 	)
-	localMember: selector <Symbol> in: mixin <MixinMirror> ^<MethodMirror | ClassDeclarationMirror | SlotDeclarationMirror | Nil> = (
+	localMember: selector <Symbol> in: mixin <MixinMirror> ^<MethodMirror | ClassDeclarationMirror | SlotDeclarationMirror | LazySlotMirror | Nil> = (
+		(* Lazy slots are members too: a getter for every lazy slot, a setter for a
+	mutable one (lazy x ::= ...). They are looked up after the eager slots; the
+	language forbids a name being both, so the order does not matter. *)
+		
 		| result <Mirror> selectorString <String> slotName <Symbol> |
 		mixin = nil ifTrue: [ ^nil ].
 		
@@ -2456,7 +2465,9 @@ type's classDeclaration. First check scope of mixin , otherwise climb the enclos
 						^
 						(* 'found: ' out. result out. *)
 						result
-					]
+					].
+				result:: mixin lazySlots findMirrorNamed: slotName.
+				(result ~= nil and: [ result isMutable ]) ifTrue: [ ^result ]
 			]
 			ifFalse: [
 				result:: mixin nestedClasses findMirrorNamed: selector.
@@ -2466,7 +2477,8 @@ type's classDeclaration. First check scope of mixin , otherwise climb the enclos
 						result
 					].
 				result:: mixin slots findMirrorNamed: selector.
-				^result
+				result ~= nil ifTrue: [ ^result ].
+				^mixin lazySlots findMirrorNamed: selector
 			].
 		^nil
 	)
@@ -2589,6 +2601,26 @@ Otherwise, check the main namespace. *)
 	)
 	nonPrivate: m <Mirror> ^<Boolean> = (
 		^m ~= nil and: [ m accessModifier ~= #private ]
+	)
+	public noteTypeChangesFor: builders <Array[ClassDeclarationBuilder]> from: snapshots <Map[Symbol, Map]> in: ns <Map[Symbol, Object]> ^<Map[Declaration, Set[TypeError]]> = (
+		(* Install hook, part 2. After the install, diff each class against its
+	pre-install snapshot (typeSnapshotsFor:in:) and invalidate and re-check whatever
+	depended on the changes (recheckChangesFrom:to:). Answers the combined fresh
+	error sets of the re-checked dependents, and keeps them in lastNotedChanges for
+	the IDE to report. Not guarded: see typeSnapshotsFor:in:. *)
+		
+		| results <Map[Declaration, Set[TypeError]]> = Map new. |
+		builders do: [:b <ClassDeclarationBuilder> |
+				| old <Map | Nil> = snapshots at: b name ifAbsent: [ nil ]. |
+				old isNil ifFalse: [
+						(recheckChangesFrom: old
+							to: (snapshotOfClass: (ns at: b name ifAbsent: [ nil ]))) keysAndValuesDo: [:d <Declaration> :errs |
+								results at: d put: errs
+							]
+					]
+			].
+		lastNotedChanges:: results.
+		^results
 	)
 	public numberNode: node = (
 		(* Infer Integer for integer literals, Float for floating-point literals *)
@@ -2765,6 +2797,54 @@ always correct here; a missed invalidation is silent staleness. *)
 	declaration that referenced the name (and their transitive dependents). *)
 		
 		^recheckSeeded: (invalidateNamespaceName: name)
+	)
+	public recheckChangesFrom: old <Map[Declaration, String]> to: new <Map[Declaration, String]> ^<Map[Declaration, Set[TypeError]]> = (
+		(* Diff two snapshots (snapshotOfClass:) of the same class taken around an
+	install. Every added, removed or edited declaration is invalidated -- headers
+	first, so the structure caches are flushed before member lookups are recomputed
+	-- and their transitive DEPENDENTS are re-typechecked. The changed declarations
+	themselves are not re-checked here: callers that display them (the editors) do
+	that, and checking every member of a freshly loaded module would be costly.
+	Returns each re-checked dependent's fresh error set. *)
+		
+		| headers <List[Declaration]> = List new. others <List[Declaration]> = List new. results <Map[Declaration, Set[TypeError]]> = Map new. worklist <List[Declaration]> = List new. queued <Set[Declaration]> = Set new. |
+		old keysAndValuesDo: [:d <Declaration> :src |
+				(new at: d ifAbsent: [ nil ]) = src ifFalse: [
+						d kind = #classHeader ifTrue: [ headers add: d ]
+							ifFalse: [ others add: d ]
+					]
+			].
+		new keysAndValuesDo: [:d <Declaration> :src |
+				(old includesKey: d) ifFalse: [
+						d kind = #classHeader ifTrue: [ headers add: d ]
+							ifFalse: [ others add: d ]
+					]
+			].
+		headers do: [:d <Declaration> | queued add: d ].
+		others do: [:d <Declaration> | queued add: d ].
+		{headers. others. } do: [:group <List[Declaration]> |
+				group do: [:d <Declaration> |
+						(invalidateDeclaration: d) do: [:dep <Declaration> |
+								(queued includes: dep) ifFalse: [
+										queued add: dep.
+										worklist addLast: dep
+									]
+							]
+					]
+			].
+		[ worklist isEmpty ] whileFalse: [
+				| cur <Declaration> = worklist removeFirst. dependents <Set[Declaration]> errs <Set | Nil> |
+				dependents:: invalidateDeclaration: cur.
+				errs:: recheckDeclaration: cur.
+				errs isNil ifFalse: [ results at: cur put: errs ].
+				dependents do: [:dep <Declaration> |
+						(queued includes: dep) ifFalse: [
+								queued add: dep.
+								worklist addLast: dep
+							]
+					]
+			].
+		^results
 	)
 	recheckDeclaration: d <Declaration> ^<Set[TypeError] | Nil> = (
 		(* Re-typecheck the member a Declaration names, returning its fresh error set,
@@ -2970,6 +3050,16 @@ built-ins, which are not editable. *)
 		returnType:: node returnType.
 		returnType = nil ifTrue: [ ^TypeIdAST new name: #Self ].
 		^returnType
+	)
+	runtimeSuperclassOf: klass <MixinMirror> ^<MixinMirror | Nil> = (
+		(* The superclass klass actually has at runtime, read from one of its mixin
+	applications; nil if it has none (its enclosing object never created it). *)
+		
+		^[
+			| apps |
+			apps:: klass applications.
+			apps isEmpty ifTrue: [ nil ] ifFalse: [ apps first superclass mixin ]
+		] on: Error do: [:e | nil ]
 	)
 	seedBuiltinSuperclasses = (
 		(* Pre-populate the superclass table for built-in kernel types (their
@@ -3180,22 +3270,20 @@ remains the right one when the question really is 'what would a plain send see'.
 				^currentScope at: node name put: errorType
 			].
 		
-		(* Determine the slot's type. With an explicit annotation, resolve and use it,
-	   checking any initializer against it. With no annotation, infer the type from
-	   the initializer (e.g. a method-body local `x = expr`). A lazy slot, or one
-	   with no initializer to infer from, still requires an explicit annotation --
-	   otherwise the initializer-vs-slot subtype check degenerates to errorType >:
-	   anything and silently accepts garbage. *)
+		(* Determine the slot's type. Every slot and every method local must be
+	   annotated; types are never inferred from initializers. An unannotated one is
+	   reported here, at its declaration, and given ErrorType so its uses do not
+	   produce further errors. Its initializer is still checked for errors of its
+	   own. With an annotation, the initializer must conform to it. Class slots
+	   and method locals (temporaries with initializers) both come through here;
+	   the message calls them Slot or Local accordingly. *)
 		node type isNil ifTrue: [
-				(node isLazy not and: [ node initializer isNil not ]) ifTrue: [
-						declaredType:: node initializer apply: self
-					]
-					ifFalse: [
-						error: 'Slot ' , node name , ' has no type annotation'
-							at: {node start. node end. }.
-						declaredType:: errorType.
-						node initializer isNil ifFalse: [ node initializer apply: self ]
-					]
+				error: ((currentDeclaration kind = #method or: [
+							currentDeclaration kind = #expression
+						]) ifTrue: [ 'Local ' ] ifFalse: [ 'Slot ' ]) , node name , ' has no type annotation'
+					at: {node start. node end. }.
+				declaredType:: errorType.
+				node initializer isNil ifFalse: [ node initializer apply: self ]
 			]
 			ifFalse: [
 				declaredType:: node type apply: typeBuilder.
@@ -3214,6 +3302,42 @@ remains the right one when the question really is 'what would a plain send see'.
 		(* Track if this is a mutable slot *)
 		node isMutable ifTrue: [ currentMutableSlots add: node name ].
 		^declaredType
+	)
+	snapshotDeclaration: decl <ClassDeclarationMirror> into: map <Map[Declaration, String]> = (
+		(* Helper for snapshotOfClass:. A nested class is recorded twice: as a
+	#nestedClass member of its enclosing class (so adding or removing it propagates
+	like any member-name change) and through its own header and members. *)
+		
+		| inst <MixinMirror> = decl instanceSide. |
+		map at: (declarationFor: inst kind: #classHeader name: inst name asSymbol)
+			put: decl header source.
+		{inst. decl classSide. } do: [:m <MixinMirror> |
+				m methods do: [:x |
+						map at: (declarationFor: m kind: #method name: x name asSymbol)
+							put: x source
+					].
+				m lazySlots do: [:x |
+						map at: (declarationFor: m kind: #lazySlot name: x name asSymbol)
+							put: x source
+					]
+			].
+		inst nestedClasses do: [:n <ClassDeclarationMirror> |
+				map at: (declarationFor: inst kind: #nestedClass name: n name asSymbol)
+					put: n header source.
+				snapshotDeclaration: n into: map
+			]
+	)
+	public snapshotOfClass: c <Class | Nil> ^<Map[Declaration, String]> = (
+		(* Map every typecheckable declaration in c (header, methods and lazy slots on
+	both sides, nested classes recursively) to its current source. Taken before and
+	after an install, two snapshots diff into the set of changed declarations; see
+	recheckChangesFrom:to:. An absent class (nil) has an empty snapshot. *)
+		
+		| map <Map[Declaration, String]> = Map new. |
+		c isNil ifFalse: [
+				snapshotDeclaration: (ClassMirror reflecting: c) mixin declaration into: map
+			].
+		^map
 	)
 	public stringNode: node = (
 		^literal: #String
@@ -3420,11 +3544,26 @@ remains the right one when the question really is 'what would a plain send see'.
 				setClass: enclosing.
 				superclassClauseType:: header superclassCall apply: self.
 				setClass: klassMirror.
-				superclassClauseType mixin isNil ifFalse: [
-						superclassClauseType mixin isMeta ifFalse: [
-								error: 'Class type expected'
-									at: {header superclassCall start. header superclassCall end. }
-							]
+				
+				(* The superclass clause's class expression (header superclassCall; the
+			   factory send is header superConstructorCall) must have a class type.
+			   Anything else -- an unannotated slot or method (ErrorType, or a
+			   Self-bound type variable), a send the checker cannot type, an instance
+			   type -- means the superclass cannot be determined statically. Always
+			   report it, here against the header, saying what the inheritance walk
+			   (computeSuperclassOf:) uses instead: the runtime superclass if there is
+			   one, else Object. *)
+				(isClassType: superclassClauseType) ifFalse: [
+						| runtimeSuper <MixinMirror | Nil> clauseText <String> fallback <String> |
+						runtimeSuper:: runtimeSuperclassOf: klassMirror.
+						clauseText:: [
+							'''' , (src copyFrom: header superclassCall start
+								to: header superclassCall end) , ''''
+						] on: Error do: [:e | 'its superclass clause' ].
+						fallback:: runtimeSuper isNil ifTrue: [ 'Treating it as Object.' ]
+							ifFalse: [ 'Using its runtime superclass ' , runtimeSuper name , '.' ].
+						error: 'Cannot determine the superclass of ' , header name , ' statically: ' , clauseText , ' does not have a class type. ' , fallback
+							at: {header superclassCall start. header superclassCall end. }
 					]
 			].
 		
@@ -3434,9 +3573,9 @@ remains the right one when the question really is 'what would a plain send see'.
 		header constructor parameters do: [:p | p apply: self ].
 		
 		(* Check the slot declarations in the instance initializer: missing
-	   annotations and any initializer-vs-declared-type mismatches.
-	   Slots become available in scope for subsequent declarations and
-	   initialization expressions. *)
+	   annotations (slotDefNode: reports every unannotated slot) and any
+	   initializer-vs-declared-type mismatches. Slots become available in scope
+	   for subsequent declarations and initialization expressions. *)
 		header slots do: [:s | s apply: self ].
 		
 		(* Check the free-standing initialization expressions in the
@@ -3648,6 +3787,22 @@ identity on this platform. *)
 				current:: current enclosingMixin
 			].
 		^nil
+	)
+	public typeSnapshotsFor: builders <Array[ClassDeclarationBuilder]> in: ns <Map[Symbol, Object]> ^<Map[Symbol, Map]> = (
+		(* Install hook, part 1. Before an installer replaces the top-level classes the
+	builders name, snapshot their current declarations (snapshotOfClass:), keyed by
+	class name; an absent class snapshots as empty. Pass the result to
+	noteTypeChangesFor:from:in: after the install. Also starts a fresh
+	lastNotedChanges for this install. Not guarded: callers that must not fail (the
+	IDE's install path) guard the call themselves. *)
+		
+		| snapshots <Map[Symbol, Map]> = Map new. |
+		lastNotedChanges:: Map new.
+		builders do: [:b <ClassDeclarationBuilder> |
+				snapshots at: b name
+					put: (snapshotOfClass: (ns at: b name ifAbsent: [ nil ]))
+			].
+		^snapshots
 	)
 	public unresolvedSendNode: node <UnresolvedSendAST> ^<ObjectType> = (
 		| functionType <FunctionType> domain <List[ObjectType]> argASTs <List[ExpressionAST]> args <List[ObjectType]> selector <Symbol> localType receiverType defResult whereResult factoryResult |

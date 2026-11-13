@@ -326,6 +326,19 @@ class HopscotchWebIDE packageUsing: manifest = Object new (
 			
 			^replaceIn: (replaceIn: s all: '%2F' with: '/') all: '%25' with: '%'
 		)
+		describeDeclaration: d = (
+			(* A typechecker Declaration as the user knows it: Outer Inner>>selector,
+		   with 'class' for class-side members and 'header of' for class headers. *)
+			
+			| s <String> |
+			s:: ''.
+			d path do: [:p |
+					s:: s isEmpty ifTrue: [ p asString ] ifFalse: [ s , ' ' , p asString ]
+				].
+			d side = #class ifTrue: [ s:: s , ' class' ].
+			d kind = #classHeader ifTrue: [ ^'header of ' , s ].
+			^s , '>>' , d name asString
+		)
 		public draftPathForClassDeclaration: cdm ^<String> = (
 			(* <TopLevel>/.../<This class>/header.ns -- the class header covers the
      factory params, slot block, superclass clause, and all regular
@@ -398,9 +411,31 @@ class HopscotchWebIDE packageUsing: manifest = Object new (
 			(* Snapshot the live per-class state BEFORE installing so the drafts
      hook can compare against drafts' latest commit and emit a Baseline
      or Resync commit when needed. Synchronous walk; cheap. *)
-			computeBaselinesFor: builders inNamespace: namespace. mixins = 
+			computeBaselinesFor: builders inNamespace: namespace. typeSnapshots = 
+			(* Typechecker hook, part 1: snapshot the declarations about to be
+     replaced, so the post-install diff can drive incremental re-checking.
+     Guarded: a typechecker failure must never prevent an install --
+     including the install of a fix to the typechecker itself. Logged, not
+     swallowed. *)
+			[ typechecker typeSnapshotsFor: builders in: namespace ] on: Error
+				do: [:e <Exception> |
+					noteSwallowed: e in: 'typechecker snapshot before install'.
+					nil
+				]. mixins = 
 			(* Install the code *)
 			atomicInstaller install: builders into: namespace. |
+			
+			(* Typechecker hook, part 2: invalidate and re-check dependents of
+     whatever changed. Must precede any caller's own re-check. Guarded and
+     logged. *)
+			typeSnapshots isNil ifFalse: [
+					[
+						typechecker noteTypeChangesFor: builders from: typeSnapshots in: namespace
+					] on: Error
+						do: [:e <Exception> |
+							noteSwallowed: e in: 'typechecker re-check after install'
+						]
+				].
 			
 			(* Backup the changes *)
 			builders do: [:b <ClassDeclarationBuilder> |
@@ -424,8 +459,10 @@ class HopscotchWebIDE packageUsing: manifest = Object new (
 			(* AI hook: every code install funnels through here — editor accepts
      and changeset applies alike — so this is the one place to tell the
      live AI chat sessions the codebase changed under them. Fire-and-
-     forget; a notification failure must never fail the install. *)
-			[ aiSupport noteCodebaseChangedFor: builders ] on: Exception do: [:e |].
+     forget; a notification failure must never fail the install, but is
+     logged. *)
+			[ aiSupport noteCodebaseChangedFor: builders ] on: Exception
+				do: [:e | noteSwallowed: e in: 'notifying AI chats of the install' ].
 			^mixins
 		)
 		lastBackupTime ^<Integer> = (
@@ -531,6 +568,16 @@ class HopscotchWebIDE packageUsing: manifest = Object new (
 	   that list changes. *)
 			
 			^{'AccessModifierTesting'. 'AccessModifierTestingConfiguration'. 'AI_IDE_Support'. 'AIAccess'. 'ActivationMirrorTesting'. 'ActivationMirrorTestingConfiguration'. 'ActorsForJS'. 'AliensForJS'. 'Browsing'. 'BuildInfo'. 'BytecodeSimulatorForJS'. 'Collections'. 'CombinatorialParsing'. 'Debugging'. 'DeploymentManager'. 'DocumentHolder'. 'Documents'. 'HopscotchWebIDE'. 'JSTesting'. 'JSTestingConfiguration'. 'JavascriptGeneration'. 'KernelForJS'. 'KernelTests'. 'KernelTestsConfiguration'. 'MemoryHoleTesting'. 'MemoryHoleTestingConfiguration'. 'MetadataParsing'. 'Minitest'. 'MinitestTests'. 'NewspeakBytecodeCompilation'. 'MinitestTestsConfiguration'. 'MinitestUI'. 'MirrorBuilderTesting'. 'MirrorBuilderTestingConfiguration'. 'MirrorGroups'. 'MirrorTesting'. 'MirrorTestingConfiguration'. 'MirrorTestingModel'. 'MirrorsForJS'. 'Namespacing'. 'NewspeakASTs'. 'NewspeakColorization'. 'NewspeakCompilation'. 'NewspeakGrammar'. 'NewspeakParsing'. 'NewspeakPrettyPrinter'. 'NewspeakPrettyPrinterTesting'. 'NewspeakPrettyPrinterTestingConfiguration'. 'Newspeak2V5BytecodeCompilation'. 'NewspeakTypechecker'. 'NewspeakTypecheckerTesting'. 'NewspeakTypecheckerTestingConfiguration'. 'HopscotchForCroquet'. 'JSForCroquet'. 'Repositories'. 'RuntimeForCroquetJS'. 'RuntimeForHopscotchForHTML'. 'RuntimeForJS'. 'RuntimeForJSWithMirrorBuilders'. 'Streams'. 'V5BytecodeSimulation'. 'VCSCore'. 'VCSDiffing'. 'VCSIsomorphicGitBackendProvider'. 'VCSLib'. 'VCSSourceMirrors'. 'WebFiles'. 'WorkspaceHolder'. 'WorkspaceManager'. }
+		)
+		public noteSwallowed: e <Exception> in: context <String> = (
+			(* For code that must not let a failure propagate (a typechecker glitch must
+		   never break Accept or an install) but must not hide it either: write it to
+		   the console. Silent handlers hid two IDE wiring bugs, each a
+		   doesNotUnderstand. Logging itself must never fail, hence the one guard
+		   here that does swallow. *)
+			
+			[ ('[IDE] ' , context , ' failed: ' , e printString) out ] on: Error
+				do: [:ignored |]
 		)
 		partitionDiffPaths: jsArray marker: key into: pathsByClass <Map[String, Map[String, List[String]]]> = (
 			(* jsArray is a JS array of paths like 'Foo/method.bar.ns' or
@@ -789,27 +836,54 @@ class HopscotchWebIDE packageUsing: manifest = Object new (
 			result add: (s copyFrom: start to: s size).
 			^result asString
 		)
+		public reportRecheckAfterNamespaceName: name <Symbol> = (
+			(* A top-level class named `name` was added, removed or renamed: drive the
+   transitive re-check of every declaration that resolved that name, so the caches
+   AND the dependency edges are rebuilt rather than merely dropped. Robust -- a
+   re-check glitch must never break class installation or deletion -- but logged,
+   not swallowed.
+   Lives here, on the IDE instance (`ide`), next to `typechecker`. It used to be
+   defined on the top-level HopscotchWebIDE module class instead, so every
+   `ide reportRecheckAfterNamespaceName:` raised doesNotUnderstand -- swallowed by
+   the callers' guards -- and namespace changes never reached the typechecker. *)
+			
+			^[ typechecker recheckAfterNamespaceName: name ] on: Error
+				do: [:e <Exception> |
+					noteSwallowed: e in: 'type re-check after namespace change of ' , name.
+					nil
+				]
+		)
 		public reportRecheckFrom: declaration onSubject: subject = (
-			(* After an edit, drive an incremental re-check from `declaration` and report
-		   results on the edited member's subject: its own type errors, plus a count of
-		   any errors that surfaced in dependent members. Robust -- a re-check glitch
-		   never breaks Accept. *)
+			(* After an edit, report on the edited member's subject: its own type errors,
+		   then every type error in a dependent member, naming the member.
+		   Dependents come from typechecker lastNotedChanges -- what the install hook
+		   found when the edit was installed -- merged with anything this re-check
+		   reaches. They must not come from this re-check alone: the hook has already
+		   brought the cached signatures up to date, so recheckFrom: prunes the
+		   dependents and would report none even when they are broken. Robust -- a
+		   re-check glitch never breaks Accept -- but logged, not swallowed. *)
 			
 			[
-				| results <Map> own <Set> dependentErrors <Integer> |
+				| results <Map> dependents <Map> own <Set> |
 				results:: typechecker recheckFrom: declaration.
 				own:: results at: declaration ifAbsent: [ Set new ].
 				own do: [:e |
 						subject typeErrorMessages add: 'Type error: ' , e message , ' [' , e start printString , '-' , e end printString , ']'
 					].
-				dependentErrors:: 0.
-				results keysAndValuesDo: [:d :errs |
-						d = declaration ifFalse: [ dependentErrors:: dependentErrors + errs size ]
+				dependents:: Map new.
+				typechecker lastNotedChanges keysAndValuesDo: [:d :errs |
+						dependents at: d put: errs
 					].
-				dependentErrors > 0 ifTrue: [
-						subject typeErrorMessages add: dependentErrors printString , ' new type error(s) in dependent member(s) -- re-typecheck them to see details'
+				results keysAndValuesDo: [:d :errs | dependents at: d put: errs ].
+				dependents keysAndValuesDo: [:d :errs |
+						d = declaration ifFalse: [
+								errs do: [:e |
+										subject typeErrorMessages add: 'Type error in ' , (describeDeclaration: d) , ': ' , e message , ' [' , e start printString , '-' , e end printString , ']'
+									]
+							]
 					]
-			] on: Error do: [:e <Exception> |]
+			] on: Error
+				do: [:e <Exception> | noteSwallowed: e in: 'type re-check report' ]
 		)
 		public resetTypechecker = (
 			(* Full from-scratch reset of the persistent typechecker's incremental state
@@ -946,13 +1020,17 @@ class HopscotchWebIDE packageUsing: manifest = Object new (
 		) : ()
 	) : ()
 	armDebuggerFor: ide platform: platform = (
-		(* Stage 3: an unhandled signal in event-driven code reconstructs the failed stack (when the deploy was compiled with shadow frames) and opens the debugger on it. Failure-tolerant: platforms without the hook API, or without mirrors, simply stay unarmed. *)
+		(* Stage 3: an unhandled signal in event-driven code reconstructs the failed stack (when the deploy was compiled with shadow frames) and opens the debugger on it. Failure-tolerant: platforms without the hook API, or without mirrors, simply stay unarmed -- logged, so a broken hook on a platform that has one is visible. *)
 		
 		[
 			platform mirrors installDebugHook: [:threadMirror |
 					ide browsing Utilities enterSubject: (ide debugging ThreadSubject onModel: threadMirror)
 				]
-		] on: Error do: [:e | nil ]
+		] on: Error
+			do: [:e |
+				ide noteSwallowed: e in: 'arming the debugger hook (debugger stays unarmed)'.
+				nil
+			]
 	)
 	public augmentNamespace: namespace withPlatform: p = (
 		| platformMirror <ObjectMirror> = p mirrors ObjectMirror reflecting: p. platformClass <ClassMirror> = platformMirror getClass. runtimeMirror <ObjectMirror> = platformClass enclosingObject. runtimeClass <ClassMirror> = topLevelClassOf: platformMirror. |
@@ -1087,17 +1165,24 @@ class HopscotchWebIDE packageUsing: manifest = Object new (
 		(* OpenAI-compatible providers use a three-arg factory (apiKey, model,
        baseUrl). Many local servers (Ollama, mlx-omni-server, etc.) do not
        require an API key, so an empty key is fine; we attempt the refresh
-       whenever a base URL is configured.
+       whenever a base URL is configured. Missing entries read as nil without
+       error; a storage failure is logged and treated as missing.
 
        Carries the same caveat as refreshProviderModelsFor:ide:platform: about
        running outside any synchronized event handler. *)
 		
 		| key url |
 		key:: [ platform js localStorage getItem: 'ns_ai_apikey_' , cls name ] on: Exception
-			do: [:e | nil ].
+			do: [:e |
+				ide noteSwallowed: e in: 'reading the API key for ' , cls name.
+				nil
+			].
 		key isNil ifTrue: [ key:: '' ].
 		url:: [ platform js localStorage getItem: 'ns_ai_baseurl_' , cls name ] on: Exception
-			do: [:e | nil ].
+			do: [:e |
+				ide noteSwallowed: e in: 'reading the base URL for ' , cls name.
+				nil
+			].
 		(url isNil or: [ url isEmpty ]) ifTrue: [ ^self ].
 		(cls apiKey: key model: 'discovery' baseUrl: url) refreshAvailableModelsThen: [
 				ide browsing updateCurrentDisplay
@@ -1109,7 +1194,8 @@ class HopscotchWebIDE packageUsing: manifest = Object new (
 	refreshProviderModelsFor: cls ide: ide platform: platform = (
 		(* Two-arg-factory providers (Anthropic, Gemini, OpenAI, Grok). Skip if no
        API key is stored. Fire-and-forget; on success force a re-render so any
-       picker on screen picks up the new cache.
+       picker on screen picks up the new cache. A missing key reads as nil
+       without error; a storage failure is logged and treated as no key.
 
        NB: this runs from setupIDEWith:using:, which is not a synchronized event
        handler, and it is gated on per-client localStorage - so on the Croquet
@@ -1121,7 +1207,10 @@ class HopscotchWebIDE packageUsing: manifest = Object new (
 		
 		| key |
 		key:: [ platform js localStorage getItem: 'ns_ai_apikey_' , cls name ] on: Exception
-			do: [:e | nil ].
+			do: [:e |
+				ide noteSwallowed: e in: 'reading the API key for ' , cls name.
+				nil
+			].
 		(key isNil or: [ key isEmpty ]) ifTrue: [ ^self ].
 		(cls apiKey: key model: 'discovery') refreshAvailableModelsThen: [
 				ide browsing updateCurrentDisplay
@@ -1155,17 +1244,6 @@ class HopscotchWebIDE packageUsing: manifest = Object new (
 			ide: ide
 			platform: platform
 	)
-	public reportRecheckAfterNamespaceName: name <Symbol> = (
-		(* A top-level class named `name` was added, removed or renamed: drive the
-   transitive re-check of every declaration that resolved that name, so the caches
-   AND the dependency edges are rebuilt rather than merely dropped. The callers
-   previously called invalidateNamespaceName: and discarded its result, which left
-   the edges consumed and never restored. Robust -- a re-check glitch must never
-   break class installation or deletion. *)
-		
-		^[ typechecker recheckAfterNamespaceName: name ] on: Error
-			do: [:e <Exception> | nil ]
-	)
 	setupIDEWith: mixins using: platform = (
 		| ide = ideUsingPlatform: platform. namespace = ide namespacing Root. |
 		augmentNamespace: namespace withPlatform: platform local.
@@ -1176,7 +1254,11 @@ class HopscotchWebIDE packageUsing: manifest = Object new (
 		ide launch: ide browsing HomeSubject new.
 		armDebuggerFor: ide platform: platform.
 		refreshProviderModelsInBackgroundFor: ide platform: platform.
-		[ ide aiSupport startAgentBusListening ] on: Exception do: [:e | nil ]
+		[ ide aiSupport startAgentBusListening ] on: Exception
+			do: [:e |
+				ide noteSwallowed: e in: 'starting agent bus listening'.
+				nil
+			]
 	)
 	topLevelClassOf: om <ObjectMirror> ^<ClassMirror> = (
 		| klass <ClassMirror> ::= om getClass. |

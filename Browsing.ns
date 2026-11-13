@@ -74,6 +74,13 @@ class Browsing usingPlatform: p ide: webIde
 	installDiffSideBySideStyles.
 ) (
 	lazy public JSZip = cachedPlatform js global at: 'JSZip'.
+	lazy prettyCompilationUnitCache <Map[Symbol, Array]> = (* Per top-level class name: {raw compilation-unit source. its pretty-printed form}.
+Saving a class must hand the browser its file within the user-activation window
+(a few seconds after the click), but prettyPrintCompilationUnit: is slow on deeply
+nested code (NewspeakTypechecker: ~6 s), so the browser rejected the save. Caching
+makes a repeat Save instant; the entry is only used while the raw source is
+unchanged, so an edit can never save stale text. One entry per class keeps it
+bounded. Interim fix until the pretty-printer's cost on nesting is fixed. *) Map new.
 	class AppPlatform new = Proxy new (
 		|
 			public hopscotch = HopscotchProxy new.
@@ -481,7 +488,10 @@ class Browsing usingPlatform: p ide: webIde
 										kind: #classHeader
 										ofClass: subject classMirror instanceSide)
 									onSubject: subject
-							] on: Error do: [:e <Exception> |].
+							] on: Error
+								do: [:e <Exception> |
+									ide noteSwallowed: e in: 'type re-check after class header Accept'
+								].
 							ed text: canonical.
 							colorizeHeaderSource: (crToLf: canonical) withEditor: ed.
 							ed leaveEditState
@@ -1218,12 +1228,15 @@ class Browsing usingPlatform: p ide: webIde
 			(* Canonicalize the file source on the way out so a saved/exported file is
 		   pretty-printed with its members nested under the class -- the same
 		   prettyPrintCompilationUnit: path that produced the committed codebase. Falls back
-		   to the raw assembly on a parse error. (ide is reachable here by lexical scope.) *)
+		   to the raw assembly on a parse error. Goes through
+		   prettyCompilationUnitFor:named:, which caches the result so a repeat Save is
+		   fast enough for the browser's user-activation window. (ide is reachable here
+		   by lexical scope.) *)
 			
 			isTopLevel ifTrue: [
-					| raw = compilationUnitFromSource: classMirror source forClassNamed: name. |
-					^[ ide prettyPrinter prettyPrintCompilationUnit: raw ] on: Error
-						do: [:e | raw ]
+					^prettyCompilationUnitFor: (compilationUnitFromSource: classMirror source
+							forClassNamed: name)
+						named: name
 				].
 			^classMirror source
 		)
@@ -3277,7 +3290,10 @@ The home page includes links to a variety of useful places, like the workspace m
 										kind: #lazySlot
 										ofClass: subject slotMirror definingMixin)
 									onSubject: subject
-							] on: Error do: [:e <Exception> |].
+							] on: Error
+								do: [:e <Exception> |
+									ide noteSwallowed: e in: 'type re-check after lazy slot Accept'
+								].
 							ed text: canonical.
 							colorizeLazySlotSource: (crToLf: canonical) withEditor: ed.
 							ed leaveEditState
@@ -4270,15 +4286,24 @@ blob; writes still install live, matching <b>Make Live</b>.</li>
      source. Returns nil for memberMirrors that don't resolve to a
      live mirror (e.g. SourceMirror-flavoured stand-ins used in the
      changeset flow) -- the presenter checks and disables the
-     compare button in that case. *)
+     compare button in that case. A failure to read the source is
+     logged and also answers nil. *)
 			
 			| m |
 			m:: memberMirror.
 			m isKindOfClassDeclarationMirror ifTrue: [
-					^[ m header source ] on: Exception do: [:e | nil ]
+					^[ m header source ] on: Exception
+						do: [:e |
+							ide noteSwallowed: e in: 'reading live header source for history compare'.
+							nil
+						]
 				].
 			(m isKindOfMethodMirror or: [ m isKindOfLazySlotMirror ]) ifTrue: [
-					^[ m source ] on: Exception do: [:e | nil ]
+					^[ m source ] on: Exception
+						do: [:e |
+							ide noteSwallowed: e in: 'reading live member source for history compare'.
+							nil
+						]
 				].
 			^nil
 		)
@@ -4290,12 +4315,17 @@ blob; writes still install live, matching <b>Make Live</b>.</li>
      walks the resulting bytecode for sent selectors. Returns nil when
      compilation fails (e.g. the source predates a syntax change) or
      when there's no source yet. nil is the "menu shows a disabled
-     entry" signal; an empty list is "compiled fine but no sends". *)
+     entry" signal; an empty list is "compiled fine but no sends".
+     A failure is logged, so a real bug is not mistaken for an old source. *)
 			
 			messagesComputed_slot ifTrue: [ ^messages_slot ].
 			versionSource_slot isNil ifTrue: [ ^nil ].
 			messagesComputed_slot:: true.
-			messages_slot:: [ computeMessages ] on: Error do: [:e | nil ].
+			messages_slot:: [ computeMessages ] on: Error
+				do: [:e |
+					ide noteSwallowed: e in: 'computing messages of a history entry'.
+					nil
+				].
 			^messages_slot
 		)
 		public path = (
@@ -5501,7 +5531,10 @@ repository panel.</li>
 										kind: #method
 										ofClass: subject methodMirror definingMixin)
 									onSubject: subject
-							] on: Error do: [:e <Exception> |].
+							] on: Error
+								do: [:e <Exception> |
+									ide noteSwallowed: e in: 'type re-check after method Accept'
+								].
 							ed text: canonical.
 							colorizeMethodSource: (crToLf: canonical) withEditor: ed.
 							ed leaveEditState
@@ -6708,7 +6741,9 @@ repository panel.</li>
 										namespace at: m name put: m declaration applyToObject reflectee
 									].
 								[ ide reportRecheckAfterNamespaceName: m name ] on: Error
-									do: [:e <Exception> |]
+									do: [:e <Exception> |
+										ide noteSwallowed: e in: 'type re-check after adding ' , m name
+									]
 							].
 						successBlock value
 					] on: Error do: [:ex | failureBlock value: ex printString ]
@@ -8636,7 +8671,9 @@ are presenting. *)
 			| backup <Map[Symbol, Object] | Nil> |
 			ide namespacing removeKey: cname.
 			[ ide reportRecheckAfterNamespaceName: cname ] on: Error
-				do: [:e <Exception> |].
+				do: [:e <Exception> |
+					ide noteSwallowed: e in: 'type re-check after deleting ' , cname
+				].
 			backup:: ide json decode: ([ localStorage getItem: 'backup' ] on: Error
 					do: [:e | ^self ]).
 			backup isNil ifTrue: [ ^self ].
@@ -8937,15 +8974,21 @@ def ' *)
 		(* The Subject of the IDE's current top-level presenter. Used by the
 	   chat brain-click action to determine whether a previously-active
 	   chat region is on the same page as the new click — only same-page
-	   regions are auto-closed. *)
+	   regions are auto-closed. nil if there is none; a failure is logged. *)
 		
-		^[ currentWindow currentPresenter subject ] on: Error do: [:e | nil ]
+		^[ currentWindow currentPresenter subject ] on: Error
+			do: [:e |
+				ide noteSwallowed: e in: 'finding the current page subject'.
+				nil
+			]
 	)
 	deleteTopLevelClassNamed: cname <Symbol> = (
 		| backup <Map[Symbol, Object] | Nil> |
 		ide namespacing removeKey: cname.
 		[ ide reportRecheckAfterNamespaceName: cname ] on: Error
-			do: [:e <Exception> |].
+			do: [:e <Exception> |
+				ide noteSwallowed: e in: 'type re-check after deleting ' , cname
+			].
 		backup:: ide json decode: ([ localStorage getItem: 'backup' ] on: Error
 				do: [:e | ^self ]).
 		backup isNil ifTrue: [ ^self ].
@@ -9060,6 +9103,23 @@ def ' *)
 		
 		currentWindow enterSubject: aSubject
 	)
+	public prettyCompilationUnitFor: raw <String> named: className <Symbol> ^<String> = (
+		(* The pretty-printed form of the compilation unit raw for className, from
+	   prettyCompilationUnitCache when raw is unchanged since it was computed. A
+	   pretty-printing failure falls back to raw (as before) and is logged. *)
+		
+		| cached pretty |
+		cached:: prettyCompilationUnitCache at: className asSymbol ifAbsent: [ nil ].
+		(cached isNil not and: [ (cached at: 1) = raw ]) ifTrue: [ ^cached at: 2 ].
+		pretty:: [ ide prettyPrinter prettyPrintCompilationUnit: raw ] on: Error
+			do: [:e |
+				ide noteSwallowed: e
+					in: 'pretty-printing ' , className , ' for saving (saving it unformatted)'.
+				raw
+			].
+		prettyCompilationUnitCache at: className asSymbol put: {raw. pretty. }.
+		^pretty
+	)
 	saveSources = (
 		localStorage setItem: #lastSaved to: (localStorage getItem: #backup).
 		localStorage setItem: #lastSavedTime to: ide incrementedVersion
@@ -9075,8 +9135,9 @@ def ' *)
 	   path goes through updateGUI: from within a presenter event handler;
 	   AI tool handlers run outside any such context, so we drive the
 	   Window's own updateDisplay directly. Wrapped in error handling so
-	   a stale-window edge case can never abort an evaluation. *)
+	   a stale-window edge case can never abort an evaluation; logged. *)
 		
-		[ currentWindow updateDisplay ] on: Error do: [:e |]
+		[ currentWindow updateDisplay ] on: Error
+			do: [:e | ide noteSwallowed: e in: 'updating the current display' ]
 	)
 ) : ()

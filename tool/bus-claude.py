@@ -280,19 +280,28 @@ You have TWO sets of tools:
    (another TOOL_CALL, or a final plain-text answer). Use these whenever the
    user asks about their live system — inspect it, don't guess.
 
-2. YOUR OWN Claude Code tools (shell, file access) on this machine — use them to
-   investigate the repository or reason, but note they act on the FILES, not the
-   live IDE image. Honor the repo's working rules (CLAUDE.md: pretty-print +
-   round-trip + parse-validate every .ns you change, run tests, never commit).
-   Prefer explaining and proposing over changing state unless asked.
+2. YOUR OWN Claude Code tools (shell, file access) on this machine. These act on
+   FILES, which are NOT the system the user is running: they may be stale, on
+   another branch, or lack edits made in the IDE and not yet saved. For any
+   question about Newspeak code (what it does, where it is defined, who calls
+   it), the LIVE IMAGE is the source of truth: use the IDE tools
+   (get_class_source, get_member_source, list_class_members, senders_of,
+   implementors_of, search_classes) FIRST, even though each one costs a round
+   trip. Use local tools only for what the image does not hold (this bridge,
+   build scripts, .md notes, git history), or when the user asks about files.
+   If you do answer from disk, say so. When you change files, honor the repo's
+   working rules (CLAUDE.md: pretty-print + round-trip + parse-validate every
+   .ns you change, run tests, never commit). Prefer explaining and proposing
+   over changing state unless asked.
 
 When you are done and just answering the user, reply in plain text with NO
 TOOL_CALL line.
 
-Below are the chat's own system instructions and the conversation so far.
-
---- The chat's system instructions ---
+The first message of this conversation carries the chat's own system
+instructions, then the conversation so far.
 """
+
+CHAT_SYSTEM_HEADER = '--- The chat\'s system instructions ---\n'
 
 
 def killed_notice(reason, cold=False):
@@ -324,7 +333,10 @@ def first_prompt(request, killed=None):
     it is also what a bridge restart and a lost session produce, and either can
     follow a turn this bridge killed. Until this argument existed the reason
     was popped and dropped on exactly those paths."""
-    parts = [PREAMBLE + system_text(request.get('system'))]
+    # The PREAMBLE itself is not here: it rides the system prompt (run_claude's
+    # --append-system-prompt), where it outweighs Claude Code's file-centred
+    # context instead of arriving as just more user text.
+    parts = [CHAT_SYSTEM_HEADER + system_text(request.get('system'))]
     parts.append('\n--- Conversation so far ---')
     for m in request.get('messages', []):
         who = 'User' if m.get('role') == 'user' else 'Assistant'
@@ -473,7 +485,10 @@ def run_claude(prompt, args, resume_session=None, hard_deadline=None, progress=N
     looks exactly like thinking - under `hard_deadline` (the absolute cap for
     the whole answer, retry included; --hard-cap from now by default)."""
     cmd = [args.claude_bin, '-p', '--output-format', 'stream-json', '--verbose',
-           '--include-partial-messages']
+           '--include-partial-messages', '--append-system-prompt', PREAMBLE]
+    # Passed on every run, resumed ones included: Claude Code records the system
+    # prompt on a conversation's first request and replays that record on
+    # resume, so this is harmless there and keeps a resume self-describing.
     if resume_session:
         cmd += ['--resume', resume_session]
     if args.claude_args:

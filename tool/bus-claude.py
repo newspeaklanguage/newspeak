@@ -187,6 +187,53 @@ def refuse_stale_front_door(origin):
                  f'reload the IDE page, then start this bridge again.')
 
 
+# A listener whose bridge has just quit stays on the front door's list until
+# a write to it fails - and the first keepalive after the close still lands in
+# the socket buffer, so it is the SECOND that fails: up to twice BUS_KEEPALIVE_S
+# (20 in cors-proxy.py); measured at 39s, 2026-11-13. A restart inside that
+# window should wait it out rather than be refused.
+NAME_RELEASE_WAIT_S = 45
+
+
+def refuse_duplicate_name(origin, token, name):
+    """Exit if a listener with this name is already on the bus.
+
+    The bus fans every message out to every subscriber, so two bridges of one
+    name BOTH answer each completion_request, on the same corr_id. The IDE takes
+    whichever reply lands first and drops the other, so the chat is driven by
+    two agents at once, each holding its own session: one agent's TOOL_CALL
+    runs, and the result goes to both, so the other agent sees answers to
+    calls it never made. Seen 2026-11-13: a bridge left running since Oct 3
+    beside its replacement, which the chat reported as "the replies are being
+    delivered to the wrong chat".
+
+    Checked at startup only. A reconnect after a dropped stream may still find
+    its own old entry on the list, and must not refuse itself. A front door
+    without /_ns/bus/agents predates the check and is not refused."""
+    url = (origin + '/_ns/bus/agents?token=' + urllib.parse.quote(token))
+    give_up = time.monotonic() + NAME_RELEASE_WAIT_S
+    waited = False
+    while True:
+        try:
+            with urllib.request.urlopen(url, timeout=5) as r:
+                agents = json.load(r).get('agents') or []
+        except Exception:
+            return
+        if name not in agents:
+            return
+        if time.monotonic() >= give_up:
+            sys.exit(f'error: an agent named {name!r} is already listening on the bus at '
+                     f'{origin}. Two bridges of one name both answer every turn and the '
+                     f'chat gets the other one\'s tool results. Stop the other one first '
+                     f'(look for it with: pgrep -fl "bus-claude.py {name}"), or give this '
+                     f'one a different name.')
+        if not waited:
+            print(f'[{name!r} is already on the bus; waiting up to {NAME_RELEASE_WAIT_S}s '
+                  f'in case it is a bridge that has just quit]', file=sys.stderr, flush=True)
+            waited = True
+        time.sleep(2)
+
+
 def post(origin, token, obj, attempts=3):
     """POST a bus message, retrying a transient failure.
 
@@ -800,6 +847,7 @@ def main():
 
     refuse_stale_front_door(args.origin)
     token = fetch_token(args.origin)
+    refuse_duplicate_name(args.origin, token, args.name)
     print(f'bus-claude {args.name!r} on {args.origin} — backing any Bus Agent chat '
           f'whose Model is {args.name!r} (one Claude Code session per chat). Ctrl-C to quit.',
           flush=True)

@@ -473,6 +473,9 @@ bounded. Interim fix until the pretty-printer's cost on nesting is fixed. *) Map
 			headerEditor <CodeMirrorFragment>
 		|
 	) (
+		acceptableEditor ^<CodeMirrorFragment | Nil> = (
+			^headerEditor
+		)
 		acceptResponse ^<[:CodeMirrorFragment :Event | Object]> = (
 			^[:ed <CodeMirrorFragment> :event <Event> |
 				| b <ClassDeclarationBuilder> = subject classMirror asBuilder. |
@@ -482,16 +485,10 @@ bounded. Interim fix until the pretty-printer's cost on nesting is fixed. *) Map
 							canonical:: ide prettyPrintClassHeaderOr: ed textBeingAccepted.
 							b header source: canonical.
 							ide installFromBuilders: {b. }.
-							subject clearTypeErrors.
-							[
-								ide reportRecheckFrom: (ide typechecker declarationForMember: subject classMirror instanceSide name
-										kind: #classHeader
-										ofClass: subject classMirror instanceSide)
-									onSubject: subject
-							] on: Error
-								do: [:e <Exception> |
-									ide noteSwallowed: e in: 'type re-check after class header Accept'
-								].
+							
+							(* The install re-checked the dependents; check the header itself. The banner reads the result from the model. *)
+							subject typeStatus dropDraft;
+								checkInstalled.
 							ed text: canonical.
 							colorizeHeaderSource: (crToLf: canonical) withEditor: ed.
 							ed leaveEditState
@@ -505,7 +502,8 @@ bounded. Interim fix until the pretty-printer's cost on nesting is fixed. *) Map
 				| src = ide prettyPrintClassHeaderOr: (crToLf: subject classHeaderSource). |
 				ed text: src.
 				colorizeHeaderSource: src withEditor: ed.
-				ed leaveEditState
+				ed leaveEditState.
+				updateGUI: [ subject typeStatus dropDraft ]
 			]
 		)
 		changeResponse ^<[:CodeMirrorFragment :Event | Object]> = (
@@ -524,6 +522,13 @@ bounded. Interim fix until the pretty-printer's cost on nesting is fixed. *) Map
 		definition = (
 			toggle:: collapsed: [ collapsedDefinition ] expanded: [ expandedDefinition ].
 			^toggle
+		)
+		editorBufferText ^<String | Nil> = (
+			(* The header editor's text when it has been edited, else nil. *)
+			
+			headerEditor isNil ifTrue: [ ^nil ].
+			headerEditor isInEditState ifFalse: [ ^nil ].
+			^headerEditor textBeingAccepted
 		)
 		editorDefinition = (
 			(* Re-base the header source to indent 0 for display (see MethodPresenter). *)
@@ -626,41 +631,6 @@ bounded. Interim fix until the pretty-printer's cost on nesting is fixed. *) Map
 				].
 			^row: rowElements asArray
 		)
-		respondToTypecheck = (
-			(* Override MethodPresenter>>respondToTypecheck. The factory IS the
-       class header; route through typecheckClassHeader: instead of
-       typecheckMethodSource:. Uses the captured headerEditor for the
-       in-progress buffer, falling back to the installed header. *)
-			
-			| ed source typed mixin errs failureMessage |
-			ed:: headerEditor.
-			typed:: ed isNil ifTrue: [ nil ] ifFalse: [ ed textBeingAccepted ].
-			source:: (typed isNil or: [ typed isEmpty ]) ifTrue: [
-					subject classHeaderSource
-				]
-				ifFalse: [ typed ].
-			mixin:: subject classMirror instanceSide.
-			subject clearTypeErrors.
-			failureMessage:: nil.
-			errs:: [ ide typechecker typecheckClassHeader: source ofClass: mixin ] on: Error
-				do: [:e |
-					failureMessage:: 'Typechecker failed: ' , e printString.
-					nil
-				].
-			updateGUI: [
-					failureMessage isNil ifFalse: [
-							subject typeErrorMessages add: failureMessage
-						]
-						ifTrue: [
-							errs isEmpty ifTrue: [ subject typeErrorMessages add: 'No type errors.' ]
-								ifFalse: [
-									errs do: [:e |
-											subject typeErrorMessages add: 'Type error: ' , e message , ' [' , e start printString , '-' , e end printString , ']'
-										]
-								]
-						]
-				]
-		)
 		slotList ^<Fragment> = (
 			| sl |
 			^column: {(sl:: subject classMirror instanceSide slots) size > 0 ifTrue: [
@@ -717,6 +687,9 @@ bounded. Interim fix until the pretty-printer's cost on nesting is fixed. *) Map
 		public enclosingScope ^<ObjectMirror> = (
 			#BOGUS
 		)
+		public installedTypeSource ^<String> = (
+			^classHeaderSource
+		)
 		public isKindOfClassFactorySubject ^<Boolean> = (
 			^true
 		)
@@ -745,6 +718,17 @@ bounded. Interim fix until the pretty-printer's cost on nesting is fixed. *) Map
 		)
 		public source ^<String> = (
 			^classHeaderSource
+		)
+		public typeDeclaration ^<Declaration> = (
+			^ide typechecker declarationForMember: classMirror instanceSide name
+				kind: #classHeader
+				ofClass: classMirror instanceSide
+		)
+		public typeKind ^<Symbol> = (
+			^#classHeader
+		)
+		public typeMixin ^<MixinMirror> = (
+			^classMirror instanceSide
 		)
 	) : (
 		public onModel: m <ClassDeclarationMirror> = (
@@ -1115,22 +1099,19 @@ bounded. Interim fix until the pretty-printer's cost on nesting is fixed. *) Map
 		public accessModifier = (
 			^classMirror accessModifier
 		)
-		addEntryTo: entries <List[TypecheckReportEntry]> label: lbl <String> banner: bannerSubject <Subject> nav: navSubject <Subject> errors: errorBlock <[Set]> = (
-			| errs <Set> messages <List[String]> = List new. failure <String> |
-			failure:: nil.
-			errs:: errorBlock on: Error
-				do: [:e <Error> |
-					failure:: 'Typechecker failed: ' , e printString.
-					nil
-				].
-			failure isNil ifFalse: [ messages add: failure ]
+		addEntryTo: entries <List[TypecheckReportEntry]> label: lbl <String> banner: bannerSubject <MethodSubject | LazySlotSubject> nav: navSubject <Subject> errors: errorBlock <[Set | Nil]> = (
+			(* Check one member (errorBlock, which goes through the member subject's type status, so the result is recorded in the typechecker's model and the member's own editor shows it too) and add a report entry for it. *)
+			
+			| errs <Set | Nil> messages <List[String]> = List new. status <MemberTypeStatus> = bannerSubject typeStatus. |
+			errs:: errorBlock value.
+			status failure isNil ifFalse: [ messages add: status failure ]
 				ifTrue: [
-					errs do: [:e |
-							messages add: 'Type error: ' , e message , ' [' , e start printString , '-' , e end printString , ']'
+					errs isNil ifFalse: [
+							errs do: [:e |
+									messages add: 'Type error: ' , e message , ' [' , e start printString , '-' , e end printString , ']'
+								]
 						]
 				].
-			bannerSubject clearTypeErrors.
-			messages do: [:m <String> | bannerSubject typeErrorMessages add: m ].
 			entries add: (TypecheckReportEntry label: lbl
 					bannerSubject: bannerSubject
 					navSubject: navSubject
@@ -1191,32 +1172,33 @@ bounded. Interim fix until the pretty-printer's cost on nesting is fixed. *) Map
 			^model
 		)
 		public collectTypecheckEntriesWith: tc <NewspeakTypechecker> into: entries <List[TypecheckReportEntry]> prefix: prefix <String> = (
-			| mixin = classMirror instanceSide. classSideMixin = classMirror classSide. |
+			(* Check every member of this class and its nested classes through the members' subjects, recording the results in the typechecker's model. tc is the IDE's typechecker, the one the subjects use. *)
+			
 			addEntryTo: entries
 				label: prefix , name , ' (class header)'
 				banner: factorySubject
 				nav: self
-				errors: [ tc typecheckClassHeader: classHeaderSource ofClass: mixin ].
+				errors: [ factorySubject typeStatus checkInstalled ].
 			methodsSubject elements do: [:ms <MethodSubject> |
 					addEntryTo: entries
 						label: prefix , ms name , ' (method)'
 						banner: ms
 						nav: ms
-						errors: [ tc typecheckMethodSource: ms source ofClass: mixin ]
+						errors: [ ms typeStatus checkInstalled ]
 				].
 			classMethodsSubject elements do: [:ms <MethodSubject> |
 					addEntryTo: entries
 						label: prefix , ms name , ' (class method)'
 						banner: ms
 						nav: ms
-						errors: [ tc typecheckMethodSource: ms source ofClass: classSideMixin ]
+						errors: [ ms typeStatus checkInstalled ]
 				].
 			lazySlotsSubject elements do: [:ls <LazySlotSubject> |
 					addEntryTo: entries
 						label: prefix , ls name , ' (lazy slot)'
 						banner: ls
 						nav: ls
-						errors: [ tc typecheckLazySlot: ls source ofClass: mixin ]
+						errors: [ ls typeStatus checkInstalled ]
 				].
 			nestedClassesSubject elements do: [:nc <ClassSubject> |
 					nc collectTypecheckEntriesWith: tc
@@ -1350,14 +1332,10 @@ bounded. Interim fix until the pretty-printer's cost on nesting is fixed. *) Map
 			^name
 		)
 		public typecheckReportSubject ^<ClassTypecheckReportSubject> = (
-			(* Typecheck this class and all nested classes (header, instance and
-	   class methods, lazy slots). Populates each member's typeErrorMessages
-	   banner (errors only) as a side effect, and returns a summary report
-	   subject listing every member. One typechecker is shared across the
-	   whole walk. *)
+			(* Typecheck this class and all nested classes (header, instance and class methods, lazy slots) with the IDE's typechecker, recording each member's errors in its model -- so the members' editors show them -- and return a summary report subject listing every member. *)
 			
-			| tc <NewspeakTypechecker> = ide freshTypechecker. entries <List[TypecheckReportEntry]> = List new. |
-			collectTypecheckEntriesWith: tc into: entries prefix: ''.
+			| entries <List[TypecheckReportEntry]> = List new. |
+			collectTypecheckEntriesWith: ide typechecker into: entries prefix: ''.
 			^ClassTypecheckReportSubject onClassNamed: name entries: entries
 		)
 	) : (
@@ -3276,6 +3254,11 @@ The home page includes links to a variety of useful places, like the workspace m
 			slotEvaluatorPresenter <EvaluatorPresenter>
 		|
 	) (
+		acceptableEditor ^<CodeMirrorFragment | Nil> = (
+			(* The editor Typecheck and Accept accepts from; nil in exemplar mode, where the editor is an evaluator. *)
+			
+			^slotEditor
+		)
 		acceptResponse ^<[:CodeMirrorFragment :Event | Object]> = (
 			^[:ed <CodeMirrorFragment> :event <Event> |
 				| b <MixinBuilder> = subject slotMirror definingMixin asBuilder. canonical |
@@ -3284,16 +3267,10 @@ The home page includes links to a variety of useful places, like the workspace m
 							canonical:: ide prettyPrintLazySlotOr: ed textBeingAccepted.
 							b lazySlots addFromSource: canonical.
 							ide installFromBuilders: {b declaration. }.
-							subject clearTypeErrors.
-							[
-								ide reportRecheckFrom: (ide typechecker declarationForMember: subject name
-										kind: #lazySlot
-										ofClass: subject slotMirror definingMixin)
-									onSubject: subject
-							] on: Error
-								do: [:e <Exception> |
-									ide noteSwallowed: e in: 'type re-check after lazy slot Accept'
-								].
+							
+							(* The install re-checked the dependents; check the slot itself. The banner reads the result from the model. *)
+							subject typeStatus dropDraft;
+								checkInstalled.
 							ed text: canonical.
 							colorizeLazySlotSource: (crToLf: canonical) withEditor: ed.
 							ed leaveEditState
@@ -3307,7 +3284,8 @@ The home page includes links to a variety of useful places, like the workspace m
 				| src = ide prettyPrintLazySlotOr: (crToLf: subject source). |
 				ed text: src.
 				colorizeLazySlotSource: src withEditor: ed.
-				ed leaveEditState
+				ed leaveEditState.
+				updateGUI: [ subject typeStatus dropDraft ]
 			]
 		)
 		changeResponse ^<[:CodeMirrorFragment :Event | Object]> = (
@@ -3368,6 +3346,16 @@ The home page includes links to a variety of useful places, like the workspace m
 							ifFalse: [ nothing ]. }
 				].
 			^toggle
+		)
+		editorBufferText ^<String | Nil> = (
+			(* The editor's text when it may differ from the installed code, else nil (see MethodPresenter>>editorBufferText). *)
+			
+			slotEditor isNil ifFalse: [
+					slotEditor isInEditState ifFalse: [ ^nil ].
+					^slotEditor textBeingAccepted
+				].
+			slotEvaluatorPresenter isNil ifFalse: [ ^slotEvaluatorPresenter editorText ].
+			^nil
 		)
 		editorDefinition ^<CodeMirrorFragment | EvaluatorPresenter> = (
 			^hasExemplars ifTrue: [ evaluatorDefinition ]
@@ -3546,43 +3534,22 @@ The home page includes links to a variety of useful places, like the workspace m
 			colorizeLazySlotSource: (crToLf: formatted) withEditor: ed.
 			ed editor focus
 		)
-		respondToTypecheckSlot = (
-			(* Run the typechecker on the current lazy-slot source (editor buffer
-       if non-empty, else the installed source) and surface results in
-       the typeErrorMessages banner column below the editor.
-       Source priority: codeMirror editor (no-exemplar mode), else the
-       embedded evaluator's editor (exemplar mode), else the installed
-       source. *)
+		respondToTypecheckAndAccept = (
+			(* Typecheck the editor's text and accept it only if it has no type errors itself (see MethodPresenter>>respondToTypecheckAndAccept). *)
 			
-			| source typed mixin errs failureMessage |
-			typed:: slotEditor isNil ifTrue: [
-					slotEvaluatorPresenter isNil ifTrue: [ nil ]
-						ifFalse: [ slotEvaluatorPresenter editorText ]
-				]
-				ifFalse: [ slotEditor textBeingAccepted ].
-			source:: (typed isNil or: [ typed isEmpty ]) ifTrue: [ subject source ]
-				ifFalse: [ typed ].
-			mixin:: subject slotMirror definingMixin.
-			subject clearTypeErrors.
-			failureMessage:: nil.
-			errs:: [ ide typechecker typecheckLazySlot: source ofClass: mixin ] on: Error
-				do: [:e |
-					failureMessage:: 'Typechecker failed: ' , e printString.
-					nil
+			| ed <CodeMirrorFragment | Nil> = acceptableEditor. status <MemberTypeStatus> = subject typeStatus. errs |
+			(ed isNil or: [ ed isInEditState not ]) ifTrue: [ ^respondToTypecheckSlot ].
+			status checkSource: ed textBeingAccepted.
+			errs:: status errors.
+			(status failure isNil and: [ errs isNil not and: [ errs isEmpty ] ]) ifTrue: [
+					^acceptResponse value: ed value: nil
 				].
-			updateGUI: [
-					failureMessage isNil ifFalse: [
-							subject typeErrorMessages add: failureMessage
-						]
-						ifTrue: [
-							errs isEmpty ifTrue: [ subject typeErrorMessages add: 'No type errors.' ]
-								ifFalse: [
-									errs do: [:e |
-											subject typeErrorMessages add: 'Type error: ' , e message , ' [' , e start printString , '-' , e end printString , ']'
-										]
-								]
-						]
-				]
+			updateGUI: []
+		)
+		respondToTypecheckSlot = (
+			(* Typecheck the editor's text -- unaccepted code included. An unedited editor is checked as the installed slot, recorded in the typechecker's model. The banner shows the result through the subject's type status. *)
+			
+			updateGUI: [ subject typeStatus checkSource: editorBufferText ]
 		)
 		slotHeader: toggleBlock <[]> ^<Fragment> = (
 			^column: {helpSection. row: {accessIndicator. defaultBlank. (link: subject name
@@ -3615,7 +3582,9 @@ The home page includes links to a variety of useful places, like the workspace m
 				updateGUI: [ subject delete ]
 			]. }. #separator. {'Pretty Print'. [ respondToPrettyPrint ]. }. #separator. {'Typecheck'. [
 				respondToTypecheckSlot
-			]. }. #separator. {'Inspect Presenter'. [ respondToInspectPresenter ]. }. }. |
+			]. }. {'Typecheck and Accept'. [ respondToTypecheckAndAccept ]. }. #separator. {'Inspect Presenter'. [
+				respondToInspectPresenter
+			]. }. }. |
 			hasExemplars ifTrue: [
 					labelsAndActions:: labelsAndActions , {#separator. {'Add Evaluator'. [
 						respondToAddSlotWorkspace
@@ -3630,15 +3599,8 @@ The home page includes links to a variety of useful places, like the workspace m
 			historyHolder content isKindOfBlankFragment ifTrue: [ installHistory ]
 				ifFalse: [ historyHolder content: nothing ]
 		)
-		typeErrorDisplay: msg <String> ^<Fragment> = (
-			| textColor |
-			textColor:: msg = 'No type errors.' ifTrue: [ Color r: 0 g: 0.5 b: 0 ]
-				ifFalse: [ Color r: 0.7 g: 0 b: 0 ].
-			^row: {(label: msg) color: textColor. button: 'Clear'
-					action: [ updateGUI: [ subject typeErrorMessages remove: msg ] ]. }
-		)
 		typeErrorMessages ^<Array[Fragment]> = (
-			^(subject typeErrorMessages collect: [:msg <String> | typeErrorDisplay: msg ]) asArray
+			^typeStatusDisplayFor: subject typeStatus
 		)
 		updateVisualsFromSameKind: oldPresenter <Self> ^<Alien[Element]> = (
 			| oldHistory |
@@ -3652,7 +3614,6 @@ The home page includes links to a variety of useful places, like the workspace m
 		
 		|
 			public errorMessages <Set[String]> = Set new.
-			public typeErrorMessages <Set[String]> = Set new.
 			public exemplars <List[String]> = computeExemplars.
 			public exemplar <String>
 			evaluator_slot <EvaluationSubject>
@@ -3660,6 +3621,7 @@ The home page includes links to a variety of useful places, like the workspace m
 			public threadMap <Map[Symbol, ThreadMirror | Error]> = Map new.
 		|
 	) (
+		lazy public typeStatus <MemberTypeStatus> = (* What this member's editor shows about type errors; see MemberTypeStatus. *) MemberTypeStatus for: self.
 		public accessModifier ^<Symbol> = (
 			^slotMirror accessModifier
 		)
@@ -3671,9 +3633,6 @@ The home page includes links to a variety of useful places, like the workspace m
 		)
 		public clearErrors = (
 			errorMessages removeAll: errorMessages
-		)
-		public clearTypeErrors = (
-			typeErrorMessages removeAll: typeErrorMessages
 		)
 		public compileSource: src <String> ifSuccess: successBlock <[:MethodMirror | Object]> ifFailure: failureBlock <[:String | Object]> = (
 			(* Canonicalise via prettyPrintLazySlotOr: before compiling. *)
@@ -3736,6 +3695,9 @@ The home page includes links to a variety of useful places, like the workspace m
 		public hasSlotWorkspace ^<Boolean> = (
 			^workspace_slot isNil not
 		)
+		public installedTypeSource ^<String> = (
+			^source
+		)
 		public isKindOfLazySlotSubject ^<Boolean> = (
 			^true
 		)
@@ -3788,6 +3750,15 @@ The home page includes links to a variety of useful places, like the workspace m
 			| thread <ThreadMirror | Error> = threadMap at: e asSymbol
 				ifAbsentPut: [ processExemplar: e ]. |
 			^thread
+		)
+		public typeDeclaration ^<Declaration> = (
+			^ide typechecker declarationForMember: name kind: typeKind ofClass: typeMixin
+		)
+		public typeKind ^<Symbol> = (
+			^#lazySlot
+		)
+		public typeMixin ^<MixinMirror> = (
+			^slotMirror definingMixin
 		)
 		public workspace = (
 			workspace_slot isNil ifTrue: [
@@ -5169,6 +5140,165 @@ repository panel.</li>
 			^result
 		)
 	) : ()
+	class MemberTypeStatus for: s <MethodSubject | LazySlotSubject> = Object new (
+		(* The type-error state of one member (method, lazy slot or class header), held by that member's subject. The errors of installed code live in the typechecker, which is the model (errorsFor:); this adds only the editor's own state: an unaccepted draft that was checked, the messages the user has cleared, and whether to say 'No type errors.' (only after the user asked for a check). Everything shown is recomputed on each render, so an open editor follows the model. The owner subject supplies typeDeclaration, typeKind, typeMixin and installedTypeSource. *)
+		
+		|
+			owner <MethodSubject | LazySlotSubject> = s.
+			draftSource <String | Nil>
+			draftErrors <Set[TypeError] | Nil>
+			draftGeneration <Integer | Nil>
+			draftFailure <String | Nil>
+			installedFailure <String | Nil>
+			dismissed <Set[String]> ::= Set new.
+			showsClean <Boolean> ::= false.
+		|
+	) (
+		public brokenDependents ^<List[Declaration]> = (
+			(* The dependents this member's changes caused to be re-checked and that currently have type errors, live from the model. *)
+			
+			^[ ide typechecker brokenDependentsOf: owner typeDeclaration ] on: Error
+				do: [:e <Exception> |
+					ide noteSwallowed: e in: 'listing broken dependents'.
+					List new
+				]
+		)
+		public checkInstalled ^<Set[TypeError] | Nil> = (
+			(* Check the installed member and record the result in the typechecker's model, where this editor -- and any other open on the member -- finds it. Leaves a checked draft alone. Answers the errors; nil if the member is not checkable or the typechecker failed. *)
+			
+			installedFailure:: nil.
+			^[ ide typechecker checkDeclaration: owner typeDeclaration ] on: Error
+				do: [:e <Exception> |
+					ide noteSwallowed: e in: 'type check of installed member'.
+					installedFailure:: 'Typechecker failed: ' , e printString.
+					nil
+				]
+		)
+		public checkSource: src <String | Nil> = (
+			(* The user asked for a typecheck of src, the editor's text; nil means the editor has not been changed. Text equal to the installed source is checked as installed code and recorded in the model; anything else is checked as an unaccepted draft, which the model never sees. Either way a clean result is reported as such. *)
+			
+			showsClean:: true.
+			(src isNil or: [ src isEmpty or: [ src = owner installedTypeSource ] ]) ifTrue: [
+					dropDraft.
+					^checkInstalled
+				].
+			draftSource:: src.
+			recheckDraft
+		)
+		public cleanMessage ^<String> = (
+			^'No type errors.'
+		)
+		public describe: d <Declaration> ^<String> = (
+			(* A Declaration as the user knows it: Outer Inner>>selector, with 'class' for class-side members and 'header of' for class headers. *)
+			
+			| str <String> ::= ''. |
+			d path do: [:p |
+					str:: str isEmpty ifTrue: [ p asString ]
+						ifFalse: [ str , ' ' , p asString ]
+				].
+			d side = #class ifTrue: [ str:: str , ' class' ].
+			d kind = #classHeader ifTrue: [ ^'header of ' , str ].
+			^str , '>>' , d name asString
+		)
+		public dismiss: msg <String> = (
+			(* Hide msg (the Clear button). A cleared 'No type errors.' simply stops being said until the next requested check. *)
+			
+			msg = cleanMessage ifTrue: [
+					showsClean:: false.
+					^self
+				].
+			dismissed add: msg
+		)
+		public dropDraft = (
+			(* Forget the checked draft: the editor's text was accepted or cancelled. *)
+			
+			draftSource:: nil.
+			draftErrors:: nil.
+			draftGeneration:: nil.
+			draftFailure:: nil
+		)
+		public errorCountOf: d <Declaration> ^<Integer> = (
+			| errs <Set[TypeError] | Nil> = ide typechecker errorsFor: d. |
+			^errs isNil ifTrue: [ 0 ] ifFalse: [ errs size ]
+		)
+		public errors ^<Set[TypeError] | Nil> = (
+			(* The errors to show: a checked draft's -- re-checked whenever the typechecker's generation has moved, so the draft follows changes elsewhere -- else the installed member's current errors from the model; nil if neither has been checked. *)
+			
+			isDraft ifTrue: [
+					draftGeneration = ide typechecker generation ifFalse: [ recheckDraft ].
+					^draftErrors
+				].
+			^[ ide typechecker errorsFor: owner typeDeclaration ] on: Error
+				do: [:e <Exception> |
+					ide noteSwallowed: e in: 'reading type errors'.
+					nil
+				]
+		)
+		public failure ^<String | Nil> = (
+			^isDraft ifTrue: [ draftFailure ] ifFalse: [ installedFailure ]
+		)
+		public hiddenCount ^<Integer> = (
+			^(messages select: [:m <String> | dismissed includes: m ]) size
+		)
+		public isDraft ^<Boolean> = (
+			^draftSource isNil not
+		)
+		messages ^<List[String]> = (
+			(* Every message to show, cleared or not. *)
+			
+			| errs <Set[TypeError] | Nil> = errors. result <List[String]> = List new. |
+			failure isNil ifFalse: [
+					result add: failure.
+					^result
+				].
+			errs isNil ifTrue: [ ^result ].
+			errs do: [:e |
+					result add: 'Type error: ' , e message , ' [' , e start printString , '-' , e end printString , ']'
+				].
+			(errs isEmpty and: [ showsClean ]) ifTrue: [ result add: cleanMessage ].
+			^result
+		)
+		recheckDraft = (
+			draftFailure:: nil.
+			draftErrors:: [
+				ide typechecker checkDraft: draftSource
+					kind: owner typeKind
+					ofClass: owner typeMixin
+			] on: Error
+				do: [:e <Exception> |
+					ide noteSwallowed: e in: 'type check of unaccepted code'.
+					draftFailure:: 'Typechecker failed: ' , e printString.
+					nil
+				].
+			draftGeneration:: ide typechecker generation
+		)
+		public showAll = (
+			dismissed:: Set new
+		)
+		public subjectForDeclaration: d <Declaration> ^<Subject | Nil> = (
+			(* A subject that opens the member d names; nil if it no longer exists. *)
+			
+			| mixin <MixinMirror | Nil> = ide typechecker mixinForDeclaration: d. m |
+			mixin isNil ifTrue: [ ^nil ].
+			d kind = #classHeader ifTrue: [ ^ClassSubject onModel: mixin declaration ].
+			m:: [
+				d kind = #method ifTrue: [ mixin methods findMirrorNamed: d name ]
+					ifFalse: [ mixin lazySlots findMirrorNamed: d name ]
+			] on: Error
+				do: [:e <Exception> |
+					ide noteSwallowed: e in: 'finding a dependent member'.
+					nil
+				].
+			m isNil ifTrue: [ ^nil ].
+			d kind = #method ifTrue: [
+					^MethodSubject onMethodModel: (MethodModel method: m exemplar: nil)
+				].
+			^LazySlotSubject onLazySlotModel: (LazySlotModel slot: m exemplar: nil)
+		)
+		public visibleMessages ^<List[String]> = (
+			^messages select: [:m <String> | (dismissed includes: m) not ]
+		)
+	) : ()
 	class MethodEvaluatorPresenter onSubject: s = EvaluatorPresenter onSubject: s (
 	) (
 		acceptResponse ^<[:CodeMirrorFragment :Event | Object]> = (
@@ -5517,6 +5647,11 @@ repository panel.</li>
 			methodEvaluatorPresenter <EvaluatorPresenter>
 		|
 	) (
+		acceptableEditor ^<CodeMirrorFragment | Nil> = (
+			(* The editor Typecheck and Accept accepts from; nil in exemplar mode, where the editor is an evaluator. *)
+			
+			^methodEditor
+		)
 		acceptResponse ^<[:CodeMirrorFragment :Event | Object]> = (
 			^[:ed <CodeMirrorFragment> :event <Event> |
 				| b <MixinBuilder> = subject methodMirror definingMixin asBuilder. canonical |
@@ -5525,16 +5660,10 @@ repository panel.</li>
 							canonical:: ide prettyPrintMethodOr: ed textBeingAccepted.
 							b methods addFromSource: canonical.
 							ide installFromBuilders: {b declaration. }.
-							subject clearTypeErrors.
-							[
-								ide reportRecheckFrom: (ide typechecker declarationForMember: subject name
-										kind: #method
-										ofClass: subject methodMirror definingMixin)
-									onSubject: subject
-							] on: Error
-								do: [:e <Exception> |
-									ide noteSwallowed: e in: 'type re-check after method Accept'
-								].
+							
+							(* The install re-checked the dependents; check the member itself. The banner reads the result from the model. *)
+							subject typeStatus dropDraft;
+								checkInstalled.
 							ed text: canonical.
 							colorizeMethodSource: (crToLf: canonical) withEditor: ed.
 							ed leaveEditState
@@ -5548,7 +5677,8 @@ repository panel.</li>
 				| src = ide prettyPrintMethodOr: (crToLf: subject source). |
 				ed text: src.
 				colorizeMethodSource: src withEditor: ed.
-				ed leaveEditState
+				ed leaveEditState.
+				updateGUI: [ subject typeStatus dropDraft ]
 			]
 		)
 		changeResponse ^<[:CodeMirrorFragment :Event | Object]> = (
@@ -5614,6 +5744,18 @@ repository panel.</li>
 				]
 				initiallyExpanded: mustBeExpanded.
 			^toggle
+		)
+		editorBufferText ^<String | Nil> = (
+			(* The editor's text when it may differ from the installed code, else nil. A CodeMirror editor knows whether it has been edited; the exemplar evaluator's editor does not, so its text is always passed on and compared with the installed source. *)
+			
+			methodEditor isNil ifFalse: [
+					methodEditor isInEditState ifFalse: [ ^nil ].
+					^methodEditor textBeingAccepted
+				].
+			methodEvaluatorPresenter isNil ifFalse: [
+					^methodEvaluatorPresenter editorText
+				].
+			^nil
 		)
 		editorDefinition ^<CodeMirrorFragment | EvaluatorPresenter> = (
 			^hasExemplars ifTrue: [ evaluatorDefinition ]
@@ -5792,7 +5934,9 @@ repository panel.</li>
 				updateGUI: [ subject delete ]
 			]. }. #separator. {'Pretty Print'. [ respondToPrettyPrint ]. }. #separator. {'Typecheck'. [
 				respondToTypecheck
-			]. }. #separator. {'Inspect Presenter'. [ respondToInspectPresenter ]. }. }. |
+			]. }. {'Typecheck and Accept'. [ respondToTypecheckAndAccept ]. }. #separator. {'Inspect Presenter'. [
+				respondToInspectPresenter
+			]. }. }. |
 			hasExemplars ifTrue: [
 					labelsAndActions:: labelsAndActions , {#separator. {'Add Evaluator'. [
 						respondToAddMethodWorkspace
@@ -5854,42 +5998,21 @@ repository panel.</li>
 			ed editor focus
 		)
 		respondToTypecheck = (
-			(* Run the typechecker on the current method source (editor buffer
-       if non-empty, else the installed source) and surface results in
-       the typeErrorMessages banner column below the editor.
-       Source priority: codeMirror editor (no-exemplar mode), else the
-       embedded evaluator's editor (exemplar mode), else the installed
-       source. *)
+			(* Typecheck the editor's text -- unaccepted code included, so errors are found before the code enters the system. An unedited editor is checked as the installed member, recorded in the typechecker's model. The banner shows the result through the subject's type status. *)
 			
-			| source typed mixin errs failureMessage |
-			typed:: methodEditor isNil ifTrue: [
-					methodEvaluatorPresenter isNil ifTrue: [ nil ]
-						ifFalse: [ methodEvaluatorPresenter editorText ]
-				]
-				ifFalse: [ methodEditor textBeingAccepted ].
-			source:: (typed isNil or: [ typed isEmpty ]) ifTrue: [ subject source ]
-				ifFalse: [ typed ].
-			mixin:: subject methodMirror definingMixin.
-			subject clearTypeErrors.
-			failureMessage:: nil.
-			errs:: [ ide typechecker typecheckMethodSource: source ofClass: mixin ] on: Error
-				do: [:e |
-					failureMessage:: 'Typechecker failed: ' , e printString.
-					nil
+			updateGUI: [ subject typeStatus checkSource: editorBufferText ]
+		)
+		respondToTypecheckAndAccept = (
+			(* Typecheck the editor's text and accept it only if it has no type errors itself. Breaking a dependent does not block acceptance; the dependents summary then shows what broke. With nothing edited, or no accepting editor (exemplar mode), this is just Typecheck. *)
+			
+			| ed <CodeMirrorFragment | Nil> = acceptableEditor. status <MemberTypeStatus> = subject typeStatus. errs |
+			(ed isNil or: [ ed isInEditState not ]) ifTrue: [ ^respondToTypecheck ].
+			status checkSource: ed textBeingAccepted.
+			errs:: status errors.
+			(status failure isNil and: [ errs isNil not and: [ errs isEmpty ] ]) ifTrue: [
+					^acceptResponse value: ed value: nil
 				].
-			updateGUI: [
-					failureMessage isNil ifFalse: [
-							subject typeErrorMessages add: failureMessage
-						]
-						ifTrue: [
-							errs isEmpty ifTrue: [ subject typeErrorMessages add: 'No type errors.' ]
-								ifFalse: [
-									errs do: [:e |
-											subject typeErrorMessages add: 'Type error: ' , e message , ' [' , e start printString , '-' , e end printString , ']'
-										]
-								]
-						]
-				]
+			updateGUI: []
 		)
 		public tag ^<String> = (
 			^subject name
@@ -5898,15 +6021,8 @@ repository panel.</li>
 			historyHolder content isKindOfBlankFragment ifTrue: [ installHistory ]
 				ifFalse: [ historyHolder content: nothing ]
 		)
-		typeErrorDisplay: msg <String> ^<Fragment> = (
-			| textColor |
-			textColor:: msg = 'No type errors.' ifTrue: [ Color r: 0 g: 0.5 b: 0 ]
-				ifFalse: [ Color r: 0.7 g: 0 b: 0 ].
-			^row: {(label: msg) color: textColor. button: 'Clear'
-					action: [ updateGUI: [ subject typeErrorMessages remove: msg ] ]. }
-		)
 		typeErrorMessages ^<Array[Fragment]> = (
-			^(subject typeErrorMessages collect: [:msg <String> | typeErrorDisplay: msg ]) asArray
+			^typeStatusDisplayFor: subject typeStatus
 		)
 		updateVisualsFromSameKind: oldPresenter <Self> ^<Alien[Element]> = (
 			(* Preserve whether the embedded history view was showing across
@@ -5926,7 +6042,6 @@ repository panel.</li>
 		
 		|
 			public errorMessages <Set[String]> = Set new.
-			public typeErrorMessages <Set[String]> = Set new.
 			public exemplars <List[String]> = computeExemplars.
 			public exemplar <String>
 			evaluator_slot <EvaluationSubject>
@@ -5934,6 +6049,7 @@ repository panel.</li>
 			public threadMap <Map[Symbol, ThreadMirror | Error]> = Map new.
 		|
 	) (
+		lazy public typeStatus <MemberTypeStatus> = (* What this member's editor shows about type errors; see MemberTypeStatus. *) MemberTypeStatus for: self.
 		public accessModifier ^<Symbol> = (
 			^methodMirror accessModifier
 		)
@@ -5956,9 +6072,6 @@ repository panel.</li>
 		)
 		public clearErrors = (
 			errorMessages removeAll: errorMessages
-		)
-		public clearTypeErrors = (
-			typeErrorMessages removeAll: typeErrorMessages
 		)
 		public compileSource: src <String> ifSuccess: successBlock <[:MethodMirror | Object]> ifFailure: failureBlock <[:String | Object]> = (
 			(* Canonicalise via prettyPrintMethodOr: before compiling. *)
@@ -6044,6 +6157,9 @@ repository panel.</li>
 		public hasMethodWorkspace ^<Boolean> = (
 			^workspace_slot isNil not
 		)
+		public installedTypeSource ^<String> = (
+			^source
+		)
 		public isKindOfMethodSubject ^<Boolean> = (
 			^true
 		)
@@ -6096,6 +6212,15 @@ repository panel.</li>
 			| thread <ThreadMirror | Error> = threadMap at: e asSymbol
 				ifAbsentPut: [ processExemplar: e ]. |
 			^thread
+		)
+		public typeDeclaration ^<Declaration> = (
+			^ide typechecker declarationForMember: name kind: typeKind ofClass: typeMixin
+		)
+		public typeKind ^<Symbol> = (
+			^#method
+		)
+		public typeMixin ^<MixinMirror> = (
+			^methodMirror definingMixin
 		)
 		public workspace = (
 			workspace_slot isNil ifTrue: [
@@ -6856,18 +6981,14 @@ repository panel.</li>
 			^key
 		)
 		public typecheckReportSubject ^<ClassTypecheckReportSubject> = (
-			(* Typecheck every class in this namespace, each recursing into its nested
-	   classes via ClassSubject>>collectTypecheckEntriesWith:into:prefix:, sharing
-	   one typechecker across the whole sweep, and return an aggregated summary
-	   report. Documents, forms, and nested namespaces are skipped (only
-	   behaviors are typecheckable — same filter as the IDE's makeTypechecker).
-	   Per-member banners are populated on the cached class subjects, so they
-	   show when those classes are opened from this namespace. *)
+			(* Typecheck every class in this namespace, each recursing into its nested classes via ClassSubject>>collectTypecheckEntriesWith:into:prefix:, with the IDE's typechecker, and return an aggregated summary report. Documents, forms, and nested namespaces are skipped (only behaviors are typecheckable -- same filter as the IDE's makeTypechecker). Each member's errors are recorded in the typechecker's model, so they show when those classes are opened. *)
 			
-			| tc <NewspeakTypechecker> = ide freshTypechecker. entries <List[TypecheckReportEntry]> = List new. subs <Map[Symbol, Subject]> = namespaceSubjects. |
+			| entries <List[TypecheckReportEntry]> = List new. subs <Map[Symbol, Subject]> = namespaceSubjects. |
 			namespace keysAndValuesDo: [:k <Symbol> :v |
 					v isKindOfBehavior ifTrue: [
-							(subs at: k) collectTypecheckEntriesWith: tc into: entries prefix: ''
+							(subs at: k) collectTypecheckEntriesWith: ide typechecker
+								into: entries
+								prefix: ''
 						]
 				].
 			^ClassTypecheckReportSubject onClassNamed: title entries: entries
@@ -7552,6 +7673,19 @@ are presenting. *)
 						cp
 					]. }
 		)
+		brokenDependentLink: d <Declaration> of: status <MemberTypeStatus> ^<Fragment> = (
+			(* A link that opens a broken dependent, with its current error count. *)
+			
+			| count <Integer> = status errorCountOf: d. |
+			^row: {smallBlank. link: (status describe: d) , ' (' , count printString , (count = 1 ifTrue: [
+							' error)'
+						]
+						ifFalse: [ ' errors)' ])
+					action: [
+						| s <Subject | Nil> = status subjectForDeclaration: d. |
+						s isNil ifFalse: [ enterSubject: s ]
+					]. }
+		)
 		browseClass: klass <Behavior | ClassDeclarationMirror> = (
 			| decl <ClassDeclarationMirror> = klass isKindOfClassDeclarationMirror ifTrue: [
 					klass
@@ -7684,6 +7818,37 @@ are presenting. *)
 		)
 		tertiaryTextColor = (
 			^Color gray: 0.8
+		)
+		typeMessageDisplay: msg <String> of: status <MemberTypeStatus> ^<Fragment> = (
+			| textColor |
+			textColor:: msg = status cleanMessage ifTrue: [ Color r: 0 g: 0.5 b: 0 ]
+				ifFalse: [ Color r: 0.7 g: 0 b: 0 ].
+			^row: {(label: msg) color: textColor. button: 'Clear'
+					action: [ updateGUI: [ status dismiss: msg ] ]. }
+		)
+		typeStatusDisplayFor: status <MemberTypeStatus> ^<Array[Fragment]> = (
+			(* The type-error banner of a member editor. Computed on every render from the subject's type status, which reads the typechecker's model, so an open editor shows current errors -- including errors caused by edits elsewhere. *)
+			
+			| result <List[Fragment]> = List new. visible <List[String]> = status visibleMessages. hidden <Integer> = status hiddenCount. broken <List[Declaration]> = status brokenDependents. grey = Color r: 0.4
+				g: 0.4
+				b: 0.4. |
+			(status isDraft and: [ visible isEmpty not ]) ifTrue: [
+					result add: ((label: 'Unaccepted code:') color: grey)
+				].
+			visible do: [:msg <String> |
+					result add: (typeMessageDisplay: msg of: status)
+				].
+			hidden > 0 ifTrue: [
+					result add: (row: {(label: hidden printString , ' hidden. ') color: grey. link: 'Show all'
+								action: [ updateGUI: [ status showAll ] ]. })
+				].
+			broken isEmpty ifFalse: [
+					result add: ((label: 'Dependents with type errors:') color: (Color r: 0.7
+								g: 0
+								b: 0)).
+					broken do: [:d | result add: (brokenDependentLink: d of: status) ]
+				].
+			^result asArray
 		)
 		updateVisualsFromSameKind: oldPresenter <Self> ^<Alien[Element]> = (
 			(* Reinstall a fresh chat-toggle on refresh, preserving the user's

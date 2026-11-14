@@ -158,6 +158,9 @@ Use and distribution of this software is subject to the terms of the attached so
 	arrayMixin:: (kernelMixin nestedClasses findMirrorNamed: #_Array) instanceSide.
 	seedBuiltinSuperclasses.
 ) (
+	lazy affectedDependents <Map[Declaration, Set[Declaration]]> ::= (* For each changed declaration, the dependents its changes have caused to be re-checked. brokenDependentsOf: filters these by their CURRENT errors, so the list stays live. *) Map new.
+	lazy errorsByDeclaration <Map[Declaration, Set[TypeError]]> ::= (* The model the IDE's editors render: for each declaration of INSTALLED code, its error set as of its last check. Written only by recheckDeclaration:, through which every re-check of installed code goes; draft checks (checkDraft:kind:ofClass:) never touch it. No entry means never checked, or removed since. Lazy so hot-loading cannot leave a live typechecker with it unset. *) Map new.
+	lazy public generation <Integer> ::= (* Advances whenever the model (errorsByDeclaration) changes or anything is invalidated. Clients that cache results derived from the typechecker -- an editor's check of its unaccepted buffer -- recompute when it has moved. *) 0.
 	lazy public lastNotedChanges <Map[Declaration, Set[TypeError]]> ::= (* The dependents re-checked by the most recent install (noteTypeChangesFor:from:in:),
 each with its fresh error set. Reset by typeSnapshotsFor:in: at the start of every
 install. Later re-checks do not touch it, so it remains the authoritative answer to
@@ -1475,10 +1478,9 @@ bound. *)
 				].
 			(m isKindOfSlotDeclarationMirror or: [ m isKindOfLazySlotMirror ]) ifTrue: [
 					| slotType |
-					s:: signatureFor: m.
-					slotType:: s type.
 					
-					(* Defensive: if type is nil, use errorType *)
+					(* signatureFor: answers the slot's type annotation itself, or nil if the slot has none. An unannotated slot is reported at its own declaration; here it is just ErrorType, so its uses do not cascade. *)
+					slotType:: signatureFor: m.
 					slotType isNil ifTrue: [ ^errorType ].
 					^applyForeignSignature: slotType with: self
 				].
@@ -1501,17 +1503,7 @@ bound. *)
 					^returnType
 				].
 			
-			(* The name did not resolve to any type: it is an undefined type. Report it
-         (then return errorType so its uses don't cascade), UNLESS we are resolving
-         another declaration's signature (suppressUndefinedDepth > 0 -- that error
-         belongs to, and is reported by, that declaration), or the name is the #def
-         pseudo-keyword of <def E> sugar. This single site covers every annotation
-         position: locals, slots, parameters, return types, generic arguments, tuple
-         element types, and block parameter/return types -- all resolve through here. *)
-			
-			(* Report only when the name resolved to NOTHING (m is nil). A non-nil result
-         that isn't one of the mirror kinds above (e.g. BottomType for the
-         DoesNotMatter pseudo-type) is a valid type and must not be flagged. *)
+			(* The name did not resolve to any type: it is an undefined type. Report it (then return errorType so its uses don't cascade), UNLESS we are resolving another declaration's signature (suppressUndefinedDepth > 0 -- that error belongs to, and is reported by, that declaration), or the name is the #def pseudo-keyword of <def E> sugar. This single site covers every annotation position: locals, slots, parameters, return types, generic arguments, tuple element types, and block parameter/return types -- all resolve through here. Report only when the name resolved to NOTHING (m is nil). A non-nil result that isn't one of the mirror kinds above (e.g. BottomType for the DoesNotMatter pseudo-type) is a valid type and must not be flagged. *)
 			(m isNil and: [
 					(node name = #def) not and: [
 							(currentMethodTypeParams includes: node name) not
@@ -1724,6 +1716,16 @@ order answer false, which over-invalidates rather than missing a change. *)
 		popScope.
 		^ClosureType parameterTypes: domain returnType: range
 	)
+	public brokenDependentsOf: d <Declaration> ^<List[Declaration]> = (
+		(* The dependents that changes to d have caused to be re-checked and that currently have type errors. Read from the model on every call, so it follows those dependents as they are fixed or broken again. Order unspecified. *)
+		
+		| result <List[Declaration]> = List new. |
+		(affectedDependents at: d ifAbsent: [ ^result ]) do: [:dep <Declaration> |
+				| errs <Set[TypeError] | Nil> = errorsFor: dep. |
+				errs isNil ifFalse: [ errs isEmpty ifFalse: [ result add: dep ] ]
+			].
+		^result
+	)
 	cacheableSignature: t <Type> ^<Boolean> = (
 		(* Error and access-error signature results must not be cached: an undefined
 selector may become defined after an edit, and the cycle guard returns errorType
@@ -1745,11 +1747,22 @@ walk to distinguish a genuine not-found from a transient cycle break first. *)
 	public characterNode: node <CharacterAST> ^<ObjectType> = (
 		^literal: #Character
 	)
+	public checkDeclaration: d <Declaration> ^<Set[TypeError] | Nil> = (
+		(* Re-check the installed declaration d itself and record the result in the model. Its dependents are not re-checked: the install hook has already done that for any change. Its old dependency edges are dropped first so the check rebuilds them from the current source. Answers d's fresh errors, or nil if d names no checkable installed member. *)
+		
+		removeDependenciesOf: d.
+		^recheckDeclaration: d
+	)
+	public checkDraft: src <String> kind: k <Symbol> ofClass: mixin <Class | MixinMirror> ^<Set[TypeError]> = (
+		(* Typecheck source that is NOT installed -- an editor's unaccepted buffer -- as a member of kind k (#method, #lazySlot or #classHeader) of mixin. Answers its errors without recording them as the member's current errors (errorsFor:). The check does register the dependency edges it used; edges only accumulate until the member is next invalidated, so a draft check can cause an extra re-check but never a missed one. *)
+		
+		k = #method ifTrue: [ ^typecheckMethodSource: src ofClass: mixin ].
+		k = #lazySlot ifTrue: [ ^typecheckLazySlot: src ofClass: mixin ].
+		k = #classHeader ifTrue: [ ^typecheckClassHeader: src ofClass: mixin ].
+		^Error signal: 'checkDraft: unknown kind ' , k
+	)
 	public clearQueryState = (
-		(* Drop all memoized query results and dependency edges -- a full reset of the
-	incremental state, leaving the structure caches reseeded. Not used on the normal
-	per-check path (results persist and are pruned by invalidateDeclaration:); this
-	is the escape hatch for a from-scratch re-typecheck. *)
+		(* Drop all memoized query results, dependency edges and recorded errors -- a full reset of the incremental state, leaving the structure caches reseeded. Not used on the normal per-check path (results persist and are pruned by invalidateDeclaration:); this is the escape hatch for a from-scratch re-typecheck. *)
 		
 		cachedTypes:: Map new.
 		trail:: Map new.
@@ -1757,10 +1770,11 @@ walk to distinguish a genuine not-found from a transient cycle break first. *)
 		dependentQueries:: Map new.
 		queriesOfDeclaration:: Map new.
 		namespaceDependents:: Map new.
+		errorsByDeclaration:: Map new.
+		affectedDependents:: Map new.
+		generation:: generation + 1.
 		
-		(* Safe to drop here, unlike in flushClassStructureCaches: with every cached
-	answer gone there is nothing left for a downward walk to invalidate, and the
-	index refills as classes are queried again. *)
+		(* Safe to drop here, unlike in flushClassStructureCaches: with every cached answer gone there is nothing left for a downward walk to invalidate, and the index refills as classes are queried again. *)
 		subclassIndex:: Map new.
 		flushClassStructureCaches
 	)
@@ -1779,6 +1793,31 @@ walk to distinguish a genuine not-found from a transient cycle break first. *)
 		node statements do: [:s <Statement> | lastStatementType:: s apply: self ].
 		popScope.
 		^lastStatementType
+	)
+	computeErrorsOf: d <Declaration> ^<Set[TypeError] | Nil> = (
+		(* Typecheck the installed member a Declaration names, answering its fresh error set, or nil if the member no longer exists (class/member removed) or the kind is not directly checkable (#absent / #expression). A check that raises answers a single 'Typechecker failed' error rather than nil, so the failure is recorded and shown instead of looking like an unchecked member. Records nothing; see recheckDeclaration:. *)
+		
+		| mixin <MixinMirror | Nil> member |
+		mixin:: mixinForDeclaration: d.
+		mixin isNil ifTrue: [ ^nil ].
+		d kind = #classHeader ifTrue: [
+				^[ typecheckClassHeader: mixin declaration header source ofClass: mixin ] on: Error
+					do: [:e | failureErrors: e ]
+			].
+		d kind = #method ifTrue: [
+				member:: [ localMember: d name in: mixin ] on: Error do: [:e | nil ].
+				(member isNil or: [ member source isNil ]) ifTrue: [ ^nil ].
+				^[ typecheckMethodSource: member source ofClass: mixin ] on: Error
+					do: [:e | failureErrors: e ]
+			].
+		d kind = #lazySlot ifTrue: [
+				member:: [ mixin lazySlots findMirrorNamed: d name ] on: Error
+					do: [:e | nil ].
+				(member isNil or: [ member source isNil ]) ifTrue: [ ^nil ].
+				^[ typecheckLazySlot: member source ofClass: mixin ] on: Error
+					do: [:e | failureErrors: e ]
+			].
+		^nil
 	)
 	computeSuperclassOf: klass <MixinMirror> ^<MixinMirror | Nil> = (
 		(* The superclass of klass, for the inheritance walk. Never reports: this runs
@@ -2016,6 +2055,11 @@ raising out of a typecheck. *)
 	error: msg <String> at: location <Pair[Integer]> = (
 		errorSet add: (TypeError message: msg start: location first end: location last)
 	)
+	public errorsFor: d <Declaration> ^<Set[TypeError] | Nil> = (
+		(* The current type errors of the installed declaration d, as of its last check; nil if it has never been checked, or no longer exists. *)
+		
+		^errorsByDeclaration at: d ifAbsent: [ nil ]
+	)
 	evalInferenceExpr: expr args: args <List[ObjectType]> receiverType: rt <ObjectType> ^<ObjectType> = (
 		(* Evaluate a `where`-clause inference expression to a type. *)
 		
@@ -2100,6 +2144,15 @@ raising out of a typecheck. *)
 		instanceSide:: receiverType mixin declaration instanceSide.
 		^GenericType generic: (ObjectType forMixin: instanceSide)
 			typeArguments: accessorArgs , sendArgs
+	)
+	failureErrors: e <Exception> ^<Set[TypeError]> = (
+		(* The error set recorded for a member whose check raised e: one error naming the failure, at the start of the member. *)
+		
+		| result <Set[TypeError]> = Set new. |
+		result add: (TypeError message: 'Typechecker failed: ' , e printString
+				start: 1
+				end: 1).
+		^result
 	)
 	flushClassStructureCaches = (
 		(* A class header / superclass change can alter subtype relations and
@@ -2329,9 +2382,10 @@ member and heads no class. *)
 		^affected
 	)
 	invalidateDependenciesOn: declaration <Declaration> ^<Set[Declaration]> = (
-		(* Will invalidate all queries that depended on the declaration. *)
+		(* Will invalidate all queries that depended on the declaration. Advances generation: anything derived from those queries may now be stale. *)
 		
 		| queries <Set[Query]> invalidDeclarations <Set[Declaration]> = Set new. |
+		generation:: generation + 1.
 		queries:: dependentQueries at: declaration ifAbsent: [ ^invalidDeclarations ].
 		queries do: [:q <Query> |
 				q invalidate.
@@ -2556,7 +2610,9 @@ type's classDeclaration. First check scope of mixin , otherwise climb the enclos
 			].
 		^names
 	)
-	mixinForDeclaration: d <Declaration> ^<MixinMirror | Nil> = (
+	public mixinForDeclaration: d <Declaration> ^<MixinMirror | Nil> = (
+		(* The mixin that holds the member d names, or nil if there is none. Public so the IDE can open a dependent named by a Declaration. *)
+		
 		^[ unsafeMixinForDeclaration: d ] on: Error do: [:e | nil ]
 	)
 	mixinOf: c <Class | MixinMirror> ^<MixinMirror> = (
@@ -2601,6 +2657,18 @@ Otherwise, check the main namespace. *)
 	)
 	nonPrivate: m <Mirror> ^<Boolean> = (
 		^m ~= nil and: [ m accessModifier ~= #private ]
+	)
+	noteDependentsIn: results <Map[Declaration, Set[TypeError]]> of: roots <Collection[Declaration]> = (
+		(* Record that the changes to each of roots caused the declarations re-checked in results to be re-checked (see brokenDependentsOf:). *)
+		
+		roots do: [:r <Declaration> |
+				results keysAndValuesDo: [:dep <Declaration> :errs |
+						dep = r ifFalse: [
+								(affectedDependents at: r
+									ifAbsent: [ affectedDependents at: r put: Set new ]) add: dep
+							]
+					]
+			]
 	)
 	public noteTypeChangesFor: builders <Array[ClassDeclarationBuilder]> from: snapshots <Map[Symbol, Map]> in: ns <Map[Symbol, Object]> ^<Map[Declaration, Set[TypeError]]> = (
 		(* Install hook, part 2. After the install, diff each class against its
@@ -2799,13 +2867,7 @@ always correct here; a missed invalidation is silent staleness. *)
 		^recheckSeeded: (invalidateNamespaceName: name)
 	)
 	public recheckChangesFrom: old <Map[Declaration, String]> to: new <Map[Declaration, String]> ^<Map[Declaration, Set[TypeError]]> = (
-		(* Diff two snapshots (snapshotOfClass:) of the same class taken around an
-	install. Every added, removed or edited declaration is invalidated -- headers
-	first, so the structure caches are flushed before member lookups are recomputed
-	-- and their transitive DEPENDENTS are re-typechecked. The changed declarations
-	themselves are not re-checked here: callers that display them (the editors) do
-	that, and checking every member of a freshly loaded module would be costly.
-	Returns each re-checked dependent's fresh error set. *)
+		(* Diff two snapshots (snapshotOfClass:) of the same class taken around an install. Every added, removed or edited declaration is invalidated -- headers first, so the structure caches are flushed before member lookups are recomputed -- and their transitive DEPENDENTS are re-typechecked. A changed declaration is itself re-checked only if it had been checked before (the model knows it), so an editor already showing it stays current; checking every member of a freshly loaded module would be costly. The re-checked dependents are recorded as affected by the changed declarations (brokenDependentsOf:). Returns each re-checked dependent's fresh error set. *)
 		
 		| headers <List[Declaration]> = List new. others <List[Declaration]> = List new. results <Map[Declaration, Set[TypeError]]> = Map new. worklist <List[Declaration]> = List new. queued <Set[Declaration]> = Set new. |
 		old keysAndValuesDo: [:d <Declaration> :src |
@@ -2844,34 +2906,22 @@ always correct here; a missed invalidation is silent staleness. *)
 							]
 					]
 			].
+		{headers. others. } do: [:group <List[Declaration]> |
+				group do: [:d <Declaration> |
+						(errorsByDeclaration includesKey: d) ifTrue: [ recheckDeclaration: d ]
+					].
+				noteDependentsIn: results of: group
+			].
 		^results
 	)
 	recheckDeclaration: d <Declaration> ^<Set[TypeError] | Nil> = (
-		(* Re-typecheck the member a Declaration names, returning its fresh error set,
-	or nil if the member no longer exists (class/member removed) or the kind is not
-	directly checkable (#absent / #expression). *)
+		(* Re-typecheck the installed member d names and record the outcome as its current errors (errorsFor:): its fresh error set, or -- if the member no longer exists or its kind is not directly checkable -- no entry at all. Every re-check of installed code goes through here; that is what keeps the model current. *)
 		
-		| mixin <MixinMirror | Nil> member |
-		mixin:: mixinForDeclaration: d.
-		mixin isNil ifTrue: [ ^nil ].
-		d kind = #classHeader ifTrue: [
-				^[ typecheckClassHeader: mixin declaration header source ofClass: mixin ] on: Error
-					do: [:e | nil ]
-			].
-		d kind = #method ifTrue: [
-				member:: [ localMember: d name in: mixin ] on: Error do: [:e | nil ].
-				(member isNil or: [ member source isNil ]) ifTrue: [ ^nil ].
-				^[ typecheckMethodSource: member source ofClass: mixin ] on: Error
-					do: [:e | nil ]
-			].
-		d kind = #lazySlot ifTrue: [
-				member:: [ mixin lazySlots findMirrorNamed: d name ] on: Error
-					do: [:e | nil ].
-				(member isNil or: [ member source isNil ]) ifTrue: [ ^nil ].
-				^[ typecheckLazySlot: member source ofClass: mixin ] on: Error
-					do: [:e | nil ]
-			].
-		^nil
+		| errs <Set[TypeError] | Nil> = computeErrorsOf: d. |
+		errs isNil ifTrue: [ errorsByDeclaration removeKey: d ifAbsent: [] ]
+			ifFalse: [ errorsByDeclaration at: d put: errs ].
+		generation:: generation + 1.
+		^errs
 	)
 	public recheckFrom: d <Declaration> ^<Map[Declaration, Set[TypeError]]> = (
 		(* The edited declaration d changed: re-typecheck it and everything that
@@ -2928,13 +2978,7 @@ the loop stops at the first difference: one is enough to answer #changed. *)
 		^#changed
 	)
 	recheckSeeded: seeds <Collection[Declaration]> ^<Map[Declaration, Set[TypeError]]> = (
-		(* Work-list re-typecheck: starting from the seed declarations, re-check each,
-	follow its dependents transitively, and return each re-checked declaration's
-	fresh error set. invalidateDeclaration: per node drops that node's stale cached
-	queries (so its re-check recomputes against current sources) and yields its
-	dependents to enqueue. Over-eager (cascades to all transitive dependents, not
-	only when a signature changed) -- always correct; pruning is a later
-	optimization. The `queued` set bounds it to the finite dependency graph. *)
+		(* Work-list re-typecheck: starting from the seed declarations, re-check each, follow its dependents transitively, and return each re-checked declaration's fresh error set. invalidateDeclaration: per node drops that node's stale cached queries (so its re-check recomputes against current sources) and yields its dependents to enqueue. Over-eager (cascades to all transitive dependents, not only when a signature changed) -- always correct; pruning is a later optimization. The `queued` set bounds it to the finite dependency graph. The re-checked dependents are recorded as affected by the seeds (brokenDependentsOf:). *)
 		
 		| results <Map[Declaration, Set[TypeError]]> = Map new. worklist <List[Declaration]> = List new. queued <Set[Declaration]> = Set new. |
 		seeds do: [:s <Declaration> |
@@ -2955,6 +2999,7 @@ the loop stops at the first difference: one is enough to answer #changed. *)
 							]
 					]
 			].
+		noteDependentsIn: results of: seeds.
 		^results
 	)
 	recordSuperclassOf: klass <MixinMirror> is: superMixin <MixinMirror | Nil> ^<MixinMirror | Nil> = (

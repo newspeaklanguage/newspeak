@@ -89,6 +89,47 @@ check('notices_text finds only the notice paragraph',
       bus.notices_text(REQUEST).startswith('IMPORTANT')
       and 'You are the IDE assistant' not in bus.notices_text(REQUEST))
 
+# --- the preamble rides the system prompt (2026-11-13) --------------------
+# As user text it lost to Claude Code's file-centred context, and the agent
+# answered questions about live code from disk.
+preamble = getattr(bus, 'PREAMBLE', '')
+check('preamble is not in the user message',
+      'You are the model behind' not in clean)
+check('the chat system text still leads the first message',
+      clean.startswith("--- The chat's system instructions ---")
+      and 'You are the IDE assistant' in clean)
+check('preamble makes the live image the source of truth',
+      'LIVE IMAGE is the source of truth' in preamble)
+
+
+class _Stop(Exception):
+    pass
+
+
+def _capture_cmd(cmd, **kw):
+    raise _Stop(cmd)
+
+
+class _Args:
+    claude_bin, claude_args, cwd = 'claude', None, None
+
+
+_popen = bus.subprocess.Popen
+bus.subprocess.Popen = _capture_cmd
+try:
+    bus.run_claude('hi', _Args())
+    sent = []
+except _Stop as s:
+    sent = s.args[0]
+except Exception:
+    sent = []
+finally:
+    bus.subprocess.Popen = _popen
+check('run_claude appends the preamble to the system prompt',
+      '--append-system-prompt' in sent
+      and sent[sent.index('--append-system-prompt') + 1] == preamble,
+      '' if sent else 'could not capture the command line')
+
 # --- the newest message is what a delta sends -----------------------------
 check('delta sends the newest message', 'any news?' in delta)
 check('delta does not resend the history', 'what broke?' not in delta)

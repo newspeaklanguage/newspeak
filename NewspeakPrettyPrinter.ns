@@ -121,6 +121,15 @@ Slots:
 			private commentIdxAnchor <Integer> ::= 1.
 			private commentWindowHi <Integer | Nil>
 			private consumedFlags <List[Boolean] | Nil>
+			
+			(* Single-line layout attempt state (see trySingleLine:orMultiLine:).
+	   singleLineAbort is non-nil exactly while an attempt is running:
+	   a block whose non-local return abandons the attempt, called by
+	   emit: and newline the moment the output stops fitting on one
+	   line. consumedUndo lists the consumedFlags entries the attempt
+	   set, so a rollback can clear just those. *)
+			private singleLineAbort <[] | Nil>
+			private consumedUndo <List[Integer] | Nil>
 		|
 	) (
 		advanceCursorPast: node = (
@@ -132,6 +141,18 @@ Slots:
 			node isNil ifTrue: [ ^self ].
 			(node end isNil or: [ node end <= 0 ]) ifTrue: [ ^self ].
 			node end >= cursor ifTrue: [ cursor:: node end + 1 ]
+		)
+		attemptSingleLine: tryBlock ^<Boolean> = (
+			(* Run tryBlock with singleLineAbort armed. Answer true if it
+	   was abandoned because the output stopped fitting on one line,
+	   false if it ran to completion on one line. The abort block's
+	   non-local return unwinds straight out of however deep the
+	   attempt had got, so a failed attempt costs at most a line's
+	   worth of output, not a full layout of the subtree. *)
+			
+			singleLineAbort:: [ ^true ].
+			[ tryBlock value ] ensure: [ singleLineAbort:: nil ].
+			^false
 		)
 		public binaryTypeOpNode: node = (
 			emitBinaryTypeOp: node
@@ -239,7 +260,7 @@ Slots:
 			limit:: clampToWindow: pos.
 			idx:: commentIndexFrom: cursor.
 			[ idx <= commentTable size and: [ ((commentTable at: idx) at: 1) < limit ] ] whileTrue: [
-					consumedFlags at: idx put: true.
+					markConsumed: idx.
 					idx:: idx + 1
 				].
 			memoCommentIndex: idx at: limit.
@@ -247,7 +268,12 @@ Slots:
 		)
 		emit: s = (
 			output add: s.
-			column:: column + s size
+			column:: column + s size.
+			singleLineAbort isNil ifFalse: [
+					(column > width or: [ (s indexOf: lf) > 0 ]) ifTrue: [
+							singleLineAbort value
+						]
+				]
 		)
 		emitAccessModifier: am = (
 			(* Emit the access modifier with a trailing space, but only if it's
@@ -574,7 +600,7 @@ Slots:
 					rec:: commentTable at: idx.
 					(consumedFlags at: idx) ifFalse: [
 							emitCommentRecord: rec inline: isInline.
-							consumedFlags at: idx put: true
+							markConsumed: idx
 						].
 					idx:: idx + 1
 				].
@@ -965,7 +991,7 @@ Slots:
 			[ idx <= commentTable size and: [ ((commentTable at: idx) at: 1) < limit ] ] whileTrue: [
 					(consumedFlags at: idx) ifFalse: [
 							emitTrailingCommentRecord: (commentTable at: idx).
-							consumedFlags at: idx put: true
+							markConsumed: idx
 						].
 					idx:: idx + 1
 				].
@@ -1017,16 +1043,24 @@ Slots:
 				]
 		)
 		escapeStringContents: s = (
-			| out |
+			(* Double each single-quote. Copies the runs between quotes into
+	   a StringBuilder: appending char by char with , is quadratic,
+	   and a deploy script held as one 80K literal took seconds. *)
+			
+			| sb pos q |
 			(s indexOf: '''') = 0 ifTrue: [ ^s ].
-			out:: ''.
-			1 to: s size
-				do: [:i |
-					| c |
-					c:: s copyFrom: i to: i.
-					c = '''' ifTrue: [ out:: out , '''''' ] ifFalse: [ out:: out , c ]
+			sb:: StringBuilder new.
+			pos:: 1.
+			[
+				q:: s indexOf: '''' startingAt: pos.
+				q > 0
+			] whileTrue: [
+					sb add: (s copyFrom: pos to: q).
+					sb add: ''''.
+					pos:: q + 1
 				].
-			^out
+			pos <= s size ifTrue: [ sb add: (s copyFrom: pos to: s size) ].
+			^sb asString
 		)
 		extractCommentAt: openerPos <Integer> size: size <Integer> into: comments <List> ^<Integer> = (
 			(* openerPos is the position of the opening parenthesis. Walks
@@ -1302,6 +1336,14 @@ Slots:
 		public literalPatternNode: node = (
 			visitLiteralPattern: node
 		)
+		markConsumed: idx <Integer> = (
+			(* Mark comment idx emitted. During a single-line attempt, log
+	   entries that change so a rollback can restore them. *)
+			
+			(consumedFlags at: idx) ifTrue: [ ^self ].
+			consumedFlags at: idx put: true.
+			consumedUndo isNil ifFalse: [ consumedUndo add: idx ]
+		)
 		membersOf: side do: block = (
 			(* Every member of a side, in bin order. Callers that care about
 	   source order sort or scan for themselves. *)
@@ -1331,6 +1373,7 @@ Slots:
 			visitMixinApplicationClass: node
 		)
 		newline = (
+			singleLineAbort isNil ifFalse: [ singleLineAbort value ].
 			output add: lf.
 			column:: 0.
 			indentLevel timesRepeat: [
@@ -1584,48 +1627,50 @@ Slots:
 			visitSymbol: node
 		)
 		trySingleLine: tryBlock orMultiLine: altBlock = (
-			(* Run tryBlock optimistically. If it produced a newline or pushed
+			(* Run tryBlock optimistically. If it produces a newline or pushes
 	   past the width, roll the output back and run altBlock instead.
-	   commentIdx and consumedFlags must also be saved: comments
+
+	   Each nested construct is laid out once per enclosing attempt at
+	   most, not once per alternative at every level -- the latter made
+	   the cost grow roughly 4-8x per nesting level. Two things keep it
+	   linear:
+	   - An attempt fails fast: emit: and newline abort it as soon as
+	     the line breaks or overflows (see attemptSingleLine:).
+	   - Inside an attempt, a nested trySingleLine:orMultiLine: just
+	     runs its tryBlock. Its alternative could never help: either
+	     tryBlock fits, or it breaks the line, and then so does the
+	     enclosing attempt, which is abandoned anyway.
+
+	   The rollback must also restore the comment state: comments
 	   emitted during a failed attempt would otherwise stay marked
 	   consumed after the output is reverted, silently dropping them.
-	   commentIdx travels with commentIdxAnchor -- the memo is the pair,
-	   and restoring one without the other leaves it claiming an index
-	   for a position it was not taken at. *)
+	   consumedUndo records exactly the flags the attempt set, so the
+	   cost is proportional to the attempt, not to the comment table.
+	   commentIdx travels with commentIdxAnchor -- the memo is the
+	   pair, and restoring one without the other leaves it claiming an
+	   index for a position it was not taken at. *)
 			
-			| startSize savedColumn savedCursor savedIndent broke savedCommentIdx savedAnchor savedConsumed |
+			| startSize savedColumn savedCursor savedIndent savedCommentIdx savedAnchor undo |
+			singleLineAbort isNil ifFalse: [ ^tryBlock value ].
 			startSize:: output size.
 			savedColumn:: column.
 			savedCursor:: cursor.
 			savedIndent:: indentLevel.
 			savedCommentIdx:: commentIdx.
 			savedAnchor:: commentIdxAnchor.
-			savedConsumed:: consumedFlags isNil ifTrue: [ nil ]
-				ifFalse: [
-					| snap |
-					snap:: List new.
-					consumedFlags do: [:b | snap add: b ].
-					snap
+			undo:: List new.
+			consumedUndo:: undo.
+			[ (attemptSingleLine: tryBlock) ifFalse: [ ^self ] ] ensure: [
+					consumedUndo:: nil
 				].
-			tryBlock value.
-			broke:: column > width.
-			broke ifFalse: [
-					startSize + 1 to: output size
-						do: [:i | ((output at: i) indexOf: lf) > 0 ifTrue: [ broke:: true ] ]
-				].
-			broke ifTrue: [
-					[ output size > startSize ] whileTrue: [ output removeLast ].
-					column:: savedColumn.
-					cursor:: savedCursor.
-					indentLevel:: savedIndent.
-					commentIdx:: savedCommentIdx.
-					commentIdxAnchor:: savedAnchor.
-					savedConsumed isNil ifFalse: [
-							1 to: savedConsumed size
-								do: [:i | consumedFlags at: i put: (savedConsumed at: i) ]
-						].
-					altBlock value
-				]
+			[ output size > startSize ] whileTrue: [ output removeLast ].
+			column:: savedColumn.
+			cursor:: savedCursor.
+			indentLevel:: savedIndent.
+			commentIdx:: savedCommentIdx.
+			commentIdxAnchor:: savedAnchor.
+			undo do: [:i | consumedFlags at: i put: false ].
+			altBlock value
 		)
 		public tupleNode: node = (
 			visitTuple: node

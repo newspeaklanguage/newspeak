@@ -1,8 +1,9 @@
 # Eurasia genesis kernel: plan
 
 **Date:** 2026-11-17
-**Status:** Steps 1-4 done (2026-11-17): genesis builds and checks a base image
-(`eurasia/scripts/genesis.sh`). Step 5, differential tests, is next.
+**Status:** Done (2026-11-17). Genesis builds and checks a base image
+(`eurasia/scripts/genesis.sh`), and psoup's kernel tests give the same
+outcome on Eurasia as on psoup (`eurasia/scripts/kernel-tests.sh`, step 5).
 **Context:** `NEW_VM_IMPLEMENTATION_PLAN_2026-11-17.md`, "Decided: genesis,
 then full snapshots". A genesis packager builds the minimum statically; a
 genesis entry finishes initialization in Newspeak on Eurasia and saves the
@@ -153,7 +154,48 @@ Found while bringing it up, beyond the plan:
 - **The failure class is an Exception subclass**: the VM puts the five failure
   fields in its own last five slots.
 
-Not yet: runtime class creation (`InstanceMixin>>apply:…`, which needs the
-`applyMixin:superclass:enclosingObject:` operation and a mixin class whose
-extra data lives in the library field), so object literals and classes not
-pre-built by the packager do not work; method-header decoding (M6); actors.
+**Runtime class creation (step 5's prerequisite).** Every nested-class
+accessor and every object literal creates a class at run time
+(`InstanceMixin>>applyTo:withEnclosingObject:`). In Eurasia the VM creates the
+class and its metaclass in one operation,
+`vm applyMixin: m classMixin: cm superclass: s enclosingObject: eo`; the
+instance mixin's library field, which the VM never reads, holds what the
+kernel needs and the contract lacks: `{class mixin. nested instance mixins.
+access modifier. factory selector}`, written by the genesis packager.
+Accessors need no per-application copies, since their slot indices are
+relative to their mixin. Further top-level modules are packaged as classes
+with no enclosing object (`EurasiaPackager <kernel> <natives> <app>
+[<module> ...] <out>`); the application finds them in its slots named after
+them.
+
+**Differential tests (step 5).** `EurasiaKernelTestRunner` (Eurasia) and
+`EurasiaKernelTestReference` (psoup, with Minitest) run `KernelTests` and
+`AccessModifierTesting` and print one line per test; the script compares
+outcomes against `eurasia/docs/EXPECTED_DIFFERENCES.md`. Minitest's discovery
+needs mirrors and its runner promises, so on Eurasia the tests come from a
+catalog the packager writes and Minitest serves only for `TestContext`. All
+353 tests agree. The first run had 51 differences; the bugs they found:
+
+- the natives table put the arithmetic natives on psoup's
+  `addFromInteger:` family instead of `+ - *` (the table generator took the
+  last keyword of headers like `+ x ... where { Y :: returnType of
+  (addFromInteger: ...) }`), so `4 - 1` answered -3;
+- a class-side mixin's enclosing mixin, and a metaclass's enclosing object,
+  must be the enclosing class's instance side (class-side methods are nested
+  there), so implicit sends from class-side methods failed;
+- psoup runs a method's body when its primitive fails; a failing Eurasia
+  native signals instead, so the natives belong only on the `...Again:`
+  methods psoup keeps for the primitive alone (`String withAllAgain:`,
+  `Closure valueWithArgumentsAgain:`), not on the methods whose bodies
+  convert the argument first;
+- psoup's `Number>>/` primitive divided floats, so the fork gives `Float` a
+  `/` (the FloatDivide native) and `divideFromNumber:`;
+- float division by zero answers an infinity or NaN (IEEE), float printing
+  and `asStringFixed:`/`asStringExponential:`/`asStringPrecision:` follow
+  psoup, `Float parse:` accepts only psoup's spellings, an empty substring is
+  found at the start position, and a right shift may take a LargeInteger
+  count;
+- the fork's subclassing check rejects, as psoup's does, the classes whose
+  instances are not regular objects.
+
+Not yet: method-header decoding (M6); actors (M4).

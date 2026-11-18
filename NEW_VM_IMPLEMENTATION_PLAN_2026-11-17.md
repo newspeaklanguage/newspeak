@@ -187,6 +187,14 @@ statically, and **how a module-structured kernel (nested classes, slot
 initializers, `packageUsing:`) is instantiated on Eurasia is an open design
 question** for M2.
 
+**Progress (2026-11-17, later): M2 done.** Genesis
+(`EURASIA_GENESIS_KERNEL_PLAN_2026-11-17.md`) builds the base image from the
+kernel fork, Eurasia creates classes at run time, and psoup's `KernelTests`
+and `AccessModifierTesting` (353 tests) give the same outcome on both VMs
+(`eurasia/scripts/kernel-tests.sh`; differences would be listed in
+`eurasia/docs/EXPECTED_DIFFERENCES.md`, and there are none). `KernelWeakTests`
+belongs to M3.
+
 **Decided 2026-11-17: genesis, then full snapshots.** psoup runs the program
 when it builds an image because it is *deploying an application*: it
 establishes dependencies by sending the imports to a manifest. Eurasia's

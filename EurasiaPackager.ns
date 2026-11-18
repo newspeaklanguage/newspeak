@@ -20,6 +20,7 @@ The native ids and role ids must match eurasia-core's natives.rs and roles.rs. *
 		NewspeakBytecodeCompilation = manifest NewspeakBytecodeCompilation mixinApply: manifest NewspeakCompilation.
 		Newspeak2V5BytecodeCompilation = manifest Newspeak2V5BytecodeCompilation mixinApply: NewspeakBytecodeCompilation.
 		private natives
+		private allMixinPairs
 		private rootName ::= 'Object'.
 	|
 ) (
@@ -158,44 +159,43 @@ The native ids and role ids must match eurasia-core's natives.rs and roles.rs. *
 			do: [:i | (selector at: i) = 58 ifTrue: [ colons:: colons + 1 ] ].
 		^colons
 	)
-	buildGenesisFrom: kernelSource app: appSource platform: platform = (
-		(* The genesis image (plan section 4): the kernel's classes, the application packaged as if nested in the kernel, and the kernel module as the entry. *)
+	buildGenesisFrom: kernelSource app: appSource modules: moduleSources platform: platform = (
+		(* The genesis image (plan section 4): the kernel's classes, the application packaged as if nested in the kernel, any further top-level modules, and the kernel module as the entry. Each further module becomes a top-level class (no enclosing object) whose nested classes are created at run time; an application slot named like a module is filled with that module's class, and an application slot named testCatalog with the modules' tests (testCatalogFor:image:). *)
 		
-		| List Map compiler kernel app image kNested aNested classes mixins kernelClass appClass kernelInstance appInstance closureClass vmMirror commonSelectors roles strings |
+		| List Map compiler kernel app modules image kNested aNested classes mixins kTree aTree kernelClass appClass moduleClasses kernelInstance appInstance closureClass vmMirror commonSelectors roles strings |
 		List:: platform collections List.
 		Map:: platform collections Map.
 		compiler:: (compilationUsingPlatform: platform) Compiler new.
 		kernel:: compiler compileClassSource: kernelSource within: nil.
 		app:: compiler compileClassSource: appSource within: nil.
+		modules:: moduleSources collect: [:source |
+				compiler compileClassSource: source within: nil
+			].
 		image:: Image usingPlatform: platform.
 		rootName:: '_Object'.
 		kNested:: kernel instanceSide nestedClasses.
 		aNested:: app instanceSide nestedClasses.
 		classes:: Map new.
 		mixins:: Map new.
-		mixins at: kernel simpleName
-			put: (mixinPairFor: kernel
-				enclosing: {image nilNode. image nilNode. }
-				image: image
-				platform: platform).
-		kNested do: [:icd |
-				mixins at: icd simpleName
-					put: (mixinPairFor: icd
-						enclosing: (mixins at: kernel simpleName)
-						image: image
-						platform: platform)
+		allMixinPairs:: List new.
+		kTree:: mixinTreeFor: kernel
+			enclosing: {image nilNode. image nilNode. }
+			image: image
+			platform: platform.
+		mixins at: kernel simpleName put: kTree.
+		1 to: kNested size
+			do: [:i | mixins at: (kNested at: i) simpleName put: ((kTree at: 3) at: i) ].
+		aTree:: mixinTreeFor: app enclosing: kTree image: image platform: platform.
+		(mixins includesKey: app simpleName) ifTrue: [
+				^Error signal: 'The application ' , app simpleName , ' has the name of a kernel class'
 			].
-		mixins at: app simpleName
-			put: (mixinPairFor: app
-				enclosing: (mixins at: kernel simpleName)
-				image: image
-				platform: platform).
-		aNested do: [:icd |
-				mixins at: icd simpleName
-					put: (mixinPairFor: icd
-						enclosing: (mixins at: app simpleName)
-						image: image
-						platform: platform)
+		mixins at: app simpleName put: aTree.
+		1 to: aNested size
+			do: [:i |
+				(mixins includesKey: (aNested at: i) simpleName) ifTrue: [
+						^Error signal: 'The application class ' , (aNested at: i) simpleName , ' has the name of a kernel class'
+					].
+				mixins at: (aNested at: i) simpleName put: ((aTree at: 3) at: i)
 			].
 		kNested do: [:icd |
 				defineClass: icd
@@ -221,11 +221,21 @@ The native ids and role ids must match eurasia-core's natives.rs and roles.rs. *
 			mixins: (mixins at: app simpleName)
 			superclass: (classes at: rootName)
 			image: image.
+		moduleClasses:: modules collect: [:icd |
+				newClassNamed: icd simpleName
+					mixins: (mixinTreeFor: icd
+						enclosing: {image nilNode. image nilNode. }
+						image: image
+						platform: platform)
+					superclass: (classes at: rootName)
+					image: image
+			].
 		
 		(* Metaclasses: instances of Metaclass, all with Class as their superclass. *)
 		(List new addAll: classes values;
 			add: kernelClass;
 			add: appClass;
+			addAll: moduleClasses;
 			yourself) do: [:c |
 				c klass klass: (classes at: 'Metaclass').
 				c klass edges at: 2 put: (classes at: 'Class')
@@ -241,10 +251,12 @@ The native ids and role ids must match eurasia-core's natives.rs and roles.rs. *
 			classes: classes
 			image: image.
 		kNested do: [:icd |
-				(classes at: icd simpleName) edges at: 3 put: kernelInstance
+				setEnclosingObjectOf: (classes at: icd simpleName) to: kernelInstance
 			].
-		aNested do: [:icd | (classes at: icd simpleName) edges at: 3 put: appInstance ].
-		appClass edges at: 3 put: kernelInstance.
+		aNested do: [:icd |
+				setEnclosingObjectOf: (classes at: icd simpleName) to: appInstance
+			].
+		setEnclosingObjectOf: appClass to: kernelInstance.
 		image nilNode klass: (classes at: 'UndefinedObject').
 		image trueNode klass: (classes at: 'True').
 		image falseNode klass: (classes at: 'False').
@@ -260,7 +272,22 @@ The native ids and role ids must match eurasia-core's natives.rs and roles.rs. *
 			declaration: kernel
 			to: (methodNamed: 'ensure:' in: closureClass).
 		setSlot: 'application' of: kernelInstance declaration: kernel to: appInstance.
-		mixins values do: [:pair |
+		1 to: modules size
+			do: [:i |
+				(hasSlot: (modules at: i) simpleName in: app) ifTrue: [
+						setSlot: (modules at: i) simpleName
+							of: appInstance
+							declaration: app
+							to: (moduleClasses at: i)
+					]
+			].
+		(hasSlot: 'testCatalog' in: app) ifTrue: [
+				setSlot: 'testCatalog'
+					of: appInstance
+					declaration: app
+					to: (testCatalogFor: modules image: image)
+			].
+		allMixinPairs do: [:pair |
 				(pair at: 1) klass: (classes at: 'InstanceMixin').
 				(pair at: 2) klass: (classes at: 'ClassMixin')
 			].
@@ -303,6 +330,11 @@ The native ids and role ids must match eurasia-core's natives.rs and roles.rs. *
 				n kind = #array ifTrue: [ n klass: (classes at: '_Array') ].
 				n kind = #weakarray ifTrue: [ n klass: (classes at: 'WeakArray') ].
 				n kind = #method ifTrue: [ n klass: (classes at: 'Method') ].
+				n kind = #float ifTrue: [ n klass: (classes at: 'Float') ].
+				(n kind = #regular and: [ n payload = #fraction ]) ifTrue: [
+						n klass: (classes at: 'Fraction')
+					].
+				n kind = #largeint ifTrue: [ n klass: (classes at: 'LargeInteger') ].
 				nil = n klass ifTrue: [ n klass: image nilNode ]
 			].
 		^serialize: image roles: roles
@@ -375,7 +407,9 @@ The native ids and role ids must match eurasia-core's natives.rs and roles.rs. *
 					].
 				moduleInstance edges add: value
 			].
-		classesByName values do: [:class | class edges at: 3 put: moduleInstance ].
+		classesByName values do: [:class |
+				setEnclosingObjectOf: class to: moduleInstance
+			].
 		image nilNode klass: (classesByName at: 'UndefinedObject').
 		image trueNode klass: (classesByName at: 'True').
 		image falseNode klass: (classesByName at: 'False').
@@ -500,6 +534,38 @@ The native ids and role ids must match eurasia-core's natives.rs and roles.rs. *
 		fields add: (line copyFrom: start to: line size).
 		^fields
 	)
+	floatBytesOf: f = (
+		(* IEEE 754 binary64, little-endian (snapshot format section 5), computed by exact scaling by powers of two: psoup offers no access to a float's bits. NaNs are canonical; a negative zero is written as zero. *)
+		
+		| bits x e |
+		f isNaN ifTrue: [ bits:: 2047 << 52 + (1 << 51) ]
+			ifFalse: [
+				x:: f < 0 ifTrue: [ f negated ] ifFalse: [ f ].
+				x isInfinite ifTrue: [ bits:: 2047 << 52 ]
+					ifFalse: [
+						x = 0 ifTrue: [ bits:: 0 ]
+							ifFalse: [
+								e:: 0.
+								[ x >= 2 ] whileTrue: [
+										x:: x / 2.
+										e:: e + 1
+									].
+								[ x < 1 and: [ e > -1022 ] ] whileTrue: [
+										x:: x * 2.
+										e:: e - 1
+									].
+								bits:: x < 1 ifTrue: [ (x * (1 << 52)) truncated ]
+									ifFalse: [ e + 1023 << 52 + (x - 1 * (1 << 52)) truncated ]
+							]
+					].
+				f < 0 ifTrue: [ bits:: bits + (1 << 63) ]
+			].
+		^(1 to: 8) collect: [:i | bits >> (8 * (i - 1)) & 255 ]
+	)
+	hasSlot: name in: icd = (
+		^(icd instanceSide assembleSlots detect: [:slot | slot name = name ]
+			ifNone: [ nil ]) isNil not
+	)
 	instanceOf: class image: image = (
 		(* An uninitialized instance: one nil per slot of the class chain. *)
 		
@@ -516,15 +582,43 @@ The native ids and role ids must match eurasia-core's natives.rs and roles.rs. *
 	isSpace: byte = (
 		^byte = 32 or: [ byte = 9 or: [ byte = 10 or: [ byte = 13 ] ] ]
 	)
+	largeIntegerNode: n image: image = (
+		(* Snapshot kind 8: sign, then the magnitude's bytes, least significant first. *)
+		
+		| node magnitude rest |
+		magnitude:: {}.
+		rest:: n < 0 ifTrue: [ n negated ] ifFalse: [ n ].
+		[ rest > 0 ] whileTrue: [
+				magnitude:: magnitude copyWith: rest \\ 256.
+				rest:: rest // 256
+			].
+		node:: image newNode: #largeint space: #program.
+		node payload: {n < 0 ifTrue: [ 1 ] ifFalse: [ 0 ]. magnitude. }.
+		^node
+	)
 	literal: lit image: image = (
 		nil = lit ifTrue: [ ^image nilNode ].
 		true = lit ifTrue: [ ^image trueNode ].
 		false = lit ifTrue: [ ^image falseNode ].
 		lit isKindOfInteger ifTrue: [
 				(lit < -4611686018427387904 or: [ lit > 4611686018427387903 ]) ifTrue: [
-						^Error signal: 'LargeInteger literals are not supported yet'
+						^largeIntegerNode: lit image: image
 					].
 				^lit
+			].
+		lit isKindOfFraction ifTrue: [
+				| node = 
+				(* A regular object of the kernel's Fraction class, whose slots are numerator and denominator; its class is set once the classes exist. *)
+				image newNode: #regular space: #program. |
+				node payload: #fraction.
+				node edges: {literal: lit numerator image: image. literal: lit denominator
+						image: image. }.
+				^node
+			].
+		lit isKindOfFloat ifTrue: [
+				| node = image newNode: #float space: #program. |
+				node payload: (floatBytesOf: lit).
+				^node
 			].
 		lit isKindOfString ifTrue: [ ^image string: lit ].
 		lit isKindOfArray ifTrue: [
@@ -535,17 +629,20 @@ The native ids and role ids must match eurasia-core's natives.rs and roles.rs. *
 	)
 	public main: platform args: args = (
 		| bytes output |
-		args size = 4 ifTrue: [
+		(args size >= 4 and: [ (args at: 2) endsWith: '.tsv' ]) ifTrue: [
 				natives:: readNativesTable: (args at: 2) platform: platform.
-				output:: args at: 4.
+				output:: args at: args size.
 				bytes:: buildGenesisFrom: (String withAll: (readFileAsBytes: (args at: 1)))
 					app: (String withAll: (readFileAsBytes: (args at: 3)))
+					modules: ((4 to: args size - 1) collect: [:i |
+							String withAll: (readFileAsBytes: (args at: i))
+						])
 					platform: platform
 			]
 			ifFalse: [
 				args size < 3 ifTrue: [
 						'Usage: EurasiaPackager <module.ns> <EntryClassName> <output.eus>' out.
-						'   or: EurasiaPackager <kernel.ns> <natives.tsv> <application.ns> <output.eus>' out.
+						'   or: EurasiaPackager <kernel.ns> <natives.tsv> <application.ns> [<module.ns> ...] <output.eus>' out.
 						^nil
 					].
 				output:: args at: 3.
@@ -658,15 +755,36 @@ The native ids and role ids must match eurasia-core's natives.rs and roles.rs. *
 		^mixin
 	)
 	mixinPairFor: icd enclosing: pair image: image platform: platform = (
+		(* Both sides are lexically nested in the enclosing class's instance side: a class-side method's enclosing object is an instance of the enclosing class, so both mixins' enclosing mixin is the enclosing instance mixin. *)
+		
 		^{mixinFor: icd instanceSide
 			name: icd simpleName
 			enclosing: (pair at: 1)
 			image: image
 			platform: platform. mixinFor: icd classSide
 			name: icd simpleName
-			enclosing: (pair at: 2)
+			enclosing: (pair at: 1)
 			image: image
 			platform: platform. }
+	)
+	mixinTreeFor: icd enclosing: pair image: image platform: platform = (
+		(* The mixin pair for icd and, recursively, its nested classes, answered as {instance mixin. class mixin. nested trees}. The instance mixin's library field holds what the kernel's InstanceMixin reads to create classes at run time: {class mixin. nested instance mixins. access modifier. factory selector}. *)
+		
+		| own children |
+		own:: mixinPairFor: icd enclosing: pair image: image platform: platform.
+		allMixinPairs add: own.
+		children:: icd instanceSide nestedClasses collect: [:n |
+				mixinTreeFor: n enclosing: own image: image platform: platform
+			].
+		(own at: 1) edges at: 5
+			put: (image array: {own at: 2. image array: (children collect: [:c | c at: 1 ])
+					space: #program. image string: (nil = icd accessor ifTrue: [ 'public' ]
+						ifFalse: [ icd accessor accessModifier ]). image string: (nil = icd factoryName ifTrue: [
+							'new'
+						]
+						ifFalse: [ icd factoryName ]). }
+				space: #program).
+		^{own at: 1. own at: 2. children. }
 	)
 	moduleInstanceOf: class declaration: icd nested: nested classes: classes image: image = (
 		(* A module instance: nil slots, except the cached nested-class slots, which hold the classes. *)
@@ -795,6 +913,12 @@ The native ids and role ids must match eurasia-core's natives.rs and roles.rs. *
 			].
 		^w contents
 	)
+	setEnclosingObjectOf: class to: object = (
+		(* A class and its metaclass share the enclosing object: class-side methods are nested in the enclosing class's instance side too. *)
+		
+		class edges at: 3 put: object.
+		class klass edges at: 3 put: object
+	)
 	setSlot: name of: instance declaration: icd to: value = (
 		| slots |
 		slots:: icd instanceSide assembleSlots.
@@ -817,6 +941,29 @@ The native ids and role ids must match eurasia-core's natives.rs and roles.rs. *
 		space:: name indexOf: ' ' startingAt: 1.
 		space = 0 ifTrue: [ ^name ].
 		^name copyFrom: 1 to: space - 1
+	)
+	testCatalogFor: modules image: image = (
+		(* The tests of each module, as Minitest finds them without mirrors: the module's nested classes with a class-side TEST_CONTEXT method, and their instance-side selectors that start with test and take no arguments. {{module name. {{context name. {selectors}}}}}. Shared-state classes (contexts nested deeper) are not searched. *)
+		
+		^image array: (modules collect: [:m |
+					| contexts |
+					contexts:: (m instanceSide nestedClasses select: [:n |
+							(n classSide methods detect: [:x | x selector = 'TEST_CONTEXT' ]
+								ifNone: [ nil ]) isNil not
+						]) collect: [:n |
+							image array: {image string: n simpleName. image array: ((n instanceSide methods select: [:x |
+											(x selector startsWith: 'test') and: [
+													(x selector endsWith: ':') not
+												]
+										]) collect: [:x | image string: x selector ])
+									space: #program. }
+								space: #program
+						].
+					image array: {image string: m simpleName. image array: contexts
+							space: #program. }
+						space: #program
+				])
+			space: #program
 	)
 	trim: s = (
 		| first ::= 1. last ::= s size. |
@@ -856,7 +1003,7 @@ The native ids and role ids must match eurasia-core's natives.rs and roles.rs. *
 	)
 	writeNode: n writer: w = (
 		| kinds |
-		kinds:: {#regular. 1. #string. 3. #array. 4. #weakarray. 5. #method. 9. #mixin. 10. #class. 11. #metaclass. 12. }.
+		kinds:: {#regular. 1. #string. 3. #array. 4. #weakarray. 5. #float. 7. #largeint. 8. #method. 9. #mixin. 10. #class. 11. #metaclass. 12. }.
 		1 to: kinds size
 			by: 2
 			do: [:i | (kinds at: i) = n kind ifTrue: [ w byte: (kinds at: i + 1) ] ].
@@ -867,6 +1014,16 @@ The native ids and role ids must match eurasia-core's natives.rs and roles.rs. *
 		n kind = #string ifTrue: [
 				w uv: n payload size.
 				1 to: n payload size do: [:i | w byte: (n payload at: i) ].
+				^self
+			].
+		n kind = #float ifTrue: [
+				n payload do: [:b | w byte: b ].
+				^self
+			].
+		n kind = #largeint ifTrue: [
+				w byte: (n payload at: 1).
+				w uv: (n payload at: 2) size.
+				(n payload at: 2) do: [:b | w byte: b ].
 				^self
 			].
 		n kind = #mixin ifTrue: [ ^w uv: n payload ].

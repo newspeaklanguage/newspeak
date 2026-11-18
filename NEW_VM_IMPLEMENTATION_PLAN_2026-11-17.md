@@ -264,6 +264,27 @@ Still open:
 - snapshots of more than one actor;
 - per-actor state in the shared kernel (for instance the symbol table).
 
+**Progress (2026-11-18): M6 met its done-criterion.**
+- **The mirror suites agree with psoup.** `MirrorTesting`,
+  `MirrorBuilderTesting` and `ActivationMirrorTesting` run in the
+  differential kernel tests, and every test agrees, also under GC stress.
+  `AtomicInstallTesting` is configured for Squeak and runs on neither VM;
+  psoup's installer is covered by `MirrorBuilderTesting`.
+- **The IDE boots in the browser.** Browsing, evaluation and the debugger
+  were checked by hand.
+- **The work, in six steps** (`EURASIA_M6_REFLECTION_DESIGN_2026-11-18.md`
+  section 8):
+  1. program objects built in Newspeak, and the compiler on Eurasia;
+  2. the mirrors fork;
+  3. `vm commit:`;
+  4. activations and upstream's V5 Simulator;
+  5. broken threads outliving their turn (psoup's model; pausing waits for a
+     debugger in another actor);
+  6. the IDE.
+- **Not done:** saving and deployment from the IDE (the serializer is a
+  stand-in), `vm pause:` and stack replacement across actors, and the rest
+  of the operation list's activation and object operations.
+
 **Progress (2026-11-18): M5 done.** The web host's steps:
 1. The wasm32 VM runs an image under a JavaScript host: load, turns, timers
    through the host's event loop, output. **Done.**

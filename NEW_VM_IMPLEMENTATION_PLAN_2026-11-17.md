@@ -195,6 +195,33 @@ and `AccessModifierTesting` (353 tests) give the same outcome on both VMs
 `eurasia/docs/EXPECTED_DIFFERENCES.md`, and there are none). `KernelWeakTests`
 belongs to M3.
 
+**Progress (2026-11-17, later): M3 under way, its tests passing.**
+`eurasia-core/src/gc.rs` collects all garbage at safepoints (between
+instructions, and in `vm garbageCollect`), as `gc-semantics.tex`'s
+GC-Collect with the whole garbage set: survivors keep their allocation order
+and sequence numbers (identity order and identity hash unchanged, no identity
+reused), WeakArray elements are cleared, and ephemerons follow the weak-map
+fixed point, a dead ephemeron's key, value and finalizer becoming nil as in
+psoup (finalizers are not run). A collection is due after as many
+allocations as there are live objects (at least 2^20). A snapshot is a
+collection into a copy with only the roles as roots. `KernelWeakTests` joins
+the differential tests: all 377 tests agree with psoup, and a negative
+control (collection disabled) turns 13 of them red. The stress test runs the
+base image with a collection after every allocation (`genesis.sh`) and the
+suites with one every 64 allocations (`GC_STRESS=64 scripts/kernel-tests.sh`,
+about a minute), with the same outcomes; after every allocation the suites
+would take far too long, since every collection is a full one. When collection
+happens is deterministic for a given execution (it depends only on the
+allocation count). **Decided 2026-11-17: replay logs weak-array clearing.**
+That alone does not make collection timing unobservable: the population
+queries (`allInstancesOf:`, `mixinApplicationsOf:`) also see it
+(`eq:gc-all-instances-effect`). Proposed, for when the queries arrive (M6):
+each query first runs a full collection, so it reports exactly the live
+instances, in allocation order, whatever collections came before; timing is
+then observable only through weak containers, which replay logs. Until that
+is settled, scheduling stays deterministic. A generational
+or incremental collector is an M8 question.
+
 **Decided 2026-11-17: genesis, then full snapshots.** psoup runs the program
 when it builds an image because it is *deploying an application*: it
 establishes dependencies by sending the imports to a manifest. Eurasia's
@@ -224,10 +251,10 @@ hard.
 2. *Builds are reproducible.* Allocation order, identity hashes and the
    snapshot format are deterministic, so building twice gives byte-identical
    images; `eurasia/scripts/genesis.sh` checks this on every run (verified
-   2026-11-17 for both the genesis and the base image). Until the collector
-   (M3), a saved heap also holds unreachable objects, including the genesis
-   run's arguments, so the check runs genesis with identical arguments; the
-   collector must remove that dependence on inputs.
+   2026-11-17 for both the genesis and the base image). A snapshot saves
+   only what the roles reach (M3), so the image does not depend on the
+   arguments genesis ran with; the check builds the second image to a
+   different path.
 3. *Self-hosting uses a seed, not a lineage.* Once Eurasia compiles itself
    (M6), the packager runs in a pinned stage-0 image that is used only to run
    the compiler: the build compiles everything from source with it (stage 1),

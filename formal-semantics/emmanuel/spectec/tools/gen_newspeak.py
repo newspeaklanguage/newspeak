@@ -9,7 +9,7 @@ Run from emmanuel/spectec:
 Each row becomes a test method that hands the row to EmmanuelTesting's
 Driver. The core's rows are tests/cases.tsv; the library's are the rows of
 library/tests/library-cases.tsv whose relations the reference implements
-(LIBRARY_RELATIONS: the edit layer's are not yet implemented). The fixture
+(LIBRARY_RELATIONS). The fixture
 host parser (tests/host-fixtures.spectec, or the library's generated
 library/tests/library-host.spectec) becomes the table the driver's fixture
 host looks brackets up in, and the $const definitions of the fixture
@@ -23,7 +23,9 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 
-LIBRARY_RELATIONS = {"LibTree", "LibErrors", "LibRoundTrip"}
+LIBRARY_RELATIONS = {"LibTree", "LibErrors", "LibRoundTrip", "Edit", "LibAnchor", "LibIsPoint",
+                     "LibLoc", "LibBackspace", "LibEnter", "LibInsertable", "LibInsert",
+                     "LibPlace", "LibCaretOK", "LibEditCaret"}
 
 # Library rows the Newspeak library cannot satisfy, with the reason. They
 # are listed in the generated file's comment instead of becoming tests.
@@ -99,9 +101,9 @@ def main() -> None:
         table = host_table("library/tests/library-host.spectec")
         consts = constants(["tests/host-eval-fixtures.spectec", "library/tests/library-host.spectec"])
         name = "EmmanuelLibraryConformanceTesting"
-        header = f"class {name} usingPlatform: p minitest: m testing: testing blocks: blocks = ("
+        header = f"class {name} usingPlatform: p minitest: m testing: testing blocks: blocks edit: edit = ("
         sources = "library/tests/library-cases.tsv and library/tests/library-host.spectec"
-        driver = "testing libraryDriver: hostTable constants: constantTable blocks: blocks"
+        driver = "testing libraryDriver: hostTable constants: constantTable blocks: blocks edit: edit"
         skipped = "".join(f"\n  {n}: {why}" for n, why in sorted(DIVERGENT.items()))
         context = "LibraryConformance"
         if skipped:

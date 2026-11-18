@@ -254,6 +254,7 @@ identity) because it reifies their frames.
 | `vm is: o identicalTo: p` | 86 | pure | — | Boolean | |
 | `vm identityHashOf: o` | 87 | resource | — | SmallInteger | |
 | `vm isCanonical: o` | 126 | heap | inspect | Boolean | |
+| `vm isValue: o` | new | heap | inspect | Boolean | Whether `o` is a value: an immediate, nil, a Boolean, a String, Float or LargeInteger, an instance of a value class, or a class whose enclosing object is a value (added 2026-11-17; `EURASIA_ACTORS_DESIGN_2026-11-17.md` section 5). |
 | `vm markCanonical: o` | 127 | heap | editObjectSlots | `o` | |
 | `vm allInstancesOf: c` | 96 | reflective | inspect | Array, in allocation order | Cohort-wide, as in the semantics (`eq:all-instances-of` ranges over every actor heap). |
 | `vm mixinApplicationsOf: m` | new | reflective | inspect | Array of classes, in allocation order | Cohort-wide (`eq:mixin-applications`). Required by `mixinApplicationsQuery`. |

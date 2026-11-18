@@ -127,6 +127,20 @@ for (const [name, act, expected] of scenarios) {
   }
   for (const line of consoleLines.slice(before)) console.log("     console: " + line);
 }
+// Amplets run once: typing elsewhere does not run them again.
+{
+  const doc = "[\\paragraph\\]Hi [\\amplet: [self clock]\\] there[\\endParagraph\\]";
+  await js(`emmanuelLoad(${JSON.stringify(doc)})`);
+  await js("caretAt('there', 5)");
+  await type("!!");
+  const got = await source();
+  const runs = await js("emmanuelRuns");
+  const shown = await js("document.body.innerText.includes('ran [self clock]')");
+  const ok = runs === 1 && shown && got === "[\\paragraph\\]Hi [\\amplet: [self clock]\\] there!![\\endParagraph\\]";
+  if (!ok) failures++;
+  console.log(`${ok ? "PASS" : "FAIL"} amplets run once\n     ${got}; runs ${runs}; shown ${shown}`);
+  scenarios.push(null);
+}
 console.log(`${scenarios.length - failures}/${scenarios.length} scenarios passed`);
 
 // Timing: with source files given, the time of a keystroke in each, typed

@@ -20,7 +20,8 @@ def seq(*xs): return '(%s)' % ' '.join(xs) if xs else '(eps)'
 
 # Host constants: code text -> id of $const in tests/host-eval-fixtures.spectec.
 CONST = {"#intro": 1001, "'x := 1'": 1002, "#smalltalk": 1003, "'<hr>'": 1004,
-         "nil": 1005, "#fig": 1006, "'Hamlet'": 1007, "#plot": 1008}
+         "nil": 1005, "#fig": 1006, "'Hamlet'": 1007, "#plot": 1008,
+         "aClosure": 5}
 OPEN, CLOSE = '[\\', '\\]'
 SRCNAME = ['doc']   # the source being parsed, recorded in every literal
 
@@ -230,6 +231,18 @@ roundtrip('lib-displays-roundtrip', W6,
           "[\\verbatim: 'x := 1'\\][\\codeBlock: 'x := 1'\\][\\codeBlock: 'x := 1' language: #smalltalk\\]"
           "[\\html: nil\\][\\figure\\][\\html: '<hr>'\\][\\caption: [\\A plot\\]\\][\\label: #plot\\][\\endFigure\\]"
           "[\\quote\\][\\attribution: [\\Hamlet\\]\\][\\paragraph\\]To be.[\\endParagraph\\][\\endQuote\\]")
+
+# Amplets: a host value (the closure of the amplet's code) is a display in
+# flow content and an inline leaf in a paragraph; anything else is refused.
+W6b = "[\\amplet: aClosure. paragraph\\]See [\\amplet: aClosure\\] here.[\\endParagraph. amplet: 'x := 1'\\]"
+s_am, s_amx = S('amplet:', C('aClosure')), S('amplet:', C("'x := 1'"))
+tree('lib-amplets', W6b, doc(DOCF, [
+    leafb(s_am, st('amplet', '(HOSTV 5)')),
+    para(run('See '), leafb(s_am, st('inlineAmplet', '(HOSTV 5)')), run(' here.')),
+    refused(s_amx)]))
+errors('lib-amplets-errors', W6b, [leaf(s_amx)], [leaf(s_amx)])
+roundtrip('lib-amplets-roundtrip', W6b,
+          "[\\amplet: aClosure\\][\\paragraph\\]See [\\amplet: aClosure\\] here.[\\endParagraph\\][\\amplet: 'x := 1'\\]")
 
 # Errors inside a title are the library's to report; the core does not see them.
 W7 = "[\\title: [\\x[\\endParagraph\\]\\]\\]"

@@ -289,6 +289,25 @@ activation (60, 62, 64) become arguments of `newActivationFor:…`. Changing
 them on an activation that is already running is not offered: no current
 user, and the formal semantics has no command for it.
 
+**Implemented on Eurasia (2026-11-18, M6 step 4).** psoup's activation
+protocol, because the mirror library's Simulator (upstream's, for V5) uses
+it:
+- `Activation new` (native 162) makes a detached activation, whose sender,
+  bci, method, closure, receiver and temps the setters write (163–167, and
+  the existing `sender:`, `tempAt:put:`).
+- `vm continueAt: a with: v` (170) jumps to a live activation. The frames
+  above it become detached activations rather than dead ones.
+- `vm resumeActivation: top` (171) turns a detached chain into frames, in
+  place of psoup's jump to a heap activation.
+- `vm runNative:receiver:arguments:` (172) is the Simulator's
+  `doPrimitive`.
+- `newClosureIn:initialBCI:numArgs:numCopied:` (173) is psoup's `Closure
+  class new`.
+- Simulation roots are methods marked by `vm markSimulationRoot:` (168).
+
+`newActivationFor:…`, `pcOf:put:` and `depthOf:put:` on live activations,
+and `markUncontinuable:`, are not implemented.
+
 **pc.** Positions are V5 bytecode positions in the method's bytecode, never
 machine addresses. A JIT maps them (formal semantics `machinePoint`).
 

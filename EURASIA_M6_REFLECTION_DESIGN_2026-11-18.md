@@ -188,10 +188,9 @@ reach another's instances.
    `newspeak/Mirrors.ns` (head `e7a7ece`, 2026-09-26) is psoup's mirrors
    module for V5. It has the V5 `InstructionStream`, `Printer` and
    `Simulator` (with `doPrimitive:`), and the `Thread` machinery the
-   debugger runs on. Since the extract the newspeak checkout holds
-   (`upstream-V5Simulator-338f0bb3.ns.txt`), it has gained "Handle shape
-   changes to classes and mixins" and an unhandled-exception hook for the
-   debugger.
+   debugger runs on. Its `Simulator` is unchanged since the extract the
+   newspeak checkout holds (`upstream-V5Simulator-338f0bb3.ns.txt`, which
+   is current: no commit to `Mirrors.ns` follows 338f0bb3).
    - **The fork's base stays `MirrorsForPrimordialSoup.ns`,** whose API the
      IDE and the test suites use. The fork replaces its V4 Simulator with
      upstream's V5 one, adapted to Eurasia's operations.
@@ -214,7 +213,7 @@ runs on Eurasia.**
 - **Headers and bytecode.** `Method>>header`, `header:`, `bytecode` and
   `bytecode:` are natives 149–152. `header:` reads psoup's header word:
   primitive 256 + i is a getter of the mixin's own slot i, 512 + i its
-  setter, 1024 answers the receiver, any other nonzero one a Eurasia
+  setter, 1023 answers the receiver, any other nonzero one a Eurasia
   native. So psoup's compiler and its `Method newGetterForSlot:…` helpers
   work unchanged, given mixin-relative indices.
 - **One packager change.** A module whose header names another module as
@@ -289,3 +288,46 @@ runs on Eurasia.**
 - **`AtomicInstallTesting` is not a target after all.** It is configured
   for Squeak (`MirrorsForSqueak`, `platform squeak`), so it runs on neither
   psoup nor Eurasia; `MirrorBuilderTesting` covers psoup's installer.
+
+**Step 4 (2026-11-18): activations and the V5 Simulator; all three mirror
+suites agree with psoup.**
+- **Detached activations.** `Activation new` makes an activation that holds
+  its own state (sender, bci, temps), as psoup's heap activations do. psoup's
+  setters (`method:`, `closure:`, `receiver:`, `bci:`, `size:`, `sender:`)
+  work on it (natives 162–167), and the existing activation natives read it.
+- **Three VM operations for threads:**
+  - `vm resumeActivation: top` (171) turns a detached chain, whose bottom's
+    sender is the current frame, into frames, and continues at its top.
+  - `vm continueAt: a with: v` (170) jumps to a live activation, whose
+    pending send answers `v`.
+  - The frames `continueAt:` cuts off are **detached**, not killed, as
+    psoup's heap activations survive a jump: a broken thread's stack stays
+    inspectable and resumable.
+- **For the Simulator:**
+  - `vm runNative:receiver:arguments:` (172) runs a native or accessor
+    method without a frame. It answers the result, the failure to signal,
+    or the send or closure activation the native asks for.
+  - `newClosureIn:initialBCI:numArgs:numCopied:` (173) makes a closure.
+- **Simulation roots** (psoup's primitive 142) are methods carrying a flag
+  bit (bit 4, snapshot format 5), set and tested by `vm markSimulationRoot:`
+  and `vm isSimulationRoot:` (168–169). The VM's non-local return stops at
+  them, and the kernel routes a simulated thread's exceptions to them.
+- **Return-self is primitive 1023** in psoup's header word, and setters
+  512–1022, inside psoup's `Method>>primitive` mask, so the Simulator never
+  mistakes a return-self method for bytecode.
+- **The fork's V5 Simulator.** Its decoder is `V5BytecodeSimulation`'s. The
+  Simulator is upstream's, with `tryPrimitive:` taking the method, so that:
+  - the current activation, the closure `value…` natives, perform and the
+    two jumps are simulated;
+  - anything else runs through `runNative`.
+
+  The V4 selector scan and instruction sizes are replaced by V5 ones.
+- **The result.** psoup's `ActivationMirrorTesting` joins the differential
+  tests, and all 73 tests agree. Four fail on both VMs: they expect `[^2]`,
+  but the pretty-printed test file has `[ ^2 ]`. With it, every test of the
+  three mirror suites agrees with psoup, including the `evaluate:` tests.
+- **Two bugs found by the suite:**
+  - The Simulator hung re-signalling its own jump to the simulation root,
+    until the jumps were simulated.
+  - `runNative` stored only into ordinary objects, until the interpreter's
+    slot store was factored out for both.

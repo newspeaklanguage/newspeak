@@ -1,8 +1,8 @@
 # Eurasia actors: the rest of M4
 
 **Date:** 2026-11-17
-**Status:** Decided 2026-11-17 (section 5); sections 2.3 and 2.4 are
-superseded where section 5 says so. Implementation under way.
+**Status:** Decided 2026-11-17 (section 5) and 2026-11-18 (sections 7-10); sections 2.3, 2.4 and 2.5 are
+superseded where sections 5 and 10 say so. M4 is done except ports (section 10).
 **Context:** `NEW_VM_IMPLEMENTATION_PLAN_2026-11-17.md` (M4),
 `VM_KERNEL_OPERATIONS_2026-11-10.md` section 7,
 `formal-semantics/actor-semantics.tex`.
@@ -251,7 +251,7 @@ receiver is an opaque far reference. Section 7 has the choices.
 
 Recommendation: 1. **Decided 2026-11-18: choice 1.**
 
-## 8. Promise records (2026-11-18, uncommitted)
+## 8. Promise records (2026-11-18)
 
 A promise that crosses actors is a **promise record** in the VM (the
 semantics' Π): a hidden object kind (snapshot kind 16; its class is the
@@ -352,3 +352,67 @@ Pausing one actor comes with the debugger (M6). A snapshot saves what the
 roles reach, so only the main actor is saved today; snapshots of a whole
 cohort are open.
 
+
+## 10. Serialization, deployment and ports (decided 2026-11-18)
+
+Supersedes section 2.5's psoup-style serializer.
+
+**What psoup's serializer is for.** `PrimordialFuel.ns` is psoup's
+snapshot writer (`.vfuel`). It has two jobs:
+- **Deployment.** It serializes what the app object reaches. The manifest
+  technique keeps that small: `packageUsing:` pulls in only the classes the
+  app imports, so the image has nothing the app does not need.
+- **Port messages** between isolates.
+
+It reads and writes psoup's object layouts directly. It names kernel
+objects by fixed class ids and by position in its `sharedObjects` list, so
+both ends must have the same kernel layout.
+
+**Deployment on Eurasia is a snapshot rooted at the app.** Eurasia's
+snapshot writer already saves only what its roots reach, and psoup's
+trimming is the same: reachability, with a class bringing all its methods.
+A deployed image is a snapshot whose roots are:
+- the kernel's roles;
+- a fresh platform template;
+- the app object, as the entry.
+
+That is one operation over the existing writer (for instance
+`vm snapshotWithEntry: app`). As in psoup, an app class nested in something
+large drags its enclosing objects in; the manifest pattern avoids that by
+passing top-level classes. The deploy step should report what it included.
+Building the app from source on Eurasia needs the compiler on Eurasia (M6);
+until then the packager on psoup builds it.
+
+**One serializer: the VM's, in the snapshot format.** Snapshots, deployment
+and port messages use the same writer. A message is a fragment in the
+snapshot format.
+- **The VM does the encoding,** for speed.
+- **Newspeak sets the policy:** the roots, what is copied and what goes by
+  reference, the format version, and when to fall back to sending code. The
+  VM operation takes these as arguments.
+
+**Versioning.** A message carries its format version in its header. The VM
+keeps readers for older versions for as long as we choose, and a reader may
+translate an old message rather than refuse it. The snapshot format is
+already versioned (now 4).
+
+**Code by reference or by value.** Cohorts started from the same snapshot
+share the program: identical program objects with identical sequence
+numbers. When two cohorts connect, each states which program it runs (a
+program id or hash).
+- **Same program:** methods, mixins and kernel classes go by reference
+  (sequence number). This is fast and small.
+- **Different programs:** the code goes by value, as in psoup, and the
+  receiver installs it. The loader already installs program objects for
+  whole images; doing it for a fragment overlaps M6's `commit:`, so this
+  comes after M6.
+
+Talking to a psoup cohort would need a third path: a Newspeak serializer
+that speaks psoup's format. That is the one case for forking PrimordialFuel.
+
+**Order.** M5 starts with the web host (wasm32, the JS FFI, expats,
+callbacks, CounterApp in the browser), which needs neither ports nor the
+serializer: psoup's web host starts with no message and has no isolates.
+Ports and the serializer come when a cohort-to-cohort user needs them
+(parallel compile, Web Workers): native cohorts on threads first, then Web
+Workers.

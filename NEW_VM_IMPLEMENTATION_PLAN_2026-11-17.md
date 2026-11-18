@@ -259,10 +259,28 @@ mixin with a heap per actor, and far references between VMs.
   with a collection after every allocation.
 
 Still open:
-- ports and the serializer (with M5);
+- ports and the serializer: decided 2026-11-18 to be one VM-level serializer in the snapshot format, versioned, with deployment as a snapshot rooted at the app (`EURASIA_ACTORS_DESIGN_2026-11-17.md` section 10); built when a cohort-to-cohort user needs it, after the web host;
 - pausing an actor (M6);
 - snapshots of more than one actor;
 - per-actor state in the shared kernel (for instance the symbol table).
+
+**Progress (2026-11-18): M5 begun, step 1 of 4.** The web host's steps:
+1. The wasm32 VM runs an image under a JavaScript host: load, turns, timers
+   through the host's event loop, output. **Done.**
+2. The call-based JS FFI (`Alien` natives and marshalling, operation list
+   section 10).
+3. Expats and callbacks, with synchronous re-entry.
+4. CounterApp, on forks of psoup's JS and Hopscotch modules.
+
+Step 1 details:
+- `eurasia-web` exports a non-blocking run (`eurasia_start`,
+  `eurasia_resume`). The VM answers `Completion::Waiting` when nothing can
+  run before the next timer and the host cannot block (`Host::blocks`).
+- `eurasia/web/eurasia.mjs` is the loader, for browsers and Node.
+- `eurasia/scripts/web-tests.sh` checks that the base image prints exactly
+  what it prints natively, and that all 445 kernel tests have the same
+  outcomes (they wait for timers about 30 times).
+- In a browser, both images give the same results.
 
 **Decided 2026-11-17: genesis, then full snapshots.** psoup runs the program
 when it builds an image because it is *deploying an application*: it

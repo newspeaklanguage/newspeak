@@ -71,7 +71,9 @@ Following the formal semantics (decided: it takes precedence over psoup):
 - **Collector:** start with a per-actor copying collector (Cheney), with weak
   arrays and ephemerons handled as the GC layer of the semantics specifies.
   Each collection's clearings are logged as input once replay exists (M7;
-  the logging decision is still open).
+  the logging decision is still open). *Decided by M7 (2026-11-18): not
+  logged; collections run on an allocation schedule that checkpoints save,
+  so replay clears at the same points.*
 
 ### 2.4 Interpreter
 
@@ -171,7 +173,7 @@ The kernel fork starts from `KernelForPrimordialSoup.ns` and changes:
 | M4 | Actors: ports, turns, spawn from a mixin, the message loop, `finishTurn:` | Actor test suites pass. |
 | M5 | Web host: wasm32 build, call-based JS FFI, expats, callbacks | A Hopscotch demo (CounterApp) runs in the browser. |
 | M6 | Reflection: `commit:` with layout maps, activation operations, pause and stack replacement; the Simulator over natives | The mirror and atomic-install test suites pass; the IDE boots. |
-| M7 | Snapshots, restore, replay log, checkpoints, divergence detection | Save and restore with paused stacks; replay of a recorded IDE session reproduces its outputs. |
+| M7 | Snapshots, restore, replay log, checkpoints, divergence detection | Save and restore with paused stacks; replay of a recorded IDE session reproduces its outputs. **Met 2026-11-18** (`EURASIA_M7_SNAPSHOTS_REPLAY_DESIGN_2026-11-18.md` section 6). |
 | M8 | Performance: inline fast paths, then measure against psoup | Benchmarks within an agreed factor of psoup (the design doc's efficiency question). |
 
 The packager is self-hosted (runs on the new VM) after M6.

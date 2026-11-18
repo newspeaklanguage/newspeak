@@ -482,6 +482,21 @@ exception library does this with `vm abandonCallback: exception` (below);
 
 Restoring is not an operation: it starts a VM (`spawn:` for an actor, or a
 host start for the whole VM), after which the restore role runs.
+
+*Eurasia, M7 (2026-11-18; `EURASIA_M7_SNAPSHOTS_REPLAY_DESIGN_2026-11-18.md`):*
+- `vm snapshot` stays the snapshot that starts afresh (genesis,
+  deployment): no frames, a frame's activation handle saved dead. Paused
+  stacks are in *checkpoints*, which `vm checkpointNow` (native 174) and
+  `vm checkpointPolicy: n` (175: a checkpoint after every `n` allocations, 0
+  none; answers the receiver) hand to the host; a recording host keeps
+  them in its log. `vm logPosition` is native 176 (nil with no log).
+- Weak clearings are not logged: collections run on an allocation
+  schedule, which is part of the checkpoint, so replay clears at the same
+  points.
+- Lazy slots holding Aliens are reset when a checkpoint is restored into a
+  new host, not on save, so that one checkpoint serves both replay and
+  restore. The restore role is role 40, sent `restored` in a turn of its own.
+- `vm heapStatistics` does not exist yet.
 Replay control (stepping back, replaying to a position) is driven from
 outside the replayed actor by the debugger; whether that is a kernel
 operation or a host-side tool is left to the time-travel design.

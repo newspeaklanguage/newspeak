@@ -268,7 +268,9 @@ Still open:
 1. The wasm32 VM runs an image under a JavaScript host: load, turns, timers
    through the host's event loop, output. **Done.**
 2. The call-based JS FFI (`Alien` natives and marshalling, operation list
-   section 10).
+   section 10). **Done:** psoup's `JSTesting` passes on wasm (under Node
+   and in a browser), except one test of psoup's internal error text
+   (`eurasia/docs/EXPECTED_DIFFERENCES.md`).
 3. Expats and callbacks, with synchronous re-entry.
 4. CounterApp, on forks of psoup's JS and Hopscotch modules.
 

@@ -462,6 +462,7 @@ class, and on the VM mirror for the entry points. Every call is **input**
 | `alien callWithArguments: anArray` (the alien is a function) | 163 | value or Alien | same |
 | `alien newWithArguments: anArray` | 164 | Alien | same |
 | `alien isInstanceOf: anAlien` | 166 | Boolean | `#host: e`, `#dead` |
+| `alien isUndefined` | — | Boolean | (not a native: whether the alien is the host's `undefined`) |
 | `vm expat: aClosure` | 156 | Expat (a host-callable function) | |
 | `expat release` | — | `nil` | Calls after release fail on the host side with a defined error. |
 
@@ -471,11 +472,17 @@ marshalling of arguments and results inside each call. 169 (handle-table
 size) moves into `vm heapStatistics`.
 
 **Marshalling** (exact, no operand stack): `nil`, Booleans, SmallIntegers,
-Floats and Strings cross by value (host `null`/`undefined` both arrive as
-`nil`; an Integer outside the host's exact range fails with `#outOfRange`).
-Every other host value arrives as an Alien; an Alien passed back arrives as
-its host object; an Expat arrives as its host function. Any other Newspeak
-object fails with `#wrongKind`.
+Floats and Strings cross by value. Host `null` arrives as `nil`; host
+`undefined` arrives as an Alien that answers true to `isUndefined`, as in
+psoup (decided 2026-11-18; psoup's API, which `JSTesting` and Hopscotch use).
+`nil` passed to the host arrives as `null`, and the undefined Alien as
+`undefined`. A host number that is integral and within the host's exact
+range (2^53 for JavaScript) arrives as an Integer, any other as a Float; an
+Integer outside that range fails with `#outOfRange`. Every other host value
+arrives as an Alien; an Alien passed back arrives as its host object; an
+Expat arrives as its host function. Any other Newspeak object fails with
+`#wrongKind`. In `#host: e`, `e` is a String: the host's description of the
+exception.
 
 **Callbacks** follow design doc section 4 (decided 2026-11-09): a callback
 arriving during a turn is a sub-step of that turn, runs above the boundary
@@ -483,6 +490,21 @@ role, never drains the queue, and may call an expat synchronously only from
 its owning actor's turn. **Arity (decided 2026-11-10):** as in JS, extra
 host arguments are dropped and missing ones arrive as `nil`. psoup today
 raises on extra arguments; NS2JS already drops them.
+
+**Implemented on Eurasia (2026-11-18, M5 step 2).** The operations are
+natives 140–148 (`eurasia/kernel/natives.tsv`):
+- `vm hostGlobal` (140);
+- `Alien` (a kernel class, role 33): `at:` (141), `at:put:` (142),
+  `removeKey:` (143), `includesKey:` (144), `call:withArguments:` and
+  psoup's `perform:withArguments:` (145), `callWithArguments:` (146),
+  `newWithArguments:` (147), `isInstanceOf:` and psoup's `instanceOf:`
+  (148).
+
+They reach the host through `Host::host_operation`, which the web host
+performs in JavaScript (`eurasia/web/eurasia.mjs`). An Alien's unknown
+messages go to the host object as psoup's do. The platform's `js`
+(`EurasiaRuntime.ns`) gives `global`, `undefined` and `localStorage`.
+Expats and callbacks are next.
 
 **Native FFI.** The same operations, with `call:withArguments:` on a C
 function alien plus a signature describing the C types, cover native hosts.

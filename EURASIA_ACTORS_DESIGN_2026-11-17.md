@@ -204,4 +204,123 @@ Classes the genesis packager builds are marked by the packager (a class whose
 chain includes Value is a value class; one with a nil enclosing object is a
 value) and are not checked, being trusted.
 
-Next: VM actors (section 3, step 1).
+**2026-11-17: VM actors (uncommitted).** In place: actor records in the VM
+(message loop, mailbox, next timer), round-robin turns, allocation in the
+running actor's space, far references as a VM object kind (snapshot kind
+15), the remote-representation rules on every `vm post:to:`, platform
+cloning (`vm clone:`; a class is cloned exactly when its enclosing object
+is, so a clone's nested classes reach the clone's state), the template
+(role 36) saved by genesis, and the shared bit (8) on the kernel module and
+the VM mirror. psoup's actors module is forked (`kernel/fork-actors.py`
+derives `EurasiaActors.ns`): `Actor named:` creates a VM actor, `seed:`
+answers a VM far reference, eventual sends to one post packets, and a
+RemoteResolver posts results back. 440 of the 445 differential tests agree,
+including most of the multi-actor ones.
+
+**Finding: promise state must be visible across actors.** Five tests
+differ: `TwoActorTests>>testPipelining`, `testPipeliningImmediateLocalResolution1`
+and its `Forking` variant, and the same two in `MultiActorTests`. Each passes
+a promise to another actor and expects it to behave as a promise there:
+`when:` waits for it, and once it is resolved, immediate sends reach the
+resolution, even when the resolution happened in another actor a moment
+before. psoup gets this from its shared heap (one promise object, its state
+visible at once); the semantics gets it from the global promise table Π and
+RR-Promise (a promise crosses as a promise identity). Option (b) cannot: a
+promise crosses as a far reference to the sender's promise, which in the
+receiver is an opaque far reference. Section 7 has the choices.
+
+## 7. Promises across actors: choices
+
+1. **Promise state in the VM (option (a) for promises only).** A promise
+   that crosses actors becomes a VM promise record (Π): its state (pending,
+   fulfilled with a value or a far reference, broken) is global, and
+   RR-Promise passes its identity. The library's promises stay as they are
+   inside an actor; crossing an actor boundary creates or reuses the VM
+   record, and the library asks the VM for its state on an immediate send
+   and registers waiters (as packets) for `when:`. This is what the
+   semantics describes, and it passes the five tests. Cost: a VM object kind
+   with waiters, and settlement packets the VM sends.
+2. **A library protocol.** A promise crosses as a far reference plus a
+   marker; the receiver makes a local promise that subscribes to the
+   original by message. That fixes `when:` (`testPipelining`), but not the
+   immediate sends: the resolution arrives by message after the receiving
+   turn has started, so the `ImmediateLocalResolution` tests still differ.
+3. **Strict isolation, as expected differences.** A promise's resolution
+   reaches another actor only by message; the five tests become documented
+   differences. This contradicts the semantics' RR-Promise.
+
+Recommendation: 1. **Decided 2026-11-18: choice 1.**
+
+## 8. Promise records (2026-11-18, uncommitted)
+
+A promise that crosses actors is a **promise record** in the VM (the
+semantics' Π): a hidden object kind (snapshot kind 16; its class is the
+FarReference class, whose `doesNotUnderstand:` refuses immediate sends to a
+bare record). A record holds:
+
+- a state: pending, fulfilled, broken, or forwarded to another record;
+- a value: the resolution, the problem, or the record forwarded to;
+- the owner: a far reference to the library promise that stands for it in
+  the actor that created it;
+- waiters: far references to library promises that follow it;
+- a queue of eventual sends made while it is pending (Route-Pending).
+
+Everything in a record is in no actor's terms: values, far references and
+records. RR-Promise holds because the VM passes a record as itself.
+
+**VM operations** (natives 132–138, installed on the actors module):
+
+| Native | Operation | Effect |
+|---|---|---|
+| 132 | `newPromiseFor:` | Makes a pending record. |
+| 133 | `resolvePromise:with:` | Fulfils the record. A record as the value forwards it instead. A cycle breaks it. |
+| 134 | `breakPromise:with:` | Breaks the record. |
+| 135 | `promiseState:` | Answers the state at the end of the chain, in the running actor's terms. A pending record answers the owner's promise when that is in the running actor. |
+| 136 | `promise:addWaiter:` | Registers a waiter. |
+| 137 | `isVMPromise:` | Tests whether an object is a record. |
+| 138 | `promise:send:` | Queues an eventual send in the record, or delivers it if the record has settled. |
+
+**Settling a record:**
+- Its queue is delivered:
+  - a send to a far reference goes as a packet to that reference's actor;
+  - a send to a value goes as a packet to the sender's actor;
+  - when the record is broken, each send's result record is broken with the same problem.
+- Forwarding moves the queue to the end of the chain.
+- Each waiter gets a `resolveRemotely:` or `breakRemotely:` packet.
+
+**The library** (`kernel/fork-actors.py`):
+- **When a promise crosses:** an unresolved library promise crosses as its record (`vmWrap`). The first crossing makes a record that a RemoteResolver on the promise settles.
+- **A send to another actor:** the result is a *follower* promise of a new record, which the remote RemoteResolver settles directly. An unresolved local promise used as the resolution forwards the record to that promise's record.
+- **An arriving record** becomes, in the receiving actor:
+  - its resolution, or its problem;
+  - the actor's own promise, if it created the record;
+  - otherwise a new follower.
+- **Later sends to a promise with a record** queue in the record, so messages from every actor keep the order in which they were sent.
+- **An immediate send** to a follower asks the VM first, so a settlement in another actor is seen at once.
+
+**Why the queue is in the VM:** with sends queued in each actor's library
+promise, `TwoActorTests>>testPromiseForking2` broke. A forwarded promise let
+main's later sends overtake one that the other actor had queued earlier
+on the same promise. Queuing at the record gives the semantics' single
+order.
+
+**Result:** 444 of 445 differential tests agree, with and without GC stress
+(`GC_STRESS=50`). The five pipelining tests of section 6 that differed now
+agree, except `TwoActorTests>>testPipelining`.
+
+**`testPipelining`** sends the test's `Promise` (the actors module's
+`PromiseFactories` instance) to the other actor, which calls `Promise when:`
+on it. psoup's library lists `Promise` as a value object, so it crosses as
+itself. Here it is a mutable object of the sender's platform, so it crosses
+as a far reference, and the immediate send fails. With per-actor platforms,
+the faithful reading is that the receiver should get *its own* `Promise`.
+The choices:
+
+1. **Platform correspondence.** An object of the platform template crosses
+   as the receiver's clone of it. The VM would keep, for each actor, the map
+   from template objects to clones. Main would then also have to run a clone,
+   rather than the original platform.
+2. **Make `Promise` a value.** The factories would be restructured so they
+   need no mutable enclosing state.
+3. **Record it as an expected difference.**
+

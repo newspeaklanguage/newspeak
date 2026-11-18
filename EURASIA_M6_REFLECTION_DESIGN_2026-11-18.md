@@ -226,3 +226,39 @@ runs on Eurasia.**
   It builds the mixins as the packager does, applies them and runs the
   class: slots, accessors, the factory and the class side. It also runs
   under GC stress.
+
+**Step 2 (2026-11-18): the mirrors fork; `MirrorTesting` agrees except
+`evaluate:`.**
+- **The fork.** `eurasia/kernel/fork-mirrors.py` derives `EurasiaMirrors.ns`
+  from `MirrorsForPrimordialSoup.ns` with few edits:
+  - the module's name;
+  - a class's mixin and superclass are contract fields 1 and 2;
+  - its methods are its mixin's;
+  - an instance's size is the slots its mixins declare;
+  - the compiler is the V5 one.
+
+  The primitive methods map to natives by the natives table: the existing
+  object operations, plus new natives 153–157 (`allInstancesOf:`, which
+  collects first, and four closure accessors).
+- **Most of the parity comes from the kernel.** Its mixins answer psoup's
+  mixin fields from the library field:
+  - `_headerSource`, `_accessModifier`, `_nestedMixins` and
+    `_primaryFactorySelector`, with their setters;
+  - a class-side mixin's `_instanceMixin`.
+
+  `_slots` holds psoup's `{name. isMutable. accessModifier}` triples, which
+  the VM only counts.
+- **The packager now keeps what the mirrors read:**
+  - method sources;
+  - psoup's `MethodMetadata` for lazy-slot methods;
+  - header sources;
+  - slot triples;
+  - psoup's class-side mixin names (`'X class'`).
+
+  Images grow with the sources (the base image from 104 KB to 271 KB).
+- **`EurasiaReflectiveRuntime.ns`** adds `mirrors` to the base platform,
+  over a namespace of the compiler's modules.
+- **The result.** `MirrorTesting` joins the differential kernel tests. 48 of
+  its 51 tests agree with psoup, also under GC stress. The three
+  `evaluate:` tests wait for step 4's Simulator and are listed in
+  `eurasia/docs/EXPECTED_DIFFERENCES.md`.

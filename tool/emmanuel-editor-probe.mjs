@@ -162,6 +162,12 @@ for (const path of process.argv.slice(4)) {
     times.push(Date.now() - t0);
   }
   console.log(`timing ${path.split("/").pop()} (${text.length} chars): ${times.join(", ")} ms per keystroke`);
+  await js("emmanuelRead(0)");
+  console.log(`       last keystroke: ${await js("emmanuelTimings")}`);
+  for (let i = 0; i < 3; i++) {
+    await js(`emmanuelProfile(${JSON.stringify(text)})`);
+    console.log(`       full pass: ${await js("emmanuelProfileResult")}`);
+  }
 }
 ws.close();
 process.exit(failures ? 1 : 0);

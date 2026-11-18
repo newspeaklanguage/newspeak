@@ -439,6 +439,13 @@ The debugger, normally another actor, is told by an ordinary message and
 works through a mirror. psoup instead detaches the stack into a Thread
 object and lets the actor go on with other turns.
 
+**For now, on Eurasia (decided 2026-11-18):** an unhandled exception does
+not pause the actor, because the IDE runs its debugger in the same actor
+(`EURASIA_M6_REFLECTION_DESIGN_2026-11-18.md` section 9). The turn's frames
+become detached activations when it ends, if something holds one of them,
+and the actor carries on. Pausing applies once a debugger runs in another
+actor.
+
 **Exception inside a callback.** A callback cannot stay paused, because the
 host is waiting on it synchronously. Per the decision of 2026-11-09 (design
 doc 4.2), the callback's frames are copied into a stack image for the

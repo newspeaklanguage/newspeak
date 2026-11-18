@@ -331,3 +331,36 @@ suites agree with psoup.**
     until the jumps were simulated.
   - `runNative` stored only into ordinary objects, until the interpreter's
     slot store was factored out for both.
+
+## 9. Unhandled exceptions: psoup's model for now (decided 2026-11-18)
+
+On psoup, the IDE handles an unhandled exception in the same actor as the
+code that failed:
+- `Debugging.ns` sets the handler of last resort to make a broken thread of
+  the failing stack (`ActivationMirror threadForBrokenActivation:reason:`)
+  and open the debugger on it;
+- the actor carries on, so the debugger's own UI works.
+
+Pausing the actor, as decided on 2026-11-10 (operation list section 7),
+would freeze the IDE until its debugger moved to an actor of its own.
+
+**Decided: psoup's model now.** When a turn ends while something holds an
+activation of it, the turn's frames become a stack image of detached
+activations instead of dying, as psoup's heap activations outlive their
+turn. The debugger inspects, steps and resumes that thread with the
+machinery of step 4. `vm pause:`, `vm resume:` and `vm replaceStackOf:with:`
+come when a debugger runs in another actor; the 2026-11-10 decision stands
+for that case.
+
+**Step 5 (2026-11-18): done on that basis.**
+- **At the end of a turn** in which some frame has an activation handle, the
+  VM detaches all of the turn's frames, the bottom one with no sender.
+  Otherwise frames die as before, at no cost.
+- **`EurasiaDebuggerProbe.ns`** checks the IDE's path, in
+  `eurasia/scripts/reflection-tests.sh`, also under GC stress. A failure in
+  a turn with no promise reaches a handler of last resort that makes a
+  broken thread. In a later turn, the thread's whole stack, from
+  `doesNotUnderstand:` down to the turn's dispatch, and its receivers are
+  still there.
+- **A negative control.** With the detaching disabled, the stack below
+  `doesNotUnderstand:` is dead and the probe fails.

@@ -264,7 +264,7 @@ Still open:
 - snapshots of more than one actor;
 - per-actor state in the shared kernel (for instance the symbol table).
 
-**Progress (2026-11-18): M5 begun, step 1 of 4.** The web host's steps:
+**Progress (2026-11-18): M5 done.** The web host's steps:
 1. The wasm32 VM runs an image under a JavaScript host: load, turns, timers
    through the host's event loop, output. **Done.**
 2. The call-based JS FFI (`Alien` natives and marshalling, operation list
@@ -275,7 +275,21 @@ Still open:
    the contract design's section 4 (boundary, exceptions, non-local
    return, nesting, sub-steps, idle callbacks), checked by
    `EurasiaHostTesting.ns` on wasm, under Node and in a browser.
-4. CounterApp, on forks of psoup's JS and Hopscotch modules.
+4. CounterApp. **Done:** it runs in a browser. Increment, decrement and
+   reset work, with no console errors. psoup's Hopscotch, graphics, fonts,
+   text, ducts, voice-controller and AI-access modules are packaged
+   unchanged:
+   - `EurasiaWebRuntime.ns` builds their platform over Eurasia's;
+   - `EurasiaCounterApp.ns` is the genesis entry;
+   - the genesis packager now compiles lazy slots.
+
+   `eurasia/scripts/web-tests.sh` builds the image. Checking it needs a
+   browser, because Hopscotch needs a DOM.
+
+Not done in M5: the vendor libraries psoup's page loads for larger apps
+(CodeMirror, JSZip, isomorphic-git) are not on Eurasia's page yet;
+`vm expat:`, `expat release` and reclaiming host handles are open, as are
+ports and the serializer.
 
 Step 1 details:
 - `eurasia-web` exports a non-blocking run (`eurasia_start`,

@@ -118,7 +118,9 @@ for (const [name, act, expected] of scenarios) {
   try {
     await act();
     const got = await source();
-    const ok = expected === null ? got !== DOC : got === expected;
+    const agrees = await js("emmanuelAgrees");
+    const ok = (expected === null ? got !== DOC : got === expected) && agrees;
+    if (!agrees) console.log("     the incremental parse disagrees with the whole parse");
     if (!ok) failures++;
     console.log(`${ok ? "PASS" : "FAIL"} ${name}\n     ${got}${ok || expected === null ? "" : "\n want " + expected}`);
   } catch (e) {
@@ -163,7 +165,7 @@ for (const path of process.argv.slice(4)) {
   }
   console.log(`timing ${path.split("/").pop()} (${text.length} chars): ${times.join(", ")} ms per keystroke`);
   await js("emmanuelRead(0)");
-  console.log(`       last keystroke: ${await js("emmanuelTimings")}`);
+  console.log(`       last keystroke: ${await js("emmanuelTimings")}; agrees with the whole parse: ${await js("emmanuelAgrees")}`);
   for (let i = 0; i < 3; i++) {
     await js(`emmanuelProfile(${JSON.stringify(text)})`);
     console.log(`       full pass: ${await js("emmanuelProfileResult")}`);

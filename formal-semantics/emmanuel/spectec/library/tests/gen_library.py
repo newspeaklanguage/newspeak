@@ -263,7 +263,7 @@ errors('lib-misplaced-errors', W9,
 
 # ---- Editing (Section 7). Expected sources are hand-written.
 CONST.update({"actTitle": 1009, "standardTitle": 1010, "'Act I'": 1011, "'y := 2'": 1012,
-              "scratchTitle": 1013})
+              "scratchTitle": 1013, "'http://x'": 1015, "'http://y'": 1016})
 TEMPLATES = "standardTitle = ( ^[\\The Play\\] )"
 SRCNAME[0] = 'Templates'
 template_lit, _ = parse_literal(TEMPLATES, TEMPLATES.index(OPEN))
@@ -307,6 +307,21 @@ def edit(name, doc, op, result, templates=False, out=None):
     if out is not None: register(plain(out))
     rel(name, 'Edit', '(%s, "doc", HOSTSTATE 0, STATE "doc" (NILV NILV), %s)'
         % (image(doc, templates), op), result)
+
+# Links: an inline block whose target is a string; its text is inline
+# content, without links. A target that is not a string is refused.
+W10 = "[\\paragraph\\]See [\\link: 'http://x'\\]the [\\emphasis\\]site[\\endEmphasis. endLink\\] now.[\\endParagraph\\]"
+s_lk = S('link:', C("'http://x'"))
+tree('lib-links', W10, doc(DOCF, [para(run('See '),
+    sub(T(st('link', strv('http://x')), [run('the '), simple('emph', 'emphasis', 'endEmphasis', run('site'))],
+          [s_lk, S('endLink')])),
+    run(' now.'))]))
+roundtrip('lib-links-roundtrip', W10,
+          "[\\paragraph\\]See [\\link: 'http://x'\\]the [\\emphasis\\]site[\\endEmphasis\\][\\endLink\\] now.[\\endParagraph\\]")
+W10b = "[\\paragraph\\]a[\\link: nil\\]b[\\link: 'http://x'. link: 'http://x'\\]c[\\endLink. endParagraph\\]"
+s_ln = S('link:', C('nil'))
+tree('lib-link-refusals', W10b, doc(DOCF, [para(run('a'), refused(s_ln), run('b'),
+    sub(T(st('link', strv('http://x')), [dnu(s_lk), run('c')], [s_lk, S('endLink')])))]))
 
 rows.append('# Editing (Section 7).')
 emph_all = simple('emph', 'emphasis', 'endEmphasis', run('all'))
@@ -379,6 +394,10 @@ edit('edit-detach', E12, '(DETACH (eps) 0)', edited("[\\title: 'Act I'\\]"), out
 E14 = "[\\codeBlock: 'x := 1'\\]"
 edit('edit-string', E14, '(SETSTRING (%s) 0 (%s))' % (INTO(0), chars('y := 2')),
      edited("[\\codeBlock: 'y := 2'\\]"), out="[\\codeBlock: 'y := 2'\\]")
+# A link's target is its field: setting the string changes it.
+edit('edit-link-target', W10, '(SETSTRING (%s) 0 (%s))' % (path(INTO(0), INTO(1))[1:-1], chars('http://y')),
+     edited("[\\paragraph\\]See [\\link: 'http://y'\\]the [\\emphasis\\]site[\\endEmphasis. endLink\\] now.[\\endParagraph\\]"),
+     out="[\\paragraph\\]See [\\link: 'http://y'\\]the [\\emphasis\\]site[\\endEmphasis. endLink\\] now.[\\endParagraph\\]")
 E16 = "[\\title: scratchTitle\\]"
 edit('edit-computed-tree', E16, REPLACE(INP(path(FLD(0)), 0, 1), INP(path(FLD(0)), 0, 1), TXTI('x')),
      refusedE('GIVEUP'))

@@ -4,8 +4,9 @@
 Run from tool/:
   python3 emmanuel-corpus.py WORKDIR [DOCS]
 
-DOCS defaults to ~/newspeak/dev/web/docs. Every document there (each *.zip,
-and the documents nested in its documents/ folder) is converted in a
+DOCS defaults to ~/newspeak/dev/web/docs. Every document there (each *.zip
+at any depth, and the documents nested in its documents/ and contents/
+folders) is converted in a
 headless Chrome by EmmanuelCorpusApp (see EmmanuelCorpusApp.ns), which is
 built into out/EmmanuelCorpus.vfuel; the static server must be serving out/
 on localhost:8080. WORKDIR gets the converted sources (sources/NAME.ems),
@@ -36,7 +37,8 @@ PORT = 9333
 
 def documents_in(name, data, out):
     """The documents of a zip: its top-level HTML file, and those of the
-    zips in its documents/ folder."""
+    zips in its documents/ and contents/ folders (a presentation's slides
+    are documents in contents/)."""
     try:
         archive = zipfile.ZipFile(io.BytesIO(data))
     except zipfile.BadZipFile:
@@ -45,7 +47,7 @@ def documents_in(name, data, out):
         parts = entry.split("/")
         if len(parts) == 2 and parts[1].endswith(".html"):
             out.append({"name": name, "html": archive.read(entry).decode("utf-8", "replace")})
-        elif len(parts) == 3 and parts[1] == "documents" and parts[2].endswith(".zip"):
+        elif len(parts) == 3 and parts[1] in ("documents", "contents") and parts[2].endswith(".zip"):
             documents_in(name + "/" + parts[2][:-4], archive.read(entry), out)
 
 
@@ -131,8 +133,8 @@ def main():
     docs_dir = Path(sys.argv[2] if len(sys.argv) > 2 else Path.home() / "newspeak/dev/web/docs")
     (work / "sources").mkdir(parents=True, exist_ok=True)
     docs = []
-    for z in sorted(docs_dir.glob("*.zip")):
-        documents_in(z.stem, z.read_bytes(), docs)
+    for z in sorted(docs_dir.glob("**/*.zip")):
+        documents_in(str(z.relative_to(docs_dir).with_suffix("")), z.read_bytes(), docs)
     (work / "documents.json").write_text(json.dumps(docs))
     print(f"{len(docs)} documents")
     build()

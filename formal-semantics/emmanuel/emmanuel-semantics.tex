@@ -1,0 +1,2969 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage{booktabs,longtable,array}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{textcomp}
+\usepackage[hidelinks]{hyperref}
+\numberwithin{equation}{section}
+\allowdisplaybreaks
+
+\newcommand{\EM}{\textsc{Emmanuel}}
+\newcommand{\NS}{\textsc{Newspeak}}
+\newcommand{\kw}[1]{\ensuremath{\mathsf{#1}}}
+\newcommand{\str}[1]{\ensuremath{\text{\texttt{#1}}}}
+\newcommand{\bs}{\textbackslash}
+\newcommand{\Open}{\str{[\bs}}
+\newcommand{\Close}{\str{\bs]}}
+\newcommand{\TM}{\kw{T}}
+\newcommand{\CM}{\kw{C}}
+\newcommand{\lexto}{\longrightarrow_{\mathrm{lex}}}
+\newcommand{\rulelabel}[1]{\textsc{#1}}
+\newcommand{\vs}{\text{\textvisiblespace}}
+\newcommand{\crt}{\mathord{\curlywedge}}
+
+\title{A Formal Semantics for \EM\\\large Design draft 0.1: the parametric core}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\EM{} is the mark-edit language of Ampleforth, Newspeak's live document
+system.  A mark-edit language is a markup language designed so that a
+document can be edited both as source and through its live rendering, with
+every edit made in the rendering carried back to source.  This draft gives
+the parametric core of \EM: its lexical structure, its grammar, the
+interpretation of markup into a tree of document blocks, and printing.  The
+core is parametric in three things: the host that parses and runs the
+\NS{} code occurring in markup, the block signature that says what
+each message does to each kind of block, and the field interface used by
+a live view.  On the core it builds the structural core of the standard
+library and the edit semantics: how each edit made in the live view is
+carried back to source as a rewrite of it.
+\end{abstract}
+
+\clearpage
+\begingroup
+\footnotesize
+\tableofcontents
+\endgroup
+\clearpage
+
+\section{Authority, scope, and method}
+\label{sec:method}
+
+The normative source is the Ampleforth document
+\emph{Newsepak\_Markup\_Design\_Notes}, in the state of its decisions dated
+November 7, 2026 (henceforth \emph{the design notes}).  Where this document
+and the design notes disagree, the disagreement is a defect to be resolved
+with the author; neither silently governs.
+
+The specification is layered:
+\begin{enumerate}
+\item lexical structure (Section~\ref{sec:lexical});
+\item grammar and abstract syntax;
+\item interpretation, a small-step transition system over a block store,
+      a stack of open blocks, and the sequence of parsed document blocks;
+\item printing, with the round-trip property stated as an obligation;
+\item the standard library, the block signature of ordinary documents
+      (Section~\ref{sec:library});
+\item edit semantics: provenance, and live-view edits as
+      source rewrites.
+\end{enumerate}
+
+\paragraph{Parameters.}
+The core does not embed \NS.  It is parametric in
+\begin{itemize}
+\item a \emph{host}, with three components: a \emph{host parser}, which
+      parses the code of a bracket into statements
+      (Section~\ref{sec:host-parser}), a \emph{host evaluator}, which
+      evaluates a \NS{} expression in the scope of the document and may
+      diverge, and a \emph{host printer}, which prints statements back
+      (Section~\ref{sec:printing});
+\item a \emph{block signature}, which for each kind of block and message
+      gives the message's effect: pop, add a leaf, add and push, mutate,
+      refuse, pop and reject, or not understood; and
+\item a \emph{field interface}, used only by the edit layer
+      (Section~\ref{sec:field}).
+\end{itemize}
+The standard block library (sections, paragraphs, styles, tables, citations,
+and so on) is one instance of the block signature; its structural core is
+given in Section~\ref{sec:library}.  Ordinary \NS{} supplies the host through the
+\NS{} semantics.
+
+\paragraph{Conventions.}
+As in the \NS{} semantics, disjunctive conditions are written as separately
+named rules with no first-match priority, chains and closures are inductive
+relations without fuel, and absent results have explicit constructors.
+
+%----------------------------------------------------------------------
+\section{Lexical structure}
+\label{sec:lexical}
+
+\subsection{Characters, positions, and spans}
+
+Let $\Sigma$ be the set of Unicode scalar values and let $w \in \Sigma^*$
+range over character sequences; $\epsilon$ is the empty sequence and
+juxtaposition is concatenation.  A markup source is a sequence
+$W = c_0 c_1 \cdots c_{n-1}$.  A \emph{position} is an index
+$0 \le i \le n$, and a \emph{span} $[i,j)$ with $i \le j$ denotes
+$c_i \cdots c_{j-1}$.  Every token and every node of abstract syntax carries
+the span of the source it was read from; the design notes require this so
+that a block can recover the exact source of every message it received.
+
+Four two-character sequences are distinguished:
+\begin{equation}\label{eq:lexical-sequences}
+\Open = \str{[}\,\str{\bs} \qquad
+\Close = \str{\bs}\,\str{]} \qquad
+\str{\bs\bs} \qquad
+\str{\bs[}
+\end{equation}
+The first two are \emph{mode switches}; the last two are the only
+\emph{escapes}, and occur only in text.
+
+\subsection{Modes}
+
+The lexer has two modes, text $\TM$ and code $\CM$, and keeps a stack of
+them.  Let $\mu$ range over mode stacks, written with the top at the right:
+\begin{equation}\label{eq:mode-stacks}
+\mu ::= \TM \mid \mu\,\TM \mid \mu\,\CM
+\end{equation}
+The initial stack is $\TM$.  The bottom of every stack is $\TM$, and $\TM$
+and $\CM$ alternate: $\Open$ always pushes the mode other than the current
+one, and $\Close$ pops.  Hence a stack is determined by its depth, and
+\begin{equation}\label{eq:mode-alternation}
+\mu = \TM\,\CM\,\TM\,\CM \cdots
+\end{equation}
+A $\CM$ pushed over $\TM$ opens a bracket of messages; a $\TM$ pushed over
+$\CM$ opens a markup expression nested in code.
+
+\subsection{Lexemes}
+
+The lexer produces a sequence of \emph{lexemes}, each with its span:
+\begin{equation}\label{eq:lexemes}
+\lambda ::= \kw{char}(c) \mid \kw{openMessages} \mid \kw{closeMessages}
+  \mid \kw{openMarkup} \mid \kw{closeMarkup} \mid \kw{code}(w)
+\end{equation}
+Here $\kw{char}(c)$ is one character of text after escapes are resolved,
+and $\kw{code}(w)$ is one piece of code source: a single character, a whole
+string literal, or a whole comment.
+
+\subsection{The lexing relation}
+
+A lexer configuration is $\langle \mu, w \rangle$, a mode stack and the
+input not yet read.  A step reads a prefix of $w$ and emits one lexeme:
+$\langle \mu, w \rangle \lexto^{\lambda} \langle \mu', w' \rangle$.
+Spans are omitted from the rules; the span of each lexeme is the prefix it
+consumes.  In the rules, $\mu$ ranges over possibly empty prefixes of a mode
+stack, so that $\mu\TM$ matches every stack whose top is $\TM$, including the
+initial stack.
+
+\paragraph{Text mode.}
+\begin{gather}
+\label{eq:lex-open-messages}
+\rulelabel{Lex-Open-Messages}\quad
+\langle \mu\TM, \Open\,w \rangle \lexto^{\kw{openMessages}}
+  \langle \mu\TM\CM, w \rangle
+\\
+\label{eq:lex-close-markup}
+\rulelabel{Lex-Close-Markup}\quad
+\langle \mu\CM\TM, \Close\,w \rangle \lexto^{\kw{closeMarkup}}
+  \langle \mu\CM, w \rangle
+\\
+\label{eq:lex-escape-backslash}
+\rulelabel{Lex-Escape-Backslash}\quad
+\langle \mu\TM, \str{\bs\bs}\,w \rangle \lexto^{\kw{char}(\str{\bs})}
+  \langle \mu\TM, w \rangle
+\\
+\label{eq:lex-escape-bracket}
+\rulelabel{Lex-Escape-Bracket}\quad
+\langle \mu\TM, \str{\bs[}\,w \rangle \lexto^{\kw{char}(\str{[})}
+  \langle \mu\TM, w \rangle
+\\
+\label{eq:lex-text-char}
+\rulelabel{Lex-Text-Char}\quad
+\langle \mu\TM, c\,w \rangle \lexto^{\kw{char}(c)}
+  \langle \mu\TM, w \rangle
+  \quad\text{if } c\,w \text{ begins with none of }
+  \Open, \Close, \str{\bs\bs}, \str{\bs[}
+\end{gather}
+$\Close$ in text mode with stack $\TM$, that is, outside any markup
+expression, has no rule; it is the lexical error
+$\kw{strayClose}$ (Section~\ref{sec:lexical-errors}).
+
+\paragraph{Code mode.}
+\begin{gather}
+\label{eq:lex-open-markup}
+\rulelabel{Lex-Open-Markup}\quad
+\langle \mu\CM, \Open\,w \rangle \lexto^{\kw{openMarkup}}
+  \langle \mu\CM\TM, w \rangle
+\\
+\label{eq:lex-close-messages}
+\rulelabel{Lex-Close-Messages}\quad
+\langle \mu\TM\CM, \Close\,w \rangle \lexto^{\kw{closeMessages}}
+  \langle \mu\TM, w \rangle
+\\
+\label{eq:lex-code-string}
+\rulelabel{Lex-Code-String}\quad
+\langle \mu\CM, \str{'}\,w \rangle \lexto^{\kw{code}(\str{'}\,u)}
+  \langle \mu\CM, w' \rangle
+  \quad\text{if } \mathit{lit}(w) = \langle u, w' \rangle
+\\
+\label{eq:lex-code-comment}
+\rulelabel{Lex-Code-Comment}\quad
+\langle \mu\CM, \str{(*}\,w \rangle \lexto^{\kw{code}(\str{(*}\,u)}
+  \langle \mu\CM, w' \rangle
+  \quad\text{if } \mathit{com}(1, w) = \langle u, w' \rangle
+\\
+\label{eq:lex-code-char}
+\rulelabel{Lex-Code-Char}\quad
+\langle \mu\CM, c\,w \rangle \lexto^{\kw{code}(c)}
+  \langle \mu\CM, w \rangle
+\notag\\
+  \text{if } c \ne \str{'} \text{ and } c\,w \text{ begins with none of }
+  \Open, \Close, \str{(*}
+\end{gather}
+A string literal and a comment are each read whole by a \emph{reader}, a
+function from the input after the opening delimiter to either a pair
+$\langle u, w' \rangle$, the rest $u$ of the literal (closing delimiter
+included) and the input $w'$ after it, or $\bot$ if the input ends first.
+Write $v \cdot \langle u, w' \rangle = \langle v\,u, w' \rangle$ and
+$v \cdot \bot = \bot$.  The string reader follows the \NS{} string literal:
+a quote is doubled inside the literal, and the literal ends at the first
+quote that is not doubled.
+\begin{equation}\label{eq:string-reader}
+\begin{aligned}
+\mathit{lit}(\str{'}\,\str{'}\,w) &= \str{'}\,\str{'} \cdot \mathit{lit}(w) \\
+\mathit{lit}(\str{'}\,w) &= \langle \str{'}, w \rangle
+  && \text{if } w \text{ does not begin with } \str{'} \\
+\mathit{lit}(c\,w) &= c \cdot \mathit{lit}(w) && \text{if } c \ne \str{'} \\
+\mathit{lit}(\epsilon) &= \bot
+\end{aligned}
+\end{equation}
+The comment reader follows the \NS{} comment, which nests; its first
+argument $d \ge 1$ is the number of comments open.
+\begin{equation}\label{eq:comment-reader}
+\begin{aligned}
+\mathit{com}(1, \str{*)}\,w) &= \langle \str{*)}, w \rangle \\
+\mathit{com}(d, \str{*)}\,w) &= \str{*)} \cdot \mathit{com}(d-1, w)
+  && \text{if } d > 1 \\
+\mathit{com}(d, \str{(*}\,w) &= \str{(*} \cdot \mathit{com}(d+1, w) \\
+\mathit{com}(d, c\,w) &= c \cdot \mathit{com}(d, w)
+  && \text{if } c\,w \text{ begins with neither } \str{(*} \text{ nor } \str{*)} \\
+\mathit{com}(d, \epsilon) &= \bot
+\end{aligned}
+\end{equation}
+The equations of each reader have disjoint conditions, so each reader is a
+function.  Because a string literal or comment is read whole, a mode switch
+inside one has no effect; this is how the design notes' lexical rule~4 is
+realized.  A string literal or comment whose reader yields $\bot$ is the
+lexical error $\kw{unclosedLiteral}$.
+
+Note that in code mode $\str{\bs\bs}$ and $\str{\bs[}$ are not escapes:
+$\str{\bs\bs}$ is the \NS{} modulo operator, read as two
+$\kw{code}$ lexemes.
+
+\subsection{Determinism}
+
+\begin{equation}\label{eq:lex-determinism}
+\langle \mu, w \rangle \lexto^{\lambda_1} \langle \mu_1, w_1 \rangle
+\ \wedge\
+\langle \mu, w \rangle \lexto^{\lambda_2} \langle \mu_2, w_2 \rangle
+\implies \lambda_1 = \lambda_2 \wedge \mu_1 = \mu_2 \wedge w_1 = w_2
+\end{equation}
+In text mode the four distinguished sequences differ in their first two
+characters, so at most one of the first four rules applies, and
+\rulelabel{Lex-Text-Char} applies exactly when none does.  In code mode,
+$\Open$, $\Close$, a quote, and $\str{(*}$ are mutually exclusive
+beginnings, and the readers are functions.  Lexing is therefore a
+deterministic left-to-right transduction.  For example, the text
+$\str{\bs\bs]}$ reads as $\kw{char}(\str{\bs})\,\kw{char}(\str{]})$, not as
+$\str{\bs}$ followed by $\Close$, because the escape begins first.  This is
+why the design notes write the literal text $\Close$ as $\str{\bs\bs]}$.
+
+\subsection{Lexing a source}
+\label{sec:lexical-errors}
+
+A \emph{located lexeme} $\ell = (\lambda, [i,j))$ pairs a lexeme with its
+span.  Running the lexer from position $i$ yields a result $r$:
+\begin{equation}\label{eq:lex-results}
+r ::= \kw{lexed}(\bar\ell) \mid \kw{error}(e, i)
+\qquad
+e ::= \kw{strayClose} \mid \kw{unclosedLiteral} \mid \kw{unclosedBracket}
+\end{equation}
+The run judgment $\langle \mu, i, w \rangle \Downarrow r$ says that lexing
+$w$, which begins at position $i$, from mode stack $\mu$ yields $r$.
+\begin{gather}
+\label{eq:run-end}
+\rulelabel{Run-End}\quad
+\langle \TM, i, \epsilon \rangle \Downarrow \kw{lexed}(\epsilon)
+\\
+\label{eq:run-step}
+\rulelabel{Run-Step}\quad
+\frac{\langle \mu, w \rangle \lexto^{\lambda} \langle \mu', w' \rangle
+      \qquad j = i + |w| - |w'|
+      \qquad \langle \mu', j, w' \rangle \Downarrow \kw{lexed}(\bar\ell)}
+     {\langle \mu, i, w \rangle \Downarrow
+      \kw{lexed}((\lambda, [i,j))\,\bar\ell)}
+\\
+\label{eq:run-step-error}
+\rulelabel{Run-Step-Error}\quad
+\frac{\langle \mu, w \rangle \lexto^{\lambda} \langle \mu', w' \rangle
+      \qquad j = i + |w| - |w'|
+      \qquad \langle \mu', j, w' \rangle \Downarrow \kw{error}(e, i')}
+     {\langle \mu, i, w \rangle \Downarrow \kw{error}(e, i')}
+\\
+\label{eq:run-stray-close}
+\rulelabel{Run-Stray-Close}\quad
+\langle \TM, i, \Close\,w \rangle \Downarrow \kw{error}(\kw{strayClose}, i)
+\\
+\label{eq:run-unclosed-string}
+\rulelabel{Run-Unclosed-String}\quad
+\langle \mu\CM, i, \str{'}\,w \rangle \Downarrow
+  \kw{error}(\kw{unclosedLiteral}, i)
+  \quad\text{if } \mathit{lit}(w) = \bot
+\\
+\label{eq:run-unclosed-comment}
+\rulelabel{Run-Unclosed-Comment}\quad
+\langle \mu\CM, i, \str{(*}\,w \rangle \Downarrow
+  \kw{error}(\kw{unclosedLiteral}, i)
+  \quad\text{if } \mathit{com}(1, w) = \bot
+\\
+\label{eq:run-unclosed-bracket}
+\rulelabel{Run-Unclosed-Bracket}\quad
+\langle \mu, i, \epsilon \rangle \Downarrow \kw{error}(\kw{unclosedBracket}, i)
+  \quad\text{if } \mu \ne \TM
+\end{gather}
+The span of each lexeme is the prefix of the input its step consumes.  An
+error records the position where it is detected: the stray $\Close$, the
+start of the unclosed literal, or the end of the input.  A
+source $W$ \emph{lexes} to $\bar\ell$, or \emph{fails} with $e$ at $i$, according
+to the run from the initial configuration:
+\begin{equation}\label{eq:lex-source}
+W \text{ lexes to } \bar\ell \iff
+  \langle \TM, 0, W \rangle \Downarrow \kw{lexed}(\bar\ell)
+\qquad
+W \text{ fails with } e \text{ at } i \iff
+  \langle \TM, 0, W \rangle \Downarrow \kw{error}(e, i)
+\end{equation}
+On the stacks reachable from $\TM$, which alternate
+by~\eqref{eq:mode-alternation}, every configuration either takes a lexing
+step or matches exactly one of the error rules, and none does both: a
+$\Close$ in text mode can step only when the stack has a $\CM$ under its
+top, and a quote or $\str{(*}$ in code mode steps exactly when its reader
+does not yield $\bot$.  With determinism~\eqref{eq:lex-determinism}, every
+source therefore has exactly one result.
+
+\paragraph{Obligation (no collision with \NS).}
+The design notes' lexical rule~4 asserts that neither $\Open$ nor $\Close$
+can occur in valid \NS{} code outside string literals and comments.  This is
+a property of the \NS{} grammar, recorded here as an obligation to be
+discharged against the \NS{} front-end semantics.  It guarantees that the
+lexer never misreads valid code as a mode switch.
+
+\subsection{Tokens}
+
+The parser consumes \emph{tokens}, obtained from located lexemes by
+coalescing.
+\begin{equation}\label{eq:tokens}
+\tau ::= \kw{text}(u) \mid \kw{code}(w) \mid \kw{openMessages}
+  \mid \kw{closeMessages} \mid \kw{openMarkup} \mid \kw{closeMarkup}
+\end{equation}
+A located token $t = (\tau, [i,j))$ pairs a token with its span.  Each
+lexeme first becomes a token, $\kw{char}(c)$ becoming $\kw{text}(c)$ and
+every other lexeme the token of the same name; then every maximal run of
+$\kw{text}$ tokens is merged into one, and likewise every maximal run of
+$\kw{code}$ tokens.
+\begin{equation}\label{eq:coalesce}
+\begin{aligned}
+\mathit{tokens}(\bar\ell) &= \mathit{merge}(\mathit{tok}(\ell_1) \cdots
+  \mathit{tok}(\ell_k)) \qquad \text{where } \bar\ell = \ell_1 \cdots \ell_k \\
+\mathit{merge}(\epsilon) &= \epsilon \\
+\mathit{merge}(t) &= t \\
+\mathit{merge}((\kw{text}(u), [i,j))\,(\kw{text}(u'), [j,k))\,\bar t)
+  &= \mathit{merge}((\kw{text}(u\,u'), [i,k))\,\bar t) \\
+\mathit{merge}((\kw{code}(w), [i,j))\,(\kw{code}(w'), [j,k))\,\bar t)
+  &= \mathit{merge}((\kw{code}(w\,w'), [i,k))\,\bar t) \\
+\mathit{merge}(t\,t'\,\bar t) &= t\,\mathit{merge}(t'\,\bar t)
+\\
+  &\phantom{{}={}} \text{if } t, t' \text{ are neither both } \kw{text}
+     \text{ nor both } \kw{code}
+\end{aligned}
+\end{equation}
+Consecutive lexemes of a run have adjacent spans, so the merging equations
+always apply to them, and the span of a merged token is the union of the
+spans merged.  Coalescing realizes the maximal-munch reading of text on
+which the design notes' argument for the trailing $\kw{Text}$ depends: two
+$\kw{text}$ tokens are never adjacent.
+
+%----------------------------------------------------------------------
+\section{Grammar and abstract syntax}
+\label{sec:grammar}
+
+The design notes give the grammar
+\begin{equation}\label{eq:concrete-grammar}
+\begin{aligned}
+\kw{DocumentMarkup} &\to \kw{DocumentBlock}^{*}\ \kw{Text} \\
+\kw{DocumentBlock} &\to \kw{Text}\ \Open\ \kw{Messages}\ \Close \\
+\kw{MarkupExpression} &\to \Open\ \kw{DocumentMarkup}\ \Close
+\end{aligned}
+\end{equation}
+where $\kw{Text}$ may be empty, $\kw{Messages}$ is a sequence of \NS{}
+statements separated by dots, each a single message without an explicit
+receiver and without cascades, and a $\kw{MarkupExpression}$ may occur in
+$\kw{Messages}$ wherever \NS{} allows an expression.
+
+Parsing is split in two.  The \emph{structural parse} reads the token
+sequence of Section~\ref{sec:lexical} into raw nodes, in which the code of a
+bracket is kept as a sequence of pieces: code, and the markup expressions
+nested in it.  It knows nothing of \NS, and it never fails on the output of
+the lexer.  \emph{Resolution} then hands the pieces of each bracket to the
+host parser, innermost markup expressions first, and yields the abstract
+syntax.  All syntax errors other than lexical ones come from the host
+parser.
+
+\subsection{Raw nodes}
+
+\begin{equation}\label{eq:raw-nodes}
+\begin{aligned}
+\rho &::= \kw{rblock}(u, s_u, \bar p, s) \mid \kw{rfinal}(u, s)
+  && \text{raw node} \\
+p &::= \kw{src}(w, s) \mid \kw{hole}(\bar\rho, s)
+  && \text{piece}
+\end{aligned}
+\end{equation}
+Here $s$ ranges over spans.  A raw block $\kw{rblock}(u, s_u, \bar p, s)$ is
+a $\kw{DocumentBlock}$: its contents $u$, with escapes resolved and possibly
+empty, the span $s_u$ of the contents, the pieces $\bar p$ of its bracket,
+and the span $s$ of the whole block, from the start of its contents to the
+end of its $\Close$.  A raw final node $\kw{rfinal}(u, s)$ is the trailing
+$\kw{Text}$ when it is not empty.  A piece is either code $\kw{src}(w, s)$,
+or $\kw{hole}(\bar\rho, s)$, a markup expression whose contents parse to
+$\bar\rho$ and whose span $s$ runs from its $\Open$ to its $\Close$.
+
+\subsection{The structural parse}
+
+The judgment $\bar t \Rightarrow_{\mathrm{m}} (\bar\rho, \bar t')$ reads a
+$\kw{DocumentMarkup}$ from the located tokens $\bar t$, leaving $\bar t'$,
+which is empty or begins with $\kw{closeMarkup}$.  The judgment
+$\bar t \Rightarrow_{\mathrm{b}} (\bar p, s, \bar t')$ reads the pieces of a
+bracket up to and including its $\kw{closeMessages}$, whose span is $s$.
+Tokens are written with their spans, as $\kw{text}(u)_{[i,j)}$.
+\begin{gather}
+\label{eq:markup-end}
+\rulelabel{Markup-End}\quad
+\epsilon \Rightarrow_{\mathrm{m}} (\epsilon, \epsilon)
+\\
+\label{eq:markup-stop}
+\rulelabel{Markup-Stop}\quad
+\kw{closeMarkup}_{s}\,\bar t \Rightarrow_{\mathrm{m}}
+  (\epsilon, \kw{closeMarkup}_{s}\,\bar t)
+\\
+\label{eq:markup-trailing-end}
+\rulelabel{Markup-Trailing-End}\quad
+\kw{text}(u)_{s} \Rightarrow_{\mathrm{m}} (\kw{rfinal}(u, s), \epsilon)
+\\
+\label{eq:markup-trailing-stop}
+\rulelabel{Markup-Trailing-Stop}\quad
+\kw{text}(u)_{s}\,\kw{closeMarkup}_{s'}\,\bar t \Rightarrow_{\mathrm{m}}
+  (\kw{rfinal}(u, s), \kw{closeMarkup}_{s'}\,\bar t)
+\\
+\label{eq:markup-block}
+\rulelabel{Markup-Block}\quad
+\frac{\bar t \Rightarrow_{\mathrm{b}} (\bar p, [k', l), \bar t')
+      \qquad \bar t' \Rightarrow_{\mathrm{m}} (\bar\rho, \bar t'')}
+     {\kw{text}(u)_{[i,j)}\,\kw{openMessages}_{[j,k)}\,\bar t
+      \Rightarrow_{\mathrm{m}}
+      (\kw{rblock}(u, [i,j), \bar p, [i,l))\,\bar\rho, \bar t'')}
+\\
+\label{eq:markup-bare-block}
+\rulelabel{Markup-Bare-Block}\quad
+\frac{\bar t \Rightarrow_{\mathrm{b}} (\bar p, [k', l), \bar t')
+      \qquad \bar t' \Rightarrow_{\mathrm{m}} (\bar\rho, \bar t'')}
+     {\kw{openMessages}_{[j,k)}\,\bar t
+      \Rightarrow_{\mathrm{m}}
+      (\kw{rblock}(\epsilon, [j,j), \bar p, [j,l))\,\bar\rho, \bar t'')}
+\\
+\label{eq:messages-close}
+\rulelabel{Messages-Close}\quad
+\kw{closeMessages}_{s}\,\bar t \Rightarrow_{\mathrm{b}} (\epsilon, s, \bar t)
+\\
+\label{eq:messages-code}
+\rulelabel{Messages-Code}\quad
+\frac{\bar t \Rightarrow_{\mathrm{b}} (\bar p, s', \bar t')}
+     {\kw{code}(w)_{s}\,\bar t \Rightarrow_{\mathrm{b}}
+      (\kw{src}(w, s)\,\bar p, s', \bar t')}
+\\
+\label{eq:messages-markup}
+\rulelabel{Messages-Markup}\quad
+\frac{\bar t \Rightarrow_{\mathrm{m}}
+        (\bar\rho, \kw{closeMarkup}_{[k,l)}\,\bar t')
+      \qquad \bar t' \Rightarrow_{\mathrm{b}} (\bar p, s', \bar t'')}
+     {\kw{openMarkup}_{[i,j)}\,\bar t \Rightarrow_{\mathrm{b}}
+      (\kw{hole}(\bar\rho, [i,l))\,\bar p, s', \bar t'')}
+\end{gather}
+A bracket with no text before it has empty contents, with the empty span at
+the start of its $\Open$.  The trailing $\kw{Text}$ yields a node only when
+it is not empty: an empty $\kw{Text}$ is the absence of a $\kw{text}$
+token.  Because $\kw{text}$ tokens are never adjacent, the token after a
+$\kw{text}$ token decides which rule applies, as the design notes argue.
+
+\paragraph{Totality (obligation).}
+\begin{equation}\label{eq:structural-totality}
+W \text{ lexes to } \bar\ell
+\implies
+\exists!\, \bar\rho.\ \mathit{tokens}(\bar\ell) \Rightarrow_{\mathrm{m}}
+  (\bar\rho, \epsilon)
+\end{equation}
+The lexer emits $\kw{text}$ and $\kw{openMessages}$ only in text mode,
+$\kw{code}$ and $\kw{openMarkup}$ only in code mode, and its mode stack
+pairs every $\kw{openMessages}$ with a $\kw{closeMessages}$ and every
+$\kw{openMarkup}$ with a $\kw{closeMarkup}$, properly nested; no
+$\kw{closeMarkup}$ occurs at top level, since that is
+$\kw{strayClose}$.  So the structural parse cannot fail on lexer output.
+
+\subsection{Abstract syntax}
+
+\begin{equation}\label{eq:abstract-syntax}
+\begin{aligned}
+n &::= \kw{block}(u, s_u, \bar\sigma, s) \mid \kw{final}(u, s)
+  && \text{DocumentBlockAST} \\
+L &::= \kw{markup}(d, \bar n, s) && \text{MarkupLiteral} \\
+\sigma &::= \kw{send}(\bar c, x, \bar\eta, s) \mid \kw{comment}(s)
+  && \text{statement} \\
+h &::= \kw{src}(w, s) \mid \kw{hole}(L) && \text{host input piece}
+\end{aligned}
+\end{equation}
+A $\kw{block}$ is the DocumentBlockAST of a bracket: its contents and their
+span, its statements in order, and its span.  A $\kw{final}$ node is the
+final DocumentBlockAST of the design notes, the one with no messages; it is
+kept distinct from a block whose bracket is empty, which is printed with
+its bracket.  A markup literal holds the name $d$ of the source it was read
+from, the DocumentBlockASTs of a markup expression, and its span.  Every
+source has a name; a document's is fixed by the image it belongs to
+(Section~\ref{sec:image}), and the name is what lets an edit find the source
+of a literal that a method returned.  A statement is either a message send
+$\kw{send}(\bar c, x, \bar\eta, s)$, with the spans $\bar c$ of the comments
+that precede it in its bracket, its selector $x$, its argument expressions
+$\bar\eta$, and its span; or a $\kw{comment}(s)$ that no message follows.
+Argument expressions $\eta$ are abstract syntax of the host.  The core
+observes only $\mathit{lits}(\eta)$, the markup literals occurring in
+$\eta$, in source order.
+
+\subsection{The host parser}
+\label{sec:host-parser}
+
+The host parser is a function from the host input pieces of one bracket to
+either its statements or a syntax error with its span:
+\begin{equation}\label{eq:host-parser}
+\mathcal{P}(\bar h) \in \{\, \kw{stmts}(\bar\sigma) \,\} \cup
+  \{\, \kw{fail}(s) \,\}
+\end{equation}
+A hole is an atomic expression, a literal, to the host parser.  The host
+parser is required to satisfy:
+\begin{enumerate}
+\item[(H1)] it is total: parsing does not diverge;
+\item[(H2)] every send is a message without an explicit receiver, unary or
+      keyword, and not a cascade; any other statement makes it fail;
+\item[(H3)] the holes of $\bar h$, in order, are exactly the concatenation
+      of $\mathit{lits}(\eta)$ over the arguments of the sends, in order, so
+      no markup expression is lost, duplicated, or reordered;
+\item[(H4)] statement, comment, and error spans lie within the span from
+      the first piece of $\bar h$ to its last, statements in increasing
+      order; and
+\item[(H5)] code that is empty or white space has no statements; a
+      bracket holding only a comment yields one $\kw{comment}$ statement;
+      a comment followed by a message in its bracket is recorded in that
+      send's $\bar c$.
+\end{enumerate}
+Ordinary \NS{} supplies $\mathcal{P}$ from its front-end semantics; the
+obligation that $\Open$ and $\Close$ never arise in valid \NS{} code
+(Section~\ref{sec:lexical-errors}) is what lets the core cut the code at
+the holes.
+
+\subsection{Resolution}
+
+Resolution replaces each raw node by a DocumentBlockAST, innermost markup
+expressions first, and stops at the first syntax error.  A result is
+$\kw{ok}(x)$ or $\kw{fail}(s)$.  As for the readers, write
+$v \cdot \kw{ok}(\bar x) = \kw{ok}(v\,\bar x)$ and
+$v \cdot \kw{fail}(s) = \kw{fail}(s)$.
+\begin{equation}\label{eq:resolve}
+\begin{aligned}
+\mathit{res}(\epsilon) &= \kw{ok}(\epsilon) \\
+\mathit{res}(\rho\,\bar\rho) &= n \cdot \mathit{res}(\bar\rho)
+  && \text{if } \mathit{node}(\rho) = \kw{ok}(n) \\
+\mathit{res}(\rho\,\bar\rho) &= \kw{fail}(s)
+  && \text{if } \mathit{node}(\rho) = \kw{fail}(s) \\[1ex]
+\mathit{node}(\kw{rfinal}(u, s)) &= \kw{ok}(\kw{final}(u, s)) \\
+\mathit{node}(\kw{rblock}(u, s_u, \bar p, s)) &=
+  \kw{ok}(\kw{block}(u, s_u, \bar\sigma, s))
+  && \text{if } \mathit{pieces}(\bar p) = \kw{ok}(\bar h),\
+     \mathcal{P}(\bar h) = \kw{stmts}(\bar\sigma) \\
+\mathit{node}(\kw{rblock}(u, s_u, \bar p, s)) &= \kw{fail}(s')
+  && \text{if } \mathit{pieces}(\bar p) = \kw{ok}(\bar h),\
+     \mathcal{P}(\bar h) = \kw{fail}(s') \\
+\mathit{node}(\kw{rblock}(u, s_u, \bar p, s)) &= \kw{fail}(s')
+  && \text{if } \mathit{pieces}(\bar p) = \kw{fail}(s') \\[1ex]
+\mathit{pieces}(\epsilon) &= \kw{ok}(\epsilon) \\
+\mathit{pieces}(\kw{src}(w, s)\,\bar p) &=
+  \kw{src}(w, s) \cdot \mathit{pieces}(\bar p) \\
+\mathit{pieces}(\kw{hole}(\bar\rho, s)\,\bar p) &=
+  \kw{hole}(L) \cdot \mathit{pieces}(\bar p)
+  && \text{if } \mathit{res}(\bar\rho) = \kw{ok}(\bar n),\
+     L = \kw{markup}(d, \bar n, s) \\
+\mathit{pieces}(\kw{hole}(\bar\rho, s)\,\bar p) &= \kw{fail}(s')
+  && \text{if } \mathit{res}(\bar\rho) = \kw{fail}(s')
+\end{aligned}
+\end{equation}
+Here $d$ is the name of the source being parsed, which every literal records.
+The error reported is the first in this order: within a bracket, an error
+in a nested markup expression is found before the host parses the bracket
+itself.  Every markup expression is therefore parsed when the enclosing
+markup is parsed, as the design notes require; only its interpretation is
+deferred (Section~\ref{sec:interpretation}).
+
+\subsection{Parsing a source}
+
+\begin{equation}\label{eq:parse-results}
+\pi ::= \kw{parsed}(\bar n) \mid \kw{lexError}(e, i)
+  \mid \kw{syntaxError}(s)
+\end{equation}
+\begin{gather}
+\label{eq:parse-lex-error}
+\rulelabel{Parse-Lex-Error}\quad
+\frac{W \text{ fails with } e \text{ at } i}
+     {\mathit{parse}(W) = \kw{lexError}(e, i)}
+\\
+\label{eq:parse-ok}
+\rulelabel{Parse-Ok}\quad
+\frac{W \text{ lexes to } \bar\ell
+      \qquad \mathit{tokens}(\bar\ell) \Rightarrow_{\mathrm{m}}
+        (\bar\rho, \epsilon)
+      \qquad \mathit{res}(\bar\rho) = \kw{ok}(\bar n)}
+     {\mathit{parse}(W) = \kw{parsed}(\bar n)}
+\\
+\label{eq:parse-syntax-error}
+\rulelabel{Parse-Syntax-Error}\quad
+\frac{W \text{ lexes to } \bar\ell
+      \qquad \mathit{tokens}(\bar\ell) \Rightarrow_{\mathrm{m}}
+        (\bar\rho, \epsilon)
+      \qquad \mathit{res}(\bar\rho) = \kw{fail}(s)}
+     {\mathit{parse}(W) = \kw{syntaxError}(s)}
+\end{gather}
+By the determinism of lexing, structural totality, and (H1), every source
+has exactly one parse result.
+
+\paragraph{Provisional: one error fails the parse.}
+A syntax error anywhere makes the whole source fail to parse.  That is
+accepted for now (2026-11-08) but is not the intended end state: an editor
+that reparses on every keystroke will want local recovery, in which a
+bracket the host cannot parse becomes an error leaf and the rest of the
+document still parses, as a message that is not understood does in
+interpretation.
+
+\paragraph{Example.}
+The source $\str{[\bs{}title: [\bs{}Hamlet\bs]\bs]}$ lexes to the tokens
+\begin{gather*}
+\kw{openMessages}_{[0,2)}\ \kw{code}(\str{title: })_{[2,9)}\
+\kw{openMarkup}_{[9,11)}
+\\
+\kw{text}(\str{Hamlet})_{[11,17)}\
+\kw{closeMarkup}_{[17,19)}\ \kw{closeMessages}_{[19,21)}
+\end{gather*}
+whose structural parse is the single raw block
+\[
+\kw{rblock}(\epsilon, [0,0),\
+  \kw{src}(\str{title: }, [2,9))\
+  \kw{hole}(\kw{rfinal}(\str{Hamlet}, [11,17)), [9,19)),\ [0,21)).
+\]
+Resolution gives the hole the literal
+$L = \kw{markup}(d, \kw{final}(\str{Hamlet}, [11,17)), [9,19))$, and the host
+parser yields one send of $\str{title:}$ whose single argument $\eta$ has
+$\mathit{lits}(\eta) = L$.
+
+\section{Interpretation}
+\label{sec:interpretation}
+
+Interpretation turns a sequence of DocumentBlockASTs into a tree of
+document blocks.  As in the design notes, it keeps a stack of open blocks,
+initially holding only a root, and processes the ASTs in order: the
+contents of each are added to the block on top of the stack (the ToS)
+under the whitespace rules, and its messages are then sent, one at a time,
+to whichever block is ToS when each is sent.  Each message pops the stack,
+adds a leaf, adds a block and pushes it, mutates the ToS, or is not
+understood.  Blocks are attached when they are created, so every block on
+the stack is already part of the tree.
+
+\subsection{The host evaluator and the block signature}
+
+The host evaluator and the block signature are parameters.  Neither is
+defined by the core; the core fixes only their shape.
+
+\paragraph{Host evaluator.}
+Let $\chi$ range over host states, $v$ over values, and $\xi$ over
+exceptions.  Host states are abstract; they include the document, which
+arguments are evaluated against as their implicit receiver.  The
+evaluator relates a host state and an argument expression to an outcome:
+\begin{equation}\label{eq:host-evaluator}
+\langle \chi, \eta \rangle \Downarrow_{\mathrm{E}} o
+\qquad
+o ::= \kw{val}(\chi', v) \mid \kw{exn}(\chi', \xi)
+\end{equation}
+Evaluation may diverge, in which case there is no outcome.  The evaluator
+is required to satisfy:
+\begin{enumerate}
+\item[(E1)] a markup expression standing alone as an argument evaluates,
+      without effect, to the uninterpreted literal: if $\eta$ is the hole
+      $L$ alone, then
+      $\langle \chi, \eta \rangle \Downarrow_{\mathrm{E}}
+        \kw{val}(\chi, \ulcorner L \urcorner)$; and
+\item[(E2)] values never refer to the blocks the interpreter is building.
+      A value may contain a finished tree $\tau$
+      (Section~\ref{sec:interp-results}), which is how a computed block
+      reaches the markup.  A tree held in a value is written $\tau^{L}$:
+      it records the literal $L$ it was interpreted from, which is where an
+      edit of the tree goes (Section~\ref{sec:editing}).
+\end{enumerate}
+Values thus include the literals $\ulcorner L \urcorner$ and the trees
+$\tau^{L}$; everything else about them belongs to the host.
+
+\paragraph{Block signature.}
+Let $\kappa$ range over block states.  A block state is the host's view of
+a block: its class and its fields, such as the title of the top-level
+block.  The signature gives, for each block state, its \emph{content
+class}
+\begin{equation}\label{eq:content-class}
+\mathit{cls}(\kappa) \in \{\, \kw{flow}, \kw{para}, \kw{cell}, \kw{inline} \,\}
+\end{equation}
+and, for a message sent to a block, its effect:
+\begin{equation}\label{eq:block-signature}
+\begin{gathered}
+\langle \chi, \kappa, x, \bar v \rangle \Downarrow_{\mathrm{S}} o
+\qquad
+o ::= \kw{eff}(\chi', \varepsilon) \mid \kw{exn}(\chi', \xi)
+\\
+\varepsilon ::= \kw{pop} \mid \kw{popReject} \mid \kw{leaf}(\kappa')
+  \mid \kw{push}(\kappa') \mid \kw{mutate}(\kappa') \mid \kw{refuse}
+  \mid \kw{dnu}
+\end{gathered}
+\end{equation}
+Here $x$ is the selector and $\bar v$ the argument values.  A $\kw{flow}$
+block holds no inline content: the top-level block, a section, a list, a
+table or row, a quote, a figure, a list item.  A $\kw{para}$ block holds
+inline content and is block-level, so its text is trimmed when it closes: a
+paragraph.  A $\kw{cell}$ block, a table cell, holds either flow content or
+inline content, but not both; which one is decided when it closes.  An
+$\kw{inline}$ block holds inline content and keeps its white space: a
+style, or an inline root.  A message that the block does not understand has
+effect $\kw{dnu}$.  A message that the block understands but whose check
+fails, such as a second title or an argument of the wrong kind, has effect
+$\kw{refuse}$: it leaves an error leaf and changes nothing else.  A closing
+message whose check fails has effect $\kw{popReject}$: the block is popped
+and closed as by $\kw{pop}$, and flagged as rejected.  An ordinary error
+raised in the method that implements a message, including a failed check
+that the method chooses to raise rather than report, is an exception.
+
+The effect relation may itself interpret markup: a method such as
+$\str{title:}$ receives a literal $\ulcorner L \urcorner$ and interprets it
+with a root of its choosing (Section~\ref{sec:interp-results}).  The
+signature and interpretation are therefore defined together, as the least
+relations closed under the rules of the signature and of this section.
+
+A block state is the only part of a block the host sees.  The children of
+a block, and the messages it received, are kept by the core in the block
+store.
+
+\subsection{White space}
+
+White space is the set
+$\mathit{WS} = \{\text{U+0009}, \text{U+000A}, \text{U+000B},
+\text{U+000C}, \text{U+000D}, \text{U+0020}\}$; in particular a
+non-breaking space is not white space, so it is kept as written
+(whitespace rule~1).  Write $\vs$ for U+0020.
+$\mathit{collapse}(u)$ replaces each maximal run of characters of
+$\mathit{WS}$ in $u$ by a single $\vs$:
+\begin{equation}\label{eq:collapse}
+\begin{aligned}
+\mathit{collapse}(\epsilon) &= \epsilon \\
+\mathit{collapse}(c\,u) &=
+  \vs\ \mathit{collapse}(\mathit{dropWS}(u))
+  && \text{if } c \in \mathit{WS} \\
+\mathit{collapse}(c\,u) &= c\ \mathit{collapse}(u)
+  && \text{if } c \notin \mathit{WS}
+\end{aligned}
+\end{equation}
+where $\mathit{dropWS}(u)$ removes the leading characters of $u$ that are in
+$\mathit{WS}$.
+
+The contents $u$, with span $s$, of a DocumentBlockAST add at most one
+child to the ToS, decided by the ToS's content class $k$
+(whitespace rules~3 and~4):
+\begin{equation}\label{eq:text-child}
+\mathit{child}(k, u, s) =
+\begin{cases}
+\kw{none} & \text{if } \mathit{collapse}(u) = \epsilon \\
+\kw{none} & \text{if } \mathit{collapse}(u) = \vs
+  \text{ and } k = \kw{flow} \\
+\kw{run}(\vs, s) & \text{if } \mathit{collapse}(u) =
+  \vs \text{ and } k \neq \kw{flow} \\
+\kw{stray}(u, s) & \text{if } \mathit{collapse}(u) \notin
+  \{\epsilon, \vs\} \text{ and } k = \kw{flow} \\
+\kw{run}(\mathit{collapse}(u), s) & \text{if } \mathit{collapse}(u)
+  \notin \{\epsilon, \vs\} \text{ and } k \neq \kw{flow}
+\end{cases}
+\end{equation}
+A text run keeps the span of the contents it came from.  A $\kw{stray}$
+child is the error leaf of rule~4; it keeps the contents as written.  A
+$\kw{cell}$ block keeps its text as a $\kw{para}$ block does; whether the
+text may stay is decided when the cell closes.
+
+When a $\kw{para}$ block closes, its text is trimmed (whitespace rule~2):
+a leading $\vs$ is removed from its first child and a
+trailing one from its last child, when those children are text runs, and
+a run left empty is removed.
+\begin{equation}\label{eq:trim}
+\begin{aligned}
+\mathit{trim}(\bar g) &= \mathit{trimEnd}(\mathit{trimStart}(\bar g)) \\
+\mathit{trimStart}(\kw{run}(\vs, s)\,\bar g) &= \bar g \\
+\mathit{trimStart}(\kw{run}(\vs\,c\,u, s)\,\bar g) &=
+  \kw{run}(c\,u, s)\,\bar g \\
+\mathit{trimStart}(\bar g) &= \bar g
+  && \text{if } \bar g \neq \kw{run}(\vs\,u, s)\,\bar g' \\
+\mathit{trimEnd}(\bar g\,\kw{run}(\vs, s)) &= \bar g \\
+\mathit{trimEnd}(\bar g\,\kw{run}(u\,c\,\vs, s)) &=
+  \bar g\,\kw{run}(u\,c, s) \\
+\mathit{trimEnd}(\bar g) &= \bar g
+  && \text{if } \bar g \neq \bar g'\,\kw{run}(u\,\vs, s)
+\end{aligned}
+\end{equation}
+Since runs are collapsed, one space is all there is to trim at each end.
+White space at the edge of an inline child, such as an emphasized run that
+begins with a space, is the inline block's own and is kept.
+
+\subsection{Block store and configurations}
+
+\begin{equation}\label{eq:block-store}
+\begin{aligned}
+g &::= \kw{run}(u, s) \mid \kw{blk}(\beta) \mid \kw{note}(s)
+  \mid \kw{mut}(\sigma) \mid \kw{dnu}(\sigma) \\
+  &\phantom{{}::={}} \mid \kw{stray}(u, s)
+  \mid \kw{rootPop}(\sigma) \mid \kw{refused}(\sigma)
+  && \text{child} \\
+B &::= \langle \kappa, \bar g, \bar\sigma, r \rangle
+  \qquad r ::= \kw{ok} \mid \kw{rejected}
+  && \text{block record} \\
+\Sigma &::= B_0 \cdots B_{m-1}
+  && \text{block store} \\
+\omega &::= \kw{text}(u, s) \mid \sigma && \text{item} \\
+C &::= \langle \chi, \Sigma, \bar\beta, \bar\omega \rangle
+  \mid \kw{raise}(\chi, \xi)
+  && \text{configuration}
+\end{aligned}
+\end{equation}
+A block reference $\beta$ is an index into the store, and a new block takes
+the next index, $|\Sigma|$.  A block record holds the block's state, its
+children in order, and the messages it received, in order: the one that
+created it, any that mutated it, and the one that closed it, and whether
+it was rejected when it closed.  Children are
+text runs, blocks, the $\kw{note}$ of a comment bracket (a CommentBlock),
+the marker $\kw{mut}(\sigma)$ of a mutating message, which records where
+among the children the block received it and renders nothing, and four
+error leaves: an ErrorDocumentBlock $\kw{dnu}(\sigma)$ holding the
+message not understood, stray text, $\kw{rootPop}(\sigma)$, a message
+that would pop the root, and $\kw{refused}(\sigma)$, a message whose check
+failed.  The stack $\bar\beta$ is written top first and is
+never empty; its last element is the root.
+
+The items of a DocumentBlockAST are its contents followed by its
+statements:
+\begin{equation}\label{eq:items}
+\mathit{items}(\kw{block}(u, s_u, \bar\sigma, s)) = \kw{text}(u, s_u)\,\bar\sigma
+\qquad
+\mathit{items}(\kw{final}(u, s)) = \kw{text}(u, s)
+\end{equation}
+and $\mathit{items}(\bar n)$ concatenates the items of $\bar n$.
+
+On the store, $\Sigma[\beta \mathrel{+}= g]$ appends the child $g$ to block
+$\beta$, $\Sigma[\beta \mathrel{\lhd} \sigma]$ appends the message $\sigma$
+to its received messages, $\Sigma[\beta := \kappa]$ replaces its state,
+$\Sigma[\beta\ \kw{rejected}]$ flags it as rejected, and
+$\Sigma\,B$ allocates $B$ at index $|\Sigma|$.
+
+In a store $\Sigma$, a child $\kw{blk}(\beta')$ is \emph{inline} if
+$\mathit{cls}(\kappa') = \kw{inline}$ and a \emph{block child} otherwise,
+where $\kappa'$ is the state of $\Sigma(\beta')$.  Closing a block trims
+it when it is a $\kw{para}$ block, or a $\kw{cell}$ block with no block
+child.  A cell with a block child holds flow content: its white-space runs
+are layout and are dropped, and if text or an inline child remains, the
+cell mixes the two and is rejected.  Let
+$\Sigma(\beta) = \langle \kappa, \bar g, \bar\sigma, r\rangle$.
+\begin{equation}\label{eq:close}
+\mathit{close}(\Sigma, \beta) =
+\begin{cases}
+\Sigma[\beta \mapsto \langle \kappa, \mathit{trim}(\bar g), \bar\sigma, r\rangle]
+  & \text{if } \mathit{cls}(\kappa) = \kw{para}, \text{ or }
+    \mathit{cls}(\kappa) = \kw{cell} \\
+  & \quad\text{and } \bar g \text{ has no block child} \\
+\Sigma[\beta \mapsto \langle \kappa, \bar g', \bar\sigma, r'\rangle]
+  & \text{if } \mathit{cls}(\kappa) = \kw{cell}
+    \text{ and } \bar g \text{ has a block child} \\
+\Sigma & \text{otherwise}
+\end{cases}
+\end{equation}
+where $\bar g'$ is $\bar g$ without its runs $\kw{run}(\vs, s)$, and
+$r' = \kw{rejected}$ if $\bar g'$ has a run or an inline child, and
+$r' = r$ otherwise.
+
+\subsection{Argument evaluation}
+
+Arguments are evaluated left to right, threading the host state; the first
+exception ends the evaluation.
+\begin{gather}
+\label{eq:args-nil}
+\rulelabel{Args-Nil}\quad
+\langle \chi, \epsilon \rangle \Downarrow_{\mathrm{A}} \kw{vals}(\chi, \epsilon)
+\\
+\label{eq:args-cons}
+\rulelabel{Args-Cons}\quad
+\frac{\langle \chi, \eta \rangle \Downarrow_{\mathrm{E}} \kw{val}(\chi', v)
+      \qquad \langle \chi', \bar\eta \rangle \Downarrow_{\mathrm{A}}
+        \kw{vals}(\chi'', \bar v)}
+     {\langle \chi, \eta\,\bar\eta \rangle \Downarrow_{\mathrm{A}}
+        \kw{vals}(\chi'', v\,\bar v)}
+\\
+\label{eq:args-raise-head}
+\rulelabel{Args-Raise-Head}\quad
+\frac{\langle \chi, \eta \rangle \Downarrow_{\mathrm{E}} \kw{exn}(\chi', \xi)}
+     {\langle \chi, \eta\,\bar\eta \rangle \Downarrow_{\mathrm{A}}
+        \kw{exn}(\chi', \xi)}
+\\
+\label{eq:args-raise-tail}
+\rulelabel{Args-Raise-Tail}\quad
+\frac{\langle \chi, \eta \rangle \Downarrow_{\mathrm{E}} \kw{val}(\chi', v)
+      \qquad \langle \chi', \bar\eta \rangle \Downarrow_{\mathrm{A}}
+        \kw{exn}(\chi'', \xi)}
+     {\langle \chi, \eta\,\bar\eta \rangle \Downarrow_{\mathrm{A}}
+        \kw{exn}(\chi'', \xi)}
+\end{gather}
+A message not understood while computing an argument is sent to some
+object other than the ToS, so it surfaces here as an exception, an ordinary
+error rather than a markup error, as the design notes require.
+
+\subsection{Steps}
+
+The step relation $C \longrightarrow C'$ processes one item.  Throughout,
+$\Sigma(\beta) = \langle \kappa, \bar g, \bar\sigma', r \rangle$ is the
+record of the ToS.  In the rules for a send,
+$\sigma = \kw{send}(\bar c, x, \bar\eta, s)$, and the premises
+\[
+\langle \chi, \bar\eta \rangle \Downarrow_{\mathrm{A}} \kw{vals}(\chi', \bar v)
+\qquad
+\langle \chi', \kappa, x, \bar v \rangle \Downarrow_{\mathrm{S}}
+  \kw{eff}(\chi'', \varepsilon)
+\]
+are abbreviated as $\chi, \beta \vdash \sigma \Downarrow \chi'', \varepsilon$.
+\begin{gather}
+\label{eq:step-text}
+\rulelabel{Step-Text}\quad
+\frac{\mathit{child}(\mathit{cls}(\kappa), u, s) = g}
+     {\langle \chi, \Sigma, \beta\,\bar\beta, \kw{text}(u, s)\,\bar\omega \rangle
+      \longrightarrow
+      \langle \chi, \Sigma[\beta \mathrel{+}= g], \beta\,\bar\beta, \bar\omega \rangle}
+\\
+\label{eq:step-text-none}
+\rulelabel{Step-Text-None}\quad
+\frac{\mathit{child}(\mathit{cls}(\kappa), u, s) = \kw{none}}
+     {\langle \chi, \Sigma, \beta\,\bar\beta, \kw{text}(u, s)\,\bar\omega \rangle
+      \longrightarrow
+      \langle \chi, \Sigma, \beta\,\bar\beta, \bar\omega \rangle}
+\\
+\label{eq:step-comment}
+\rulelabel{Step-Comment}\quad
+\langle \chi, \Sigma, \beta\,\bar\beta, \kw{comment}(s)\,\bar\omega \rangle
+\longrightarrow
+\langle \chi, \Sigma[\beta \mathrel{+}= \kw{note}(s)], \beta\,\bar\beta,
+  \bar\omega \rangle
+\\
+\label{eq:step-pop}
+\rulelabel{Step-Pop}\quad
+\frac{\chi, \beta \vdash \sigma \Downarrow \chi'', \kw{pop}}
+     {\langle \chi, \Sigma, \beta\,\beta'\,\bar\beta, \sigma\,\bar\omega \rangle
+      \longrightarrow
+      \langle \chi'', \mathit{close}(\Sigma[\beta \lhd \sigma], \beta),
+        \beta'\,\bar\beta, \bar\omega \rangle}
+\\
+\label{eq:step-pop-reject}
+\rulelabel{Step-Pop-Reject}\quad
+\frac{\chi, \beta \vdash \sigma \Downarrow \chi'', \kw{popReject}}
+     {\langle \chi, \Sigma, \beta\,\beta'\,\bar\beta, \sigma\,\bar\omega \rangle
+      \longrightarrow
+      \langle \chi'', \mathit{close}(\Sigma[\beta \lhd \sigma], \beta)
+        [\beta\ \kw{rejected}], \beta'\,\bar\beta, \bar\omega \rangle}
+\\
+\label{eq:step-root-pop}
+\rulelabel{Step-Root-Pop}\quad
+\frac{\chi, \beta \vdash \sigma \Downarrow \chi'', \varepsilon
+      \qquad \varepsilon \in \{\kw{pop}, \kw{popReject}\}}
+     {\langle \chi, \Sigma, \beta, \sigma\,\bar\omega \rangle
+      \longrightarrow
+      \langle \chi'', \Sigma[\beta \mathrel{+}= \kw{rootPop}(\sigma)], \beta,
+        \bar\omega \rangle}
+\\
+\label{eq:step-leaf}
+\rulelabel{Step-Leaf}\quad
+\frac{\chi, \beta \vdash \sigma \Downarrow \chi'', \kw{leaf}(\kappa')
+      \qquad \beta'' = |\Sigma|}
+     {\langle \chi, \Sigma, \beta\,\bar\beta, \sigma\,\bar\omega \rangle
+      \longrightarrow
+      \langle \chi'', \Sigma[\beta \mathrel{+}= \kw{blk}(\beta'')]\,
+        \langle \kappa', \epsilon, \sigma, \kw{ok} \rangle,
+        \beta\,\bar\beta, \bar\omega \rangle}
+\\
+\label{eq:step-push}
+\rulelabel{Step-Push}\quad
+\frac{\chi, \beta \vdash \sigma \Downarrow \chi'', \kw{push}(\kappa')
+      \qquad \beta'' = |\Sigma|}
+     {\langle \chi, \Sigma, \beta\,\bar\beta, \sigma\,\bar\omega \rangle
+      \longrightarrow
+      \langle \chi'', \Sigma[\beta \mathrel{+}= \kw{blk}(\beta'')]\,
+        \langle \kappa', \epsilon, \sigma, \kw{ok} \rangle,
+        \beta''\,\beta\,\bar\beta, \bar\omega \rangle}
+\\
+\label{eq:step-mutate}
+\rulelabel{Step-Mutate}\quad
+\frac{\chi, \beta \vdash \sigma \Downarrow \chi'', \kw{mutate}(\kappa')}
+     {\langle \chi, \Sigma, \beta\,\bar\beta, \sigma\,\bar\omega \rangle
+      \longrightarrow
+      \langle \chi'', \Sigma[\beta := \kappa'][\beta \lhd \sigma]
+        [\beta \mathrel{+}= \kw{mut}(\sigma)],
+        \beta\,\bar\beta, \bar\omega \rangle}
+\\
+\label{eq:step-dnu}
+\rulelabel{Step-Dnu}\quad
+\frac{\chi, \beta \vdash \sigma \Downarrow \chi'', \kw{dnu}}
+     {\langle \chi, \Sigma, \beta\,\bar\beta, \sigma\,\bar\omega \rangle
+      \longrightarrow
+      \langle \chi'', \Sigma[\beta \mathrel{+}= \kw{dnu}(\sigma)],
+        \beta\,\bar\beta, \bar\omega \rangle}
+\\
+\label{eq:step-refuse}
+\rulelabel{Step-Refuse}\quad
+\frac{\chi, \beta \vdash \sigma \Downarrow \chi'', \kw{refuse}}
+     {\langle \chi, \Sigma, \beta\,\bar\beta, \sigma\,\bar\omega \rangle
+      \longrightarrow
+      \langle \chi'', \Sigma[\beta \mathrel{+}= \kw{refused}(\sigma)],
+        \beta\,\bar\beta, \bar\omega \rangle}
+\\
+\label{eq:step-arg-raise}
+\rulelabel{Step-Arg-Raise}\quad
+\frac{\langle \chi, \bar\eta \rangle \Downarrow_{\mathrm{A}} \kw{exn}(\chi', \xi)}
+     {\langle \chi, \Sigma, \beta\,\bar\beta, \sigma\,\bar\omega \rangle
+      \longrightarrow \kw{raise}(\chi', \xi)}
+\\
+\label{eq:step-effect-raise}
+\rulelabel{Step-Effect-Raise}\quad
+\frac{\langle \chi, \bar\eta \rangle \Downarrow_{\mathrm{A}} \kw{vals}(\chi', \bar v)
+      \qquad \langle \chi', \kappa, x, \bar v \rangle \Downarrow_{\mathrm{S}}
+        \kw{exn}(\chi'', \xi)}
+     {\langle \chi, \Sigma, \beta\,\bar\beta, \sigma\,\bar\omega \rangle
+      \longrightarrow \kw{raise}(\chi'', \xi)}
+\end{gather}
+In Step-Pop and Step-Pop-Reject the stack has at least two blocks; in
+Step-Root-Pop it has only the root.  The root is never popped: a message that would pop it leaves an
+error leaf and changes nothing else, so, as with a message not understood,
+later messages behave as though it were absent.  No message both pops and
+pushes, since an effect is exactly one of the seven.
+
+\subsection{Results}
+\label{sec:interp-results}
+
+A finished tree is
+\begin{equation}\label{eq:trees}
+\begin{aligned}
+\tau &::= \kw{tree}(\kappa, \bar t, \bar\sigma, f)
+  && f ::= \kw{closed} \mid \kw{unclosed} \mid \kw{rejected} \\
+t &::= \kw{run}(u, s) \mid \kw{sub}(\tau) \mid \kw{note}(s)
+  \mid \kw{mut}(\sigma) \mid \kw{dnu}(\sigma) \\
+  &\phantom{{}::={}} \mid \kw{stray}(u, s)
+  \mid \kw{rootPop}(\sigma) \mid \kw{refused}(\sigma)
+\end{aligned}
+\end{equation}
+and is read off the store from the root, flagging the blocks in a set $U$
+as unclosed:
+\begin{equation}\label{eq:read-tree}
+\mathit{tree}_U(\Sigma, \beta) =
+  \kw{tree}(\kappa, \mathit{tree}_U(\Sigma, \bar g), \bar\sigma, f)
+\quad\text{where } \Sigma(\beta) = \langle \kappa, \bar g, \bar\sigma, r \rangle
+\end{equation}
+and $f = \kw{unclosed}$ if $\beta \in U$, $f = \kw{rejected}$ if
+$\beta \notin U$ and $r = \kw{rejected}$, and $f = \kw{closed}$ otherwise,
+mapping $\kw{blk}(\beta')$ to $\kw{sub}(\mathit{tree}_U(\Sigma, \beta'))$
+and every other child to itself.  Every block other than the root is
+allocated as a child of a block allocated before it, so the store is a
+tree rooted at index 0 and $\mathit{tree}$ is well defined.
+
+Interpretation from a root state $\kappa_0$ runs the configuration
+$\langle \chi, \langle \kappa_0, \epsilon, \epsilon, \kw{ok} \rangle, 0,
+\mathit{items}(\bar n) \rangle$ to the end of its items:
+\begin{equation}\label{eq:interp-results}
+\psi ::= \kw{done}(\chi, \tau) \mid \kw{raised}(\chi, \xi)
+\end{equation}
+\begin{gather}
+\label{eq:interp-done}
+\rulelabel{Interp-Done}\quad
+\langle \chi, \Sigma, \bar\beta\,0, \epsilon \rangle \Downarrow
+  \kw{done}(\chi, \mathit{tree}_{\{\bar\beta\}}(\Sigma, 0))
+\\
+\label{eq:interp-step}
+\rulelabel{Interp-Step}\quad
+\frac{C \longrightarrow \langle \chi', \Sigma', \bar\beta', \bar\omega' \rangle
+      \qquad \langle \chi', \Sigma', \bar\beta', \bar\omega' \rangle \Downarrow \psi}
+     {C \Downarrow \psi}
+\\
+\label{eq:interp-raise}
+\rulelabel{Interp-Raise}\quad
+\frac{C \longrightarrow \kw{raise}(\chi', \xi)}
+     {C \Downarrow \kw{raised}(\chi', \xi)}
+\\
+\label{eq:interpret}
+\rulelabel{Interpret}\quad
+\frac{\langle \chi, \langle \kappa_0, \epsilon, \epsilon, \kw{ok} \rangle, 0,
+        \mathit{items}(\bar n) \rangle \Downarrow \psi}
+     {\langle \chi, \kappa_0, \bar n \rangle \Downarrow_{\mathrm{I}} \psi}
+\end{gather}
+In Interp-Done the blocks still on the stack above the root were never
+closed.  They are already in the tree, and each is flagged
+$\kw{unclosed}$, so it can render plausibly from its subtrees; it is not
+trimmed.  A literal is interpreted with a root chosen by the method that
+receives it; this is what the design notes write as
+\texttt{markup interpretWith: root}:
+\begin{equation}\label{eq:interpret-with}
+\mathit{interpretWith}(\chi, \kw{markup}(d, \bar n, s), \kappa_0) = \psi
+\quad\text{iff}\quad
+\langle \chi, \kappa_0, \bar n \rangle \Downarrow_{\mathrm{I}} \psi
+\end{equation}
+A document whose source parses to $\bar n$ is interpreted with the
+signature's top-level block state $\kappa_{\mathrm{doc}}$, the
+document's ToplevelDocumentBlock, as its root.
+
+\paragraph{Errors.}
+The markup errors of a tree are its error leaves and its unclosed and
+rejected blocks, in document order:
+\begin{equation}\label{eq:errors}
+\begin{aligned}
+\mathit{errors}(\kw{tree}(\kappa, \bar t, \bar\sigma, f)) &=
+  \mathit{flag}(f)\ \mathit{errors}(t_1) \cdots \mathit{errors}(t_m) \\
+\mathit{flag}(\kw{unclosed}) &= \kw{unclosed}(\bar\sigma),\quad
+\mathit{flag}(\kw{rejected}) = \kw{rejected}(\bar\sigma),\quad
+\mathit{flag}(\kw{closed}) = \epsilon \\
+\mathit{errors}(\kw{sub}(\tau)) &= \mathit{errors}(\tau) \\
+\mathit{errors}(t) &= t
+  \quad\text{if } t \text{ is a } \kw{dnu},\ \kw{stray},\ \kw{rootPop},
+    \text{ or } \kw{refused} \text{ leaf} \\
+\mathit{errors}(t) &= \epsilon
+  \quad\text{if } t \text{ is a } \kw{run},\ \kw{note},
+    \text{ or } \kw{mut}
+\end{aligned}
+\end{equation}
+An unclosed or rejected block is reported by the messages it received, the
+first of which created it.  Markup errors never stop interpretation; only an
+exception from the host does.  Errors inside a tree built by a nested
+interpretation are the business of the method that stored it; the
+standard library reports them with the tree that holds them.
+
+\paragraph{Properties.}
+Each step consumes one item, so a derivation of
+$\langle \chi, \kappa_0, \bar n \rangle \Downarrow_{\mathrm{I}} \psi$ has
+at most $|\mathit{items}(\bar n)|$ steps, not counting those of nested
+interpretations, and interpretation can fail to
+have a result only if the host evaluator or the signature diverges.
+\begin{multline}\label{eq:interp-determinism}
+\text{if } \Downarrow_{\mathrm{E}} \text{ and } \Downarrow_{\mathrm{S}}
+\text{ each relate an input to at most one outcome,} \\
+\text{then }
+\langle \chi, \kappa_0, \bar n \rangle \Downarrow_{\mathrm{I}} \psi
+\text{ for at most one } \psi
+\end{multline}
+The side conditions of the step rules are disjoint: an item is text, a
+comment, or a send; the effect of a send is one of five; and Step-Pop and
+Step-Root-Pop are told apart by the height of the stack.
+
+\paragraph{Example.}
+Take a signature in which $\str{paragraph}$, sent to a $\kw{flow}$ block,
+pushes a $\kw{para}$ block, $\str{emphasis}$ sent to a $\kw{para}$ or
+$\kw{inline}$ block pushes an $\kw{inline}$ one, and $\str{endParagraph}$
+and $\str{endEmphasis}$ pop.  The source
+\[
+\str{[\bs{}paragraph\bs]\ Hi\ [\bs{}emphasis\bs]all[\bs{}endEmphasis\bs]\ [\bs{}endParagraph\bs]}
+\]
+has four DocumentBlockASTs, and the root $\beta = 0$ is a $\kw{flow}$
+block.  The first has empty contents, which add nothing, and pushes a
+paragraph, block~1.  The second adds the run $\vs\str{Hi}
+\vs$ to block~1 and pushes the emphasis, block~2.  The third
+adds the run $\str{all}$ to block~2 and pops it.  The fourth adds the
+whitespace-only run $\vs$ to block~1, since a paragraph keeps
+it, and pops the paragraph, which trims it: the leading space of the first
+run goes, and the last run, now empty, is removed.  The tree is
+\[
+\kw{tree}(\kappa_{\mathrm{doc}},\ 
+  \kw{sub}(\kw{tree}(\kappa_{\mathrm{p}},\
+    \kw{run}(\str{Hi}\vs, s_2)\
+    \kw{sub}(\kw{tree}(\kappa_{\mathrm{e}}, \kw{run}(\str{all}, s_3),
+      \sigma_2\,\sigma_3, \kw{closed})),\
+    \sigma_1\,\sigma_4, \kw{closed})),\
+  \epsilon, \kw{closed})
+\]
+where $\sigma_1, \ldots, \sigma_4$ are the four sends and $s_2, s_3$ the
+spans of the contents of the second and third ASTs.  The space between
+\str{Hi} and the emphasis survives, as whitespace rule~2 intends.
+
+\section{Printing}
+\label{sec:printing}
+
+The design notes ask that a document be a tree that prints itself to a
+markup program reproducing it.  The printer works from a tree $\tau$ and the
+source $W$ that it was interpreted from.  Text is printed from the runs, so
+white space comes out normalized.  Messages are printed by the host's
+pretty printer, a further parameter of the semantics, which for \NS{} is
+the \NS{} pretty printer; the core prints only the markup literals in the
+messages' arguments.  A
+tree built by code has no source of its own; it reaches a document only as
+a value, through the source of the message that computed it, and so needs
+no printing of its own here.
+
+\subsection{Escaping text}
+
+\begin{equation}\label{eq:escape}
+\begin{aligned}
+\mathit{esc}(\epsilon) &= \epsilon \\
+\mathit{esc}(\str{\bs}\,u) &= \str{\bs\bs}\ \mathit{esc}(u) \\
+\mathit{esc}(\str{[}\,u) &= \str{\bs[}\ \mathit{esc}(u) \\
+\mathit{esc}(c\,u) &= c\ \mathit{esc}(u)
+  && \text{if } c \notin \{\str{\bs}, \str{[}\}
+\end{aligned}
+\end{equation}
+Every backslash and every $\str{[}$ is escaped, so the escaped text
+contains no $\Open$, and every backslash in it begins an escape, so no
+$\Close$ is read from it either.  In text mode it lexes back to $u$, one
+character lexeme per character of $u$, whatever follows it:
+\begin{equation}\label{eq:escape-lexes}
+\text{for all } u \text{ and } W,\quad
+\langle \TM, i, \mathit{esc}(u)\,W \rangle \text{ reads the characters of }
+u \text{ and then lexes } W \text{ as } \langle \TM, i', W \rangle
+  \text{ does}
+\end{equation}
+where $i' = i + |\mathit{esc}(u)|$.  This is an obligation, checked by the
+regressions on texts that contain $\Open$, $\Close$, and trailing
+backslashes.
+
+\subsection{The host printer}
+
+The host printer is the inverse partner of the host parser: it prints the
+statements of one bracket back to host input pieces, code with holes, where
+each hole is a markup literal for the core to print:
+\begin{equation}\label{eq:host-printer}
+\mathcal{Q}_W(\bar\sigma) \in (\kw{pcode}(u) \mid \kw{plit}(L))^*
+\end{equation}
+It is given the source $W$ that the statements were parsed from, because
+the statements record their comments only by span; for a span
+$s = [i, j)$, $W[s]$ is the source from $i$ to $j$.  The host decides the
+layout of the code, including the comments, which it should keep.  Its
+requirements, (H6) and (H8), are stated with the round trip below.  The
+trivial host printer copies each statement from its source, cutting the
+code at its literals, $W[c_1]\,\vs \cdots W[c_m]\,\vs\ W[s]$ for a send
+with comments $c_1 \cdots c_m$.
+
+\subsection{Printing a tree}
+
+The core prints the pieces, and the literals in their holes, which are
+markup and contain brackets of their own:
+\begin{equation}\label{eq:print-message}
+\begin{aligned}
+\mathit{show}_W(\kw{pcode}(u)\,\bar p) &= u\ \mathit{show}_W(\bar p),
+  \qquad \mathit{show}_W(\epsilon) = \epsilon \\
+\mathit{show}_W(\kw{plit}(L)\,\bar p) &=
+  \mathit{showLit}_W(L)\ \mathit{show}_W(\bar p) \\
+\mathit{showLit}_W(\kw{markup}(d, n_1 \cdots n_m, s)) &=
+  \Open\ \mathit{showNode}_W(n_1) \cdots \mathit{showNode}_W(n_m)\ \Close \\
+\mathit{showNode}_W(\kw{block}(u, s_u, \bar\sigma, s)) &=
+  \mathit{esc}(u)\ \Open\ \mathit{show}_W(\mathcal{Q}_W(\bar\sigma))\ \Close \\
+\mathit{showNode}_W(\kw{final}(u, s)) &= \mathit{esc}(u) \\
+\mathit{br}_W(\sigma) &= \Open\ \mathit{show}_W(\mathcal{Q}_W(\sigma))\ \Close
+\end{aligned}
+\end{equation}
+A message of the tree is printed in a bracket of its own.  A literal's
+text is uninterpreted, so it is escaped but not trimmed or collapsed.
+The children of a tree are printed in order, and the creating message of a
+block before its children and its closing message after them:
+\begin{equation}\label{eq:print-tree}
+\begin{aligned}
+\mathit{print}_W(\kw{tree}(\kappa, t_1 \cdots t_m, \bar\sigma, f)) &=
+  \mathit{item}_W(t_1) \cdots \mathit{item}_W(t_m) \\
+\mathit{item}_W(\kw{run}(u, s)) &= \mathit{esc}(u) \\
+\mathit{item}_W(\kw{stray}(u, s)) &= \mathit{esc}(u) \\
+\mathit{item}_W(\kw{note}(s)) &= \mathit{br}_W(\kw{comment}(s)) \\
+\mathit{item}_W(t) &= \mathit{br}_W(\sigma)
+  \quad\text{if } t \in \{\kw{mut}(\sigma), \kw{dnu}(\sigma),
+    \kw{rootPop}(\sigma), \kw{refused}(\sigma)\} \\
+\mathit{item}_W(\kw{sub}(\kw{tree}(\kappa, \bar t, \sigma\,\bar\sigma, f))) &=
+  \mathit{br}_W(\sigma)\ \mathit{print}_W(\kw{tree}(\kappa, \bar t,
+    \sigma\,\bar\sigma, f))\ \mathit{closer}_W(\bar\sigma, f) \\
+\mathit{closer}_W(\bar\sigma\,\sigma', f) &= \mathit{br}_W(\sigma')
+  \quad\text{if } f \in \{\kw{closed}, \kw{rejected}\} \\
+\mathit{closer}_W(\epsilon, f) &= \epsilon
+  \quad\text{if } f \in \{\kw{closed}, \kw{rejected}\} \\
+\mathit{closer}_W(\bar\sigma, \kw{unclosed}) &= \epsilon
+\end{aligned}
+\end{equation}
+The root is printed through its children alone: it has no creating or
+closing message, and the messages that mutated it are its $\kw{mut}$
+markers.  A leaf received only its creating message, so it has no closer.  A
+block that was pushed and closed received at least its creating and its
+closing message, and the last is the closer.  Its mutating messages are
+printed from its $\kw{mut}$ markers, where they were received.  An unclosed
+block has no closer; it can only be on the rightmost path of the tree, so
+nothing is printed after it that it could swallow.
+
+\paragraph{Layout.}
+This printer emits no layout: it is canonical.  Whitespace rule~5 leaves the
+line layout to the printer, and a pretty printer may insert white space
+wherever the canonical output puts a bracket with no text before it whose
+ToS is a $\kw{flow}$ block: there white space adds no child.  Layout is not
+modelled further here.
+
+\subsection{Round trip}
+
+The round trip needs three more requirements of the host.
+\begin{enumerate}
+\item[(H6)] \emph{Printed statements reparse.}  If $\bar\sigma'$ is a
+      nonempty sequence of statements, each a result of $\mathcal{P}$ on
+      some bracket of $W$ or given by the field interface
+      (Section~\ref{sec:field}), then $\mathcal{P}$ on the pieces of the
+      bracket $\Open\,\mathit{show}_W(\mathcal{Q}_W(\bar\sigma'))\,\Close$,
+      wherever it is placed, yields $\bar\sigma'$, up to spans.  The round
+      trip needs this only for a sublist of one bracket; editing
+      (Section~\ref{sec:editing}) needs the rest.
+\item[(H7)] \emph{Positions are invisible.}  The host evaluator and the
+      block signature are deterministic, and they relate inputs that are
+      equal up to spans to outcomes that are equal up to spans.
+\item[(H8)] \emph{Printing is stable.}  In the situation of (H6), if
+      $W'$ contains that bracket and $\bar\sigma''$ is what $\mathcal{P}$
+      yields on it, then
+      $\lfloor \mathcal{Q}_{W'}(\bar\sigma'') \rfloor =
+      \lfloor \mathcal{Q}_W(\bar\sigma') \rfloor$: printing what was
+      printed changes nothing.
+\end{enumerate}
+These are what is asked of a pretty printer: that it change layout only,
+keep the comments in place, and reach a fixed point after one pass.  The
+trivial printer satisfies them for the statements of $W$; a statement given
+by the field interface has no source to copy, and needs a printer that
+prints from abstract syntax.
+Write $\lfloor \cdot \rfloor$ for the canonical form: every span replaced
+by $[0, 0)$, in statements, literals, and trees, and in host data as the
+host defines; and every list of children $\bar t$ replaced by
+$\mathit{merge}(\bar t)$, which merges adjacent runs and adjacent strays:
+\begin{equation}\label{eq:merge}
+\begin{aligned}
+\mathit{merge}(\kw{run}(u, s)\,\kw{run}(u', s')\,\bar t) &=
+  \mathit{merge}(\kw{run}(\mathit{collapse}(u\,u'), s)\,\bar t) \\
+\mathit{merge}(\kw{stray}(u, s)\,\kw{stray}(u', s')\,\bar t) &=
+  \mathit{merge}(\kw{stray}(u\,u', s)\,\bar t) \\
+\mathit{merge}(t\,t'\,\bar t) &= t\ \mathit{merge}(t'\,\bar t)
+  && (\dagger) \\
+\mathit{merge}(t) &= t, \qquad \mathit{merge}(\epsilon) = \epsilon
+\end{aligned}
+\end{equation}
+where ($\dagger$) applies unless $t$ and $t'$ are both runs or both strays.
+\begin{equation}\label{eq:canonical}
+\tau \approx \tau' \iff \lfloor \tau \rfloor = \lfloor \tau' \rfloor
+\end{equation}
+Adjacent runs arise only around a bracket that sends nothing, which leaves
+no trace in the tree; the printer then prints the two texts together, and
+they come back as one run.
+
+\paragraph{Round trip (obligation).}
+\begin{multline}\label{eq:round-trip}
+\mathit{parse}(W) = \kw{parsed}(\bar n),\quad
+\langle \chi, \kappa_{\mathrm{doc}}, \bar n \rangle \Downarrow_{\mathrm{I}}
+  \kw{done}(\chi', \tau),\quad
+W' = \mathit{print}_W(\tau)
+\implies \\
+\mathit{parse}(W') = \kw{parsed}(\bar n'),\quad
+\langle \chi, \kappa_{\mathrm{doc}}, \bar n' \rangle \Downarrow_{\mathrm{I}}
+  \kw{done}(\chi'', \tau'),\quad
+\tau' \approx \tau,\quad
+\lfloor \chi'' \rfloor = \lfloor \chi' \rfloor
+\end{multline}
+The reinterpretation sends the same messages, with arguments equal up to
+spans, in the same order, to blocks in the same states, so by (H6) and (H7)
+it has the same effects; the escaping lemma gives back the text of every
+run and stray; closing a paragraph again trims nothing more, since its
+runs were trimmed the first time; and closing a cell again drops nothing
+more and rejects it exactly when it was rejected before.
+
+\paragraph{Idempotence (obligation).}
+Printing the reinterpreted tree reproduces the printed source exactly:
+\begin{equation}\label{eq:print-idempotent}
+\text{in the situation of (\ref{eq:round-trip}),}\quad
+\mathit{print}_{W'}(\tau') = W'
+\end{equation}
+Every message in $W'$ prints again to the text it was printed from, by
+(H8) and induction on its literals, and the text of every run is already
+canonical.
+
+\paragraph{Example.}
+The source of the example of Section~\ref{sec:interpretation} prints as
+\[
+\str{[\bs{}paragraph\bs]Hi\ [\bs{}emphasis\bs]all[\bs{}endEmphasis\bs][\bs{}endParagraph\bs]}
+\]
+The leading space and the whitespace-only text before
+$\str{[\bs{}endParagraph\bs]}$ are gone, since trimming removed them; the
+space after $\str{Hi}$ is kept.  Interpreting this source gives the same
+tree up to spans, and printing it again gives the same source.
+
+%----------------------------------------------------------------------
+\section{The standard library}
+\label{sec:library}
+
+The standard library is an instance of the block signature for the \NS{}
+host: the block classes a document gets unless it overrides them.  This
+section gives its structural core: the top-level block, sections,
+paragraphs, the inline styles, lists, quotes, tables, figures, verbatim and
+code displays, embedded HTML, and labels.  Citations and bibliographies,
+references to labels, media, IDE links, and amplets are deferred; they need
+registries and a resolution pass after interpretation.  A document that
+overrides a block class extends this signature; overriding is not modelled
+here.
+
+\subsection{Values and block states}
+
+The library inspects only a few kinds of host value: strings $\ulcorner u
+\urcorner$, symbols $\#x$, $\kw{nil}$, literals $\ulcorner L \urcorner$,
+and trees $\tau$.  Strings, symbols, and trees are \emph{inline values},
+written $h$: the content of a title or heading, shown as its text or as the
+tree.  A message that takes inline content accepts a literal, which it
+interprets with the inline root $\kappa_{\mathrm{inl}}$, or an inline value
+as it is:
+\begin{gather}
+\label{eq:lib-inline-lit}
+\rulelabel{Inline-Lit}\quad
+\frac{\mathit{interpretWith}(\chi, L, \kappa_{\mathrm{inl}}) =
+        \kw{done}(\chi', \tau)}
+     {\langle \chi, \ulcorner L \urcorner \rangle \Downarrow_{\mathrm{H}}
+        \kw{val}(\chi', \tau^{L})}
+\\
+\label{eq:lib-inline-raise}
+\rulelabel{Inline-Raise}\quad
+\frac{\mathit{interpretWith}(\chi, L, \kappa_{\mathrm{inl}}) =
+        \kw{raised}(\chi', \xi)}
+     {\langle \chi, \ulcorner L \urcorner \rangle \Downarrow_{\mathrm{H}}
+        \kw{exn}(\chi', \xi)}
+\\
+\label{eq:lib-inline-value}
+\rulelabel{Inline-Value}\quad
+\langle \chi, h \rangle \Downarrow_{\mathrm{H}} \kw{val}(\chi, h)
+\\
+\label{eq:lib-inline-bad}
+\rulelabel{Inline-Bad}\quad
+\frac{v \text{ is neither a literal nor an inline value}}
+     {\langle \chi, v \rangle \Downarrow_{\mathrm{H}} \kw{bad}(\chi)}
+\end{gather}
+
+The block states, with their content classes, are:
+\begin{equation}\label{eq:lib-states}
+\begin{array}{@{}ll@{}}
+\kw{flow} & \kw{doc}(t, t', \bar a),\ \kw{section}(d, h, \ell),\
+  \kw{list},\ \kw{numbered},\ \kw{item},\ \kw{quote}(a),\ \kw{table}(\ell), \\
+  & \kw{headerRow},\ \kw{row},\ \kw{figure}(c, \ell),\
+  \kw{verbatim}(u),\ \kw{codeBlock}(u, x),\ \kw{html}(u) \\
+\kw{para} & \kw{para} \\
+\kw{cell} & \kw{cell} \\
+\kw{inline} & \kw{emph},\ \kw{strong},\ \kw{code},\ \kw{inline},\
+  \kw{newline}
+\end{array}
+\end{equation}
+Here $t$, $t'$, $a$, and $c$ are an inline value or $\kw{nil}$: the title,
+subtitle, attribution, and caption, each set at most once; $\bar a$ are the
+authors; $\ell$ is a label, a symbol or $\kw{nil}$; and $d \ge 1$ is the
+depth of a section, its level.  The top-level state is
+$\kappa_{\mathrm{doc}} = \kw{doc}(\kw{nil}, \kw{nil}, \epsilon)$ and the
+inline root is $\kappa_{\mathrm{inl}} = \kw{inline}$.  The verbatim, code,
+HTML, and newline states are leaves: they are never pushed, so they never
+receive a message.
+
+\subsection{Content models}
+
+The content model of a block is the set of selectors it understands, its
+public protocol.  It depends only on the kind of the block, not on its
+fields.  Inline content $I$, displays $D$, and flow
+content $F$ are shared, as the design notes' mixins are:
+\begin{equation}\label{eq:lib-models}
+\begin{aligned}
+I &= \{\str{emphasis}, \str{strong}, \str{code}, \str{newline}\} \\
+D &= \{\str{verbatim:}, \str{codeBlock:}, \str{codeBlock:language:},
+  \str{html:}\} \\
+F &= D \cup \{\str{paragraph}, \str{list}, \str{numberedList},
+  \str{quote}, \str{table}, \str{figure}\}
+\end{aligned}
+\end{equation}
+and the content models are
+\begin{equation}\label{eq:lib-model-table}
+\begin{array}{@{}l@{\;}l@{}}
+\kw{doc} & F \cup \{\str{section:}, \str{title:}, \str{subtitle:},
+  \str{author:}\} \\
+\kw{section} & F \cup \{\str{section:}, \str{label:}, \str{endSection}\} \\
+\kw{para} & I \cup \{\str{endParagraph}\} \\
+\kw{emph},\ \kw{strong},\ \kw{code} & I \cup \{\mathit{end}\} \\
+\kw{inline} & I \\
+\kw{list},\ \kw{numbered} & \{\str{item}, \mathit{end}\} \\
+\kw{item} & F \cup \{\str{endItem}\} \\
+\kw{quote} & F \cup \{\str{attribution:}, \str{endQuote}\} \\
+\kw{table} & \{\str{headerRow}, \str{row}, \str{label:},
+  \str{endTable}\} \\
+\kw{headerRow},\ \kw{row} & \{\str{cell}, \str{endRow}\} \\
+\kw{cell} & F \cup I \cup \{\str{endCell}\} \\
+\kw{figure} & D \cup \{\str{caption:}, \str{label:}, \str{endFigure}\}
+\end{array}
+\end{equation}
+where $\mathit{end}$ is the block's own closer, as in
+$\str{endEmphasis}$ for $\kw{emph}$ and $\str{endNumberedList}$ for
+$\kw{numbered}$.  Leaves understand nothing.  Each kind of block has
+exactly one closer, so a closer sent to the wrong block is not understood.
+A section opens only in the top-level block or a section, so its depth is
+its nesting depth.
+
+\subsection{Effects}
+
+Every selector $x$ in a content model is one of the following.  An
+\emph{opener} pushes a fresh block,
+\begin{equation}\label{eq:lib-openers}
+\begin{array}{@{}l@{}}
+\str{paragraph} \mapsto \kw{para},\
+\str{emphasis} \mapsto \kw{emph},\
+\str{strong} \mapsto \kw{strong},\
+\str{code} \mapsto \kw{code},\
+\str{list} \mapsto \kw{list}, \\
+\str{numberedList} \mapsto \kw{numbered},\
+\str{item} \mapsto \kw{item},\
+\str{quote} \mapsto \kw{quote}(\kw{nil}),\
+\str{table} \mapsto \kw{table}(\kw{nil}), \\
+\str{headerRow} \mapsto \kw{headerRow},\
+\str{row} \mapsto \kw{row},\
+\str{cell} \mapsto \kw{cell},\
+\str{figure} \mapsto \kw{figure}(\kw{nil}, \kw{nil})
+\end{array}
+\end{equation}
+a \emph{closer}, any selector beginning $\str{end}$, pops, and the rest
+are given by $\mathit{plain}$, below, or are \emph{inline-argument}
+messages, the set
+\[
+H = \{\str{section:}, \str{title:}, \str{subtitle:}, \str{author:},
+\str{attribution:}, \str{caption:}\}.
+\]  Writing $x \in \kappa$ for
+$x$ in the content model of $\kappa$:
+\begin{gather}
+\label{eq:lib-plain}
+\rulelabel{Lib-Plain}\quad
+\frac{x \in \kappa \qquad x \notin H \qquad
+      \mathit{plain}(\kappa, x, \bar v) = \varepsilon}
+     {\langle \chi, \kappa, x, \bar v \rangle \Downarrow_{\mathrm{S}}
+        \kw{eff}(\chi, \varepsilon)}
+\\
+\label{eq:lib-dnu}
+\rulelabel{Lib-Dnu}\quad
+\frac{x \notin \kappa}
+     {\langle \chi, \kappa, x, \bar v \rangle \Downarrow_{\mathrm{S}}
+        \kw{eff}(\chi, \kw{dnu})}
+\end{gather}
+\begin{equation}\label{eq:lib-plain-def}
+\begin{aligned}
+\mathit{plain}(\kappa, x, \epsilon) &= \kw{push}(\kappa')
+  && \text{if } x \mapsto \kappa' \text{ is an opener} \\
+\mathit{plain}(\kappa, x, \epsilon) &= \kw{pop}
+  && \text{if } x \text{ is a closer} \\
+\mathit{plain}(\kappa, \str{newline}, \epsilon) &= \kw{leaf}(\kw{newline}) \\
+\mathit{plain}(\kappa, \str{verbatim:}, \ulcorner u \urcorner) &=
+  \kw{leaf}(\kw{verbatim}(u)) \\
+\mathit{plain}(\kappa, \str{codeBlock:}, \ulcorner u \urcorner) &=
+  \kw{leaf}(\kw{codeBlock}(u, \str{newspeak})) \\
+\mathit{plain}(\kappa, \str{codeBlock:language:},
+  \ulcorner u \urcorner\,\#x) &= \kw{leaf}(\kw{codeBlock}(u, x)) \\
+\mathit{plain}(\kappa, \str{html:}, \ulcorner u \urcorner) &=
+  \kw{leaf}(\kw{html}(u)) \\
+\mathit{plain}(\kappa, \str{label:}, \#x) &=
+  \kw{mutate}(\kappa[\ell := \#x])
+  && \text{if } \ell(\kappa) = \kw{nil}
+\end{aligned}
+\end{equation}
+and $\mathit{plain}(\kappa, x, \bar v) = \kw{refuse}$ for every other
+$x \in D \cup \{\str{label:}\}$ and $\bar v$.  So a display whose argument is not a string, and a label that is not a
+symbol or that would relabel a block, are refused.  An inline-argument
+message checks first that its field is free, then takes its argument as
+inline content, then changes the block:
+\begin{gather}
+\label{eq:lib-inline}
+\rulelabel{Lib-Inline}\quad
+\frac{x \in \kappa \cap H \qquad \mathit{free}(\kappa, x) \qquad
+      \langle \chi, v \rangle \Downarrow_{\mathrm{H}} \kw{val}(\chi', h)}
+     {\langle \chi, \kappa, x, v \rangle \Downarrow_{\mathrm{S}}
+        \kw{eff}(\chi', \mathit{with}(\kappa, x, h))}
+\\
+\label{eq:lib-inline-taken}
+\rulelabel{Lib-Inline-Taken}\quad
+\frac{x \in \kappa \cap H \qquad \neg\mathit{free}(\kappa, x)}
+     {\langle \chi, \kappa, x, v \rangle \Downarrow_{\mathrm{S}}
+        \kw{eff}(\chi, \kw{refuse})}
+\\
+\label{eq:lib-inline-refuse}
+\rulelabel{Lib-Inline-Refuse}\quad
+\frac{x \in \kappa \cap H \qquad \mathit{free}(\kappa, x) \qquad
+      \langle \chi, v \rangle \Downarrow_{\mathrm{H}} \kw{bad}(\chi)}
+     {\langle \chi, \kappa, x, v \rangle \Downarrow_{\mathrm{S}}
+        \kw{eff}(\chi, \kw{refuse})}
+\\
+\label{eq:lib-inline-exn}
+\rulelabel{Lib-Inline-Raise}\quad
+\frac{x \in \kappa \cap H \qquad \mathit{free}(\kappa, x) \qquad
+      \langle \chi, v \rangle \Downarrow_{\mathrm{H}} \kw{exn}(\chi', \xi)}
+     {\langle \chi, \kappa, x, v \rangle \Downarrow_{\mathrm{S}}
+        \kw{exn}(\chi', \xi)}
+\end{gather}
+\begin{equation}\label{eq:lib-with}
+\begin{aligned}
+\mathit{with}(\kappa, \str{section:}, h) &=
+  \kw{push}(\kw{section}(\mathit{depth}(\kappa) + 1, h, \kw{nil})) \\
+\mathit{with}(\kw{doc}(t, t', \bar a), \str{title:}, h) &=
+  \kw{mutate}(\kw{doc}(h, t', \bar a)) \\
+\mathit{with}(\kw{doc}(t, t', \bar a), \str{subtitle:}, h) &=
+  \kw{mutate}(\kw{doc}(t, h, \bar a)) \\
+\mathit{with}(\kw{doc}(t, t', \bar a), \str{author:}, h) &=
+  \kw{mutate}(\kw{doc}(t, t', \bar a\,h)) \\
+\mathit{with}(\kw{quote}(a), \str{attribution:}, h) &=
+  \kw{mutate}(\kw{quote}(h)) \\
+\mathit{with}(\kw{figure}(c, \ell), \str{caption:}, h) &=
+  \kw{mutate}(\kw{figure}(h, \ell))
+\end{aligned}
+\end{equation}
+where $\mathit{depth}$ is $0$ for $\kw{doc}$ and $d$ for
+$\kw{section}(d, h, \ell)$.  A field is free when it is $\kw{nil}$:
+$\mathit{free}(\kappa, x)$ holds when $x$ is $\str{title:}$,
+$\str{subtitle:}$, $\str{attribution:}$, or $\str{caption:}$ and the field
+it sets, $t$, $t'$, $a$, or $c$, is $\kw{nil}$, and always when $x$ is
+$\str{section:}$ or $\str{author:}$.  Checking the
+field before interpreting the argument means that a refused title is never
+interpreted.  The library uses no $\kw{popReject}$ yet; the bibliographic
+entries, whose closer checks the required fields, will.
+
+\paragraph{What the checks cannot see.}
+A check sees only the state of the block that receives the message.  Pushing
+a child does not change its parent's state, so the library cannot check
+the order of children, such as a title before any section, nor their
+number, such as a list with no items.  Checks of that kind need either
+states that count their children or a check over the finished tree.
+
+\subsection{Errors}
+
+A title, heading, attribution, or caption interpreted from a literal is a
+tree held in a field, and its errors are the library's to report
+(Section~\ref{sec:interp-results}).  It reports them with the block that
+holds the field, after that block's own flag:
+\begin{equation}\label{eq:lib-errors}
+\begin{split}
+\mathit{errors}_{\mathrm{lib}}(\kw{tree}(\kappa, \bar t, \bar\sigma, f)) ={}&
+  \mathit{flag}(f)\
+  \mathit{errors}_{\mathrm{lib}}(\tau_1) \cdots
+  \mathit{errors}_{\mathrm{lib}}(\tau_k) \\
+  & \mathit{errors}_{\mathrm{lib}}(t_1) \cdots \mathit{errors}_{\mathrm{lib}}(t_m)
+\end{split}
+\end{equation}
+where $\tau_1 \cdots \tau_k$ are the trees among the fields of $\kappa$, in
+order, and $\mathit{errors}_{\mathrm{lib}}$ is $\mathit{errors}$ on every
+child that is not a block.
+
+\paragraph{Example.}
+The table of the design notes,
+\[
+\begin{array}{@{}l@{}}
+\str{[\bs{}table.\ headerRow.\ cell\bs]Act[\bs{}endCell.\ cell\bs]Scenes[\bs{}endCell.\ endRow\bs]} \\
+\str{[\bs{}row.\ cell\bs]I[\bs{}endCell.\ cell\bs]5[\bs{}endCell.\ endRow\bs]} \\
+\str{[\bs{}endTable\bs]}
+\end{array}
+\]
+interprets to a $\kw{table}(\kw{nil})$ holding a $\kw{headerRow}$ and a
+$\kw{row}$, each holding two cells with one run each: the line breaks
+between the brackets fall in the table, a $\kw{flow}$ block, and add
+nothing.  A cell holding $\str{x[\bs{}paragraph\bs]y[\bs{}endParagraph.\
+endCell\bs]}$ mixes text with a paragraph and is rejected when it closes;
+$\str{[\bs{}cell.\ paragraph\bs]y[\bs{}endParagraph.\ endCell\bs]}$ is a
+cell holding flow content, and $\str{[\bs{}cell\bs]\ y\
+[\bs{}endCell\bs]}$ is the shorthand, a cell holding the run $\str{y}$.
+
+%----------------------------------------------------------------------
+\section{Editing}
+\label{sec:editing}
+
+A live view shows the tree of a document and lets its reader edit it.  In a
+mark-edit language every such edit is carried back to source: the design
+notes require that a live-view edit change source, never block instances.
+This section gives the edit layer.  An edit never changes a tree.  It
+rewrites a source, and the new tree is the interpretation of the new
+source; what the edit layer promises is that this tree is the one the
+reader asked for.
+
+The layer has four steps.  A \emph{point} is a position in a finished tree,
+which is how the view reports where an edit happens.  Its \emph{anchor} is a
+position among the items of the source (Section~\ref{sec:interpretation}),
+the place where interpretation would add whatever is put there to the right
+block.  A \emph{splice} replaces the items between two anchors with new
+items and prints them into the source.  Each edit of the view is a splice,
+chosen so that the reinterpreted source shows the edit, and tidied so that
+it leaves no empty markup behind.
+
+\paragraph{The running example.}  Most examples below edit
+\[
+W_1 = \str{[\bs{}paragraph\bs]Hi\ [\bs{}emphasis\bs]all[\bs{}endEmphasis.\
+  endParagraph\bs]}
+\]
+Its nodes are $n_0$, with empty contents and the statement
+$\str{paragraph}$; $n_1$, with the contents $\str{Hi}\vs$ and the statement
+$\str{emphasis}$; and $n_2$, with the contents $\str{all}$ and the
+statements $\str{endEmphasis}$ and $\str{endParagraph}$.  The root of its
+tree has one child, the paragraph $P$, whose children are
+$\kw{run}(\str{Hi}\vs, s_1)$ and the emphasis $E$; the one child of $E$ is
+$\kw{run}(\str{all}, s_2)$, for $s_1, s_2$ the spans of the contents of
+$n_1$ and $n_2$.  Every example in this section is a regression of the
+library suite, named in brackets, so what it claims is checked against the
+SpecTec transcription.
+
+\subsection{The image and provenance}
+\label{sec:image}
+
+The design notes give text in the view one of three provenances: a literal
+in this document; a literal elsewhere in the image, such as in a method
+that serves as a template, whose edit goes to that method's source; or a
+computation, which is read-only.
+
+An \emph{image} $I$ is a finite map from source names $d$ to sources.  It
+holds the document's source, $I(d_0)$, and the sources of the host's
+methods.  A literal records its source, $\kw{markup}(d, \bar n, s)$, and a
+tree held in a value records its literal, $\tau^{L}$
+(Section~\ref{sec:interpretation}).  A \emph{markup} $m$ is either the
+document, $\kw{doc}(d)$, or a literal; $\mathit{src}(m)$ is its source name
+and $\mathit{nodes}(m)$ its DocumentBlockASTs.  The tree of the document is
+the interpretation of $\kw{doc}(d_0)$, and the tree $\tau^L$ held in a
+field is that of $L$.  The provenance of a markup is
+\begin{equation}\label{eq:provenance}
+\mathit{prov}(m) =
+\begin{cases}
+\kw{local} & \text{if } \mathit{src}(m) = d_0 \\
+\kw{template} & \text{if } \mathit{src}(m) \in \mathrm{dom}(I)
+  \setminus \{d_0\} \\
+\kw{computed} & \text{otherwise}
+\end{cases}
+\end{equation}
+A literal parsed at run time from a string has a source outside the image,
+so its tree is computed; so is a value that is no tree at all, such as a
+string that code computed and a block shows as its title.
+
+Two requirements of the host make provenance trustworthy:
+\begin{enumerate}
+\item[(H9)] \emph{Literals are current.}  If $\mathit{src}(L) = d \in
+      \mathrm{dom}(I)$, the text of $I(d)$ at the span of $L$ is the text
+      that $L$ was parsed from.
+\item[(H10)] \emph{A literal can be spliced.}  If a source of the host
+      holds a literal, replacing the text inside the literal's brackets by
+      text that parses as markup gives a source that the host parses as
+      before except for that literal, and evaluation uses the new literal
+      from then on.
+\end{enumerate}
+
+\paragraph{Example.}  Each of these documents has a title that is a tree,
+of each provenance in turn:
+\[
+\begin{array}{@{}ll@{}}
+W_{\mathrm{l}} = \str{[\bs{}title:\ [\bs{}Hamlet\bs]\bs][\bs{}paragraph\bs]x[\bs{}endParagraph\bs]}
+  & \kw{local} \\
+W_{\mathrm{t}} = \str{[\bs{}title:\ standardTitle\bs]} & \kw{template} \\
+W_{\mathrm{c}} = \str{[\bs{}title:\ scratchTitle\bs]} & \kw{computed}
+\end{array}
+\]
+In $W_{\mathrm{l}}$ the literal is the document's own.  In
+$W_{\mathrm{t}}$ the host method $\str{standardTitle}$ answers the literal
+$\str{\^{}[\bs{}The\ Play\bs]}$ of the source $\str{Templates}$, which the
+image holds, and typing $\str{Great}\vs$ before $\str{Play}$ rewrites that
+source, not the document [edit-template].  In $W_{\mathrm{c}}$ the method
+$\str{scratchTitle}$ answers a literal parsed at run time, whose source is
+not in the image, and typing in its title is refused [edit-computed-tree].
+
+\subsection{The field interface}
+\label{sec:field}
+
+Besides the tree, the view needs to know which fields a block displays, and
+where each came from.  This is the field interface.  For a block state
+$\kappa$ and the messages $\bar\sigma$ the block received, it gives the
+block's \emph{fields}
+\begin{equation}\label{eq:fields}
+\mathit{fields}(\kappa, \bar\sigma) = \varphi_0 \cdots \varphi_{r-1}
+\qquad
+\varphi ::= \langle v, \sigma, k \rangle
+\end{equation}
+each a value $v$ that the block displays, such as its title, together with
+the message $\sigma \in \bar\sigma$ and the index $k$ of the argument it
+came from.  It also says which blocks an edit may merge,
+$\mathit{merge}(\kappa)$, and gives, for each style $x$, the statements
+that open and close it, $\mathit{open}(x)$ and $\mathit{close}(x)$.  The
+host gives, for an argument expression $\eta$: its span
+$\mathit{span}(\eta)$; $\mathit{str}(\eta) = s$ when $\eta$ is a string
+literal standing alone, at span $s$; $\mathit{enc}(u)$, the text of a
+string literal whose value is the string $u$; and, where it can,
+$\mathcal{Q}_{\mathrm{v}}(v)$, the text of an expression whose value is $v$.
+\begin{enumerate}
+\item[(H11)] \emph{Strings can be edited.}  Replacing the text at the span
+      of a string literal $\eta$ by $\mathit{enc}(u)$ gives a source that
+      parses as before, except that $\eta$ now evaluates, without effect,
+      to the string $\ulcorner u \urcorner$.
+\item[(H12)] \emph{Detaching keeps the value.}  Replacing the text at
+      $\mathit{span}(\eta)$ by $\mathcal{Q}_{\mathrm{v}}(v)$ gives a source
+      that parses as before, except that $\eta$ now evaluates, without
+      effect, to $v$ up to $\approx$; a tree $\tau^{L}$ is printed as a copy
+      of $L$, which the method receiving it interprets to $\tau$ again.
+\end{enumerate}
+The standard library's field interface is given in
+Section~\ref{sec:lib-field}.
+
+\paragraph{Example.}  Let $L = \str{[\bs{}Hamlet\bs]}$ be the literal of
+$W_{\mathrm{l}}$, with the tree $\tau_{\mathrm{H}}$.  The root of
+$W_{\mathrm{l}}$ has the state $\kw{doc}(\tau_{\mathrm{H}}^{L}, \kw{nil},
+\epsilon)$ and one field, $\langle \tau_{\mathrm{H}}^{L}, \sigma, 0
+\rangle$ for $\sigma$ the $\str{title:}$ send; a subtitle of $\kw{nil}$ is
+not shown.  The one field of the code block of
+$\str{[\bs{}codeBlock:\ 'x\ :=\ 1'\bs]}$ is a string, from an argument
+that is a string literal standing alone, so it can be set in place
+[edit-string].
+
+\subsection{Points}
+\label{sec:points}
+
+\begin{equation}\label{eq:points}
+\pi ::= \epsilon \mid \pi.i \mid \pi.\varphi_j
+\qquad
+p ::= \kw{gap}(\pi, i) \mid \kw{in}(\pi, i, k)
+\end{equation}
+A path leads from the root of a tree to a block: $\pi.i$ to the $i$th child
+of the block at $\pi$, and $\pi.\varphi_j$ to the root of the tree held in
+its $j$th field, counting from $0$.  For the tree $\tau$ of a markup $m$,
+the block $\tau@\pi$ at a path and the markup $\mathit{mk}(\pi)$ of the
+tree the path enters last are
+\begin{equation}\label{eq:path}
+\begin{aligned}
+\tau@\epsilon &= \tau & \mathit{mk}(\epsilon) &= m \\
+\tau@\pi.i &= \tau' & \mathit{mk}(\pi.i) &= \mathit{mk}(\pi)
+  &&\text{if } \tau@\pi = \kw{tree}(\kappa, \bar g, \bar\sigma, f),\
+    g_i = \kw{sub}(\tau') \\
+\tau@\pi.\varphi_j &= \tau' & \mathit{mk}(\pi.\varphi_j) &= L
+  &&\text{if } \tau@\pi = \kw{tree}(\kappa, \bar g, \bar\sigma, f),\
+    \mathit{fields}(\kappa, \bar\sigma)_j = \langle \tau'^{L}, \sigma, k
+    \rangle
+\end{aligned}
+\end{equation}
+A point $\kw{gap}(\pi, i)$ lies before the $i$th child of the block at
+$\pi$, or at its end, and $\kw{in}(\pi, i, k)$ inside the text of the $i$th
+child, before its $k$th character.  For $\tau@\pi = \kw{tree}(\kappa, \bar
+g, \bar\sigma, f)$ the points are
+\begin{equation}\label{eq:point-ok}
+\kw{gap}(\pi, i) \ \text{ for } 0 \le i \le |\bar g|
+\qquad
+\kw{in}(\pi, i, k) \ \text{ for } g_i \in \{\kw{run}(u, s),
+  \kw{stray}(u, s)\} \text{ and } 0 < k < |u|
+\end{equation}
+so the ends of a text are gaps, and no point lies inside an error leaf
+other than stray text: a message that was not understood, refused, or that
+would pop the root is shown as its message, and is edited through the
+source.  The tree of a point is the one its path enters last,
+$\mathit{mk}(p)$ is the markup of its path, and points are ordered in
+document order.
+
+For a block $B = \kw{tree}(\kappa, \bar g, \sigma_0 \cdots \sigma_r, f)$
+other than a root, its \emph{creating} and \emph{closing} messages are
+\begin{equation}\label{eq:op-cl}
+\mathit{op}(B) = \sigma_0
+\qquad
+\mathit{cl}(B) = \sigma_r \ \text{ if } r \ge 1 \text{ and } f \neq
+  \kw{unclosed}
+\end{equation}
+and $\mathit{cls}(B)$ is the class of $\kappa$.  An unclosed block has no
+closing message.
+
+\paragraph{Example.}  In $W_1$, $\kw{gap}(\epsilon, 1)$ is the end of the
+document, $\kw{gap}(0, 0)$ the start of the paragraph, $\kw{gap}(0.1, 1)$
+the end of the emphasis, and $\kw{in}(0, 0, 2)$ lies between $\str{Hi}$ and
+the space [ex-point-in].  The end of the paragraph is $\kw{gap}(0, 2)$
+[ex-point-gap-last]; $\kw{gap}(0, 3)$ is no point [ex-point-gap-past], and
+nor is $\kw{in}(0, 0, 3)$, since the end of $\str{Hi}\vs$ is the gap
+$\kw{gap}(0, 1)$ [ex-point-in-end].  In $W_{\mathrm{l}}$,
+$\kw{in}(\varphi_0, 0, 3)$ lies inside the title, between $\str{Ham}$ and
+$\str{let}$, and its markup is the literal [edit-title].
+
+\subsection{Located text}
+
+A white-space run is one character of the view but may be many of the
+source, and a character of the view may be an escape.  For contents $u$,
+$\mathit{col}(u) = \mathit{col}(u, 0)$ is $\mathit{collapse}(u)$ with each
+character paired with the range of $u$ it came from:
+\begin{equation}\label{eq:col}
+\begin{aligned}
+\mathit{col}(\epsilon, a) &= \epsilon \\
+\mathit{col}(c\,u, a) &= \langle c, [a, a{+}1) \rangle\ \mathit{col}(u, a{+}1)
+  && \text{if } c \notin \mathit{WS} \\
+\mathit{col}(c\,w\,u, a) &= \langle \vs, [a, b) \rangle\ \mathit{col}(u, b)
+  && \text{if } c \in \mathit{WS},\ w \in \mathit{WS}^*,\
+     u \notin \mathit{WS}\,\Sigma^*,\ b = a + 1 + |w|
+\end{aligned}
+\end{equation}
+A child $\kw{run}(u', s)$ of a tree of markup $m$ comes from the node of
+$m$ whose contents $u$ have the span $s$, and $u'$ is
+$\mathit{collapse}(u)$ less any space that trimming removed at either end
+(\ref{eq:trim}).  The located text of a child drops the same characters:
+\begin{equation}\label{eq:loc}
+\begin{gathered}
+\mathit{loc}(\kw{run}(u', s)) =
+\begin{cases}
+\mathit{col}(u) & \text{if } \mathit{collapse}(u) = u' \\
+\bar r & \text{if } \mathit{collapse}(u) = \vs\,u',\ \mathit{col}(u) =
+  r\,\bar r \\
+\bar r & \text{if } \mathit{collapse}(u) = u'\,\vs,\ \mathit{col}(u) =
+  \bar r\,r \\
+\bar r & \text{if } \mathit{collapse}(u) = \vs\,u'\,\vs,\
+  \mathit{col}(u) = r\,\bar r\,r'
+\end{cases}
+\\
+\mathit{loc}(\kw{stray}(u, s)) = \langle u_0, [0, 1) \rangle \cdots
+  \langle u_{|u|-1}, [|u|{-}1, |u|) \rangle
+\end{gathered}
+\end{equation}
+So the $k$th character of the text of a child has a range $[a_k, b_k)$ in
+the contents of its node, and anchors are offsets into contents with
+escapes resolved: none falls inside an escape or inside a run of white
+space.
+
+\paragraph{Example.}  The source
+\[
+W_{\mathrm{w}} = \str{[\bs{}paragraph\bs]\ \ a\ \bs[\ \ b\ [\bs{}endParagraph\bs]}
+\]
+has the contents $u = \vs\vs\str{a}\vs\str{[}\vs\vs\str{b}\vs$ in its second node,
+with the escape resolved, and its paragraph has the one child
+$\kw{run}(\str{a}\vs\str{[}\vs\str{b}, s)$, trimmed at both ends.  The
+ranges of its five characters are
+\[
+[2, 3)\quad [3, 4)\quad [4, 5)\quad [5, 7)\quad [7, 8)
+\]
+[ex-loc]: the escape $\str{\bs[}$ is one character of $u$, and the two
+spaces before $\str{b}$ one character of the view.  So $\kw{in}(0, 0, 3)$,
+before that space, is at offset $5$ of $u$, and $\kw{in}(0, 0, 4)$, before
+$\str{b}$, at offset $7$ [ex-loc-anchor, ex-loc-anchor-b].
+
+\subsection{Anchors}
+
+An anchor is a position in the items of a markup, $\mathit{items}(m) =
+\mathit{items}(\mathit{nodes}(m))$:
+\begin{equation}\label{eq:anchors}
+a ::= \kw{txt}(n, o) \mid \kw{cut}(n, k) \mid \kw{end}(m)
+\end{equation}
+$\kw{txt}(n, o)$ is the offset $o$ into the contents $u$ of the node $n$,
+$0 \le o \le |u|$; $\kw{cut}(n, k)$ lies between the statements $k-1$ and
+$k$ of the bracket of $n$, $0 < k < |\bar\sigma|$; and $\kw{end}(m)$ lies
+after the last node of $m$, and is used only when that node has a bracket.
+For $\mathit{nodes}(m) = n_0 \cdots n_{l}$, where $n_i$ has contents $u_i$
+and statements $\bar\sigma_i$, the items before an anchor are
+\begin{equation}\label{eq:anchor-items}
+\begin{aligned}
+\mathit{before}(\kw{txt}(n_i, o)) &= \mathit{items}(n_0 \cdots n_{i-1})\
+  \kw{text}(u_i[0, o)) \\
+\mathit{before}(\kw{cut}(n_i, k)) &= \mathit{items}(n_0 \cdots n_{i-1})\
+  \kw{text}(u_i)\ \bar\sigma_i[0, k) \\
+\mathit{before}(\kw{end}(m)) &= \mathit{items}(m)
+\end{aligned}
+\end{equation}
+and $\mathit{after}(a)$ is the rest, so that $\mathit{items}(m) =
+\mathit{before}(a) \oplus \mathit{after}(a)$, where $\oplus$ concatenates,
+joining a text at the end of its left operand to a text at the start of its
+right one.  For $a \le a'$, $\mathit{items}(a, a')$ is the $\bar\omega$
+with $\mathit{before}(a') = \mathit{before}(a) \oplus \bar\omega$.
+
+A point's anchor is found from the messages around it.  For $\sigma$ the
+$k$th statement of $n_i$, the anchors just after and just before it are
+\begin{equation}\label{eq:anchor-after}
+\mathit{after}(\sigma) =
+\begin{cases}
+\kw{cut}(n_i, k{+}1) & \text{if } k + 1 < |\bar\sigma_i| \\
+\kw{txt}(n_{i+1}, 0) & \text{if } k + 1 = |\bar\sigma_i| \text{ and } i < l \\
+\kw{end}(m) & \text{if } k + 1 = |\bar\sigma_i| \text{ and } i = l
+\end{cases}
+\end{equation}
+\begin{equation}\label{eq:anchor-before}
+\mathit{before}(\sigma) =
+\begin{cases}
+\kw{cut}(n_i, k) & \text{if } k > 0 \\
+\kw{txt}(n_i, |u_i|) & \text{if } k = 0
+\end{cases}
+\end{equation}
+and $\mathit{start}(m)$ is $\kw{txt}(n_0, 0)$, or $\kw{end}(m)$ when $m$ has
+no nodes.  The anchor after a child $g$ of a tree is
+\begin{equation}\label{eq:anchor-end}
+\mathit{end}(g) =
+\begin{cases}
+\kw{txt}(n, b) & \text{if } g \text{ is a run or stray text from } n
+  \text{ whose last range is } [a, b) \\
+\mathit{after}(\mathit{cl}(B)) & \text{if } g = \kw{sub}(B) \\
+\mathit{after}(\sigma) & \text{if } g \in \{\kw{mut}(\sigma),
+  \kw{dnu}(\sigma), \kw{refused}(\sigma), \kw{rootPop}(\sigma)\} \\
+\mathit{after}(\kw{comment}(s)) & \text{if } g = \kw{note}(s)
+\end{cases}
+\end{equation}
+and, for $\tau@\pi = \kw{tree}(\kappa, g_0 \cdots g_{r-1}, \bar\sigma, f)$,
+\begin{equation}\label{eq:anchor-point}
+\begin{aligned}
+\mathit{anchor}(\kw{in}(\pi, i, k)) &= \kw{txt}(n, a_k)
+  && \text{for } n \text{ the node of } g_i \text{ and } [a_k, b_k)
+     \text{ the } k\text{th range of } \mathit{loc}(g_i) \\
+\mathit{anchor}(\kw{gap}(\pi, 0)) &= \mathit{after}(\mathit{op}(\tau@\pi))
+  && \text{if } \tau@\pi \text{ is not a root} \\
+\mathit{anchor}(\kw{gap}(\pi, 0)) &= \mathit{start}(\mathit{mk}(\pi))
+  && \text{if } \tau@\pi \text{ is a root} \\
+\mathit{anchor}(\kw{gap}(\pi, i)) &= \mathit{end}(g_{i-1})
+  && \text{if } i > 0
+\end{aligned}
+\end{equation}
+An unclosed block has no closing message, so there is no point after it;
+it is on the rightmost path of the tree, and the points inside it are the
+ones that matter.  A gap after a run lies before the space that trimming
+removed from it, if any; a caret (Section~\ref{sec:carets}) can lie after
+that space.
+
+\paragraph{Example.}  The anchors of points of $W_1$:
+\[
+\begin{array}{@{}lll@{}}
+\kw{gap}(0, 0) & \mathit{after}(\str{paragraph}) = \kw{txt}(n_1, 0)
+  & \text{[ex-anchor-first-gap]} \\
+\kw{in}(0, 0, 2) & \kw{txt}(n_1, 2) & \text{[ex-anchor-in]} \\
+\kw{gap}(0, 1) & \mathit{end}(\kw{run}(\str{Hi}\vs, s_1)) =
+  \kw{txt}(n_1, 3) & \text{[ex-anchor-before-emph]} \\
+\kw{gap}(0.1, 0) & \mathit{after}(\str{emphasis}) = \kw{txt}(n_2, 0)
+  & \text{[ex-anchor-emph-start]} \\
+\kw{gap}(0.1, 1) & \mathit{end}(\kw{run}(\str{all}, s_2)) =
+  \kw{txt}(n_2, 3) & \text{[ex-anchor-emph-end]} \\
+\kw{gap}(0, 2) & \mathit{end}(\kw{sub}(E)) =
+  \mathit{after}(\str{endEmphasis}) = \kw{cut}(n_2, 1)
+  & \text{[ex-anchor-after-emph]} \\
+\kw{gap}(\epsilon, 1) & \mathit{end}(\kw{sub}(P)) =
+  \mathit{after}(\str{endParagraph}) = \kw{end}(\kw{doc}(d_0))
+  & \text{[ex-anchor-end]}
+\end{array}
+\]
+The gaps just before the emphasis and just inside it, $\kw{gap}(0, 1)$ and
+$\kw{gap}(0.1, 0)$, show the same place in the view but have different
+anchors: $\mathit{items}(\kw{txt}(n_1, 3), \kw{txt}(n_2, 0))$ is the one
+statement $\str{emphasis}$, so text typed at the first goes to the
+paragraph and text typed at the second to the emphasis.
+
+\subsection{Carets}
+\label{sec:carets}
+
+The view shows a point, but a point cannot always say where the next
+character typed goes.  In a closed paragraph trimming removes the space at
+the end of $\str{Hello}\vs$, so the last gap of the run anchors before that
+space, and a character typed at it would go before the space too.  A
+\emph{caret} is a point with an anchor:
+\begin{equation}\label{eq:carets}
+c ::= \kw{exact}(p) \mid \kw{at}(p, a)
+\qquad
+\mathit{pt}(c) = p
+\qquad
+\mathit{anchor}(\kw{exact}(p)) = \mathit{anchor}(p)
+\qquad
+\mathit{anchor}(\kw{at}(p, a)) = a
+\end{equation}
+The point is where the view draws the caret and which blocks it is in; the
+anchor is where text goes.  Where an edit or a function expects a caret, a
+point $p$ stands for $\kw{exact}(p)$.
+
+An offset $k$ of the source $W$ of a markup $m$ with the nodes $n_0 \cdots
+n_l$ is the anchor
+\begin{equation}\label{eq:caret-anchor}
+\mathit{at}_m(k) =
+\begin{cases}
+\kw{txt}(n_i, |W[i_u, k)|_{\mathrm{lex}}) & \text{for the least } i
+  \text{ with } i_u \le k \le j_u \\
+\kw{end}(m) & \text{if there is no such } i
+\end{cases}
+\end{equation}
+where $[i_u, j_u)$ is the span of the contents of $n_i$, and
+$|w|_{\mathrm{lex}}$ counts the characters $w$ lexes to in text mode, each
+of the escapes $\str{\bs\bs}$ and $\str{\bs[}$ being one.
+
+An anchor of $m$ is placed at a point of the tree $\tau$ of $m$.  If the
+contents of $n_i$ gave the child $g_j$ of $\tau@\pi$, a run or stray text
+whose $\mathit{loc}$ ranges are $[a_0, b_0) \cdots [a_{r-1}, b_{r-1})$,
+then
+\begin{equation}\label{eq:caret-resolve}
+\mathit{place}(\kw{txt}(n_i, o)) =
+\begin{cases}
+\kw{gap}(\pi, j) & \text{if } v = 0 \\
+\kw{in}(\pi, j, v) & \text{if } 0 < v < r \\
+\kw{gap}(\pi, j{+}1) & \text{if } v = r
+\end{cases}
+\qquad
+v = |\{\, t \mid b_t \le o \,\}|
+\end{equation}
+which is before the first character whose source ends after $o$.  If the
+contents of $n_i$ gave no child, being empty or white space that was
+dropped or trimmed away, then $\mathit{place}(\kw{txt}(n_i, o)) =
+\mathit{after}_\tau(i)$, and $\mathit{place}(\kw{end}(m)) =
+\mathit{after}_\tau(l{+}1)$, where $\mathit{after}_\tau(i)$ is the gap just
+after the statements before $n_i$: $\kw{gap}(\epsilon, 0)$ for $i = 0$;
+$\mathit{place}(\kw{txt}(n_{i-1}, |u_{i-1}|))$ if the bracket of $n_{i-1}$
+is empty; and otherwise, for $\sigma$ its last statement and $g_j$ the
+child of $\tau@\pi$ where $\sigma$ left its mark,
+\[
+\mathit{after}_\tau(i) =
+\begin{cases}
+\kw{gap}(\pi.j, 0) & \text{if } g_j = \kw{sub}(B),\ \sigma = \mathit{op}(B),
+  \text{ and } B \text{ was pushed} \\
+\kw{gap}(\pi, j{+}1) & \text{if } g_j = \kw{sub}(B) \text{ and } \sigma =
+  \mathit{cl}(B) \\
+\kw{gap}(\pi, j{+}1) & \text{if } g_j = \kw{sub}(B),\ \sigma =
+  \mathit{op}(B), \text{ and } B \text{ is a leaf} \\
+\kw{gap}(\pi, j{+}1) & \text{if } g_j \in \{\kw{mut}(\sigma),
+  \kw{dnu}(\sigma), \kw{refused}(\sigma), \kw{rootPop}(\sigma)\} \\
+\kw{gap}(\pi, j{+}1) & \text{if } \sigma = \kw{comment}(s) \text{ and } g_j =
+  \kw{note}(s)
+\end{cases}
+\]
+A block was pushed if it is unclosed or received at least two messages;
+otherwise it is a leaf.  For $\pi_m$ the path to the field whose literal is
+$m$, or $\epsilon$ for the document, and $\pi_m.p$ the point $p$ of $\tau$
+as a point of the document, a caret is well formed when
+\begin{equation}\label{eq:caret-ok}
+\mathit{ok}(\kw{exact}(p))
+\qquad
+\mathit{ok}(\kw{at}(p, a)) \iff a \neq \kw{cut}(n, k) \wedge
+  \pi_m.\mathit{place}(a) = p
+\end{equation}
+So the anchor of a caret that is not exact lies in white space that the
+view does not show, after its point's anchor and before the next character
+the view shows.
+
+\paragraph{Examples.}  In
+\[
+W_{\mathrm{h}} = \str{[\bs{}paragraph\bs]Hello}\vs\str{[\bs{}endParagraph\bs]}
+\]
+the run is $\str{Hello}$, and $\kw{at}(\kw{gap}(0, 1), \kw{txt}(n_1, 6))$ is a caret
+after the trimmed space [caret-ok-slack].  The point $\kw{in}(0, 0, 1)$
+with the anchor $\kw{txt}(n_1, 2)$ is not a caret, since the $\str{e}$
+between them is shown [caret-ok-shown], and neither is a caret at a cut
+[caret-ok-cut].  The end of
+\[
+\str{[\bs{}paragraph\bs]ab[\bs{}endParagraph\bs]}
+\]
+is placed at the gap after the paragraph, $\kw{gap}(\epsilon, 1)$ [caret-place-end], and so is
+an offset inside the two spaces dropped between
+$\str{[\bs{}paragraph\bs]a[\bs{}endParagraph\bs]}$ and a second paragraph
+[caret-place-dropped].  In
+$\str{[\bs{}paragraph\bs]}\vs\str{there[\bs{}endParagraph\bs]}$, the
+offset $1$, after the trimmed space, is placed at $\kw{gap}(0, 0)$, and the offset
+$2$, after the $\str{t}$, at $\kw{in}(0, 0, 1)$ [caret-place-lead,
+caret-place-in].
+
+\subsection{Splices}
+
+A splice $\mathit{splice}_m(a, a', \bar\omega, \bar\omega')$, for anchors
+$a \le a'$ of $m$, rewrites $W = I(\mathit{src}(m))$, writing the items
+$\bar\omega$ before the caret and $\bar\omega'$ after it.  For $n = \kw{block}(u, s_u,
+\bar\sigma, s)$ or $\kw{final}(u, s_u)$, with $s_u = [i_u, j_u)$ and $s =
+[i, j)$, the source replaced runs from $\mathit{L}(a)$ to $\mathit{R}(a')$:
+\begin{equation}\label{eq:splice-bounds}
+\begin{aligned}
+\mathit{L}(\kw{txt}(n, o)) &= i_u &
+\mathit{R}(\kw{txt}(n, o)) &= j_u \\
+\mathit{L}(\kw{cut}(n, k)) &= j_u &
+\mathit{R}(\kw{cut}(n, k)) &= j \\
+\mathit{L}(\kw{end}(m)) &= e_m &
+\mathit{R}(\kw{end}(m)) &= e_m
+\end{aligned}
+\end{equation}
+where $e_m$, the end of the contents of $m$, is $|W|$ for a document and
+the start of its closing $\Close$ for a literal; the end of the contents
+of a node with a bracket is where its $\Open$ starts.  The replacement is
+\begin{equation}\label{eq:splice}
+\begin{aligned}
+\mathit{left}(\kw{txt}(n, o)) &= \mathit{esc}(u[0, o)) &
+\mathit{right}(\kw{txt}(n, o)) &= \mathit{esc}(u[o, |u|)) \\
+\mathit{left}(\kw{cut}(n, k)) &=
+  \Open\,\mathit{show}_W(\mathcal{Q}_W(\bar\sigma[0, k)))\,\Close &
+\mathit{right}(\kw{cut}(n, k)) &=
+  \Open\,\mathit{show}_W(\mathcal{Q}_W(\bar\sigma[k, |\bar\sigma|)))\,\Close \\
+\mathit{left}(\kw{end}(m)) &= \epsilon &
+\mathit{right}(\kw{end}(m)) &= \epsilon
+\end{aligned}
+\end{equation}
+\begin{equation}\label{eq:out}
+\mathit{out}(\epsilon) = \epsilon \qquad
+\mathit{out}(\kw{text}(u)\,\bar\omega) = \mathit{esc}(u)\ \mathit{out}(\bar\omega)
+\qquad
+\mathit{out}(\bar\sigma\,\bar\omega) =
+  \Open\,\mathit{show}_W(\mathcal{Q}_W(\bar\sigma))\,\Close\ \mathit{out}(\bar\omega)
+\end{equation}
+with $\bar\sigma$ a maximal nonempty sequence of statements, and
+\begin{equation}\label{eq:splice-def}
+\mathit{splice}_m(a, a', \bar\omega, \bar\omega') =
+\begin{cases}
+\kw{unchanged} & \text{if } a = a' \text{ and } \bar\omega\,\bar\omega' =
+  \epsilon \\
+\langle W', k \rangle & \text{otherwise}
+\end{cases}
+\end{equation}
+\[
+W' = W[0, \mathit{L}(a))\ \mathit{left}(a)\ \mathit{out}(\bar\omega)\
+  \mathit{out}(\bar\omega')\ \mathit{right}(a')\ W[\mathit{R}(a'), |W|)
+\qquad
+k = \mathit{L}(a) + |\mathit{left}(a)| + |\mathit{out}(\bar\omega)|
+\]
+where $k$ is the offset of the caret in the new source.  The two sequences
+are printed apart, so where the caret falls between two statements their
+bracket is split, and the caret is always at a text position.  The text at
+either end of a splice is printed again, whole, from the resolved
+contents.  A source may hold a lone backslash or bracket that
+lexes as a character only because of what follows it; $\mathit{esc}$
+writes each as an escape, so nothing written next to it can change how it
+lexes.  A bracket cut by an anchor is printed again as two.
+
+\paragraph{Splicing (obligation).}
+Write $\bar\omega \doteq \bar\omega'$ when the two are equal up to spans
+once empty texts are removed; an empty text adds nothing
+(Step-Text-None).  If $\langle W', k \rangle$ is the result of
+$\mathit{splice}_m(a, a', \bar\omega, \bar\omega')$, then $W'$ parses, the
+markup $m'$ in its place has
+\begin{equation}\label{eq:splice-items}
+\mathit{items}(m') \doteq
+  \mathit{before}(a) \oplus \bar\omega\,\bar\omega' \oplus \mathit{after}(a')
+\end{equation}
+and every other part of the parse is as before; for a literal, by (H10).
+This follows from the escaping lemma (\ref{eq:escape-lexes}) and (H6).
+Since interpretation is deterministic, the interpretation of $W'$ also
+reaches the same configuration as that of $W$, up to spans, just before the
+item that holds $a$: every block closed before the edit is unchanged.
+
+\paragraph{Examples.}  In
+\[
+W_{\mathrm{p}} = \str{[\bs{}paragraph\bs]ab[\bs{}endParagraph.\
+paragraph\bs]cd[\bs{}endParagraph\bs]}
+\]
+the gap between the paragraphs,
+$\kw{gap}(\epsilon, 1)$, has the anchor $\mathit{after}(\str{endParagraph})
+= \kw{cut}(n_1, 1)$, inside the bracket of $n_1$ [ex-cut-anchor].
+Splicing the statements $\str{paragraph}\ \str{endParagraph}$ there prints
+that bracket again as two, around the new one [ex-cut]:
+\[
+\begin{array}{@{}l@{}}
+\str{[\bs{}paragraph\bs]ab[\bs{}endParagraph\bs]} \\
+\str{[\bs{}paragraph.\ endParagraph\bs][\bs{}paragraph\bs]cd[\bs{}endParagraph\bs]}
+\end{array}
+\]
+At a $\kw{txt}$ anchor the contents are printed again with every escape.
+Splicing $\kw{text}(\str{x})$ at offset $5$ of the contents $u$ of the
+source $W_{\mathrm{w}}$ replaces their text,
+$\vs\vs\str{a}\vs\str{\bs[}\vs\vs\str{b}\vs$, by
+$\mathit{esc}(u[0, 5))\,\str{x}\,\mathit{esc}(u[5, 9)) =
+\vs\vs\str{a}\vs\str{\bs[x}\vs\vs\str{b}\vs$, and the paragraph shows
+$\str{a}\vs\str{[x}\vs\str{b}$ [ex-loc-type, edit-escape,
+edit-escape-left].
+
+\subsection{Tidying}
+
+Closing a block where it was just opened would leave an empty inline
+block, which renders nothing, so the items of an edit are tidied before
+they are written.  The items are \emph{marked}: a marked item
+$\sigma^{\uparrow B}_{o}$ opens the block $B$ and $\sigma^{\downarrow
+B}_{o}$ closes it, where the origin $o$ is $\mathrm{l}$, $\mathrm{s}$, or
+$\mathrm{r}$ as the item lies before the splice, in it, or after it; a new
+style $x$ counts as a block identified by $\mathit{open}(x)$.  Each
+$\mathit{op}(B)$ and $\mathit{open}(x)$ that an edit writes is marked
+$\cdot^{\uparrow}_{\mathrm{s}}$, each $\mathit{cl}(B)$ and
+$\mathit{close}(x)$ is marked $\cdot^{\downarrow}_{\mathrm{s}}$, and so, in
+the items between the anchors that styling writes again, are the closing
+messages of the $L_i$ and the creating messages of the $R_i$
+(Section~\ref{sec:edits}).  For points $p \le q$, with blocks $B_0 \cdots
+B_h$ and $B'_0 \cdots B'_{h'}$ on their paths, the marked messages just
+outside the splice are
+\begin{equation}\label{eq:tidy-neighbours}
+\begin{aligned}
+\mathit{nb}_{\mathrm{l}}(p) &= \mathit{op}(B_t)^{\uparrow B_t}_{\mathrm{l}}
+  \cdots \mathit{op}(B_h)^{\uparrow B_h}_{\mathrm{l}}
+  && \text{if } p = \kw{gap}(\pi, 0) \text{ and } h > 0 \\
+\mathit{nb}_{\mathrm{r}}(q) &= \mathit{cl}(B'_{h'})^{\downarrow
+  B'_{h'}}_{\mathrm{r}} \cdots \mathit{cl}(B'_{t'})^{\downarrow
+  B'_{t'}}_{\mathrm{r}}
+  && \text{if } q = \kw{gap}(\pi', |\bar g'|),\ h' > 0, \text{ and }
+     \mathit{cl}(B'_{h'}) \text{ is defined}
+\end{aligned}
+\end{equation}
+and $\epsilon$ otherwise, where $\bar g'$ are the children of $B'_{h'}$;
+$t \ge 1$ is least such that $B_l$ is the first child of $B_{l-1}$ for $t <
+l \le h$, and $t' \ge 1$ least such that $B'_l$ is the last child of
+$B'_{l-1}$ and $\mathit{cl}(B'_{l-1})$ is defined for $t' < l \le h'$.  An
+opening of an inline block followed by a closing of it cancels:
+\begin{equation}\label{eq:tidy-cancel}
+\bar\omega\ \sigma^{\uparrow B}_{o}\ \sigma'^{\downarrow B}_{o'}\
+  \bar\omega' \leadsto \bar\omega\ \bar\omega'
+\qquad \text{if } \mathit{cls}(B) = \kw{inline}
+\end{equation}
+The items an edit writes also hold one \emph{caret marker} $\crt$, where the
+caret goes.  The marker is never removed, and a pair cancels across it:
+\begin{equation}\label{eq:tidy-caret}
+\bar\omega\ \sigma^{\uparrow B}_{o}\ \crt\ \sigma'^{\downarrow B}_{o'}\
+  \bar\omega' \leadsto \bar\omega\ \crt\ \bar\omega'
+\qquad \text{if } \mathit{cls}(B) = \kw{inline}
+\end{equation}
+Two redexes never share an item, so $\leadsto$ has unique normal forms,
+$\mathit{nf}(\bar\omega)$.  Then
+\begin{equation}\label{eq:tidy}
+\mathit{tidy}_m(a, a', \bar\omega) =
+\begin{cases}
+\kw{unchanged} & \text{if } a = a' \text{ and } \bar\omega = \crt \\
+\mathit{splice}_m(a_\circ, a'_\circ, |\bar\omega_1|_{\mathrm{s}},
+  |\bar\omega_2|_{\mathrm{s}}) &
+  \text{otherwise, for } \bar\omega_1\,\crt\,\bar\omega_2 =
+  \mathit{nf}(\mathit{drop}(\mathit{nb}_{\mathrm{l}}(p)\ \bar\omega\
+  \mathit{nb}_{\mathrm{r}}(q)))
+\end{cases}
+\end{equation}
+where $\mathit{drop}$ removes empty texts, $|\cdot|_{\mathrm{s}}$ keeps the
+items of origin $\mathrm{s}$ and the unmarked ones and erases their marks,
+and the splice is widened over the messages removed outside it.  If
+$\mathit{nb}_{\mathrm{l}}(p) = \sigma_1 \cdots \sigma_e$ and $k$ of them
+remain in $\bar\omega_\circ = \bar\omega_1\,\crt\,\bar\omega_2$, they are $\sigma_1 \cdots \sigma_k$, and
+$a_\circ$ is $a$ if $k = e$ and $\mathit{before}(\sigma_{k+1})$ otherwise;
+if $\mathit{nb}_{\mathrm{r}}(q) = \sigma'_1 \cdots \sigma'_{e'}$, innermost
+first, and $k'$ of them remain, they are the last $k'$, and $a'_\circ$ is
+$a'$ if $k' = e'$ and $\mathit{after}(\sigma'_{e'-k'})$ otherwise.  So
+deleting all of an emphasis removes the emphasis rather than emptying it,
+and Enter at the start of an emphasis leaves an empty paragraph but no
+empty emphasis.  An edit that writes nothing at one anchor changes nothing,
+so a caret inside an empty block that the document already has leaves it
+alone; the caret too stays where it was.
+
+\paragraph{Examples.}  Deleting all of the emphasis of $W_1$, from
+$\kw{gap}(0.1, 0)$ to $\kw{gap}(0.1, 1)$, writes no items of its own.  The
+first point is the first gap of $E$, which is not the first child of $P$,
+and the second is the last gap of $E$, which is the last child of $P$:
+\[
+\mathit{nb}_{\mathrm{l}} = \str{emphasis}^{\uparrow E}_{\mathrm{l}}
+\qquad
+\mathit{nb}_{\mathrm{r}} = \str{endEmphasis}^{\downarrow E}_{\mathrm{r}}\
+  \str{endParagraph}^{\downarrow P}_{\mathrm{r}}
+\]
+The first two cancel, so the splice is widened to the anchors
+\[
+\mathit{before}(\str{emphasis}) = \kw{txt}(n_1, 3)
+\qquad
+\mathit{after}(\str{endEmphasis}) = \kw{cut}(n_2, 1)
+\]
+and the source becomes
+\[
+\str{[\bs{}paragraph\bs]Hi\ [\bs{}endParagraph\bs]}
+\]
+[edit-delete-tidy].  Enter at the start of the emphasis of
+\[
+\str{[\bs{}paragraph.\ emphasis\bs]abc[\bs{}endEmphasis.\ endParagraph\bs]}
+\]
+writes the four statements $\str{endEmphasis}$, $\str{endParagraph}$,
+$\str{paragraph}$, and $\str{emphasis}$ after the neighbours
+$\str{paragraph}^{\uparrow}_{\mathrm{l}}$ and
+$\str{emphasis}^{\uparrow}_{\mathrm{l}}$; the emphasis opened and closed
+cancels, the paragraph, which is not inline, does not, and the splice is
+widened to $\mathit{before}(\str{emphasis})$ [edit-split-tidy]:
+\[
+\begin{array}{@{}l@{}}
+\str{[\bs{}paragraph\bs][\bs{}endParagraph.\ paragraph.\ emphasis\bs]} \\
+\str{abc[\bs{}endEmphasis.\ endParagraph\bs]}
+\end{array}
+\]
+The caret inside the empty emphasis of
+\[
+\str{[\bs{}paragraph\bs]a[\bs{}emphasis.\ endEmphasis\bs]b[\bs{}endParagraph\bs]}
+\]
+has both neighbours, which would
+cancel, but an empty edit there changes nothing [edit-identity-empty].
+
+\subsection{Edits}
+\label{sec:edits}
+
+The edits of the view are
+\begin{equation}\label{eq:edits}
+e ::= \kw{replace}(c, c', \bar\omega, \bar\omega') \mid \kw{split}(c, i) \mid
+  \kw{style}(c, c', x) \mid \kw{setString}(\pi.\varphi_j, u) \mid
+  \kw{detach}(\pi.\varphi_j)
+\end{equation}
+where $c$ and $c'$ are carets, and $p = \mathit{pt}(c)$ and $q =
+\mathit{pt}(c')$ their points; a replacement writes $\bar\omega$, then the
+caret, then $\bar\omega'$.  For a point $p$, let $B_0 \cdots B_h$ be the blocks on its path from the
+root of its tree, $B_0$ the root.  For points $p \le q$ of one tree, with
+blocks $B_0 \cdots B_h$ and $B'_0 \cdots B'_{h'}$, let $c$ be the depth of
+the deepest block on both paths; then
+\begin{equation}\label{eq:edit-blocks}
+D = B_c \qquad
+L_i = B_{c+i} \ \ (1 \le i \le a = h - c) \qquad
+R_i = B'_{c+i} \ \ (1 \le i \le b = h' - c)
+\end{equation}
+are the deepest common block and the blocks below it on the path of $p$
+and on the path of $q$, outermost first.  For a block $B$ with children
+$g_0 \cdots g_{r-1}$, $\mathit{muts}_{[l, l')}(B)$ is the sequence of the
+$\sigma$ with $g_i = \kw{mut}(\sigma)$ for $l \le i < l'$.  The mutating
+messages of a block that lie between $p$ and $q$ are
+\begin{equation}\label{eq:edit-muts}
+M(L_i) = \mathit{muts}_{[\mathit{lo}(L_i), r)}(L_i)
+\qquad
+M(R_i) = \mathit{muts}_{[0, \mathit{hi}(R_i))}(R_i)
+\qquad
+M(D) = \mathit{muts}_{[\mathit{lo}(D), \mathit{hi}(D))}(D)
+\end{equation}
+where, for a block on the path of $p$ whose child $i'$ is the next on the
+path, $\mathit{lo} = i' + 1$, and for the last block of the path,
+$\mathit{lo} = i$ for $p = \kw{gap}(\pi, i)$ and $i + 1$ for $p =
+\kw{in}(\pi, i, k)$; $\mathit{hi}$ is $i'$, or $i$ for both kinds of
+point, on the path of $q$.  Two blocks \emph{join}, and the depth $j$ to
+which the paths of $p$ and $q$ join is
+\begin{equation}\label{eq:edit-join}
+\begin{gathered}
+B \sim B' \iff \mathit{merge}(\kappa_B) \wedge
+  \lfloor \mathit{op}(B) \rfloor = \lfloor \mathit{op}(B') \rfloor
+\\
+j = \max\{\, j \le \min(a, b) \mid \forall i,\ 1 \le i \le j.\ L_i \sim R_i
+  \wedge M_{i-1} = \epsilon \,\}
+\end{gathered}
+\end{equation}
+for $\kappa_B$ the state of $B$, $M_0 = M(D)$, and $M_i = M(L_i)\,M(R_i)$
+for $i > 0$.
+
+\paragraph{Replacing.}
+Replacing what lies between two carets by new items $\bar\omega\,\bar\omega'$
+is the edit for typing, deleting, pasting, and inserting a block:
+\begin{multline}\label{eq:edit-replace}
+\mathit{replace}(c, c', \bar\omega, \bar\omega') =
+\mathit{tidy}_m(\mathit{anchor}(c), \mathit{anchor}(c'),\
+  \bar\omega\,\crt\,\bar\omega'\ M(L_a)\,\mathit{cl}(L_a) \cdots M(L_{j+1})\,\mathit{cl}(L_{j+1}) \\
+  M_j\ \mathit{op}(R_{j+1})\,M(R_{j+1}) \cdots \mathit{op}(R_b)\,M(R_b))
+\end{multline}
+where $m = \mathit{mk}(p) = \mathit{mk}(q)$.  Everything shown between $p$
+and $q$ goes.  A block that holds $p$ but not $q$ keeps what lies before
+$p$ and is closed after $\bar\omega$; one that holds $q$ but not $p$ keeps
+what lies after $q$ and is opened again; and the outermost pairs of such
+blocks that join are merged into one.  A mutating message renders nothing
+where it lies, so it is kept and sent to the same block, and $j$ is lowered
+where it could not be.  The keys of the view are replacements:
+\begin{equation}\label{eq:edit-keys}
+\begin{aligned}
+\mathit{type}(c, u) &= \kw{replace}(c, c, \kw{text}(u), \epsilon) \\
+\mathit{delete}(c, c') &= \kw{replace}(c, c', \epsilon, \epsilon) \\
+\mathit{backspace}(\pi.i) &= \kw{replace}(\kw{gap}(\pi.(i{-}1),
+  |\bar g|),\ \kw{gap}(\pi.i, 0),\ \epsilon, \epsilon)
+  \qquad \text{for } i > 0
+\end{aligned}
+\end{equation}
+where $\bar g$ are the children of $\tau@\pi.(i{-}1)$: Backspace at the
+start of the block at $\pi.i$, and Delete at the end of its predecessor,
+deletes from the end of the predecessor to the start of the block, which
+merges the two when they join.  Inserting a block is replacing with its
+template (Section~\ref{sec:lib-field}).
+
+\paragraph{Examples.}
+\begin{itemize}
+\item Typing $\str{!}$ at the end of $\str{all}$ in $W_1$,
+      $\mathit{type}(\kw{gap}(0.1, 1), \str{!})$, has $D = E$ and no $L_i$
+      or $R_i$; it splices $\kw{text}(\str{!})$ at $\kw{txt}(n_2, 3)$, and
+      the contents of $n_2$ become $\str{all!}$ [edit-type].  Replacing
+      nothing there by nothing changes nothing [edit-identity].
+\item In $\str{[\bs{}paragraph\bs]a\ [\bs{}emphasis\bs]bc[\bs{}endEmphasis\bs]\
+      d[\bs{}endParagraph\bs]}$, typing $\str{X}$ over the selection from
+      $\kw{in}(0.1, 0, 1)$, between $\str{b}$ and $\str{c}$, to
+      $\kw{in}(0, 2, 1)$, before $\str{d}$, has $D$ the paragraph, $L_1$
+      the emphasis, and $b = 0$.  The emphasis keeps $\str{b}$ and is
+      closed after $\str{X}$ [edit-replace-across]:
+      $\str{[\bs{}paragraph\bs]a\ [\bs{}emphasis\bs]bX[\bs{}endEmphasis\bs]d[\bs{}endParagraph\bs]}$.
+\item Deleting from $\kw{in}(0, 0, 1)$ to $\kw{in}(1, 0, 1)$ in two
+      paragraphs $\str{ab}$ and $\str{cd}$ has $D$ the root and $L_1$ and
+      $R_1$ the paragraphs, which join, so $j = 1$ and neither
+      $\mathit{cl}(L_1)$ nor $\mathit{op}(R_1)$ is written:
+      $\str{[\bs{}paragraph\bs]ad[\bs{}endParagraph\bs]}$
+      [edit-delete-join].  With $\str{title:\ [\bs{}T\bs]}$ sent to the
+      root between them, $M(D)$ is not empty, so $j = 0$; the message is
+      kept, and so are both paragraphs [edit-delete-keeps-title]:
+      \[
+      \str{[\bs{}paragraph\bs]a[\bs{}endParagraph.\ title:\
+      [\bs{}T\bs].\ paragraph\bs]d[\bs{}endParagraph\bs]}
+      \]
+\end{itemize}
+
+\paragraph{Splitting.}
+Splitting the block $B_i$, $i \ge 1$, at the caret $c$ closes the blocks
+from the innermost out to $B_i$ and opens them again, and puts the caret at
+the start of the second half:
+\begin{equation}\label{eq:edit-split}
+\mathit{split}(c, B_i) = \mathit{tidy}_m(\mathit{anchor}(c),
+  \mathit{anchor}(c),\ \mathit{cl}(B_h) \cdots \mathit{cl}(B_i)\
+  \mathit{op}(B_i) \cdots \mathit{op}(B_h)\ \crt)
+\end{equation}
+which needs each of $B_i, \ldots, B_h$ to have a closing message.  The
+second half receives none of the mutating messages of the first, so it
+starts with the fields its creating message gave it.  Enter in a paragraph
+splits the paragraph, and in a list item the item
+(\ref{eq:lib-enter}).
+
+\paragraph{Examples.}  Enter between $\str{Hi}$ and the space of $W_1$ is
+$\kw{split}(\kw{in}(0, 0, 2), 1)$ [ex-enter], which gives
+\[
+\begin{array}{@{}l@{}}
+\str{[\bs{}paragraph\bs]Hi[\bs{}endParagraph.\ paragraph\bs]\ } \\
+\str{[\bs{}emphasis\bs]all[\bs{}endEmphasis.\ endParagraph\bs]}
+\end{array}
+\]
+and the second paragraph's leading space is trimmed when it closes
+[edit-split, edit-split-tree].  Backspace at the start of the second
+paragraph is $\mathit{backspace}(\epsilon.1) = \kw{replace}(\kw{gap}(0,
+1), \kw{gap}(1, 0), \epsilon)$ [ex-backspace]: the paragraphs join, so
+neither closer nor opener is kept, and the splice gives back $W_1$
+[edit-join].  Enter inside the emphasis, at
+$\kw{in}(0.1, 0, 1)$, splits the paragraph too, $B_1$ and not $B_2$
+[ex-enter-emph], so the emphasis is closed and opened again around the
+break [ex-split-emph]:
+\[
+\begin{array}{@{}l@{}}
+\str{[\bs{}paragraph\bs]Hi\ [\bs{}emphasis\bs]a} \\
+\str{[\bs{}endEmphasis.\ endParagraph.\ paragraph.\ emphasis\bs]} \\
+\str{ll[\bs{}endEmphasis.\ endParagraph\bs]}
+\end{array}
+\]
+
+\paragraph{Styling.}
+Toggling a style $x$ on the range from $p$ to $q$, $p < q$, needs
+\begin{equation}\label{eq:style-ok}
+\mathit{styleable}(p, q) \iff \mathit{cls}(D) \in \{\kw{para}, \kw{cell},
+  \kw{inline}\} \wedge \forall i.\ \mathit{cls}(L_i) = \mathit{cls}(R_i) =
+  \kw{inline}
+\end{equation}
+If some inline block on both paths was opened as $x$ is, the range is
+styled and the style is removed from it.  The innermost such block is
+$B = B_l$ for
+\[
+l = \max\{\, l \le c \mid \mathit{cls}(B_l) = \kw{inline} \wedge
+  \lfloor \mathit{op}(B_l) \rfloor = \lfloor \mathit{open}(x) \rfloor \,\}
+\]
+and, with $C_1 \cdots C_e = B_{l+1} \cdots B_c$ the blocks below it down to
+$D$,
+\begin{equation}\label{eq:edit-unstyle}
+\begin{aligned}
+\bar\omega_p &= \mathit{cl}(L_a) \cdots \mathit{cl}(L_1)\
+  \mathit{cl}(C_e) \cdots \mathit{cl}(C_1)\ \mathit{cl}(B)\
+  \mathit{op}(C_1) \cdots \mathit{op}(C_e)\
+  \mathit{op}(L_1) \cdots \mathit{op}(L_a) \\
+\bar\omega_q &= \mathit{cl}(R_b) \cdots \mathit{cl}(R_1)\
+  \mathit{cl}(C_e) \cdots \mathit{cl}(C_1)\ \mathit{op}(B)\
+  \mathit{op}(C_1) \cdots \mathit{op}(C_e)\
+  \mathit{op}(R_1) \cdots \mathit{op}(R_b)
+\end{aligned}
+\end{equation}
+Otherwise the style is applied:
+\begin{equation}\label{eq:edit-restyle}
+\begin{gathered}
+\bar\omega_p = \mathit{cl}(L_a) \cdots \mathit{cl}(L_1)\ \mathit{open}(x)\
+  \mathit{op}(L_1) \cdots \mathit{op}(L_a)
+\\
+\bar\omega_q = \mathit{cl}(R_b) \cdots \mathit{cl}(R_1)\ \mathit{close}(x)\
+  \mathit{op}(R_1) \cdots \mathit{op}(R_b)
+\end{gathered}
+\end{equation}
+and in both cases
+\begin{equation}\label{eq:edit-style}
+\mathit{style}(c, c', x) = \mathit{tidy}_m(\mathit{anchor}(c),
+  \mathit{anchor}(c'),\ \bar\omega_p\ \mathit{items}(\mathit{anchor}(c),
+  \mathit{anchor}(c'))\ \crt\ \bar\omega_q)
+\end{equation}
+so the caret ends at the end of the range, in the blocks its text now lies
+in.
+The blocks open at $p$ are closed there and opened again inside the new
+style, and likewise at $q$, so the style nests properly whatever the range
+crosses.  A range only partly styled is styled throughout, so toggling
+twice gives back the source's tree only when the range was plain or
+styled throughout.
+
+\paragraph{Examples.}
+\begin{itemize}
+\item Toggling emphasis on $\str{Hi}$ in $W_1$, from $\kw{gap}(0, 0)$ to
+      $\kw{in}(0, 0, 2)$, finds no emphasis on both paths and applies it
+      [edit-style-apply]:
+      \[
+      \begin{array}{@{}l@{}}
+      \str{[\bs{}paragraph\bs][\bs{}emphasis\bs]Hi[\bs{}endEmphasis\bs]\ } \\
+      \str{[\bs{}emphasis\bs]all[\bs{}endEmphasis.\ endParagraph\bs]}
+      \end{array}
+      \]
+\item Toggling emphasis on $\str{all}$, from $\kw{gap}(0.1, 0)$ to
+      $\kw{gap}(0.1, 1)$, finds $B = E$ and removes it; the statements
+      $\str{endEmphasis}\ \str{emphasis}$ that it writes at the two ends
+      cancel against $E$'s own, and the source becomes
+      $\str{[\bs{}paragraph\bs]Hi\ all[\bs{}endParagraph\bs]}$
+      [edit-style-remove].
+\item In the source of [edit-replace-across] above, making the range from inside the
+      emphasis to before $\str{d}$ strong closes the emphasis at $p$ and
+      opens it again inside the strong text [edit-style-across]:
+      \[
+      \begin{array}{@{}l@{}}
+      \str{[\bs{}paragraph\bs]a\ [\bs{}emphasis\bs]b[\bs{}endEmphasis.\ strong.\ emphasis\bs]} \\
+      \str{c[\bs{}endEmphasis\bs]\ [\bs{}endStrong\bs]d[\bs{}endParagraph\bs]}
+      \end{array}
+      \]
+\end{itemize}
+
+\paragraph{Strings and detaching.}
+For a field $\varphi = \langle v, \sigma, k \rangle$ of the block at $\pi$,
+whose message $\sigma$ has the arguments $\bar\eta$, let $W = I(d)$ for $d
+= \mathit{src}(\mathit{mk}(\pi))$, the source that holds $\sigma$.
+Setting the string of $\varphi$ to $u$ and detaching $\varphi$ rewrite the
+text of its argument:
+\begin{equation}\label{eq:edit-string}
+\begin{aligned}
+\mathit{setString}(\varphi, u) &= W[0, i)\ \mathit{enc}(u)\ W[i', |W|)
+  && \text{for } \mathit{str}(\eta_k) = [i, i') \\
+\mathit{detach}(\varphi) &= W[0, i)\ \mathcal{Q}_{\mathrm{v}}(v)\
+  W[i', |W|)
+  && \text{for } \mathit{span}(\eta_k) = [i, i')
+\end{aligned}
+\end{equation}
+so that after a detach the value is written in the source as a literal.  A
+field can be detached when its message lies in a markup that is not
+computed and the host can write its value, and what the view offers for a
+field is
+\begin{equation}\label{eq:detachable}
+\begin{gathered}
+\mathit{detachable}(\varphi) \iff \mathit{prov}(\mathit{mk}(\pi)) \neq
+  \kw{computed} \wedge \mathcal{Q}_{\mathrm{v}}(v) \text{ is defined}
+\\
+\mathit{offers}(\varphi) =
+\begin{cases}
+\kw{detach}(\pi.\varphi_j)\ \kw{giveUp} & \text{if }
+  \mathit{detachable}(\varphi) \\
+\kw{giveUp} & \text{otherwise}
+\end{cases}
+\end{gathered}
+\end{equation}
+for $\varphi$ the $j$th field of the block at $\pi$.
+
+\subsection{The edit relation}
+
+\begin{equation}\label{eq:edit-results}
+\varrho ::= \kw{edited}(d, W', \hat c) \mid \kw{refused}(\bar o)
+\qquad
+\hat c ::= k \mid \kw{same}
+\qquad
+o ::= \kw{detach}(\pi.\varphi_j) \mid \kw{giveUp}
+\end{equation}
+An edit either gives the new text $W'$ of one source $d$, with the offset
+$k$ in it of the caret or $\kw{same}$ when the caret stays where it was, or
+is refused with the offers the view should make.  A replacement, split, or
+style gives
+\[
+\mathit{result}_d(\langle W', k \rangle) = \kw{edited}(d, W', k)
+\qquad
+\mathit{result}_d(\kw{unchanged}) = \kw{edited}(d, I(d), \kw{same})
+\]  The edit relation $I \vdash e
+\Rightarrow \varrho$ is relative to the host state $\chi$ and root state
+$\kappa_0$ with which the document is interpreted:
+\begin{gather}
+\rulelabel{Document}\quad
+\frac{\mathit{parse}(I(d_0)) = \kw{parsed}(\bar n)
+      \qquad \langle \chi, \kappa_0, \bar n \rangle \Downarrow_{\mathrm{I}}
+        \kw{done}(\chi', \tau)}
+     {\mathit{doc}(I) = \langle \bar n, \tau \rangle}
+\end{gather}
+In the rules below, $\mathit{doc}(I) = \langle \bar n, \tau \rangle$, the
+points and paths are those of $\tau$, $m = \mathit{mk}(p)$ for an edit with
+the points $p$ and $q$, and $p \asymp q$ holds when $p$ and $q$ lie in one
+tree.  For $\kw{setString}$ and $\kw{detach}$, $\varphi = \langle v,
+\sigma, k \rangle$ is the $j$th field of $\tau@\pi$, $m =
+\mathit{mk}(\pi)$, and $\eta_k$ is the $k$th argument of $\sigma$.
+\begin{gather}
+\rulelabel{Edit-Replace}\quad
+\frac{p \asymp q \qquad \mathit{prov}(m) \neq \kw{computed}}
+     {I \vdash \kw{replace}(c, c', \bar\omega, \bar\omega') \Rightarrow
+      \mathit{result}_{\mathit{src}(m)}(\mathit{replace}(c, c', \bar\omega,
+        \bar\omega'))}
+\\
+\rulelabel{Edit-Split}\quad
+\frac{\mathit{prov}(m) \neq \kw{computed} \qquad 1 \le i \le h \qquad
+      \mathit{cl}(B_l) \text{ is defined for } i \le l \le h}
+     {I \vdash \kw{split}(c, i) \Rightarrow
+      \mathit{result}_{\mathit{src}(m)}(\mathit{split}(c, B_i))}
+\\
+\rulelabel{Edit-Style}\quad
+\frac{p \asymp q \qquad \mathit{prov}(m) \neq \kw{computed} \qquad
+      \mathit{styleable}(p, q)}
+     {I \vdash \kw{style}(c, c', x) \Rightarrow
+      \mathit{result}_{\mathit{src}(m)}(\mathit{style}(c, c', x))}
+\\
+\rulelabel{Edit-Set-String}\quad
+\frac{\mathit{prov}(m) \neq \kw{computed} \qquad
+      \mathit{str}(\eta_k) \text{ is defined}}
+     {I \vdash \kw{setString}(\pi.\varphi_j, u) \Rightarrow
+      \kw{edited}(\mathit{src}(m), \mathit{setString}(\varphi, u),
+        \kw{same})}
+\\
+\rulelabel{Edit-Detach}\quad
+\frac{\mathit{detachable}(\varphi)}
+     {I \vdash \kw{detach}(\pi.\varphi_j) \Rightarrow
+      \kw{edited}(\mathit{src}(m), \mathit{detach}(\varphi), \kw{same})}
+\end{gather}
+An edit aimed at computed text is offered, as the design notes ask, a
+choice: to detach, where that is possible, or to give up.  For a point $p$,
+$\varphi(p)$ is the field its path entered last, and $\mathit{offers}$ of
+no field is $\kw{giveUp}$.  In Refuse-Computed, $e$ is a $\kw{replace}$, a
+$\kw{split}$, or a $\kw{style}$ whose first point is $p$, and $p \asymp q$
+when it has a second point $q$.
+\begin{gather}
+\rulelabel{Refuse-Trees}\quad
+\frac{\neg(p \asymp q)}
+     {I \vdash e \Rightarrow \kw{refused}(\kw{giveUp})}
+  \quad e \in \{\kw{replace}(c, c', \bar\omega, \bar\omega'),
+    \kw{style}(c, c', x)\}
+\\
+\rulelabel{Refuse-Computed}\quad
+\frac{\mathit{prov}(\mathit{mk}(p)) = \kw{computed}}
+     {I \vdash e \Rightarrow \kw{refused}(\mathit{offers}(\varphi(p)))}
+\\
+\rulelabel{Refuse-Split}\quad
+\frac{\mathit{prov}(m) \neq \kw{computed} \qquad
+      \neg(1 \le i \le h \wedge \mathit{cl}(B_l) \text{ is defined for } i
+        \le l \le h)}
+     {I \vdash \kw{split}(c, i) \Rightarrow \kw{refused}(\kw{giveUp})}
+\\
+\rulelabel{Refuse-Style}\quad
+\frac{p \asymp q \qquad \mathit{prov}(m) \neq \kw{computed} \qquad
+      \neg\,\mathit{styleable}(p, q)}
+     {I \vdash \kw{style}(c, c', x) \Rightarrow \kw{refused}(\kw{giveUp})}
+\\
+\rulelabel{Refuse-String}\quad
+\frac{\neg(\mathit{prov}(m) \neq \kw{computed} \wedge
+        \mathit{str}(\eta_k) \text{ is defined})}
+     {I \vdash \kw{setString}(\pi.\varphi_j, u) \Rightarrow
+      \kw{refused}(\mathit{offers}(\varphi))}
+\\
+\rulelabel{Refuse-Detach}\quad
+\frac{\neg\,\mathit{detachable}(\varphi)}
+     {I \vdash \kw{detach}(\pi.\varphi_j) \Rightarrow
+      \kw{refused}(\kw{giveUp})}
+\end{gather}
+The premises of the rules for each kind of edit are exclusive and
+exhaustive, so every edit has exactly one result.  After a detach, the
+view repeats the edit on the reinterpreted document, where the field is now
+local.  An edit of a template is not refused: it goes to the method's
+source, as the design notes require, and the view shows its scope, since
+every document that uses the template changes with it.  Detaching a
+template's field instead gives the document its own copy.
+
+\paragraph{Examples.}
+\begin{itemize}
+\item In $\str{[\bs{}title:\ actTitle\bs]}$ the title is a string that the
+      host method $\str{actTitle}$ computes.  Setting it is refused with
+      $\kw{detach}(\varphi_0)\ \kw{giveUp}$ [edit-string-computed], and
+      detaching it writes its value as a string literal,
+      $\str{[\bs{}title:\ 'Act\ I'\bs]}$, after which it can be set
+      [edit-detach].
+\item Detaching the title of $W_{\mathrm{t}}$ puts a copy of the
+      template's literal in the document [edit-detach-template]:
+      \[
+      \str{[\bs{}title:\ [\bs{}The\ Play\bs]\bs]}
+      \]
+\item Typing in the computed title of $W_{\mathrm{c}}$ is refused with
+      $\kw{giveUp}$ alone: the field cannot be detached, since the host
+      cannot write a tree whose literal has no source in the image
+      [edit-computed-tree].
+\item Deleting from the title of $W_{\mathrm{l}}$ into its paragraph
+      [edit-two-trees], Enter in a paragraph that is never closed
+      [edit-split-unclosed], and styling a range across two paragraphs
+      [edit-style-flow] are refused with $\kw{giveUp}$.
+\end{itemize}
+
+
+\paragraph{The caret after an edit.}  For $\kw{edited}(d, W', k)$, let $I'
+= I[d := W']$ and $\mathit{doc}(I') = \langle \bar n', \tau' \rangle$.  The
+edited markup is at the same path $\pi_m$ (the edit changes nothing outside
+it, by locality), and the caret is placed in it:
+\begin{gather}
+\rulelabel{Caret}\quad
+\frac{\mathit{doc}(I') = \langle \bar n', \tau' \rangle \qquad
+      m' = \mathit{mk}(\pi_m) \text{ in } \tau' \qquad
+      a = \mathit{at}_{m'}(k)}
+     {I' \vdash \mathit{caret}(\pi_m, k) = \kw{at}(\pi_m.\mathit{place}(a), a)}
+\end{gather}
+For $\kw{same}$, the caret is the one the edit was given.
+
+\paragraph{Examples.}
+\begin{itemize}
+\item Typing a space at the end of $\str{[\bs{}paragraph\bs]Hello[\bs{}endParagraph\bs]}$,
+      at $\kw{gap}(0, 1)$, writes the space and puts the caret after it, at
+      offset $19$ [caret-space].  The space is trimmed, so the caret is
+      $\kw{at}(\kw{gap}(0, 1), \kw{txt}(n_1, 6))$ [caret-space-caret], and
+      typing $\str{w}$ there gives $\str{Hello}\vs\str{w}$
+      [caret-after-space].  At the exact caret, whose anchor is
+      $\kw{txt}(n_1, 5)$, it would give $\str{Hellow}\vs$
+      [caret-exact-trims].
+\item A second space typed after the one of
+      $\str{[\bs{}paragraph\bs]a}\vs\str{b[\bs{}endParagraph\bs]}$
+      collapses into it; the caret is $\kw{at}(\kw{in}(0, 0, 2),
+      \kw{txt}(n_1, 3))$, still before the $\str{b}$ [caret-collapsed].
+\item Enter between $\str{Hi}$ and the space of $W_1$ leaves the caret at
+      the start of the second paragraph, $\kw{at}(\kw{gap}(1, 0),
+      \kw{txt}(n_2, 0))$, the space being trimmed [caret-enter].  Deleting
+      all of the emphasis leaves it where the emphasis was,
+      $\kw{at}(\kw{gap}(0, 1), \kw{txt}(n_1, 3))$: the emphasis's opener and
+      closer cancel across the marker [caret-delete-emph].
+\item Typing $\str{-}$ in the title of $\str{[\bs{}title:\ [\bs{}Hamlet\bs]\bs]}$
+      places the caret in the literal, below the field: $\kw{at}(\kw{in}(\varphi_0, 0,
+      4), \kw{txt}(n_0, 4))$ [caret-title].
+\end{itemize}
+
+\subsection{Laws}
+
+\paragraph{Locality.}
+By construction an edit changes only the source of its points, and in it
+only the text between the bounds of its anchors as tidying widened them:
+if $I \vdash e \Rightarrow \kw{edited}(d, W', \hat c)$ for a $\kw{replace}$,
+$\kw{split}$, or $\kw{style}$ with the widened anchors $a_\circ, a'_\circ$
+of $m$, then $d = \mathit{src}(m)$ and
+\begin{equation}\label{eq:law-locality}
+W' = I(d)[0, \mathit{L}(a_\circ))\ w\ I(d)[\mathit{R}(a'_\circ), |I(d)|)
+\end{equation}
+for some $w$; for $\kw{setString}$ and $\kw{detach}$ the same holds of the
+argument's span.  A local edit never changes a template, and an edit of a
+template never changes the document.
+
+\paragraph{Identity.}
+\begin{equation}\label{eq:law-identity}
+I \vdash \kw{replace}(c, c, \epsilon, \epsilon) \Rightarrow
+  \kw{edited}(\mathit{src}(m), I(\mathit{src}(m)), \kw{same})
+\quad\text{when } \mathit{prov}(m) \neq \kw{computed}
+\end{equation}
+by the first case of (\ref{eq:tidy}).
+
+\paragraph{Typing (obligation).}
+If the anchors of $p$ and $q$ are $\kw{txt}(n, o)$ and $\kw{txt}(n, o')$
+in the contents $u$ of one node $n$, whose text is the child $g$ of the
+block $B$ at the end of the path of $p$, then typing replaces $g$ alone:
+\begin{equation}\label{eq:edit-typing}
+\mathit{replace}(p, q, \kw{text}(u''), \epsilon) \text{ gives } W', \text{ whose
+tree is } \approx\ \tau[g := g']
+\end{equation}
+where $g'$ is the child that the contents $u[0, o)\,u''\,u[o', |u|)$ give in
+$B$ (\ref{eq:text-child}), trimmed as closing $B$ trims it; if that is no
+child, $g$ is removed.  The statements of the source are unchanged, so by
+(H7) every message has the effect it had before.
+
+\paragraph{Library edits (obligations).}  For the standard library, with
+$\tau'$ the tree of the result:
+\begin{itemize}
+\item Backspace at the start of the second of two consecutive paragraphs
+      $P_1 P_2$ gives one paragraph holding the children of both,
+      $\tau' \approx \tau[P_1 P_2 := P]$ with $P$ the paragraph of
+      $P_1$ whose children are those of $P_1$ then those of $P_2$, trimmed.
+\item Splitting a paragraph $P$ at a point gives two paragraphs, $\tau'
+      \approx \tau[P := P_1 P_2]$ with the children before and after the
+      point, each trimmed.
+\item Inserting the template of $x$ at a point whose block understands $x$
+      adds no error: $\mathit{errors}(\tau') = \mathit{errors}(\tau)$.
+\item Toggling a style twice on a range of plain text gives back the tree:
+      $\tau'' \approx \tau$.
+\end{itemize}
+The regressions check instances of each [edit-join, edit-split-tree,
+edit-insert-block-tree, edit-style-apply, edit-style-remove].
+
+\subsection{The standard library's field interface}
+\label{sec:lib-field}
+
+The fields of the standard library's blocks are the values it displays:
+\begin{equation}\label{eq:lib-fields}
+\begin{array}{@{}ll@{}}
+\kw{doc}(t, t', \bar a) & t, t', \bar a \text{ from } \str{title:},
+  \str{subtitle:}, \str{author:} \\
+\kw{section}(d, h, \ell),\ \kw{quote}(a),\ \kw{figure}(c, \ell)
+  & h, a, c \text{ from } \str{section:}, \str{attribution:},
+  \str{caption:} \\
+\kw{verbatim}(u),\ \kw{codeBlock}(u, x),\ \kw{html}(u)
+  & u \text{ from the creating message} \\[-1ex]
+\end{array}
+\end{equation}
+each the first argument of its message; a field that is $\kw{nil}$ is not
+shown, and labels and code languages are not displayed.  The blocks that
+merge are paragraphs, the three styles, lists, numbered lists, and items;
+sections, tables, rows, cells, quotes, and figures do not, so deleting a
+selection that spans two cells clears the cells but keeps both.  The styles
+are $\str{emphasis}$, $\str{strong}$, and $\str{code}$, closed by
+$\str{endEmphasis}$, $\str{endStrong}$, and $\str{endCode}$.
+
+The \emph{template} of an opener $x$ is the opener followed by its closer,
+with the view's caret between them, and a table's holds one row of one
+cell; it is inserted only where the block at the point understands $x$:
+\begin{equation}\label{eq:lib-templates}
+\begin{gathered}
+\mathit{tmpl}(x) = x\ \crt\ \mathit{closer}(x) \quad (x \neq \str{table})
+\\
+\mathit{tmpl}(\str{table}) = \str{table}\ \str{row}\ \str{cell}\ \crt\
+  \str{endCell}\ \str{endRow}\ \str{endTable}
+\\
+\mathit{insert}(c, x) = \kw{replace}(c, c, \bar\omega, \bar\omega') \quad
+  \text{for } \mathit{tmpl}(x) = \bar\omega\,\crt\,\bar\omega', \text{ if }
+  x \in \mathit{model}(\kappa_p)
+\end{gathered}
+\end{equation}
+for $\kappa_p$ the state of the block of $p = \mathit{pt}(c)$, so the
+caret lands inside the new block.  Here $\mathit{closer}$
+gives $\str{endParagraph}$ for $\str{paragraph}$, $\str{endRow}$ for
+$\str{row}$ and $\str{headerRow}$, and so on for every
+opener of (\ref{eq:lib-openers}).  The template of a display is the
+message with an empty string, as $\str{verbatim:\ ''}$, and that of an
+inline-argument message the message with an empty literal, as
+$\str{title:\ [\bs\bs]}$, which is how a reader gives a document a title it
+lacks.  Enter splits the innermost paragraph or list item:
+\begin{equation}\label{eq:lib-enter}
+\mathit{enter}(c) = \kw{split}(c, l) \quad \text{for } l = \max\{\, l \ge 1
+  \mid B_l \text{ is a } \kw{para} \text{ or } \kw{item} \text{ block}
+  \,\}
+\end{equation}
+
+\paragraph{Examples.}  At the gap between the paragraphs of
+$W_{\mathrm{p}}$ the root understands $\str{paragraph}$ but not
+$\str{row}$, and at the start of a paragraph the paragraph understands
+$\str{emphasis}$ but not $\str{paragraph}$ [ex-insertable,
+ex-insertable-row, ex-insertable-emph, ex-insertable-para].  Inserting a
+paragraph there writes its opener, the caret, and its closer [ex-insert];
+the bracket of the new paragraph is split at the caret [caret-template,
+caret-template-tree],
+\[
+\begin{array}{@{}l@{}}
+\str{[\bs{}paragraph\bs]ab[\bs{}endParagraph\bs][\bs{}paragraph\bs]} \\
+\str{[\bs{}endParagraph\bs][\bs{}paragraph\bs]cd[\bs{}endParagraph\bs]}
+\end{array}
+\]
+and the caret is $\kw{at}(\kw{gap}(1, 0), \kw{txt}(n_3, 0))$, inside the
+new paragraph [caret-template-caret].  A table's template puts the caret in
+its one cell [ex-insert-table].
+Writing the two statements of a paragraph's template with the caret after
+both, after the last block of
+$\str{[\bs{}paragraph\bs]ab[\bs{}endParagraph\bs]}$, adds an empty
+paragraph in one bracket, $\str{[\bs{}paragraph.\ endParagraph\bs]}$
+[edit-insert-block, edit-insert-block-tree].
+
+\end{document}

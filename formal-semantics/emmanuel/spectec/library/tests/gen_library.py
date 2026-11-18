@@ -114,7 +114,7 @@ def mut(s): return '(MUT %s)' % s
 def dnu(s): return '(DNU %s)' % s
 def refused(s): return '(REFUSED %s)' % s
 def strv(u): return '(STRV %s)' % seq(chars(u))
-def sym(x): return '(SYMV "%s")' % x
+def sym(x): return strv(x)   # a symbol #x is the string literal 'x'
 NIL = 'NILV'
 def inline(u):
     """The tree value of the literal [\\u\\]: a single run."""
@@ -200,20 +200,20 @@ roundtrip('lib-refusals-roundtrip', W5,
           "[\\title: [\\A\\]\\][\\title: [\\B\\]\\][\\subtitle: nil\\][\\section: #intro\\][\\label: #fig\\]"
           "[\\label: 'x := 1'\\][\\label: #plot\\][\\endSection\\]")
 
-# A taken title is refused without interpreting its argument; a label must be a symbol.
-W5b = "[\\title: [\\A\\]. title: nil. section: #intro. label: 'x := 1'\\][\\endSection\\]"
-s_tf, s_lx = S('title:', C('nil')), S('label:', C("'x := 1'"))
+# A taken title is refused without interpreting its argument; a label must be a string.
+W5b = "[\\title: [\\A\\]. title: nil. section: #intro. label: nil\\][\\endSection\\]"
+s_tf, s_lx = S('title:', C('nil')), S('label:', C('nil'))
 sec5b = sub(T(st('section', '(INTV 1)', sym('intro'), NIL), [refused(s_lx)],
               [S('section:', C('#intro')), S('endSection')]))
 tree('lib-refusal-args', W5b, doc((inline('A'), NIL), [mut(s_ta), refused(s_tf), sec5b], [s_ta]))
 
 # Displays, a figure, and a quote.
-W6 = ("[\\verbatim: 'x := 1'. codeBlock: 'x := 1'. codeBlock: 'x := 1' language: #smalltalk. html: #fig. "
+W6 = ("[\\verbatim: 'x := 1'. codeBlock: 'x := 1'. codeBlock: 'x := 1' language: #smalltalk. html: nil. "
       "figure. html: '<hr>'. caption: [\\A plot\\]. label: #plot. endFigure. quote. attribution: [\\Hamlet\\]. "
       "paragraph\\]To be.[\\endParagraph. endQuote\\]")
 def leafb(s, state): return sub(T(state, [], [s]))
 s_v, s_c1 = S('verbatim:', C("'x := 1'")), S('codeBlock:', C("'x := 1'"))
-s_c2, s_h1 = S('codeBlock:language:', C("'x := 1'"), C('#smalltalk')), S('html:', C('#fig'))
+s_c2, s_h1 = S('codeBlock:language:', C("'x := 1'"), C('#smalltalk')), S('html:', C('nil'))
 s_h2, s_cap, s_lab = S('html:', C("'<hr>'")), S('caption:', LIT(FIN('A plot'))), S('label:', C('#plot'))
 s_att = S('attribution:', LIT(FIN('Hamlet')))
 fig = sub(T(st('figure', inline('A plot'), sym('plot')),
@@ -228,7 +228,7 @@ tree('lib-displays', W6, doc(DOCF, [
     refused(s_h1), fig, quote]))
 roundtrip('lib-displays-roundtrip', W6,
           "[\\verbatim: 'x := 1'\\][\\codeBlock: 'x := 1'\\][\\codeBlock: 'x := 1' language: #smalltalk\\]"
-          "[\\html: #fig\\][\\figure\\][\\html: '<hr>'\\][\\caption: [\\A plot\\]\\][\\label: #plot\\][\\endFigure\\]"
+          "[\\html: nil\\][\\figure\\][\\html: '<hr>'\\][\\caption: [\\A plot\\]\\][\\label: #plot\\][\\endFigure\\]"
           "[\\quote\\][\\attribution: [\\Hamlet\\]\\][\\paragraph\\]To be.[\\endParagraph\\][\\endQuote\\]")
 
 # Errors inside a title are the library's to report; the core does not see them.

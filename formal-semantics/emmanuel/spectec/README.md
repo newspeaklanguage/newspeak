@@ -112,8 +112,8 @@ instances (`edit-identity`, `edit-identity-empty`).
   `RBLOCK (u*) s (p*) s'`, so ground terms parse unambiguously.
 - Host states, values, exceptions, and block states are abstract in the
   LaTeX. They are transcribed as carriers wide enough for the regressions:
-  `HOSTSTATE nat`, `LITV L | TREEV tree | HOSTV nat | STRV | SYMV | INTV |
-  NILV` (the last four for the library), `EXCEPTION nat`,
+  `HOSTSTATE nat`, `LITV L | TREEV tree | HOSTV nat | STRV | INTV | NILV`
+  (the last three for the library; a symbol is a string literal), `EXCEPTION nat`,
   `STATE text value*`. The evaluator and signature are rule-less relations;
   `tests/signature-fixtures.spectec` (hand-written) gives a toy instance in
   the shape of the standard library, including `title:`, whose effect

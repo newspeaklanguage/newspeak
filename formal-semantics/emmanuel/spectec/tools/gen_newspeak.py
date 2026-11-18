@@ -3,13 +3,19 @@
 implementation from the SpecTec regressions.
 
 Run from emmanuel/spectec:
-  python3 tools/gen_newspeak.py ../../../EmmanuelConformanceTesting.ns
+  python3 tools/gen_newspeak.py core ../../../EmmanuelConformanceTesting.ns
+  python3 tools/gen_newspeak.py library ../../../EmmanuelLibraryConformanceTesting.ns
 
-Each row of tests/cases.tsv becomes a test method that hands the row to
-EmmanuelTesting's Driver; the fixture host parser of
-tests/host-fixtures.spectec becomes the table the driver's fixture host
-looks brackets up in. The output must then be pretty-printed
-(tool/pretty-print.sh) like any .ns file.
+Each row becomes a test method that hands the row to EmmanuelTesting's
+Driver. The core's rows are tests/cases.tsv; the library's are the rows of
+library/tests/library-cases.tsv whose relations the reference implements
+(LIBRARY_RELATIONS: the edit layer's are not yet implemented). The fixture
+host parser (tests/host-fixtures.spectec, or the library's generated
+library/tests/library-host.spectec) becomes the table the driver's fixture
+host looks brackets up in, and the $const definitions of the fixture
+evaluator (tests/host-eval-fixtures.spectec, and for the library also
+library-host.spectec) become its constants. The output must then be
+pretty-printed (tool/pretty-print.sh) like any .ns file.
 """
 from pathlib import Path
 import re
@@ -17,14 +23,20 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 
+LIBRARY_RELATIONS = {"LibTree", "LibErrors", "LibRoundTrip"}
+
+# Library rows the Newspeak library cannot satisfy, with the reason. They
+# are listed in the generated file's comment instead of becoming tests.
+DIVERGENT = {}
+
 
 def ns_string(s: str) -> str:
     return "'" + s.replace("'", "''") + "'"
 
 
-def rows():
+def rows(path):
     out = []
-    for line in (ROOT / "tests/cases.tsv").read_text().splitlines():
+    for line in (ROOT / path).read_text().splitlines():
         if not line or line.startswith("#"):
             continue
         fields = line.split("\t")
@@ -33,47 +45,93 @@ def rows():
     return out
 
 
-def host_table():
+def host_table(path):
     out = []
-    for line in (ROOT / "tests/host-fixtures.spectec").read_text().splitlines():
+    for line in (ROOT / path).read_text().splitlines():
         m = re.fullmatch(r"def \$hostParse\((.*)\) = (.*)", line)
         if m:
             out.append((m.group(1), m.group(2)))
     return out
 
 
-def main() -> None:
-    target = Path(sys.argv[1])
+def constants(paths):
+    out = []
+    for path in paths:
+        for line in (ROOT / path).read_text().splitlines():
+            m = re.fullmatch(r"def \$const\((\d+)\) = (.*)", line)
+            if m:
+                out.append((int(m.group(1)), m.group(2)))
+    return out
+
+
+def methods_of(selected):
     methods = []
     seen = set()
-    for name, kind, what, query, expected in rows():
+    for name, kind, what, query, expected in selected:
         selector = "test_" + name.replace("-", "_")
         assert selector not in seen, selector
         seen.add(selector)
         row = ". ".join(ns_string(x) for x in (name, kind, what, query, expected))
         methods.append(f"\t\tpublic {selector} = (\n\t\t\tcheck: {{{row}. }}\n\t\t)\n")
-    table = "\n".join(f"\t\t\t{{{ns_string(a)}. {ns_string(b)}. }}." for a, b in host_table())
+    return "".join(methods)
+
+
+def tuples(pairs, show):
+    return "\n".join(f"\t\t\t{{{show(a)}. {ns_string(b)}. }}." for a, b in pairs)
+
+
+def main() -> None:
+    mode, target = sys.argv[1], Path(sys.argv[2])
+    if mode == "core":
+        selected = rows("tests/cases.tsv")
+        table = host_table("tests/host-fixtures.spectec")
+        consts = constants(["tests/host-eval-fixtures.spectec"])
+        name = "EmmanuelConformanceTesting"
+        header = f"class {name} usingPlatform: p minitest: m testing: testing = ("
+        sources = "tests/cases.tsv and tests/host-fixtures.spectec"
+        driver = "testing driver: hostTable constants: constantTable"
+        skipped = ""
+        context = "CoreConformance"
+    else:
+        assert mode == "library", mode
+        all_rows = rows("library/tests/library-cases.tsv")
+        selected = [r for r in all_rows if r[2] in LIBRARY_RELATIONS and r[0] not in DIVERGENT]
+        table = host_table("library/tests/library-host.spectec")
+        consts = constants(["tests/host-eval-fixtures.spectec", "library/tests/library-host.spectec"])
+        name = "EmmanuelLibraryConformanceTesting"
+        header = f"class {name} usingPlatform: p minitest: m testing: testing blocks: blocks = ("
+        sources = "library/tests/library-cases.tsv and library/tests/library-host.spectec"
+        driver = "testing libraryDriver: hostTable constants: constantTable blocks: blocks"
+        skipped = "".join(f"\n  {n}: {why}" for n, why in sorted(DIVERGENT.items()))
+        context = "LibraryConformance"
+        if skipped:
+            skipped = "\n\nRows left out, where Newspeak differs from the specification:" + skipped
     text = f"""Newspeak3
 'Emmanuel'
-class EmmanuelConformanceTesting usingPlatform: p minitest: m testing: testing = (
+{header}
 \t(* Generated by formal-semantics/emmanuel/spectec/tools/gen_newspeak.py from
-tests/cases.tsv and tests/host-fixtures.spectec. Do not edit: regenerate. *)
+{sources}. Do not edit: regenerate.{skipped} *)
 \t|
 \t\tprivate TestContext = m TestContext.
-\t\tprivate driver = testing driver: hostTable.
+\t\tprivate driver = {driver}.
 \t|
 ) (
-\tpublic class CoreConformance new = TestContext new (
+\tpublic class {context} new = TestContext new (
 \t) (
 \t\tcheck: row = (
 \t\t\tassert: (driver run: row) equals: 'ok'
 \t\t)
-{''.join(methods)}\t) : (
+{methods_of(selected)}\t) : (
 \t\tTEST_CONTEXT = ()
+\t)
+\tconstantTable = (
+\t\t^{{
+{tuples(consts, str)}
+\t\t}}
 \t)
 \thostTable = (
 \t\t^{{
-{table}
+{tuples(table, ns_string)}
 \t\t}}
 \t)
 ) : (

@@ -324,3 +324,31 @@ The choices:
    need no mutable enclosing state.
 3. **Record it as an expected difference.**
 
+**Decided 2026-11-18: 3** (`eurasia/docs/EXPECTED_DIFFERENCES.md`).
+
+## 9. `spawn:` and the actor checks (2026-11-18)
+
+`vm spawn: mixin` (native 139) follows the semantics' create-actor. It makes
+a new actor running a clone of the platform template. It applies the mixin,
+in the new actor's heap, to Object (role 37) with a nil enclosing object.
+It answers a far reference to the new class. The class is a value (its
+enclosing object is nil), but the answer is a far reference, as the
+semantics requires, so `<-: new` runs in the new actor.
+
+The base image (`EurasiaKernelSmokeTest.ns` with `EurasiaSpawnProbe.ns`,
+checked by `eurasia/scripts/genesis.sh`) checks four things:
+- `spawn:` answers a far reference, and the spawned module answers
+  eventual sends;
+- a mutable Array sent to it comes back as itself (RR-Far-Home);
+- an immediate send to it there is refused, so the promise breaks rather
+  than leaking the size;
+- the spawned actor's own state survives a full collection.
+
+The base image runs these checks again with a collection after every
+allocation.
+
+Still open in M4: ports and the serializer (section 2.5, with M5).
+Pausing one actor comes with the debugger (M6). A snapshot saves what the
+roles reach, so only the main actor is saved today; snapshots of a whole
+cohort are open.
+

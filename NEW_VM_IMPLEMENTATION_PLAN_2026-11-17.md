@@ -244,6 +244,26 @@ the debugger (M6). `ActorsTesting` joins the differential tests: all 445
 tests agree, also under GC stress. Still to do for M4: ports, `spawn:` from a
 mixin with a heap per actor, and far references between VMs.
 
+**Progress (2026-11-18): M4 actors done; ports remain.** Following
+`EURASIA_ACTORS_DESIGN_2026-11-17.md`:
+- **VM actors.** Every actor, from `Actor named:` or `vm spawn: mixin`, is a
+  VM actor in one arena, with its own heap, mailbox and clone of the
+  platform template. The VM schedules them round robin.
+- **Crossing actors.** References cross only through the VM: far
+  references (Φ), and promise records (Π) with Route-Pending queues.
+- **The library.** psoup's actors module is forked
+  (`eurasia/kernel/fork-actors.py`).
+- **Tests.** 444 of 445 differential tests agree; `testPipelining` is an
+  expected difference. The base image checks `spawn:`, isolation, far
+  references coming home, and an actor's state surviving collection, also
+  with a collection after every allocation.
+
+Still open:
+- ports and the serializer (with M5);
+- pausing an actor (M6);
+- snapshots of more than one actor;
+- per-actor state in the shared kernel (for instance the symbol table).
+
 **Decided 2026-11-17: genesis, then full snapshots.** psoup runs the program
 when it builds an image because it is *deploying an application*: it
 establishes dependencies by sending the imports to a manifest. Eurasia's

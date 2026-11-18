@@ -372,6 +372,27 @@ because serialisation (PrimordialFuel) uses slot writes heavily.
 | `vm resume: actor` | new | reflective | controlActorStack | `nil` | `resumePausedActorAtFullSpeed` |
 | `vm replaceStackOf: actor with: image andResume` | new | reflective | controlActorStack | `nil` | `replaceAndResumePausedActorStack` |
 
+**Implemented on Eurasia (2026-11-18, `EURASIA_ACTORS_DESIGN_2026-11-17.md`).**
+`vm spawn:` is Eurasia native 139. Actors are VM actors in one arena, and
+the library's actors module reaches them through these further operations
+(Eurasia natives, installed on the actors module or the VM mirror by
+`eurasia/kernel/natives.tsv`):
+
+| Operation | Native | Result | Notes |
+|---|---|---|---|
+| `vm clone: root` | 126 | the copy | Copies the mutable graph; values, program objects, shared objects and their classes stay shared. |
+| `vm newActor` | 127 | a far reference to nil in the new actor | `Actor named:`: a new actor running a clone of the platform template (role 36). |
+| `vm farReference: handle to: value` | 128 | a far reference | To a value in the handle's actor. |
+| `vm post: packet to: farReference` | 129 | `nil` | Queues the packet, every element translated by the remote-representation rules, in the far reference's actor; its message loop gets `dispatchPacket:`. |
+| `vm isFarReference: x` | 130 | Boolean | |
+| `vm currentMessageLoop` | 131 | the running actor's loop | |
+| `vm newPromiseFor: p` | 132 | a pending promise record (Π) | Its owner is a far reference to the library promise `p`. |
+| `vm resolvePromise: r with: v`, `vm breakPromise: r with: e` | 133, 134 | whether `r` was pending | A record as the resolution forwards `r` to it. Queued sends are delivered and waiters are notified. |
+| `vm promiseState: r` | 135 | `{state. payload}` | At the end of the forwarding chain, in the running actor's terms. |
+| `vm promise: r addWaiter: p` | 136 | `nil` | `p` is sent `resolveRemotely:` or `breakRemotely:` when `r` settles. |
+| `vm isPromise: x` | 137 | Boolean | |
+| `vm promise: r send: message` | 138 | `nil` | Route-Pending: queued in the record until it settles. |
+
 Each incoming event (message, timer, host callback with no turn on the
 stack) is delivered through the dispatch roles and is a logged input.
 

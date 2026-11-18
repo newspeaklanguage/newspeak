@@ -3,9 +3,13 @@ Newspeak3
 class EurasiaPackager packageUsing: manifest = (
 	(* Builds a snapshot for Eurasia, the new Rust VM, from a Newspeak module. Runs on psoup (V4): it compiles the module with the V5 compiler (Newspeak2V5BytecodeCompilation) and writes the object graph in the format of the eurasia repository's docs/SNAPSHOT_FORMAT.md.
 
-Usage: EurasiaPackager <module.ns> <EntryClassName> <output.eus>
+Usage:
+	EurasiaPackager <module.ns> <EntryClassName> <output.eus>                (first light, M1b)
+	EurasiaPackager <kernel.ns> <natives.tsv> <application.ns> <output.eus>  (genesis)
 
 M1b (first light) builds classes statically: the module's nested classes become the image's classes, each with the superclass named in its header (no superclass clause means Object, and Object itself has none). The module is instantiated without running its initializer: its slots are nil except the cached nested-class slots, which hold the classes built here, so nested-class accessors answer them. The entry object is an uninitialized instance of the named nested class. Methods listed in the natives table become native methods of the kernel catalog; their source bodies are ignored. How a module-structured kernel is instantiated on Eurasia (running initializers) is open.
+
+Genesis (EURASIA_GENESIS_KERNEL_PLAN_2026-11-17.md) builds the same way from the kernel fork (EurasiaKernel.ns): _Object is the root and the default superclass, every metaclass's superclass is Class, natives come from the eurasia repository's kernel/natives.tsv, and the packager fills the kernel module's slots (the nested classes, the VM mirror, the on:do: and ensure: methods, the symbol table, and the application). The application module is packaged as if nested in the kernel, so its code sees kernel classes lexically. The image's entry is the kernel module, whose main:args: is the genesis entry.
 
 The native ids and role ids must match eurasia-core's natives.rs and roles.rs. *)
 	
@@ -15,6 +19,8 @@ The native ids and role ids must match eurasia-core's natives.rs and roles.rs. *
 		Intermediates = manifest IntermediatesForPrimordialSoup.
 		NewspeakBytecodeCompilation = manifest NewspeakBytecodeCompilation mixinApply: manifest NewspeakCompilation.
 		Newspeak2V5BytecodeCompilation = manifest Newspeak2V5BytecodeCompilation mixinApply: NewspeakBytecodeCompilation.
+		private natives
+		private rootName ::= 'Object'.
 	|
 ) (
 	class Image usingPlatform: platform = (
@@ -71,6 +77,11 @@ The native ids and role ids must match eurasia-core's natives.rs and roles.rs. *
 					strings at: s put: node.
 					node
 				]
+		)
+		public weakArray: elements = (
+			| node = newNode: #weakarray space: #actor. |
+			node edges: elements.
+			^node
 		)
 	) : ()
 	class StubInternalKernel new = (
@@ -146,6 +157,155 @@ The native ids and role ids must match eurasia-core's natives.rs and roles.rs. *
 		1 to: selector size
 			do: [:i | (selector at: i) = 58 ifTrue: [ colons:: colons + 1 ] ].
 		^colons
+	)
+	buildGenesisFrom: kernelSource app: appSource platform: platform = (
+		(* The genesis image (plan section 4): the kernel's classes, the application packaged as if nested in the kernel, and the kernel module as the entry. *)
+		
+		| List Map compiler kernel app image kNested aNested classes mixins kernelClass appClass kernelInstance appInstance closureClass vmMirror commonSelectors roles strings |
+		List:: platform collections List.
+		Map:: platform collections Map.
+		compiler:: (compilationUsingPlatform: platform) Compiler new.
+		kernel:: compiler compileClassSource: kernelSource within: nil.
+		app:: compiler compileClassSource: appSource within: nil.
+		image:: Image usingPlatform: platform.
+		rootName:: '_Object'.
+		kNested:: kernel instanceSide nestedClasses.
+		aNested:: app instanceSide nestedClasses.
+		classes:: Map new.
+		mixins:: Map new.
+		mixins at: kernel simpleName
+			put: (mixinPairFor: kernel
+				enclosing: {image nilNode. image nilNode. }
+				image: image
+				platform: platform).
+		kNested do: [:icd |
+				mixins at: icd simpleName
+					put: (mixinPairFor: icd
+						enclosing: (mixins at: kernel simpleName)
+						image: image
+						platform: platform)
+			].
+		mixins at: app simpleName
+			put: (mixinPairFor: app
+				enclosing: (mixins at: kernel simpleName)
+				image: image
+				platform: platform).
+		aNested do: [:icd |
+				mixins at: icd simpleName
+					put: (mixinPairFor: icd
+						enclosing: (mixins at: app simpleName)
+						image: image
+						platform: platform)
+			].
+		kNested do: [:icd |
+				defineClass: icd
+					nested: kNested
+					classes: classes
+					mixins: mixins
+					image: image
+					platform: platform
+			].
+		aNested do: [:icd |
+				defineClass: icd
+					nested: aNested
+					classes: classes
+					mixins: mixins
+					image: image
+					platform: platform
+			].
+		kernelClass:: newClassNamed: kernel simpleName
+			mixins: (mixins at: kernel simpleName)
+			superclass: (classes at: rootName)
+			image: image.
+		appClass:: newClassNamed: app simpleName
+			mixins: (mixins at: app simpleName)
+			superclass: (classes at: rootName)
+			image: image.
+		
+		(* Metaclasses: instances of Metaclass, all with Class as their superclass. *)
+		(List new addAll: classes values;
+			add: kernelClass;
+			add: appClass;
+			yourself) do: [:c |
+				c klass klass: (classes at: 'Metaclass').
+				c klass edges at: 2 put: (classes at: 'Class')
+			].
+		kernelInstance:: moduleInstanceOf: kernelClass
+			declaration: kernel
+			nested: kNested
+			classes: classes
+			image: image.
+		appInstance:: moduleInstanceOf: appClass
+			declaration: app
+			nested: aNested
+			classes: classes
+			image: image.
+		kNested do: [:icd |
+				(classes at: icd simpleName) edges at: 3 put: kernelInstance
+			].
+		aNested do: [:icd | (classes at: icd simpleName) edges at: 3 put: appInstance ].
+		appClass edges at: 3 put: kernelInstance.
+		image nilNode klass: (classes at: 'UndefinedObject').
+		image trueNode klass: (classes at: 'True').
+		image falseNode klass: (classes at: 'False').
+		vmMirror:: instanceOf: (classes at: 'VMMirror') image: image.
+		closureClass:: classes at: 'Closure'.
+		setSlot: 'vm' of: kernelInstance declaration: kernel to: vmMirror.
+		setSlot: 'onDoMethod'
+			of: kernelInstance
+			declaration: kernel
+			to: (methodNamed: 'on:do:' in: closureClass).
+		setSlot: 'ensureMethod'
+			of: kernelInstance
+			declaration: kernel
+			to: (methodNamed: 'ensure:' in: closureClass).
+		setSlot: 'application' of: kernelInstance declaration: kernel to: appInstance.
+		mixins values do: [:pair |
+				(pair at: 1) klass: (classes at: 'InstanceMixin').
+				(pair at: 2) klass: (classes at: 'ClassMixin')
+			].
+		commonSelectors:: List new.
+		(commonSelectorsCheckedWith: compiler) do: [:selector |
+				commonSelectors add: (image string: selector).
+				commonSelectors add: (arityOf: selector)
+			].
+		roles:: List new.
+		roles add: {1. image nilNode. };
+			add: {2. image trueNode. };
+			add: {3. image falseNode. }.
+		{{4. 'SmallInteger'. }. {5. 'MediumInteger'. }. {6. 'LargeInteger'. }. {7. 'Float'. }. {8. 'String'. }. {9. 'ByteArray'. }. {10. '_Array'. }. {11. 'WeakArray'. }. {12. 'Ephemeron'. }. {13. 'Closure'. }. {14. 'Activation'. }. {15. 'Method'. }. {24. 'NativeFailure'. }. {30. 'Message'. }. } do: [:pair |
+				roles add: {pair at: 1. classes at: (pair at: 2). }
+			].
+		roles add: {18. image string: 'doesNotUnderstand:'. }.
+		roles add: {19. image string: 'nonBooleanReceiver:'. }.
+		roles add: {20. image string: 'cannotReturn:'. }.
+		roles add: {21. image string: 'aboutToReturn:through:'. }.
+		roles add: {25. methodNamed: 'ensure:' in: closureClass. }.
+		roles add: {26. methodNamed: 'on:do:' in: closureClass. }.
+		roles add: {29. image array: commonSelectors space: #actor. }.
+		roles add: {31. vmMirror. }.
+		roles add: {32. kernelInstance. }.
+		1 to: 33
+			do: [:id |
+				(roles detect: [:pair | (pair at: 1) = id ] ifNone: [ nil ]) isNil ifTrue: [
+						roles add: {id. image nilNode. }
+					]
+			].
+		
+		(* The symbol table: every canonical string, compact; the kernel rehashes it on first use. *)
+		strings:: image nodes select: [:n | n kind = #string ].
+		setSlot: 'symbolTable'
+			of: kernelInstance
+			declaration: kernel
+			to: (image weakArray: strings).
+		image nodes do: [:n |
+				n kind = #string ifTrue: [ n klass: (classes at: 'String') ].
+				n kind = #array ifTrue: [ n klass: (classes at: '_Array') ].
+				n kind = #weakarray ifTrue: [ n klass: (classes at: 'WeakArray') ].
+				n kind = #method ifTrue: [ n klass: (classes at: 'Method') ].
+				nil = n klass ifTrue: [ n klass: image nilNode ]
+			].
+		^serialize: image roles: roles
 	)
 	buildSnapshotFrom: source entry: entryName platform: platform = (
 		| List Map compiler module image nested classesByName mixins metaclassClass objectClass moduleClass moduleInstance entryClass roles commonSelectors vmMirrorInstance |
@@ -290,6 +450,11 @@ The native ids and role ids must match eurasia-core's natives.rs and roles.rs. *
 			newspeakParser: parsing
 			intermediates: intermediates
 	)
+	decimalValueOf: digits = (
+		| n ::= 0. |
+		1 to: digits size do: [:i | n:: n * 10 + ((digits at: i) - 48) ].
+		^n
+	)
 	defineClass: icd nested: nested classes: classesByName mixins: mixins image: image platform: platform = (
 		| superName superclass |
 		(classesByName includesKey: icd simpleName) ifTrue: [
@@ -297,8 +462,13 @@ The native ids and role ids must match eurasia-core's natives.rs and roles.rs. *
 			].
 		superName:: superclassNameOf: icd.
 		superclass:: image nilNode.
+		superName = 'Object' ifTrue: [ superName:: rootName ].
 		superName isEmpty ifTrue: [
-				icd simpleName = 'Object' ifFalse: [ superName:: 'Object' ]
+				icd simpleName = rootName ifFalse: [ superName:: rootName ]
+			].
+		(superName isEmpty not and: [ classesByName includesKey: superName ]) ifTrue: [
+				superclass:: classesByName at: superName.
+				superName:: ''
 			].
 		superName isEmpty ifFalse: [
 				| superIcd |
@@ -318,6 +488,17 @@ The native ids and role ids must match eurasia-core's natives.rs and roles.rs. *
 				mixins: (mixins at: icd simpleName)
 				superclass: superclass
 				image: image)
+	)
+	fieldsOf: line platform: platform = (
+		| fields start tab |
+		fields:: platform collections List new.
+		start:: 1.
+		[ (tab:: line indexOf: (String with: 9) startingAt: start) > 0 ] whileTrue: [
+				fields add: (line copyFrom: start to: tab - 1).
+				start:: tab + 1
+			].
+		fields add: (line copyFrom: start to: line size).
+		^fields
 	)
 	instanceOf: class image: image = (
 		(* An uninitialized instance: one nil per slot of the class chain. *)
@@ -353,15 +534,25 @@ The native ids and role ids must match eurasia-core's natives.rs and roles.rs. *
 		^Error signal: 'Unsupported literal: ' , lit printString
 	)
 	public main: platform args: args = (
-		| source entryName output image bytes |
-		args size < 3 ifTrue: [
-				'Usage: EurasiaPackager <module.ns> <EntryClassName> <output.eus>' out.
-				^nil
+		| bytes output |
+		args size = 4 ifTrue: [
+				natives:: readNativesTable: (args at: 2) platform: platform.
+				output:: args at: 4.
+				bytes:: buildGenesisFrom: (String withAll: (readFileAsBytes: (args at: 1)))
+					app: (String withAll: (readFileAsBytes: (args at: 3)))
+					platform: platform
+			]
+			ifFalse: [
+				args size < 3 ifTrue: [
+						'Usage: EurasiaPackager <module.ns> <EntryClassName> <output.eus>' out.
+						'   or: EurasiaPackager <kernel.ns> <natives.tsv> <application.ns> <output.eus>' out.
+						^nil
+					].
+				output:: args at: 3.
+				bytes:: buildSnapshotFrom: (String withAll: (readFileAsBytes: (args at: 1)))
+					entry: (args at: 2)
+					platform: platform
 			].
-		source:: String withAll: (readFileAsBytes: (args at: 1)).
-		entryName:: args at: 2.
-		output:: args at: 3.
-		bytes:: buildSnapshotFrom: source entry: entryName platform: platform.
 		writeBytes: bytes toFileNamed: output.
 		('Wrote ' , bytes size printString , ' bytes to ' , output) out
 	)
@@ -371,6 +562,15 @@ The native ids and role ids must match eurasia-core's natives.rs and roles.rs. *
 		method:: image newNode: #method space: #program.
 		method klass: image nilNode.
 		literals:: platform collections List new.
+		
+		(* The root's initializers have no superclass initializer to call: they answer the receiver. *)
+		(className = rootName and: [
+				(m selector indexOf: 'initializer`' startingAt: 1) = 1
+			]) ifTrue: [
+				method payload: {#returnSelf. m accessModifier. m argCount. 0. 0. {}. }.
+				method edges: {image array: literals space: #program. mixin. image string: m selector. image nilNode. image nilNode. }.
+				^method
+			].
 		native = 0 ifTrue: [
 				nil = m literals ifFalse: [
 						m literals do: [:lit | literals add: (literal: lit image: image) ]
@@ -383,6 +583,12 @@ The native ids and role ids must match eurasia-core's natives.rs and roles.rs. *
 			].
 		method edges: {image array: literals space: #program. mixin. image string: m selector. image nilNode. image nilNode. }.
 		^method
+	)
+	methodNamed: selector in: class = (
+		| methods |
+		methods:: ((class edges at: 1) edges at: 2) edges.
+		^methods detect: [:m | (m edges at: 3) payload = selector ]
+			ifNone: [ Error signal: 'No method ' , selector ]
 	)
 	mixinFor: side name: name enclosing: enclosingMixin image: image platform: platform = (
 		(* A mixin node with its methods: compiled methods, nested-class accessors, the factory (class side) or initializers (instance side), and synthesized slot accessors whose slot index is relative to this mixin. *)
@@ -451,10 +657,41 @@ The native ids and role ids must match eurasia-core's natives.rs and roles.rs. *
 				space: #program. image nilNode. }.
 		^mixin
 	)
+	mixinPairFor: icd enclosing: pair image: image platform: platform = (
+		^{mixinFor: icd instanceSide
+			name: icd simpleName
+			enclosing: (pair at: 1)
+			image: image
+			platform: platform. mixinFor: icd classSide
+			name: icd simpleName
+			enclosing: (pair at: 2)
+			image: image
+			platform: platform. }
+	)
+	moduleInstanceOf: class declaration: icd nested: nested classes: classes image: image = (
+		(* A module instance: nil slots, except the cached nested-class slots, which hold the classes. *)
+		
+		| instance |
+		instance:: image newNode: #regular space: #actor.
+		instance klass: class.
+		instance edges: (icd instanceSide assembleSlots collect: [:slot |
+					| value ::= image nilNode. |
+					nested do: [:each |
+							slot name = (each simpleName , '`slot') ifTrue: [
+									value:: classes at: each simpleName
+								]
+						].
+					value
+				]).
+		^instance
+	)
 	nativeIdFor: className selector: selector = (
 		(* The catalog ids of eurasia-core's natives.rs, kernel version 1. *)
 		
 		| table |
+		nil = natives ifFalse: [
+				^natives at: className , '|' , selector ifAbsent: [ 0 ]
+			].
 		table:: {{'SmallInteger'. '+'. 1. }. {'SmallInteger'. '-'. 2. }. {'SmallInteger'. '*'. 3. }. {'SmallInteger'. '<'. 4. }. {'SmallInteger'. '>'. 5. }. {'SmallInteger'. '<='. 6. }. {'SmallInteger'. '>='. 7. }. {'SmallInteger'. '='. 8. }. {'SmallInteger'. 'asString'. 9. }. {'Object'. '=='. 10. }. {'Object'. 'class'. 11. }. {'Object'. 'identityHash'. 12. }. {'String'. ','. 13. }. {'String'. 'size'. 14. }. {'VMMirror'. 'print:'. 20. }. {'VMMirror'. 'exit:'. 21. }. }.
 		table do: [:entry |
 				((entry at: 1) = className and: [ (entry at: 2) = selector ]) ifTrue: [
@@ -480,6 +717,27 @@ The native ids and role ids must match eurasia-core's natives.rs and roles.rs. *
 		(* :literalmessage: primitive: 130 *)
 		
 		halt
+	)
+	readNativesTable: path platform: platform = (
+		(* kernel/natives.tsv: class, side, selector, native name, native id; '#' starts a comment line. Keys are 'Class|selector', or 'Class class|selector' for the class side. *)
+		
+		| text map start stop line fields |
+		text:: String withAll: (readFileAsBytes: path).
+		map:: platform collections Map new.
+		start:: 1.
+		[ start <= text size ] whileTrue: [
+				stop:: text indexOf: (String with: 10) startingAt: start.
+				stop = 0 ifTrue: [ stop:: text size + 1 ].
+				line:: text copyFrom: start to: stop - 1.
+				start:: stop + 1.
+				(line isEmpty or: [ (line at: 1) = 35 ]) ifFalse: [
+						fields:: fieldsOf: line platform: platform.
+						map at: ((fields at: 2) = 'class' ifTrue: [ (fields at: 1) , ' class' ]
+								ifFalse: [ fields at: 1 ]) , '|' , (fields at: 3)
+							put: (decimalValueOf: (fields at: 5))
+					]
+			].
+		^map
 	)
 	sendOf: selector to: receiver = (
 		(* Source for a send of selector to receiver, with receiver as every argument. *)
@@ -537,6 +795,15 @@ The native ids and role ids must match eurasia-core's natives.rs and roles.rs. *
 			].
 		^w contents
 	)
+	setSlot: name of: instance declaration: icd to: value = (
+		| slots |
+		slots:: icd instanceSide assembleSlots.
+		1 to: slots size
+			do: [:i |
+				(slots at: i) name = name ifTrue: [ ^instance edges at: i put: value ]
+			].
+		^Error signal: 'No slot ' , name , ' in ' , icd simpleName
+	)
 	superclassNameOf: icd = (
 		(* The superclass named in a nested class header, 'class X new = Super new (' or 'class X new = (': the first word between = and (. An empty clause means the default superclass. *)
 		
@@ -572,7 +839,10 @@ The native ids and role ids must match eurasia-core's natives.rs and roles.rs. *
 		w byte: (#ordinary = kind ifTrue: [ 0 ]
 				ifFalse: [
 					#native = kind ifTrue: [ 1 ]
-						ifFalse: [ #getter = kind ifTrue: [ 2 ] ifFalse: [ 3 ] ]
+						ifFalse: [
+							#getter = kind ifTrue: [ 2 ]
+								ifFalse: [ #setter = kind ifTrue: [ 3 ] ifFalse: [ 4 ] ]
+						]
 				]).
 		w byte: (#public = access ifTrue: [ 0 ]
 				ifFalse: [ #protected = access ifTrue: [ 1 ] ifFalse: [ 2 ] ]).
@@ -586,13 +856,14 @@ The native ids and role ids must match eurasia-core's natives.rs and roles.rs. *
 	)
 	writeNode: n writer: w = (
 		| kinds |
-		kinds:: {#regular. 1. #string. 3. #array. 4. #method. 9. #mixin. 10. #class. 11. #metaclass. 12. }.
+		kinds:: {#regular. 1. #string. 3. #array. 4. #weakarray. 5. #method. 9. #mixin. 10. #class. 11. #metaclass. 12. }.
 		1 to: kinds size
 			by: 2
 			do: [:i | (kinds at: i) = n kind ifTrue: [ w byte: (kinds at: i + 1) ] ].
 		w byte: (n space = #program ifTrue: [ 1 ] ifFalse: [ 0 ]).
 		n kind = #regular ifTrue: [ ^w uv: n edges size ].
 		n kind = #array ifTrue: [ ^w uv: n edges size ].
+		n kind = #weakarray ifTrue: [ ^w uv: n edges size ].
 		n kind = #string ifTrue: [
 				w uv: n payload size.
 				1 to: n payload size do: [:i | w byte: (n payload at: i) ].

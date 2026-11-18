@@ -1,8 +1,8 @@
 # Eurasia genesis kernel: plan
 
 **Date:** 2026-11-17
-**Status:** Plan for review; the VM-side activation operations (step 2) are
-being implemented, since every option below needs them.
+**Status:** Steps 1-4 done (2026-11-17): genesis builds and checks a base image
+(`eurasia/scripts/genesis.sh`). Step 5, differential tests, is next.
 **Context:** `NEW_VM_IMPLEMENTATION_PLAN_2026-11-17.md`, "Decided: genesis,
 then full snapshots". A genesis packager builds the minimum statically; a
 genesis entry finishes initialization in Newspeak on Eurasia and saves the
@@ -125,3 +125,35 @@ these become natives over activation handles:
 2. **Until actors (M4), an unhandled exception prints and exits**, with a
    stack trace (each frame's receiver class and selector, by walking `sender`
    links) where feasible.
+
+## 7. Progress (2026-11-17)
+
+Genesis works end to end. `eurasia/kernel/fork-kernel.py` derives
+`EurasiaKernel.ns` from psoup's kernel (every change explicit and checked);
+`EurasiaPackager` in genesis mode packages it with `eurasia/kernel/natives.tsv`
+and `EurasiaKernelSmokeTest.ns`; Eurasia runs the genesis entry, which saves
+the base image; the base image runs the smoke test. psoup's own exception
+machinery runs unchanged on Eurasia's activation natives: `on:do:`, native
+failures as exceptions, `ensure:`, and non-local return through `ensure:`.
+An unhandled exception prints a stack trace and exits 1.
+
+Found while bringing it up, beyond the plan:
+
+- **Contract-ordered slots.** The kernel's `Behavior`, `Class`, `Metaclass`,
+  `Method` and mixin classes declared psoup's layouts. The fork declares their
+  slots in Eurasia's contract order, and a slot getter on a contract object
+  reads the contract field at that position (setters are refused). psoup-only
+  fields (`methods`, `classIndex`, `format`, method `header` and `bytecode`, the
+  mixins' bookkeeping) answer neutral values until the mirrors (M6).
+- **The root initializer.** `_Object`'s compiled `initializer` sends to super,
+  and the root has no superclass, so every initialization ended in a DNU. The
+  packager installs the root's initializers as return-self methods.
+- **Metaclass superclass is `Class`**, as in psoup (class-side methods are not
+  inherited); `basicNew` is found that way.
+- **The failure class is an Exception subclass**: the VM puts the five failure
+  fields in its own last five slots.
+
+Not yet: runtime class creation (`InstanceMixin>>apply:…`, which needs the
+`applyMixin:superclass:enclosingObject:` operation and a mixin class whose
+extra data lives in the library field), so object literals and classes not
+pre-built by the packager do not work; method-header decoding (M6); actors.

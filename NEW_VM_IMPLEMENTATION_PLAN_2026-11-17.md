@@ -187,6 +187,48 @@ statically, and **how a module-structured kernel (nested classes, slot
 initializers, `packageUsing:`) is instantiated on Eurasia is an open design
 question** for M2.
 
+**Decided 2026-11-17: genesis, then full snapshots.** psoup runs the program
+when it builds an image because it is *deploying an application*: it
+establishes dependencies by sending the imports to a manifest. Eurasia's
+images are full heap snapshots, code and state. Only the first image is
+built specially:
+1. A **genesis packager** (EurasiaPackager grown up) builds, statically, the
+   classes and objects needed before any code runs: the kernel classes, the
+   failure class, the VM mirror, roles and natives.
+2. At first boot Eurasia runs a **genesis entry** in Newspeak that does the
+   rest of the kernel's initialization, then **saves the whole heap**. That
+   snapshot is the base image every later run starts from.
+3. After that, apps are deployed on Eurasia itself with the manifest
+   technique psoup uses, once the compiler runs on Eurasia (M6). Until then
+   apps are packaged from psoup, as in M1b.
+
+Consequence: saving an idle heap (no paused stacks) moves from M7 to M2/M3.
+Paused stacks, restore with aliens, and replay stay in M7.
+
+**Principle (decided 2026-11-17): images are build artifacts, always
+recreatable from source.** Eurasia must never reach the Smalltalk situation
+where an image lives on for years because rebuilding it from source is too
+hard.
+1. *Every base image is genesis output only.* Anything it contains is produced
+   from source: by the genesis packager (its own source and
+   `eurasia/kernel/natives.tsv`) or by the genesis entry, which is Newspeak.
+   No state set up by hand in an image and saved.
+2. *Builds are reproducible.* Allocation order, identity hashes and the
+   snapshot format are deterministic, so building twice gives byte-identical
+   images; `eurasia/scripts/genesis.sh` checks this on every run (verified
+   2026-11-17 for both the genesis and the base image). Until the collector
+   (M3), a saved heap also holds unreachable objects, including the genesis
+   run's arguments, so the check runs genesis with identical arguments; the
+   collector must remove that dependence on inputs.
+3. *Self-hosting uses a seed, not a lineage.* Once Eurasia compiles itself
+   (M6), the packager runs in a pinned stage-0 image that is used only to run
+   the compiler: the build compiles everything from source with it (stage 1),
+   rebuilds with stage 1 (stage 2), and requires stage 1 and stage 2 to be
+   byte-identical. The seed can always be rebuilt from source, so it is never
+   precious.
+4. *Genesis runs routinely,* as part of the regular checks, so building from
+   source cannot rot unnoticed.
+
 ## 7. Risks
 
 - **Kernel fork drift.** Two kernels evolve in parallel until psoup retires.

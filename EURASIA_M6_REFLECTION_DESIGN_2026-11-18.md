@@ -262,3 +262,30 @@ runs on Eurasia.**
   its 51 tests agree with psoup, also under GC stress. The three
   `evaluate:` tests wait for step 4's Simulator and are listed in
   `eurasia/docs/EXPECTED_DIFFERENCES.md`.
+
+**Step 3 (2026-11-18): `vm commit:`; `MirrorBuilderTesting` agrees except
+`evaluate:`.**
+- **`vm commit: {old objects. new objects. layout maps}`** (native 158)
+  installs atomically, all or nothing:
+  - Each layout map `{old class. new class. for each new slot, the old
+    slot's index or 0}` reshapes every instance of the old class in place,
+    so its identity, flags and actor stay.
+  - Each old object's references then go to the new one, in one pass over
+    the arena and the VM's roots. Running frames keep their methods.
+  - The new methods, mixins and classes are frozen.
+  - The program version goes up (`vm programVersion`, 161).
+  - There is no general become.
+- **Class queries.** `vm mixinApplicationsOf:` and `vm subclassesOf:`
+  (159–160) replace psoup's weak sets. Like `allInstancesOf:`, they collect
+  first. Without that, the installer re-applied classes that forwarding had
+  just made garbage.
+- **Root classes.** `applyMixin:` takes a nil superclass, for root classes.
+- **The installer, in the fork.** It builds layout maps instead of copying
+  instances, and installs with one `commit:`. It synthesizes slot accessors
+  per mixin, with mixin-relative indices.
+- **The result.** psoup's `MirrorBuilderTesting` joins the differential
+  tests. 51 of its 54 tests agree, also under GC stress; the three
+  `evaluate:` ones wait for step 4.
+- **`AtomicInstallTesting` is not a target after all.** It is configured
+  for Squeak (`MirrorsForSqueak`, `platform squeak`), so it runs on neither
+  psoup nor Eurasia; `MirrorBuilderTesting` covers psoup's installer.

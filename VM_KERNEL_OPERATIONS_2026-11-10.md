@@ -351,6 +351,22 @@ a safepoint first. A paused actor is always at one.
 mixin is committed. Nothing in source can produce one (design doc
 section 8).
 
+**Implemented on Eurasia (2026-11-18, M6 step 3).** `vm commit:` is
+native 158. Its change set is an Array of three parts:
+- the old objects;
+- the new objects;
+- the layout maps, each `{old class. new class. for each new slot, the old
+  slot's index or 0}`.
+
+Layout maps reshape instances in place: identity, flags and actor are
+kept. Forwarding is one pass over the arena and the VM's roots, and
+running frames keep their methods. The new program objects are frozen.
+`vm mixinApplicationsOf:` (159), `vm subclassesOf:` (160) and
+`vm programVersion` (161) come with it. The class queries and
+`vm allInstancesOf:` (153) collect first, so that no dead object answers.
+Object and activation commands in the change set, and `reclassify:as:`,
+are not yet implemented.
+
 **Single-command shortcuts.** `vm slotOf:at:put:` and `vm reclassify:as:`
 (section 4) are exactly one-command commits. They are kept as operations
 because serialisation (PrimordialFuel) uses slot writes heavily.

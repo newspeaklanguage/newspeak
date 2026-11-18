@@ -299,7 +299,8 @@ class EurasiaMirrors usingPlatform: platform internalKernel: ik namespace: ns
 	class AtomicInstaller new = (
 		|
 			private updateMixinsAndClasses <IdentityMap[OldObject, NewObject]>
-			private updateInstances <IdentityMap[OldObject, NewObject]>
+			private updateInstances <IdentityMap[OldObject, NewObject]> (* Eurasia: unused; instances are reshaped by the VM from layoutMaps. *)
+			private layoutMaps <List[{Class. Class. Array[Integer]}]>
 			private existingClasses <IdentityMap[HierarchyDepth, Set[Class]]>
 			private newExistingMixins <Map[IntermediateClassDeclaration, InstanceMixin]>
 		|
@@ -313,6 +314,7 @@ class EurasiaMirrors usingPlatform: platform internalKernel: ik namespace: ns
 		private cleanup = (
 			updateMixinsAndClasses: nil.
 			updateInstances: nil.
+			layoutMaps: nil.
 			existingClasses: nil.
 			newExistingMixins: nil
 		)
@@ -349,27 +351,19 @@ class EurasiaMirrors usingPlatform: platform internalKernel: ik namespace: ns
 			
 		)
 		private installAll = (
-			| updateCount oldObjects newObjects index |
-			updateCount:: updateMixinsAndClasses size + updateInstances size.
-			oldObjects:: Array new: updateCount.
-			newObjects:: Array new: updateCount.
-			index: 1.
-			updateInstances keysAndValuesDo: [:old :new |
-					oldObjects at: index put: old.
-					newObjects at: index put: new.
-					index: index + 1
-				].
+			(* Eurasia: one vm commit: with the forwarding pairs (old mixins and classes to new) and the layout maps, which the VM applies to the instances in place. *)
 			
-			(* Put updated mixins and classes last, so A -> C follows B -> C (see class comment). *)
+			| oldObjects newObjects index |
+			oldObjects:: Array new: updateMixinsAndClasses size.
+			newObjects:: Array new: updateMixinsAndClasses size.
+			index:: 1.
 			updateMixinsAndClasses keysAndValuesDo: [:old :new |
 					oldObjects at: index put: old.
-					newObjects at: index put: (updateInstances at: old ifAbsent: [ new ]).
-					
-					(* Follow B to avoid B -> C, A -> B. *)
-					index: index + 1
+					newObjects at: index put: new.
+					index:: index + 1
 				].
-			updateCount = 0 ifTrue: [ ^self ].
-			elementsOf: oldObjects forwardIdentityToElementsOf: newObjects
+			(index = 1 and: [ layoutMaps isEmpty ]) ifTrue: [ ^self ].
+			commit: {oldObjects. newObjects. layoutMaps asArray. }
 		)
 		private layoutHasChangedBetween: oldClass <Behavior> and: newClass <Behavior> ^<Boolean> = (
 			| oldCls newCls oldMixin newMixin oldSlots newSlots |
@@ -395,11 +389,36 @@ class EurasiaMirrors usingPlatform: platform internalKernel: ik namespace: ns
 			^false
 		)
 		private methodDictionaryFor: mixin <AbstractMixin> from: imixin <IntermediateMixin> ^<MethodDictionary> = (
-			| cmethods |
-			cmethods:: imixin assembleMethods collect: [:imethod <IntermediateMethod> |
-					imethod methodMixin: mixin.
-					imethod compiledMethod
+			(* Eurasia: the slot accessors are made here, with indices relative to the mixin, as the genesis packager makes them; psoup's assembleMethods has placeholders, which psoup's kernel rebuilds for each application. *)
+			
+			| slots accessors cmethods |
+			slots:: imixin assembleSlots.
+			accessors:: List new.
+			1 to: slots size
+				do: [:i |
+					| slot = slots at: i. |
+					accessors add: (internalKernel Method newGetterForSlot: slot name
+							at: i
+							accessModifier: slot accessModifier).
+					accessors add: (internalKernel Method newInitializerForSlot: slot name
+							at: i).
+					slot isMutable ifTrue: [
+							accessors add: (internalKernel Method newSetterForSlot: slot name
+									at: i
+									accessModifier: slot accessModifier)
+						]
 				].
+			accessors do: [:accessor | accessor mixin: mixin ].
+			cmethods:: List new.
+			imixin assembleMethods do: [:imethod <IntermediateMethod> |
+					| method |
+					imethod methodMixin: mixin.
+					method:: imethod compiledMethod.
+					(accessors anySatisfy: [:accessor | accessor selector = method selector ]) ifFalse: [
+							cmethods add: method
+						]
+				].
+			cmethods addAll: accessors.
 			^cmethods asArray
 		)
 		private noteUpdateOf: existingMixin <InstanceMixin | nil> to: newMixin <InstanceMixin> = (
@@ -499,29 +518,14 @@ class EurasiaMirrors usingPlatform: platform internalKernel: ik namespace: ns
 	((allInstVarNamesOf: newClass) inject: '' into: [:a :b | a, ' ', b])) out.
 	1 to: remapIndices size do: [:newIndex |
 		(newIndex printString, '<-', (remapIndices at: newIndex) printString) out]. *)
-			(allInstancesOf: oldClass) do: [:oldInstance |
-					
-					(* Avoid A -> D (see class comment). *)
-					(updateMixinsAndClasses includesKey: oldInstance) ifFalse: [
-							| newInstance = allocate: newClass. |
-							
-							(* Copy state from oldInstance to newInstance. *)
-							1 to: newSlotCount
-								do: [:newIndex |
-									| oldIndex value |
-									oldIndex:: remapIndices at: newIndex.
-									0 = oldIndex ifFalse: [
-											value:: slotOf: oldInstance at: oldIndex.
-											slotOf: newInstance at: newIndex put: value
-										]
-								].
-							updateInstances at: oldInstance put: newInstance
-						]
-				]
+			
+			(* Eurasia: the VM reshapes every instance in place (vm commit:'s layout maps). *)
+			layoutMaps add: {oldClass. newClass. remapIndices asArray. }
 		)
 		private setup = (
 			updateMixinsAndClasses:: IdentityMap new.
 			updateInstances:: IdentityMap new.
+			layoutMaps:: List new.
 			existingClasses:: IdentityMap new.
 			newExistingMixins:: IdentityMap new
 			(* Regular Map okay here. *)
@@ -3070,6 +3074,11 @@ c. If the slot is mutable, there will be a third method, which is an ordinary se
 		
 		halt
 	)
+	private commit: changeSet = (
+		(* Eurasia: a native (VmCommit). *)
+		
+		halt
+	)
 	public compiler = (
 		nil = compilerX ifTrue: [ constructCompiler ].
 		^compilerX
@@ -3294,7 +3303,9 @@ c. If the slot is mutable, there will be a third method, which is an ordinary se
 		^sorted
 	)
 	private subclassesOf: klass = (
-		^self slotOf: klass at: 8
+		(* Eurasia: a native (VmSubclassesOf); psoup keeps a weak set in the class. *)
+		
+		halt
 	)
 	private superclassOf: behavior = (
 		(* Eurasia: contract field 2. *)

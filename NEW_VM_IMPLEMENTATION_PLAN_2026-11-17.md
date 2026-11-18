@@ -222,6 +222,28 @@ then observable only through weak containers, which replay logs. Until that
 is settled, scheduling stays deterministic. A generational
 or incremental collector is an M8 question.
 
+**Progress (2026-11-17, later): M4 in part.** Images now run as psoup's do:
+genesis builds the platform (`EurasiaRuntime.ns`: psoup's public kernel,
+collections and actors modules over the kernel fork) and the actors module's
+message loop, which becomes the MessageLoop role; the VM delivers the
+arguments as the startup message, every turn ends with `finish:` naming the
+next timer, and the VM waits for it. Eventual sends compile to V5's
+instruction 239 (`messageLoop eventualSendTo:selector:arguments:`); a bug in
+the shared bytecode pipeline (`ClosureRewriter2>>messageNode:` in
+`primordialsoup/newspeak/NewspeakBytecodeCompilation.ns` dropped the
+eventual flag, harmless for V4, which lowers eventual sends earlier) had made
+every V5 eventual send an ordinary one. psoup's actors module is packaged
+unchanged: the packager strips its primitive pragmas and the natives table
+installs `classOf:`, `currentMonotonicNanos`, `finish:` and `exit:` on its
+methods by class name. Unlike the kernel's helpers, which go through the VM
+mirror, that gives two non-kernel classes natives by name; the packager is
+trusted, but this should become a capability passed to the module. An
+unhandled exception goes to the message loop (the application's handler of
+last resort, or a trace and exit), as in psoup; pausing the actor comes with
+the debugger (M6). `ActorsTesting` joins the differential tests: all 445
+tests agree, also under GC stress. Still to do for M4: ports, `spawn:` from a
+mixin with a heap per actor, and far references between VMs.
+
 **Decided 2026-11-17: genesis, then full snapshots.** psoup runs the program
 when it builds an image because it is *deploying an application*: it
 establishes dependencies by sending the imports to a manifest. Eurasia's

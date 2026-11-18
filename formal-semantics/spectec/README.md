@@ -28,6 +28,20 @@ per-receiver nested-class caches. It is **not yet the whole sequential
 language**: remaining expression forms, platform/exception boundaries,
 front-end derivation, and the no-method-home return boundary remain pending.
 
+Section 13, the optional VM kernel layer (`../kernel-semantics.tex`), is
+transcribed for native methods only: the native body form, the three native
+outcomes, the `nativeOf` restriction that keeps `Invoke-NonTail`/`Invoke-Tail`
+from allocating an activation for a native method, and rules `Native-Answer`,
+`Native-Tail` and `Native-Fail`. The native catalog is a parameter: the
+`NativeTransform` relation has no rules in the sources, and
+`tests/kernel-fixtures.spectec` supplies a three-entry test catalog. A native
+failure stays as the control term `NATIVEFAILURE`, like `CONSTRUCTIONERROR`,
+until the exception boundary is transcribed. The layer's freshness refinement,
+labels, host calls, callbacks and restore depend on the actor layer and remain
+pending. `statement` and `control` are now variant fragments (`/base`,
+`/kernel`), so the kernel module extends them without editing their base
+definitions.
+
 ## Reading the source
 
 Read these in order:
@@ -48,6 +62,8 @@ Read these in order:
    factory descriptors, layouts, initializer records, and simultaneous expansion.
 9. [08-class-machine.spectec](08-class-machine.spectec): class construction,
    initialization, slots, lazy getters, and nested-class caching.
+10. [09-kernel.spectec](09-kernel.spectec): native methods of the optional
+   VM kernel layer (section 13).
 
 `syntax` defines a domain; `var` declares a metavariable; `def $name` gives a
 function signature followed by its equations. A `relation` declares a

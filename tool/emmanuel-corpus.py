@@ -128,9 +128,10 @@ def report(results, work):
     print("\n".join(lines[:4]))
 
 
-def main():
-    work = Path(sys.argv[1]).resolve()
-    docs_dir = Path(sys.argv[2] if len(sys.argv) > 2 else Path.home() / "newspeak/dev/web/docs")
+def run(work, docs_dir):
+    """Convert every document under docs_dir in headless Chrome; answers the
+    results, and writes the report and sources into work."""
+    work = Path(work).resolve()
     (work / "sources").mkdir(parents=True, exist_ok=True)
     docs = []
     for z in sorted(docs_dir.glob("**/*.zip")):
@@ -149,7 +150,13 @@ def main():
                         str(work / "documents.json"), str(work / "results.json")], check=True)
     finally:
         chrome.terminate()
-    report(json.loads((work / "results.json").read_text())["results"], work)
+    results = json.loads((work / "results.json").read_text())["results"]
+    report(results, work)
+    return results
+
+
+def main():
+    run(sys.argv[1], Path(sys.argv[2] if len(sys.argv) > 2 else Path.home() / "newspeak/dev/web/docs"))
 
 
 if __name__ == "__main__":

@@ -97,7 +97,10 @@ The model is the formal semantics' (`actor-semantics.tex` eq.
   slot index for getter and setter), literals, bytecode, mixin, selector,
   access, source.
 - *Mixin*: name, methods (an Array), enclosing mixin, slot declarations
-  (names, in order; the VM derives instance layouts from them).
+  (names, in order; the VM derives instance layouts from them), and, for an
+  instance-side mixin, its paired class-side mixin (nil for a class-side
+  mixin; added 2026-11-17, so `applyMixin:superclass:enclosingObject:` can
+  build the metaclass).
 - *Class*: mixin, superclass, enclosing object, name; *metaclass*: its
   class.
 - *Message*: selector, arguments.
@@ -296,7 +299,7 @@ machine addresses. A JIT maps them (formal semantics `machinePoint`).
 | `vm programVersion` | new | reflective | inspect | SmallInteger | |
 | `vm nativeMethod: name selector: s` | new | reflective | primitive | a fresh, uninstalled native Method | `#wrongKind: 1` (no such native) |
 | `vm natives` | new | reflective | inspect | Array of (name, kernel version) pairs | |
-| `vm applyMixin: m classMixin: cm superclass: s enclosingObject: eo` | new | heap | — | a new class, applying `m` to `s`, and its metaclass, applying `cm`, in the caller's heap | `#wrongKind: 1/2/3` (Eurasia, 2026-11-17: the class-side mixin is an argument because the instance mixin's contract fields do not name it; the metaclass's superclass and class follow those of `s`'s metaclass. For review.) |
+| `vm applyMixin: m superclass: s enclosingObject: eo` | new | heap | — | a new class, applying the instance-side mixin `m` to `s`, and its metaclass, applying `m`'s class-side mixin (a contract field), in the caller's heap; the metaclass's superclass and class are those of `s`'s metaclass | `#wrongKind: 1/2` |
 
 **This keeps today's install shape.** The mirror library builds fresh
 methods, mixins and classes in Newspeak, validates them, and installs
@@ -480,7 +483,7 @@ above:
 New operations, not in psoup: `bootstrapRoles:`, `mixinApplicationsOf:`,
 `markUncontinuable:`, `commit:`, `programVersion`,
 `nativeMethod:selector:`, `natives`,
-`applyMixin:classMixin:superclass:enclosingObject:`, the six debugger operations of
+`applyMixin:superclass:enclosingObject:`, the six debugger operations of
 section 7, the Ephemeron natives,
 `abandonCallback:`, `randomBytes:`, `versions`, `heapStatistics`, `snapshot`,
 `checkpointPolicy:`, `checkpointNow`, `logPosition`, `hostGlobal`, the
@@ -515,7 +518,7 @@ and finalize roles.
    workers with shared memory. Actors on workers without shared memory would
    be separate cohorts, talking only through far references. Is that the
    intended model?
-2. **Who may create classes.** `applyMixin:classMixin:superclass:enclosingObject:` is
+2. **Who may create classes.** `applyMixin:superclass:enclosingObject:` is
    needed by ordinary code (every nested class and mixin application). It
    should be reachable only through the language's own protocol, installed on
    the runtime's class-creation method, not as a public native.

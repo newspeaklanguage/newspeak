@@ -158,9 +158,10 @@ Found while bringing it up, beyond the plan:
 accessor and every object literal creates a class at run time
 (`InstanceMixin>>applyTo:withEnclosingObject:`). In Eurasia the VM creates the
 class and its metaclass in one operation,
-`vm applyMixin: m classMixin: cm superclass: s enclosingObject: eo`; the
-instance mixin's library field, which the VM never reads, holds what the
-kernel needs and the contract lacks: `{class mixin. nested instance mixins.
+`vm applyMixin: m superclass: s enclosingObject: eo`, finding the metaclass's
+mixin in `m`'s class-side mixin, a contract field (decided 2026-11-17;
+snapshot format version 2). The instance mixin's library field, which the VM
+never reads, holds the rest the kernel needs: `{nested instance mixins.
 access modifier. factory selector}`, written by the genesis packager.
 Accessors need no per-application copies, since their slot indices are
 relative to their mixin. Further top-level modules are packaged as classes

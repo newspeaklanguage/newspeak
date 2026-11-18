@@ -77,7 +77,7 @@ def report(results, work):
     kinds = collections.Counter()
     kind_docs = collections.Counter()
     examples = {}
-    unclean, failures = [], []
+    unclean, failures, disagree = [], [], []
     stages = collections.defaultdict(list)
     for r in results:
         name, res = r["name"], r["result"]
@@ -91,6 +91,8 @@ def report(results, work):
             examples.setdefault(kind, detail)
         for kind in seen:
             kind_docs[kind] += 1
+        if res.get("tokensAgree") is False:
+            disagree.append(name)
         if not res["done"] or res["errors"] != 0:
             unclean.append((name, res["done"], res["errors"]))
         for stage in ("parse", "convert", "interpret"):
@@ -112,6 +114,8 @@ def report(results, work):
         ms = sorted(v[0] for v in values)
         worst = max(values)
         lines.append(f"| {stage} | {sum(ms):.0f} | {ms[len(ms) // 2]:.1f} | {worst[0]:.0f} ({worst[2]}, {worst[1]} chars) |")
+    lines += ["", f"The direct tokenizer disagrees with the reference on {len(disagree)} documents."]
+    lines += [f"- {n}" for n in disagree]
     if unclean:
         lines += ["", "## Documents that did not interpret cleanly", ""]
         lines += [f"- {n}: " + ("did not interpret" if not d else f"{e} errors") for n, d, e in unclean]

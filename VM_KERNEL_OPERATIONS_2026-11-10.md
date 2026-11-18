@@ -480,7 +480,11 @@ psoup (decided 2026-11-18; psoup's API, which `JSTesting` and Hopscotch use).
 range (2^53 for JavaScript) arrives as an Integer, any other as a Float; an
 Integer outside that range fails with `#outOfRange`. Every other host value
 arrives as an Alien; an Alien passed back arrives as its host object; an
-Expat arrives as its host function. Any other Newspeak object fails with
+Expat arrives as its host function. A closure passed to the host becomes a
+new expat implicitly, as in psoup (decided 2026-11-18); `vm expat:` makes one
+explicitly. A callback's result crosses back by the same rules; one that
+cannot cross fails the callback, as in psoup, so a callback whose value does
+not matter should answer nil. Any other Newspeak object fails with
 `#wrongKind`. In `#host: e`, `e` is a String: the host's description of the
 exception.
 
@@ -504,7 +508,29 @@ They reach the host through `Host::host_operation`, which the web host
 performs in JavaScript (`eurasia/web/eurasia.mjs`). An Alien's unknown
 messages go to the host object as psoup's do. The platform's `js`
 (`EurasiaRuntime.ns`) gives `global`, `undefined` and `localStorage`.
-Expats and callbacks are next.
+
+**Expats and callbacks on Eurasia (2026-11-18, M5 step 3):**
+- The VM keeps a table of expats (closure and owning actor), a GC root.
+  The host wraps each in a function that calls the export
+  `eurasia_callback`.
+- A host call is performed by the interpreter, which hands the host itself
+  (`HostCallbacks`) for callbacks during the call. Such a callback is a
+  sub-step of the turn: the closure runs above the boundary, the kernel's
+  `Closure>>dispatchCallbackWith:` (role 28), in a nested step loop, and
+  nothing else runs.
+- The boundary catches any exception and answers its description, which
+  the host caller gets as a host exception. A non-local return through it
+  raises `cannotReturn:`, because the VM's non-local return stops at role
+  28. Nesting is limited to 64.
+- A callback while the VM is idle starts a turn in the owning actor. Its
+  loop then drains the sends the callback queued, and the loader resumes
+  the VM.
+- An expat called from another actor's turn becomes a message to its owner,
+  and the host gets `undefined`.
+
+Not yet: `vm expat:` and `expat release` (expats are made implicitly and
+never released, as in psoup), and reporting a callback's exception with its
+live stack (M6).
 
 **Native FFI.** The same operations, with `call:withArguments:` on a C
 function alien plus a signature describing the C types, cover native hosts.

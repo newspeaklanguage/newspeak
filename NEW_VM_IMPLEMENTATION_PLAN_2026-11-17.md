@@ -271,7 +271,10 @@ Still open:
    section 10). **Done:** psoup's `JSTesting` passes on wasm (under Node
    and in a browser), except one test of psoup's internal error text
    (`eurasia/docs/EXPECTED_DIFFERENCES.md`).
-3. Expats and callbacks, with synchronous re-entry.
+3. Expats and callbacks, with synchronous re-entry. **Done:** the rules of
+   the contract design's section 4 (boundary, exceptions, non-local
+   return, nesting, sub-steps, idle callbacks), checked by
+   `EurasiaHostTesting.ns` on wasm, under Node and in a browser.
 4. CounterApp, on forks of psoup's JS and Hopscotch modules.
 
 Step 1 details:

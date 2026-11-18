@@ -1,0 +1,621 @@
+Newspeak3
+'Eurasia'
+class EurasiaPackager packageUsing: manifest = (
+	(* Builds a snapshot for Eurasia, the new Rust VM, from a Newspeak module. Runs on psoup (V4): it compiles the module with the V5 compiler (Newspeak2V5BytecodeCompilation) and writes the object graph in the format of the eurasia repository's docs/SNAPSHOT_FORMAT.md.
+
+Usage: EurasiaPackager <module.ns> <EntryClassName> <output.eus>
+
+M1b (first light) builds classes statically: the module's nested classes become the image's classes, each with the superclass named in its header (no superclass clause means Object, and Object itself has none). The module is instantiated without running its initializer: its slots are nil except the cached nested-class slots, which hold the classes built here, so nested-class accessors answer them. The entry object is an uninitialized instance of the named nested class. Methods listed in the natives table become native methods of the kernel catalog; their source bodies are ignored. How a module-structured kernel is instantiated on Eurasia (running initializers) is open.
+
+The native ids and role ids must match eurasia-core's natives.rs and roles.rs. *)
+	
+	|
+		NewspeakASTs = manifest NewspeakASTs.
+		NewspeakPredictiveParsing = manifest NewspeakPredictiveParsing.
+		Intermediates = manifest IntermediatesForPrimordialSoup.
+		NewspeakBytecodeCompilation = manifest NewspeakBytecodeCompilation mixinApply: manifest NewspeakCompilation.
+		Newspeak2V5BytecodeCompilation = manifest Newspeak2V5BytecodeCompilation mixinApply: NewspeakBytecodeCompilation.
+	|
+) (
+	class Image usingPlatform: platform = (
+		(* The object graph under construction. A node's sequence number is its creation order, which becomes its allocation sequence number in Eurasia. *)
+		
+		|
+			private List = platform collections List.
+			private Map = platform collections Map.
+			public nodes = List new.
+			private strings = Map new.
+			public nilNode
+			public trueNode
+			public falseNode
+		|
+		nilNode:: newNode: #regular space: #actor.
+		nilNode edges: List new.
+		trueNode:: newNode: #regular space: #actor.
+		trueNode edges: List new.
+		falseNode:: newNode: #regular space: #actor.
+		falseNode edges: List new.
+	) (
+		public class Node kind: k space: s seq: n = (
+			|
+				public kind = k.
+				public space = s.
+				public seq = n.
+				public number ::= 0.
+				public klass
+				public payload
+				public edges
+			|
+		) (
+			public isNode = (
+				^true
+			)
+		) : ()
+		public array: elements space: space = (
+			| node = newNode: #array space: space. |
+			node edges: elements.
+			^node
+		)
+		public newNode: kind space: space = (
+			| node = Node kind: kind space: space seq: nodes size. |
+			nodes add: node.
+			^node
+		)
+		public string: s = (
+			(* Strings are canonical: one node per distinct string, in the program space. *)
+			
+			^strings at: s
+				ifAbsent: [
+					| node = newNode: #string space: #program. |
+					node payload: s.
+					strings at: s put: node.
+					node
+				]
+		)
+	) : ()
+	class StubInternalKernel new = (
+		(* Satisfies IntermediatesForPrimordialSoup's imports: the packager generates slot accessors itself and never asks the intermediates for psoup Method objects. *)
+		
+	) (
+		public Method = (
+			^nil
+		)
+		public MethodMetadata = (
+			^nil
+		)
+	) : ()
+	class Writer new = (
+		(* The encoding of docs/SNAPSHOT_FORMAT.md section 1. *)
+		
+		|
+			public bytes ::= ByteArray new: 4096.
+			public size ::= 0.
+		|
+	) (
+		public byte: b = (
+			size = bytes size ifTrue: [
+					| grown = ByteArray new: bytes size * 2. |
+					1 to: size do: [:i | grown at: i put: (bytes at: i) ].
+					bytes:: grown
+				].
+			size:: size + 1.
+			bytes at: size put: b
+		)
+		public contents = (
+			| result = ByteArray new: size. |
+			1 to: size do: [:i | result at: i put: (bytes at: i) ].
+			^result
+		)
+		public u16: n = (
+			byte: n \\ 256.
+			byte: n // 256
+		)
+		public uv: n = (
+			| rest ::= n. |
+			[ rest >= 128 ] whileTrue: [
+					byte: rest \\ 128 + 128.
+					rest:: rest // 128
+				].
+			byte: rest
+		)
+		public value: v = (
+			(* SmallIntegers are zigzagged, then tagged with a 0 bit; references are node numbers tagged with a 1 bit. *)
+			
+			| zigzag |
+			v isKindOfInteger ifTrue: [
+					zigzag:: v >= 0 ifTrue: [ v * 2 ] ifFalse: [ v * -2 - 1 ].
+					^uv: zigzag * 2
+				].
+			^uv: v number * 2 + 1
+		)
+	) : ()
+	accessor: kind selector: selector access: access slot: index mixin: mixin image: image = (
+		| method |
+		method:: image newNode: #method space: #program.
+		method klass: image nilNode.
+		method payload: {kind. access. kind = #getter ifTrue: [ 0 ] ifFalse: [ 1 ]. 0. index. {}. }.
+		method edges: {image array: {} space: #program. mixin. image string: selector. image nilNode. image nilNode. }.
+		^method
+	)
+	arityOf: selector = (
+		| colons ::= 0. first |
+		first:: selector at: 1.
+		((first >= 97 and: [ first <= 122 ]) or: [ first >= 65 and: [ first <= 90 ] ]) ifFalse: [
+				^1
+			].
+		1 to: selector size
+			do: [:i | (selector at: i) = 58 ifTrue: [ colons:: colons + 1 ] ].
+		^colons
+	)
+	buildSnapshotFrom: source entry: entryName platform: platform = (
+		| List Map compiler module image nested classesByName mixins metaclassClass objectClass moduleClass moduleInstance entryClass roles commonSelectors vmMirrorInstance |
+		List:: platform collections List.
+		Map:: platform collections Map.
+		compiler:: (compilationUsingPlatform: platform) Compiler new.
+		module:: compiler compileClassSource: source within: nil.
+		image:: Image usingPlatform: platform.
+		nested:: module instanceSide nestedClasses.
+		classesByName:: Map new.
+		mixins:: Map new.
+		
+		(* Mixins first: instance side and class side, for the module and each nested class. *)
+		mixins at: module simpleName
+			put: {mixinFor: module instanceSide
+				name: module simpleName
+				enclosing: image nilNode
+				image: image
+				platform: platform. mixinFor: module classSide
+				name: module simpleName
+				enclosing: image nilNode
+				image: image
+				platform: platform. }.
+		nested do: [:icd |
+				mixins at: icd simpleName
+					put: {mixinFor: icd instanceSide
+						name: icd simpleName
+						enclosing: ((mixins at: module simpleName) at: 1)
+						image: image
+						platform: platform. mixinFor: icd classSide
+						name: icd simpleName
+						enclosing: ((mixins at: module simpleName) at: 2)
+						image: image
+						platform: platform. }
+			].
+		
+		(* Classes, superclasses before subclasses. *)
+		nested do: [:icd |
+				defineClass: icd
+					nested: nested
+					classes: classesByName
+					mixins: mixins
+					image: image
+					platform: platform
+			].
+		objectClass:: classesByName at: 'Object'.
+		metaclassClass:: classesByName at: 'Metaclass' ifAbsent: [ nil ].
+		classesByName values do: [:class |
+				nil = metaclassClass ifFalse: [ class klass klass: metaclassClass ]
+			].
+		moduleClass:: newClassNamed: module simpleName
+			mixins: (mixins at: module simpleName)
+			superclass: objectClass
+			image: image.
+		nil = metaclassClass ifFalse: [ moduleClass klass klass: metaclassClass ].
+		
+		(* The module instance: its own slots are nil; the cached nested-class slots hold the classes. *)
+		moduleInstance:: image newNode: #regular space: #actor.
+		moduleInstance klass: moduleClass.
+		moduleInstance edges: List new.
+		module instanceSide assembleSlots do: [:slot |
+				| value ::= image nilNode. |
+				nested do: [:icd |
+						slot name = (icd simpleName , '`slot') ifTrue: [
+								value:: classesByName at: icd simpleName
+							]
+					].
+				moduleInstance edges add: value
+			].
+		classesByName values do: [:class | class edges at: 3 put: moduleInstance ].
+		image nilNode klass: (classesByName at: 'UndefinedObject').
+		image trueNode klass: (classesByName at: 'True').
+		image falseNode klass: (classesByName at: 'False').
+		entryClass:: classesByName at: entryName.
+		vmMirrorInstance:: instanceOf: (classesByName at: 'VMMirror') image: image.
+		commonSelectors:: List new.
+		(commonSelectorsCheckedWith: compiler) do: [:selector |
+				commonSelectors add: (image string: selector).
+				commonSelectors add: (arityOf: selector)
+			].
+		roles:: List new.
+		roles add: {1. image nilNode. }.
+		roles add: {2. image trueNode. }.
+		roles add: {3. image falseNode. }.
+		roles add: {4. classesByName at: 'SmallInteger'. }.
+		roles add: {8. classesByName at: 'String'. }.
+		roles add: {10. classesByName at: 'Array'. }.
+		roles add: {18. image string: 'doesNotUnderstand:'. }.
+		roles add: {24. classesByName at: 'NativeFailure'. }.
+		roles add: {29. image array: commonSelectors space: #actor. }.
+		roles add: {30. classesByName at: 'Message'. }.
+		roles add: {31. vmMirrorInstance. }.
+		roles add: {32. instanceOf: entryClass image: image. }.
+		
+		(* Every role must be present (format section 7); those this module does not provide are nil. *)
+		1 to: 33
+			do: [:id |
+				(roles detect: [:pair | (pair at: 1) = id ] ifNone: [ nil ]) isNil ifTrue: [
+						roles add: {id. image nilNode. }
+					]
+			].
+		
+		(* Strings and arrays were created before their classes existed. *)
+		image nodes do: [:n |
+				n kind = #string ifTrue: [ n klass: (classesByName at: 'String') ].
+				n kind = #array ifTrue: [ n klass: (classesByName at: 'Array') ].
+				nil = n klass ifTrue: [ n klass: image nilNode ]
+			].
+		^serialize: image roles: roles
+	)
+	commonSelectorsCheckedWith: compiler = (
+		(* The V5 common-selector table (opcodes 176-207, in order), as in eurasia-core's bytecode.rs. It is checked against the compiler: one method sending each selector must compile to exactly the opcodes 176-207 in order, so a compiler whose table differs fails packaging instead of producing an image whose sends dispatch wrongly. *)
+		
+		| table source icd opcodes |
+		table:: {'+'. '-'. '*'. '//'. '\\'. '<<'. '>>'. '&'. '|'. '<'. '>'. '<='. '>='. '='. 'new'. 'new:'. 'at:'. 'at:put:'. 'size'. 'value'. 'value:'. 'value:value:'. 'name'. 'name:'. 'add:'. 'hash'. 'yourself'. ','. 'and:'. 'or:'. 'not'. 'basicNew'. }.
+		source:: 'Newspeak3 ''Eurasia'' class CommonSelectorCheck = ( ) ( check: x = ( '.
+		table do: [:selector | source:: source , (sendOf: selector to: 'x') , '. ' ].
+		source:: source , ') ) : ( )'.
+		icd:: compiler compileClassSource: source within: nil.
+		opcodes:: (icd instanceSide methods detect: [:m | m selector = 'check:' ]) bytes select: [:b |
+				b >= 176 and: [ b <= 207 ]
+			].
+		opcodes size = table size ifFalse: [
+				^Error signal: 'The compiler''s common-selector table differs from the packager''s'
+			].
+		1 to: table size
+			do: [:i |
+				(opcodes at: i) = (175 + i) ifFalse: [
+						^Error signal: 'The compiler''s common-selector table differs at ' , (table at: i)
+					]
+			].
+		^table
+	)
+	compilationUsingPlatform: platform = (
+		| asts parsing intermediates |
+		asts:: NewspeakASTs usingPlatform: platform.
+		parsing:: NewspeakPredictiveParsing usingPlatform: platform asts: asts.
+		intermediates:: Intermediates usingPlatform: platform
+			internalKernel: StubInternalKernel new.
+		^Newspeak2V5BytecodeCompilation usingPlatform: platform
+			asts: asts
+			newspeakParser: parsing
+			intermediates: intermediates
+	)
+	defineClass: icd nested: nested classes: classesByName mixins: mixins image: image platform: platform = (
+		| superName superclass |
+		(classesByName includesKey: icd simpleName) ifTrue: [
+				^classesByName at: icd simpleName
+			].
+		superName:: superclassNameOf: icd.
+		superclass:: image nilNode.
+		superName isEmpty ifTrue: [
+				icd simpleName = 'Object' ifFalse: [ superName:: 'Object' ]
+			].
+		superName isEmpty ifFalse: [
+				| superIcd |
+				nested do: [:each | each simpleName = superName ifTrue: [ superIcd:: each ] ].
+				nil = superIcd ifTrue: [
+						^Error signal: 'Superclass ' , superName , ' of ' , icd simpleName , ' is not a class of the module'
+					].
+				superclass:: defineClass: superIcd
+					nested: nested
+					classes: classesByName
+					mixins: mixins
+					image: image
+					platform: platform
+			].
+		^classesByName at: icd simpleName
+			put: (newClassNamed: icd simpleName
+				mixins: (mixins at: icd simpleName)
+				superclass: superclass
+				image: image)
+	)
+	instanceOf: class image: image = (
+		(* An uninitialized instance: one nil per slot of the class chain. *)
+		
+		| instance count ::= 0. c ::= class. |
+		[ c == image nilNode ] whileFalse: [
+				count:: count + (c edges at: 1) payload.
+				c:: c edges at: 2
+			].
+		instance:: image newNode: #regular space: #actor.
+		instance klass: class.
+		instance edges: ((1 to: count) collect: [:i | image nilNode ]).
+		^instance
+	)
+	isSpace: byte = (
+		^byte = 32 or: [ byte = 9 or: [ byte = 10 or: [ byte = 13 ] ] ]
+	)
+	literal: lit image: image = (
+		nil = lit ifTrue: [ ^image nilNode ].
+		true = lit ifTrue: [ ^image trueNode ].
+		false = lit ifTrue: [ ^image falseNode ].
+		lit isKindOfInteger ifTrue: [
+				(lit < -4611686018427387904 or: [ lit > 4611686018427387903 ]) ifTrue: [
+						^Error signal: 'LargeInteger literals are not supported yet'
+					].
+				^lit
+			].
+		lit isKindOfString ifTrue: [ ^image string: lit ].
+		lit isKindOfArray ifTrue: [
+				^image array: (lit collect: [:each | literal: each image: image ])
+					space: #program
+			].
+		^Error signal: 'Unsupported literal: ' , lit printString
+	)
+	public main: platform args: args = (
+		| source entryName output image bytes |
+		args size < 3 ifTrue: [
+				'Usage: EurasiaPackager <module.ns> <EntryClassName> <output.eus>' out.
+				^nil
+			].
+		source:: String withAll: (readFileAsBytes: (args at: 1)).
+		entryName:: args at: 2.
+		output:: args at: 3.
+		bytes:: buildSnapshotFrom: source entry: entryName platform: platform.
+		writeBytes: bytes toFileNamed: output.
+		('Wrote ' , bytes size printString , ' bytes to ' , output) out
+	)
+	methodFrom: m mixin: mixin className: className image: image platform: platform = (
+		| native method literals locals |
+		native:: nativeIdFor: className selector: m selector.
+		method:: image newNode: #method space: #program.
+		method klass: image nilNode.
+		literals:: platform collections List new.
+		native = 0 ifTrue: [
+				nil = m literals ifFalse: [
+						m literals do: [:lit | literals add: (literal: lit image: image) ]
+					].
+				locals:: m maxLocals - m argCount.
+				method payload: {#ordinary. m accessModifier. m argCount. locals. 0. m bytes. }
+			]
+			ifFalse: [
+				method payload: {#native. m accessModifier. m argCount. 0. native. {}. }
+			].
+		method edges: {image array: literals space: #program. mixin. image string: m selector. image nilNode. image nilNode. }.
+		^method
+	)
+	mixinFor: side name: name enclosing: enclosingMixin image: image platform: platform = (
+		(* A mixin node with its methods: compiled methods, nested-class accessors, the factory (class side) or initializers (instance side), and synthesized slot accessors whose slot index is relative to this mixin. *)
+		
+		| List mixin slots methods slotNames compiled declaration |
+		List:: platform collections List.
+		declaration:: side declaration.
+		side lazySlots isEmpty ifFalse: [
+				^Error signal: 'Lazy slots are not supported by the psoup parser used by the packager'
+			].
+		mixin:: image newNode: #mixin space: #program.
+		mixin klass: image nilNode.
+		slots:: side assembleSlots.
+		mixin payload: slots size.
+		compiled:: List new.
+		compiled addAll: side methods.
+		side isMeta ifTrue: [
+				nil = declaration factory ifFalse: [ compiled add: declaration factory ]
+			]
+			ifFalse: [
+				side nestedClasses do: [:n | compiled add: n accessor ].
+				nil = declaration initializers ifFalse: [
+						compiled addAll: declaration initializers
+					]
+			].
+		methods:: List new.
+		compiled do: [:m |
+				methods add: (methodFrom: m
+						mixin: mixin
+						className: (side isMeta ifTrue: [ name , ' class' ] ifFalse: [ name ])
+						image: image
+						platform: platform)
+			].
+		1 to: slots size
+			do: [:index |
+				| slot = slots at: index. hasSelector |
+				hasSelector:: [:s |
+					(compiled detect: [:m | m selector = s ] ifNone: [ nil ]) isNil not
+				].
+				(hasSelector value: slot name) ifFalse: [
+						methods add: (accessor: #getter
+								selector: slot name
+								access: slot accessModifier
+								slot: index - 1
+								mixin: mixin
+								image: image)
+					].
+				methods add: (accessor: #setter
+						selector: 'init`' , slot name , ':'
+						access: #private
+						slot: index - 1
+						mixin: mixin
+						image: image).
+				(slot isMutable and: [ (hasSelector value: slot name , ':') not ]) ifTrue: [
+						methods add: (accessor: #setter
+								selector: slot name , ':'
+								access: slot accessModifier
+								slot: index - 1
+								mixin: mixin
+								image: image)
+					]
+			].
+		slotNames:: List new.
+		slots do: [:slot | slotNames add: (image string: slot name) ].
+		mixin edges: {image string: name. image array: methods space: #program. enclosingMixin. image array: slotNames
+				space: #program. image nilNode. }.
+		^mixin
+	)
+	nativeIdFor: className selector: selector = (
+		(* The catalog ids of eurasia-core's natives.rs, kernel version 1. *)
+		
+		| table |
+		table:: {{'SmallInteger'. '+'. 1. }. {'SmallInteger'. '-'. 2. }. {'SmallInteger'. '*'. 3. }. {'SmallInteger'. '<'. 4. }. {'SmallInteger'. '>'. 5. }. {'SmallInteger'. '<='. 6. }. {'SmallInteger'. '>='. 7. }. {'SmallInteger'. '='. 8. }. {'SmallInteger'. 'asString'. 9. }. {'Object'. '=='. 10. }. {'Object'. 'class'. 11. }. {'Object'. 'identityHash'. 12. }. {'String'. ','. 13. }. {'String'. 'size'. 14. }. {'VMMirror'. 'print:'. 20. }. {'VMMirror'. 'exit:'. 21. }. }.
+		table do: [:entry |
+				((entry at: 1) = className and: [ (entry at: 2) = selector ]) ifTrue: [
+						^entry at: 3
+					]
+			].
+		^0
+	)
+	newClassNamed: name mixins: pair superclass: superclass image: image = (
+		| class metaclass |
+		metaclass:: image newNode: #metaclass space: #actor.
+		metaclass klass: image nilNode.
+		class:: image newNode: #class space: #actor.
+		class klass: metaclass.
+		class edges: {pair at: 1. superclass. image nilNode. image string: name. image nilNode. }.
+		metaclass edges: {pair at: 2. superclass == image nilNode ifTrue: [
+					image nilNode
+				]
+				ifFalse: [ superclass klass ]. image nilNode. class. image nilNode. }.
+		^class
+	)
+	readFileAsBytes: filename = (
+		(* :literalmessage: primitive: 130 *)
+		
+		halt
+	)
+	sendOf: selector to: receiver = (
+		(* Source for a send of selector to receiver, with receiver as every argument. *)
+		
+		| arity result start colon |
+		arity:: arityOf: selector.
+		arity = 0 ifTrue: [ ^receiver , ' ' , selector ].
+		(selector at: selector size) = 58 ifFalse: [
+				^receiver , ' ' , selector , ' ' , receiver
+			].
+		result:: receiver.
+		start:: 1.
+		[ start <= selector size ] whileTrue: [
+				colon:: selector indexOf: ':' startingAt: start.
+				result:: result , ' ' , (selector copyFrom: start to: colon) , ' ' , receiver.
+				start:: colon + 1
+			].
+		^result
+	)
+	serialize: image roles: roles = (
+		| w program actor number |
+		program:: image nodes select: [:n | n space = #program ].
+		actor:: image nodes select: [:n | n space = #actor ].
+		number:: 0.
+		program do: [:n |
+				number:: number + 1.
+				n number: number
+			].
+		actor do: [:n |
+				number:: number + 1.
+				n number: number
+			].
+		w:: Writer new.
+		w byte: 69;
+			byte: 85;
+			byte: 82;
+			byte: 65.
+		w u16: 1.
+		w u16: 1.
+		w u16: 1.
+		w byte: 64.
+		w byte: 0.
+		w uv: image nodes size.
+		w uv: number.
+		w uv: 3.
+		writeSection: program kind: 2 writer: w.
+		writeSection: actor kind: 3 writer: w.
+		w byte: 1.
+		w uv: 0.
+		w uv: 0.
+		w uv: roles size.
+		roles do: [:pair |
+				w uv: (pair at: 1).
+				w value: (pair at: 2)
+			].
+		^w contents
+	)
+	superclassNameOf: icd = (
+		(* The superclass named in a nested class header, 'class X new = Super new (' or 'class X new = (': the first word between = and (. An empty clause means the default superclass. *)
+		
+		| header start stop name space |
+		header:: icd headerSource.
+		start:: header indexOf: '=' startingAt: 1.
+		start = 0 ifTrue: [ ^'' ].
+		stop:: header indexOf: '(' startingAt: start.
+		stop = 0 ifTrue: [ ^'' ].
+		name:: trim: (header copyFrom: start + 1 to: stop - 1).
+		space:: name indexOf: ' ' startingAt: 1.
+		space = 0 ifTrue: [ ^name ].
+		^name copyFrom: 1 to: space - 1
+	)
+	trim: s = (
+		| first ::= 1. last ::= s size. |
+		[ first <= last and: [ isSpace: (s at: first) ] ] whileTrue: [
+				first:: first + 1
+			].
+		[ last >= first and: [ isSpace: (s at: last) ] ] whileTrue: [ last:: last - 1 ].
+		first > last ifTrue: [ ^'' ].
+		^s copyFrom: first to: last
+	)
+	writeBytes: bytes toFileNamed: filename = (
+		(* :literalmessage: primitive: 128 *)
+		
+		halt
+	)
+	writeMethodHeader: p writer: w = (
+		| kind access bytes |
+		kind:: p at: 1.
+		access:: p at: 2.
+		w byte: (#ordinary = kind ifTrue: [ 0 ]
+				ifFalse: [
+					#native = kind ifTrue: [ 1 ]
+						ifFalse: [ #getter = kind ifTrue: [ 2 ] ifFalse: [ 3 ] ]
+				]).
+		w byte: (#public = access ifTrue: [ 0 ]
+				ifFalse: [ #protected = access ifTrue: [ 1 ] ifFalse: [ 2 ] ]).
+		w uv: (p at: 3).
+		w uv: (p at: 4).
+		#native = kind ifTrue: [ w uv: (p at: 5) ].
+		(#getter = kind or: [ #setter = kind ]) ifTrue: [ w uv: (p at: 5) ].
+		bytes:: p at: 6.
+		w uv: bytes size.
+		bytes do: [:b | w byte: b ]
+	)
+	writeNode: n writer: w = (
+		| kinds |
+		kinds:: {#regular. 1. #string. 3. #array. 4. #method. 9. #mixin. 10. #class. 11. #metaclass. 12. }.
+		1 to: kinds size
+			by: 2
+			do: [:i | (kinds at: i) = n kind ifTrue: [ w byte: (kinds at: i + 1) ] ].
+		w byte: (n space = #program ifTrue: [ 1 ] ifFalse: [ 0 ]).
+		n kind = #regular ifTrue: [ ^w uv: n edges size ].
+		n kind = #array ifTrue: [ ^w uv: n edges size ].
+		n kind = #string ifTrue: [
+				w uv: n payload size.
+				1 to: n payload size do: [:i | w byte: (n payload at: i) ].
+				^self
+			].
+		n kind = #mixin ifTrue: [ ^w uv: n payload ].
+		n kind = #method ifTrue: [ ^writeMethodHeader: n payload writer: w ]
+		(* Classes and metaclasses have no node payload. *)
+		
+	)
+	writeSection: nodes kind: kind writer: w = (
+		| previous ::= nil. |
+		w byte: kind.
+		w uv: 0.
+		w uv: nodes size.
+		nodes do: [:n |
+				w uv: (nil = previous ifTrue: [ n seq ] ifFalse: [ n seq - previous ]).
+				previous:: n seq.
+				writeNode: n writer: w
+			].
+		nodes do: [:n |
+				w value: n klass.
+				nil = n edges ifFalse: [ n edges do: [:e | w value: e ] ]
+			]
+	)
+) : ()

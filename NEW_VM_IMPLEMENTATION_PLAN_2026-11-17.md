@@ -176,6 +176,17 @@ The kernel fork starts from `KernelForPrimordialSoup.ns` and changes:
 
 The packager is self-hosted (runs on the new VM) after M6.
 
+**Progress (2026-11-17):** M0 and M1 done. M1a: the Rust loader and
+interpreter core. M1b: `EurasiaPackager.ns` compiles `EurasiaFirstLight.ns`
+with the V5 compiler on psoup and writes a snapshot that Eurasia runs
+(`eurasia/scripts/first-light-from-source.sh`). Findings: accessor slot
+indices are relative to their mixin (the semantics' `(C, j)`), because
+methods are shared through mixins; psoup builds images by running the
+program, which cannot work for V5 on psoup, so the packager builds classes
+statically, and **how a module-structured kernel (nested classes, slot
+initializers, `packageUsing:`) is instantiated on Eurasia is an open design
+question** for M2.
+
 ## 7. Risks
 
 - **Kernel fork drift.** Two kernels evolve in parallel until psoup retires.

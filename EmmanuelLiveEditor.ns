@@ -23,7 +23,9 @@ The presenters mark their rendering with each block's path (data-steps)
 and each child's index (data-item); the editor maps the browser's selection
 to points through them, and points back to the selection. Typing, deleting,
 Enter, Shift-Enter (a newline), bold and italic (Cmd-B, Cmd-I), and pasting
-plain text are edits; anything else is ignored. An edit the edit layer
+plain text are edits; anything else is ignored. The editor keeps its key and input
+events to itself, so that an editable page around it (an Ampleforth
+document's) does not see them. An edit the edit layer
 refuses changes nothing. *)
 	
 	|
@@ -31,6 +33,7 @@ refuses changes nothing. *)
 		private Fragment = p hopscotch Fragment.
 		private domDocument = p js global at: #document.
 		private console = p js global at: #console.
+		private window = p js global.
 		private clock = p js global at: #performance.
 		private emmanuel = EmmanuelClass usingPlatform: p.
 		private parsing = ParsingClass usingPlatform: p
@@ -113,12 +116,28 @@ its anchor may lie in white space the view does not show. *)
 				to: 'white-space: pre-wrap; outline: none; padding: 4px; min-height: 2em;'.
 			root addEventListener: 'beforeinput'
 				action: [:event |
+					event stopPropagation.
 					[ handle: event ] on: Error
+						do: [:e | console log: 'Emmanuel editor: ' , e messageText printString ].
+					nil
+				].
+			{'keyup'. 'keypress'. 'input'. 'paste'. 'cut'. 'drop'. } do: [:type |
+					root addEventListener: type
+						action: [:event |
+							event stopPropagation.
+							nil
+						]
+				].
+			root appendChild: styleSheet.
+			root addEventListener: 'click'
+				action: [:event |
+					[ handleClick: event ] on: Error
 						do: [:e | console log: 'Emmanuel editor: ' , e messageText printString ].
 					nil
 				].
 			root addEventListener: 'keydown'
 				action: [:event |
+					event stopPropagation.
 					[ handleKey: event ] on: Error
 						do: [:e | console log: 'Emmanuel editor: ' , e messageText printString ].
 					nil
@@ -246,6 +265,16 @@ caret. *)
 			edit: [:a :b :collapsed |
 					editFor: type event: event caret: a caret: b collapsed: collapsed
 				]
+		)
+		handleClick: event = (
+			(* Cmd-click (Ctrl-click elsewhere) on a link opens its target. *)
+			
+			| anchor |
+			((event at: #metaKey) or: [ event at: #ctrlKey ]) ifFalse: [ ^self ].
+			anchor:: (event at: #target) closest: 'a[href]'.
+			anchor isNil ifTrue: [ ^self ].
+			event preventDefault.
+			window open: (anchor getAttribute: 'href') with: '_blank'
 		)
 		handleKey: event = (
 			(* Cmd-B and Cmd-I (Ctrl on other platforms) style the selection. *)
@@ -389,6 +418,17 @@ their index. *)
 				ifFalse: [ root replaceChild: visual with: content ].
 			content:: visual
 		)
+		public replaceSelectionWith: items after: afterItems = (
+			(* Replace the selection with items, the caret after them and before
+afterItems; for commands, such as a toolbar's. *)
+			
+			edit: [:a :b :collapsed |
+					edits replace: a to: b items: items after: afterItems
+				]
+		)
+		public selectedText = (
+			^domDocument getSelection toString
+		)
 		stepsOf: element = (
 			| s = dataAttribute: 'data-steps' of: element. |
 			s isNil ifTrue: [ ^{} ].
@@ -418,6 +458,21 @@ their index. *)
 				steps: nil
 				index: nil
 				chars: nil
+		)
+		public styleSelection: x = (
+			(* Style the selection: emphasis, strong, or code. *)
+			
+			edit: [:a :b :collapsed |
+					collapsed ifTrue: [ nil ] ifFalse: [ styleFrom: a to: b style: x ]
+				]
+		)
+		styleSheet = (
+			(* Empty blocks keep a height, so that the caret can be put in them. *)
+			
+			| s = domDocument createElement: 'style'. |
+			s at: #textContent
+				put: '[data-steps]:empty { min-height: 1.2em; } span[data-steps]:empty, em[data-steps]:empty, strong[data-steps]:empty, code[data-steps]:empty, a[data-steps]:empty { display: inline-block; min-width: 1px; }'.
+			^s
 		)
 		typing: text from: a to: b = (
 			^edits replace: a
@@ -458,6 +513,7 @@ interpreted, when the source does not), and the caret of the last edit. *)
 			public failed ::= false.
 			public caret
 			public timings ::= ''.
+			public changeHandler ::= nil.
 		|
 		interpret.
 	) (
@@ -493,6 +549,7 @@ was refused or changed another source. *)
 			(result isNil or: [ result isRefused ]) ifTrue: [ ^nil ].
 			result sourceName = 'doc' ifFalse: [ ^nil ].
 			reinterpret: result chars.
+			changeHandler isNil ifFalse: [ changeHandler value: sourceString ].
 			t2:: clock now.
 			timings:: 'edit ' , (t1 - t0) printString , ', interpret ' , (t2 - t1) printString.
 			result caret isNil ifTrue: [ ^caret ].
@@ -556,6 +613,16 @@ interpret. *)
 			^emmanuel stringOfCodePoints: source
 		)
 	) : ()
+	public codeItem: selector code: code = (
+		(* The item of a send of selector to an argument, the Newspeak code. *)
+		
+		^sendItem: selector
+			argument: (hosts HostExpr ast: nil
+				text: code
+				literals: {}
+				placeholder: false
+				span: (emmanuel Span from: 0 to: 0))
+	)
 	public editorOn: source = (
 		(* An editor of a source; computed arguments are an error. *)
 		
@@ -563,6 +630,19 @@ interpret. *)
 	)
 	public editorOn: source evaluator: ev = (
 		^EditorFragment session: (Session source: source evaluator: ev)
+	)
+	public markupItem: selector text: u = (
+		(* The item of a send of selector to a markup literal of the text u. *)
+		
+		| zero = emmanuel Span from: 0 to: 0. literal = emmanuel MarkupLiteral source: 'doc'
+			nodes: {emmanuel FinalNode contents: (emmanuel codePointsOf: u) span: zero. }
+			span: zero. |
+		^sendItem: selector
+			argument: (hosts HostExpr ast: nil
+				text: ''
+				literals: {literal. }
+				placeholder: true
+				span: zero)
 	)
 	public profile: source = (
 		(* The time, in milliseconds, of each stage of a full pass over a
@@ -600,5 +680,21 @@ interpretation, printing, and rendering. *)
 		t:: clock now.
 		(blocks TreeSubject onModel: done tree) presenter visual.
 		^out , ', render ' , (clock now - t) printString
+	)
+	sendItem: selector argument: e = (
+		^emmanuel Item text: nil
+			span: nil
+			statement: (emmanuel SendStatement comments: {}
+				selector: selector
+				arguments: {e. }
+				span: (emmanuel Span from: 0 to: 0))
+	)
+	public textItem: u = (
+		^emmanuel Item text: (emmanuel codePointsOf: u)
+			span: (emmanuel Span from: 0 to: 0)
+			statement: nil
+	)
+	public unaryItem: selector = (
+		^emmanuel Item text: nil span: nil statement: (blocks styleOpen: selector)
 	)
 ) : ()

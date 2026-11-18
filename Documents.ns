@@ -80,6 +80,7 @@ Copyright Gilad Bracha 2022-2025 *)
 	webIDE browsing addObjectViews: {DocumentPresenter. }
 		forKind: 'isKindOfDocument'.
 ) (
+	lazy public emmanuel = (* The EmmanuelDocuments module, for documents whose content is an Emmanuel source; made on first use from the Emmanuel modules in Root, which must be loaded by then; nil when they are not. *) emmanuelModule.
 	lazy public JSZip = retainedPlatform js global at: 'JSZip'.
 	lazy serverLoadsInFlight <Map[String, List]> = (* Document name -> the {ifSuccess. ifFailure. } pairs waiting on a load of it that has been started but has not installed yet. loadFromServerNamed:'s only other guard is `Root at: n`, which is not populated until the fetch, the unzip and the install have all completed; two overlapping loads of one document would otherwise each start a fetch. That used to be harmless, because the coordination key was the constant 'document:' , n and the second request simply joined the first's pending list. It is not harmless now: the host mints a per-request key (URL digest plus an ordinal), so a second request is a DIFFERENT resource as far as coordination is concerned, and under Croquet it elects a second initiator and fetches the bytes again. Deduplicating here is the right place regardless - it also stops us unzipping the same archive twice. *) Map new.
 	public class Document named: n <String> contents: s <String> = FragmentFactory new (
@@ -521,6 +522,11 @@ bothered writing code for mortals like you to use?</p>'
 			| cdm = mirrorFor: c. |
 			^(ide browsing MethodSubject onModel: (methodMirrorFor: n of: c)) presenter
 		)
+		public savesItsOwnFolder ^<Boolean> = (
+			(* Whether the document makes its own zip folder (createFolderWithAncestors:), as a document of another kind than HTML, an Emmanuel document, does. *)
+			
+			^false
+		)
 		public selfReferenceFragment ^<Fragment> = (
 			(* The recursive-self-embedding catch: shown when a document attempts to embed itself (an amplet naming AmpleforthTargetDocument, or an expression evaluating to the document - typically a method returning self by mistake). Sent by AmpleforthFragment>>recomputeAmplet: and by evaluateFragment: below. *)
 			
@@ -643,6 +649,11 @@ bothered writing code for mortals like you to use?</p>'
 			
 			^(DocumentViewerSubject onModel: (ide namespacing Root at: documentName)) presenter
 		)
+		public twoViewEditorSubject = (
+			(* The subject of the document's editor, the raw and live views. *)
+			
+			^TwoViewEditorSubject onModel: self
+		)
 		URL = (
 			^outer Documents URL
 		)
@@ -671,7 +682,7 @@ bothered writing code for mortals like you to use?</p>'
 		|
 	) (
 		definition ^<Fragment> = (
-			twoViewEditor:: (TwoViewEditorSubject onModel: subject document) presenter.
+			twoViewEditor:: subject document twoViewEditorSubject presenter.
 			
 			(* The live view subscribes itself to the document's contentsChanged
      duct — see TwoViewEditorPresenter>>definition. The subscription was
@@ -685,9 +696,11 @@ bothered writing code for mortals like you to use?</p>'
 					respondToDeployForWeb
 				]. }. #separator. {'Pretty Print Selection'. [
 					respondToPrettyPrintSelection
-				]. }. #separator. {'Inspect Document Object'. [ respondToInspectDocument ]. }. {'Inspect Presenter'. [
-					respondToInspectPresenter
-				]. }. #separator. {'Delete'. [ respondToDelete ]. }. }
+				]. }. {'Convert to Emmanuel'. [ respondToConvertToEmmanuel ]. }. #separator. {'Inspect Document Object'. [
+					respondToInspectDocument
+				]. }. {'Inspect Presenter'. [ respondToInspectPresenter ]. }. #separator. {'Delete'. [
+					respondToDelete
+				]. }. }
 		)
 		helpText ^<AmpleforthFragment> = (
 			| mapping = Map new. |
@@ -727,6 +740,15 @@ bothered writing code for mortals like you to use?</p>'
 		)
 		respondToCenter = (
 			twoViewEditor respondToCenter
+		)
+		respondToConvertToEmmanuel = (
+			(* Make an Emmanuel document from this one, and show it. *)
+			
+			| emmanuel = ide documents emmanuel. |
+			emmanuel isNil ifTrue: [
+					^retainedPlatform js global alert: 'Load the Emmanuel modules first.'
+				].
+			enterSubject: (DocumentSubject onModel: (emmanuel convert: subject document))
 		)
 		respondToDelete = (
 			updateGUI: [
@@ -967,6 +989,16 @@ bothered writing code for mortals like you to use?</p>'
 			^createFolderWithAncestors: ancestors
 		)
 		public createFolderWithAncestors: ancestors <Set[String]> ^<Folder> = (
+			(* In-memory zip folder for this document: a document of another kind,
+     such as an Emmanuel document, makes its own; an HTML document's is
+     made here. *)
+			
+			document savesItsOwnFolder ifTrue: [
+					^document createFolderWithAncestors: ancestors
+				].
+			^createHTMLFolderWithAncestors: ancestors
+		)
+		createHTMLFolderWithAncestors: ancestors <Set[String]> ^<Folder> = (
 			(* In-memory zip folder for this document. Embeds classes and the documents
      this one EAGERLY transcludes (recursively); lazy transclusions and nav links
      are NOT embedded (they load / link at runtime). `ancestors` is the chain of
@@ -2630,7 +2662,14 @@ These maps are stored here so that they can be passed to newly created Amplefort
 	createDocumentSubclassNamed: n <Symbol> body: b <String> ^<Class>
 	(* :exemplar: createDocumentSubclassNamed: #ADoc body: '()()' *)
 	 = (
-		| src <String> = 'public class ' , n , ' contents: c <String> = Document named: #' , n , ' contents: c ' , b. mb <MixinBuilder> = documentHolderMixinBuilder. |
+		^createDocumentSubclassNamed: n body: b superclass: 'Document'
+	)
+	public createDocumentSubclassNamed: n <Symbol> body: b <String> superclass: s <String> ^<Class> = (
+		(* The class of a document named n, with the class body b, whose superclass
+   is the expression s in the scope of the document holder: Document for an
+   HTML document, another for a document of another kind. *)
+		
+		| src <String> = 'public class ' , n , ' contents: c <String> = ' , s , ' named: #' , n , ' contents: c ' , b. mb <MixinBuilder> = documentHolderMixinBuilder. |
 		mb nestedClasses addFromSource: src.
 		mb declaration install.
 		^((ObjectMirror reflecting: ide documentHolder) evaluate: n) result reflectee
@@ -2768,6 +2807,20 @@ These maps are stored here so that they can be passed to newly created Amplefort
 	public documentHolderMixinBuilder ^<MixinBuilder> = (
 		^(ObjectMirror reflecting: ide documentHolder) getClass mixin asBuilder
 	)
+	emmanuelModule = (
+		| at = [:k | Root at: k ifAbsent: [ ^nil ] ]. |
+		^(at value: #EmmanuelDocuments) usingPlatform: retainedPlatform
+			ide: ide
+			emmanuel: (at value: #Emmanuel)
+			newspeakHost: (at value: #EmmanuelNewspeakHost)
+			blocks: (at value: #EmmanuelBlocks)
+			edit: (at value: #EmmanuelEdit)
+			incremental: (at value: #EmmanuelIncremental)
+			parsing: (at value: #NewspeakPredictiveParsing)
+			asts: (at value: #NewspeakASTs)
+			liveEditor: (at value: #EmmanuelLiveEditor)
+			fromHTML: (at value: #EmmanuelFromHTML)
+	)
 	public freshDocumentFromDOM: dom <Alien[Node]> ^<Document> = (
 		| amplets = dom getElementsByClassName: #ampleforth. doc <Document> |
 		
@@ -2865,6 +2918,13 @@ These maps are stored here so that they can be passed to newly created Amplefort
 		| imageFolder <JSZip> = jsz folder: n , '/images'. videoFolder <JSZip> = jsz folder: n , '/video'. audioFolder <JSZip> = jsz folder: n , '/audio'. classFolder <JSZip> = jsz folder: n , '/classes'. documentFolder <JSZip> = jsz folder: n , '/documents'. contents <JSZip> = jsz folder: n , '/contents'. main <JSZipObject> = 
 		(* get main document *)
 		jsz file: n , '/' , n , '.html'. mediaRegistry <Map[String, Blob]> = Map new. doc <Document> |
+		(main isNil and: [ (jsz file: n , '/' , n , '.ems') isNil not ]) ifTrue: [
+				^loadEmmanuelDocument: jsz
+					named: n
+					into: namespace
+					ifSuccess: successBlock
+					ifFailure: failureBlock
+			].
 		loadClasses: classFolder
 			into: namespace
 			ifSuccess: [
@@ -3003,6 +3063,70 @@ These maps are stored here so that they can be passed to newly created Amplefort
 		fresh maxAmpletCount: count.
 		namespace model at: n put: fresh.
 		^fresh
+	)
+	loadEmmanuelDocument: jsz <JSZip> named: n <String> into: namespace <NamespaceSubject> ifSuccess: successBlock <[]> ifFailure: failureBlock <[:String | Object]> = (
+		(* Load a document whose main file is NAME/NAME.ems, an Emmanuel source
+     (EmmanuelDocuments): its classes and transcluded documents as for an
+     HTML document, its media into its registry, its source, and its class
+     body from NAME/NAME.class. *)
+		
+		| source <JSZipObject> = jsz file: n , '/' , n , '.ems'. classFile <JSZipObject> = jsz file: n , '/' , n , '.class'. registry <Map[String, Blob]> = Map new. maps = {mediaMapFor: (jsz folder: n , '/images')
+			withinFolderNamed: n , '/images/'. mediaMapFor: (jsz folder: n , '/video')
+			withinFolderNamed: n , '/video/'. mediaMapFor: (jsz folder: n , '/audio')
+			withinFolderNamed: n , '/audio/'. }. names = List new. promises = List new. all <JSArray> |
+		emmanuel isNil ifTrue: [
+				^failureBlock value: 'Cannot load ' , n , ': it is an Emmanuel document, and the Emmanuel modules are not loaded'
+			].
+		maps do: [:map |
+				map keysAndValuesDo: [:k :v |
+						names add: k.
+						promises add: v
+					]
+			].
+		promises add: (source async: #string).
+		classFile isNil ifFalse: [ promises add: (classFile async: #string) ].
+		all:: JSArray new: promises size.
+		0 to: promises size - 1 do: [:i | all at: i put: (promises at: i + 1) ].
+		loadClasses: (jsz folder: n , '/classes')
+			into: namespace
+			ifSuccess: [
+				loadTranscluded: (jsz folder: n , '/documents')
+					into: namespace
+					ifSuccess: [
+						(JSPromise all: all) then: [:results |
+								| doc |
+								[
+									1 to: names size
+										do: [:i | registry at: (names at: i) put: (results at: i - 1) ].
+									doc:: emmanuel documentNamed: n asSymbol
+										source: (results at: names size)
+										classBody: (classFile isNil ifTrue: [ '()()' ]
+											ifFalse: [ results at: names size + 1 ]).
+									registry keysAndValuesDo: [:k :v | doc mediaRegistry at: k put: v ].
+									namespace model at: n put: doc.
+									doc loadContentsUsingFolder: (jsz folder: n , '/contents')
+										ifSuccess: successBlock
+										ifFail: failureBlock
+								] on: Error
+									do: [:e |
+										failureBlock value: 'Error making Emmanuel document ' , n , ': ' , e messageText printString
+									].
+								nil
+							]
+							onError: [:ex |
+								failureBlock value: 'Error loading Emmanuel document: ' , ex printString.
+								nil
+							].
+						nil
+					]
+					ifFailure: [:ex |
+						failureBlock value: 'Error loading transcluded documents folder: ' , ex printString
+					].
+				nil
+			]
+			ifFailure: [:ex |
+				failureBlock value: 'Error loading class folder: ' , ex printString
+			]
 	)
 	public loadFromServerNamed: n <String> ifSuccess: sb <[:Document | Object]> ifFailure: fb <[:String | Object]> = (
 		(* Load the document named n into the Root namespace and report the live

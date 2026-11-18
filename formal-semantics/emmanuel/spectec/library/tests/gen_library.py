@@ -479,6 +479,12 @@ key('ex-insert-table', 'LibInsert', EC, '%s, "table"' % ex(GAPP(path(), 1)),
 key('ex-backspace', 'LibBackspace', O2, '%s, 1' % path(), REPLACE(GAPP(path(INTO(0)), 1), GAPP(path(INTO(1)), 0)))
 key('ex-enter', 'LibEnter', E1, ex(P_HI), SPLIT(P_HI, 1))
 key('ex-enter-emph', 'LibEnter', E1, ex(INP(path(INTO(0), INTO(1)), 0, 1)), SPLIT(INP(path(INTO(0), INTO(1)), 0, 1), 1))
+# In a list item, Enter splits the item, making a new one.
+EL = "[\\list. item. paragraph\\]ab[\\endParagraph. endItem. endList\\]"
+P_ITEM = INP(path(INTO(0), INTO(0), INTO(0)), 0, 1)
+OL = "[\\list. item. paragraph\\]a[\\endParagraph. endItem. item. paragraph\\]b[\\endParagraph. endItem. endList\\]"
+key('ex-enter-item', 'LibEnter', EL, ex(P_ITEM), SPLIT(P_ITEM, 2))
+edit('edit-enter-item', EL, SPLIT(P_ITEM, 2), edited(mark(OL, 'b[\\endParagraph')), out=OL)
 
 anchor('ex-anchor-before-emph', E1, GAPP(path(INTO(0)), 1), 'TXT 1 3')
 # Enter inside the emphasis splits the paragraph, closing the emphasis.

@@ -240,4 +240,4 @@ Every other source equation and named rule remains explicitly `pending`.
 | [eq:edit-typing](../emmanuel-semantics.tex#L2903) | pending | — |
 | [eq:lib-fields](../emmanuel-semantics.tex#L2934) | converted | [$selOf(stmt)](library/07-library.spectec#L341), [$joins(STATE](library/07-library.spectec#L375), [$styleOpen("emphasis")](library/07-library.spectec#L380) |
 | [eq:lib-templates](../emmanuel-semantics.tex#L2957) | converted | [$closerOf(text)](library/07-library.spectec#L391), [$templateAfter(text)](library/07-library.spectec#L416), [$insertAt(markup,](library/07-library.spectec#L422) |
-| [eq:lib-enter](../emmanuel-semantics.tex#L2978) | converted | [$enter(markup,](library/07-library.spectec#L428) |
+| [eq:lib-enter](../emmanuel-semantics.tex#L2979) | converted | [$enter(markup,](library/07-library.spectec#L429) |

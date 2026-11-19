@@ -1,0 +1,200 @@
+# Eurasia performance: where it stands, and options
+
+**Date:** 2026-11-19
+**Status:** Measured; Tier 1 done (section 5), uncommitted.
+
+## 1. How slow
+
+BenchmarkRunner's eleven benchmarks, measured as `BenchmarkRunner>>report`
+does: a 500 ms warm-up, then the median of three 1000 ms windows. Scores are
+runs per second (higher is better). Same machine, same session.
+
+| Benchmark | psoup native | Eurasia native | slower by | Eurasia wasm (Node) |
+|---|---:|---:|---:|---:|
+| ClosureDefFibonacci | 50.7 | 3.2 | 16x | 3.2 |
+| ClosureFibonacci | 89.3 | 3.5 | 26x | 3.8 |
+| DeltaBlue | 187.2 | 6.8 | 28x | 5.8 |
+| MethodFibonacci | 89.3 | 4.3 | 21x | 4.3 |
+| NLRImmediate | 1157.0 | 86.9 | 13x | 79.6 |
+| NLRLoop | 238.5 | 14.4 | 17x | 13.0 |
+| ParserCombinators | 21.5 | 0.7 | 31x | 0.6 |
+| Richards | 198.2 | 7.8 | 25x | 5.4 |
+| SlotRead | 92.1 | 3.8 | 24x | 3.2 |
+| SlotWrite | 53.5 | 3.3 | 16x | 2.7 |
+| Splay | 274.7 | 27.3 | 10x | 21.9 |
+
+- **Eurasia native is 10x to 31x slower than psoup native**, about 20x
+  typically. Splay, which mostly allocates, suffers least; send-heavy code
+  (ParserCombinators, DeltaBlue, Richards, the fibs) most.
+- **Eurasia's wasm build is about as fast as its native one** (0.7x to 1.1x),
+  so the browser is not the problem: the interpreter is.
+- Against psoup's wasm build in Chrome (July baseline,
+  `BENCHMARK_BASELINE_2026-07-16.md`, shorter windows): Eurasia's wasm is
+  roughly 9x to 24x slower (Richards 5.4 against 130, DeltaBlue 5.8 against
+  95). NS2JS in Chrome is far ahead of both.
+
+How it was run: `EurasiaBenchmarkApp.ns` (an entry like
+`EurasiaKernelSmokeTest`, packaging psoup's Kernel, collections and the
+eleven benchmark modules with Eurasia's Actors and Runtime), packaged with
+`target/kerneltests/EurasiaPackager.vfuel`, genesis with
+`target/release/eurasia genesis.eus base.eus`, then
+`target/release/eurasia base.eus [names]`, and
+`node web/run-node.mjs eurasia_web.wasm base.eus`. psoup:
+`out/ReleaseX64/primordialsoup out/snapshots/BenchmarkRunner.vfuel`.
+`eurasia/scripts/benchmarks.sh` now does all of this (`PSOUP=1` adds
+psoup's run).
+
+## 2. Where the time goes
+
+macOS `sample`, 6 s of Richards and DeltaBlue on native Eurasia, by the
+function at the top of the stack:
+
+| Share | Where | Why |
+|---:|---|---|
+| ~30% | `Vm::method_at`, plus `memcmp` (~5%) | Every send searches each class's method array linearly, comparing the selector's bytes with each method's. There is no method cache. |
+| ~20% | drop glue of `VmError` | `ok_or(VmError::Malformed(..))` builds an error value on every call, and the loop in `method_at` does it once per method compared; dropping it is not free because other `VmError` variants own `String`s and `Vec`s. |
+| ~16% | malloc and free | `selector_bytes` copies the selector into a new `Vec` on every send; every object is an enum whose body is its own `Vec` (`Body::Regular(Vec<Value>)` and so on), so each allocation is two mallocs; activations, closures and failures allocate. |
+| ~6% | `step` | Each instruction looks the method up in the heap again to fetch its bytecode. |
+| ~5% | `find_application_of`, `slot_index`, `instance_slot_count` | Every slot read or write walks the receiver's class chain to find the mixin's application, then walks it again to count the slots above it. |
+| rest | sends, activation, natives | `3 + 4` is an ordinary send: the common-selector opcodes (176-207) have no fast path for SmallIntegers, so arithmetic and comparisons go through lookup and a native activation. |
+
+Release-build settings are not the issue: LTO, one codegen unit and
+`panic = "abort"` gained 5% to 9% (Richards 7.7 to 8.0, SlotRead 3.9 to
+4.1, MethodFibonacci 4.4 to 4.8).
+
+## 3. Options
+
+In order of payoff for effort. The first group is local to
+`interpreter.rs` and changes no format, bytecode or semantics; each must
+keep the replay tests' outputs identical (they are deterministic, and none
+of these change what a program observes).
+
+### Tier 1: remove the obvious waste (days)
+
+1. **A global lookup cache** keyed by (receiver class, selector, send kind
+   and, for lexical sends, the sending mixin), holding the method found.
+   Flushed when a class or mixin changes (`commit`, mixin application,
+   reflection natives that install methods), and on restore. This removes
+   the linear search and most of the selector copying. Psoup's interpreter
+   has the same structure, so it also shows what to flush on.
+2. **Compare selectors by identity**, if the packager and the compilers
+   intern them (psoup's symbols are canonical); fall back to bytes
+   otherwise. With 1, this matters only on a miss.
+3. **Construct errors lazily**: `ok_or_else` instead of `ok_or` on hot
+   paths, or a small `Copy` error code inside the interpreter with the
+   rich `VmError` built at the boundary. About a fifth of the time today.
+4. **Cache slot offsets**: the offset of a mixin's slots in a class is
+   fixed until the class changes, so keep it in the class (or in the lookup
+   cache entry, beside the getter or setter it was found for).
+5. **SmallInteger fast paths** for the arithmetic and comparison common
+   selectors (`+ - * // \\ < > <= >= = & | << >>`) when both operands are
+   SmallIntegers and the result fits, as psoup does; overflow and anything
+   else take the ordinary send.
+6. **Keep the current method's bytecode in the frame** (or a raw slice
+   valid until the next allocation or collection), so `step` does not look
+   the method up per instruction.
+7. **Release profile**: `lto = "fat"`, `codegen-units = 1`,
+   `panic = "abort"` for native and wasm: 5% to 9%, for one line each.
+
+Expected together: something like 5x to 10x on send-heavy code, which
+would put Eurasia within a few times of psoup. That is an estimate from the
+profile, to be checked benchmark by benchmark.
+
+### Tier 2: the object model (weeks)
+
+8. **Objects in one arena** instead of `Vec<Object>` with a `Vec` per body:
+   a header and the slots inline, so an allocation is a bump, a slot read is
+   one indirection, and the collector copies contiguous memory. This is
+   what Splay and allocation-heavy code (and the GC) need; it touches the
+   heap, the collector, the snapshot reader and writer, and every
+   `Body` match.
+9. **Contexts without heap objects** for ordinary activations (already
+   mostly so: frames are Rust structs; activations are made only on
+   demand), and closures that do not copy into a fresh `Vec`.
+
+### Tier 3: beyond an interpreter (months)
+
+10. **Inline caches** per send site (monomorphic, then polymorphic), once
+    the global cache shows its hit rate.
+11. **A template or baseline compiler**: native code for each method, or,
+    in the browser, generated wasm per method or per hot method. This is
+    where psoup is not, and where NS2JS gets its 10x-100x; for Eurasia it
+    must coexist with replay (the compiled code must make the same host
+    calls in the same order) and with checkpoints taken at safepoints.
+
+## 4. Recommendation
+
+Do Tier 1, measuring after each item with the harness above, and stop to
+reassess when it is done. It is low risk (no format or semantic change,
+and replay checks determinism), and the profile says most of the time is
+there.
+
+## 5. Tier 1: what was done, and the result
+
+Native, same machine and measuring as section 1, runs per second:
+
+| Benchmark | before | after | gain | psoup | now slower by |
+|---|---:|---:|---:|---:|---:|
+| ClosureDefFibonacci | 3.2 | 13.9 | 4.3x | 50.7 | 3.6x |
+| ClosureFibonacci | 3.5 | 17.6 | 5.0x | 89.3 | 5.1x |
+| DeltaBlue | 6.8 | 60.2 | 8.9x | 187.2 | 3.1x |
+| MethodFibonacci | 4.3 | 28.8 | 6.7x | 89.3 | 3.1x |
+| NLRImmediate | 86.9 | 343.3 | 4.0x | 1157.0 | 3.4x |
+| NLRLoop | 14.4 | 70.2 | 4.9x | 238.5 | 3.4x |
+| ParserCombinators | 0.7 | 4.5 | 6.4x | 21.5 | 4.8x |
+| Richards | 7.8 | 56.3 | 7.2x | 198.2 | 3.5x |
+| SlotRead | 3.8 | 26.8 | 7.1x | 92.1 | 3.4x |
+| SlotWrite | 3.3 | 21.3 | 6.5x | 53.5 | 2.5x |
+| Splay | 27.3 | 103.5 | 3.8x | 274.7 | 2.7x |
+
+From about 20x slower than psoup to about 3.5x (2.5x to 5x).
+
+The wasm build (Node, run while the replay tests were also running) gained
+as much: Richards 5.4 to 36.3, DeltaBlue 5.8 to 36.8, MethodFibonacci 4.3
+to 19.1, ParserCombinators 0.6 to 2.8, Splay 21.9 to 67.3. Against psoup's
+wasm build in Chrome (the July baseline: Richards 130, DeltaBlue 95), that
+is about 3x slower, down from about 20x.
+
+What changed, all in `eurasia-core` and none of it in a format, the
+bytecode or what a program observes:
+
+- **A global lookup cache** (`Vm::send`): direct-mapped, 4096 entries, keyed
+  by the receiver's class, the selector, the rule (ordinary, self, super,
+  implicit receiver, outer at a depth) and, for all but ordinary sends, the
+  sending method's mixin. An entry holds the method, where its receiver comes
+  from (present, the frame's, or a fixed enclosing object), and an
+  accessor's absolute slot index, so slot reads and writes no longer walk
+  the class chain (Tier 1 items 1 and 4; with the cache, comparing selectors
+  by identity, item 2, matters only on a miss and was not needed). Only
+  sends that find a method are cached; a #doesNotUnderstand: takes the full
+  lookup. Cleared after a collection (objects move), a commit (identities
+  are forwarded), a write to a method or mixin (`store_slot`), and
+  `Method>>header:`. Like psoup's, it is not cleared when an element of a
+  mixin's method array is written: that array is not frozen, and a program
+  that changes it in place on a mixin in use would see a stale method, as
+  on psoup (the mirror builders make new arrays and commit them). Gain: 2x to 6x on its own.
+- **SmallInteger fast paths** for common selectors 0 to 13 (`+ - * // \\
+  << >> & | < > <= >= =`): computed in place when both operands are
+  SmallIntegers and the native would answer; overflow, a zero divisor, a
+  shift out of range (and, conservatively, `>>` of a negative) take the
+  send. Each fast path is used only after checking, through the lookup, that
+  SmallInteger's method for that selector is the expected native, so an
+  image that redefines one keeps its definition. Gain: up to 3x more on
+  arithmetic (MethodFibonacci 9.9 to 28).
+- **Lazy errors**: `ok_or_else` on the interpreter's paths, and the
+  indirect-local instructions no longer build an error (with the method's
+  selector as a `String`) on every execution.
+- **Fewer allocations per send**: a native's arguments are not copied unless
+  it fails or needs a frame; inserting an absent receiver no longer calls
+  memmove.
+- **Bytecode in the frame**: `Method.bytecode` is an `Rc<[u8]>`, and a frame
+  keeps its method's, so an instruction fetch does not look the method up
+  (a few percent). A frame keeps the code it began with if `Method>>bytecode:`
+  later changes an unfrozen method's.
+- **Release profile**: fat LTO, one codegen unit, `panic = "abort"`.
+
+What the profile shows now: the instruction loop itself, then malloc and
+free (an object's body is its own `Vec`, closures copy their captured values
+into one, activations are allocated for closures' defining frames), then the
+send path. The next steps are Tier 2's object model and Tier 3's inline
+caches; closures (ClosureFibonacci, 5x) gain most from the first.

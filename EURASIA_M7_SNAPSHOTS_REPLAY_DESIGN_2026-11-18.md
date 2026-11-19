@@ -217,6 +217,20 @@ Done since (2026-11-18, later):
   after the oldest (`--keep-checkpoints K`; in the browser `keep=k`,
   default 2). Positions and checkpoint numbers stay absolute. Log format 2
   (format 1 still reads).
+- **Saving a running image.** `actors saveImage: name` (native 179) asks
+  for a checkpoint at the next safepoint, which the VM hands to the host
+  (`Host::save_image`) even when nothing is recorded; the restore handler
+  is then sent `imageSaved`. The promise it answers is fulfilled with
+  `#saved` there, and with `#restored` in an image restored from it (the
+  pending save is in the image; the notice is queued after the image is
+  taken). The program learns only that the image was handed over, so the
+  outcome is not an input and logs are unchanged; a recorder passes the
+  image on, a replay saves nothing. The command line writes the file
+  `name`; the web page keeps it in the origin private file system and
+  offers saved images, or a fresh IDE, when it loads. `actors
+  savesImages` is false on psoup and JS, where `saveImage:` answers a
+  broken promise. The IDE's Home page menu has Save Image.
+  EurasiaSaveImageProbe checks both outcomes (replay-tests.sh, step 5).
 
 Not done:
 - **Recording a run restored from a checkpoint** is refused. Its replay

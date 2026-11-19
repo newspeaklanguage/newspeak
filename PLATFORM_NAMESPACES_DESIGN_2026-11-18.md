@@ -1,7 +1,7 @@
 # Platform modules: one set of names, one namespace per platform
 
 **Date:** 2026-11-18
-**Status:** Accepted 2026-11-18 as recommended. Steps 1–3 committed; step 4 done, uncommitted (section 7).
+**Status:** Accepted 2026-11-18 as recommended. Steps 1–4 committed 2026-11-18 (section 7).
 
 ## 1. The problem
 

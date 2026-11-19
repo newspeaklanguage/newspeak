@@ -116,12 +116,12 @@ Further documentation of subjects and decorators will be added in the future. *)
    instantiated as part of the serialization process, before load time.
    Hence JS objects are not yet available. *)
 		private js = p js.
+		private liveSnapshots <Boolean> = p supportsLiveSnapshots.
 		
 		(* Module variables (non-JS) *)
 		currentHopscotchWindow <HopscotchShell>
 		windowList <List[HopscotchShell]> = List new.
 		uiGeneration <Number> ::= 0.
-		visualEpoch <Number> ::= 0.
 		private deferredContentQueue = List new.
 		
 		(* should be lazy *)
@@ -1460,6 +1460,9 @@ The picker is hidden while a request is in flight, to avoid switching in the mid
 			public beforeSelectionChangeHandler <CallBackWrapper>
 			lastChangeWasSynthetic <Boolean> ::= false.
 			public readOnly <Boolean> ::= false.
+			
+			(* The editor's view - scroll left and top, selection anchor and head as character indices - as captured before the image was saved (captureHostState), until an editor made after the restore has been shown with it (restoreSavedView). *)
+			public savedView <{Number. Number. Integer. Integer}>
 		|
 	) (
 		acceptFromKeydown: event <Alien> = (
@@ -1509,6 +1512,15 @@ The picker is hidden while a request is in flight, to avoid switching in the mid
 		cancelFromKeydown = (
 			respondToCancel
 		)
+		public captureHostState = (
+			(* An edit not yet accepted lives only in the editor. Keep it as the fragment's text, so that the editor made after the image is restored into a new host shows it (createVisual; a fragment reconciled against this one takes it over in updateVisualsFromSameKind:), with its accept and cancel controls. *)
+			
+			| doc |
+			hasVisual ifFalse: [ ^self ].
+			isInEditState ifTrue: [ textSlot:: editor getValue ].
+			doc:: editor getDoc.
+			savedView:: {doc at: #scrollLeft. doc at: #scrollTop. editor indexFromPos: (editor getCursor: 'anchor'). editor indexFromPos: (editor getCursor: 'head'). }
+		)
 		createVisual = (
 			| container <Alien[Div]> frame <Alien[Div]> accept <Alien[Img]> cancel <Alien[Img]> textArea <Alien[Span]> options <Alien[JSObject]> |
 			container:: document createElement: 'div'.
@@ -1529,9 +1541,10 @@ The picker is hidden while a request is in flight, to avoid switching in the mid
 						at: 'align-items' put: 'center';
 						at: 'justify-content' put: 'flex-end';
 						at: 'z-index' put: '10';
-						at: 'opacity' put: '0.0';
+						at: 'opacity' put: (isInEditState ifTrue: [ '1.0' ] ifFalse: [ '0.0' ]);
 						at: 'width' put: 'auto';
-						at: 'pointer-events' put: 'none'.
+						at: 'pointer-events'
+							put: (isInEditState ifTrue: [ 'auto' ] ifFalse: [ 'none' ]).
 					accept:: document createElement: 'img'.
 					accept at: 'src' put: (accept16px yourself at: 'src').
 					(accept at: 'style') at: 'width' put: '22px'.
@@ -1676,7 +1689,8 @@ The picker is hidden while a request is in flight, to avoid switching in the mid
 				]
 		)
 		public noticeExposure = (
-			refresh
+			refresh.
+			restoreSavedView
 		)
 		preventDefault: event <Alien> = (
 			(* Designed as an overridable extension point, so we can choose not to actually call #preventDefault on event *)
@@ -1813,6 +1827,21 @@ The picker is hidden while a request is in flight, to avoid switching in the mid
 						]
 				]
 		)
+		restoreSavedView = (
+			(* Show the editor as it was when the image was saved (captureHostState): its selection, then its scroll position, once, when it is first shown after the restore. *)
+			
+			| v = savedView. options |
+			(v isNil or: [ editor isNil ]) ifTrue: [ ^self ].
+			savedView:: nil.
+			
+			(* scroll: false, or CodeMirror would scroll the page to the cursor, away from where the page was. *)
+			options:: (window at: #Object) new.
+			options at: 'scroll' put: false.
+			editor setSelection: (editor posFromIndex: (v at: 3))
+				head: (editor posFromIndex: (v at: 4))
+				options: options.
+			editor scrollTo: (v at: 1) top: (v at: 2)
+		)
 		scheduleStyling = (
 			(* The queued styles are applied in a turn of their own, right after the current one: by then the colorizing pass that is queuing them is complete. A promise turn, not a timer: an unpainted page's timers are throttled. Nothing may be raised inside it. *)
 			
@@ -1943,6 +1972,7 @@ and the change event fed the garbled text back as the user's (2026-11-19). *)
 			editor:: oldFragment editor.
 			styleMarks:: oldFragment styleMarks.
 			readOnly:: oldFragment readOnly.
+			savedView:: oldFragment savedView.
 			isInEditState ifTrue: [ textSlot:: oldFragment textBeingAccepted ]
 				ifFalse: [
 					lastChangeWasSynthetic:: true.
@@ -2379,7 +2409,7 @@ Class methods that provide convenient defaults for the button image and the alig
 		public reattachInto: element = (
 			(* After the image is restored into a new host: attach the window, with its history, to element, in the new page. *)
 			
-			reattachIn: element toolbar: ToolbarPresenter new
+			reattachIn: element toolbar: keptToolbarPresenter
 		)
 		selectFutureIndex: i <Integer> = (
 			navigator goToFutureIndex: i.
@@ -2508,7 +2538,6 @@ A further subclass responsibility is #childrenDo:, which iterates the fragment's
 		
 		|
 			visualX
-			visualMadeIn <Number>
 			public parent
 			public size ::= nil.
 			public expansibility ::= 0.
@@ -2522,6 +2551,11 @@ A further subclass responsibility is #childrenDo:, which iterates the fragment's
 			
 			nil = decorators ifTrue: [ decorators:: List new ].
 			decorators addLast: newDecorator
+		)
+		public captureHostState = (
+			(* Propagated down the fragment hierarchy before the image is saved (HopscotchForHTML5>>captureHostState): a fragment that keeps state only in its host objects - an editor's unaccepted text, say - copies it into its own slots, so that the visual made from it after the image is restored into a new host shows it. The default merely propagates. *)
+			
+			childrenDo: [:each | each captureHostState ]
 		)
 		public childrenDo: aBlock <[:Fragment | Object]> = (
 			(* Iterate the receiver's logical child fragments in order. Called
@@ -2556,7 +2590,9 @@ A further subclass responsibility is #childrenDo:, which iterates the fragment's
 			^false
 		)
 		public hasVisual = (
-			^visualX isNil not
+			(* A visual made before the image was restored into a new host is dead (restoreWindows), and counts as none: the fragment makes a new one from its own state when asked, and code that touches its host objects only while it has a visual leaves them alone. *)
+			
+			^visualX isNil not and: [ (isDeadHostObject: visualX) not ]
 		)
 		public isKindOfFragment ^<Boolean> = (
 			^true
@@ -2570,11 +2606,6 @@ A further subclass responsibility is #childrenDo:, which iterates the fragment's
 along with an implementation of isKindOfX:  public isKindOfX ^ <Boolean> = (true) *)
 			
 			subclassResponsibility
-		)
-		isVisualStale ^<Boolean> = (
-			(* Whether the visual was made before the image was restored into a new host, where it is dead (restoreWindows). *)
-			
-			^visualMadeIn isNil not and: [ visualMadeIn < visualEpoch ]
 		)
 		public key ^<Object> = (
 			(* A stable identity for this fragment within a sequence, used by
@@ -2635,6 +2666,11 @@ the subject where that is practical. *)
 				].
 			^newVisual
 		)
+		public reviveVisual = (
+			(* A visual this fragment made before the image was restored into a new host is dead (hasVisual). Make a new one from the fragment's own state, so that a fragment of the same kind reconciled against this one (updateVisualsReusingFrom:) takes over its state - an evaluator's results, an editor's text - as it would have from a live visual. A fragment that never made a visual stays without one. *)
+			
+			(visualX isNil not and: [ hasVisual not ]) ifTrue: [ visual ]
+		)
 		public sendDown ^<DownwardRequestDispatcher> = (
 			(* Create and answer a RequestDispatcher that can deliver a downward request on behalf of the receiver. *)
 			
@@ -2689,10 +2725,10 @@ of it and must be styled in full. The answer has to come from here, because
 of a sibling. *)
 			
 			(isMyKind: oldFragment) ifTrue: [
+					oldFragment reviveVisual.
 					visualX:: oldFragment hasVisual ifTrue: [
 							updateVisualsFromSameKind: oldFragment
 						].
-					visualMadeIn:: visualEpoch.
 					^true
 				].
 			oldFragment noticeDisposal.
@@ -2703,11 +2739,8 @@ of a sibling. *)
 			^self
 		)
 		public visual = (
-			(* A visual made before the image was restored into a new host (an older visualEpoch) is dead; the fragment makes a new one from its own state. *)
-			
-			(visualX isNil or: [ isVisualStale ]) ifTrue: [
+			hasVisual ifFalse: [
 					visualX:: decorate: createVisual.
-					visualMadeIn:: visualEpoch.
 					updateToolTip
 				].
 			^visualX
@@ -3261,6 +3294,7 @@ merely documents it. *)
 		|
 			navigator = navigationHistory.
 			currentPresenterX
+			toolbarPresenter <Presenter>
 			toolbarHolder ::= document createElement: 'div'.
 			contentHolder ::= document createElement: 'div'.
 			public activeMenu <Alien[Div]>
@@ -3275,6 +3309,13 @@ merely documents it. *)
 		)
 		atHome ^<Boolean> = (
 			^currentPresenter isKindOfHomePresenter
+		)
+		public captureHostState = (
+			(* Before the image is saved: every presenter this window has shown, not only the current one, may be shown again after the image is restored into a new host (HopscotchForHTML5>>captureHostState). *)
+			
+			navigator allVisits do: [:p <Presenter> | p captureHostState ].
+			currentPresenterX isNil ifFalse: [ currentPresenterX captureHostState ].
+			toolbarPresenter isNil ifFalse: [ toolbarPresenter captureHostState ]
 		)
 		public childrenDo: aBlock = (
 			aBlock value: currentPresenter
@@ -3472,7 +3513,8 @@ We guard against all of the above problems by obtaining the refreshmentPresenter
 		listenForBackButton.
 		container appendChild: toolbarHolder.
 		container appendChild: contentHolder.
-		toolbarHolder appendChild: ToolbarPresenter new visual.
+		toolbarPresenter:: ToolbarPresenter new.
+		toolbarHolder appendChild: toolbarPresenter visual.
 		enterSubject: s.
 	) (
 		class ToolbarPresenter new = Presenter onSubject: nil (
@@ -3525,10 +3567,16 @@ We guard against all of the above problems by obtaining the refreshmentPresenter
 		public isKindOfHopscotchWindow = (
 			^true
 		)
+		keptToolbarPresenter ^<Presenter> = (
+			(* The toolbar this window was made with, so that after the image is restored into a new host the toolbar's state, such as text typed in a search field, comes back with it (captureHostState); a new one for a window made before windows kept theirs. *)
+			
+			toolbarPresenter isNil ifTrue: [ toolbarPresenter:: ToolbarPresenter new ].
+			^toolbarPresenter
+		)
 		public reattach = (
 			(* After the image is restored into a new host (restoreWindows). *)
 			
-			reattachIn: body toolbar: ToolbarPresenter new
+			reattachIn: body toolbar: keptToolbarPresenter
 		)
 		setTitle: t = (
 			document at: 'title' put: t
@@ -4156,12 +4204,11 @@ sound even though it can only walk the rows that are realized. *)
 			(* A shallow copy of the image element i, for a visual. After the image is restored into a new host (restoreWindows), i, made in the old page, is dead: make a new img element from the source remembered when the fragment was made (rememberImageSource:). *)
 			
 			| copy |
-			imageSource isNil ifTrue: [ ^i cloneNode: false ].
-			copy:: [ i cloneNode: false ] on: Exception do: [:e | nil ].
-			copy isNil ifTrue: [
-					copy:: document createElement: 'img'.
-					copy at: 'src' put: imageSource
+			(imageSource isNil or: [ (isDeadHostObject: i) not ]) ifTrue: [
+					^i cloneNode: false
 				].
+			copy:: document createElement: 'img'.
+			copy at: 'src' put: imageSource.
 			^copy
 		)
 		public defaultHandler ^<[:Object | Object]> = (
@@ -6342,8 +6389,16 @@ By default, subjects are equal if they are of the same kind and have equal model
 			public acceptResponse <[TextEditorFragment]>
 			public cancelResponse <[TextEditorFragment]>
 			public oldText <TextFragment | String>
+			
+			(* What the input held when the image was saved (captureHostState): typing that was not accepted, which the input made after the restore shows again. *)
+			capturedInput <String>
 		|
 	) (
+		public captureHostState = (
+			(hasVisual and: [ textX isKindOfString ]) ifTrue: [
+					capturedInput:: textEditor at: 'value'
+				]
+		)
 		createVisual = (
 			| frame = document createElement: 'div'. |
 			frame at: 'id' put: 'TextEditorFragment'.
@@ -6352,6 +6407,9 @@ By default, subjects are equal if they are of the same kind and have equal model
 			textEditor at: 'contentEditable' put: 'true'.
 			(textEditor at: 'style') at: 'flex' put: 1.
 			setText: textX.
+			(capturedInput isNil or: [ textX isKindOfString not ]) ifFalse: [
+					textEditor at: 'value' put: capturedInput
+				].
 			textEditor addEventListener: 'input'
 				action: [:event |
 					respondToChange: event.
@@ -6903,6 +6961,11 @@ If none of the parents of a presenter accept a request, an error is signaled by 
 			public embeddedWindow <EmbeddedHopscotchWindow>
 		|
 	) (
+		public captureHostState = (
+			(* The embedded window's whole history, not only the presenter it shows (HopscotchShell>>captureHostState). *)
+			
+			embeddedWindow isNil ifFalse: [ embeddedWindow captureHostState ]
+		)
 		public childrenDo: aBlock <[:Fragment | Object]> = (
 			(* Our logical child is whatever presenter the embedded window is currently
      showing - the same fragment updateVisualsFromSameKind: below reaches for.
@@ -7010,6 +7073,17 @@ If none of the parents of a presenter accept a request, an error is signaled by 
 	)
 	public cancel16px = (
 		^images cancel16px
+	)
+	public captureHostState = (
+		(* Before the image is saved (Actors>>saveImage:, on a platform with live snapshots): fragments that keep state only in their host objects copy it into their own slots, which the image keeps; after it is restored into a new host, their visuals are made again from those slots (restoreWindows). *)
+		
+		currentHopscotchWindow isNil ifFalse: [
+				| p <Presenter> = currentHopscotchWindow currentPresenter. |
+				
+				(* How far the page is scrolled is recorded when a presenter is left (displayPresenter:); the one being shown has not been left yet. *)
+				p isNil ifFalse: [ p setScrollPosition ]
+			].
+		windowList do: [:w <HopscotchShell> | w captureHostState ]
 	)
 	public chatBubbleHtml: text <String> role: role <String> ^<String> = (
 		(* The one definition of a chat turn bubble, shared by the inline
@@ -7210,6 +7284,11 @@ If none of the parents of a presenter accept a request, an error is signaled by 
 		r:: (JSString new: r) replaceAll: '<' with: '&lt;'.
 		^(JSString new: r) replaceAll: '>' with: '&gt;'
 	)
+	isDeadHostObject: a <Alien> ^<Boolean> = (
+		(* Whether a is a host object from an earlier host. Only a platform with live snapshots restores into a new host, so elsewhere nothing is dead, and asking - which goes through the host object's doesNotUnderstand: - is skipped: hasVisual is asked on every render. *)
+		
+		^liveSnapshots and: [ a isDead ]
+	)
 	public mikeImage = (
 		^images mikeImage
 	)
@@ -7323,9 +7402,8 @@ Animation frames stop while the page is not being painted, and a request already
 		^images refreshImage
 	)
 	public restoreWindows ^<Boolean> = (
-		(* After the image is restored into a new host (a new page; Eurasia, contract design section 6, rule 3), the DOM nodes the windows and fragments held are dead. Every visual made so far is stale (visualEpoch), so a fragment asked for its visual makes a new one from its own state, and a reconciliation against an old fragment remakes that one's first. Each window attaches itself to the new page and shows its current presenter again; windows, presenters and navigation histories are kept as they were. Answers whether there was a window to restore. *)
+		(* After the image is restored into a new host (a new page; Eurasia, contract design section 6, rule 3), the DOM nodes the windows and fragments held are dead. Every visual made so far is dead, so a fragment has none (hasVisual) and, asked for its visual, makes a new one from its own state. Each window attaches itself to the new page and shows its current presenter again; windows, presenters and navigation histories are kept as they were. Answers whether there was a window to restore. *)
 		
-		visualEpoch:: visualEpoch + 1.
 		windowList do: [:w <HopscotchShell> | w reattach ].
 		^windowList isEmpty not
 	)

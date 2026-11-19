@@ -200,10 +200,14 @@ How it differs from the proposal:
 Done since (2026-11-18, later):
 - **The IDE restores into a new page.** `actors whenRestored: aBlock` sets
   the restore handler (role 40; nothing on psoup and JS). The IDE's
-  handler calls Hopscotch's `restoreWindows`: a visual epoch advances, so
-  every visual made before the restore is stale and a fragment asked for
-  its visual makes a new one from its own state (a reconciliation against
-  an old fragment remakes that one's first); each top-level window makes
+  handler calls Hopscotch's `restoreWindows`. Every visual made before the
+  restore is a dead Alien (`isDead` answers true; an Alien answers it in
+  its `doesNotUnderstand:` on every platform, false unless the image was
+  restored into a new host, or the host object has an `isDead` of its
+  own), so a fragment has none
+  (`hasVisual`) and, asked for its visual, makes a new one from its own
+  state; code that touches a fragment's host objects only while it has a
+  visual leaves the dead ones alone. Each top-level window makes
   new elements in the new page and shows its current presenter again.
   Windows, presenters and navigation histories are kept, so the history,
   open debugger frames and links back to earlier views survive; an
@@ -234,9 +238,12 @@ Done since (2026-11-18, later):
   outcome is not an input and logs are unchanged; a recorder passes the
   image on, a replay saves nothing. The command line writes the file
   `name`; the web page keeps it in the origin private file system and
-  offers saved images, or a fresh IDE, when it loads. `actors
-  savesImages` is false on psoup and JS, where `saveImage:` answers a
-  broken promise. The IDE's Home page menu has Save Image.
+  offers saved images, or a fresh IDE, when it loads. Every
+  platform answers `supportsLiveSnapshots`, true only on Eurasia; on psoup
+  and JS, `saveImage:` answers a broken promise. The IDE's Home page menu has Save Image,
+  and so does the toolbar (a camera button), only where `supportsLiveSnapshots`.
+  A window keeps its toolbar presenter, so the toolbar comes back with its
+  state (the search field's text) after a restore.
   EurasiaSaveImageProbe checks both outcomes (replay-tests.sh, step 5).
 
 Not done:

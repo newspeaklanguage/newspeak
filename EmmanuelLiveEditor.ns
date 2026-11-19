@@ -52,6 +52,7 @@ session's tree. *)
 			public session = s.
 			root
 			content
+			typed
 		|
 	) (
 		backspaceAt: c = (
@@ -82,6 +83,7 @@ block with the one before it. *)
 								items: {}
 								after: {}
 						].
+					(isLeaf: prev) ifTrue: [ ^deleteChild: pt child - 1 at: pt steps caret: c ].
 					prev kind = #sub ifTrue: [
 							ss:: pt steps , {edits into: pt child - 1. }.
 							^backspaceAt: (edits exact: (edits gap: ss at: (kidsAt: ss) size))
@@ -93,6 +95,12 @@ block with the one before it. *)
 					ss:: ss copyFrom: 1 to: ss size - 1
 				].
 			(ss isEmpty or: [ ss last isField ]) ifTrue: [ ^nil ].
+			kids:: kidsAt: (ss copyFrom: 1 to: ss size - 1).
+			(ss last index > 0 and: [ isLeaf: (kids at: ss last index) ]) ifTrue: [
+					^deleteChild: ss last index - 1
+						at: (ss copyFrom: 1 to: ss size - 1)
+						caret: c
+				].
 			^edits backspace: markup
 				tree: session tree
 				steps: (ss copyFrom: 1 to: ss size - 1)
@@ -149,6 +157,14 @@ its anchor may lie in white space the view does not show. *)
 			(node at: #nodeType) = 1 ifFalse: [ ^nil ].
 			^node getAttribute: name
 		)
+		deleteChild: j at: ss caret: c = (
+			(* The edit that deletes the child j of the block at ss, a leaf. *)
+			
+			^edits replace: (edits exact: (edits gap: ss at: j))
+				to: (edits exact: (edits gap: ss at: j + 1))
+				items: {}
+				after: {}
+		)
 		deleteForwardAt: c = (
 			(* The edit that deletes the character after a caret, or joins the
 next block to its block. *)
@@ -176,6 +192,7 @@ next block to its block. *)
 								items: {}
 								after: {}
 						].
+					(isLeaf: next) ifTrue: [ ^deleteChild: pt child at: pt steps caret: c ].
 					next kind = #sub ifTrue: [
 							^deleteForwardAt: (edits exact: (edits gap: pt steps , {edits into: pt child. }
 										at: 0))
@@ -184,6 +201,12 @@ next block to its block. *)
 				].
 			ss:: pt steps.
 			(ss isEmpty or: [ ss last isField ]) ifTrue: [ ^nil ].
+			kids:: kidsAt: (ss copyFrom: 1 to: ss size - 1).
+			(ss last index + 2 <= kids size and: [ isLeaf: (kids at: ss last index + 2) ]) ifTrue: [
+					^deleteChild: ss last index + 1
+						at: (ss copyFrom: 1 to: ss size - 1)
+						caret: c
+				].
 			^edits backspace: markup
 				tree: session tree
 				steps: (ss copyFrom: 1 to: ss size - 1)
@@ -195,9 +218,14 @@ end carets, and whether it is collapsed); then render again and place the
 caret. *)
 			
 			| selection = domDocument getSelection. range a b collapsed e caret |
+			typed:: nil.
+			session tree isNil ifTrue: [ ^self ].
 			(selection at: #rangeCount) = 0 ifTrue: [ ^self ].
 			range:: selection getRangeAt: 0.
 			collapsed:: range at: #collapsed.
+			((root contains: (range at: #startContainer)) and: [
+					root contains: (range at: #endContainer)
+				]) ifFalse: [ ^self ].
 			a:: caretFor: (pointAt: (range at: #startContainer)
 					offset: (range at: #startOffset)).
 			b:: collapsed ifTrue: [ a ]
@@ -207,7 +235,7 @@ caret. *)
 				].
 			e:: makeEdit value: a value: b value: collapsed.
 			e isNil ifTrue: [ ^self ].
-			caret:: session apply: e.
+			caret:: session apply: e typed: typed.
 			caret isNil ifTrue: [ ^self ].
 			render.
 			place: caret point
@@ -290,12 +318,24 @@ caret. *)
 				]
 		)
 		indexOf: node in: parent = (
+			(* The index of a child node. The DOM decides identity: two aliens of
+one node are not ==. *)
+			
 			| kids = parent at: #childNodes. |
-			0 to: (kids at: #length) - 1 do: [:i | (kids at: i) == node ifTrue: [ ^i ] ].
+			0 to: (kids at: #length) - 1
+				do: [:i | ((kids at: i) isSameNode: node) ifTrue: [ ^i ] ].
 			^0
 		)
 		public isKindOfEmmanuelEditorFragment = (
 			^true
+		)
+		isLeaf: g = (
+			(* Whether a child is a leaf block (an amplet, a newline): one the
+caret does not go into, which Backspace and Delete delete whole. *)
+			
+			^g kind = #sub and: [
+					g ref messages size = 1 and: [ g ref flag ~= #unclosed ]
+				]
 		)
 		isMyKind: other = (
 			^other isKindOfEmmanuelEditorFragment
@@ -388,11 +428,12 @@ their index. *)
 					next isNil ifTrue: [ ^edits gap: steps at: (kidsAt: steps) size ].
 					^edits gap: steps at: (next at: 1)
 				].
-			node == root ifTrue: [
+			(node isSameNode: root) ifTrue: [
 					^edits gap: {} at: (o = 0 ifTrue: [ 0 ] ifFalse: [ (kidsAt: {}) size ])
 				].
 			j:: dataAttribute: 'data-item' of: node.
 			parent:: node at: #parentNode.
+			parent isNil ifTrue: [ ^nil ].
 			j isNil ifFalse: [
 					steps:: stepsOf: parent.
 					^edits gap: steps
@@ -404,7 +445,9 @@ their index. *)
 		render = (
 			(* Render the session's tree in place of the previous rendering. *)
 			
-			| subject = blocks TreeSubject onModel: session tree. presenter visual start |
+			| subject presenter visual start |
+			session tree isNil ifTrue: [ ^renderUnparsable ].
+			subject:: blocks TreeSubject onModel: session tree.
 			subject amplets: session amplets.
 			presenter:: subject presenter.
 			presenter parent: self.
@@ -414,6 +457,17 @@ their index. *)
 			session timings: session timings , ', render ' , (clock now - start) printString.
 			session amplets endRender.
 			session failed ifTrue: [ visual setAttribute: 'style' to: 'opacity: 0.5;' ].
+			content isNil ifTrue: [ root appendChild: visual ]
+				ifFalse: [ root replaceChild: visual with: content ].
+			content:: visual
+		)
+		renderUnparsable = (
+			(* A source that has never interpreted has no tree to show: its text
+is shown, dimmed, until it does. *)
+			
+			| visual = domDocument createElement: 'div'. |
+			visual setAttribute: 'style' to: 'opacity: 0.5;'.
+			visual at: #textContent put: session sourceString.
 			content isNil ifTrue: [ root appendChild: visual ]
 				ifFalse: [ root replaceChild: visual with: content ].
 			content:: visual
@@ -428,6 +482,14 @@ afterItems; for commands, such as a toolbar's. *)
 		)
 		public selectedText = (
 			^domDocument getSelection toString
+		)
+		public source: w = (
+			(* Make the string w the source, as when the raw view changes it: it
+is reinterpreted, and shown again. While it does not interpret, the last
+tree that did is shown, dimmed, and typing in it does nothing. *)
+			
+			session reinterpret: (emmanuel codePointsOf: w).
+			root isNil ifFalse: [ render ]
 		)
 		stepsOf: element = (
 			| s = dataAttribute: 'data-steps' of: element. |
@@ -475,6 +537,7 @@ afterItems; for commands, such as a toolbar's. *)
 			^s
 		)
 		typing: text from: a to: b = (
+			typed:: emmanuel codePointsOf: text.
 			^edits replace: a
 				to: b
 				items: {emmanuel Item text: (emmanuel codePointsOf: text)
@@ -535,8 +598,13 @@ whole source; for tests. *)
 			^true
 		)
 		public apply: e = (
+			^apply: e typed: nil
+		)
+		public apply: e typed: typed = (
 			(* Apply an edit: answers the caret after it, or nil when the edit
-was refused or changed another source. *)
+was refused or changed another source. When the edit types the code points
+typed, a space among them that white space beside it would collapse away
+becomes a no-break space, so that what one types is what one sees. *)
 			
 			| t0 = clock now. t1 t2 result |
 			failed ifTrue: [ ^nil ].
@@ -548,7 +616,8 @@ was refused or changed another source. *)
 			t1:: clock now.
 			(result isNil or: [ result isRefused ]) ifTrue: [ ^nil ].
 			result sourceName = 'doc' ifFalse: [ ^nil ].
-			reinterpret: result chars.
+			reinterpret: (typed isNil ifTrue: [ result chars ]
+					ifFalse: [ keepSpaces: typed in: result chars before: result caret ]).
 			changeHandler isNil ifFalse: [ changeHandler value: sourceString ].
 			t2:: clock now.
 			timings:: 'edit ' , (t1 - t0) printString , ', interpret ' , (t2 - t1) printString.
@@ -581,6 +650,23 @@ was refused or changed another source. *)
 			nodes:: doc at: 1.
 			tree:: doc at: 2
 		)
+		keepSpaces: typed in: w before: k = (
+			(* w, a source in which typed ends at offset k, with each space of
+typed that has white space beside it made a no-break space. *)
+			
+			| out = w copy. n = typed size. |
+			(k isNil or: [ k < n or: [ k > w size ] ]) ifTrue: [ ^w ].
+			1 to: n do: [:i | (w at: k - n + i) = (typed at: i) ifFalse: [ ^w ] ].
+			k - n + 1 to: k
+				do: [:i |
+					((out at: i) = 32 and: [
+							(i > 1 and: [ emmanuel isWS: (out at: i - 1) ]) or: [
+									i < out size and: [ emmanuel isWS: (out at: i + 1) ]
+								]
+						]) ifTrue: [ out at: i put: 160 ]
+				].
+			^out
+		)
 		markupSteps: e = (
 			(* The path to the markup an edit is in: its point's path, up to the
 last field it enters. *)
@@ -589,7 +675,7 @@ last field it enters. *)
 			ss keysAndValuesDo: [:i :s | s isField ifTrue: [ k:: i ] ].
 			^ss copyFrom: 1 to: k
 		)
-		reinterpret: w = (
+		public reinterpret: w = (
 			(* Make w the source: reparse only what the edit damaged
 (EmmanuelIncremental), or, when that will not do, all of it; then
 interpret. *)

@@ -3,7 +3,10 @@
 // node emmanuel-editor-probe.mjs <debugging port> <page url>
 // Run by emmanuel-editor-probe.py, which starts Chrome and builds the snapshot.
 const [port, url] = process.argv.slice(2);
-// Any further arguments are source files to time keystrokes in.
+// Any further arguments are source files to time keystrokes in, and to
+// check the caret and every key at many places in.
+// PROBE_DUMP=<part of a scenario name> prints that scenario's DOM, and the
+// selection the browser reports at each beforeinput.
 
 const targets = await (await fetch(`http://localhost:${port}/json/list`)).json();
 const page = targets.find((t) => t.type === "page");
@@ -50,6 +53,7 @@ await js(`
   window.findText = (text) => {
     const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
     for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+      if (n.parentNode.tagName === 'STYLE') continue;
       const i = n.data.indexOf(text);
       if (i >= 0) return [n, i];
     }
@@ -60,6 +64,20 @@ await js(`
     document.body.firstChild.focus();
     const r = document.createRange();
     r.setStart(n, i + k); r.collapse(true);
+    const s = getSelection(); s.removeAllRanges(); s.addRange(r);
+  };
+  window.caretInElement = (steps, k) => {
+    const e = document.querySelector('[data-steps="' + steps + '"]');
+    document.body.firstChild.focus();
+    const r = document.createRange();
+    r.setStart(e, k); r.collapse(true);
+    const s = getSelection(); s.removeAllRanges(); s.addRange(r);
+  };
+  window.caretInRun = (steps, item, k) => {
+    const e = [...document.querySelector('[data-steps="' + steps + '"]').childNodes].find((c) => c.getAttribute && c.getAttribute('data-item') === String(item));
+    document.body.firstChild.focus();
+    const r = document.createRange();
+    r.setStart(e.firstChild, k); r.collapse(true);
     const s = getSelection(); s.removeAllRanges(); s.addRange(r);
   };
   window.selectText = (text) => {
@@ -90,6 +108,13 @@ async function source() {
 }
 
 const DOC = "[\\title: [\\Doc\\]\\][\\paragraph\\]Hello world[\\endParagraph\\][\\paragraph\\]Second[\\endParagraph\\]";
+const LIST = "[\\list. item. paragraph\\]One[\\endParagraph. endItem. item. paragraph\\]Two[\\endParagraph. endItem. endList\\]";
+const STRONG_LIST = "[\\list. item. paragraph\\]One [\\strong\\]Bold[\\endStrong. endParagraph. endItem. item. paragraph\\]Two[\\endParagraph. endItem. endList\\]";
+const LINK_LIST = "[\\list. item. paragraph. link: 'x.html'\\]Link[\\endLink. endParagraph. endItem. item. paragraph\\]Two[\\endParagraph. endItem. endList\\]";
+const CONVERTED_LIST = "[\\paragraph\\]Before[\\endParagraph\\]\n[\\numberedList. item. paragraph\\]alpha[\\endParagraph. endItem. item. paragraph\\]beta[\\endParagraph. endItem. endNumberedList\\]\n[\\paragraph\\]After[\\endParagraph\\]";
+const NEWLINES = "[\\paragraph\\]a [\\newline\\] [\\newline\\] b[\\endParagraph\\]";
+const AMPLET_BETWEEN = "[\\paragraph\\]a[\\endParagraph\\][\\amplet: [x]\\][\\paragraph\\]b[\\endParagraph\\]";
+const EMPTY_PARAGRAPH = "[\\paragraph\\]a[\\endParagraph\\][\\paragraph\\][\\endParagraph\\][\\paragraph\\]b[\\endParagraph\\]";
 const scenarios = [
   ["type in a run", async () => { await js("caretAt('Hello', 3)"); await type("XY"); },
     "[\\title: [\\Doc\\]\\][\\paragraph\\]HelXYlo world[\\endParagraph\\][\\paragraph\\]Second[\\endParagraph\\]"],
@@ -109,20 +134,61 @@ const scenarios = [
     "[\\title: [\\Docs\\]\\][\\paragraph\\]Hello world[\\endParagraph\\][\\paragraph\\]Second[\\endParagraph\\]"],
   ["two keystrokes keep the caret", async () => { await js("caretAt('world', 5)"); await type("!"); await key("Backspace"); await type("?"); },
     "[\\title: [\\Doc\\]\\][\\paragraph\\]Hello world?[\\endParagraph\\][\\paragraph\\]Second[\\endParagraph\\]"],
+  ["two spaces are kept", async () => { await js("caretAt('Hello', 5)"); await type("  X"); },
+    "[\\title: [\\Doc\\]\\][\\paragraph\\]Hello\u00a0\u00a0X world[\\endParagraph\\][\\paragraph\\]Second[\\endParagraph\\]"],
+  ["a space before a space is kept", async () => { await js("caretAt('Hello', 5)"); await type(" "); await type("X"); },
+    "[\\title: [\\Doc\\]\\][\\paragraph\\]Hello\u00a0X world[\\endParagraph\\][\\paragraph\\]Second[\\endParagraph\\]"],
+  ["enter at the end of the last item", async () => { await js("caretAt('Two', 3)"); await key("Enter"); await type("Z"); },
+    LIST.replace("Two[", "Two[\\endParagraph. endItem. item. paragraph\\]Z["), LIST],
+  ["enter at the end of an item", async () => { await js("caretAt('One', 3)"); await key("Enter"); await type("Z"); },
+    LIST.replace("One[", "One[\\endParagraph. endItem. item. paragraph\\]Z["), LIST],
+  ["enter after a strong run ending an item", async () => { await js("caretAt('Bold', 4)"); await key("Enter"); await type("Z"); },
+    null, STRONG_LIST],
+  ["enter after a link ending an item", async () => { await js("caretAt('Link', 4)"); await key("Enter"); await type("Z"); },
+    null, LINK_LIST],
+  ["enter in a converted list", async () => { await js("caretAt('alpha', 5)"); await key("Enter"); await type("Z"); },
+    null, CONVERTED_LIST],
+  ["the raw view makes the source unparsable, then fixes it", async () => {
+      await js(`emmanuelSetSource(${JSON.stringify(DOC.replace("Hello", "Hel[\\lo"))})`);
+      await js(`emmanuelSetSource(${JSON.stringify(DOC.replace("Hello", "Hello!"))})`);
+      await js("caretAt('Hello!', 6)"); await type("?"); },
+    DOC.replace("Hello", "Hello!?")],
+  ["an editor on an unparsable source", async () => { await js("emmanuelLoad('[\\\\paragraph')"); await js("document.body.firstChild.focus()"); await type("x"); },
+    "[\\paragraph"],
+  ["type into a space between newlines", async () => { await js("caretInRun('i0', 2, 0)"); await type("Q"); },
+    "[\\paragraph\\]a [\\newline\\]Q [\\newline\\] b[\\endParagraph\\]", NEWLINES],
+  ["backspace after an amplet deletes it", async () => { await js("caretInElement('', 2)"); await key("Backspace"); },
+    AMPLET_BETWEEN.replace("[\\amplet: [x]\\]", ""), AMPLET_BETWEEN],
+  ["backspace at the start of the block after an amplet deletes it", async () => { await js("caretAt('b', 0)"); await key("Backspace"); },
+    AMPLET_BETWEEN.replace("[\\amplet: [x]\\]", ""), AMPLET_BETWEEN],
+  ["delete before an amplet deletes it", async () => { await js("caretInElement('', 1)"); await key("Delete"); },
+    AMPLET_BETWEEN.replace("[\\amplet: [x]\\]", ""), AMPLET_BETWEEN],
+  ["delete at the end of the block before an amplet deletes it", async () => { await js("caretAt('a', 1)"); await key("Delete"); },
+    AMPLET_BETWEEN.replace("[\\amplet: [x]\\]", ""), AMPLET_BETWEEN],
+  ["backspace after a newline deletes it", async () => { await js("caretInRun('i0', 2, 0)"); await key("Backspace"); },
+    "[\\paragraph\\]a  [\\newline\\] b[\\endParagraph\\]", NEWLINES],
+  ["backspace after an empty paragraph", async () => { await js("caretInElement('', 2)"); await key("Backspace"); },
+    null, EMPTY_PARAGRAPH],
 ];
 
 let failures = 0;
-for (const [name, act, expected] of scenarios) {
-  await js(`emmanuelLoad(${JSON.stringify(DOC)})`);
+for (const [name, act, expected, doc = DOC] of scenarios) {
+  await js(`emmanuelLoad(${JSON.stringify(doc)})`);
   const before = consoleLines.length;
+  if (process.env.PROBE_DUMP && name.includes(process.env.PROBE_DUMP)) {
+    console.log("DOM " + await js("document.body.innerHTML"));
+    await js(`document.addEventListener('beforeinput', (e) => { const r = getSelection().getRangeAt(0);
+      const d = (n) => n.nodeType === 3 ? JSON.stringify(n.data) : n.tagName + '[' + (n.getAttribute('data-steps') ?? '') + ']';
+      console.log('SEL ' + e.inputType + ' ' + d(r.startContainer) + '@' + r.startOffset + ' .. ' + d(r.endContainer) + '@' + r.endOffset); }, true); true`);
+  }
   try {
     await act();
     const got = await source();
     const agrees = await js("emmanuelAgrees");
-    const ok = (expected === null ? got !== DOC : got === expected) && agrees;
+    const ok = (expected === null ? got !== doc : got === expected) && agrees;
     if (!agrees) console.log("     the incremental parse disagrees with the whole parse");
     if (!ok) failures++;
-    console.log(`${ok ? "PASS" : "FAIL"} ${name}\n     ${got}${ok || expected === null ? "" : "\n want " + expected}`);
+    console.log(`${ok ? "PASS" : "FAIL"} ${name}\n     ${JSON.stringify(got)}${ok || expected === null ? "" : "\n want " + JSON.stringify(expected)}`);
   } catch (e) {
     failures++;
     console.log(`FAIL ${name}: ${e.message.slice(0, 300)}`);
@@ -170,6 +236,70 @@ for (const path of process.argv.slice(4)) {
     await js(`emmanuelProfile(${JSON.stringify(text)})`);
     console.log(`       full pass: ${await js("emmanuelProfileResult")}`);
   }
+  // The caret: a character typed at a place in a run's text appears there.
+  const misplaced = [];
+  let tried = 0;
+  for (let n = 0; n < 40; n++) {
+    await js(`emmanuelLoad(${JSON.stringify(text)})`);
+    const where = await js(`(() => {
+      const runs = [...document.querySelectorAll('span[data-item]')].filter(e => !e.hasAttribute('contenteditable')
+        && e.childNodes.length === 1 && e.firstChild.nodeType === 3 && e.firstChild.length > 0
+        && !e.closest('[contenteditable=false]'));
+      if (!runs.length) return null;
+      const e = runs[(${n} * 7919) % runs.length]; const k = (${n} * 31) % (e.firstChild.length + 1);
+      e.setAttribute('id', 'probe-run');
+      document.body.firstChild.focus(); const r = document.createRange();
+      r.setStart(e.firstChild, k); r.collapse(true); getSelection().removeAllRanges(); getSelection().addRange(r);
+      return [e.firstChild.data, k, e.getAttribute('data-item'), e.parentNode.getAttribute('data-steps')]; })()`);
+    if (!where) break;
+    tried++;
+    await send("Input.insertText", { text: "Q" });
+    const [data, k, item, steps] = where;
+    const want = data.slice(0, k) + "Q" + data.slice(k);
+    const got = await js(`(() => { const p = document.querySelector('[data-steps="${steps}"]');
+      const e = p && [...p.childNodes].find(c => c.getAttribute && c.getAttribute('data-item') === '${item}');
+      return e ? e.textContent : null; })()`);
+    if (got !== want) misplaced.push(`${JSON.stringify(want.slice(Math.max(0, k - 20), k + 21))} got ${JSON.stringify(got && got.slice(Math.max(0, k - 20), k + 21))}`);
+  }
+  if (misplaced.length) failures++;
+  console.log(`caret ${path.split("/").pop()}: ${tried - misplaced.length}/${tried} typed where the caret was`);
+  for (const m of misplaced.slice(0, 10)) console.log("       want " + m);
+  // Any place a click can put the caret (in text, or between elements),
+  // and any key: the editor raises no error, and stays in agreement.
+  const errors = [];
+  const actions = [["Q", () => type("Q")], ["Enter", () => key("Enter")], ["Backspace", () => key("Backspace")],
+                   ["Delete", () => key("Delete")], ["two spaces", () => type("  ")]];
+  let actsTried = 0;
+  for (let n = 0; n < 80; n++) {
+    await js(`emmanuelLoad(${JSON.stringify(text)})`);
+    const where = await js(`(() => {
+      const root = document.body.firstChild; const places = [];
+      const walk = (node) => {
+        if (node.nodeType === 1 && node.getAttribute('contenteditable') === 'false') return;
+        if (node.nodeType === 1 && node.tagName === 'STYLE') return;
+        const size = node.nodeType === 3 ? node.length : node.childNodes.length;
+        for (let k = 0; k <= size; k++) places.push([node, k]);
+        if (node.nodeType === 1) for (const c of node.childNodes) walk(c);
+      };
+      walk(root);
+      const [node, k] = places[(${n} * 7919 + 13) % places.length];
+      root.focus(); const r = document.createRange(); r.setStart(node, k); r.collapse(true);
+      getSelection().removeAllRanges(); getSelection().addRange(r);
+      const d = node.nodeType === 3 ? JSON.stringify(node.data.slice(Math.max(0, k - 12), k + 12)) + '@' + k
+        : '<' + node.tagName + ' ' + (node.getAttribute('data-steps') || '') + '>@' + k;
+      return d; })()`);
+    const [label, act] = actions[n % actions.length];
+    const before = consoleLines.length;
+    await act();
+    actsTried++;
+    await js("emmanuelRead(0)");
+    const agrees = await js("emmanuelAgrees");
+    const said = consoleLines.slice(before).filter((l) => l.includes("Emmanuel editor") || l.includes("Exception"));
+    if (said.length || !agrees) errors.push(`${label} at ${where}: ${agrees ? "" : "DISAGREES "}${said.join(" | ").slice(0, 300)}`);
+  }
+  if (errors.length) failures++;
+  console.log(`keys ${path.split("/").pop()}: ${actsTried - errors.length}/${actsTried} without error`);
+  for (const m of errors.slice(0, 15)) console.log("       " + m);
 }
 ws.close();
 process.exit(failures ? 1 : 0);

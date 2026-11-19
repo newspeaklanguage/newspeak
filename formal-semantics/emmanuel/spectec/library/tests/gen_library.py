@@ -486,6 +486,19 @@ OL = "[\\list. item. paragraph\\]a[\\endParagraph. endItem. item. paragraph\\]b[
 key('ex-enter-item', 'LibEnter', EL, ex(P_ITEM), SPLIT(P_ITEM, 2))
 edit('edit-enter-item', EL, SPLIT(P_ITEM, 2), edited(mark(OL, 'b[\\endParagraph')), out=OL)
 
+# Typing after a leaf (a newline: only a creating message) writes after it.
+NL = "[\\paragraph\\]a[\\newline\\]b[\\endParagraph\\]"
+P_NL = GAPP(path(INTO(0)), 2)
+ONL = "[\\paragraph\\]a[\\newline\\]Qb[\\endParagraph\\]"
+edit('edit-after-leaf', NL, REPLACE(P_NL, P_NL, TXTI('Q')), edited(mark(ONL, 'b[')), out=ONL)
+
+# Deleting a leaf whole: an amplet between paragraphs, a newline in one.
+AB = "[\\paragraph\\]a[\\endParagraph\\][\\amplet: aClosure\\][\\paragraph\\]b[\\endParagraph\\]"
+OAB = "[\\paragraph\\]a[\\endParagraph\\][\\paragraph\\]b[\\endParagraph\\]"
+edit('edit-delete-amplet', AB, REPLACE(GAPP(path(), 1), GAPP(path(), 2)), edited(mark(OAB, '[\\paragraph\\]b')), out=OAB)
+ONL2 = "[\\paragraph\\]ab[\\endParagraph\\]"
+edit('edit-delete-newline', NL, REPLACE(GAPP(path(INTO(0)), 1), GAPP(path(INTO(0)), 2)), edited(mark(ONL2, 'b')), out=ONL2)
+
 anchor('ex-anchor-before-emph', E1, GAPP(path(INTO(0)), 1), 'TXT 1 3')
 # Enter inside the emphasis splits the paragraph, closing the emphasis.
 OS = "[\\paragraph\\]Hi [\\emphasis\\]a[\\endEmphasis. endParagraph. paragraph. emphasis\\]ll[\\endEmphasis. endParagraph\\]"

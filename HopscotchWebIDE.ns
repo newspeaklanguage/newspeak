@@ -316,7 +316,7 @@ class HopscotchWebIDE packageUsing: manifest = (
 			
 			^BuildInfo version , ', built ' , aPlatform buildTime , BuildInfo dirty
 		)
-		computeBaselinesFor: builders <Array[ClassDeclarationBuilder]> inNamespace: namespace ^<Map[String, Map[String, String]]> = (
+		computeBaselinesFor: builders <Array[ClassDeclarationBuilder]> inNamespace: namespace prefixes: prefixes <Array[String]> ^<Map[String, Map[String, String]]> = (
 			(* For each top-level builder, look up the LIVE class in namespace.
    If present, walk the live ClassDeclarationMirror into a per-class
    {path -> source} Map and store it under the class's simple name in
@@ -331,8 +331,10 @@ class HopscotchWebIDE packageUsing: manifest = (
 			
 			| result |
 			result:: Map new.
-			builders do: [:b <ClassDeclarationBuilder> |
-					| className liveClass perClass |
+			1 to: builders size
+				do: [:index |
+					| b <ClassDeclarationBuilder> = builders at: index. className liveClass perClass prefix |
+					prefix:: prefixes at: index.
 					className:: b name asString.
 					liveClass:: namespace at: b name
 						ifAbsent: [ namespace at: className ifAbsent: [ nil ] ].
@@ -340,9 +342,9 @@ class HopscotchWebIDE packageUsing: manifest = (
 							[
 								perClass:: Map new.
 								walkClassDecl: (platformHolder mirrors ClassMirror reflecting: liveClass) mixin declaration
-									intoPath: ''
+									intoPath: prefix
 									files: perClass.
-								result at: className put: perClass
+								result at: prefix , className put: perClass
 							] on: Exception
 								do: [:ex |
 									
@@ -389,21 +391,48 @@ class HopscotchWebIDE packageUsing: manifest = (
      returns 'Foo/'; for D nested in Foo returns 'Foo/D/'. Shared by all
      draftPathFor*: helpers. *)
 			
-			| classes path c |
+			| classes path c rawMixin platformName |
 			classes:: List new.
 			c:: cdm.
 			[ c isNil ] whileFalse: [
 					classes add: c.
 					c:: c enclosingClass
 				].
-			path:: ''.
+			
+			(* A platform module's members are under platform/<P>/ (draftPrefixFor:in:). *)
+			rawMixin:: [
+				((platformHolder mirrors ObjectMirror reflecting: classes last instanceSide) getSlot: #mixin) reflectee
+			] on: Exception do: [:e | nil ].
+			platformName:: platformHolding: rawMixin.
+			path:: nil = platformName ifTrue: [ '' ]
+				ifFalse: [ 'platform/' , platformName , '/' ].
 			classes size to: 1
 				by: -1
 				do: [:i | path:: path , (classes at: i) simpleName asString , '/' ].
 			^path
 		)
+		draftPrefixFor: b <ClassDeclarationBuilder> in: namespace ^<String> = (
+			(* Where a top-level class's members live in drafts and in a repository: 'platform/<P>/' for platform P's module -- installed into P's namespace, or held there as well as in Root -- else ''. *)
+			
+			| platformName |
+			platformNamespaceNames do: [:name |
+					(namespacing Root at: name asSymbol ifAbsent: [ nil ]) == namespace ifTrue: [
+							^'platform/' , name , '/'
+						]
+				].
+			platformName:: platformHolding: (existingMixinOf: b).
+			^nil = platformName ifTrue: [ '' ]
+				ifFalse: [ 'platform/' , platformName , '/' ]
+		)
 		public encodeForFilename: s <String> ^<String> = (
 			^replaceIn: (replaceIn: s all: '%' with: '%25') all: '/' with: '%2F'
+		)
+		existingMixinOf: b <ClassDeclarationBuilder> ^<Mixin | Nil> = (
+			(* The low-level mixin a builder was made from (its intermediate's existingMixin), or nil for a new class or where mirrors differ. *)
+			
+			^[
+				((platformHolder mirrors ObjectMirror reflecting: b) getSlot: #intermediate) reflectee existingMixin
+			] on: Exception do: [:e | nil ]
 		)
 		public freshTypechecker = (
 			(* Returns a freshly-constructed typechecker. Menu actions call this
@@ -428,13 +457,17 @@ class HopscotchWebIDE packageUsing: manifest = (
 			
 			(* Make sure all builders are top level *)
 			
-			| lastBackup <Map[Symbol, String]> = backup. builders <Array[ClassDeclarationBuilder]> = bs collect: [:b <ClassDeclartionBuilder> |
+			| routed = 
+			(* A platform module that is not the running platform's lives in its platform's Root namespace, not Root itself (PLATFORM_NAMESPACES_DESIGN_2026-11-18.md): installing it into Root would match Root's module of the same name -- the running platform's -- and replace that one. Such builders install by a recursive send into their platform's namespace; the rest go on here. *)
+			routeToPlatforms: bs from: namespace. lastBackup <Map[Symbol, String]> = backup. builders <Array[ClassDeclarationBuilder]> = (routed at: 2) collect: [:b <ClassDeclartionBuilder> |
 					topMostBuilderOf: b
-				]. baselines = 
+				]. draftPrefixes = 
+			(* Each class's place in drafts, computed before installing: 'platform/<P>/' for a platform module, else ''. *)
+			builders collect: [:b | draftPrefixFor: b in: namespace ]. baselines = 
 			(* Snapshot the live per-class state BEFORE installing so the drafts
      hook can compare against drafts' latest commit and emit a Baseline
      or Resync commit when needed. Synchronous walk; cheap. *)
-			computeBaselinesFor: builders inNamespace: namespace. typeSnapshots = 
+			computeBaselinesFor: builders inNamespace: namespace prefixes: draftPrefixes. typeSnapshots = 
 			(* Typechecker hook, part 1: snapshot the declarations about to be
      replaced, so the post-install diff can drive incremental re-checking.
      Guarded: a typechecker failure must never prevent an install --
@@ -477,7 +510,9 @@ class HopscotchWebIDE packageUsing: manifest = (
 			(* Drafts hook (git-as-infinite-undo): record per-member commits in the
      hidden drafts repo. Fire-and-forget; failures are logged to the console
      but don't fail the install. *)
-			recordAcceptForBuilders: builders baselines: baselines.
+			recordAcceptForBuilders: builders
+				baselines: baselines
+				prefixes: draftPrefixes.
 			
 			(* AI hook: every code install funnels through here — editor accepts
      and changeset applies alike — so this is the one place to tell the
@@ -486,7 +521,7 @@ class HopscotchWebIDE packageUsing: manifest = (
      logged. *)
 			[ aiSupport noteCodebaseChangedFor: builders ] on: Exception
 				do: [:e | noteSwallowed: e in: 'notifying AI chats of the install' ].
-			^mixins
+			^(routed at: 1) , mixins
 		)
 		lastBackupTime ^<Integer> = (
 			| backupString <String> = [ localStorage getItem: #lastBackupTime ] on: Error
@@ -608,16 +643,12 @@ class HopscotchWebIDE packageUsing: manifest = (
 			
 			0 to: (jsArray at: 'length') - 1
 				do: [:i |
-					| p slashIdx topLevel block bucket |
+					| p |
 					p:: jsArray at: i.
-					slashIdx:: p indexOf: '/' startingAt: 1.
-					slashIdx = 0 ifFalse: [
-							topLevel:: p copyFrom: 1 to: slashIdx - 1.
-							block:: pathsByClass at: topLevel ifAbsent: [ nil ].
-							nil = block ifFalse: [
-									bucket:: block at: key.
-									bucket add: p
-								]
+					
+					(* A class's paths start with its name, or with platform/<P>/ and its name for a platform module. *)
+					pathsByClass keysAndValuesDo: [:className :block |
+							(p startsWith: className , '/') ifTrue: [ (block at: key) add: p ]
 						]
 				]
 		)
@@ -662,6 +693,28 @@ class HopscotchWebIDE packageUsing: manifest = (
 				].
 			^qualifier isEmpty ifTrue: [ memberKindOf: segments last ]
 				ifFalse: [ qualifier , ' ' , (memberKindOf: segments last) ]
+		)
+		platformHolding: aMixin ^<String | Nil> = (
+			(* The platform whose Root namespace holds a class with this (low-level) mixin, or nil. *)
+			
+			nil = aMixin ifTrue: [ ^nil ].
+			platformNamespaceNames do: [:platformName |
+					| ns |
+					ns:: namespacing Root at: platformName asSymbol ifAbsent: [ nil ].
+					nil = ns ifFalse: [
+							ns keysAndValuesDo: [:name :c |
+									(c isKindOfBehavior and: [ (rawMixinOf: c) == aMixin ]) ifTrue: [
+											^platformName
+										]
+								]
+						]
+				].
+			^nil
+		)
+		platformNamespaceNames ^<Array[String]> = (
+			(* Root's platform namespaces (PLATFORM_NAMESPACES_DESIGN_2026-11-18.md). *)
+			
+			^{'Eurasia'. 'JS'. 'PrimordialSoup'. }
 		)
 		populateIconNamespace: ns <Namespace> ^<Namespace> = (
 			^ns at: 'accept16px' put: images accept16px;
@@ -783,7 +836,14 @@ class HopscotchWebIDE packageUsing: manifest = (
 			
 			^{'AccessModifierTesting'. 'AccessModifierTestingConfiguration'. 'ActivationMirrorTesting'. 'ActivationMirrorTestingConfiguration'. 'JSON'. 'JSTesting'. 'JSTestingConfiguration'. 'IntermediatesForPrimordialSoup'. 'Host'. 'JavascriptGeneration'. 'KernelTests'. 'KernelTestsConfiguration'. 'MetadataParsing'. 'Minitest'. 'MinitestTests'. 'MinitestTestsConfiguration'. 'MirrorBuilderTesting'. 'MirrorBuilderTestingConfiguration'. 'MirrorTesting'. 'MirrorTestingConfiguration'. 'MirrorTestingModel'. 'NewspeakASTs'. 'NewspeakCompilation'. 'NewspeakPredictiveParsing'. 'WebCompiler'. }
 		)
-		recordAcceptForBuilders: builders <Array[ClassDeclarationBuilder]> baselines: baselineMap <Map[String, Map[String, String]]> = (
+		rawMixinOf: aClass ^<Mixin | Nil> = (
+			(* The low-level mixin of a class: its MixinMirror's (psoup's and Eurasia's mirrors keep it in the slot mixin); nil where mirrors differ. *)
+			
+			^[
+				((platformHolder mirrors ObjectMirror reflecting: (platformHolder mirrors ClassMirror reflecting: aClass) mixin) getSlot: #mixin) reflectee
+			] on: Exception do: [:e | nil ]
+		)
+		recordAcceptForBuilders: builders <Array[ClassDeclarationBuilder]> baselines: baselineMap <Map[String, Map[String, String]]> prefixes: prefixes <Array[String]> = (
 			(* Per-member drafts hook. Builds the Accept files map by walking every
    touched top-level builder, then chains:
      1. For each touched class with a baseline: check whether drafts'
@@ -799,10 +859,11 @@ class HopscotchWebIDE packageUsing: manifest = (
 			touchedPrefixes:: List new.
 			touchedNames:: List new.
 			classNamesInOrder:: List new.
-			builders do: [:b <ClassDeclarationBuilder> |
-					| name |
-					name:: b name asString.
-					walkClassDecl: b intoPath: '' files: acceptFiles.
+			1 to: builders size
+				do: [:index |
+					| b <ClassDeclarationBuilder> = builders at: index. name |
+					name:: (prefixes at: index) , b name asString.
+					walkClassDecl: b intoPath: (prefixes at: index) files: acceptFiles.
 					touchedPrefixes add: name , '/'.
 					touchedNames add: name.
 					classNamesInOrder add: name
@@ -883,6 +944,33 @@ class HopscotchWebIDE packageUsing: manifest = (
 		   hatch for a clean re-typecheck. *)
 			
 			typechecker clearQueryState
+		)
+		routeToPlatforms: bs <Array[ClassDeclarationBuilder]> from: namespace ^<{List[MixinMirror]. Array[ClassDeclarationBuilder]}> = (
+			(* Install the builders whose existing class is a platform module held only in its platform's Root namespace (not also Root's own entry of that name, as the running platform's modules are) into that namespace. Answers the mirrors installed so and the builders left to install into namespace. Only installs into Root are routed. *)
+			
+			| installed rest byPlatform |
+			installed:: List new.
+			namespace == namespacing Root ifFalse: [ ^{installed. bs. } ].
+			rest:: List new.
+			byPlatform:: Map new.
+			bs do: [:b0 |
+					| b existing platformName here |
+					b:: topMostBuilderOf: b0.
+					existing:: existingMixinOf: b.
+					platformName:: platformHolding: existing.
+					here:: namespace at: b name ifAbsent: [ nil ].
+					(nil = platformName or: [
+							here isKindOfBehavior and: [ (rawMixinOf: here) == existing ]
+						]) ifTrue: [ rest add: b0 ]
+						ifFalse: [
+							(byPlatform at: platformName ifAbsentPut: [ List new ]) add: b0
+						]
+				].
+			byPlatform keysAndValuesDo: [:platformName :list |
+					installed addAll: (installFromBuilders: list asArray
+							into: (namespace at: platformName asSymbol))
+				].
+			^{installed. rest asArray. }
 		)
 		seedBootstrapNamespacesInto: namespace <Namespace> = (
 			(* Pre-populate two sub-namespaces in Root reflecting which top-

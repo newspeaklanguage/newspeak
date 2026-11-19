@@ -185,8 +185,10 @@ for (const [name, act, expected, doc = DOC] of scenarios) {
     await act();
     const got = await source();
     const agrees = await js("emmanuelAgrees");
-    const ok = (expected === null ? got !== doc : got === expected) && agrees;
+    const stuck = (await js("emmanuelFailed")) && !name.includes("unparsable");
+    const ok = (expected === null ? got !== doc : got === expected) && agrees && !stuck;
     if (!agrees) console.log("     the incremental parse disagrees with the whole parse");
+    if (stuck) console.log("     the source no longer interprets: the editor is dimmed and stuck");
     if (!ok) failures++;
     console.log(`${ok ? "PASS" : "FAIL"} ${name}\n     ${JSON.stringify(got)}${ok || expected === null ? "" : "\n want " + JSON.stringify(expected)}`);
   } catch (e) {
@@ -213,6 +215,115 @@ console.log(`${scenarios.length - failures}/${scenarios.length} scenarios passed
 
 // Timing: with source files given, the time of a keystroke in each, typed
 // at the start of its first paragraph's text.
+// The raw view: a live-view edit is written into the code editor as the
+// range that differs. Its offsets must be the code editor's (UTF-16), not
+// psoup's (UTF-8 bytes), and the range whole characters, or the raw view
+// garbles the source and hands the garbled text back as the user's edit.
+{
+  const nb = "\u00a0", cases = [
+    ["a" + nb + "b [x] c", "a" + nb + "b [x] cQ"],
+    ["a" + nb + "b [x] c", "a" + nb + "bQ [x] c"],
+    ["x" + nb + "y", "x\u00a9y"],
+    ["caf\u00e9 \u2014 na\u00efve", "caf\u00e9 \u2014 na\u00efveté"],
+    ["\u{1F600} smile \u{1F600}", "\u{1F600} smiles \u{1F600}"],
+    ["\u2018quoted\u2019 text", "\u2018quote\u2019 text"],
+  ];
+  let bad = 0;
+  for (const [old, now] of cases) {
+    await js(`emmanuelCodeMirrorWrite(${JSON.stringify(old)}, ${JSON.stringify(now)})`);
+    const got = await js("emmanuelCodeMirrorText");
+    if (got !== now) { bad++; console.log(`     raw view: wrote ${JSON.stringify(now)} over ${JSON.stringify(old)}, holds ${JSON.stringify(got)}`); }
+  }
+  if (bad) failures++;
+  console.log(`raw view: ${cases.length - bad}/${cases.length} writes from the live view kept exactly`);
+}
+
+// Links: every place a click can put the caret in a document with links,
+// and every key there. No edit may leave the source uninterpretable (the
+// editor would dim and refuse all further edits), raise, or disagree.
+await js(`
+  window.places = () => {
+    const root = document.body.firstChild; const out = [];
+    const walk = (node) => {
+      if (node.nodeType === 1 && node.getAttribute('contenteditable') === 'false') return;
+      if (node.nodeType === 1 && node.tagName === 'STYLE') return;
+      const size = node.nodeType === 3 ? node.length : node.childNodes.length;
+      for (let k = 0; k <= size; k++) out.push([node, k]);
+      if (node.nodeType === 1) for (const c of node.childNodes) walk(c);
+    };
+    walk(root); return out;
+  };
+  window.placeCaret = (i) => {
+    const [node, k] = places()[i];
+    document.body.firstChild.focus(); const r = document.createRange(); r.setStart(node, k); r.collapse(true);
+    getSelection().removeAllRanges(); getSelection().addRange(r);
+    return node.nodeType === 3 ? JSON.stringify(node.data) + '@' + k
+      : '<' + node.tagName + ' ' + (node.getAttribute('data-steps') || '') + '>@' + k;
+  };
+  true`);
+const LINK_DOCS = [
+  LINK_LIST,
+  "[\\paragraph\\]See [\\link: 'x.html'\\]the link[\\endLink\\] here.[\\endParagraph\\]",
+  "[\\paragraph. link: 'x.html'\\]whole[\\endLink. endParagraph\\][\\paragraph\\]next[\\endParagraph\\]",
+  "[\\paragraph\\]a [\\link: 'x.html'\\]b [\\strong\\]c[\\endStrong\\] d[\\endLink\\] e[\\endParagraph\\]",
+];
+{
+  const actions = [["Q", () => type("Q")], ["Enter", () => key("Enter")], ["Backspace", () => key("Backspace")],
+                   ["Delete", () => key("Delete")], ["space", () => type(" ")], ["QQ", () => type("QQ")],
+                   ["Backspace x2", async () => { await key("Backspace"); await key("Backspace"); }]];
+  const errors = [];
+  let tried = 0;
+  for (const doc of LINK_DOCS) {
+    await js(`emmanuelLoad(${JSON.stringify(doc)})`);
+    const count = await js("places().length");
+    for (let i = 0; i < count; i++) {
+      for (const [label, act] of actions) {
+        await js(`emmanuelLoad(${JSON.stringify(doc)})`);
+        const where = await js(`placeCaret(${i})`);
+        const before = consoleLines.length;
+        await act();
+        tried++;
+        const got = await source();
+        const agrees = await js("emmanuelAgrees");
+        const stuck = await js("emmanuelFailed");
+        const said = consoleLines.slice(before).filter((l) => l.includes("Emmanuel editor") || l.includes("Exception"));
+        if (said.length || !agrees || stuck)
+          errors.push(`${label} at ${where} in ${JSON.stringify(doc)}: ${agrees ? "" : "DISAGREES "}${stuck ? "STUCK " + JSON.stringify(got) + " " : ""}${said.join(" | ").slice(0, 300)}`);
+      }
+    }
+  }
+  // Selections: from one place to a later one, then a key.
+  const selActions = [["Q", () => type("Q")], ["Backspace", () => key("Backspace")], ["Enter", () => key("Enter")]];
+  for (const doc of LINK_DOCS) {
+    await js(`emmanuelLoad(${JSON.stringify(doc)})`);
+    const count = await js("places().length");
+    for (let i = 0; i < count; i += 2) {
+      for (let j = i + 1; j < count; j += 3) {
+        const [label, act] = selActions[(i + j) % selActions.length];
+        await js(`emmanuelLoad(${JSON.stringify(doc)})`);
+        const where = await js(`(() => { const ps = places(); const [a, ka] = ps[${i}]; const [b, kb] = ps[${j}];
+          const r = document.createRange(); r.setStart(a, ka); r.setEnd(b, kb);
+          if (r.collapsed) return null;
+          document.body.firstChild.focus(); getSelection().removeAllRanges(); getSelection().addRange(r);
+          return JSON.stringify(getSelection().toString()); })()`);
+        if (where === null) continue;
+        const before = consoleLines.length;
+        await act();
+        tried++;
+        const got = await source();
+        const agrees = await js("emmanuelAgrees");
+        const stuck = await js("emmanuelFailed");
+        const said = consoleLines.slice(before).filter((l) => l.includes("Emmanuel editor") || l.includes("Exception"));
+        if (said.length || !agrees || stuck)
+          errors.push(`${label} over ${where} (places ${i}..${j}) in ${JSON.stringify(doc)}: ${agrees ? "" : "DISAGREES "}${stuck ? "STUCK " + JSON.stringify(got) + " " : ""}${said.join(" | ").slice(0, 300)}`);
+      }
+    }
+  }
+  if (errors.length) failures++;
+  console.log(`links: ${tried - errors.length}/${tried} edits without error`);
+  for (const m of errors.slice(0, 40)) console.log("       " + m);
+}
+
 for (const path of process.argv.slice(4)) {
   const fs = await import("node:fs");
   const text = fs.readFileSync(path, "utf8");
@@ -294,8 +405,9 @@ for (const path of process.argv.slice(4)) {
     actsTried++;
     await js("emmanuelRead(0)");
     const agrees = await js("emmanuelAgrees");
+    const stuck = await js("emmanuelFailed");
     const said = consoleLines.slice(before).filter((l) => l.includes("Emmanuel editor") || l.includes("Exception"));
-    if (said.length || !agrees) errors.push(`${label} at ${where}: ${agrees ? "" : "DISAGREES "}${said.join(" | ").slice(0, 300)}`);
+    if (said.length || !agrees || stuck) errors.push(`${label} at ${where}: ${agrees ? "" : "DISAGREES "}${stuck ? "STUCK " + JSON.stringify((await source()).slice(0, 200)) + " " : ""}${said.join(" | ").slice(0, 300)}`);
   }
   if (errors.length) failures++;
   console.log(`keys ${path.split("/").pop()}: ${actsTried - errors.length}/${actsTried} without error`);

@@ -25,7 +25,7 @@ spec.loader.exec_module(corpus)
 def main():
     work = Path(sys.argv[1]).resolve()
     work.mkdir(parents=True, exist_ok=True)
-    corpus.build("EmmanuelEditorProbeApp", "EmmanuelEditorProbe.vfuel")
+    corpus.build("EmmanuelEditorProbeApp", "EmmanuelEditorProbe.vfuel", tree=("HopscotchForHTML5.ns",))
     chrome = subprocess.Popen([corpus.CHROME, "--headless=new", "--disable-gpu", "--no-sandbox", "--no-first-run",
                                f"--remote-debugging-port={corpus.PORT}", f"--user-data-dir={work / 'chrome-profile'}",
                                "about:blank"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

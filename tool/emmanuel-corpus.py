@@ -51,11 +51,13 @@ def documents_in(name, data, out):
             documents_in(name + "/" + parts[2][:-4], archive.read(entry), out)
 
 
-def build(app="EmmanuelCorpusApp", snapshot="EmmanuelCorpus.vfuel"):
-    # The Emmanuel modules come from the source tree, not from out/, which
-    # may hold older copies (an IDE build copies the tree there).
-    sources = [str(p) for p in sorted(OUT.glob("*.ns")) if not p.name.startswith("Emmanuel")]
+def build(app="EmmanuelCorpusApp", snapshot="EmmanuelCorpus.vfuel", tree=()):
+    # The Emmanuel modules, and those named in tree, come from the source
+    # tree, not from out/, which may hold older copies (an IDE build copies
+    # the tree there).
+    sources = [str(p) for p in sorted(OUT.glob("*.ns")) if not p.name.startswith("Emmanuel") and p.name not in tree]
     sources += [str(p) for p in sorted(NEWSPEAK.glob("Emmanuel*.ns"))]
+    sources += [str(NEWSPEAK / name) for name in tree]
     sources += [str(p) for p in sorted(OUT.glob("platform/*/*.ns"))]
     images = [str(p) for p in sorted(OUT.glob("*.png"))]
     target = OUT / snapshot

@@ -1,0 +1,764 @@
+Newspeak3
+'Emmanuel'
+class EmmanuelFromHTML usingPlatform: p emmanuel: em = (
+	(* Converts HTML, such as the body of an Ampleforth document, to an Emmanuel
+source that uses the standard block library (EmmanuelBlocks).
+
+The converter reads a tree of Elements and Texts. fromDOM: builds one from
+a browser DOM node, and fromHTML: from a string, with the browser's own HTML
+parser; tests build trees directly.
+
+The mapping. Headings become the title (an h1 before any other content) and
+sections, nested by heading level; p, and runs of inline content in other
+blocks, become paragraphs; i and em become emphasis, b and strong strong,
+code, tt, kbd and samp inline code; br is a newline, and two or more in a
+row end the paragraph. ul and ol become lists, blockquote a quote, table a
+table (a row of th cells is a header row), pre a verbatim display (or a code
+block when it holds code). div and the other presentational containers are
+transparent. An anchor with a target becomes a link around its text.
+
+An amplet becomes amplet: with its expression in a block, which the view
+runs: a display in flow content, an inline leaf in a paragraph.
+
+What the library has no block for is never silently dropped: it is reported
+as a Loss. Images, rules, and unknown elements are kept as html: displays of
+their HTML; presentational styling is dropped; scripts and styles are dropped. The report tells which of these the
+documents use, and how often. *)
+	
+	|
+		private List = p collections List.
+		private Map = p collections Map.
+		private emmanuel = em.
+		private DOMParser = p hopscotch DOMParser.
+	|
+) (
+	public class Conversion source: s losses: ls = (
+		(* The result of a conversion: the Emmanuel source and what was lost. *)
+		
+		|
+			public source = s.
+			public losses = ls.
+		|
+	) (
+		public report = (
+			(* The number of losses of each kind. *)
+			
+			| counts = Map new. |
+			losses do: [:l |
+					counts at: l kind put: (counts at: l kind ifAbsent: [ 0 ]) + 1
+				].
+			^counts
+		)
+	) : ()
+	class Converter literal: isLiteral = (
+		(* The state of one conversion. Statements are collected in pending
+and written as one bracket when text, or the end, follows. A literal
+conversion is of the inline content of a markup literal, such as a
+heading's: it never ends a paragraph or writes a display. *)
+		
+		|
+			out = List new.
+			pending = List new.
+			public losses = List new.
+			inParagraph ::= isLiteral.
+			paragraphEmpty ::= true.
+			breaks ::= 0.
+			inlineDepth ::= 0.
+			flowDepth ::= 0.
+			cellDepth ::= -1.
+			inLink ::= false.
+			sections = List new.
+			titleTaken ::= false.
+			contentSeen ::= false.
+			textAtEnd ::= false.
+			literal = isLiteral.
+		|
+	) (
+		amplet: n = (
+			(* An amplet in flow content: a display; directly in a table cell,
+where an amplet is inline, it goes in a paragraph. *)
+			
+			| s = ampletStatement: n. |
+			s isNil ifTrue: [ ^self ].
+			flowDepth = cellDepth ifTrue: [ ^inlineAmplet: n ].
+			closeParagraph.
+			send: s.
+			contentSeen:: true.
+			lineBreak
+		)
+		ampletStatement: n = (
+			(* amplet: with the amplet's expression in a block, which the view
+runs; nil, and a loss, when it has no expression. *)
+			
+			| code = (isMediaImage: n) ifTrue: [ mediaCode: n ]
+				ifFalse: [ n attribute: 'name' ]. |
+			(code isNil or: [ isBlank: code ]) ifTrue: [
+					lose: 'amplet without code' detail: (detailOf: n).
+					^nil
+				].
+			^'amplet: [' , code , ']'
+		)
+		applyBreaks = (
+			(* Before content: one pending br is a newline; two or more end
+the paragraph, unless it cannot end here. *)
+			
+			| n = breaks. |
+			breaks:: 0.
+			n = 0 ifTrue: [ ^self ].
+			(n >= 2 and: [ inlineDepth = 0 and: [ literal not ] ]) ifTrue: [
+					closeParagraph.
+					^openParagraph
+				].
+			n timesRepeat: [ send: 'newline' ]
+		)
+		block: n = (
+			(* A block-level element in flow content. *)
+			
+			| tag = n tag. |
+			(isAmplet: n) ifTrue: [ ^amplet: n ].
+			tag = 'p' ifTrue: [
+					closeParagraph.
+					inlineChildren: n.
+					^closeParagraph
+				].
+			({'h1'. 'h2'. 'h3'. 'h4'. 'h5'. 'h6'. } includes: tag) ifTrue: [
+					^heading: n level: (headingLevel: tag)
+				].
+			tag = 'ul' ifTrue: [ ^list: n opener: 'list' closer: 'endList' ].
+			tag = 'ol' ifTrue: [
+					^list: n opener: 'numberedList' closer: 'endNumberedList'
+				].
+			tag = 'blockquote' ifTrue: [
+					^container: n opener: 'quote' closer: 'endQuote'
+				].
+			tag = 'pre' ifTrue: [ ^pre: n ].
+			tag = 'table' ifTrue: [ ^table: n ].
+			(transparentBlocks includes: tag) ifTrue: [
+					closeParagraph.
+					flow: n children.
+					^closeParagraph
+				].
+			(droppedTags includes: tag) ifTrue: [ ^lose: tag detail: (detailOf: n) ].
+			keep: n as: tag detail: (detailOf: n)
+		)
+		closeParagraph = (
+			(inParagraph not or: [ literal ]) ifTrue: [ ^self ].
+			(pending isEmpty and: [ textAtEnd ]) ifTrue: [ trimTrailingSpace ].
+			send: 'endParagraph'.
+			inParagraph:: false.
+			breaks:: 0.
+			lineBreak
+		)
+		container: n opener: o closer: c = (
+			closeParagraph.
+			send: o.
+			contentSeen:: true.
+			flowDepth:: flowDepth + 1.
+			flow: n children.
+			closeParagraph.
+			flowDepth:: flowDepth - 1.
+			send: c.
+			lineBreak
+		)
+		display: html = (
+			closeParagraph.
+			send: 'html: ' , (stringLiteral: html).
+			contentSeen:: true.
+			lineBreak
+		)
+		emitText: s = (
+			| cps ::= emmanuel collapse: (emmanuel codePointsOf: s). |
+			(paragraphEmpty or: [ inParagraph not ]) ifTrue: [ cps:: stripLeading: cps ].
+			cps isEmpty ifTrue: [ ^self ].
+			ensureParagraph.
+			applyBreaks.
+			flush.
+			out add: (emmanuel stringOfCodePoints: (emmanuel esc: cps)).
+			paragraphEmpty:: false.
+			contentSeen:: true.
+			textAtEnd:: true
+		)
+		ensureParagraph = (
+			inParagraph ifTrue: [ ^self ].
+			openParagraph
+		)
+		flow: nodes = (
+			nodes do: [:n | flowNode: n ]
+		)
+		flowNode: n = (
+			n isText ifTrue: [
+					((isBlank: n text) and: [ inParagraph not ]) ifTrue: [ ^self ].
+					^emitText: n text
+				].
+			n tag = 'br' ifTrue: [
+					inParagraph ifTrue: [ breaks:: breaks + 1 ].
+					^self
+				].
+			((isAmplet: n) and: [ inParagraph ]) ifTrue: [ ^inlineAmplet: n ].
+			((inlineTags includes: n tag) and: [ (isAmplet: n) not ]) ifTrue: [
+					^inline: n
+				].
+			block: n
+		)
+		flush = (
+			pending isEmpty ifTrue: [ ^self ].
+			out add: '[\' , (join: pending asArray with: '. ') , '\]'.
+			pending removeAll.
+			textAtEnd:: false
+		)
+		heading: n level: level = (
+			| arg = headingArgument: n. |
+			arg isNil ifTrue: [ ^self ].
+			(flowDepth > 0 or: [ literal ]) ifTrue: [
+					lose: 'heading in a block' detail: (detailOf: n).
+					closeParagraph.
+					ensureParagraph.
+					wrap: n opener: 'strong' closer: 'endStrong'.
+					^closeParagraph
+				].
+			closeParagraph.
+			(level = 1 and: [ titleTaken not and: [ contentSeen not ] ]) ifTrue: [
+					titleTaken:: true.
+					send: 'title: ' , arg.
+					contentSeen:: true.
+					^lineBreak
+				].
+			[ sections isEmpty not and: [ sections last >= level ] ] whileTrue: [
+					send: 'endSection'.
+					sections removeLast
+				].
+			send: 'section: ' , arg.
+			sections add: level.
+			contentSeen:: true.
+			lineBreak
+		)
+		headingArgument: n = (
+			(* The argument of title: or section:: a markup literal, which the
+live view can edit as text; nil when the heading is empty. *)
+			
+			| inner = Converter literal: true. text |
+			(n children allSatisfy: [:c | c isText or: [ c tag = 'br' ] ]) ifTrue: [
+					text:: stripTrailing: (stripLeading: (emmanuel collapse: (emmanuel codePointsOf: (textOf: n)))).
+					text isEmpty ifTrue: [ ^nil ].
+					^'[\' , (emmanuel stringOfCodePoints: (emmanuel esc: text)) , '\]'
+				].
+			inner inlineChildren: n.
+			losses addAll: inner losses.
+			(isBlank: inner source) ifTrue: [ ^nil ].
+			^'[\' , inner source , '\]'
+		)
+		inline: n = (
+			(* An inline element. *)
+			
+			| tag = n tag. |
+			(isEmptyInline: n) ifTrue: [ ^self ].
+			ensureParagraph.
+			({'i'. 'em'. } includes: tag) ifTrue: [
+					^wrap: n opener: 'emphasis' closer: 'endEmphasis'
+				].
+			({'b'. 'strong'. } includes: tag) ifTrue: [
+					^wrap: n opener: 'strong' closer: 'endStrong'
+				].
+			({'code'. 'tt'. 'kbd'. 'samp'. } includes: tag) ifTrue: [
+					^wrap: n opener: 'code' closer: 'endCode'
+				].
+			tag = 'a' ifTrue: [ ^link: n ].
+			({'u'. 's'. 'strike'. 'sub'. 'sup'. 'mark'. } includes: tag) ifTrue: [
+					lose: tag detail: (detailOf: n)
+				].
+			(n attribute: 'style') isNil ifFalse: [
+					lose: 'style attribute' detail: (detailOf: n)
+				].
+			inlineChildren: n
+		)
+		inlineAmplet: n = (
+			(* An amplet in inline content: an inline leaf of the paragraph. *)
+			
+			| s = ampletStatement: n. |
+			s isNil ifTrue: [ ^self ].
+			ensureParagraph.
+			applyBreaks.
+			send: s.
+			paragraphEmpty:: false.
+			contentSeen:: true
+		)
+		public inlineChildren: n = (
+			n children do: [:c | inlineNode: c ]
+		)
+		inlineNode: n = (
+			n isText ifTrue: [ ^emitText: n text ].
+			n tag = 'br' ifTrue: [
+					breaks:: breaks + 1.
+					^self
+				].
+			((inlineTags includes: n tag) and: [ (isAmplet: n) not ]) ifTrue: [
+					^inline: n
+				].
+			(isAmplet: n) ifTrue: [ ^inlineAmplet: n ].
+			(inlineDepth = 0 and: [ literal not ]) ifTrue: [ ^block: n ].
+			(transparentBlocks includes: n tag) ifFalse: [
+					lose: 'block in inline content' detail: (detailOf: n)
+				].
+			breaks:: breaks max: 1.
+			inlineChildren: n
+		)
+		keep: n as: kind detail: d = (
+			(* What has no block: an html: display of its HTML, and a Loss. *)
+			
+			lose: kind detail: d.
+			(inlineDepth > 0 or: [ literal ]) ifTrue: [ ^self ].
+			display: (htmlOf: n)
+		)
+		lineBreak = (
+			(* A line break in the source between blocks, for readability; it
+is white space in flow content, so it adds nothing. *)
+			
+			flowDepth = 0 ifFalse: [ ^self ].
+			literal ifTrue: [ ^self ].
+			flush.
+			out add: (emmanuel stringOfCodePoints: {10. }).
+			textAtEnd:: false
+		)
+		link: n = (
+			(* An anchor: a link around its text when it has a target; inside
+another link, only its text. *)
+			
+			| href = n attribute: 'href'. |
+			(href isNil or: [ isBlank: href ]) ifTrue: [ ^inlineChildren: n ].
+			inLink ifTrue: [
+					lose: 'link in a link' detail: href.
+					^inlineChildren: n
+				].
+			inLink:: true.
+			wrap: n opener: 'link: ' , (stringLiteral: href) closer: 'endLink'.
+			inLink:: false
+		)
+		list: n opener: o closer: c = (
+			closeParagraph.
+			send: o.
+			contentSeen:: true.
+			flowDepth:: flowDepth + 1.
+			n children do: [:child |
+					child isText ifTrue: [
+							(isBlank: child text) ifFalse: [
+									lose: 'list content outside an item' detail: child text.
+									listItem: {child. }
+								]
+						]
+						ifFalse: [
+							child tag = 'li' ifTrue: [ listItem: child children ]
+								ifFalse: [
+									lose: 'list content outside an item' detail: (detailOf: child).
+									listItem: {child. }
+								]
+						]
+				].
+			flowDepth:: flowDepth - 1.
+			send: c.
+			lineBreak
+		)
+		listItem: nodes = (
+			send: 'item'.
+			flow: nodes.
+			closeParagraph.
+			send: 'endItem'
+		)
+		lose: kind detail: d = (
+			losses add: (Loss kind: kind detail: d)
+		)
+		openParagraph = (
+			send: 'paragraph'.
+			inParagraph:: true.
+			paragraphEmpty:: true
+		)
+		pre: n = (
+			| text = textOf: n. code = n children anySatisfy: [:c |
+					c isText not and: [ c tag = 'code' ]
+				]. |
+			closeParagraph.
+			text isEmpty ifTrue: [ ^self ].
+			send: (code ifTrue: [ 'codeBlock: ' ] ifFalse: [ 'verbatim: ' ]) , (stringLiteral: text).
+			contentSeen:: true.
+			lineBreak
+		)
+		public root: nodes = (
+			(* Convert the flow content of a document. *)
+			
+			flow: nodes.
+			closeParagraph.
+			[ sections isEmpty ] whileFalse: [
+					send: 'endSection'.
+					sections removeLast
+				].
+			flush
+		)
+		send: statement = (
+			pending add: statement
+		)
+		public source = (
+			flush.
+			^join: out asArray with: ''
+		)
+		table: n = (
+			closeParagraph.
+			send: 'table'.
+			contentSeen:: true.
+			flowDepth:: flowDepth + 1.
+			(rowsOf: n) do: [:row |
+					| cells = row children reject: [:c | c isText ]. header = cells isEmpty not and: [
+							cells allSatisfy: [:c | c tag = 'th' ]
+						]. |
+					send: (header ifTrue: [ 'headerRow' ] ifFalse: [ 'row' ]).
+					cells do: [:cell |
+							({'td'. 'th'. } includes: cell tag) ifTrue: [
+									| saved = cellDepth. |
+									send: 'cell'.
+									cellDepth:: flowDepth.
+									flow: cell children.
+									cellDepth:: saved.
+									closeParagraph.
+									send: 'endCell'
+								]
+								ifFalse: [
+									lose: 'table content outside a cell' detail: (detailOf: cell)
+								]
+						].
+					send: 'endRow'
+				].
+			flowDepth:: flowDepth - 1.
+			send: 'endTable'.
+			lineBreak
+		)
+		trimTrailingSpace = (
+			| last = emmanuel codePointsOf: out last. trimmed = stripTrailing: last. |
+			trimmed size = last size ifTrue: [ ^self ].
+			out removeLast.
+			trimmed isEmpty ifFalse: [ out add: (emmanuel stringOfCodePoints: trimmed) ]
+		)
+		wrap: n opener: o closer: c = (
+			send: o.
+			inlineDepth:: inlineDepth + 1.
+			inlineChildren: n.
+			breaks:: 0.
+			inlineDepth:: inlineDepth - 1.
+			send: c
+		)
+	) : ()
+	public class Element tag: t attributes: as children: cs = (
+		(* An HTML element: its tag (in lower case), its attributes (pairs of
+name and value, in order), and its children (Elements and Texts). *)
+		
+		|
+			public tag = t.
+			public attributes = as.
+			public children = cs.
+		|
+	) (
+		public attribute: name = (
+			attributes do: [:a | (a at: 1) = name ifTrue: [ ^a at: 2 ] ].
+			^nil
+		)
+		public isText = (
+			^false
+		)
+	) : ()
+	public class Loss kind: k detail: d = (
+		(* A construct that has no block in the library: its kind (a tag, or
+a description) and a detail, such as an amplet's expression or a link's
+target. *)
+		
+		|
+			public kind = k.
+			public detail = d.
+		|
+	) (
+	) : ()
+	public class Text text: s = (
+		(* A text node. *)
+		
+		|
+			public text = s.
+		|
+	) (
+		public isText = (
+			^true
+		)
+	) : ()
+	public convert: nodes = (
+		(* The conversion of a sequence of nodes, as flow content. *)
+		
+		| c = Converter literal: false. |
+		c root: nodes.
+		^Conversion source: c source losses: c losses asArray
+	)
+	public convertDocument: root = (
+		(* The conversion of an Ampleforth document: the content of its
+self_ampleforth element, or of root when it has none. *)
+		
+		| body = findClass: 'self_ampleforth' in: root. |
+		^convert: (body isNil ifTrue: [ root children ] ifFalse: [ body children ])
+	)
+	detailOf: n = (
+		| h = htmlOf: n. |
+		h size > 80 ifTrue: [ ^(h copyFrom: 1 to: 80) , '...' ].
+		^h
+	)
+	dotsAsSpaces: s = (
+		^emmanuel stringOfCodePoints: ((emmanuel codePointsOf: s) collect: [:c |
+					c = 46 ifTrue: [ 32 ] ifFalse: [ c ]
+				])
+	)
+	droppedTags = (
+		^{'script'. 'style'. 'link'. 'meta'. 'title'. 'head'. 'noscript'. 'template'. }
+	)
+	escapeHTML: s attribute: inAttribute = (
+		| out = List new. |
+		(emmanuel codePointsOf: s) do: [:c |
+				c = 38 ifTrue: [ out addAll: (emmanuel codePointsOf: '&amp;') ]
+					ifFalse: [
+						c = 60 ifTrue: [ out addAll: (emmanuel codePointsOf: '&lt;') ]
+							ifFalse: [
+								c = 62 ifTrue: [ out addAll: (emmanuel codePointsOf: '&gt;') ]
+									ifFalse: [
+										(inAttribute and: [ c = 34 ]) ifTrue: [
+												out addAll: (emmanuel codePointsOf: '&quot;')
+											]
+											ifFalse: [ out add: c ]
+									]
+							]
+					]
+			].
+		^emmanuel stringOfCodePoints: out asArray
+	)
+	findClass: name in: n = (
+		| found |
+		n isText ifTrue: [ ^nil ].
+		(hasClass: name in: n) ifTrue: [ ^n ].
+		n children do: [:c |
+				found:: findClass: name in: c.
+				found isNil ifFalse: [ ^found ]
+			].
+		^nil
+	)
+	public fromDOM: node = (
+		(* The Element or Text of a DOM node, or nil for other nodes, such as
+comments. *)
+		
+		| type = node at: #nodeType. attrs jsAttrs jsChildren kids |
+		type = 3 ifTrue: [ ^Text text: (node at: #nodeValue) ].
+		type = 1 ifFalse: [ ^nil ].
+		jsAttrs:: node at: #attributes.
+		attrs:: (0 to: (jsAttrs at: #length) - 1) asArray collect: [:i |
+				| a = jsAttrs at: i. |
+				{a at: #name. a at: #value. }
+			].
+		jsChildren:: node at: #childNodes.
+		kids:: List new.
+		0 to: (jsChildren at: #length) - 1
+			do: [:i |
+				| k = fromDOM: (jsChildren at: i). |
+				k isNil ifFalse: [ kids add: k ]
+			].
+		^Element tag: (node at: #localName) attributes: attrs children: kids asArray
+	)
+	public fromHTML: html = (
+		(* The Element of the body of an HTML string, parsed by the browser. *)
+		
+		^fromDOM: ((DOMParser new parseFromString: html mimeType: 'text/html') at: #body)
+	)
+	hasClass: name in: n = (
+		| classes = n attribute: 'class'. |
+		classes isNil ifTrue: [ ^false ].
+		^(words: classes) includes: name
+	)
+	headingLevel: tag = (
+		^(emmanuel codePointsOf: tag) last - 48
+	)
+	public htmlOf: n = (
+		(* The HTML of a node. *)
+		
+		| out ::= ''. |
+		n isText ifTrue: [ ^escapeHTML: n text attribute: false ].
+		out:: '<' , n tag.
+		n attributes do: [:a |
+				out:: out , ' ' , (a at: 1) , '="' , (escapeHTML: (a at: 2) attribute: true) , '"'
+			].
+		out:: out , '>'.
+		(voidTags includes: n tag) ifTrue: [ ^out ].
+		n children do: [:c | out:: out , (htmlOf: c) ].
+		^out , '</' , n tag , '>'
+	)
+	inlineTags = (
+		^{'i'. 'em'. 'b'. 'strong'. 'code'. 'tt'. 'kbd'. 'samp'. 'span'. 'font'. 'a'. 'u'. 's'. 'strike'. 'sub'. 'sup'. 'small'. 'big'. 'mark'. 'abbr'. 'cite'. 'q'. 'var'. 'label'. }
+	)
+	isAmplet: n = (
+		(* An amplet, or an image of the document's media, which is one. *)
+		
+		^(hasClass: 'ampleforth' in: n) or: [ isMediaImage: n ]
+	)
+	isBlank: s = (
+		^(emmanuel codePointsOf: s) allSatisfy: [:c | isWhiteSpace: c ]
+	)
+	isEmptyInline: n = (
+		(* An inline element with no text and nothing visible in it. *)
+		
+		n isText ifTrue: [ ^isBlank: n text ].
+		({'br'. 'img'. } includes: n tag) ifTrue: [ ^false ].
+		(isAmplet: n) ifTrue: [ ^false ].
+		^n children allSatisfy: [:c | isEmptyInline: c ]
+	)
+	isMediaImage: n = (
+		(* An image of the document's media: Ampleforth's legacy form, an img
+whose source is in the document's images folder. *)
+		
+		| src |
+		n isText ifTrue: [ ^false ].
+		n tag = 'img' ifFalse: [ ^false ].
+		src:: n attribute: 'src'.
+		^src isNil not and: [
+				(emmanuel codePointsOf: src) size > 9 and: [
+						(src copyFrom: 1 to: 9) = './images/'
+					]
+			]
+	)
+	isWhiteSpace: c = (
+		^{32. 9. 10. 13. 12. } includes: c
+	)
+	join: strings with: separator = (
+		| out ::= ''. |
+		strings keysAndValuesDo: [:i :s |
+				i > 1 ifTrue: [ out:: out , separator ].
+				out:: out , s
+			].
+		^out
+	)
+	mediaCode: n = (
+		(* The amplet code of a media image: Ampleforth's preferred form,
+mediaFromFileNamed:type: (with width: when it has a width), which finds
+the file in the document's media registry. *)
+		
+		| src = n attribute: 'src'. file = n attribute: 'name'. width = widthOf: n. code |
+		(file isNil or: [ isBlank: file ]) ifTrue: [
+				file:: src copyFrom: 10 to: src size
+			].
+		code:: 'mediaFromFileNamed: ' , (stringLiteral: file) , ' type: ' , (stringLiteral: (mimeTypeOf: file)).
+		width isNil ifFalse: [ code:: code , ' width: ' , (stringLiteral: width) ].
+		^code
+	)
+	mimeTypeOf: file = (
+		| w = words: (dotsAsSpaces: file). ext = w isEmpty ifTrue: [ '' ]
+			ifFalse: [ w last ]. |
+		(ext = 'jpg' or: [ ext = 'jpeg' or: [ ext = 'JPG' or: [ ext = 'JPEG' ] ] ]) ifTrue: [
+				^'image/jpeg'
+			].
+		(ext = 'png' or: [ ext = 'PNG' ]) ifTrue: [ ^'image/png' ].
+		(ext = 'gif' or: [ ext = 'GIF' ]) ifTrue: [ ^'image/gif' ].
+		ext = 'webp' ifTrue: [ ^'image/webp' ].
+		ext = 'svg' ifTrue: [ ^'image/svg+xml' ].
+		^'image'
+	)
+	rowsOf: table = (
+		(* The rows of a table, through its thead, tbody and tfoot. *)
+		
+		| rows = List new. |
+		table children do: [:c |
+				c isText ifFalse: [
+						c tag = 'tr' ifTrue: [ rows add: c ]
+							ifFalse: [
+								({'thead'. 'tbody'. 'tfoot'. } includes: c tag) ifTrue: [
+										rows addAll: (rowsOf: c)
+									]
+							]
+					]
+			].
+		^rows asArray
+	)
+	semicolonsAsSpaces: s = (
+		(* s with each semicolon a space, and the space after each colon
+removed, so that width: 321px is one word. *)
+		
+		| out = List new. cps = emmanuel codePointsOf: s. k ::= 1. |
+		[ k <= cps size ] whileTrue: [
+				| c = cps at: k. |
+				c = 59 ifTrue: [ out add: 32 ] ifFalse: [ out add: c ].
+				(c = 58 and: [ k < cps size and: [ (cps at: k + 1) = 32 ] ]) ifTrue: [
+						k:: k + 1
+					].
+				k:: k + 1
+			].
+		^emmanuel stringOfCodePoints: out asArray
+	)
+	stringLiteral: s = (
+		(* A Newspeak string literal of s. *)
+		
+		| out = List new. |
+		out add: 39.
+		(emmanuel codePointsOf: s) do: [:c |
+				c = 39 ifTrue: [ out add: 39 ].
+				out add: c
+			].
+		out add: 39.
+		^emmanuel stringOfCodePoints: out asArray
+	)
+	stripLeading: cps = (
+		| k ::= 1. |
+		[ k <= cps size and: [ isWhiteSpace: (cps at: k) ] ] whileTrue: [ k:: k + 1 ].
+		^cps copyFrom: k to: cps size
+	)
+	stripTrailing: cps = (
+		| k ::= cps size. |
+		[ k >= 1 and: [ isWhiteSpace: (cps at: k) ] ] whileTrue: [ k:: k - 1 ].
+		^cps copyFrom: 1 to: k
+	)
+	textOf: n = (
+		(* The text of a node and its descendants. *)
+		
+		| out ::= ''. |
+		n isText ifTrue: [ ^n text ].
+		n tag = 'br' ifTrue: [ ^emmanuel stringOfCodePoints: {10. } ].
+		n children do: [:c | out:: out , (textOf: c) ].
+		^out
+	)
+	transparentBlocks = (
+		^{'div'. 'center'. 'section'. 'article'. 'main'. 'header'. 'footer'. 'nav'. 'aside'. 'body'. 'html'. 'li'. 'dl'. 'dt'. 'dd'. 'figure'. 'figcaption'. 'details'. 'summary'. 'form'. }
+	)
+	voidTags = (
+		^{'br'. 'hr'. 'img'. 'input'. 'meta'. 'link'. 'area'. 'base'. 'col'. 'embed'. 'source'. 'track'. 'wbr'. }
+	)
+	widthOf: n = (
+		(* The width of an image, as CSS: its width attribute in pixels, or the
+width in its style; nil when it has none. *)
+		
+		| w = n attribute: 'width'. style = n attribute: 'style'. i rest |
+		(w isNil not and: [ (isBlank: w) not ]) ifTrue: [
+				^((emmanuel codePointsOf: w) allSatisfy: [:c | c between: 48 and: 57 ]) ifTrue: [
+						w , 'px'
+					]
+					ifFalse: [ w ]
+			].
+		style isNil ifTrue: [ ^nil ].
+		(words: (semicolonsAsSpaces: style)) do: [:part |
+				| cps = emmanuel codePointsOf: part. |
+				(cps size > 6 and: [
+						(emmanuel stringOfCodePoints: (cps copyFrom: 1 to: 6)) = 'width:'
+					]) ifTrue: [ ^emmanuel stringOfCodePoints: (cps copyFrom: 7 to: cps size) ]
+			].
+		^nil
+	)
+	words: s = (
+		(* The words of s, separated by white space. *)
+		
+		| out = List new. word = List new. |
+		(emmanuel codePointsOf: s) do: [:c |
+				(isWhiteSpace: c) ifTrue: [
+						word isEmpty ifFalse: [
+								out add: (emmanuel stringOfCodePoints: word asArray).
+								word removeAll
+							]
+					]
+					ifFalse: [ word add: c ]
+			].
+		word isEmpty ifFalse: [ out add: (emmanuel stringOfCodePoints: word asArray) ].
+		^out asArray
+	)
+) : ()

@@ -20,9 +20,10 @@ OUT="${PRIMORDIALSOUP}/out/snapshots/NewspeakLazySlotMigrationApp.vfuel"
 
 "$PSOUP" "$WEBCOMPILER" \
     "${PRIMORDIALSOUP}"/newspeak/*.ns \
+    "${PRIMORDIALSOUP}"/newspeak/platform/PrimordialSoup/*.ns \
     "${NEWSPEAK}/NewspeakLazySlotMigration.ns" \
     "${NEWSPEAK}/NewspeakLazySlotMigrationApp.ns" \
-    RuntimeWithMirrorsForPrimordialSoup NewspeakLazySlotMigrationApp \
+    PrimordialSoup/RuntimeWithMirrors NewspeakLazySlotMigrationApp \
     "$OUT"
 
 if [ -f "$OUT" ]; then

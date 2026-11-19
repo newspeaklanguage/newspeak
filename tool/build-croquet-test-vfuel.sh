@@ -28,6 +28,12 @@ STAGE=${NEWSPEAK}/scratch/croquet-test-stage
 rm -rf "$STAGE" && mkdir -p "$STAGE"
 cp "${PRIMORDIALSOUP}"/newspeak/*.ns "$STAGE"/
 cp "${NEWSPEAK}"/*.ns "${NEWSPEAK}"/*.png "$STAGE"/
+# Platform modules keep their directories (PLATFORM_NAMESPACES_DESIGN_2026-11-18.md).
+for dir in "${PRIMORDIALSOUP}"/newspeak/platform/* "${NEWSPEAK}"/platform/*; do
+    [ -d "$dir" ] || continue
+    mkdir -p "$STAGE/platform/$(basename "$dir")"
+    cp "$dir"/*.ns "$STAGE/platform/$(basename "$dir")/"
+done
 if [ -n "$1" ]; then
     echo "Overlaying $(ls "$1"/*.ns | wc -l | tr -d ' ') file(s) from $1"
     cp "$1"/*.ns "$STAGE"/
@@ -72,8 +78,9 @@ python3 "${NEWSPEAK}"/tool/check-duplicate-modules.py . || exit 1
 "${PRIMORDIALSOUP}"/out/ReleaseX64/primordialsoup \
     "${PRIMORDIALSOUP}"/out/snapshots/WebCompiler.vfuel \
     ./*.ns \
+    $(ls ./platform/*/*.ns) \
     ./*.png \
-    RuntimeForCroquet HopscotchWebIDE "${NEWSPEAK}"/out/CroquetHopscotchWebIDE-TEST.vfuel \
-    RuntimeForHopscotchForHTML HopscotchWebIDE "${NEWSPEAK}"/out/HopscotchWebIDE-TEST.vfuel
+    PrimordialSoup/CroquetRuntime HopscotchWebIDE "${NEWSPEAK}"/out/CroquetHopscotchWebIDE-TEST.vfuel \
+    PrimordialSoup/WebRuntime HopscotchWebIDE "${NEWSPEAK}"/out/HopscotchWebIDE-TEST.vfuel
 
 ls -la "${NEWSPEAK}"/out/CroquetHopscotchWebIDE-TEST.vfuel "${NEWSPEAK}"/out/HopscotchWebIDE-TEST.vfuel

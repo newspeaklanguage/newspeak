@@ -26,6 +26,12 @@ STAGE=${NEWSPEAK}/scratch/croquet-bug-stage
 rm -rf "$STAGE" && mkdir -p "$STAGE"
 cp "${PRIMORDIALSOUP}"/newspeak/*.ns "$STAGE"/
 cp "${NEWSPEAK}"/*.ns "${NEWSPEAK}"/*.png "$STAGE"/
+# Platform modules keep their directories (PLATFORM_NAMESPACES_DESIGN_2026-11-18.md).
+for dir in "${PRIMORDIALSOUP}"/newspeak/platform/* "${NEWSPEAK}"/platform/*; do
+    [ -d "$dir" ] || continue
+    mkdir -p "$STAGE/platform/$(basename "$dir")"
+    cp "$dir"/*.ns "$STAGE/platform/$(basename "$dir")/"
+done
 
 # Undo the fix in the staged copy. Fail loudly rather than build a snapshot
 # that is quietly identical to the good one - that would turn the control
@@ -63,7 +69,8 @@ python3 "${NEWSPEAK}"/tool/check-duplicate-modules.py . || exit 1
 "${PRIMORDIALSOUP}"/out/ReleaseX64/primordialsoup \
     "${PRIMORDIALSOUP}"/out/snapshots/WebCompiler.vfuel \
     ./*.ns \
+    $(ls ./platform/*/*.ns) \
     ./*.png \
-    RuntimeForCroquet HopscotchWebIDE "${NEWSPEAK}"/out/CroquetHopscotchWebIDE-BUG.vfuel
+    PrimordialSoup/CroquetRuntime HopscotchWebIDE "${NEWSPEAK}"/out/CroquetHopscotchWebIDE-BUG.vfuel
 
 ls -la "${NEWSPEAK}"/out/CroquetHopscotchWebIDE-BUG.vfuel

@@ -1,0 +1,1349 @@
+Newspeak3
+'Eurasia'
+class Actors usingPlatform: p = (
+	(* The actors module. It not only creates actors, but manages the Newspeak message loop, which controls the scheduling of all actors and the connection with the JS event loop when running in the web browser.
+
+This module has a slot, #handlerOfLastResort, which can be set via the method #ultimateExceptionHandler: to an application defined  exception handler which will be called in the event of an unhandled exception. This handler is useful for web applications, which are invoked from the JS event loop.  Because they are repeatedly reinvoked, they cannot rely on a conventional exception handler in their #main:args: method. Instead, their handler should set up a presenter that will be displayed to the user. After the handler runs, the system will return to the JS event loop, and the app will continue to interact via the UI the handler created. *)
+	
+	|
+		private WeakMap = p kernel WeakMap.
+		private List = p collections List.
+		private Map = p collections Map.
+		private Message = p kernel Message.
+		public Promise = PromiseFactories new.
+		private messageLoop
+		private internalRefs <WeakMap[Ref, InternalRef]> = WeakMap new.
+		private currentActor ::= InternalActor named: 'Initial actor'.
+		private pendingActors ::= List new.
+		private timerHeap = TimerHeap new.
+		private portMap = Map new.
+		public handles <List> = List new.
+		private Serializer = p victoryFuel Serializer.
+		private Deserializer = p victoryFuel Deserializer.
+		private handlerOfLastResort <[:Exception :Activation | Object]>
+		private imageHandler = ImageHandler new.
+	|
+) (
+	public class Actor named: debugName <String> = (
+		(* Eurasia: a VM actor, with its own heap and a clone of the platform. The handle is a far reference to nil in it. *)
+		
+		|
+			private handle = newActorHandle.
+		|
+	) (
+		public interrupt = (
+			unimplemented
+		)
+		public onError: onError <[:E | Object]> = (
+			unimplemented
+		)
+		public seed: value <Value> ^<FarReference[Value]> = (
+			(* Creating a far reference to a PassByCopy is questionable. It may be that this should be seed: receiver perform: selector with: argument. *)
+			
+			(isValueObject: value) ifFalse: [
+					Error signal: 'Cannot seed an actor with a non-Value.'
+				].
+			^farReference: handle to: value
+		)
+		public terminate = (
+			unimplemented
+		)
+	) : ()
+	class EventualSend receiver: r selector: s arguments: a resolver: y = (
+		(* A message in an actor's event queue. Every turn starts by sending #deliver.
+
+Note that all slots contain objects that belong to the actor in which the message is queued, even the resolver. *)
+		
+		|
+			receiver <Object> = r.
+			selector <Symbol> = s.
+			arguments <Array> = a.
+			resolver <InternalResolver> = y.
+			public next
+		|
+	) (
+		public deliver = (
+			| resolution type msg |
+			msg:: Message selector: selector arguments: arguments.
+			
+			(* Execute the message, and deal with any exceptions *)
+			[
+				resolution:: msg sendTo: receiver.
+				type:: #value
+			] on: Exception
+				do: [:error |
+					nil = resolver ifTrue: [
+							reportUnresolvedTurnFailure: error.
+							error pass
+						].
+					resolution:: error.
+					type:: #error
+				].
+			nil = resolver ifTrue: [ ^self ].
+			resolver internalResolve: (#value = type ifTrue: [ asInternalRef: resolution ]
+					ifFalse: [ InternalBrokenRef problem: resolution ])
+		)
+		reportUnresolvedTurnFailure: error = (
+			(* An exception in a turn with no resolver has nowhere to report to, so it is
+   passed on - but it is also the last chance to say anything about it. The bare
+   'Exception in turn without resolver' this used to print named neither the send
+   that failed nor the failure, which made it a common dead end when diagnosing
+   (a hot-load crash, an amplet blowing up in a callback).
+
+   Defensive throughout, because a diagnostic must never replace the exception it
+   is reporting: printString can fail on a broken or proxied receiver, and
+   messageText is frequently nil, which raises on concatenation. *)
+			
+			| receiverText selectorText errorText |
+			receiverText:: [ receiver printString ] on: Exception
+				do: [:e | '<unprintable receiver>' ].
+			selectorText:: [ selector printString ] on: Exception
+				do: [:e | '<unprintable selector>' ].
+			errorText:: [ error printString ] on: Exception
+				do: [:e | '<unprintable exception>' ].
+			[
+				('Exception in turn without resolver: ' , receiverText , ' ' , selectorText , ' -- ' , errorText) out
+			] on: Exception do: [:e | 'Exception in turn without resolver' out ]
+		)
+	) : ()
+	class EventualSendReactor selector: s arguments: a resolver: r = (
+		(* An eventual-send to a promise.
+
+Note that all slots contain objects that belong to the actor which performed the eventual send. *)
+		
+		|
+			selector <Symbol> = s.
+			arguments <Array> = a.
+			resolver <InternalResolver> = r.
+		|
+	) (
+		public reactBroken: error = (
+			(* Broken promise contagion. *)
+			
+			(* Should this be immediate? *)
+			
+			(* resolver internalBreak: error. ? *)
+			
+			currentActor enqueueReceiver: resolver
+				selector: #internalResolve:
+				arguments: {InternalBrokenRef problem: error. }
+				resolver: nil
+		)
+		public reactMoreResolved: internalRef = (
+			resolver internalResolve: (asInternalRef: (internalRef eventualSend: selector
+						arguments: arguments))
+		)
+		public reactResolved: value = (
+			resolver internalResolve: (asInternalRef: (messageLoop eventualSendTo: value
+						selector: selector
+						arguments: arguments))
+		)
+	) : ()
+	class ImageHandler new = (
+		(* The restore handler (role 40): sent restored, in a turn of its own, after the image is restored into a new host (Actors>>whenRestored:), and imageSaved after the VM has handed a saved image to the host (Actors>>saveImage:). *)
+		
+		|
+			public action <[]>
+			public pendingSave <Resolver>
+		|
+	) (
+		public imageSaved = (
+			| r = pendingSave. |
+			pendingSave:: nil.
+			r isNil ifFalse: [ r fulfill: #saved ]
+		)
+		public restored = (
+			| r = pendingSave. |
+			pendingSave:: nil.
+			r isNil ifFalse: [ r fulfill: #restored ].
+			action isNil ifFalse: [ action value ]
+		)
+	) : ()
+	class InternalActor named: n = (
+		|
+			name <String> = n.
+			head <PendingDelivery>
+			tail <PendingDelivery>
+		|
+	) (
+		public drainQueue = (
+			currentActor:: self.
+			[ nil = head ] whileFalse: [
+					| message = head. |
+					head: message next.
+					message deliver
+				].
+			tail: nil
+		)
+		public enqueueReceiver: receiver selector: selector arguments: arguments resolver: resolver = (
+			| send = EventualSend receiver: receiver
+				selector: selector
+				arguments: arguments
+				resolver: resolver. |
+			nil = head ifTrue: [ head:: tail:: send ]
+				ifFalse: [
+					tail next: send.
+					tail: send
+				].
+			pendingActors add: self
+		)
+	) : ()
+	class InternalBrokenRef problem: p = InternalRef new (
+		|
+			problem = p.
+		|
+	) (
+		public addReactor: reactor = (
+			reactor reactBroken: problem
+		)
+		public checkCycle ^<Boolean> = (
+			^false
+		)
+		public eventualSend: selector <Symbol> arguments: arguments <Array> ^<Ref> = (
+			^self externalRef
+			(* I.e., broken with same problem. Should this wait for the next turn? *)
+			
+		)
+		public immediateSend: message <Message> ^<Object> = (
+			^Error signal: 'Cannot immediate-send to a broken ref: ' , message selector
+		)
+		public whenFulfilled: onValue whenBroken: onError ^<Ref> = (
+			| localPromise = InternalLocalPromise new. |
+			currentActor enqueueReceiver: onError
+				selector: #cull:
+				arguments: {problem. }
+				resolver: localPromise.
+			^localPromise externalRef
+		)
+		public wrapFor: targetActor = (
+			#BOGUS.
+			^(InternalBrokenRef problem: problem) externalRef
+		)
+	) : ()
+	class InternalFarReference target: t targetsActor: ta = InternalRef new (
+		|
+			target = t.
+			targetsActor = ta.
+		|
+	) (
+		public addReactor: reactor = (
+			reactor reactResolved: externalRef
+		)
+		public checkCycle ^<Boolean> = (
+			^false
+		)
+		public eventualSend: selector <Symbol> arguments: arguments <Array> ^<Ref> = (
+			| resolverInTarget remotePromise redirector |
+			resolverInTarget:: InternalLocalPromise new.
+			targetsActor enqueueReceiver: target
+				selector: selector
+				arguments: (wrapArguments: arguments from: currentActor to: targetsActor)
+				resolver: resolverInTarget.
+			remotePromise:: InternalRemotePromise target: resolverInTarget
+				targetsActor: targetsActor.
+			redirector:: RedirectReactor from: targetsActor
+				to: currentActor
+				resolver: remotePromise.
+			targetsActor enqueueReceiver: resolverInTarget
+				selector: #addReactor:
+				arguments: {redirector. }
+				resolver: nil.
+			^remotePromise externalRef
+		)
+		public immediateSend: message <Message> ^<Object> = (
+			^Error signal: 'Cannot immediate-send to an eventual ref: ' , message selector
+		)
+		public whenFulfilled: onValue whenBroken: onError ^<Ref> = (
+			| localPromise = InternalLocalPromise new. |
+			currentActor enqueueReceiver: onValue
+				selector: #cull:
+				arguments: {externalRef. }
+				resolver: localPromise.
+			^localPromise externalRef
+		)
+		public wrapFor: targetActor = (
+			targetsActor = targetActor ifTrue: [ ^target ].
+			^(InternalFarReference target: target targetsActor: targetsActor) externalRef
+		)
+	) : ()
+	class InternalLocalPromise new = InternalRef new (
+		|
+			state ::= #unresolved.
+			
+			(* resolving. resolved *)
+			resolution <InternalRef>
+			reactors
+			vmPromise (* Eurasia: the promise record (Π) standing for this promise in other actors, or nil. *)
+		|
+	) (
+		public addReactor: reactor = (
+			state = #unresolved ifTrue: [
+					nil = reactors ifTrue: [ reactors:: List new ].
+					reactors add: reactor.
+					^self
+				].
+			state = #resolved ifTrue: [ ^resolution addReactor: reactor ].
+			halt
+		)
+		public breakRemotely: problem = (
+			state = #unresolved ifFalse: [ ^self ].
+			self internalResolve: (InternalBrokenRef problem: problem)
+		)
+		public checkCycle ^<Boolean> = (
+			state = #resolving ifTrue: [ ^true ].
+			state = #unresolved ifTrue: [ ^false ].
+			state = #resolved ifTrue: [ ^resolution checkCycle ].
+			halt
+		)
+		public eventualSend: selector <Symbol> arguments: arguments <Array> ^<Ref> = (
+			| localPromise |
+			state = #resolved ifTrue: [
+					^resolution eventualSend: selector arguments: arguments
+				].
+			nil = vmPromise ifFalse: [
+					
+					(* Eurasia: the promise has crossed actors, so the send queues in its promise record, in the order every actor sends (Route-Pending). *)
+					localPromise:: newFollowerPromise.
+					promise: vmPromise
+						send: {selector. localPromise vmPromiseRecord. } , (arguments collect: [:each |
+								(asInternalRef: each) vmWrap
+							]).
+					^localPromise externalRef
+				].
+			localPromise:: InternalLocalPromise new.
+			self addReactor: (EventualSendReactor selector: selector
+					arguments: arguments
+					resolver: localPromise).
+			^localPromise externalRef
+		)
+		public followVMPromise: record = (
+			(* Eurasia: this promise follows a promise record settled in another actor; the VM posts the settlement here. *)
+			
+			vmPromise:: record.
+			promise: record addWaiter: self
+		)
+		public immediateSend: message <Message> ^<Object> = (
+			state = #unresolved ifTrue: [ syncWithVM ].
+			state = #resolved ifTrue: [ ^resolution immediateSend: message ].
+			^Error signal: 'Cannot immediate-send to an eventual ref: ' , message selector
+		)
+		public internalResolve: internalRef <InternalRef> = (
+			state = #unresolved ifFalse: [ ^Error signal: 'Already resolved' ].
+			internalRef isKindOfInternalRef ifFalse: [ halt ].
+			state:: #resolving.
+			internalRef checkCycle ifTrue: [
+					resolution:: InternalBrokenRef problem: (Error new messageText: 'Cyclic resolution')
+				]
+				ifFalse: [ resolution:: internalRef ].
+			state:: #resolved.
+			nil = reactors ifFalse: [
+					reactors do: [:reactor | resolution addReactor: reactor ].
+					reactors:: nil
+				]
+		)
+		public resolveRemotely: value = (
+			(* Eurasia: the settlement of the promise record this promise follows, posted by the VM. An immediate send may have seen it first (syncWithVM). *)
+			
+			state = #unresolved ifFalse: [ ^self ].
+			self internalResolve: (asInternalRef: value)
+		)
+		public syncWithVM = (
+			(* Eurasia: a promise record is settled in every actor at once, before its followers hear of it; an immediate send sees the settlement now. *)
+			
+			| s |
+			nil = vmPromise ifTrue: [ ^self ].
+			s:: promiseState: vmPromise.
+			(s at: 1) = 1 ifTrue: [ ^self internalResolve: (asInternalRef: (s at: 2)) ].
+			(s at: 1) = 2 ifTrue: [
+					^self internalResolve: (InternalBrokenRef problem: (s at: 2))
+				]
+		)
+		public vmPendingRecord = (
+			state = #resolved ifTrue: [ ^resolution vmPendingRecord ].
+			state = #unresolved ifTrue: [ ^vmPromiseRecord ].
+			^nil
+		)
+		public vmPromiseRecord = (
+			(* Eurasia: the promise record standing for this unresolved promise in other actors. A new one is settled by this promise's resolution. *)
+			
+			nil = vmPromise ifTrue: [
+					vmPromise:: newPromiseFor: self.
+					self addReactor: (RemoteResolver for: vmPromise)
+				].
+			^vmPromise
+		)
+		public vmWrap = (
+			state = #resolved ifTrue: [ ^resolution vmWrap ].
+			^vmPromiseRecord
+		)
+		public whenFulfilled: onValue whenBroken: onError ^<Ref> = (
+			| localPromise |
+			state = #resolved ifTrue: [
+					^resolution whenFulfilled: onValue whenBroken: onError
+				].
+			localPromise:: InternalLocalPromise new.
+			self addReactor: (WhenReactor onValue: onValue
+					onError: onError
+					resolver: localPromise).
+			^localPromise externalRef
+		)
+		public wrapFor: targetActor = (
+			state = #resolved ifTrue: [ ^resolution wrapFor: targetActor ].
+			^(InternalRemotePromise target: self targetsActor: currentActor) externalRef
+		)
+	) : ()
+	class InternalNearRef wrapping: t = InternalRef new (
+		|
+			target = t.
+		|
+	) (
+		public addReactor: reactor = (
+			reactor reactResolved: target
+		)
+		public checkCycle ^<Boolean> = (
+			^false
+		)
+		public eventualSend: selector <Symbol> arguments: arguments <Array> ^<Ref> = (
+			| localPromise = InternalLocalPromise new. |
+			currentActor enqueueReceiver: target
+				selector: selector
+				arguments: arguments
+				resolver: localPromise.
+			^localPromise externalRef
+		)
+		public immediateSend: message <Message> ^<Object> = (
+			^message sendTo: target
+		)
+		public vmArgument = (
+			^target
+		)
+		public vmWrap = (
+			^target
+		)
+		public whenFulfilled: onValue whenBroken: onError ^<Ref> = (
+			| localPromise = InternalLocalPromise new. |
+			currentActor enqueueReceiver: onValue
+				selector: #cull:
+				arguments: {target. }
+				resolver: localPromise.
+			^localPromise externalRef
+		)
+		public wrapFor: targetActor = (
+			(isValueObject: target) ifTrue: [ ^target ].
+			^createFarReferenceTo: target in: currentActor for: targetActor
+		)
+	) : ()
+	class InternalRef new = (
+	) (
+		public checkCycle ^<Boolean> = (
+			subclassResponsibility
+		)
+		public eventualSend: selector <Symbol> arguments: arguments <Array> ^<Ref> = (
+			subclassResponsibility
+		)
+		public externalRef = (
+			^Ref wrapping: self
+		)
+		public immediateSend: message <Message> ^<Object> = (
+			subclassResponsibility
+		)
+		public isKindOfInternalRef ^<Boolean> = (
+			^true
+		)
+		public vmArgument = (
+			(* Eurasia: what an argument that arrived from another actor becomes here. *)
+			
+			^externalRef
+		)
+		public vmPendingRecord = (
+			(* Eurasia: the promise record of an unresolved promise of this actor's, for forwarding to; nil for any other ref. *)
+			
+			^nil
+		)
+		public vmWrap = (
+			(* Eurasia: what crosses to another actor in place of this ref; the VM turns non-values into far references. *)
+			
+			^externalRef
+		)
+		public whenFulfilled: onValue whenBroken: onError ^<Ref> = (
+			subclassResponsibility
+		)
+		public wrapFor: targetActor = (
+			subclassResponsibility
+		)
+	) : ()
+	class InternalRemotePromise target: t targetsActor: ta = InternalRef new (
+		|
+			target <InternalLocalPromise> = t.
+			targetsActor <InternalActor> = ta.
+			state ::= #unresolved.
+			resolution <InternalRef>
+		|
+	) (
+		public addReactor: reactor = (
+			state = #resolved ifTrue: [ ^resolution addReactor: reactor ].
+			state = #unresolved ifTrue: [ ^reactor reactMoreResolved: self ].
+			stop5
+		)
+		public checkCycle ^<Boolean> = (
+			state = #resolving ifTrue: [ ^true ].
+			state = #unresolved ifTrue: [ ^false ].
+			state = #resolved ifTrue: [ ^resolution checkCycle ].
+			halt
+		)
+		public eventualSend: selector <Symbol> arguments: arguments <Array> ^<Ref> = (
+			| resolverInTarget remotePromise redirector |
+			resolverInTarget:: InternalLocalPromise new.
+			targetsActor enqueueReceiver: target
+				selector: #eventualSend:arguments:
+				arguments: {selector. wrapArguments: arguments
+					from: currentActor
+					to: targetsActor. }
+				resolver: resolverInTarget.
+			remotePromise:: InternalRemotePromise target: resolverInTarget
+				targetsActor: targetsActor.
+			redirector:: RedirectReactor from: targetsActor
+				to: currentActor
+				resolver: remotePromise.
+			targetsActor enqueueReceiver: resolverInTarget
+				selector: #addReactor:
+				arguments: {redirector. }
+				resolver: nil.
+			^remotePromise externalRef
+		)
+		public immediateSend: message <Message> ^<Object> = (
+			state = #resolved ifTrue: [ ^resolution immediateSend: message ].
+			^Error signal: 'Cannot immediate-send to an eventual ref: ' , message selector
+		)
+		public internalResolve: internalRef <InternalRef> = (
+			state = #unresolved ifFalse: [ ^Error signal: 'Already resolved' ].
+			internalRef isKindOfInternalRef ifFalse: [ halt ].
+			state:: #resolving.
+			internalRef checkCycle ifTrue: [
+					resolution:: InternalBrokenRef problem: (Error new messageText: 'Cyclic resolution')
+				]
+				ifFalse: [ resolution:: internalRef ].
+			state:: #resolved
+		)
+		public redirectFrom: sourceActor to: destinationActor resolving: resolver = (
+			| redirector |
+			destinationActor = targetsActor ifTrue: [
+					targetsActor enqueueReceiver: resolver
+						selector: #internalResolve:
+						arguments: {target. }
+						resolver: nil.
+					^self
+				].
+			redirector:: RedirectReactor from: targetsActor
+				to: destinationActor
+				resolver: resolver.
+			targetsActor enqueueReceiver: target
+				selector: #addReactor:
+				arguments: {redirector. }
+				resolver: nil
+		)
+		public whenFulfilled: onValue whenBroken: onError ^<Ref> = (
+			| localPromise redirector |
+			state = #resolved ifTrue: [
+					^resolution whenFulfilled: onValue whenBroken: onError
+				].
+			localPromise:: InternalLocalPromise new.
+			redirector:: RedirectReactor from: targetsActor
+				to: currentActor
+				resolver: localPromise.
+			targetsActor enqueueReceiver: target
+				selector: #addReactor:
+				arguments: {redirector. }
+				resolver: nil.
+			^localPromise whenFulfilled: onValue whenBroken: onError
+		)
+		public wrapFor: targetActor = (
+			state = #resolved ifTrue: [ ^resolution wrapFor: targetActor ].
+			targetActor = targetsActor ifTrue: [ ^target externalRef ].
+			^(InternalRemotePromise target: target targetsActor: targetsActor) externalRef
+		)
+	) : ()
+	class InternalTimer new = (
+		|
+			callback
+			actor
+			public dueTime
+			public id
+			millisecondDuration
+			repeating
+			public externalTimer
+		|
+	) (
+		public < other = (
+			dueTime = other dueTime ifTrue: [ ^id < other id ].
+			^dueTime < other dueTime
+		)
+		public after: duration do: callbackX = (
+			callback:: callbackX.
+			actor:: currentActor.
+			dueTime:: currentMonotonicMillis + duration + 1.
+			millisecondDuration:: duration.
+			repeating:: false.
+			timerHeap insert: self
+		)
+		public cancel = (
+			callback:: nil
+		)
+		public every: duration do: callbackX = (
+			callback:: callbackX.
+			actor:: currentActor.
+			dueTime:: currentMonotonicMillis + duration + 1.
+			millisecondDuration:: duration.
+			repeating:: true.
+			timerHeap insert: self
+		)
+		public fire = (
+			(* A timer callback is a turn: an exception that escapes it is reported and passed on to the handler of last resort, as EventualSend>>deliver does for a turn without a resolver. It used to be caught and dropped without a word. *)
+			
+			nil = callback ifTrue: [ ^self ].
+			
+			(* Cancelled. *)
+			repeating ifTrue: [
+					dueTime:: currentMonotonicMillis + millisecondDuration.
+					timerHeap insert: self.
+					[ callback value: externalTimer ] on: Exception
+						do: [:ex |
+							reportTimerFailure: ex.
+							ex pass
+						]
+				]
+				ifFalse: [
+					| savedCallback = callback. |
+					callback:: nil.
+					[ savedCallback value ] on: Exception
+						do: [:ex |
+							reportTimerFailure: ex.
+							ex pass
+						]
+				]
+		)
+		public isActive = (
+			^(nil = callback) not
+		)
+		reportTimerFailure: error = (
+			(* Name the failure before passing it on. Defensive, like EventualSend>>reportUnresolvedTurnFailure: a diagnostic must never replace the exception it reports. *)
+			
+			| errorText |
+			errorText:: [ error printString ] on: Exception
+				do: [:e | '<unprintable exception>' ].
+			[ ('Exception in timer callback: ' , errorText) out ] on: Exception
+				do: [:e | 'Exception in timer callback' out ]
+		)
+	) : ()
+	class InternalVMFarReference wrapping: f = InternalRef new (
+		(* Eurasia: a VM far reference to an object in another actor. An eventual send posts a packet to that actor: the target, the selector, the promise for the result and the arguments, which the VM translates. *)
+		
+		|
+			farRef = f.
+		|
+	) (
+		public addReactor: reactor = (
+			reactor reactResolved: farRef
+		)
+		public checkCycle ^<Boolean> = (
+			^false
+		)
+		public eventualSend: selector <Symbol> arguments: arguments <Array> ^<Ref> = (
+			| promise |
+			promise:: newFollowerPromise.
+			post: {farRef. selector. promise vmPromiseRecord. } , (arguments collect: [:each |
+						(asInternalRef: each) vmWrap
+					])
+				to: farRef.
+			^promise externalRef
+		)
+		public externalRef = (
+			^farRef
+		)
+		public immediateSend: message <Message> ^<Object> = (
+			^Error signal: 'Cannot immediate-send to an eventual ref: ' , message selector
+		)
+		public vmWrap = (
+			^farRef
+		)
+		public whenFulfilled: onValue whenBroken: onError ^<Ref> = (
+			| localPromise = InternalLocalPromise new. |
+			currentActor enqueueReceiver: onValue
+				selector: #cull:
+				arguments: {farRef. }
+				resolver: localPromise.
+			^localPromise externalRef
+		)
+		public wrapFor: targetActor = (
+			^farRef
+		)
+	) : ()
+	class MessageLoop application: a platform: p = (
+		|
+			application ::= a.
+			platform ::= p.
+		|
+	) (
+		private dispatchHandle: handle status: status signals: signals count: count = (
+			(* :literalmessage: primitive: 168 *)
+			
+			(* On of two entry points into Newspeak-land. This one handles callbacks to this VM. Primitive 168 never runs; it marks this activation as the bottom of the turn, so exception search, non-local return and finish: stop here even when a synchronous JS callback has put this frame on top of a turn that is suspended inside a primitive. *)
+			
+			| handler |
+			
+			(* locate the callback *)
+			handler:: handles at: handle.
+			nil = handler ifTrue: [
+					'Signal for ' , handle printString , ' with no handler' out
+				]
+				ifFalse: 
+				(* Enqueue the callback *)
+				[
+					currentActor enqueueReceiver: handler
+						selector: #value:value:
+						arguments: {status. signals. }
+						resolver: nil
+				].
+			
+			(* Process the VM's message queue and go back to the VM *)
+			finish: drainQueue
+		)
+		private dispatchMessage: message port: port = (
+			(* :literalmessage: primitive: 168 *)
+			
+			(* On of two entry points into Newspeak-land. This one handles messages sent to this VM. Primitive 168 marks the bottom of the turn; see dispatchHandle:status:signals:count:. *)
+			
+			nil = message ifFalse: [
+					nil = port ifTrue: [ enqueueStartupMessage: message ]
+						ifFalse: [ enqueuePortMessage: message port: port ]
+				].
+			finish: drainQueue
+		)
+		private dispatchPacket: packet = (
+			(* Eurasia: the VM delivers a packet posted to this actor: target, selector, the promise record for the result (nil for none), then the arguments, of which promise records become this actor's refs. A target that is a promise of this actor's (reached through a far reference to its ref) gets the message eventually. *)
+			
+			| target selector replyTo arguments resolver |
+			target:: packet at: 1.
+			selector:: packet at: 2.
+			replyTo:: packet at: 3.
+			arguments:: (packet copyFrom: 4 to: packet size) collect: [:each |
+					(isVMPromise: each) ifTrue: [ (asInternalRef: each) vmArgument ]
+						ifFalse: [ each ]
+				].
+			resolver:: nil = replyTo ifFalse: [ RemoteResolver for: replyTo ].
+			(isRef: target) ifTrue: [
+					| result |
+					result:: (asInternalRef: target) eventualSend: selector
+						arguments: arguments.
+					nil = resolver ifFalse: [
+							resolver internalResolve: (asInternalRef: result)
+						]
+				]
+				ifFalse: [
+					currentActor enqueueReceiver: target
+						selector: selector
+						arguments: arguments
+						resolver: resolver
+				].
+			finish: drainQueue
+		)
+		public drainQueue = (
+			timerHeap drainQueue.
+			[ pendingActors isEmpty ] whileFalse: [ pendingActors removeLast drainQueue ].
+			^timerHeap nextDueTime
+		)
+		private enqueuePortMessage: bytes port: portId = (
+			| port |
+			port:: portMap at: portId ifAbsent: [ ^self ].
+			currentActor enqueueReceiver: port
+				selector: #deliver:
+				arguments: {bytes. }
+				resolver: nil
+		)
+		private enqueueStartupMessage: argvOrBytes = (
+			| args |
+			argvOrBytes isKindOfByteArray ifTrue: [
+					| deserializer |
+					deserializer:: Deserializer new.
+					args:: deserializer deserialize: argvOrBytes
+				]
+				ifFalse: [ args:: argvOrBytes ].
+			currentActor enqueueReceiver: application
+				selector: #main:args:
+				arguments: {platform. args. }
+				resolver: nil.
+			application:: nil.
+			platform:: nil
+		)
+		public eventualSendTo: receiver selector: selector arguments: arguments = (
+			(* Sent from the compilation of an eventual send. *)
+			
+			^(asInternalRef: receiver) eventualSend: selector arguments: arguments
+		)
+		private exit: code = (
+			(* :literalmessage: primitive: 107 *)
+			
+			halt
+		)
+		private finish: wakeup <Integer> = (
+			(* :literalmessage: primitive: 139 *)
+			
+			(* Takes a delay and returns to the JS event loop. *)
+			
+			halt
+		)
+		private isInsideSynchronousCallback: activation = (
+			(* True if the innermost dispatch below activation sits on top of another turn, i.e. JS called back into us from inside a primitive. A top-level dispatch has no sender. *)
+			
+			| a ::= activation. |
+			[ nil = a ] whileFalse: [
+					a method primitive = 168 ifTrue: [ ^(nil = a sender) not ].
+					a:: a sender
+				].
+			^false
+		)
+		public reportCallbackException: exception from: signalActivationSender ^<Boolean> = (
+			(* An exception stopped at a callback boundary (Closure>>dispatchCallbackWith:), where Eurasia catches it so that the host's caller gets a host exception; psoup has no such handler, so the exception reaches the dispatch and the handler of last resort. Hand it to the handler of last resort, if the application set one (the IDE's opens the debugger on the stack, which survives the unwinding as detached activations), and answer whether there was one. The boundary still answers the failure to the host. A failure of the handler itself is dropped: it must not hide the original failure. *)
+			
+			handlerOfLastResort isNil ifTrue: [ ^false ].
+			[ handlerOfLastResort value: exception value: signalActivationSender ] on: Exception
+				do: [:e | 'The handler of last resort failed in a callback: ' out ].
+			^true
+		)
+		public unhandledException: exception from: signalActivationSender = (
+			| activation |
+			
+			(* If the application has defined an exception handler of last resort for itself, we call it *)
+			handlerOfLastResort isNil ifFalse: [
+					handlerOfLastResort value: exception value: signalActivationSender.
+					
+					(* after calling the handler, return to the Javascript event loop *)
+					finish: timerHeap nextDueTime
+				].
+			
+			(* We'll only get here if there was no handler of last resort  (the call to #finish: would take us out if there was a handler), or the handler itself failed.  In this case, print out error messages and exit the VM. *)
+			'Unhandled exception: ' out.
+			exception out.
+			activation:: signalActivationSender.
+			
+			(* Print out the stack trace *)
+			[ nil = activation ] whileFalse: [
+					activation out.
+					activation:: activation sender
+				].
+			
+			(* Inside a synchronous callback a caller is waiting below the dispatch: abandon just this dispatch, so that the caller's call-out fails and the caller can deal with it, instead of exiting the VM. *)
+			(isInsideSynchronousCallback: signalActivationSender) ifTrue: [
+					finish: timerHeap nextDueTime
+				].
+			exit: -1
+		)
+	) : ()
+	public class Port fromId: i = (
+		|
+			public id = i.
+			public handler
+		|
+	) (
+		public close = (
+			close: id.
+			portMap removeKey: id
+		)
+		private close: portId = (
+			(* :literalmessage: primitive: 136 *)
+			
+			halt
+		)
+		public deliver: bytes = (
+			| deserializer message |
+			deserializer:: Deserializer new.
+			message:: deserializer deserialize: bytes.
+			handler value: message
+		)
+		private rawSpawn: bytes = (
+			(* :literalmessage: primitive: 137 *)
+			
+			halt
+		)
+		public send: message = (
+			| serializer bytes |
+			serializer:: Serializer new.
+			bytes:: serializer serialize: message.
+			to: id send: bytes
+		)
+		public spawn: message = (
+			| serializer bytes |
+			serializer:: Serializer new.
+			bytes:: serializer serialize: message.
+			rawSpawn: bytes
+		)
+		private to: port send: data = (
+			(* :literalmessage: primitive: 138 *)
+			
+			halt
+		)
+	) : (
+		private createPort = (
+			(* :literalmessage: primitive: 135 *)
+			
+			halt
+		)
+		public new = (
+			| id = createPort. port = self fromId: id. |
+			portMap at: id put: port.
+			^port
+		)
+	)
+	class PromiseFactories new = (
+	) (
+		public all: refs <List[Promise[V, E]]> ^<Promise[List[V], E]> = (
+			(* Answers a promise that resolves with all the resolutions of refs, or the first problem. *)
+			
+		)
+		public broken: problem <E> ^<Promise[nil, E]> = (
+			^Resolver new break: problem;
+				promise
+		)
+		public fulfilled: resolution <V> ^<Promise[V, nil]> = (
+			^Resolver new fulfill: resolution;
+				promise
+		)
+		public timeout: ref <Promise[V, E]> after: milliseconds <Integer> ^<Promise[V, E | TimeoutError]> = (
+			(* Answers a promise that resolves with the resolution of ref, or a TimeoutError if refs is not resolved within milliseconds. *)
+			
+			#BOGUS
+			(* Should have proper duration type. *)
+			
+		)
+		public when: ref <Promise[V, E]> fulfilled: onValue <[:V | V2 def]> ^<Promise[V2, E]> = (
+			(* Subscribe to notification of a reference being fulfilled. If ref is fulfilled, onValue will run in some turn after the turn that resolves ref, and the returned promise with be resolved with the result of onValue. If ref is broken, the returned promise with be broken with the same error. *)
+			
+			^(asInternalRef: ref) whenFulfilled: onValue whenBroken: [:e | e signal ]
+			(* Should we make this the behavior of a nil catch-clause instead? *)
+			
+		)
+		public when: ref <Promise[V, E]> fulfilled: onValue <[:V | V2 def]> broken: onError <[:E | E2 def]> ^<Promise[V2, E2]> = (
+			(* Subscribe to notification of a reference being fulfilled or broken. onValue or onError respectively will run in some turn after the turn that resolves ref., and the returned promise with be resolved with the result of the callback. *)
+			
+			^(asInternalRef: ref) whenFulfilled: onValue whenBroken: onError
+		)
+		public when: ref <Promise> partitioned: onPartition <[:Promise | R def] | [R def]> ^<Promise[R, nil]> = (
+			(* Subscribe to notification of a reference breaking due to partition. *)
+			
+		)
+	) : ()
+	class RedirectReactor from: s to: d resolver: r = (
+		(* A bridge between InternalResolvers in different actors. *)
+		
+		|
+			sourceActor <Actor> = s.
+			destinationActor <Actor> = d.
+			resolver <InternalResolver> = r.
+		|
+	) (
+		public reactBroken: r = (
+			currentActor = sourceActor ifFalse: [ halt ].
+			destinationActor enqueueReceiver: resolver
+				selector: #internalResolve:
+				arguments: {InternalBrokenRef problem: r. }
+				resolver: nil
+		)
+		public reactMoreResolved: internalRef = (
+			internalRef redirectFrom: sourceActor
+				to: destinationActor
+				resolving: resolver
+		)
+		public reactResolved: r = (
+			currentActor = sourceActor ifFalse: [ halt ].
+			destinationActor enqueueReceiver: resolver
+				selector: #internalResolve:
+				arguments: {asInternalRef: (wrapArgument: r
+						from: sourceActor
+						to: destinationActor). }
+				resolver: nil
+		)
+	) : ()
+	class Ref wrapping: ref = (
+		|
+			internalRef = ref.
+		|
+		internalRefs at: self put: ref.
+	) (
+		doesNotUnderstand: message <Message> = (
+			(* For the debugger/inspector. Questionable. *)
+			
+			(* Should probably override public method of Object as well. *)
+			
+			0 = message arguments size ifTrue: [
+					(message selector startsWith: 'isKindOf') ifTrue: [ ^false ]
+				].
+			^internalRef immediateSend: message
+		)
+		public isKindOfPromise ^<Boolean> = (
+			^true
+		)
+		yourself = (
+			^super yourself
+		)
+	) : ()
+	class RemoteResolver for: r = (
+		(* Eurasia: settles the promise record r (Π), which every actor sees at once, with the resolution of a ref of this actor's: the result of a send from another actor, or a promise of this actor's that crossed to another. An unresolved promise of this actor's settles it by forwarding to its own record. *)
+		
+		|
+			record = r.
+		|
+	) (
+		public internalResolve: internalRef = (
+			| forward |
+			forward:: internalRef vmPendingRecord.
+			nil = forward ifFalse: [ ^resolvePromise: record with: forward ].
+			internalRef addReactor: self
+		)
+		public reactBroken: problem = (
+			breakPromise: record with: problem
+		)
+		public reactMoreResolved: internalRef = (
+			internalRef addReactor: self
+		)
+		public reactResolved: value = (
+			resolvePromise: record with: (asInternalRef: value) vmWrap
+		)
+	) : ()
+	public class Resolver new = (
+		(* A Resolver represents the authority to resolve a Promise and is the control facet of the promise's eventual resolution. *)
+		
+		|
+			private (* N.B. We must not leak access to an InternalResolver via subobjects. *) internalResolver = InternalLocalPromise new.
+			public promise <Promise[V, E]> = internalResolver externalRef.
+		|
+	) (
+		public break: error <E> = (
+			internalResolver internalResolve: (InternalBrokenRef problem: error)
+		)
+		public fulfill: value <V> = (
+			internalResolver internalResolve: (asInternalRef: value)
+		)
+		public isKindOfResolver ^<Boolean> = (
+			^true
+		)
+	) : ()
+	public class Timer wrapping: i = (
+		|
+			private internalTimer = i.
+		|
+	) (
+		public cancel = (
+			internalTimer cancel
+		)
+		public isActive ^<Boolean> = (
+			^internalTimer isActive
+		)
+		public isTimer ^<Boolean> = (
+			^true
+		)
+	) : (
+		public after: duration do: callback <[]> ^<Timer> = (
+			^Timer wrapping: (InternalTimer new after: duration do: callback)
+		)
+		public every: duration do: callback <[:Timer | Object]> ^<Timer> = (
+			| internal external |
+			internal:: InternalTimer new every: duration do: callback.
+			external:: Timer wrapping: internal.
+			internal externalTimer: external.
+			^external
+		)
+	)
+	class TimerHeap new = (
+		|
+			private table ::= Array new: 32.
+			private used ::= 0.
+			private nextId ::= 0.
+		|
+	) (
+		downHeapFrom: startParentIndex = (
+			| parentIndex ::= startParentIndex. parent leftChildIndex rightChildIndex |
+			parent:: table at: parentIndex.
+			[
+				leftChildIndex:: parentIndex << 1.
+				rightChildIndex:: parentIndex << 1 + 1.
+				leftChildIndex <= used
+			] whileTrue: [
+					| leftChild rightChild |
+					leftChild:: table at: leftChildIndex.
+					rightChildIndex <= used ifTrue: [
+							rightChild:: table at: rightChildIndex.
+							leftChild < rightChild ifTrue: [
+									parent < leftChild ifTrue: [ ^self ].
+									table at: leftChildIndex put: parent.
+									table at: parentIndex put: leftChild.
+									parentIndex:: leftChildIndex
+								]
+								ifFalse: [
+									parent < rightChild ifTrue: [ ^self ].
+									table at: rightChildIndex put: parent.
+									table at: parentIndex put: rightChild.
+									parentIndex:: rightChildIndex
+								]
+						]
+						ifFalse: [
+							
+							(* Only has left child. *)
+							parent < leftChild ifTrue: [ ^self ].
+							table at: leftChildIndex put: parent.
+							table at: parentIndex put: leftChild.
+							parentIndex:: leftChildIndex
+						]
+				]
+		)
+		public drainQueue = (
+			| now = currentMonotonicMillis. |
+			[ used > 0 ] whileTrue: [
+					peek dueTime > now ifTrue: [ ^self ].
+					pop fire
+				]
+		)
+		public insert: timer = (
+			used >= table size ifTrue: [
+					| newSize = table size << 1. |
+					
+					(* ('Growing timer heap to ', newSize printString) out. *)
+					table:: table copyWithSize: newSize
+				].
+			used = 0 ifTrue: [ nextId:: 0 ].
+			
+			(* Reset id space when possible. *)
+			used:: 1 + used.
+			table at: used put: timer.
+			timer id: nextId.
+			nextId:: 1 + nextId.
+			
+			(* Heap isn't a stable sort. Use a tie breaker to ensure timers fire in the order they are scheduled if their due times are the same. *)
+			upheapFrom: used
+		)
+		public nextDueTime = (
+			| next = peek. |
+			nil = next ifTrue: [ ^0 ].
+			^1000000 * next dueTime
+		)
+		public peek = (
+			0 = used ifTrue: [ ^nil ].
+			^table at: 1
+		)
+		public pop = (
+			| min = table at: 1. |
+			table at: 1 put: (table at: used).
+			table at: used put: nil.
+			used:: used - 1.
+			downHeapFrom: 1.
+			min id: nil.
+			^min
+		)
+		upheapFrom: startChildIndex = (
+			| childIndex ::= startChildIndex. |
+			[ childIndex = 1 ] whileFalse: [
+					| parentIndex child parent |
+					parentIndex:: childIndex >> 1.
+					child:: table at: childIndex.
+					parent:: table at: parentIndex.
+					parent < child ifTrue: [ ^self ].
+					table at: childIndex put: parent.
+					table at: parentIndex put: child.
+					childIndex:: parentIndex
+				]
+		)
+	) : ()
+	class WhenReactor onValue: v onError: e resolver: r = (
+		(* A when-catch for a promise.
+
+Note that all slots contain objects that belong to the actor which sent #whenFulfilled:whenBroken. *)
+		
+		|
+			onValue <[:V | Object] | []> = v.
+			onError <[:E | Object] | []> = e.
+			resolver <InternalResolver> = r.
+		|
+	) (
+		public reactBroken: value = (
+			currentActor enqueueReceiver: onError
+				selector: #cull:
+				arguments: {value. }
+				resolver: resolver
+		)
+		public reactMoreResolved: internalRef = (
+			resolver internalResolve: (asInternalRef: (internalRef whenFulfilled: onValue
+						whenBroken: onError))
+		)
+		public reactResolved: value = (
+			currentActor enqueueReceiver: onValue
+				selector: #cull:
+				arguments: {value. }
+				resolver: resolver
+		)
+	) : ()
+	private asInternalRef: externalRefOrUnboxedNearRef = (
+		(isVMPromise: externalRefOrUnboxedNearRef) ifTrue: [
+				^internalRefForPromiseRecord: externalRefOrUnboxedNearRef
+			].
+		(isFarReference: externalRefOrUnboxedNearRef) ifTrue: [
+				^InternalVMFarReference wrapping: externalRefOrUnboxedNearRef
+			].
+		^(isRef: externalRefOrUnboxedNearRef) ifTrue: [
+				internalRefs at: externalRefOrUnboxedNearRef
+			]
+			ifFalse: [ InternalNearRef wrapping: externalRefOrUnboxedNearRef ]
+	)
+	private breakPromise: record with: problem = (
+		(* Eurasia: a native (VmBreakPromise). *)
+		
+		halt
+	)
+	public buildLoopForApplication: app platform: platform = (
+		^messageLoop:: MessageLoop application: app platform: platform
+	)
+	private classOf: object = (
+		(* :literalmessage: primitive: 85 *)
+		
+		halt
+	)
+	private createFarReferenceTo: target in: targetActor for: sourceActor = (
+		^(InternalFarReference target: target targetsActor: targetActor) externalRef
+	)
+	private currentMonotonicMillis = (
+		^currentMonotonicNanos quo: 1000000
+	)
+	private currentMonotonicNanos = (
+		(* :literalmessage: primitive: 100 *)
+		
+		halt
+	)
+	private farReference: handle to: value = (
+		(* Eurasia: a native (VmFarReferenceTo), from the natives table. *)
+		
+		halt
+	)
+	private internalRefForPromiseRecord: record = (
+		(* Eurasia: a promise record (Π) as this actor sees it: its resolution or problem once settled; while pending, this actor's own promise for it if this actor created it, else a new promise following it. *)
+		
+		| s p |
+		s:: promiseState: record.
+		(s at: 1) = 1 ifTrue: [ ^asInternalRef: (s at: 2) ].
+		(s at: 1) = 2 ifTrue: [ ^InternalBrokenRef problem: (s at: 2) ].
+		(isVMPromise: (s at: 2)) ifFalse: [ ^s at: 2 ].
+		p:: InternalLocalPromise new.
+		p followVMPromise: (s at: 2).
+		^p
+	)
+	private isFarReference: object = (
+		(* Eurasia: a native (VmIsFarReference). *)
+		
+		halt
+	)
+	private isRef: object <Object> ^<Boolean> = (
+		^Ref = (classOf: object)
+	)
+	private isValueObject: object <Object> ^<Boolean> = (
+		nil = object ifTrue: [ ^true ].
+		true = object ifTrue: [ ^true ].
+		false = object ifTrue: [ ^true ].
+		object isKindOfString ifTrue: [ ^true ].
+		object isKindOfNumber ifTrue: [ ^true ].
+		object isKindOfBehavior ifTrue: [ ^true ].
+		
+		(* ^isValueObject: object enclosingClass *)
+		Promise = object ifTrue: [ ^true ].
+		^false
+	)
+	private isVMPromise: object = (
+		(* Eurasia: a native (VmIsPromise). *)
+		
+		halt
+	)
+	private newActorHandle = (
+		(* Eurasia: a native (VmNewActor). *)
+		
+		halt
+	)
+	private newFollowerPromise = (
+		(* Eurasia: a promise for the result of a send that runs in another actor (or whose target is not yet known), following a new promise record which the send's resolver settles. *)
+		
+		| p |
+		p:: InternalLocalPromise new.
+		p followVMPromise: (newPromiseFor: p).
+		^p
+	)
+	private newPromiseFor: localPromise = (
+		(* Eurasia: a native (VmNewPromise). *)
+		
+		halt
+	)
+	private post: packet to: farRef = (
+		(* Eurasia: a native (VmPost). *)
+		
+		halt
+	)
+	private primSaveImage: name <String> = (
+		(* Eurasia: a native (VmSaveImage). *)
+		
+		halt
+	)
+	private promise: record addWaiter: localPromise = (
+		(* Eurasia: a native (VmPromiseAddWaiter). *)
+		
+		halt
+	)
+	private promise: record send: message = (
+		(* Eurasia: a native (VmPromiseSend). *)
+		
+		halt
+	)
+	private promiseState: record = (
+		(* Eurasia: a native (VmPromiseState). *)
+		
+		halt
+	)
+	private resolvePromise: record with: value = (
+		(* Eurasia: a native (VmResolvePromise). *)
+		
+		halt
+	)
+	public saveImage: name <String> ^<Promise[Symbol]> = (
+		(* Save the running image, its state and not only its code, under name: the VM takes a checkpoint at its next safepoint and hands it to the host, which keeps it (the web host's page stores it in the browser). Answers a promise of #saved once the image is handed over; in an image restored from it, the same promise is fulfilled with #restored instead. One save at a time. *)
+		
+		| r |
+		imageHandler pendingSave isNil ifFalse: [
+				^Promise broken: 'An image is already being saved.'
+			].
+		r:: Resolver new.
+		imageHandler pendingSave: r.
+		setRole: 40 to: imageHandler.
+		primSaveImage: name.
+		^r promise
+	)
+	private setRole: id <Integer> to: value = (
+		(* Eurasia: a native (VmSetRole). *)
+		
+		halt
+	)
+	public ultimateExceptionHandler: h <[:Exception :Activation | Object]> = (
+		handlerOfLastResort:: h
+	)
+	public whenRestored: action <[]> = (
+		(* Run action, in a turn of its own, after the image is restored into a new host (M7; contract design, section 6, rule 3): a checkpoint continued in a new page or process, where the host objects the program created (DOM nodes, timers) are gone, and the program rebuilds them from its own model. Lazy slots holding host objects look them up again by themselves. Replaces an earlier action. *)
+		
+		imageHandler action: action.
+		setRole: 40 to: imageHandler
+	)
+	private wrapArgument: argument from: sourceActor to: targetActor = (
+		(* [argument] lives in [sourceActor], answer the corresponding proxy that lives in [targetActor] *)
+		
+		sourceActor = targetActor ifTrue: [ halt ].
+		
+		(* We can't tell which side a near reference belongs to here, so we must have decided this earlier. *)
+		^(asInternalRef: argument) wrapFor: targetActor
+	)
+	private wrapArguments: arguments from: sourceActor to: targetActor = (
+		^arguments collect: [:argument |
+				wrapArgument: argument from: sourceActor to: targetActor
+			]
+	)
+) : ()

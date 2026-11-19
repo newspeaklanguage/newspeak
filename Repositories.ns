@@ -27,13 +27,6 @@ class Repositories usingPlatform: platform ide: webIde = (
 		private js = platform js.
 		private global = js global.
 		
-		(* Built-in JS globals — always present, eager capture is safe. *)
-		private JSPromise = global at: #Promise.
-		private TextDecoder = global at: #TextDecoder.
-		private JSON = global at: #JSON.
-		private JSDate = global at: #Date.
-		private console = global at: #console.
-		
 		(* CDN-loaded JS classes (window.LightningFS / window.git /
 	   window.GitHttp) are NOT captured here. The Newspeak snapshot is
 	   loaded via <script async>, so module construction can run before
@@ -53,7 +46,6 @@ class Repositories usingPlatform: platform ide: webIde = (
 		private ClassDeclarationBuilder = platform mirrors ClassDeclarationBuilder.
 		private platformHolder = platform.
 		private Color = platform graphics Color.
-		private localStorage = platform js localStorage.
 		styleButtonSize <Float> = 30.
 		
 		(* localStorage key holding the JSON-encoded list of Repository
@@ -89,12 +81,18 @@ class Repositories usingPlatform: platform ide: webIde = (
 	   body after seeding finishes. *)
 	
 ) (
+	lazy private console = global at: #console.
 	lazy public gitFacade = global at: #git.
 	lazy public gitHttpFacade = global at: #GitHttp.
+	lazy private JSDate = global at: #Date.
+	lazy private JSON = global at: #JSON.
+	lazy private JSPromise = (* A host object: a lazy slot, so that a restore into a new host (Eurasia) looks it up again. *) global at: #Promise.
 	lazy public LightningFSClass = global at: #LightningFS.
+	lazy private localStorage = js localStorage.
 	lazy public sourceMirrors = (Root at: #VCSSourceMirrors) usingPlatform: platformHolder
 		vcs: nil
 		ide: ide.
+	lazy private TextDecoder = global at: #TextDecoder.
 	public class ApplyStrategy new = (
 		(* Abstract base for "what happens when the user accepts a Changeset."
    Concretes: RepoCommitStrategy for repository commits.
@@ -532,7 +530,7 @@ class Repositories usingPlatform: platform ide: webIde = (
 			status = #removed ifTrue: [ bg:: Color r: 0.97 g: 0.85 b: 0.85 ].
 			status = #changed ifTrue: [ bg:: Color r: 0.85 g: 0.92 b: 0.98 ].
 			liveClass:: (status = #changed or: [ status = #new ]) ifTrue: [
-					subject liveNamespace at: name ifAbsent: [ nil ]
+					ide repositories classIn: subject liveNamespace at: name ifAbsent: [ nil ]
 				]
 				ifFalse: [ nil ].
 			liveDecl:: liveClass isNil ifTrue: [ nil ]
@@ -2704,18 +2702,39 @@ class Repositories usingPlatform: platform ide: webIde = (
 			   contents). *)
 					preInstallNames:: Set new.
 					namespace keysAndValuesDo: [:k :v |
-							v isKindOfBehavior ifTrue: [ preInstallNames add: k asString ]
+							v isKindOfBehavior ifTrue: [ preInstallNames add: k asString ].
+							(v isKindOfNamespace and: [ platformNamespaceNames includes: k asString ]) ifTrue: [
+									v keysAndValuesDo: [:k2 :v2 |
+											v2 isKindOfBehavior ifTrue: [
+													preInstallNames add: k asString , '/' , k2 asString
+												]
+										]
+								]
 						].
 					reboundCount:: 0.
 					ok:: [
+						| byPlatform |
 						builders:: List new.
+						
+						(* Platform modules (platform/<P>/<Class>.ns) install apart, into Root's P namespace: at Root itself they would replace the running platform's module of the same name (PLATFORM_NAMESPACES_DESIGN_2026-11-18.md). *)
+						byPlatform:: Map new.
 						files keysAndValuesDo: [:path :src |
-								builders add: (ClassDeclarationBuilder fromUnitSource: src)
+								| builder key slash |
+								builder:: ClassDeclarationBuilder fromUnitSource: src.
+								builders add: builder.
+								key:: (classNameFromFilename: path) asString.
+								slash:: key indexOf: '/'.
+								slash = 0 ifFalse: [
+										(byPlatform at: (key copyFrom: 1 to: slash - 1)
+											ifAbsentPut: [ List new ]) add: builder
+									]
 							].
 						
 						(* Install into Root -- the IDE convention is that every
 				   top-level class lives there. *)
-						mixins:: ide installFromBuilders: builders asArray.
+						mixins:: ide installFromBuilders: (builders reject: [:b |
+									byPlatform anySatisfy: [:list | list includes: b ]
+								]) asArray.
 						mixins do: [:m |
 								| live |
 								live:: m declaration applyToObject reflectee.
@@ -2734,6 +2753,22 @@ class Repositories usingPlatform: platform ide: webIde = (
 								(preInstallNames includes: m name asString) ifTrue: [
 										namespace at: m name put: live.
 										reboundCount:: reboundCount + 1
+									]
+							].
+						byPlatform keysAndValuesDo: [:platformName :platformBuilders |
+								| rootPlatform |
+								rootPlatform:: Root at: platformName asSymbol
+									ifAbsent: [
+										Root at: platformName asSymbol put: ide namespacing freshNamespace
+									].
+								(ide installFromBuilders: platformBuilders asArray into: rootPlatform) do: [:m |
+										| live |
+										live:: m declaration applyToObject reflectee.
+										rootPlatform at: m name put: live.
+										(preInstallNames includes: platformName , '/' , m name asString) ifTrue: [
+												(namespace at: platformName asSymbol) at: m name put: live.
+												reboundCount:: reboundCount + 1
+											]
 									]
 							].
 						true
@@ -2855,7 +2890,12 @@ class Repositories usingPlatform: platform ide: webIde = (
 			cached:: cachedMemberSourceAt: draftPath in: sha.
 			cached isNil ifFalse: [ ^JSPromise resolve: cached ].
 			classFile:: topLevelClassFileFor: draftPath.
+			
+			(* A platform module's path starts platform/<P>/: its class chain follows. *)
 			segs:: splitPath: draftPath.
+			((draftPath startsWith: 'platform/') and: [ segs size > 3 ]) ifTrue: [
+					segs:: segs copyFrom: 3 to: segs size
+				].
 			^(readBlobAt: classFile in: sha) then: [:rawSrc |
 					[
 						extractMemberSourceFromRaw: rawSrc
@@ -3274,7 +3314,7 @@ class Repositories usingPlatform: platform ide: webIde = (
 	                                       make it into the snapshot.
 	   File source format: 'Newspeak3\n<namespaceKey>\n' + class
 	   declaration source from the live mirror (nested classes inlined,
-	   lazy slots preserved -- see MirrorsForPrimordialSoup.ns:627). *)
+	   lazy slots preserved -- see PrimordialSoup/Mirrors.ns:627). *)
 			
 			| files skipped |
 			files:: Map new.
@@ -3287,10 +3327,27 @@ class Repositories usingPlatform: platform ide: webIde = (
 							files at: key asString , '.ns' put: body
 						]
 						ifFalse: [
-							| desc |
-							desc:: [ value class name asString ] on: Exception
-								do: [:e | '<unknown class>' ].
-							skipped add: key asString , ' (' , desc , ')'
+							(value isKindOfNamespace and: [
+									platformNamespaceNames includes: key asString
+								]) ifTrue: [
+									
+									(* A platform's modules: platform/<P>/<Class>.ns, category P. *)
+									value keysAndValuesDo: [:name :module |
+											module isKindOfBehavior ifTrue: [
+													| cdm body |
+													cdm:: (ClassMirror reflecting: module) mixin declaration.
+													body:: 'Newspeak3' , String newline , key asString printString , String newline , cdm source.
+													files at: 'platform/' , key asString , '/' , name asString , '.ns'
+														put: body
+												]
+										]
+								]
+								ifFalse: [
+									| desc |
+									desc:: [ value class name asString ] on: Exception
+										do: [:e | '<unknown class>' ].
+									skipped add: key asString , ' (' , desc , ')'
+								]
 						]
 				].
 			^Map new at: #files put: files;
@@ -3435,11 +3492,20 @@ class Repositories usingPlatform: platform ide: webIde = (
 			^stageSubtreeReplacements: {''. } newFiles: files
 		)
 		topLevelClassFileFor: draftPath <String> ^<String> = (
-			(* '<TopLevel>/Enclosing/method.foo.ns' -> '<TopLevel>.ns'.
-	   No slash -> already a top-level (e.g. 'header.ns' on a top-level
-	   class itself), use as-is. *)
+			(* '<TopLevel>/Enclosing/method.foo.ns' -> '<TopLevel>.ns', and a
+	   platform module's 'platform/<P>/<TopLevel>/...' ->
+	   'platform/<P>/<TopLevel>.ns'. No slash -> already a top-level
+	   (e.g. 'header.ns' on a top-level class itself), use as-is. *)
 			
 			| idx |
+			(draftPath startsWith: 'platform/') ifTrue: [
+					| platformEnd |
+					platformEnd:: draftPath indexOf: '/' startingAt: 'platform/' size + 1.
+					platformEnd = 0 ifFalse: [
+							idx:: draftPath indexOf: '/' startingAt: platformEnd + 1.
+							idx = 0 ifFalse: [ ^(draftPath copyFrom: 1 to: idx - 1) , '.ns' ]
+						]
+				].
 			idx:: draftPath indexOf: '/' startingAt: 1.
 			idx = 0 ifTrue: [ ^draftPath ].
 			^(draftPath copyFrom: 1 to: idx - 1) , '.ns'
@@ -4948,11 +5014,28 @@ The header provides the following buttons:
 				errBlock value: msg
 			]
 	)
-	classNameFromFilename: path <String> ^<Symbol> = (
-		(* 'Browsing.ns' -> #Browsing. The snapshot only emits top-level
-	   '<ClassName>.ns'; nested classes are inline in the parent file
-	   so no path-segment splitting needed here. *)
+	public classIn: ns at: key <String | Symbol> ifAbsent: onAbsent <[Object]> = (
+		(* The class with the given key in ns: Name for a top-level class,
+	   P/Name for platform P's module, held in ns's P sub-namespace
+	   (classNameFromFilename:). *)
 		
+		| slash platformNs |
+		slash:: key indexOf: '/'.
+		slash = 0 ifTrue: [ ^ns at: key asSymbol ifAbsent: onAbsent ].
+		platformNs:: ns at: (key copyFrom: 1 to: slash - 1) asSymbol
+			ifAbsent: [ ^onAbsent value ].
+		^platformNs at: (key copyFrom: slash + 1 to: key size) asSymbol
+			ifAbsent: onAbsent
+	)
+	public classNameFromFilename: path <String> ^<Symbol> = (
+		(* 'Browsing.ns' -> #Browsing; a platform module's
+	   'platform/JS/Mirrors.ns' -> #'JS/Mirrors' (classIn:at:ifAbsent:
+	   finds it). Nested classes are inline in the parent file, so no
+	   further path-segment splitting is needed. *)
+		
+		(isPlatformNsFile: path) ifTrue: [
+				^(path copyFrom: 'platform/' size + 1 to: path size - 3) asSymbol
+			].
 		(path endsWith: '.ns') ifTrue: [
 				^(path copyFrom: 1 to: path size - 3) asSymbol
 			]
@@ -5005,7 +5088,9 @@ The header provides the following buttons:
 								classDiffs at: className
 									put: (Map new at: #status put: #new;
 										at: #liveSnapshot
-											put: (liveSnapshotOf: (repo namespace at: className));
+											put: (liveSnapshotOf: (classIn: repo namespace
+													at: className
+													ifAbsent: [ nil ]));
 										at: #liveSource put: liveSrc;
 										yourself)
 							]
@@ -5022,7 +5107,9 @@ The header provides the following buttons:
 								headSrc = liveSrc ifFalse: [
 										| headSnap liveSnap diff |
 										headSnap:: extractedSnapshotFromSource: headSrc.
-										liveSnap:: liveSnapshotOf: (repo namespace at: className).
+										liveSnap:: liveSnapshotOf: (classIn: repo namespace
+												at: className
+												ifAbsent: [ nil ]).
 										diff:: diffSnapshot: headSnap to: liveSnap.
 										(diffIsEmpty: diff) ifFalse: [
 												classDiffs at: className
@@ -5352,15 +5439,35 @@ The header provides the following buttons:
 		^slashIdx = 0 ifTrue: [ afterScheme ]
 			ifFalse: [ afterScheme copyFrom: 1 to: slashIdx - 1 ]
 	)
+	public isPlatformNsFile: path <String> ^<Boolean> = (
+		(* True iff path is platform/<P>/<Class>.ns for a platform P
+	   (platformNamespaceNames; PLATFORM_NAMESPACES_DESIGN_2026-11-18.md):
+	   a module of platform P, held in the P sub-namespace of a
+	   repository's namespace. *)
+		
+		| rest slash |
+		((path startsWith: 'platform/') and: [ path endsWith: '.ns' ]) ifFalse: [
+				^false
+			].
+		rest:: path copyFrom: 'platform/' size + 1 to: path size.
+		slash:: rest indexOf: '/'.
+		slash = 0 ifTrue: [ ^false ].
+		(platformNamespaceNames includes: (rest copyFrom: 1 to: slash - 1)) ifFalse: [
+				^false
+			].
+		^(rest indexOf: '/' startingAt: slash + 1) = 0
+	)
 	isTopLevelNsFile: path <String> ^<Boolean> = (
-		(* True iff path looks like a top-level Newspeak class file:
-	   ends in '.ns' and contains no path separator. The user-visible
-	   commit scope is exactly the namespace's top-level <Class>.ns
-	   files; subdirectory .ns files (out/, tool/, tests/...) and
+		(* True iff path looks like a class file of a namespace: a top-level
+	   <Class>.ns, or a platform module's platform/<P>/<Class>.ns
+	   (isPlatformNsFile:). The user-visible commit scope is exactly
+	   those; other subdirectory .ns files (out/, tool/, tests/...) and
 	   non-.ns files (README, LICENSE, .gitignore, ...) are out of
 	   scope and must not be touched by stage/commit. *)
 		
-		^(path endsWith: '.ns') and: [ (path indexOf: '/') = 0 ]
+		^(path endsWith: '.ns') and: [
+				(path indexOf: '/') = 0 or: [ isPlatformNsFile: path ]
+			]
 	)
 	jsObjectToMap: jsObj <Alien> ^<Map[String, Object]> = (
 		(* Convert a plain JS object (alien) to a Newspeak Map by iterating
@@ -5475,6 +5582,12 @@ The header provides the following buttons:
 				nil
 			]
 	)
+	public platformNamespaceNames ^<Array[String]> = (
+		(* The sub-namespaces of a repository's namespace whose classes are
+	   platform modules, kept in platform/<P>/ (PLATFORM_NAMESPACES_DESIGN_2026-11-18.md). *)
+		
+		^{'Eurasia'. 'JS'. 'PrimordialSoup'. }
+	)
 	public repositoriesForNamespaceKey: key <String> ^<List[Repository]> = (
 		(* Reverse lookup: every Repository registered in Root whose
 	   namespaceKey matches `key`. Used by Browsing's NamespacePresenter
@@ -5515,6 +5628,11 @@ The header provides the following buttons:
 				[
 					name:: cfg at: 'name'.
 					namespaceKey:: cfg at: 'namespaceKey'.
+					
+					(* Until 2026-11-18 the namespace of the psoup repository's classes was PrimordialSoup, which now names the psoup platform's own namespace (PLATFORM_NAMESPACES_DESIGN_2026-11-18.md). *)
+					namespaceKey = 'PrimordialSoup' ifTrue: [
+							namespaceKey:: 'PrimordialSoupRepository'
+						].
 					(Root includesKey: name asSymbol) ifTrue: [ (* Already restored or shadowed — skip. *) ]
 						ifFalse: [
 							ns:: namespaceKey = 'Root' ifTrue: [ Root ]

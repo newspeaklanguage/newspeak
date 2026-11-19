@@ -16,8 +16,15 @@ Every source in this tree declares the class its filename names, so within a
 colliding group the stray is identifiable: it is the file whose name does not
 match the class.
 
+Platform namespaces (PLATFORM_NAMESPACES_DESIGN_2026-11-18.md): the modules of
+platform P live in DIR/platform/P/ and are compiled as P/Name, so a class there
+may share its name with one in DIR or in another platform's directory. Each
+platform directory is checked as a namespace of its own, and each of its files
+must name P as its category (line 2): the directory is the authority, and the
+category must agree with it.
+
 Usage: check-duplicate-modules.py DIR [DIR ...]
-Exits 1 and reports on the first directory containing a collision.
+Exits 1 and reports every directory containing a collision.
 """
 import collections
 import glob
@@ -36,8 +43,37 @@ def duplicates_in(directory):
     return {cls: files for cls, files in declared.items() if len(files) > 1}
 
 
-def main(directories):
+def misfiled_in(directory, platform):
+    """Files in a platform directory whose category is not the platform."""
+    wrong = []
+    for path in sorted(glob.glob(os.path.join(directory, '*.ns'))):
+        lines = open(path, encoding='utf-8', errors='replace').read(4000).splitlines()
+        category = lines[1].strip().strip("'") if len(lines) > 1 else ''
+        if category != platform:
+            wrong.append((os.path.basename(path), category))
+    return wrong
+
+
+def namespaces_of(directory):
+    """DIR itself, then each DIR/platform/P, with its platform name."""
+    yield directory, None
+    for sub in sorted(glob.glob(os.path.join(directory, 'platform', '*'))):
+        if os.path.isdir(sub):
+            yield sub, os.path.basename(sub)
+
+
+def main(roots):
     failed = False
+    directories = []
+    for root in roots:
+        for directory, platform in namespaces_of(root):
+            directories.append(directory)
+            if platform is None:
+                continue
+            for name, category in misfiled_in(directory, platform):
+                failed = True
+                print("error: %s/%s is in platform %s's directory but its category is '%s'."
+                      % (directory, name, platform, category), file=sys.stderr)
     for directory in directories:
         dups = duplicates_in(directory)
         if not dups:

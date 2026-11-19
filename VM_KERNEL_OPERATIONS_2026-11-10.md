@@ -97,7 +97,10 @@ The model is the formal semantics' (`actor-semantics.tex` eq.
   slot index for getter and setter), literals, bytecode, mixin, selector,
   access, source.
 - *Mixin*: name, methods (an Array), enclosing mixin, slot declarations
-  (names, in order; the VM derives instance layouts from them).
+  (names, in order; the VM derives instance layouts from them), and, for an
+  instance-side mixin, its paired class-side mixin (nil for a class-side
+  mixin; added 2026-11-17, so `applyMixin:superclass:enclosingObject:` can
+  build the metaclass).
 - *Class*: mixin, superclass, enclosing object, name; *metaclass*: its
   class.
 - *Message*: selector, arguments.
@@ -251,6 +254,7 @@ identity) because it reifies their frames.
 | `vm is: o identicalTo: p` | 86 | pure | — | Boolean | |
 | `vm identityHashOf: o` | 87 | resource | — | SmallInteger | |
 | `vm isCanonical: o` | 126 | heap | inspect | Boolean | |
+| `vm isValue: o` | new | heap | inspect | Boolean | Whether `o` is a value: an immediate, nil, a Boolean, a String, Float or LargeInteger, an instance of a value class, or a class whose enclosing object is a value (added 2026-11-17; `EURASIA_ACTORS_DESIGN_2026-11-17.md` section 5). |
 | `vm markCanonical: o` | 127 | heap | editObjectSlots | `o` | |
 | `vm allInstancesOf: c` | 96 | reflective | inspect | Array, in allocation order | Cohort-wide, as in the semantics (`eq:all-instances-of` ranges over every actor heap). |
 | `vm mixinApplicationsOf: m` | new | reflective | inspect | Array of classes, in allocation order | Cohort-wide (`eq:mixin-applications`). Required by `mixinApplicationsQuery`. |
@@ -285,6 +289,25 @@ activation (60, 62, 64) become arguments of `newActivationFor:…`. Changing
 them on an activation that is already running is not offered: no current
 user, and the formal semantics has no command for it.
 
+**Implemented on Eurasia (2026-11-18, M6 step 4).** psoup's activation
+protocol, because the mirror library's Simulator (upstream's, for V5) uses
+it:
+- `Activation new` (native 162) makes a detached activation, whose sender,
+  bci, method, closure, receiver and temps the setters write (163–167, and
+  the existing `sender:`, `tempAt:put:`).
+- `vm continueAt: a with: v` (170) jumps to a live activation. The frames
+  above it become detached activations rather than dead ones.
+- `vm resumeActivation: top` (171) turns a detached chain into frames, in
+  place of psoup's jump to a heap activation.
+- `vm runNative:receiver:arguments:` (172) is the Simulator's
+  `doPrimitive`.
+- `newClosureIn:initialBCI:numArgs:numCopied:` (173) is psoup's `Closure
+  class new`.
+- Simulation roots are methods marked by `vm markSimulationRoot:` (168).
+
+`newActivationFor:…`, `pcOf:put:` and `depthOf:put:` on live activations,
+and `markUncontinuable:`, are not implemented.
+
 **pc.** Positions are V5 bytecode positions in the method's bytecode, never
 machine addresses. A JIT maps them (formal semantics `machinePoint`).
 
@@ -296,7 +319,7 @@ machine addresses. A JIT maps them (formal semantics `machinePoint`).
 | `vm programVersion` | new | reflective | inspect | SmallInteger | |
 | `vm nativeMethod: name selector: s` | new | reflective | primitive | a fresh, uninstalled native Method | `#wrongKind: 1` (no such native) |
 | `vm natives` | new | reflective | inspect | Array of (name, kernel version) pairs | |
-| `vm applyMixin: m superclass: s enclosingObject: eo` | new | heap | — | a new class object in the caller's heap | `#wrongKind: 1/2` |
+| `vm applyMixin: m superclass: s enclosingObject: eo` | new | heap | — | a new class, applying the instance-side mixin `m` to `s`, and its metaclass, applying `m`'s class-side mixin (a contract field), in the caller's heap; the metaclass's superclass and class are those of `s`'s metaclass | `#wrongKind: 1/2` |
 
 **This keeps today's install shape.** The mirror library builds fresh
 methods, mixins and classes in Newspeak, validates them, and installs
@@ -347,6 +370,22 @@ a safepoint first. A paused actor is always at one.
 mixin is committed. Nothing in source can produce one (design doc
 section 8).
 
+**Implemented on Eurasia (2026-11-18, M6 step 3).** `vm commit:` is
+native 158. Its change set is an Array of three parts:
+- the old objects;
+- the new objects;
+- the layout maps, each `{old class. new class. for each new slot, the old
+  slot's index or 0}`.
+
+Layout maps reshape instances in place: identity, flags and actor are
+kept. Forwarding is one pass over the arena and the VM's roots, and
+running frames keep their methods. The new program objects are frozen.
+`vm mixinApplicationsOf:` (159), `vm subclassesOf:` (160) and
+`vm programVersion` (161) come with it. The class queries and
+`vm allInstancesOf:` (153) collect first, so that no dead object answers.
+Object and activation commands in the change set, and `reclassify:as:`,
+are not yet implemented.
+
 **Single-command shortcuts.** `vm slotOf:at:put:` and `vm reclassify:as:`
 (section 4) are exactly one-command commits. They are kept as operations
 because serialisation (PrimordialFuel) uses slot writes heavily.
@@ -368,6 +407,27 @@ because serialisation (PrimordialFuel) uses slot writes heavily.
 | `vm resume: actor` | new | reflective | controlActorStack | `nil` | `resumePausedActorAtFullSpeed` |
 | `vm replaceStackOf: actor with: image andResume` | new | reflective | controlActorStack | `nil` | `replaceAndResumePausedActorStack` |
 
+**Implemented on Eurasia (2026-11-18, `EURASIA_ACTORS_DESIGN_2026-11-17.md`).**
+`vm spawn:` is Eurasia native 139. Actors are VM actors in one arena, and
+the library's actors module reaches them through these further operations
+(Eurasia natives, installed on the actors module or the VM mirror by
+`eurasia/kernel/natives.tsv`):
+
+| Operation | Native | Result | Notes |
+|---|---|---|---|
+| `vm clone: root` | 126 | the copy | Copies the mutable graph; values, program objects, shared objects and their classes stay shared. |
+| `vm newActor` | 127 | a far reference to nil in the new actor | `Actor named:`: a new actor running a clone of the platform template (role 36). |
+| `vm farReference: handle to: value` | 128 | a far reference | To a value in the handle's actor. |
+| `vm post: packet to: farReference` | 129 | `nil` | Queues the packet, every element translated by the remote-representation rules, in the far reference's actor; its message loop gets `dispatchPacket:`. |
+| `vm isFarReference: x` | 130 | Boolean | |
+| `vm currentMessageLoop` | 131 | the running actor's loop | |
+| `vm newPromiseFor: p` | 132 | a pending promise record (Π) | Its owner is a far reference to the library promise `p`. |
+| `vm resolvePromise: r with: v`, `vm breakPromise: r with: e` | 133, 134 | whether `r` was pending | A record as the resolution forwards `r` to it. Queued sends are delivered and waiters are notified. |
+| `vm promiseState: r` | 135 | `{state. payload}` | At the end of the forwarding chain, in the running actor's terms. |
+| `vm promise: r addWaiter: p` | 136 | `nil` | `p` is sent `resolveRemotely:` or `breakRemotely:` when `r` settles. |
+| `vm isPromise: x` | 137 | Boolean | |
+| `vm promise: r send: message` | 138 | `nil` | Route-Pending: queued in the record until it settles. |
+
 Each incoming event (message, timer, host callback with no turn on the
 stack) is delivered through the dispatch roles and is a logged input.
 
@@ -378,6 +438,13 @@ the actor runs nothing until a debugger resumes it or replaces its stack.
 The debugger, normally another actor, is told by an ordinary message and
 works through a mirror. psoup instead detaches the stack into a Thread
 object and lets the actor go on with other turns.
+
+**For now, on Eurasia (decided 2026-11-18):** an unhandled exception does
+not pause the actor, because the IDE runs its debugger in the same actor
+(`EURASIA_M6_REFLECTION_DESIGN_2026-11-18.md` section 9). The turn's frames
+become detached activations when it ends, if something holds one of them,
+and the actor carries on. Pausing applies once a debugger runs in another
+actor.
 
 **Exception inside a callback.** A callback cannot stay paused, because the
 host is waiting on it synchronously. Per the decision of 2026-11-09 (design
@@ -415,6 +482,21 @@ exception library does this with `vm abandonCallback: exception` (below);
 
 Restoring is not an operation: it starts a VM (`spawn:` for an actor, or a
 host start for the whole VM), after which the restore role runs.
+
+*Eurasia, M7 (2026-11-18; `EURASIA_M7_SNAPSHOTS_REPLAY_DESIGN_2026-11-18.md`):*
+- `vm snapshot` stays the snapshot that starts afresh (genesis,
+  deployment): no frames, a frame's activation handle saved dead. Paused
+  stacks are in *checkpoints*, which `vm checkpointNow` (native 174) and
+  `vm checkpointPolicy: n` (175: a checkpoint after every `n` allocations, 0
+  none; answers the receiver) hand to the host; a recording host keeps
+  them in its log. `vm logPosition` is native 176 (nil with no log).
+- Weak clearings are not logged: collections run on an allocation
+  schedule, which is part of the checkpoint, so replay clears at the same
+  points.
+- Lazy slots holding Aliens are reset when a checkpoint is restored into a
+  new host, not on save, so that one checkpoint serves both replay and
+  restore. The restore role is role 40, sent `restored` in a turn of its own.
+- `vm heapStatistics` does not exist yet.
 Replay control (stepping back, replaying to a position) is driven from
 outside the replayed actor by the debugger; whether that is a kernel
 operation or a host-side tool is left to the time-travel design.
@@ -437,6 +519,7 @@ class, and on the VM mirror for the entry points. Every call is **input**
 | `alien callWithArguments: anArray` (the alien is a function) | 163 | value or Alien | same |
 | `alien newWithArguments: anArray` | 164 | Alien | same |
 | `alien isInstanceOf: anAlien` | 166 | Boolean | `#host: e`, `#dead` |
+| `alien isUndefined` | — | Boolean | (not a native: whether the alien is the host's `undefined`) |
 | `vm expat: aClosure` | 156 | Expat (a host-callable function) | |
 | `expat release` | — | `nil` | Calls after release fail on the host side with a defined error. |
 
@@ -446,11 +529,21 @@ marshalling of arguments and results inside each call. 169 (handle-table
 size) moves into `vm heapStatistics`.
 
 **Marshalling** (exact, no operand stack): `nil`, Booleans, SmallIntegers,
-Floats and Strings cross by value (host `null`/`undefined` both arrive as
-`nil`; an Integer outside the host's exact range fails with `#outOfRange`).
-Every other host value arrives as an Alien; an Alien passed back arrives as
-its host object; an Expat arrives as its host function. Any other Newspeak
-object fails with `#wrongKind`.
+Floats and Strings cross by value. Host `null` arrives as `nil`; host
+`undefined` arrives as an Alien that answers true to `isUndefined`, as in
+psoup (decided 2026-11-18; psoup's API, which `JSTesting` and Hopscotch use).
+`nil` passed to the host arrives as `null`, and the undefined Alien as
+`undefined`. A host number that is integral and within the host's exact
+range (2^53 for JavaScript) arrives as an Integer, any other as a Float; an
+Integer outside that range fails with `#outOfRange`. Every other host value
+arrives as an Alien; an Alien passed back arrives as its host object; an
+Expat arrives as its host function. A closure passed to the host becomes a
+new expat implicitly, as in psoup (decided 2026-11-18); `vm expat:` makes one
+explicitly. A callback's result crosses back by the same rules; one that
+cannot cross fails the callback, as in psoup, so a callback whose value does
+not matter should answer nil. Any other Newspeak object fails with
+`#wrongKind`. In `#host: e`, `e` is a String: the host's description of the
+exception.
 
 **Callbacks** follow design doc section 4 (decided 2026-11-09): a callback
 arriving during a turn is a sub-step of that turn, runs above the boundary
@@ -458,6 +551,43 @@ role, never drains the queue, and may call an expat synchronously only from
 its owning actor's turn. **Arity (decided 2026-11-10):** as in JS, extra
 host arguments are dropped and missing ones arrive as `nil`. psoup today
 raises on extra arguments; NS2JS already drops them.
+
+**Implemented on Eurasia (2026-11-18, M5 step 2).** The operations are
+natives 140–148 (`eurasia/kernel/natives.tsv`):
+- `vm hostGlobal` (140);
+- `Alien` (a kernel class, role 33): `at:` (141), `at:put:` (142),
+  `removeKey:` (143), `includesKey:` (144), `call:withArguments:` and
+  psoup's `perform:withArguments:` (145), `callWithArguments:` (146),
+  `newWithArguments:` (147), `isInstanceOf:` and psoup's `instanceOf:`
+  (148).
+
+They reach the host through `Host::host_operation`, which the web host
+performs in JavaScript (`eurasia/web/eurasia.mjs`). An Alien's unknown
+messages go to the host object as psoup's do. The platform's `js`
+(`EurasiaRuntime.ns`) gives `global`, `undefined` and `localStorage`.
+
+**Expats and callbacks on Eurasia (2026-11-18, M5 step 3):**
+- The VM keeps a table of expats (closure and owning actor), a GC root.
+  The host wraps each in a function that calls the export
+  `eurasia_callback`.
+- A host call is performed by the interpreter, which hands the host itself
+  (`HostCallbacks`) for callbacks during the call. Such a callback is a
+  sub-step of the turn: the closure runs above the boundary, the kernel's
+  `Closure>>dispatchCallbackWith:` (role 28), in a nested step loop, and
+  nothing else runs.
+- The boundary catches any exception and answers its description, which
+  the host caller gets as a host exception. A non-local return through it
+  raises `cannotReturn:`, because the VM's non-local return stops at role
+  28. Nesting is limited to 64.
+- A callback while the VM is idle starts a turn in the owning actor. Its
+  loop then drains the sends the callback queued, and the loader resumes
+  the VM.
+- An expat called from another actor's turn becomes a message to its owner,
+  and the host gets `undefined`.
+
+Not yet: `vm expat:` and `expat release` (expats are made implicitly and
+never released, as in psoup), and reporting a callback's exception with its
+live stack (M6).
 
 **Native FFI.** The same operations, with `call:withArguments:` on a C
 function alien plus a signature describing the C types, cover native hosts.

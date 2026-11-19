@@ -198,3 +198,170 @@ free (an object's body is its own `Vec`, closures copy their captured values
 into one, activations are allocated for closures' defining frames), then the
 send path. The next steps are Tier 2's object model and Tier 3's inline
 caches; closures (ClosureFibonacci, 5x) gain most from the first.
+
+## 6. Dispatch, first pass (after Tier 2 Step 0)
+
+Native, runs per second (Step 0 numbers from
+`EURASIA_TIER2_PLAN_2026-11-19.md` section 5; noise about 5% to 10%):
+
+| Benchmark | after Step 0 | now | psoup | now slower by |
+|---|---:|---:|---:|---:|
+| ClosureDefFibonacci | 16.4 | 20.0 | 50.7 | 2.5x |
+| ClosureFibonacci | 24.8 | 31.1 | 89.3 | 2.9x |
+| DeltaBlue | 64.7 | 77.7 | 187.2 | 2.4x |
+| MethodFibonacci | 29.1 | 38.3 | 89.3 | 2.3x |
+| NLRImmediate | 355.2 | 410.1 | 1157.0 | 2.8x |
+| NLRLoop | 80.8 | 97.8 | 238.5 | 2.4x |
+| ParserCombinators | 4.9 | 5.8 | 21.5 | 3.7x |
+| Richards | 70.4 | 85.3 | 198.2 | 2.3x |
+| SlotRead | 27.2 | 34.2 | 92.1 | 2.7x |
+| SlotWrite | 21.4 | 26.2 | 53.5 | 2.0x |
+| Splay | 109.3 | 117.9 | 274.7 | 2.3x |
+
+What changed:
+
+- **`step` is inlined into the event loop** (`#[inline(always)]`). It was a
+  call per instruction with a 496-byte stack frame and twelve saved
+  registers. This alone gave 20% to 28%.
+- **A frame keeps its method's literals and mixin**, so a send, a literal
+  push and an outer or implicit-receiver send do not look the method up.
+  They are forwarded with the frame on a commit, and reloaded for every
+  frame whenever the lookup cache is cleared (collections, commits, writes
+  to methods and mixins), so they never go stale. The flush now happens
+  after the change it follows (after the frames are forwarded in a
+  collection, after the write in `store_slot`).
+- **A lookup cache entry holds the method's header** (now `Copy`), so
+  activating a native or an accessor does not look the method up. Neutral
+  within noise; kept because it is no more code than what it replaced.
+- **One comparison per safepoint**: the event loop compares the allocation
+  count with the count at which a collection or checkpoint can next be due,
+  and checks in full only then; anything that changes that sets it to 0.
+  Safepoints are where they were, so collections and checkpoints happen at
+  the same points (the replay tests and GC stress agree). A few percent.
+
+Tried and dropped: caching each method's bytecode, literals and mixin in
+the lookup cache entry as well (a larger entry, and a reference count
+change on every hit, was 5% to 10% slower than the lookup it saved).
+
+Where it stands: about 56 to 98 million bytecodes a second (Richards 67M,
+MethodFibonacci 98M, Splay 56M), 10 to 15 ns each, most of it sends and
+returns. The rest of the gap is the shape of a safe-Rust interpreter: the
+operand stack and the frames are `Vec`s, so every push checks capacity and
+every frame access goes through `frames.last()`; frames are 104-byte
+structs pushed and popped by copy; the instruction pointer lives in the
+frame, not in a register; errors make every `Result` large.
+
+Options from here:
+
+1. **Pre-decoded code with per-site inline caches** (one to two weeks):
+   each method's bytecode decoded once into operands and cache cells, so
+   an instruction needs no decoding, and a send checks the receiver's class
+   against its own site's entry. Estimate 1.3x to 1.6x.
+2. **Keep the interpreter's state in locals** (days, and can come first):
+   the instruction pointer, the current code and the frame's base in local
+   variables in the loop, written back only at sends, returns and
+   safepoints. Estimate 1.2x to 1.4x.
+3. **Allow `unsafe` in the interpreter's core** (the crate denies it now):
+   a raw operand stack and frames without bounds or capacity checks, as
+   psoup has. Estimate 1.5x to 2x; it changes the project's safety stance,
+   so it is a decision, not an optimization.
+4. **A baseline compiler** (Tier 3 proper; months): the only route past
+   psoup, as NS2JS shows.
+
+## 7. Dispatch, second pass: the interpreter's state in locals
+
+Native, runs per second (section 6's numbers before; noise about 5% to
+10%):
+
+| Benchmark | section 6 | now | psoup | now slower by |
+|---|---:|---:|---:|---:|
+| ClosureDefFibonacci | 20.0 | 24.2 | 50.7 | 2.1x |
+| ClosureFibonacci | 31.1 | 40.0 | 89.3 | 2.2x |
+| DeltaBlue | 77.7 | 79.4 | 187.2 | 2.4x |
+| MethodFibonacci | 38.3 | 55.8 | 89.3 | 1.6x |
+| NLRImmediate | 410.1 | 478.5 | 1157.0 | 2.4x |
+| NLRLoop | 97.8 | 138.3 | 238.5 | 1.7x |
+| ParserCombinators | 5.8 | 6.2 | 21.5 | 3.5x |
+| Richards | 85.3 | 84.0 | 198.2 | 2.4x |
+| SlotRead | 34.2 | 42.1 | 92.1 | 2.2x |
+| SlotWrite | 26.2 | 35.1 | 53.5 | 1.5x |
+| Splay | 117.9 | 119.4 | 274.7 | 2.3x |
+
+What changed (`Vm::run_simple`):
+
+- **A loop with its state in locals.** The instruction pointer, the code,
+  the frame's base, locals and receiver, and the operand stack's buffer,
+  length and capacity are local variables. The simple instructions
+  (pushes, stores, branches, literals, SmallInteger arithmetic) run there;
+  any other instruction, and anything out of the ordinary in a simple one
+  (an index out of range, a non-Boolean condition, no room on the stack),
+  writes the state back and goes through `step` unchanged, so errors and
+  every complex instruction behave exactly as before.
+- **It does not leave the loop at a send.** After `step` runs a send or a
+  return, the loop reloads its state from the frame now on top and goes
+  on; it returns to the event loop only when that has something to do (no
+  frame left, a collection or checkpoint that can be due, the interrupt
+  poll). Safepoints are where they were: no simple instruction allocates,
+  so nothing can come due between two of them, the allocation count is
+  compared after every `step`, and the interrupt countdown counts every
+  instruction. This, more than the locals themselves, is the gain.
+- **Tried and reverted: unchecked accesses in that loop.** With `unsafe`
+  allowed in `interpreter.rs` only, the code and the operand stack were
+  read and written through raw pointers, each access after a
+  `debug_assert!` of what makes it sound (so a debug build checked them
+  all; a debug-build kernel-test run gave output identical to release).
+  Measured against the same loop with ordinary indexing, it made no
+  difference on any benchmark (within 1% to 2%): the bounds and capacity
+  checks are well-predicted branches, and the time is elsewhere (below).
+  So the crate is back to denying `unsafe` everywhere; it should come back
+  only with a change whose measured gain needs it.
+Tried and dropped: forcing `send`, `send_by_literal` and `activate_with`
+inline into the loop (`#[inline(always)]`) was 10% to 20% slower; the
+larger loop costs more than the calls.
+
+Where the time goes now (Richards, Time Profiler with line tables, by
+function): the loop 28%, `step` (now mostly the sends it decodes) 13%,
+activation 11%, the lookup-cache probe and send 13%, heap access 6%, the
+rest spread thin. No single line is above 3%. Richards and DeltaBlue, the
+most send-heavy, did not move in this pass: their cost is the send path
+itself (call and return overhead of `send` and `activate_with`, the cache
+probe, pushing and popping 104-byte frames). Pre-decoded code with per-site
+inline caches (section 6, option 1) is what addresses that.
+
+How to profile by line: build with
+`CARGO_PROFILE_RELEASE_DEBUG=line-tables-only`, run `dsymutil` on the
+binary, record with `xcrun xctrace record --template 'Time Profiler'
+--launch -- eurasia base.eus Richards`, export the `time-profile` table
+with `xcrun xctrace export`, and symbolize the leaf addresses with
+`atos -i` (inlined frames), taking the innermost Eurasia line.
+
+## 8. Per-site inline caches: tried, slower, reverted
+
+Each method's bytecode became a `Code` holding, besides the bytes, one
+cache cell per send instruction (numbered once when the method is made),
+each entry stamped with an epoch that the interpreter advanced wherever it
+clears the global lookup cache. A send checked its own site's cell (epoch,
+receiver class, selector) before the global cache, and filled it on a
+miss.
+
+It was 3% to 9% slower on ten of the eleven benchmarks (Richards 84.4 to
+81.2, MethodFibonacci 55.2 to 51.8, SlotRead 42.0 to 38.2; Splay 120.0 to
+124.5, within noise). The global cache already hits, and cheaply; a site
+check adds work (recording the instruction's index on every instruction,
+a table lookup per send, copying a 64-byte entry) without removing any.
+So lookup is not where a send's time goes, and it is reverted.
+
+What the measurements now say, after sections 6 to 8:
+
+- Lookup (the global cache) is cheap and is not worth more work.
+- Unchecked accesses are not worth `unsafe` (section 7).
+- The cost of a send is spread over its whole path: the calls themselves
+  (`send`, `activate_with` and `local_return` are not inlined, and
+  inlining them was slower), pushing and popping a 104-byte `Frame`, and
+  filling the new frame's locals. Shrinking the frame (indices as `u32`,
+  the two optional references without their `Option` tags) and merging
+  the activation of an ordinary method into the loop might give another
+  10% to 30%.
+- Beyond that, closing the remaining 2x to psoup, and going past it, takes
+  a different execution model: a baseline compiler (section 3, Tier 3,
+  item 11), not further interpreter tuning.

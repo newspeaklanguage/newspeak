@@ -119,6 +119,16 @@ cp ${PRIMORDIALSOUP}/out/snapshots/*.vfuel out
 cp ${PRIMORDIALSOUP}/newspeak/*.ns out
 # 7. Merge in Newspeak IDE dependencies
 cp ./*.ns ./*.png out
+# 7a. Platform modules (PLATFORM_NAMESPACES_DESIGN_2026-11-18.md): platform P's
+#     modules live in platform/P/, in either repository, and keep that place in
+#     out/, where WebCompiler names them P/Name. Staged afresh, so a module
+#     moved or deleted in the sources does not linger.
+rm -rf out/platform
+for dir in ${PRIMORDIALSOUP}/newspeak/platform/* ./platform/*; do
+    [ -d "$dir" ] || continue
+    mkdir -p "out/platform/$(basename "$dir")"
+    cp "$dir"/*.ns "out/platform/$(basename "$dir")/"
+done
 
 # 7c. Stamp BuildInfo, into out/ ONLY, after the copy above has put the
 #     placeholder there. Nothing copies *.ns into out/ after this point, so this
@@ -236,9 +246,12 @@ python3 ${NEWSPEAK}/tool/check-duplicate-modules.py . || exit 1
 #    from ns files (ex: HopscotchWebIDE.ns) and
 #    additional resources (*.ns, *.png).
 #
+PLATFORM_NS=$(ls ./platform/*/*.ns 2>/dev/null || true)
+# shellcheck disable=SC2086
 ${PRIMORDIALSOUP}/out/ReleaseX64/primordialsoup \
     ${PRIMORDIALSOUP}/out/snapshots/WebCompiler.vfuel \
     ./*.ns \
+    $PLATFORM_NS \
     ./*.png \
     RuntimeForHopscotchForHTML HopscotchWebIDE HopscotchWebIDE.vfuel \
     RuntimeForHopscotchForHTML Ampleforth Ampleforth.vfuel  \

@@ -211,6 +211,26 @@ for (const [name, act, expected, doc = DOC] of scenarios) {
   console.log(`${ok ? "PASS" : "FAIL"} amplets run once\n     ${got}; runs ${runs}; shown ${shown}`);
   scenarios.push(null);
 }
+// An amplet's own editor gets what is typed into it: a method presenter's
+// code editor in an amplet, say. The live editor used to take the input as
+// an edit of the document, at its own caret.
+{
+  const doc = "[\\paragraph\\]a [\\amplet: [codeEditor]\\] b[\\endParagraph\\]";
+  await js(`emmanuelLoad(${JSON.stringify(doc)})`);
+  await sleep(300);
+  await js("(() => { const cm = document.querySelector('.CodeMirror').CodeMirror; cm.focus(); cm.setCursor(0, 3); })()");
+  await sleep(200);
+  await type("Q");
+  await key("Backspace");
+  await type("RS");
+  await sleep(200);
+  const got = await source();
+  const text = await js("document.querySelector('.CodeMirror').CodeMirror.getValue()");
+  const ok = got === doc && text === "abcRS";
+  if (!ok) failures++;
+  console.log(`${ok ? "PASS" : "FAIL"} typing in an amplet's code editor\n     ${got}; the code editor holds ${JSON.stringify(text)}`);
+  scenarios.push(null);
+}
 console.log(`${scenarios.length - failures}/${scenarios.length} scenarios passed`);
 
 // Timing: with source files given, the time of a keystroke in each, typed

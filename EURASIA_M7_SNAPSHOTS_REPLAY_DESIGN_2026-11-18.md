@@ -197,13 +197,29 @@ How it differs from the proposal:
   than the host's undefined and global objects get the reference -1, and an
   operation on one fails with `#dead`.
 
+Done since (2026-11-18, later):
+- **The IDE restores into a new page.** `actors whenRestored: aBlock` sets
+  the restore handler (role 40; nothing on psoup and JS). The IDE's
+  handler makes Hopscotch forget its windows and every presenter
+  (`forgetWindows`: `uiGeneration` advances, so subjects build new
+  presenters rather than reconciling with dead visuals) and reopens the IDE
+  window on the subject it showed. The IDE's modules keep host objects
+  (the document, JS constructors, localStorage) in lazy slots, so that they
+  are looked up again (contract design, section 6, rule 1). Checked by
+  hand: a session recorded in a browser, its checkpoint opened in a new
+  page, comes back on the same page and keeps working.
+- **Incarnation ids and lineage.** Every start mints a 16-byte id from host
+  entropy (recorded, so a replay reproduces it); the id the image was saved
+  with becomes the lineage. Roles 41 and 42, snapshot format 7, `vm
+  incarnation` and `vm lineage` (natives 177, 178). Genesis saves no
+  incarnation, so base images stay reproducible.
+- **Logs stay bounded.** A log keeps its last K checkpoints and the events
+  after the oldest (`--keep-checkpoints K`; in the browser `keep=k`,
+  default 2). Positions and checkpoint numbers stay absolute. Log format 2
+  (format 1 still reads).
+
 Not done:
-- **The IDE has no restore handler.** Restoring an IDE checkpoint into a new
-  page continues its turns but shows nothing: Hopscotch must re-render from
-  its model (contract design, section 6, rule 3).
-- **Incarnation ids and lineage** (contract design, section 6) are not
-  recorded.
-- **Logs are kept whole in memory.** A long browser session's log grows
-  without bound (an IDE session of a minute is about 8 MB).
 - **Recording a run restored from a checkpoint** is refused. Its replay
   would need the restore's effects on aliens as part of the log.
+- **Succession** (contract design, section 6, items 3 and 4) is not
+  designed beyond the contract design's sketch.

@@ -200,10 +200,17 @@ How it differs from the proposal:
 Done since (2026-11-18, later):
 - **The IDE restores into a new page.** `actors whenRestored: aBlock` sets
   the restore handler (role 40; nothing on psoup and JS). The IDE's
-  handler makes Hopscotch forget its windows and every presenter
-  (`forgetWindows`: `uiGeneration` advances, so subjects build new
-  presenters rather than reconciling with dead visuals) and reopens the IDE
-  window on the subject it showed. The IDE's modules keep host objects
+  handler calls Hopscotch's `restoreWindows`: a visual epoch advances, so
+  every visual made before the restore is stale and a fragment asked for
+  its visual makes a new one from its own state (a reconciliation against
+  an old fragment remakes that one's first); each top-level window makes
+  new elements in the new page and shows its current presenter again.
+  Windows, presenters and navigation histories are kept, so the history,
+  open debugger frames and links back to earlier views survive; an
+  embedded window comes back with its WindowFragment. Image fragments
+  remember their image's source when made (`rememberImageSource:`), since
+  the shared image elements they copy are dead after a restore. (The first
+  version forgot the windows and opened a new one, which lost the history.) The IDE's modules keep host objects
   (the document, JS constructors, localStorage) in lazy slots, so that they
   are looked up again (contract design, section 6, rule 1). Checked by
   hand: a session recorded in a browser, its checkpoint opened in a new

@@ -94,6 +94,10 @@ const keys = {
   Delete: { key: "Delete", code: "Delete", windowsVirtualKeyCode: 46 },
   Enter: { key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, text: "\r" },
   CmdB: { key: "b", code: "KeyB", windowsVirtualKeyCode: 66, modifiers: 4 },
+  CmdU: { key: "u", code: "KeyU", windowsVirtualKeyCode: 85, modifiers: 4 },
+  CmdShiftX: { key: "X", code: "KeyX", windowsVirtualKeyCode: 88, modifiers: 12 },
+  CmdComma: { key: ",", code: "Comma", windowsVirtualKeyCode: 188, modifiers: 4 },
+  CmdPeriod: { key: ".", code: "Period", windowsVirtualKeyCode: 190, modifiers: 4 },
 };
 async function key(name) {
   await send("Input.dispatchKeyEvent", { type: "keyDown", ...keys[name] });
@@ -128,6 +132,10 @@ const scenarios = [
     "[\\title: [\\Doc\\]\\][\\paragraph\\]Hello worldSecond[\\endParagraph\\]"],
   ["bold a selection", async () => { await js("selectText('world')"); await key("CmdB"); },
     "[\\title: [\\Doc\\]\\][\\paragraph\\]Hello [\\strong\\]world[\\endStrong\\][\\endParagraph\\][\\paragraph\\]Second[\\endParagraph\\]"],
+  ...[["CmdU", "underline", "endUnderline"], ["CmdShiftX", "strikethrough", "endStrikethrough"],
+      ["CmdComma", "subscript", "endSubscript"], ["CmdPeriod", "superscript", "endSuperscript"]].map(([k, open, close]) =>
+    [`${open} a selection (${k})`, async () => { await js("selectText('world')"); await key(k); },
+      `[\\title: [\\Doc\\]\\][\\paragraph\\]Hello [\\${open}\\]world[\\${close}\\][\\endParagraph\\][\\paragraph\\]Second[\\endParagraph\\]`]),
   ["a space at the end, then a letter", async () => { await js("caretAt('Second', 6)"); await type(" Z"); },
     "[\\title: [\\Doc\\]\\][\\paragraph\\]Hello world[\\endParagraph\\][\\paragraph\\]Second Z[\\endParagraph\\]"],
   ["type in the title", async () => { await js("caretAt('Doc', 3)"); await type("s"); },
@@ -275,6 +283,29 @@ console.log(`${scenarios.length - failures}/${scenarios.length} scenarios passed
   if (!ok) { failures++; console.log(`     viewer: shows ${JSON.stringify(text)}`); }
   if (controlOk) { failures++; console.log(`     viewer control was not caught: ${JSON.stringify(controlText)}`); }
   console.log(`viewer: renders the document ${ok ? "yes" : "NO"}; control (source as HTML) caught ${controlOk ? "NO" : "yes"}`);
+}
+
+// The new styles render as their HTML elements, and a background as the
+// document's background image, in the viewer and in the editor. The control
+// renders the source as HTML and must be caught.
+{
+  const src = "[\\background: 'eye.png'\\][\\paragraph\\]a[\\underline\\]u[\\endUnderline. strikethrough\\]s[\\endStrikethrough\\]H[\\subscript\\]2[\\endSubscript\\]x[\\superscript\\]2[\\endSuperscript. endParagraph\\]";
+  const looks = `(() => { const tags = ['u', 's', 'sub', 'sup'].every((t) => document.body.querySelector(t + '[data-steps]'));
+    const art = document.body.querySelector('article'); const bg = art ? getComputedStyle(art).backgroundImage : 'none';
+    return [tags, bg]; })()`;
+  const check = async (asHTML) => {
+    await js(`emmanuelView(${JSON.stringify(src)}, ${asHTML})`);
+    const [tags, bg] = await js(looks);
+    return [tags && bg.includes("eye.png"), `tags ${tags}, background ${bg}`];
+  };
+  const [ok, what] = await check(false);
+  const [controlOk, controlWhat] = await check(true);
+  await js(`emmanuelLoad(${JSON.stringify(src)})`);
+  const [etags, ebg] = await js(looks);
+  const editorOk = etags && ebg.includes("eye.png");
+  if (!ok || !editorOk) { failures++; console.log(`     styles: viewer ${what}; editor tags ${etags}, background ${ebg}`); }
+  if (controlOk) { failures++; console.log(`     styles control was not caught: ${controlWhat}`); }
+  console.log(`styles and background: viewer ${ok ? "yes" : "NO"}, editor ${editorOk ? "yes" : "NO"}; control caught ${controlOk ? "NO" : "yes"}`);
 }
 
 // Links: every place a click can put the caret in a document with links,

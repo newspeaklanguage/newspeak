@@ -78,6 +78,8 @@ for (let k = 0; k < 3; k++) {
   await sleep(2500);
   console.log("SLIDE " + await slide());
 }
+// The slide shown is on its background image, if it has one.
+console.log("BACKGROUND " + await js(`[...document.querySelectorAll('article')].map((a) => getComputedStyle(a).backgroundImage).filter((b) => b !== 'none').join(' ') || 'none'`));
 const errors = consoleLines.filter((l) => l.startsWith("EXCEPTION"));
 if (errors.length) console.log(errors.join("\n"));
 process.exit(0);

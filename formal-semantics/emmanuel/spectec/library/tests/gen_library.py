@@ -125,7 +125,7 @@ def para(*items, closer=True):
 def simple(name, opener, closer, *items, flag='CLOSED'):
     return sub(T(st(name), list(items), [S(opener)] + ([S(closer)] if closer else []), flag))
 def doc(fields, items, msgs=()): return T(st('doc', *fields), items, list(msgs))
-DOCF = (NIL, NIL)
+DOCF = (NIL, NIL, NIL)   # title, subtitle, background; no authors
 
 rows = []
 def rel(name, relation, query, expected, truth='true'):
@@ -148,7 +148,7 @@ sec2 = sub(T(st('section', '(INTV 2)', sym('plot'), NIL), [para(run('Or not.'))]
              [S('section:', C('#plot')), S('endSection')]))
 sec1 = sub(T(st('section', '(INTV 1)', sym('intro'), NIL), [para(run('To be.')), sec2],
              [S('section:', C('#intro')), S('endSection')]))
-tree('lib-sections', W1, doc((inline('Hamlet'), NIL, strv('Hamlet')), [mut(s_title), mut(s_author), sec1],
+tree('lib-sections', W1, doc((inline('Hamlet'), NIL, NIL, strv('Hamlet')), [mut(s_title), mut(s_author), sec1],
                              [s_title, s_author]))
 roundtrip('lib-sections-roundtrip', W1,
           "[\\title: [\\Hamlet\\]\\][\\author: 'Hamlet'\\][\\section: #intro\\][\\paragraph\\]To be.[\\endParagraph\\]"
@@ -193,7 +193,7 @@ s_ta, s_tb, s_sub = S('title:', LIT(FIN('A'))), S('title:', LIT(FIN('B'))), S('s
 s_l1, s_l2, s_l3 = S('label:', C('#fig')), S('label:', C("'x := 1'")), S('label:', C('#plot'))
 sec5 = sub(T(st('section', '(INTV 1)', sym('intro'), sym('fig')), [mut(s_l1), refused(s_l2), refused(s_l3)],
              [S('section:', C('#intro')), s_l1, S('endSection')]))
-tree('lib-refusals', W5, doc((inline('A'), NIL), [mut(s_ta), refused(s_tb), refused(s_sub), sec5], [s_ta]))
+tree('lib-refusals', W5, doc((inline('A'), NIL, NIL), [mut(s_ta), refused(s_tb), refused(s_sub), sec5], [s_ta]))
 leaf = lambda s: '(ERRORLEAF (REFUSED %s))' % s
 errors('lib-refusals-errors', W5, [leaf(s_tb), leaf(s_sub), leaf(s_l2), leaf(s_l3)],
        [leaf(s_tb), leaf(s_sub), leaf(s_l2), leaf(s_l3)])
@@ -206,7 +206,7 @@ W5b = "[\\title: [\\A\\]. title: nil. section: #intro. label: nil\\][\\endSectio
 s_tf, s_lx = S('title:', C('nil')), S('label:', C('nil'))
 sec5b = sub(T(st('section', '(INTV 1)', sym('intro'), NIL), [refused(s_lx)],
               [S('section:', C('#intro')), S('endSection')]))
-tree('lib-refusal-args', W5b, doc((inline('A'), NIL), [mut(s_ta), refused(s_tf), sec5b], [s_ta]))
+tree('lib-refusal-args', W5b, doc((inline('A'), NIL, NIL), [mut(s_ta), refused(s_tf), sec5b], [s_ta]))
 
 # Displays, a figure, and a quote.
 W6 = ("[\\verbatim: 'x := 1'. codeBlock: 'x := 1'. codeBlock: 'x := 1' language: #smalltalk. html: nil. "
@@ -305,7 +305,7 @@ def refusedE(*offers): return 'REFUSEDEDIT %s' % seq(*offers)
 def edit(name, doc, op, result, templates=False, out=None):
     register(doc)
     if out is not None: register(plain(out))
-    rel(name, 'Edit', '(%s, "doc", HOSTSTATE 0, STATE "doc" (NILV NILV), %s)'
+    rel(name, 'Edit', '(%s, "doc", HOSTSTATE 0, STATE "doc" (NILV NILV NILV), %s)'
         % (image(doc, templates), op), result)
 
 # Links: an inline block whose target is a string; its text is inline
@@ -322,6 +322,32 @@ W10b = "[\\paragraph\\]a[\\link: nil\\]b[\\link: 'http://x'. link: 'http://x'\\]
 s_ln = S('link:', C('nil'))
 tree('lib-link-refusals', W10b, doc(DOCF, [para(run('a'), refused(s_ln), run('b'),
     sub(T(st('link', strv('http://x')), [dnu(s_lk), run('c')], [s_lk, S('endLink')])))]))
+
+# Underline, strikethrough, subscript, and superscript: inline styles, as
+# emphasis is; each has its own closer, and they nest in links.
+W11 = ("[\\paragraph\\]a[\\underline\\]b[\\endUnderline. strikethrough\\]c[\\endStrong. endStrikethrough\\]"
+       "H[\\subscript\\]2[\\endSubscript\\]O[\\link: 'http://x'. superscript\\]n[\\endSuperscript. endLink. endParagraph\\]")
+tree('lib-styles', W11, doc(DOCF, [para(run('a'),
+    simple('underline', 'underline', 'endUnderline', run('b')),
+    simple('strikethrough', 'strikethrough', 'endStrikethrough', run('c'), dnu(S('endStrong'))),
+    run('H'), simple('subscript', 'subscript', 'endSubscript', run('2')), run('O'),
+    sub(T(st('link', strv('http://x')), [simple('superscript', 'superscript', 'endSuperscript', run('n'))],
+          [s_lk, S('endLink')])))]))
+roundtrip('lib-styles-roundtrip', W11,
+          "[\\paragraph\\]a[\\underline\\]b[\\endUnderline\\][\\strikethrough\\]c[\\endStrong\\][\\endStrikethrough\\]"
+          "H[\\subscript\\]2[\\endSubscript\\]O[\\link: 'http://x'\\][\\superscript\\]n[\\endSuperscript\\][\\endLink\\][\\endParagraph\\]")
+
+# A background: a string naming an image, set once, and only on the document.
+W12 = ("[\\background: nil. background: 'Hamlet'. background: 'x := 1'. title: [\\A\\]\\]"
+       "[\\paragraph\\]a[\\background: 'Hamlet'\\][\\endParagraph\\]")
+s_bn, s_bh, s_bx = S('background:', C('nil')), S('background:', C("'Hamlet'")), S('background:', C("'x := 1'"))
+tree('lib-background', W12, doc((inline('A'), NIL, strv('Hamlet')),
+    [refused(s_bn), mut(s_bh), refused(s_bx), mut(s_ta), para(run('a'), dnu(s_bh))], [s_bh, s_ta]))
+errors('lib-background-errors', W12, [leaf(s_bn), leaf(s_bx), '(ERRORLEAF (DNU %s))' % s_bh],
+       [leaf(s_bn), leaf(s_bx), '(ERRORLEAF (DNU %s))' % s_bh])
+roundtrip('lib-background-roundtrip', W12,
+          "[\\background: nil\\][\\background: 'Hamlet'\\][\\background: 'x := 1'\\][\\title: [\\A\\]\\]"
+          "[\\paragraph\\]a[\\background: 'Hamlet'\\][\\endParagraph\\]")
 
 rows.append('# Editing (Section 7).')
 emph_all = simple('emph', 'emphasis', 'endEmphasis', run('all'))
@@ -346,6 +372,11 @@ O5 = "[\\paragraph\\]Hi all[\\endParagraph\\]"
 edit('edit-style-remove', E1, STYLE(GAPP(path(INTO(0), INTO(1)), 0), P_EMPH_END, 'emphasis'),
      edited(mark(O5, '[\\endParagraph')), out=O5)
 tree('edit-style-remove-tree', O5, doc(DOCF, [para(run('Hi all'))]))
+
+O4u = "[\\paragraph\\][\\underline\\]Hi[\\endUnderline\\] [\\emphasis\\]all[\\endEmphasis. endParagraph\\]"
+edit('edit-style-underline', E1, STYLE(GAPP(path(INTO(0)), 0), INP(path(INTO(0)), 0, 2), 'underline'),
+     edited(mark(O4u, '[\\endUnderline\\] ')), out=O4u)
+tree('edit-style-underline-tree', O4u, doc(DOCF, [para(simple('underline', 'underline', 'endUnderline', run('Hi')), run(' '), emph_all)]))
 
 # Deleting all of an emphasis removes it rather than leaving it empty.
 O6 = "[\\paragraph\\]Hi [\\endParagraph\\]"

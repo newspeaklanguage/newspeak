@@ -2,7 +2,7 @@
 """Check that a presentation in an Emmanuel document moves between slides.
 
 Run from tool/:
-  python3 emmanuel-deck-probe.py WORKDIR DECKZIP [NAME]
+  python3 emmanuel-deck-probe.py WORKDIR DECKZIP [NAME] [--background IMAGE]
 
 DECKZIP is a Telescreen presentation as an Emmanuel document zip, as
 emmanuel-corpus-zips.py writes them (say docs-emmanuel/presentations/
@@ -13,7 +13,8 @@ by emmanuel-deck-probe.mjs, twice: with the presentation opened itself, and
 with it in the section toggle of another Emmanuel document (WORKDIR/Outer.zip,
 made here), whose viewer renders it. Each time Next is clicked three times,
 and the slide shown must advance by one each time. A presenter in an amplet
-used to keep its first rendering: the slide never changed.
+used to keep its first rendering: the slide never changed. With --background
+IMAGE, the slide shown must also be on a background whose URL holds IMAGE.
 """
 from pathlib import Path
 import importlib.util
@@ -58,10 +59,19 @@ def run(work, zip_path, name, toggle=None):
     finally:
         chrome.terminate()
     print(out.rstrip())
-    return [int(s) if s != "null" else None for s in re.findall(r"^SLIDE (\S+)", out, re.M)]
+    slides = [int(s) if s != "null" else None for s in re.findall(r"^SLIDE (\S+)", out, re.M)]
+    backgrounds = re.findall(r"^BACKGROUND (.*)$", out, re.M)
+    return slides, backgrounds[0] if backgrounds else "none"
 
 
 def main():
+    args = sys.argv[1:]
+    background = None
+    if "--background" in args:
+        i = args.index("--background")
+        background = args[i + 1]
+        del args[i:i + 2]
+    sys.argv[1:] = args
     work = Path(sys.argv[1]).resolve()
     work.mkdir(parents=True, exist_ok=True)
     deck = Path(sys.argv[2]).resolve()
@@ -72,10 +82,11 @@ def main():
     failed = False
     for label, zip_path, doc, toggle in (("the presentation", deck, name, None),
                                          ("the presentation in a toggle", outer, "Outer", "Deck")):
-        slides = run(work, zip_path, doc, toggle)
-        ok = slides == [1, 2, 3, 4]
+        slides, shown = run(work, zip_path, doc, toggle)
+        ok = slides == [1, 2, 3, 4] and (background is None or background in shown)
         failed = failed or not ok
-        print(("PASS " if ok else "FAIL ") + label + ": slides " + " ".join(str(s) for s in slides))
+        print(("PASS " if ok else "FAIL ") + label + ": slides " + " ".join(str(s) for s in slides)
+              + ("" if background is None else "; background " + shown))
     sys.exit(1 if failed else 0)
 
 

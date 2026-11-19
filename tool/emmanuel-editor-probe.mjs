@@ -238,6 +238,25 @@ console.log(`${scenarios.length - failures}/${scenarios.length} scenarios passed
   console.log(`raw view: ${cases.length - bad}/${cases.length} writes from the live view kept exactly`);
 }
 
+// The viewer: a transclusion embeds a document's read-only viewer, which
+// must render an Emmanuel document, not show its source. The control renders
+// the source as HTML, as the viewer did, and must be caught.
+{
+  const src = "[\\section: 'Heading'\\][\\paragraph\\]Hello [\\emphasis\\]world[\\endEmphasis\\] [\\amplet: [x]\\][\\endParagraph. endSection\\]";
+  const check = async (asHTML) => {
+    await js(`emmanuelView(${JSON.stringify(src)}, ${asHTML})`);
+    const text = await js("emmanuelViewText");
+    const editable = await js("document.body.querySelectorAll('[contenteditable=true]').length");
+    const ok = !text.includes("[\\") && text.includes("Heading") && text.includes("Hello world") && editable === 0;
+    return [ok, text];
+  };
+  const [ok, text] = await check(false);
+  const [controlOk, controlText] = await check(true);
+  if (!ok) { failures++; console.log(`     viewer: shows ${JSON.stringify(text)}`); }
+  if (controlOk) { failures++; console.log(`     viewer control was not caught: ${JSON.stringify(controlText)}`); }
+  console.log(`viewer: renders the document ${ok ? "yes" : "NO"}; control (source as HTML) caught ${controlOk ? "NO" : "yes"}`);
+}
+
 // Links: every place a click can put the caret in a document with links,
 // and every key there. No edit may leave the source uninterpretable (the
 // editor would dim and refuse all further edits), raise, or disagree.

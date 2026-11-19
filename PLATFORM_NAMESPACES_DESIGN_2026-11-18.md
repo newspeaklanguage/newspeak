@@ -1,7 +1,7 @@
 # Platform modules: one set of names, one namespace per platform
 
 **Date:** 2026-11-18
-**Status:** Accepted 2026-11-18 as recommended. Steps 1–3 done, uncommitted (section 7).
+**Status:** Accepted 2026-11-18 as recommended. Steps 1–3 committed; step 4 done, uncommitted (section 7).
 
 ## 1. The problem
 
@@ -277,14 +277,98 @@ Checks:
 - **`NS2JSApplicationPackaging`**, the Squeak-hosted packager, resolves
   imports flat. Squeak is out of scope.
 - **Step 4 (psoup)**:
-  - `newspeak/Collections.ns` is the generic `Collections` that JS and
-    Squeak share (`usingPlatform:`), and Minitest imports
-    `manifest Collections LinkedList`. When psoup's
-    `CollectionsForPrimordialSoup` becomes `PrimordialSoup/Collections`,
-    psoup code asking for `Collections` gets psoup's. That is either right
-    (the role) or needs psoup's to offer what the generic one does.
+  - `newspeak/Collections.ns`, the generic collections that JS and Squeak
+    shared, becomes JS's `Collections`. Squeak no longer matters, and
+    Minitest's `manifest Collections LinkedList` is not used on the current
+    platforms (Gilad, 2026-11-18).
   - The existing `PrimordialSoup` sub-namespace in Root, meaning the psoup
     repository, is renamed then.
-  - In a JS deploy that also carries psoup modules, NS2JS deduplicates
-    mixins by qualified name, so two `InternalKernel`s would collide. This
-    needs checking before step 4.
+  - **Known issue, deferred (Gilad, 2026-11-18).** NS2JS deduplicates
+    mixins by qualified name (`Newspeak2JSCompilation deduplicateMixins`)
+    and keys a deployment's modules by class name, so a JS deploy carrying
+    two platforms' modules of the same name (psoup's and JS's
+    `InternalKernel`) would keep only one. It has to be fixed before such a
+    deploy is made.
+
+### Step 4: psoup (2026-11-18)
+
+**Moved and renamed:**
+- psoup's modules are now `primordialsoup/newspeak/platform/PrimordialSoup/`:
+
+  | New name | Old name |
+  |---|---|
+  | InternalKernel | KernelForPrimordialSoup |
+  | Collections | CollectionsForPrimordialSoup |
+  | Actors | ActorsForPrimordialSoup |
+  | Mirrors | MirrorsForPrimordialSoup |
+  | Aliens | JSForPrimordialSoup |
+  | Runtime | RuntimeForPrimordialSoup |
+  | RuntimeWithMirrors | RuntimeWithMirrorsForPrimordialSoup |
+
+- psoup's web and Croquet runtimes, which live in the newspeak repository,
+  are now `newspeak/platform/PrimordialSoup/WebRuntime` (was
+  RuntimeForHopscotchForHTML) and `CroquetRuntime` (was RuntimeForCroquet).
+- The generic `newspeak/Collections.ns` became `platform/JS/Collections.ns`.
+- `IntermediatesForPrimordialSoup` keeps its name: it is shared by psoup,
+  Eurasia and NS2JS's dual emission.
+
+**psoup's own build** (SConstruct, BUILD.gn) compiles the platform
+directory with the bootstrap compiler, keyed flat. The platform files go
+first: `snapshots/compiler.vfuel` fails, in some orders of its input files,
+with a doesNotUnderstand in its Snapshotter or a hang. That is
+deterministic for a given order and also happens with psoup's sources
+unrenamed. Its cause is not known.
+
+**Builds that use WebCompiler** compile the platform directory and name
+psoup's runtimes `PrimordialSoup/RuntimeWithMirrors`,
+`PrimordialSoup/WebRuntime` and `PrimordialSoup/CroquetRuntime`. This
+covers:
+- `tool/build.sh` and the other tool scripts;
+- Eurasia's scripts.
+
+The rebuilt psoup snapshots and newspeak tool snapshots are installed in
+`primordialsoup/out/snapshots`; the previous ones are kept in the session
+scratchpad.
+
+**The IDE:**
+- It imports psoup's runtimes as `manifest PrimordialSoup …` and registers
+  them in Root's `PrimordialSoup` namespace.
+- The namespace that meant "came from the psoup repository" is now
+  `PrimordialSoupRepository`. Saved repositories bound to the old key are
+  rebound to it on restore.
+- The typechecker's fallback is gone.
+
+**Deployment:**
+- **To psoup:** DeploymentManager records resources as WebCompiler does
+  (`P/X` for another platform's modules, psoup's runtimes as
+  `PrimordialSoup/X`), with a Preloader for platform `PrimordialSoup`.
+- **To JS:** a deployment leaves other platforms out. `manifest
+  PrimordialSoup X` answers nil, both at packaging and in the deployed app
+  (`ProgramBuilder addAbsentPlatform:`). psoup deploys need psoup anyway.
+
+**Eurasia:**
+- It uses psoup's `Collections` as its own, through the slot
+  `PrimordialSoupCollections`.
+- The IDE entry generator answers `manifest Collections` with it.
+
+**Checks:**
+- **psoup's own build:** HelloApp runs. TestRunner stops where it stopped
+  before, because CollectionsTesting needs an `OrderedMap` that psoup's
+  collections lack.
+- **Pretty-printer and parser:** both give identical output to the old
+  tools on 54 files.
+- **Typechecker suite:** 337/340, the same three pre-existing failures.
+- **Eurasia's suites:** kernel, reflection, genesis, web and IDE all pass.
+- **A psoup IDE built from the new layout:**
+  - It boots; Workspaces open and evaluate; and Root holds the running
+    platform's modules under their role names, beside the `PrimordialSoup`,
+    `JS` and `PrimordialSoupRepository` namespaces.
+  - **JS deploy:** its deploy of the IDE boots exactly as the control does.
+    The deploy's sources lost only psoup's three runtimes: 11,510 bytes,
+    against 11,468 bytes of source.
+  - **psoup deploy:** its deploy of the IDE boots, and the deployed IDE's
+    `JS` namespace holds JS's own modules.
+- **The JS deploy probe** (`croquet-probes/js-deploy-boot-probe.js`) now
+  counts only what packaging logs as a failure. It used to count the IDE's
+  boot-time debugger-hook message whenever packaging took longer than one
+  poll.

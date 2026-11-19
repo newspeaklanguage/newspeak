@@ -37,7 +37,7 @@ fi
 
 if [ ! -f "${PRIMORDIALSOUP}/out/snapshots/NewspeakParser.vfuel" ]; then
     printf "ERROR: NewspeakParser.vfuel not found.\n"
-    printf "Build it with: cd %s && ./out/ReleaseX64/primordialsoup ./out/snapshots/WebCompiler.vfuel ./newspeak/*.ns %s/NewspeakParser.ns RuntimeWithMirrorsForPrimordialSoup NewspeakParser ./out/snapshots/NewspeakParser.vfuel\n\n" "${PRIMORDIALSOUP}" "${NEWSPEAK}"
+    printf "Build it with: cd %s && ./out/ReleaseX64/primordialsoup ./out/snapshots/WebCompiler.vfuel ./newspeak/*.ns ./newspeak/platform/PrimordialSoup/*.ns %s/NewspeakParser.ns PrimordialSoup/RuntimeWithMirrors NewspeakParser ./out/snapshots/NewspeakParser.vfuel\n\n" "${PRIMORDIALSOUP}" "${NEWSPEAK}"
     exit 1
 fi
 

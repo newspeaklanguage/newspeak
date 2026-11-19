@@ -56,11 +56,12 @@ def build(app="EmmanuelCorpusApp", snapshot="EmmanuelCorpus.vfuel"):
     # may hold older copies (an IDE build copies the tree there).
     sources = [str(p) for p in sorted(OUT.glob("*.ns")) if not p.name.startswith("Emmanuel")]
     sources += [str(p) for p in sorted(NEWSPEAK.glob("Emmanuel*.ns"))]
+    sources += [str(p) for p in sorted(OUT.glob("platform/*/*.ns"))]
     images = [str(p) for p in sorted(OUT.glob("*.png"))]
     target = OUT / snapshot
     subprocess.run([str(PRIMORDIALSOUP / "out/ReleaseX64/primordialsoup"),
                     str(PRIMORDIALSOUP / "out/snapshots/WebCompiler.vfuel"),
-                    *sources, *images, "RuntimeForHopscotchForHTML", app, str(target)],
+                    *sources, *images, "PrimordialSoup/WebRuntime", app, str(target)],
                    check=True, cwd=OUT)
 
 

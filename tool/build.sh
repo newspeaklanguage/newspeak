@@ -9,7 +9,7 @@ check_dir_is_tool
 # 2. If additional arguments are provided, they are assumed to be 3-tuples to compile.
 # For example, if users want to build vfuel for 'CheckedItemApp.ns',
 # they could provide build arguments as follows:
-#   ./build.sh RuntimeForHopscotchForHTML CheckedItemApp CheckedItemApp.vfuel
+#   ./build.sh PrimordialSoup/WebRuntime CheckedItemApp CheckedItemApp.vfuel
 additionalNs="$*"
 
 # 3. Setup the emscripten environment needed to build primordialsoup.
@@ -40,43 +40,48 @@ cd ${PRIMORDIALSOUP} || exit 1
 ./out/ReleaseX64/primordialsoup \
   ./out/snapshots/WebCompiler.vfuel \
   ./newspeak/*.ns \
+  ./newspeak/platform/PrimordialSoup/*.ns \
   ${NEWSPEAK}/NewspeakParser.ns \
-  RuntimeWithMirrorsForPrimordialSoup NewspeakParser ./out/snapshots/NewspeakParser.vfuel
+  PrimordialSoup/RuntimeWithMirrors NewspeakParser ./out/snapshots/NewspeakParser.vfuel
 
 # 4b. Build NewspeakTestRunner.vfuel for run-tests.sh script
 ./out/ReleaseX64/primordialsoup \
   ./out/snapshots/WebCompiler.vfuel \
   ./newspeak/*.ns \
+  ./newspeak/platform/PrimordialSoup/*.ns \
   ${NEWSPEAK}/NewspeakTestRunner.ns \
-  RuntimeWithMirrorsForPrimordialSoup NewspeakTestRunner ./out/snapshots/NewspeakTestRunner.vfuel
+  PrimordialSoup/RuntimeWithMirrors NewspeakTestRunner ./out/snapshots/NewspeakTestRunner.vfuel
 
 # 4c. Build NewspeakPrettyPrintApp.vfuel for tool/pretty-print.sh script
 ./out/ReleaseX64/primordialsoup \
   ./out/snapshots/WebCompiler.vfuel \
   ./newspeak/*.ns \
+  ./newspeak/platform/PrimordialSoup/*.ns \
   ${NEWSPEAK}/NewspeakASTs.ns \
   ${NEWSPEAK}/NewspeakPrettyPrinter.ns \
   ${NEWSPEAK}/NewspeakPrettyPrintApp.ns \
-  RuntimeWithMirrorsForPrimordialSoup NewspeakPrettyPrintApp ./out/snapshots/NewspeakPrettyPrintApp.vfuel
+  PrimordialSoup/RuntimeWithMirrors NewspeakPrettyPrintApp ./out/snapshots/NewspeakPrettyPrintApp.vfuel
 
 # 4d. Build NewspeakRoundTripCheckApp.vfuel for tool/round-trip-check.sh script
 ./out/ReleaseX64/primordialsoup \
   ./out/snapshots/WebCompiler.vfuel \
   ./newspeak/*.ns \
+  ./newspeak/platform/PrimordialSoup/*.ns \
   ${NEWSPEAK}/NewspeakASTs.ns \
   ${NEWSPEAK}/NewspeakPrettyPrinter.ns \
   ${NEWSPEAK}/NewspeakRoundTripCheckApp.ns \
-  RuntimeWithMirrorsForPrimordialSoup NewspeakRoundTripCheckApp ./out/snapshots/NewspeakRoundTripCheckApp.vfuel
+  PrimordialSoup/RuntimeWithMirrors NewspeakRoundTripCheckApp ./out/snapshots/NewspeakRoundTripCheckApp.vfuel
 
 # 4e. Build NewspeakAttachmentDiffApp.vfuel for tool/attachment-diff.sh script
 ./out/ReleaseX64/primordialsoup \
   ./out/snapshots/WebCompiler.vfuel \
   ./newspeak/*.ns \
+  ./newspeak/platform/PrimordialSoup/*.ns \
   ${NEWSPEAK}/NewspeakASTs.ns \
   ${NEWSPEAK}/NewspeakPrettyPrinter.ns \
   ${NEWSPEAK}/NewspeakRoundTripCheckApp.ns \
   ${NEWSPEAK}/NewspeakAttachmentDiffApp.ns \
-  RuntimeWithMirrorsForPrimordialSoup NewspeakAttachmentDiffApp ./out/snapshots/NewspeakAttachmentDiffApp.vfuel
+  PrimordialSoup/RuntimeWithMirrors NewspeakAttachmentDiffApp ./out/snapshots/NewspeakAttachmentDiffApp.vfuel
 
 # Back to 'newspeak'.
 cd ${NEWSPEAK} || exit 1
@@ -221,25 +226,25 @@ python3 ${NEWSPEAK}/tool/check-duplicate-modules.py . || exit 1
 # not in 'out':    *.txt \
 # not needed, included in html both index.html for WebIDE and primordialsoup.html:    CodeMirror/lib/codemirror.js \
 # not needed, included in html both index.html for WebIDE and primordialsoup.html:    CodeMirror/addon/display/autorefresh.js \
-#     RuntimeForHopscotchForHTML HopscotchWebIDE HopscotchWebIDE.vfuel \
+#     PrimordialSoup/WebRuntime HopscotchWebIDE HopscotchWebIDE.vfuel \
 #     RuntimeForElectron HopscotchWebIDE HopscotchElectronIDE.vfuel \
-#     RuntimeForHopscotchForHTML Ampleforth Ampleforth.vfuel  \
-#     RuntimeForHopscotchForHTML AmpleforthViewer AmpleforthViewer.vfuel  \
-# not in git:   RuntimeForHopscotchForHTML Live22Submission Live22Submission.vfuel  \
-# not in git:   RuntimeForHopscotchForHTML Smalltalks22Tutorial Smalltalks22.vfuel  \
-# not in git:   RuntimeForHopscotchForHTML Live22Presentation Live22Presentation.vfuel  \
-#     RuntimeForCroquet CounterApp CroquetCounterApp.vfuel \
-#     RuntimeForHopscotchForHTML CounterApp CounterApp.vfuel \
-#     RuntimeForHopscotchForHTML TodoMVCApp TodoMVCApp.vfuel \
-#     RuntimeForCroquet TodoMVCApp CroquetTodoMVCApp.vfuel \
-#     RuntimeForHopscotchForHTML TwoViewEditorApp TwoViewEditorApp.vfuel \
-#     RuntimeForHopscotchForHTML TelescreenApp Telescreen.vfuel \
-#     RuntimeForHopscotchForHTML ObjectPresenterDemo ObjectPresenterDemo.vfuel \
-#     RuntimeForHopscotchForHTML BankAccountExemplarDemo BankAccountExemplarDemo.vfuel \
-#     RuntimeForHopscotchForHTML HopscotchFontDemo HopscotchFontDemo.vfuel \
-#     RuntimeForHopscotchForHTML HopscotchGestureDemo HopscotchGestureDemo.vfuel \
-#     RuntimeForHopscotchForHTML HopscotchDemo HopscotchDemo.vfuel \
-#     RuntimeForHopscotchForHTML Particles Particles.vfuel
+#     PrimordialSoup/WebRuntime Ampleforth Ampleforth.vfuel  \
+#     PrimordialSoup/WebRuntime AmpleforthViewer AmpleforthViewer.vfuel  \
+# not in git:   PrimordialSoup/WebRuntime Live22Submission Live22Submission.vfuel  \
+# not in git:   PrimordialSoup/WebRuntime Smalltalks22Tutorial Smalltalks22.vfuel  \
+# not in git:   PrimordialSoup/WebRuntime Live22Presentation Live22Presentation.vfuel  \
+#     PrimordialSoup/CroquetRuntime CounterApp CroquetCounterApp.vfuel \
+#     PrimordialSoup/WebRuntime CounterApp CounterApp.vfuel \
+#     PrimordialSoup/WebRuntime TodoMVCApp TodoMVCApp.vfuel \
+#     PrimordialSoup/CroquetRuntime TodoMVCApp CroquetTodoMVCApp.vfuel \
+#     PrimordialSoup/WebRuntime TwoViewEditorApp TwoViewEditorApp.vfuel \
+#     PrimordialSoup/WebRuntime TelescreenApp Telescreen.vfuel \
+#     PrimordialSoup/WebRuntime ObjectPresenterDemo ObjectPresenterDemo.vfuel \
+#     PrimordialSoup/WebRuntime BankAccountExemplarDemo BankAccountExemplarDemo.vfuel \
+#     PrimordialSoup/WebRuntime HopscotchFontDemo HopscotchFontDemo.vfuel \
+#     PrimordialSoup/WebRuntime HopscotchGestureDemo HopscotchGestureDemo.vfuel \
+#     PrimordialSoup/WebRuntime HopscotchDemo HopscotchDemo.vfuel \
+#     PrimordialSoup/WebRuntime Particles Particles.vfuel
 
 #
 # 8. Create vfuel files (ex: HopscotchWebIDE.vfuel)
@@ -253,26 +258,26 @@ ${PRIMORDIALSOUP}/out/ReleaseX64/primordialsoup \
     ./*.ns \
     $PLATFORM_NS \
     ./*.png \
-    RuntimeForHopscotchForHTML HopscotchWebIDE HopscotchWebIDE.vfuel \
-    RuntimeForHopscotchForHTML Ampleforth Ampleforth.vfuel  \
-    RuntimeForHopscotchForHTML AmpleforthViewer AmpleforthViewer.vfuel  \
-    RuntimeForCroquet CounterApp CroquetCounterApp.vfuel \
-    RuntimeForHopscotchForHTML CounterApp CounterApp.vfuel \
-    RuntimeForHopscotchForHTML TodoMVCApp TodoMVCApp.vfuel \
-    RuntimeForCroquet TodoMVCApp CroquetTodoMVCApp.vfuel \
-    RuntimeForHopscotchForHTML TwoViewEditorApp TwoViewEditorApp.vfuel \
-    RuntimeForHopscotchForHTML TelescreenApp Telescreen.vfuel \
-    RuntimeForHopscotchForHTML ObjectPresenterDemo ObjectPresenterDemo.vfuel \
-    RuntimeForHopscotchForHTML BankAccountExemplarDemo BankAccountExemplarDemo.vfuel \
-    RuntimeForHopscotchForHTML HopscotchFontDemo HopscotchFontDemo.vfuel \
-    RuntimeForHopscotchForHTML HopscotchGestureDemo HopscotchGestureDemo.vfuel \
-    RuntimeForHopscotchForHTML HopscotchDemo HopscotchDemo.vfuel \
-    RuntimeForHopscotchForHTML Particles Particles.vfuel \
-    RuntimeForCroquet HopscotchWebIDE CroquetHopscotchWebIDE.vfuel \
-    RuntimeForCroquet AmpleforthViewer CroquetAmpleforthViewer.vfuel \
-    RuntimeForCroquet HopscotchFontDemo CroquetHopscotchFontDemo.vfuel \
-    RuntimeForCroquet HopscotchGestureDemo CroquetHopscotchGestureDemo.vfuel \
-    RuntimeForCroquet HopscotchDemo CroquetHopscotchDemo.vfuel \
+    PrimordialSoup/WebRuntime HopscotchWebIDE HopscotchWebIDE.vfuel \
+    PrimordialSoup/WebRuntime Ampleforth Ampleforth.vfuel  \
+    PrimordialSoup/WebRuntime AmpleforthViewer AmpleforthViewer.vfuel  \
+    PrimordialSoup/CroquetRuntime CounterApp CroquetCounterApp.vfuel \
+    PrimordialSoup/WebRuntime CounterApp CounterApp.vfuel \
+    PrimordialSoup/WebRuntime TodoMVCApp TodoMVCApp.vfuel \
+    PrimordialSoup/CroquetRuntime TodoMVCApp CroquetTodoMVCApp.vfuel \
+    PrimordialSoup/WebRuntime TwoViewEditorApp TwoViewEditorApp.vfuel \
+    PrimordialSoup/WebRuntime TelescreenApp Telescreen.vfuel \
+    PrimordialSoup/WebRuntime ObjectPresenterDemo ObjectPresenterDemo.vfuel \
+    PrimordialSoup/WebRuntime BankAccountExemplarDemo BankAccountExemplarDemo.vfuel \
+    PrimordialSoup/WebRuntime HopscotchFontDemo HopscotchFontDemo.vfuel \
+    PrimordialSoup/WebRuntime HopscotchGestureDemo HopscotchGestureDemo.vfuel \
+    PrimordialSoup/WebRuntime HopscotchDemo HopscotchDemo.vfuel \
+    PrimordialSoup/WebRuntime Particles Particles.vfuel \
+    PrimordialSoup/CroquetRuntime HopscotchWebIDE CroquetHopscotchWebIDE.vfuel \
+    PrimordialSoup/CroquetRuntime AmpleforthViewer CroquetAmpleforthViewer.vfuel \
+    PrimordialSoup/CroquetRuntime HopscotchFontDemo CroquetHopscotchFontDemo.vfuel \
+    PrimordialSoup/CroquetRuntime HopscotchGestureDemo CroquetHopscotchGestureDemo.vfuel \
+    PrimordialSoup/CroquetRuntime HopscotchDemo CroquetHopscotchDemo.vfuel \
     "$additionalNs"
 
 cd ${NEWSPEAK}/tool || exit 1

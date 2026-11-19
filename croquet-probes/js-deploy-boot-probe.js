@@ -111,6 +111,10 @@ async function main() {
   await sleep(2000);
 
   console.log('packaging a plain JS deploy …');
+  // Only what the packaging logs counts: the IDE logs a debugger-hook
+  // MessageNotUnderstood at boot on every platform, which once read as a
+  // packaging failure whenever packaging took more than one poll.
+  const logStart = ide.log.length;
   await ide.ev(`(function(){var cms=document.querySelectorAll('.CodeMirror');var cm=cms[cms.length-1].CodeMirror;cm.focus();cm.setValue(${JSON.stringify(DOIT)});cm.execCommand('selectAll');return 'SET'})()`);
   await sleep(1500);
   await ide.ev(`(function(){var m=Array.from(document.querySelectorAll('a,button,span,div,label')).filter(e=>(e.innerText||'').trim().indexOf('Evaluate Selection')===0);var e=m[m.length-1];['mousedown','mouseup','click'].forEach(t=>e.dispatchEvent(new MouseEvent(t,{bubbles:true,cancelable:true,view:window})));return 'x'})()`);
@@ -120,7 +124,7 @@ async function main() {
     await sleep(2000);
     script = await ide.ev('window.depScript ? window.depScript.length : 0');
     if (script) break;
-    const bad = ide.log.filter(l => /doesNotUnderstand|MessageNotUnderstood|exception/i.test(l));
+    const bad = ide.log.slice(logStart).filter(l => /doesNotUnderstand|MessageNotUnderstood|exception/i.test(l));
     if (bad.length) {
       console.log('\nFAIL: packaging itself blew up:');
       bad.slice(0, 6).forEach(l => console.log('  ' + l.slice(0, 300)));

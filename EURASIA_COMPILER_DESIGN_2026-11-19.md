@@ -3,7 +3,8 @@
 **Date:** 2026-11-19
 **Status:** Approved (Gilad, 2026-11-19: Rust compiler, native interpreted
 for now). Stage 1, the spike, done (section 9). Stage 2, every instruction,
-done, with the first of stage 3's inline caches (section 10), uncommitted.
+done, with the first of stage 3's inline caches (section 10). Stage 3, sends
+without the general path (section 11), uncommitted.
 **Context:** `EURASIA_PERFORMANCE_2026-11-19.md` (the interpreter is about
 1.7x behind psoup; sections 6 to 12 say interpreter tuning has run its
 course), the arena and nursery designs (objects addressable as base plus
@@ -350,3 +351,90 @@ callee's entry fills the registers and loads them). Next, for stage 3:
 - the top of the operand stack in wasm locals, so that most instructions do
   not touch memory;
 - recording with compilation on (above).
+
+## 11. Stage 3: sends without the general path
+
+Stage 2 left about 70% of the time on the runtime's side of each call (Node's
+profiler: compiled code itself was 31%). Stage 3 takes the common cases of a
+send out of the general path, guided by counting what each send resolved to.
+
+**What changed.**
+- **Method inline caches.** Every ordinary, self, super, implicit-receiver
+  and common-selector send site has an inline cache of four globals: the
+  receiver's class, the epoch, a slot or target, and a kind. When the lookup
+  cache resolves a send to an ordinary method that is already compiled, the
+  VM pushes the callee's frame itself and answers `CALLEE`, and the site
+  caches a *target*: an index into a VM table of what the activation needs
+  (the method, its function, code, literals' offset and count, mixin, locals,
+  arguments, where the receiver comes from), deduplicated by method and
+  receiver and cleared with the lookup cache. A hit calls the runtime's `call`
+  with the target, which pushes the frame and sets only the registers a frame
+  push changes. Pushing a frame allocates nothing, so the checks after a
+  general call are not needed.
+- **One `after_call` per send.** A site's paths (accessor, indexed native,
+  cached method, general send) share one copy of the code after the call: a
+  second copy made accessor-heavy code 30% slower in V8.
+- **The cache is filled before the callee runs.** A compiled callee runs
+  inside the caller's `after_call`, and its own sends change the registers
+  the fill reads; filled after, method caches never filled.
+- **Common selectors are sends with an arity.** The compiler knows each
+  common selector's arity (`COMMON_SELECTORS`), so those sends get sites and
+  go through the lookup cache like ordinary sends, after SmallInteger's fast
+  path for the arithmetic and comparisons. (They were 26M of
+  ParserCombinators' sends, each through the full send.)
+- **Indexed natives inline.** `size` (Array, String, ByteArray), `at:`
+  (Array; String and ByteArray through a new register, the byte store's
+  address) and `at:put:` (Array, not frozen, young or remembered) run in
+  compiled code when the site's cache holds the native and the receiver has
+  that format, for ordinary and self sends.
+- **Closures.** A `value` send that the lookup cache resolves to a closure's
+  `value` native, to a closure whose method is compiled, pushes the closure's
+  frame directly and enters its body. Closure creation is a runtime call of
+  its own (`closure`) rather than `step`.
+- **Returns.** Compiled code keeps the literals' offset and count in locals
+  loaded at entry, so a return refreshes only the stack, the arena, the
+  safepoint and the depth, not the caller's frame registers. A `^` outside
+  every closure body (in an inlined block) compiles as a local return.
+- **The interpreter too:** a non-local return cut the frames with
+  `Vec::split_off`, a new vector per return (13% of NLRImmediate); it now
+  truncates in place.
+- **Program arguments on the web host** (`eurasia_add_arg`, `args` in
+  `eurasia.mjs`; in `run-node.mjs`, the arguments after the snapshot), to
+  run one benchmark at a time.
+
+**Correctness.** The same gates as stage 2: the kernel tests with every
+method compiled at its first activation (2648 methods) give native's
+outcomes, also under GC stress; the compiled-GC probe; check, genesis,
+kernel, reflection, replay. The native interpreter (`benchmarks.sh`):
+NLRImmediate about 500 to 600 (the in-place cut), DeltaBlue 105.5 (as
+before), Richards 112 (117 to 120 before, with runs as low as 106: noise or a
+small loss, to watch).
+
+**Speed.** Node 26, runs per second, every method compiled at its first
+activation; stage 2 is the same measurement before this work:
+
+| Benchmark | stage 2 | stage 3 | psoup wasm (Chrome, section 10) |
+|---|---:|---:|---:|
+| SlotRead | 490 | 475 | 65.6 |
+| SlotWrite | 367 | 346 | 42.1 |
+| NLRLoop | 120 | 248 | 166 |
+| MethodFibonacci | 51.3 | 91.2 | 69.4 |
+| ClosureFibonacci | 42.1 | 57.7 | 55.8 |
+| Richards | 93.9 | 136 | 153 |
+| DeltaBlue | 74.3 | 119 | 136 |
+| Splay | 142 | 196 | 240 |
+| NLRImmediate | 313 | 602 | 787 |
+| ClosureDefFibonacci | 19.3 | 29.4 | 33.4 |
+| ParserCombinators | 5.0 | 9.5 | 14.9 |
+
+**What is left.** Each cached call still crosses into Rust to push a frame
+(the VM's frames are a Rust vector, with an `Rc` of the code), and each
+return crosses back; closure creation allocates an activation for its
+defining frame. Next:
+- frames compiled code can push and pop itself (a frame record in wasm
+  memory), so that a compiled-to-compiled call is a wasm call;
+- polymorphic inline caches (megamorphic sites refill every miss);
+- inline caches for SmallInteger receivers, and for natives other than the
+  indexed ones;
+- the top of the operand stack in wasm locals;
+- recording with compilation on (section 10).

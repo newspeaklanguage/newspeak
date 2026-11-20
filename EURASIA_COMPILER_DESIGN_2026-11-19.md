@@ -2,7 +2,8 @@
 
 **Date:** 2026-11-19
 **Status:** Approved (Gilad, 2026-11-19: Rust compiler, native interpreted
-for now). Stage 1, the spike, done (section 9), uncommitted.
+for now). Stage 1, the spike, done (section 9). Stage 2, every instruction,
+done, with the first of stage 3's inline caches (section 10), uncommitted.
 **Context:** `EURASIA_PERFORMANCE_2026-11-19.md` (the interpreter is about
 1.7x behind psoup; sections 6 to 12 say interpreter tuning has run its
 course), the arena and nursery designs (objects addressable as base plus
@@ -256,3 +257,96 @@ any send or exit. Next, stage 2: every instruction (closures, non-local
 return, literals, indirect locals, the remaining sends), so that whole
 programs run compiled; then stage 3's inline caches, which the profile says
 are where most of the remaining time is.
+
+## 10. Stage 2: every instruction, and accessor inline caches
+
+**What changed.**
+- **Every method compiles.** The common instructions inline; every other one
+  as a call to the runtime's `step`, which runs that one instruction as the
+  interpreter does. Common-selector and super sends are real sends;
+  SmallInteger arithmetic that overflows or meets other operands is the
+  common-selector send. Literals and indirect locals are read (and written)
+  inline.
+- **Entries.** Compiled code can take a frame back at any block start: the
+  method's start, each closure body (a closure's body is inline in its
+  method's bytecode, so one function runs the method and its closures), each
+  jump target, and after each call into the runtime. `run(vm, regs, entry)`;
+  the code table keeps each compiled method's entries. A frame the
+  interpreter continued (after a callee that was not compiled, a safepoint, a
+  poll) is compiled again at its next entry, and closures are compiled with
+  their method, counted against it.
+- **Registers.** The VM keeps, at a fixed address, what compiled code would
+  otherwise ask for: the stack's address and height, the top frame's layout,
+  receiver and literals, nil, true and false, the arena's address and the
+  nursery boundary, the lookup cache's epoch, whether a safepoint is due. It
+  refreshes them after every call that lets compiled code go on; compiled
+  code reads them with loads. (The first version of stage 2 called the
+  runtime for each, three to ten calls per send and entry, and was slower
+  than stage 1.)
+- **Inline caches for accessors** (stage 3's first piece). Each send site of
+  no or one argument, ordinary, self or implicit-receiver, keeps a class,
+  an epoch and a slot in globals of its module. On a hit (the receiver an
+  object of that class, the epoch the lookup cache's, the slot within its
+  size; for a setter not frozen, not a value, and young or already
+  remembered) the slot is read or written inline, with no call. The cache is
+  filled from what the runtime's send found: a getter or setter of the
+  receiver itself, from the global lookup cache. Every flush of the lookup
+  cache (collections, commits, program changes) changes the epoch.
+- **Non-local return.** A `^` from a closure whose home's caller is a
+  compiled frame on the host's stack unwinds the wasm frames in between
+  (`UNWOUND`), and that caller goes on as after a completed send, instead of
+  everything going back to the interpreter.
+- **Interrupts.** Backward jumps count down and poll every 64 (`tick`).
+- **Where compiled code does not go on.** After a call, only if the frame is
+  the one it was, at the instruction it expects (an activation native, such
+  as `terminateTo:` or `continueAt:`, can cut frames back or move a frame),
+  with no collection since; a return or non-local return only after a return
+  instruction. Anything else is the interpreter's. (Found by the kernel
+  tests: `terminateTo:` cut frames back under compiled code.)
+
+**Correctness.**
+- The kernel tests with every method compiled at its first activation (2648
+  methods; none refused): the native interpreter's 620 outcomes. Also under
+  GC stress (a collection after every 64 allocations). Both in
+  `scripts/web-tests.sh` (the stress run with `STRESS=1`).
+- `EurasiaCompiledGCProbe.ns`: a compiled method whose receiver a collection
+  in the middle of the method moves. A collection leaves a safepoint due,
+  which compiled code checks after every call; the VM also refuses to let it
+  go on after one. With both checks removed, every round fails (the negative
+  control); with either, none does.
+- All gates green: check, genesis, kernel, reflection, replay, web, native GC
+  stress. The native interpreter is unchanged (within noise).
+- **Not done: recording with compilation on.** Compiled code's runtime calls
+  take the web host itself, so a recording host would not see the host
+  operations made from compiled code; recording keeps compilation off. A
+  replay check of compiled code needs the host in effect during compiled
+  code to be the recorder.
+
+**Speed.** One Chrome session, the browser pane, runs per second; psoup's wasm
+build against Eurasia compiled at the 100th activation (two runs each, the
+mean; the stage-1 column from section 9's Chrome table):
+
+| Benchmark | psoup wasm | stage 1 | stage 2 | stage 2 / psoup |
+|---|---:|---:|---:|---:|
+| SlotRead | 65.6 | 62.8 | 423 | 6.4 |
+| SlotWrite | 42.1 | 50.1 | 228 | 5.4 |
+| ClosureFibonacci | 55.8 | 17.5 to 31.4 | 40.8 | 0.73 |
+| NLRLoop | 166 | 116 | 118 | 0.71 |
+| MethodFibonacci | 69.4 | 45.7 | 48.7 | 0.70 |
+| Richards | 153 | 66.6 | 92.1 | 0.60 |
+| Splay | 240 | 115 | 138 | 0.58 |
+| ClosureDefFibonacci | 33.4 | 11.5 to 20.5 | 18.8 | 0.56 |
+| DeltaBlue | 136 | 63.1 | 72.0 | 0.53 |
+| NLRImmediate | 787 | 371 | 312 | 0.40 |
+| ParserCombinators | 14.9 | 5.7 | 5.8 | 0.39 |
+
+Where the time goes now (Node's profiler): the runtime's side of each call
+(the send, the activation, the registers) and the entries (every compiled
+callee's entry fills the registers and loads them). Next, for stage 3:
+- method sends from an inline cache: the activation without the lookup,
+  and the callee's frame pushed without the general path;
+- closure creation and closure activation (`value`) without `step` and the
+  native;
+- the top of the operand stack in wasm locals, so that most instructions do
+  not touch memory;
+- recording with compilation on (above).

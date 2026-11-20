@@ -604,6 +604,72 @@ ET = "[\\paragraph\\] there[\\endParagraph\\]"
 place('caret-place-lead', ET, 'TXT 1 1', GAPP(path(INTO(0)), 0))
 place('caret-place-in', ET, 'TXT 1 2', INP(path(INTO(0)), 0, 1))
 
+# ---- The view (Section 7.11): keys, typed spaces, and the edits it makes.
+CONST.update({"tick": 901, "fragile": 902})
+def viewed(src):
+    assert src.count(CARET) <= 1
+    pos = 'SAMECARET' if CARET not in src else '(CARETAT %d)' % src.index(CARET)
+    return 'VIEWED (%s) %s' % (chars(plain(src)), pos)
+KEPT = 'VIEWKEPT'
+def KTYPE(u): return '(KTYPE (%s))' % chars(u)
+def KSTYLE(x): return '(KSTYLE "%s")' % x
+def view(name, doc, p, q, key, result, templates=False, out=None):
+    register(doc)
+    if out is not None: register(plain(out))
+    rel(name, 'ViewKey', '(%s, "doc", HOSTSTATE 0, STATE "doc" (NILV NILV NILV), %s, %s, %s)'
+        % (image(doc, templates), ex(p), ex(q), key), result)
+def view1(name, doc, p, key, result, **kw): view(name, doc, p, p, key, result, **kw)
+
+P0 = path(INTO(0))
+VB1 = "[\\paragraph\\]H [\\emphasis\\]all[\\endEmphasis. endParagraph\\]"
+view1('view-backspace-char', E1, INP(P0, 0, 2), 'KBACKSPACE', viewed(mark(VB1, ' [\\emphasis')), out=VB1)
+VB2 = "[\\paragraph\\]Hi[\\emphasis\\]all[\\endEmphasis. endParagraph\\]"
+view1('view-backspace-run-end', E1, GAPP(P0, 1), 'KBACKSPACE', viewed(mark(VB2, '[\\emphasis')), out=VB2)
+view1('view-backspace-inline-start', E1, GAPP(path(INTO(0), INTO(1)), 0), 'KBACKSPACE',
+      viewed(mark(VB2, '[\\emphasis')), out=VB2)
+view1('view-backspace-doc-start', E1, GAPP(P0, 0), 'KBACKSPACE', KEPT)
+view1('view-backspace-field-start', E10, GAPP(path(FLD(0)), 0), 'KBACKSPACE', KEPT)
+view1('view-delete-char', E1, INP(P0, 0, 1), 'KDELETE', viewed(mark(VB1, ' [\\emphasis')), out=VB1)
+VD2 = "[\\paragraph\\]i [\\emphasis\\]all[\\endEmphasis. endParagraph\\]"
+view1('view-delete-start', E1, GAPP(P0, 0), 'KDELETE', viewed(mark(VD2, 'i [')), out=VD2)
+view('view-enter-selection', E1, INP(P0, 0, 1), INP(P0, 0, 2), 'KENTER', viewed(mark(VB1, ' [\\emphasis')), out=VB1)
+view1('view-enter', E1, INP(P0, 0, 2), 'KENTER', viewed(mark(O2, ' [\\emphasis')), out=O2)
+VN = "[\\paragraph\\]Hi[\\newline\\] [\\emphasis\\]all[\\endEmphasis. endParagraph\\]"
+view1('view-newline', E1, INP(P0, 0, 2), 'KNEWLINE', viewed(mark(VN, ' [\\emphasis')), out=VN)
+VT = "[\\paragraph\\]HX [\\emphasis\\]all[\\endEmphasis. endParagraph\\]"
+view('view-type-over', E1, INP(P0, 0, 1), INP(P0, 0, 2), KTYPE('X'), viewed(mark(VT, ' [\\emphasis')), out=VT)
+VS1 = "[\\paragraph\\]H i [\\emphasis\\]all[\\endEmphasis. endParagraph\\]"
+view1('view-space-plain', E1, INP(P0, 0, 1), KTYPE(' '), viewed(mark(VS1, 'i [')), out=VS1)
+VS2 = "[\\paragraph\\]Hi  [\\emphasis\\]all[\\endEmphasis. endParagraph\\]"
+view1('view-space-kept', E1, INP(P0, 0, 2), KTYPE(' '), viewed(mark(VS2, ' [\\emphasis')), out=VS2)
+VS3 = "[\\paragraph\\]H  Xi [\\emphasis\\]all[\\endEmphasis. endParagraph\\]"
+view1('view-spaces-typed', E1, INP(P0, 0, 1), KTYPE('  X'), viewed(mark(VS3, 'i [')), out=VS3)
+view1('view-style-collapsed', E1, INP(P0, 0, 1), KSTYLE('underline'), KEPT)
+view('view-style', E1, GAPP(P0, 0), INP(P0, 0, 2), KSTYLE('underline'), viewed(mark(O4u, '[\\endUnderline\\] ')), out=O4u)
+
+EB = "[\\paragraph\\]a [\\emphasis\\]bc[\\endEmphasis\\]d[\\endParagraph\\]"
+VBI = "[\\paragraph\\]a [\\emphasis\\]b[\\endEmphasis\\]d[\\endParagraph\\]"
+view1('view-backspace-into', EB, GAPP(P0, 2), 'KBACKSPACE', viewed(mark(VBI, '[\\endEmphasis')), out=VBI)
+VDI = "[\\paragraph\\]a [\\emphasis\\]bc[\\endEmphasis\\][\\endParagraph\\]"
+view1('view-delete-inline-end', EB, GAPP(path(INTO(0), INTO(1)), 1), 'KDELETE',
+      viewed(mark(VDI, '[\\endParagraph')), out=VDI)
+EL = "[\\paragraph\\]a[\\amplet: aClosure\\]b[\\endParagraph\\]"
+VL = "[\\paragraph\\]ab[\\endParagraph\\]"
+view1('view-backspace-leaf', EL, GAPP(P0, 2), 'KBACKSPACE', viewed(mark(VL, 'b[')), out=VL)
+view1('view-delete-leaf', EL, GAPP(P0, 1), 'KDELETE', viewed(mark(VL, 'b[')), out=VL)
+EA = "[\\paragraph\\]a[\\endParagraph\\][\\amplet: aClosure\\][\\paragraph\\]b[\\endParagraph\\]"
+VA = "[\\paragraph\\]a[\\endParagraph\\][\\paragraph\\]b[\\endParagraph\\]"
+view1('view-backspace-leaf-block', EA, GAPP(path(INTO(2)), 0), 'KBACKSPACE',
+      viewed(mark(VA, '[\\paragraph\\]b')), out=VA)
+view1('view-delete-leaf-block', EA, GAPP(P0, 1), 'KDELETE', viewed(mark(VA, '[\\paragraph\\]b')), out=VA)
+VJ = "[\\paragraph\\]abcd[\\endParagraph\\]"
+view1('view-backspace-join', E7, GAPP(path(INTO(1)), 0), 'KBACKSPACE', viewed(mark(VJ, 'cd')), out=VJ)
+view1('view-delete-join', E7, GAPP(P0, 1), 'KDELETE', viewed(mark(VJ, 'cd')), out=VJ)
+view1('view-template-elsewhere', E11, INP(path(FLD(0)), 0, 4), KTYPE('Great '), KEPT, templates=True)
+EF = "[\\paragraph\\]a[\\amplet: tick\\][\\amplet: fragile\\]b[\\endParagraph\\]"
+view1('view-raises', EF, GAPP(P0, 2), 'KBACKSPACE', KEPT,
+      out="[\\paragraph\\]a[\\amplet: fragile\\]b[\\endParagraph\\]")
+
 # Refusals with nothing to offer.
 edit('edit-two-trees', E10, REPLACE(INP(path(FLD(0)), 0, 1), GAPP(path(), 1)), refusedE('GIVEUP'))
 edit('edit-split-unclosed', "[\\paragraph\\]abc", SPLIT(INP(path(INTO(0)), 0, 1), 1), refusedE('GIVEUP'))

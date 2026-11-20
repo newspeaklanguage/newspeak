@@ -436,3 +436,61 @@ The heap is now one arena, `EURASIA_ARENA_DESIGN_2026-11-19.md` (section
 10 has the numbers): on a large heap, walking objects is 1.5x faster and no
 slower than in cache; allocation-heavy code is 15% to 30% faster; the other
 benchmarks are within noise but for non-local returns (5% to 7% slower).
+
+## 12. Before compilation: what runs, and accessor quickening
+
+**What runs.** A counting build (every instruction through `step`, counts
+of opcodes, opcode pairs, and sends by lookup rule and the kind of method
+found) on four benchmarks and on the kernel tests, as a stand-in for
+ordinary code (compiler, mirrors, collections):
+
+| | sends per instruction | sends reaching a getter or setter | reaching a native |
+|---|---:|---:|---:|
+| Richards | 45% | 66% | 9% |
+| DeltaBlue | 38% | 53% | 21% |
+| SlotRead | 34% | 100% | 0% |
+| ParserCombinators | 30% | 31% | 37% |
+| kernel tests | 28% | 32% | 43% |
+
+Most accessor sends are implicit-receiver sends to self. No pair of
+opcodes is frequent enough for superinstructions (the most frequent are 3%
+to 8%, mostly an accessor send followed by something, which quickening
+covers anyway).
+
+**Accessor quickening.** In `run_simple`, a send instruction (ordinary,
+self, implicit-receiver or common) probes the global lookup cache itself.
+On a hit whose method is a getter or setter with a known slot, the slot is
+read or written there and the loop goes on, with no call into `send` or
+`activate_with`; on a hit with any other method, the send is made from
+there (no second lookup in `step`); on a miss, `step` runs it as before.
+A setter on a frozen object or a value, an accessor on an object that is
+not a plain one, and anything out of range go to `step`, which does what
+it always did. The same cache entries decide, so what a program observes
+is unchanged; SmallInteger arithmetic keeps its fast path first.
+
+Native, runs per second (the committed arena build before):
+
+| Benchmark | arena | quickened | psoup | now |
+|---|---:|---:|---:|---:|
+| ClosureDefFibonacci | 23.0 | 23.7 | 50.7 | 2.1x slower |
+| ClosureFibonacci | 38.6 | 39.6 | 89.3 | 2.3x slower |
+| DeltaBlue | 78.4 | 105.2 | 187.2 | 1.8x slower |
+| MethodFibonacci | 54.3 | 54.0 | 89.3 | 1.7x slower |
+| NLRImmediate | 443.5 | 469.5 | 1157.0 | 2.5x slower |
+| NLRLoop | 129.3 | 137.1 | 238.5 | 1.7x slower |
+| ParserCombinators | 6.2 | 7.4 | 21.5 | 2.9x slower |
+| Richards | 83.2 | 114.8 | 198.2 | 1.7x slower |
+| SlotRead | 40.8 | 70.0 | 92.1 | 1.3x slower |
+| SlotWrite | 36.0 | 59.4 | 53.5 | 1.1x faster |
+| Splay | 138.4 | 162.5 | 274.7 | 1.7x slower |
+
+A first version that quickened only accessors made other sends pay for
+the probe and then look up again in `step` (MethodFibonacci 11% slower);
+making the send from the probe's hit removed that. The arena's
+non-local-return slowdown (section 11) is gone with it.
+
+Not done, and why: threaded dispatch (Rust has no computed goto; call
+threading costs a call per instruction; guaranteed tail calls would need
+checking against the toolchain) and superinstructions (no pair frequent
+enough). Next candidates: a generational nursery for the collector, which
+keeps paying after compilation, and the compiler itself.

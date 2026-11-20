@@ -6,6 +6,7 @@ for now). Stage 1, the spike, done (section 9). Stage 2, every instruction,
 done, with the first of stage 3's inline caches (section 10). Stage 3, sends
 without the general path (section 11), done; more inline caches (section
 12), done; frames compiled code pushes and pops itself (section 13),
+done; outer sends, non-local returns and closure calls (section 14),
 uncommitted.
 **Context:** `EURASIA_PERFORMANCE_2026-11-19.md` (the interpreter is about
 1.7x behind psoup; sections 6 to 12 say interpreter tuning has run its
@@ -602,4 +603,73 @@ activation for the defining frame. The allocation natives (`new:`,
 `basicNew`), Float arithmetic and comparisons, and `valueWithArguments:`
 still take the general path. Then the top of the operand stack in wasm
 locals, and recording with compilation on.
+
+## 14. Outer sends, non-local returns and closure calls
+
+After section 13, counting the instructions compiled code still handed to
+`step` showed what remained in the benchmarks behind psoup: per
+ParserCombinators run, 6.4M outer sends (never compiled), 2.2M
+`PUSH_NEW_ARRAY` and 1.3M non-local returns; per NLRImmediate run, 23M
+non-local returns. The profiles also showed closure `value` sends pushing
+their frames in Rust (`direct_closure`, 6 to 12%).
+
+**What changed.**
+- **Outer sends are sends with sites.** An outer send `d` levels out is
+  rule `RULE_OUTER + d`. It looks up and caches as an implicit-receiver
+  send does: keyed by the frame receiver's class and the method's mixin,
+  with a fixed receiver (the enclosing object), or the frame's at depth 0.
+  Its sites take every kind an implicit-receiver site takes, the enclosing
+  object's slot read (`IC_OUTER_GETTER`) included, and the frame push of
+  section 13.
+- **Non-local returns by their own runtime call.** A `^` in a closure body
+  is `Ins::NonLocalReturn`: compiled code pushes the value and calls `nlr`
+  (a new import, the eighth), which runs the VM's `non_local_return`
+  directly, the frame's `ip` already past the instruction as `step` leaves
+  it (an upcall, `cannotReturn:` or `aboutToReturn:through:`, resumes
+  there). Its answer is a call's (`after_call`); the frame never goes on.
+- **Closure frames pushed in wasm.** A closure `value` send that the VM
+  entered directly caches a *closure target* (`IC_CLOSURE`): for closures of
+  one method whose body starts at one instruction, what their frames need
+  (method, literals, mixin, function, entry block, literals' offset and
+  count, argument count). The VM's table of them is `#[repr(C)]` (checked
+  against the `CTARGET_` offsets), keyed by method and body, cleared with
+  the lookup cache, and published like the method targets. A hit checks
+  the closure in hand (its body's first instruction, its argument count,
+  its defining activation's method) and, with room as for a method frame,
+  pushes the frame in wasm: the receiver is the defining activation's, the
+  copied values are the first locals, and it enters the body's block.
+  Otherwise `call`, with `CLOSURE_TARGET` and the target's index, pushes
+  it in Rust or answers `MISS`.
+
+**Correctness.** The gates of section 11 pass: check; the compiled kernel
+tests (2648 methods) give native's outcomes, also under GC stress; the
+compiled-GC probe; genesis, kernel, reflection, replay.
+
+**Speed.** Node 26, runs per second, every method compiled at its first
+activation (Splay and ParserCombinators vary: three runs each, 248 to 271
+and 14.5 to 14.7):
+
+| Benchmark | section 13 | now | psoup wasm (Chrome, section 10) |
+|---|---:|---:|---:|
+| SlotRead | 488 | 485 | 65.6 |
+| SlotWrite | 381 | 378 | 42.1 |
+| NLRLoop | 293 | 444 | 166 |
+| MethodFibonacci | 193 | 194 | 69.4 |
+| ClosureFibonacci | 75.4 | 188 | 55.8 |
+| Richards | 286 | 294 | 153 |
+| DeltaBlue | 243 | 237 | 136 |
+| Splay | 268 | 248 to 271 | 240 |
+| NLRImmediate | 686 | 924 | 787 |
+| ClosureDefFibonacci | 35.7 | 47.9 | 33.4 |
+| ParserCombinators | 12.2 | 14.5 to 14.7 | 14.9 |
+
+Every benchmark but ParserCombinators beats psoup; ParserCombinators is
+within 3%.
+
+**What is left.** Closure creation is a runtime call that allocates an
+activation for the defining frame and the closure. Arrays (`PUSH_NEW_ARRAY`)
+are made by `step`. The allocation natives (`new:`, `basicNew`), Float
+arithmetic and comparisons, and `valueWithArguments:` take the general
+send. Then the top of the operand stack in wasm locals, recording with
+compilation on, and a Chrome measurement.
 

@@ -94,6 +94,10 @@ const keys = {
   Delete: { key: "Delete", code: "Delete", windowsVirtualKeyCode: 46 },
   Enter: { key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, text: "\r" },
   CmdB: { key: "b", code: "KeyB", windowsVirtualKeyCode: 66, modifiers: 4 },
+  CmdX: { key: "x", code: "KeyX", windowsVirtualKeyCode: 88, modifiers: 4, commands: ["cut"] },
+  CmdC: { key: "c", code: "KeyC", windowsVirtualKeyCode: 67, modifiers: 4, commands: ["copy"] },
+  CmdV: { key: "v", code: "KeyV", windowsVirtualKeyCode: 86, modifiers: 4, commands: ["paste"] },
+  AltBackspace: { key: "Backspace", code: "Backspace", windowsVirtualKeyCode: 8, modifiers: 1, commands: ["deleteWordBackward"] },
   CmdU: { key: "u", code: "KeyU", windowsVirtualKeyCode: 85, modifiers: 4 },
   CmdShiftX: { key: "X", code: "KeyX", windowsVirtualKeyCode: 88, modifiers: 12 },
   CmdComma: { key: ",", code: "Comma", windowsVirtualKeyCode: 188, modifiers: 4 },
@@ -283,6 +287,53 @@ console.log(`${scenarios.length - failures}/${scenarios.length} scenarios passed
   if (!ok) { failures++; console.log(`     viewer: shows ${JSON.stringify(text)}`); }
   if (controlOk) { failures++; console.log(`     viewer control was not caught: ${JSON.stringify(controlText)}`); }
   console.log(`viewer: renders the document ${ok ? "yes" : "NO"}; control (source as HTML) caught ${controlOk ? "NO" : "yes"}`);
+}
+
+// Cut, copy, and paste, through the browser's own clipboard commands (as
+// Cmd-X, Cmd-C, Cmd-V do): what is cut leaves the source, and what is
+// pasted enters it.
+{
+  await send("Browser.grantPermissions", { permissions: ["clipboardReadWrite", "clipboardSanitizedWrite"] });
+  await js(`window.inputLog = []; document.addEventListener('beforeinput', (e) => inputLog.push(e.inputType + '@' + (e.target.tagName || e.target.nodeName) + (e.target.getAttribute && e.target.getAttribute('data-steps') !== null ? '[' + e.target.getAttribute('data-steps') + ']' : '')), true); true`);
+  await js(`emmanuelLoad(${JSON.stringify(DOC)})`);
+  await js("selectText('world')");
+  await key("CmdX");
+  await sleep(300);
+  const afterCut = await source();
+  await js("caretAt('Second', 6)");
+  await key("CmdV");
+  await sleep(300);
+  const afterPaste = await source();
+  const log = await js("inputLog.join(', ')");
+  const cutOk = afterCut === DOC.replace("Hello world", "Hello ");
+  const pasteOk = afterPaste === DOC.replace("Hello world", "Hello ").replace("Second", "Secondworld");
+  if (!cutOk || !pasteOk) failures++;
+  console.log(`cut ${cutOk ? "yes" : "NO"}, paste ${pasteOk ? "yes" : "NO"}\n     after cut ${JSON.stringify(afterCut)}\n     after paste ${JSON.stringify(afterPaste)}\n     input events: ${log}`);
+}
+
+// Edits whose range the browser gives, not the selection: deleting a word
+// (Option-Backspace), and a spelling correction, whose word replaces the
+// misspelled one, wherever the caret is (synthetic, as headless Chrome has no
+// spelling service).
+{
+  await js(`emmanuelLoad(${JSON.stringify(DOC)})`);
+  await js("caretAt('world', 5)");
+  await key("AltBackspace");
+  await sleep(300);
+  const afterWord = await source();
+  await js(`emmanuelLoad(${JSON.stringify(DOC.replace("world", "wrold"))})`);
+  await js("caretAt('Second', 6)");
+  await js(`(() => { const [n, i] = findText('wrold');
+    const range = new StaticRange({ startContainer: n, startOffset: i, endContainer: n, endOffset: i + 5 });
+    const dt = new DataTransfer(); dt.setData('text/plain', 'world');
+    n.parentNode.dispatchEvent(new InputEvent('beforeinput', { inputType: 'insertReplacementText', dataTransfer: dt,
+      targetRanges: [range], bubbles: true, cancelable: true })); })()`);
+  await sleep(300);
+  const afterSpell = await source();
+  const wordOk = afterWord === DOC.replace("Hello world", "Hello ");
+  const spellOk = afterSpell === DOC;
+  if (!wordOk || !spellOk) failures++;
+  console.log(`delete a word ${wordOk ? "yes" : "NO"}, spelling correction ${spellOk ? "yes" : "NO"}\n     after word ${JSON.stringify(afterWord)}\n     after correction ${JSON.stringify(afterSpell)}`);
 }
 
 // The new styles render as their HTML elements, and a background as the

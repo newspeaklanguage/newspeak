@@ -248,6 +248,17 @@ roundtrip('lib-amplets-roundtrip', W6b,
 W7 = "[\\title: [\\x[\\endParagraph\\]\\]\\]"
 errors('lib-title-errors', W7, ['(ERRORLEAF (DNU %s))' % S('endParagraph')], [])
 
+# A horizontal line: a display, so not understood in a paragraph.
+W6c = "[\\hline. paragraph\\]a[\\hline\\]b[\\endParagraph. section: #intro. hline. endSection\\]"
+s_hl = S('hline')
+tree('lib-hline', W6c, doc(DOCF, [
+    leafb(s_hl, st('hline')),
+    para(run('a'), dnu(s_hl), run('b')),
+    sub(T(st('section', '(INTV 1)', sym('intro'), NIL), [leafb(s_hl, st('hline'))],
+          [S('section:', C('#intro')), S('endSection')]))]))
+roundtrip('lib-hline-roundtrip', W6c,
+          "[\\hline\\][\\paragraph\\]a[\\hline\\]b[\\endParagraph\\][\\section: #intro\\][\\hline\\][\\endSection\\]")
+
 # A closer sent to the wrong block is not understood.
 W8 = "[\\paragraph\\]a [\\emphasis\\]b[\\endStrong. endEmphasis. endParagraph\\]"
 tree('lib-wrong-closer', W8, doc(DOCF, [para(run('a '), simple('emph', 'emphasis', 'endEmphasis', run('b'), dnu(S('endStrong'))))]))

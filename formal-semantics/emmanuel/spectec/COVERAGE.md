@@ -161,97 +161,97 @@ Every other source equation and named rule remains explicitly `pending`.
 | [eq:lib-inline-bad](../emmanuel-semantics.tex#L1473) | converted | [Inline/Inline-Bad:](library/07-library.spectec#L58) |
 | [Inline-Bad](../emmanuel-semantics.tex#L1474) | converted | [Inline/Inline-Bad:](library/07-library.spectec#L58) |
 | [eq:lib-states](../emmanuel-semantics.tex#L1480) | converted | [$cls(STATE](library/07-library.spectec#L69) |
-| [eq:lib-models](../emmanuel-semantics.tex#L1512) | converted | [$inlineContent](library/07-library.spectec#L101) |
-| [eq:lib-model-table](../emmanuel-semantics.tex#L1525) | converted | [$model(text)](library/07-library.spectec#L109) |
-| [eq:lib-openers](../emmanuel-semantics.tex#L1556) | converted | [$openers](library/07-library.spectec#L142) |
-| [eq:lib-plain](../emmanuel-semantics.tex#L1586) | converted | [Effect/Lib-Plain:](library/07-library.spectec#L275) |
-| [Lib-Plain](../emmanuel-semantics.tex#L1587) | converted | [Effect/Lib-Plain:](library/07-library.spectec#L275) |
-| [eq:lib-dnu](../emmanuel-semantics.tex#L1593) | converted | [Effect/Lib-Dnu:](library/07-library.spectec#L282) |
-| [Lib-Dnu](../emmanuel-semantics.tex#L1594) | converted | [Effect/Lib-Dnu:](library/07-library.spectec#L282) |
-| [eq:lib-plain-def](../emmanuel-semantics.tex#L1599) | converted | [$plain(blockstate,](library/07-library.spectec#L171) |
-| [eq:lib-amplet](../emmanuel-semantics.tex#L1642) | converted | [$amplet(blockstate,](library/07-library.spectec#L201) |
-| [eq:lib-link](../emmanuel-semantics.tex#L1657) | converted | [$link(value)](library/07-library.spectec#L220) |
-| [eq:lib-background](../emmanuel-semantics.tex#L1664) | converted | [$background(blockstate,](library/07-library.spectec#L229) |
-| [eq:lib-inline](../emmanuel-semantics.tex#L1677) | converted | [Effect/Lib-Inline:](library/07-library.spectec#L288) |
-| [Lib-Inline](../emmanuel-semantics.tex#L1678) | converted | [Effect/Lib-Inline:](library/07-library.spectec#L288) |
-| [eq:lib-inline-taken](../emmanuel-semantics.tex#L1684) | converted | [Effect/Lib-Inline-Taken:](library/07-library.spectec#L297) |
-| [Lib-Inline-Taken](../emmanuel-semantics.tex#L1685) | converted | [Effect/Lib-Inline-Taken:](library/07-library.spectec#L297) |
-| [eq:lib-inline-refuse](../emmanuel-semantics.tex#L1690) | converted | [Effect/Lib-Inline-Refuse:](library/07-library.spectec#L305) |
-| [Lib-Inline-Refuse](../emmanuel-semantics.tex#L1691) | converted | [Effect/Lib-Inline-Refuse:](library/07-library.spectec#L305) |
-| [eq:lib-inline-exn](../emmanuel-semantics.tex#L1697) | converted | [Effect/Lib-Inline-Raise:](library/07-library.spectec#L314) |
-| [Lib-Inline-Raise](../emmanuel-semantics.tex#L1698) | converted | [Effect/Lib-Inline-Raise:](library/07-library.spectec#L314) |
-| [eq:lib-with](../emmanuel-semantics.tex#L1704) | converted | [$depth(blockstate)](library/07-library.spectec#L253) |
-| [eq:lib-errors](../emmanuel-semantics.tex#L1743) | converted | [$libErrors(tree)](library/07-library.spectec#L322) |
-| [eq:provenance](../emmanuel-semantics.tex#L1828) | converted | [srcentry](08-edit.spectec#L11), [$prov(srcentry*,](08-edit.spectec#L32) |
-| [eq:fields](../emmanuel-semantics.tex#L1878) | converted | [field](08-edit.spectec#L46) |
-| [eq:points](../emmanuel-semantics.tex#L1920) | converted | [step](08-edit.spectec#L176) |
-| [eq:path](../emmanuel-semantics.tex#L1930) | converted | [$nav(markup,](08-edit.spectec#L200) |
-| [eq:point-ok](../emmanuel-semantics.tex#L1946) | converted | [$isPoint(markup,](08-edit.spectec#L227) |
-| [eq:op-cl](../emmanuel-semantics.tex#L1961) | converted | [$opOf(tree)](08-edit.spectec#L680), [$clOf(tree)](08-edit.spectec#L684) |
-| [eq:col](../emmanuel-semantics.tex#L1986) | converted | [$col(char*,](08-edit.spectec#L265) |
-| [eq:loc](../emmanuel-semantics.tex#L2000) | converted | [$locRun(char*,](08-edit.spectec#L301), [$rangesOf(node*,](08-edit.spectec#L316) |
-| [eq:anchors](../emmanuel-semantics.tex#L2042) | converted | [anchor](08-edit.spectec#L324) |
-| [eq:anchor-items](../emmanuel-semantics.tex#L2051) | converted | [$ixA(anchor)](08-edit.spectec#L391) |
-| [eq:anchor-after](../emmanuel-semantics.tex#L2068) | converted | [$afterStmt(node*,](08-edit.spectec#L328) |
-| [eq:anchor-before](../emmanuel-semantics.tex#L2076) | converted | [$beforeStmt(node*,](08-edit.spectec#L345) |
-| [eq:anchor-end](../emmanuel-semantics.tex#L2085) | converted | [$endOf(node*,](08-edit.spectec#L363) |
-| [eq:anchor-point](../emmanuel-semantics.tex#L2100) | converted | [$anchor(node*,](08-edit.spectec#L379) |
-| [eq:carets](../emmanuel-semantics.tex#L2153) | converted | [caret](08-edit.spectec#L496), [$caretPt(caret)](08-edit.spectec#L500), [$caretAnchor(node*,](08-edit.spectec#L505) |
-| [eq:caret-anchor](../emmanuel-semantics.tex#L2168) | converted | [$lenU(char*)](08-edit.spectec#L511), [$anchorAt(node*,](08-edit.spectec#L523) |
-| [eq:caret-resolve](../emmanuel-semantics.tex#L2184) | converted | [$findText(titem*,](08-edit.spectec#L560), [$gapAfter(titem*,](08-edit.spectec#L602), [$place(node*,](08-edit.spectec#L635) |
-| [eq:caret-ok](../emmanuel-semantics.tex#L2222) | converted | [$caretOK(node*,](08-edit.spectec#L670) |
-| [eq:splice-bounds](../emmanuel-semantics.tex#L2260) | converted | [$mctx(srcentry*,](08-edit.spectec#L431), [$lpos(node*,](08-edit.spectec#L439), [$rpos(node*,](08-edit.spectec#L445) |
-| [eq:splice](../emmanuel-semantics.tex#L2273) | converted | [$left(char*,](08-edit.spectec#L454), [$right(char*,](08-edit.spectec#L460) |
-| [eq:out](../emmanuel-semantics.tex#L2285) | converted | [$out(char*,](08-edit.spectec#L466) |
-| [eq:splice-def](../emmanuel-semantics.tex#L2293) | converted | [spliced](08-edit.spectec#L479) |
-| [eq:splice-items](../emmanuel-semantics.tex#L2322) | pending | — |
-| [eq:tidy-neighbours](../emmanuel-semantics.tex#L2374) | converted | [litem](08-edit.spectec#L776), [$leftNb(nav,](08-edit.spectec#L813), [$rightNb(nav,](08-edit.spectec#L829) |
-| [eq:tidy-cancel](../emmanuel-semantics.tex#L2391) | converted | [$cancels(litem,](08-edit.spectec#L853), [$cancel(litem*,](08-edit.spectec#L873) |
-| [eq:tidy-caret](../emmanuel-semantics.tex#L2398) | converted | [litem](08-edit.spectec#L776), [$cancelsOver(litem,](08-edit.spectec#L865), [$beforeCaret(litem*)](08-edit.spectec#L925), [$afterCaret(litem*)](08-edit.spectec#L932) |
-| [eq:tidy](../emmanuel-semantics.tex#L2405) | converted | [$dropEmpty(litem*)](08-edit.spectec#L890), [$written(litem*)](08-edit.spectec#L914), [$tidy(char*,](08-edit.spectec#L957), [$widenL(node*,](08-edit.spectec#L973), [$widenR(node*,](08-edit.spectec#L980) |
-| [eq:edits](../emmanuel-semantics.tex#L2478) | converted | [aftercaret](08-edit.spectec#L1169), [edit](08-edit.spectec#L1171) |
-| [eq:edit-blocks](../emmanuel-semantics.tex#L2489) | converted | [$commonLen(nat*,](08-edit.spectec#L705) |
-| [eq:edit-muts](../emmanuel-semantics.tex#L2499) | converted | [$loAt(nat*,](08-edit.spectec#L716), [$hiAt(nat*,](08-edit.spectec#L725), [$mutsIn(titem*,](08-edit.spectec#L735), [$mLeft(tree*,](08-edit.spectec#L758) |
-| [eq:edit-join](../emmanuel-semantics.tex#L2512) | converted | [$join(tree,](08-edit.spectec#L701), [$mJoin(nav,](08-edit.spectec#L1028), [$joinDepth(nav,](08-edit.spectec#L1038), [$canJoin(nav,](08-edit.spectec#L1045) |
-| [eq:edit-replace](../emmanuel-semantics.tex#L2527) | converted | [$replace(srcentry*,](08-edit.spectec#L993), [Edit/edit-replace:](08-edit.spectec#L1214) |
-| [eq:edit-keys](../emmanuel-semantics.tex#L2540) | converted | [$typeText(caret,](08-edit.spectec#L1154) |
-| [eq:edit-split](../emmanuel-semantics.tex#L2587) | converted | [$split(srcentry*,](08-edit.spectec#L1052), [$closedFrom(tree*,](08-edit.spectec#L1059), [Edit/edit-split:](08-edit.spectec#L1229) |
-| [eq:style-ok](../emmanuel-semantics.tex#L2625) | converted | [$canStyle(nav,](08-edit.spectec#L1142) |
-| [eq:edit-unstyle](../emmanuel-semantics.tex#L2639) | converted | [depthopt](08-edit.spectec#L1070) |
-| [eq:edit-restyle](../emmanuel-semantics.tex#L2652) | converted | [depthopt](08-edit.spectec#L1070) |
-| [eq:edit-style](../emmanuel-semantics.tex#L2662) | converted | [depthopt](08-edit.spectec#L1070), [Edit/edit-style:](08-edit.spectec#L1242) |
-| [eq:edit-string](../emmanuel-semantics.tex#L2709) | converted | [Edit/edit-set-string:](08-edit.spectec#L1258), [Edit/edit-detach:](08-edit.spectec#L1271) |
-| [eq:detachable](../emmanuel-semantics.tex#L2722) | converted | [$detachable(srcentry*,](08-edit.spectec#L1190), [$offers(srcentry*,](08-edit.spectec#L1196) |
-| [eq:edit-results](../emmanuel-semantics.tex#L2740) | converted | [offer](08-edit.spectec#L1178), [$result(srcentry*,](08-edit.spectec#L1185) |
-| [Document](../emmanuel-semantics.tex#L2759) | converted | [Document:](08-edit.spectec#L1205) |
-| [Edit-Replace](../emmanuel-semantics.tex#L2772) | converted | [Edit/edit-replace:](08-edit.spectec#L1214) |
-| [Edit-Split](../emmanuel-semantics.tex#L2778) | converted | [Edit/edit-split:](08-edit.spectec#L1229) |
-| [Edit-Style](../emmanuel-semantics.tex#L2784) | converted | [Edit/edit-style:](08-edit.spectec#L1242) |
-| [Edit-Set-String](../emmanuel-semantics.tex#L2790) | converted | [Edit/edit-set-string:](08-edit.spectec#L1258) |
-| [Edit-Detach](../emmanuel-semantics.tex#L2797) | converted | [Edit/edit-detach:](08-edit.spectec#L1271) |
-| [Refuse-Trees](../emmanuel-semantics.tex#L2809) | converted | [Edit/refuse-trees:](08-edit.spectec#L1283) |
-| [Refuse-Computed](../emmanuel-semantics.tex#L2815) | converted | [Edit/refuse-computed:](08-edit.spectec#L1290) |
-| [Refuse-Split](../emmanuel-semantics.tex#L2819) | converted | [Edit/refuse-split:](08-edit.spectec#L1299) |
-| [Refuse-Style](../emmanuel-semantics.tex#L2825) | converted | [Edit/refuse-style:](08-edit.spectec#L1307) |
-| [Refuse-String](../emmanuel-semantics.tex#L2830) | converted | [Edit/refuse-string:](08-edit.spectec#L1315) |
-| [Refuse-Detach](../emmanuel-semantics.tex#L2836) | converted | [Edit/refuse-detach:](08-edit.spectec#L1325) |
-| [Caret](../emmanuel-semantics.tex#L2878) | converted | [Caret:](08-edit.spectec#L1361) |
-| [eq:law-locality](../emmanuel-semantics.tex#L2919) | pending | — |
-| [eq:law-identity](../emmanuel-semantics.tex#L2927) | pending | — |
-| [eq:edit-typing](../emmanuel-semantics.tex#L2938) | pending | — |
-| [eq:lib-fields](../emmanuel-semantics.tex#L2969) | converted | [$selOf(stmt)](library/07-library.spectec#L363), [$joins(STATE](library/07-library.spectec#L397), [$styleOpen("emphasis")](library/07-library.spectec#L402) |
-| [eq:lib-templates](../emmanuel-semantics.tex#L2996) | converted | [$closerOf(text)](library/07-library.spectec#L421), [$templateAfter(text)](library/07-library.spectec#L450), [$insertAt(markup,](library/07-library.spectec#L456) |
-| [eq:lib-enter](../emmanuel-semantics.tex#L3018) | converted | [$enter(markup,](library/07-library.spectec#L463) |
-| [eq:view-keys](../emmanuel-semantics.tex#L3062) | converted | [key](library/07-library.spectec#L489), [$key(markup,](library/07-library.spectec#L503), [ViewKey:](library/07-library.spectec#L649), [ViewKey/view-key:](library/07-library.spectec#L653), [ViewKey/view-no-key:](library/07-library.spectec#L661) |
-| [eq:view-backspace](../emmanuel-semantics.tex#L3088) | converted | [$isLeafKid(titem)](library/07-library.spectec#L535), [$bsAt(markup,](library/07-library.spectec#L567) |
-| [eq:view-delete](../emmanuel-semantics.tex#L3117) | converted | [$delAt(markup,](library/07-library.spectec#L609) |
-| [eq:view-spaces](../emmanuel-semantics.tex#L3139) | converted | [$lastC(char*)](08-edit.spectec#L1378), [$nb(char*,](08-edit.spectec#L1392), [$keepSpaces(char*,](08-edit.spectec#L1404) |
-| [eq:view-edit](../emmanuel-semantics.tex#L3154) | converted | [viewresult](08-edit.spectec#L1423), [ViewEdit/view-edit:](08-edit.spectec#L1432), [ViewEdit/view-refused:](08-edit.spectec#L1442), [ViewEdit/view-elsewhere:](08-edit.spectec#L1448), [ViewEdit/view-unlexable:](08-edit.spectec#L1455), [ViewEdit/view-unparsable:](08-edit.spectec#L1463), [ViewEdit/view-raises:](08-edit.spectec#L1471) |
-| [View-Edit](../emmanuel-semantics.tex#L3155) | converted | [ViewEdit/view-edit:](08-edit.spectec#L1432) |
-| [View-Refused](../emmanuel-semantics.tex#L3160) | converted | [ViewEdit/view-refused:](08-edit.spectec#L1442) |
-| [View-Elsewhere](../emmanuel-semantics.tex#L3163) | converted | [ViewEdit/view-elsewhere:](08-edit.spectec#L1448) |
-| [View-Unlexable](../emmanuel-semantics.tex#L3166) | converted | [ViewEdit/view-unlexable:](08-edit.spectec#L1455) |
-| [View-Unparsable](../emmanuel-semantics.tex#L3166) | converted | [ViewEdit/view-unparsable:](08-edit.spectec#L1463) |
-| [View-Raises](../emmanuel-semantics.tex#L3167) | converted | [ViewEdit/view-raises:](08-edit.spectec#L1471) |
-| [View-Key](../emmanuel-semantics.tex#L3179) | converted | [ViewKey/view-key:](library/07-library.spectec#L653) |
-| [View-No-Key](../emmanuel-semantics.tex#L3182) | converted | [ViewKey/view-no-key:](library/07-library.spectec#L661) |
+| [eq:lib-models](../emmanuel-semantics.tex#L1512) | converted | [$inlineContent](library/07-library.spectec#L102) |
+| [eq:lib-model-table](../emmanuel-semantics.tex#L1525) | converted | [$model(text)](library/07-library.spectec#L110) |
+| [eq:lib-openers](../emmanuel-semantics.tex#L1556) | converted | [$openers](library/07-library.spectec#L144) |
+| [eq:lib-plain](../emmanuel-semantics.tex#L1586) | converted | [Effect/Lib-Plain:](library/07-library.spectec#L278) |
+| [Lib-Plain](../emmanuel-semantics.tex#L1587) | converted | [Effect/Lib-Plain:](library/07-library.spectec#L278) |
+| [eq:lib-dnu](../emmanuel-semantics.tex#L1593) | converted | [Effect/Lib-Dnu:](library/07-library.spectec#L285) |
+| [Lib-Dnu](../emmanuel-semantics.tex#L1594) | converted | [Effect/Lib-Dnu:](library/07-library.spectec#L285) |
+| [eq:lib-plain-def](../emmanuel-semantics.tex#L1599) | converted | [$plain(blockstate,](library/07-library.spectec#L173) |
+| [eq:lib-amplet](../emmanuel-semantics.tex#L1643) | converted | [$amplet(blockstate,](library/07-library.spectec#L204) |
+| [eq:lib-link](../emmanuel-semantics.tex#L1658) | converted | [$link(value)](library/07-library.spectec#L223) |
+| [eq:lib-background](../emmanuel-semantics.tex#L1665) | converted | [$background(blockstate,](library/07-library.spectec#L232) |
+| [eq:lib-inline](../emmanuel-semantics.tex#L1678) | converted | [Effect/Lib-Inline:](library/07-library.spectec#L291) |
+| [Lib-Inline](../emmanuel-semantics.tex#L1679) | converted | [Effect/Lib-Inline:](library/07-library.spectec#L291) |
+| [eq:lib-inline-taken](../emmanuel-semantics.tex#L1685) | converted | [Effect/Lib-Inline-Taken:](library/07-library.spectec#L300) |
+| [Lib-Inline-Taken](../emmanuel-semantics.tex#L1686) | converted | [Effect/Lib-Inline-Taken:](library/07-library.spectec#L300) |
+| [eq:lib-inline-refuse](../emmanuel-semantics.tex#L1691) | converted | [Effect/Lib-Inline-Refuse:](library/07-library.spectec#L308) |
+| [Lib-Inline-Refuse](../emmanuel-semantics.tex#L1692) | converted | [Effect/Lib-Inline-Refuse:](library/07-library.spectec#L308) |
+| [eq:lib-inline-exn](../emmanuel-semantics.tex#L1698) | converted | [Effect/Lib-Inline-Raise:](library/07-library.spectec#L317) |
+| [Lib-Inline-Raise](../emmanuel-semantics.tex#L1699) | converted | [Effect/Lib-Inline-Raise:](library/07-library.spectec#L317) |
+| [eq:lib-with](../emmanuel-semantics.tex#L1705) | converted | [$depth(blockstate)](library/07-library.spectec#L256) |
+| [eq:lib-errors](../emmanuel-semantics.tex#L1744) | converted | [$libErrors(tree)](library/07-library.spectec#L325) |
+| [eq:provenance](../emmanuel-semantics.tex#L1829) | converted | [srcentry](08-edit.spectec#L11), [$prov(srcentry*,](08-edit.spectec#L32) |
+| [eq:fields](../emmanuel-semantics.tex#L1879) | converted | [field](08-edit.spectec#L46) |
+| [eq:points](../emmanuel-semantics.tex#L1921) | converted | [step](08-edit.spectec#L176) |
+| [eq:path](../emmanuel-semantics.tex#L1931) | converted | [$nav(markup,](08-edit.spectec#L200) |
+| [eq:point-ok](../emmanuel-semantics.tex#L1947) | converted | [$isPoint(markup,](08-edit.spectec#L227) |
+| [eq:op-cl](../emmanuel-semantics.tex#L1962) | converted | [$opOf(tree)](08-edit.spectec#L680), [$clOf(tree)](08-edit.spectec#L684) |
+| [eq:col](../emmanuel-semantics.tex#L1987) | converted | [$col(char*,](08-edit.spectec#L265) |
+| [eq:loc](../emmanuel-semantics.tex#L2001) | converted | [$locRun(char*,](08-edit.spectec#L301), [$rangesOf(node*,](08-edit.spectec#L316) |
+| [eq:anchors](../emmanuel-semantics.tex#L2043) | converted | [anchor](08-edit.spectec#L324) |
+| [eq:anchor-items](../emmanuel-semantics.tex#L2052) | converted | [$ixA(anchor)](08-edit.spectec#L391) |
+| [eq:anchor-after](../emmanuel-semantics.tex#L2069) | converted | [$afterStmt(node*,](08-edit.spectec#L328) |
+| [eq:anchor-before](../emmanuel-semantics.tex#L2077) | converted | [$beforeStmt(node*,](08-edit.spectec#L345) |
+| [eq:anchor-end](../emmanuel-semantics.tex#L2086) | converted | [$endOf(node*,](08-edit.spectec#L363) |
+| [eq:anchor-point](../emmanuel-semantics.tex#L2101) | converted | [$anchor(node*,](08-edit.spectec#L379) |
+| [eq:carets](../emmanuel-semantics.tex#L2154) | converted | [caret](08-edit.spectec#L496), [$caretPt(caret)](08-edit.spectec#L500), [$caretAnchor(node*,](08-edit.spectec#L505) |
+| [eq:caret-anchor](../emmanuel-semantics.tex#L2169) | converted | [$lenU(char*)](08-edit.spectec#L511), [$anchorAt(node*,](08-edit.spectec#L523) |
+| [eq:caret-resolve](../emmanuel-semantics.tex#L2185) | converted | [$findText(titem*,](08-edit.spectec#L560), [$gapAfter(titem*,](08-edit.spectec#L602), [$place(node*,](08-edit.spectec#L635) |
+| [eq:caret-ok](../emmanuel-semantics.tex#L2223) | converted | [$caretOK(node*,](08-edit.spectec#L670) |
+| [eq:splice-bounds](../emmanuel-semantics.tex#L2261) | converted | [$mctx(srcentry*,](08-edit.spectec#L431), [$lpos(node*,](08-edit.spectec#L439), [$rpos(node*,](08-edit.spectec#L445) |
+| [eq:splice](../emmanuel-semantics.tex#L2274) | converted | [$left(char*,](08-edit.spectec#L454), [$right(char*,](08-edit.spectec#L460) |
+| [eq:out](../emmanuel-semantics.tex#L2286) | converted | [$out(char*,](08-edit.spectec#L466) |
+| [eq:splice-def](../emmanuel-semantics.tex#L2294) | converted | [spliced](08-edit.spectec#L479) |
+| [eq:splice-items](../emmanuel-semantics.tex#L2323) | pending | — |
+| [eq:tidy-neighbours](../emmanuel-semantics.tex#L2375) | converted | [litem](08-edit.spectec#L776), [$leftNb(nav,](08-edit.spectec#L813), [$rightNb(nav,](08-edit.spectec#L829) |
+| [eq:tidy-cancel](../emmanuel-semantics.tex#L2392) | converted | [$cancels(litem,](08-edit.spectec#L853), [$cancel(litem*,](08-edit.spectec#L873) |
+| [eq:tidy-caret](../emmanuel-semantics.tex#L2399) | converted | [litem](08-edit.spectec#L776), [$cancelsOver(litem,](08-edit.spectec#L865), [$beforeCaret(litem*)](08-edit.spectec#L925), [$afterCaret(litem*)](08-edit.spectec#L932) |
+| [eq:tidy](../emmanuel-semantics.tex#L2406) | converted | [$dropEmpty(litem*)](08-edit.spectec#L890), [$written(litem*)](08-edit.spectec#L914), [$tidy(char*,](08-edit.spectec#L957), [$widenL(node*,](08-edit.spectec#L973), [$widenR(node*,](08-edit.spectec#L980) |
+| [eq:edits](../emmanuel-semantics.tex#L2479) | converted | [aftercaret](08-edit.spectec#L1169), [edit](08-edit.spectec#L1171) |
+| [eq:edit-blocks](../emmanuel-semantics.tex#L2490) | converted | [$commonLen(nat*,](08-edit.spectec#L705) |
+| [eq:edit-muts](../emmanuel-semantics.tex#L2500) | converted | [$loAt(nat*,](08-edit.spectec#L716), [$hiAt(nat*,](08-edit.spectec#L725), [$mutsIn(titem*,](08-edit.spectec#L735), [$mLeft(tree*,](08-edit.spectec#L758) |
+| [eq:edit-join](../emmanuel-semantics.tex#L2513) | converted | [$join(tree,](08-edit.spectec#L701), [$mJoin(nav,](08-edit.spectec#L1028), [$joinDepth(nav,](08-edit.spectec#L1038), [$canJoin(nav,](08-edit.spectec#L1045) |
+| [eq:edit-replace](../emmanuel-semantics.tex#L2528) | converted | [$replace(srcentry*,](08-edit.spectec#L993), [Edit/edit-replace:](08-edit.spectec#L1214) |
+| [eq:edit-keys](../emmanuel-semantics.tex#L2541) | converted | [$typeText(caret,](08-edit.spectec#L1154) |
+| [eq:edit-split](../emmanuel-semantics.tex#L2588) | converted | [$split(srcentry*,](08-edit.spectec#L1052), [$closedFrom(tree*,](08-edit.spectec#L1059), [Edit/edit-split:](08-edit.spectec#L1229) |
+| [eq:style-ok](../emmanuel-semantics.tex#L2626) | converted | [$canStyle(nav,](08-edit.spectec#L1142) |
+| [eq:edit-unstyle](../emmanuel-semantics.tex#L2640) | converted | [depthopt](08-edit.spectec#L1070) |
+| [eq:edit-restyle](../emmanuel-semantics.tex#L2653) | converted | [depthopt](08-edit.spectec#L1070) |
+| [eq:edit-style](../emmanuel-semantics.tex#L2663) | converted | [depthopt](08-edit.spectec#L1070), [Edit/edit-style:](08-edit.spectec#L1242) |
+| [eq:edit-string](../emmanuel-semantics.tex#L2710) | converted | [Edit/edit-set-string:](08-edit.spectec#L1258), [Edit/edit-detach:](08-edit.spectec#L1271) |
+| [eq:detachable](../emmanuel-semantics.tex#L2723) | converted | [$detachable(srcentry*,](08-edit.spectec#L1190), [$offers(srcentry*,](08-edit.spectec#L1196) |
+| [eq:edit-results](../emmanuel-semantics.tex#L2741) | converted | [offer](08-edit.spectec#L1178), [$result(srcentry*,](08-edit.spectec#L1185) |
+| [Document](../emmanuel-semantics.tex#L2760) | converted | [Document:](08-edit.spectec#L1205) |
+| [Edit-Replace](../emmanuel-semantics.tex#L2773) | converted | [Edit/edit-replace:](08-edit.spectec#L1214) |
+| [Edit-Split](../emmanuel-semantics.tex#L2779) | converted | [Edit/edit-split:](08-edit.spectec#L1229) |
+| [Edit-Style](../emmanuel-semantics.tex#L2785) | converted | [Edit/edit-style:](08-edit.spectec#L1242) |
+| [Edit-Set-String](../emmanuel-semantics.tex#L2791) | converted | [Edit/edit-set-string:](08-edit.spectec#L1258) |
+| [Edit-Detach](../emmanuel-semantics.tex#L2798) | converted | [Edit/edit-detach:](08-edit.spectec#L1271) |
+| [Refuse-Trees](../emmanuel-semantics.tex#L2810) | converted | [Edit/refuse-trees:](08-edit.spectec#L1283) |
+| [Refuse-Computed](../emmanuel-semantics.tex#L2816) | converted | [Edit/refuse-computed:](08-edit.spectec#L1290) |
+| [Refuse-Split](../emmanuel-semantics.tex#L2820) | converted | [Edit/refuse-split:](08-edit.spectec#L1299) |
+| [Refuse-Style](../emmanuel-semantics.tex#L2826) | converted | [Edit/refuse-style:](08-edit.spectec#L1307) |
+| [Refuse-String](../emmanuel-semantics.tex#L2831) | converted | [Edit/refuse-string:](08-edit.spectec#L1315) |
+| [Refuse-Detach](../emmanuel-semantics.tex#L2837) | converted | [Edit/refuse-detach:](08-edit.spectec#L1325) |
+| [Caret](../emmanuel-semantics.tex#L2879) | converted | [Caret:](08-edit.spectec#L1361) |
+| [eq:law-locality](../emmanuel-semantics.tex#L2920) | pending | — |
+| [eq:law-identity](../emmanuel-semantics.tex#L2928) | pending | — |
+| [eq:edit-typing](../emmanuel-semantics.tex#L2939) | pending | — |
+| [eq:lib-fields](../emmanuel-semantics.tex#L2970) | converted | [$selOf(stmt)](library/07-library.spectec#L366), [$joins(STATE](library/07-library.spectec#L400), [$styleOpen("emphasis")](library/07-library.spectec#L405) |
+| [eq:lib-templates](../emmanuel-semantics.tex#L2997) | converted | [$closerOf(text)](library/07-library.spectec#L424), [$templateAfter(text)](library/07-library.spectec#L453), [$insertAt(markup,](library/07-library.spectec#L459) |
+| [eq:lib-enter](../emmanuel-semantics.tex#L3019) | converted | [$enter(markup,](library/07-library.spectec#L466) |
+| [eq:view-keys](../emmanuel-semantics.tex#L3063) | converted | [key](library/07-library.spectec#L492), [$key(markup,](library/07-library.spectec#L506), [ViewKey:](library/07-library.spectec#L652), [ViewKey/view-key:](library/07-library.spectec#L656), [ViewKey/view-no-key:](library/07-library.spectec#L664) |
+| [eq:view-backspace](../emmanuel-semantics.tex#L3092) | converted | [$isLeafKid(titem)](library/07-library.spectec#L538), [$bsAt(markup,](library/07-library.spectec#L570) |
+| [eq:view-delete](../emmanuel-semantics.tex#L3121) | converted | [$delAt(markup,](library/07-library.spectec#L612) |
+| [eq:view-spaces](../emmanuel-semantics.tex#L3143) | converted | [$lastC(char*)](08-edit.spectec#L1378), [$nb(char*,](08-edit.spectec#L1392), [$keepSpaces(char*,](08-edit.spectec#L1404) |
+| [eq:view-edit](../emmanuel-semantics.tex#L3158) | converted | [viewresult](08-edit.spectec#L1423), [ViewEdit/view-edit:](08-edit.spectec#L1432), [ViewEdit/view-refused:](08-edit.spectec#L1442), [ViewEdit/view-elsewhere:](08-edit.spectec#L1448), [ViewEdit/view-unlexable:](08-edit.spectec#L1455), [ViewEdit/view-unparsable:](08-edit.spectec#L1463), [ViewEdit/view-raises:](08-edit.spectec#L1471) |
+| [View-Edit](../emmanuel-semantics.tex#L3159) | converted | [ViewEdit/view-edit:](08-edit.spectec#L1432) |
+| [View-Refused](../emmanuel-semantics.tex#L3164) | converted | [ViewEdit/view-refused:](08-edit.spectec#L1442) |
+| [View-Elsewhere](../emmanuel-semantics.tex#L3167) | converted | [ViewEdit/view-elsewhere:](08-edit.spectec#L1448) |
+| [View-Unlexable](../emmanuel-semantics.tex#L3170) | converted | [ViewEdit/view-unlexable:](08-edit.spectec#L1455) |
+| [View-Unparsable](../emmanuel-semantics.tex#L3170) | converted | [ViewEdit/view-unparsable:](08-edit.spectec#L1463) |
+| [View-Raises](../emmanuel-semantics.tex#L3171) | converted | [ViewEdit/view-raises:](08-edit.spectec#L1471) |
+| [View-Key](../emmanuel-semantics.tex#L3183) | converted | [ViewKey/view-key:](library/07-library.spectec#L656) |
+| [View-No-Key](../emmanuel-semantics.tex#L3186) | converted | [ViewKey/view-no-key:](library/07-library.spectec#L664) |

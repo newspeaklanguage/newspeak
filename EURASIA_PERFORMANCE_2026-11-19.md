@@ -365,3 +365,74 @@ What the measurements now say, after sections 6 to 8:
 - Beyond that, closing the remaining 2x to psoup, and going past it, takes
   a different execution model: a baseline compiler (section 3, Tier 3,
   item 11), not further interpreter tuning.
+
+## 9. Probe: slots inline with the header (Tier 2's premise), no gain
+
+Before spending weeks on Tier 2's arena, a probe tested its premise for
+running code: that reaching a slot through the object and then its
+separate slot vector costs a dependent cache miss. `Body::Regular` held a
+small vector instead of a `Vec`: up to 8 slots inline in the object, next
+to its header, more in a vector; `basicNew` built small instances inline
+without allocating. Reverted after measuring (it was never committed).
+
+Against the committed build (b711010), native, runs per second: every
+benchmark within 1% (Richards 84.4 to 83.8, SlotRead 42.0 to 41.5,
+DeltaBlue 80.1 to 79.8, MethodFibonacci 55.2 to 55.3), except Splay, 120.0
+to 125.1 (4%, about the noise). So the extra indirection costs nothing
+measurable here; these benchmarks' objects stay in cache. Splay's
+remaining malloc is mostly the collector's own (`collect_with` rebuilding
+the object vector and its forwarding table), which is what the arena's
+sliding collector would remove: worth perhaps 10% on allocation-heavy code.
+
+So Tier 2 is not worth its two to three weeks for speed on these
+benchmarks. It may still be for large heaps (the IDE's), where objects do
+not stay in cache; that needs a measurement on such a heap, not these
+benchmarks. For speed in general, what is left is Tier 3's baseline
+compiler.
+
+## 10. On a large heap, the object layout does matter
+
+Section 9's benchmarks keep their objects in cache. `EurasiaHeapBench.ns`
+measures a large heap instead: it builds a million four-slot nodes, each
+allocated next to a filler Array so the nodes are scattered as long-lived
+objects are in a big image, and walks them by their accessors; it also
+walks a thousand nodes, which stay in cache, for the same number of visits
+(10 million each). Packaged and run like the benchmarks (entry
+`EurasiaHeapBench.ns`, modules Kernel, Collections, Actors, Runtime).
+
+Today an object is a 120-byte `Object` (32-byte header, 88-byte `Body`, as
+large as its largest variant, `Method`), and a Regular object's slots are
+a separate allocation besides: a node is about 170 bytes in two places.
+Section 9's probe made every `Body` larger still, which is why it showed
+nothing. A fairer probe, `eurasia-perf/compact-objects-probe.patch`
+(applies to eurasia b711010; never committed): up to four slots inline in
+the `Body`, and the large, rare variants (Method, Mixin, Class,
+Metaclass, Activation, Promise) boxed, so a node is one 104-byte object
+with its slots inside it.
+
+| | committed | compact probe |
+|---|---:|---:|
+| walk 1,000,000 scattered nodes, 10 times | 1770 ms | 1200 ms |
+| walk 1,000 nodes in cache, 10,000 times | 1188 ms | 1190 ms |
+| build the 1,000,000 nodes | 955 ms | 842 ms |
+
+- On a big heap, the walk is 1.5x faster with the slots in the object, and
+  as fast as the walk in cache: the separate slot allocation is the whole
+  of the large-heap penalty here.
+- The benchmarks barely move (Splay 120 to 129, Richards 84.4 to 81.7,
+  NLRImmediate 477 to 438, the rest within 3%); the probe's boxed
+  activations cost the NLR benchmarks something that the arena would not.
+
+So Tier 2 is worth doing for large heaps, which is where the IDE lives:
+code that touches many long-lived objects (the IDE's presenters, the
+compiler's trees, the mirror and class structures) pays this penalty on
+every slot read. The arena would do better than the probe (a four-slot
+node in 56 bytes instead of 104, and no boxed variants), and also removes
+the collector's own allocation (section 9).
+
+## 11. Tier 2 done: the arena
+
+The heap is now one arena, `EURASIA_ARENA_DESIGN_2026-11-19.md` (section
+10 has the numbers): on a large heap, walking objects is 1.5x faster and no
+slower than in cache; allocation-heavy code is 15% to 30% faster; the other
+benchmarks are within noise but for non-local returns (5% to 7% slower).

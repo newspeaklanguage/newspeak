@@ -4,7 +4,8 @@
 **Status:** Approved (Gilad, 2026-11-19: Rust compiler, native interpreted
 for now). Stage 1, the spike, done (section 9). Stage 2, every instruction,
 done, with the first of stage 3's inline caches (section 10). Stage 3, sends
-without the general path (section 11), uncommitted.
+without the general path (section 11), done; more inline caches (section
+12), uncommitted.
 **Context:** `EURASIA_PERFORMANCE_2026-11-19.md` (the interpreter is about
 1.7x behind psoup; sections 6 to 12 say interpreter tuning has run its
 course), the arena and nursery designs (objects addressable as base plus
@@ -438,3 +439,77 @@ defining frame. Next:
   indexed ones;
 - the top of the operand stack in wasm locals;
 - recording with compilation on (section 10).
+
+## 12. Stage 3, continued: the sends that still missed
+
+Counting what each send through the general path resolved to (temporary
+counters in `compiled_send`, removed) showed, per DeltaBlue run: 16M `=`
+sends resolving to `Object>>==` (common selector 13 has SmallInteger's fast
+path, so it had no site at all); 13M implicit-receiver reads of an
+enclosing object's slot (19M in Richards); 8M `bitAnd:` and `bitOr:` in
+Richards (SmallInteger receivers, which no site could hold); 9M closure
+`value:` sends; 2M to 9M refills at polymorphic sites; 5M methods that only
+answer self (Splay).
+
+**What changed.**
+- **Two entries per site.** A site has two entries (class, epoch, slot or
+  target, kind, object: ten globals); a hit copies the entry's kind, slot
+  and object into locals that every path reads. A fill takes the first
+  entry if it is empty, stale or of the receiver's class, else the second.
+- **SmallInteger receivers.** A site holds SmallInteger as a class
+  (`Regs::small_integer`); methods, `==` and the bit operations cache for
+  SmallInteger receivers.
+- **Fast-path selectors get sites.** The arithmetic and comparisons keep
+  their inline SmallInteger code; when the operands are not both
+  SmallIntegers the send goes through a site (the runtime still tries the
+  fast path first). `=` on objects is the main beneficiary.
+- **New kinds, run in compiled code:** `==` (`IC_IDENTICAL`, any receiver);
+  SmallInteger's `bitAnd:`, `bitOr:`, `bitXor:` with a SmallInteger
+  argument; an implicit-receiver read of an enclosing object's slot
+  (`IC_OUTER_GETTER`: keyed by the frame receiver's class, the object in the
+  entry; every collection changes the epoch, so the object's bits stay
+  valid); a method that answers its receiver (`IC_RETURN_SELF`).
+- **Closures through `call`.** A closure `value` send that pushed the
+  closure's frame caches a target with `CLOSURE_TARGET` set and the native's
+  id; `call` pushes the frame again.
+- **`MISS`.** When `call` cannot enter the cached callee it answers `MISS`
+  and the site makes the general send. (Answering `INTERPRET` looped
+  forever: a closure of the wrong arity at a cached site sent the frame to
+  the interpreter at that instruction, which re-entered compiled code
+  there. The compiled kernel tests caught it, in
+  `testRepeatingTimerInvalidCallback`.) `call` lost its `ip` argument.
+
+**Correctness.** The gates of section 11: check; the kernel tests with
+every method compiled (2648) give native's outcomes, also under GC stress;
+the compiled-GC probe (0 of 20 rounds failed); genesis, kernel, reflection,
+replay. The native interpreter is unchanged: DeltaBlue 104, Richards 111,
+NLRImmediate 600.
+
+**Speed.** Node 26, runs per second, every method compiled at its first
+activation:
+
+| Benchmark | stage 3 | now | psoup wasm (Chrome, section 10) |
+|---|---:|---:|---:|
+| SlotRead | 475 | 490 | 65.6 |
+| SlotWrite | 346 | 373 | 42.1 |
+| NLRLoop | 248 | 259 | 166 |
+| MethodFibonacci | 91.2 | 86.7 | 69.4 |
+| ClosureFibonacci | 57.7 | 61.2 | 55.8 |
+| Richards | 136 | 185 | 153 |
+| DeltaBlue | 119 | 175 | 136 |
+| Splay | 196 | 226 | 240 |
+| NLRImmediate | 602 | 623 | 787 |
+| ClosureDefFibonacci | 29.4 | 30.5 | 33.4 |
+| ParserCombinators | 9.5 | 10.5 | 14.9 |
+
+Richards and DeltaBlue now beat psoup. Splay, NLRImmediate,
+ClosureDefFibonacci and ParserCombinators do not.
+
+**What is left.** In DeltaBlue almost every send now hits a cache. The
+remaining cost is the call and the return, which cross into Rust (per run:
+50M `call`s, 63M returns). That is section 11's first item, frames that
+compiled code pushes and pops itself. Still on the general path:
+allocation natives (`new:`, `basicNew`: 4M to 5M in ParserCombinators and
+Splay), Float arithmetic and comparisons, string concatenation, and
+`valueWithArguments:`.
+

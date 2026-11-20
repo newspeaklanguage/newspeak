@@ -5,7 +5,8 @@
 for now). Stage 1, the spike, done (section 9). Stage 2, every instruction,
 done, with the first of stage 3's inline caches (section 10). Stage 3, sends
 without the general path (section 11), done; more inline caches (section
-12), uncommitted.
+12), done; frames compiled code pushes and pops itself (section 13),
+uncommitted.
 **Context:** `EURASIA_PERFORMANCE_2026-11-19.md` (the interpreter is about
 1.7x behind psoup; sections 6 to 12 say interpreter tuning has run its
 course), the arena and nursery designs (objects addressable as base plus
@@ -512,4 +513,93 @@ compiled code pushes and pops itself. Still on the general path:
 allocation natives (`new:`, `basicNew`: 4M to 5M in ParserCombinators and
 Splay), Float arithmetic and comparisons, string concatenation, and
 `valueWithArguments:`.
+
+## 13. Frames that compiled code pushes and pops itself
+
+Section 12 left a compiled-to-compiled call crossing into Rust twice: once
+to push the callee's frame, once to pop it (in DeltaBlue, 50M `call`s and
+63M returns per run, about 47% of the time). Now compiled code does both
+in wasm, in the VM's own frames vector, and calls the runtime only for what
+it cannot do itself.
+
+**Step 1: a frame is a plain record.** `Frame` is `#[repr(C)]` and `Copy`,
+all integers (every bit pattern is a frame), 80 bytes on wasm32:
+- `code` was an `Rc<[u8]>` and is now a number: 0, the method's current
+  bytecode (every frame, in practice); `k`, the VM's pinned code `k - 1`.
+  `Method>>bytecode:` replaces the code of unfrozen methods only, so a
+  running method's code almost never changes. When it is about to, the VM
+  pins the old code for the frames running it (`pin_code_of`): they keep
+  the code they began with, as before. Pinned code goes at a collection
+  once no frame uses it. This path is not covered by any test.
+- `activation` and `closure` are `OptValue`s, one word each, 0 for none
+  (activations and closures are references, never SmallInteger 0).
+- The frame serial counter moved into the registers, so the VM and
+  compiled code take serials from one place.
+- The inline-cache targets (`TargetEntry`) are `#[repr(C)]` too.
+
+The layouts are checked at compile time on wasm32 (`offset_of!` against
+the compiler's `FRAME_` and `TARGET_` constants), and so are the
+registers'. No `unsafe` in the VM: as for the operand stack, the web host
+does the one `set_len`.
+
+**Step 2: push and pop in wasm.**
+- **Publish and adopt.** Before compiled code runs, entered or continuing
+  after a runtime call, the VM publishes what it needs: the frames'
+  address, count and capacity (with 64 frames of room reserved), the
+  targets' address, the stack's capacity, `jit_base` and whether a step
+  limit is set. At every call into the VM, the host adopts the frame count
+  compiled code left (`set_len`, as it adopts the stack's height).
+- **Push.** A method-cache hit pushes the callee's frame in wasm when there
+  is room for the frame and for its locals plus the headroom, no step
+  limit, no safepoint due, and the frame and nesting limits allow it. The
+  push inserts the frame's or a fixed receiver for self and
+  implicit-receiver sends, fills the locals with nil, sets the caller's
+  `ip`, writes the record, sets the callee's registers and runs it with
+  the existing `call_indirect`. Otherwise it goes through `call` as before.
+- **Pop.** A local return pops the frame in wasm when the frame has no
+  activation handle and is deeper than the frame the host entered
+  (`jit_base`): its caller is compiled code below it on the wasm stack,
+  which goes on from the registers. The frame the host entered returns
+  through `ret`: the host does not adopt the stack's height from a plain
+  return. Popping that frame too was a bug: DeltaBlue failed with
+  `NonBooleanReceiver 0`, found by isolating pop from push.
+
+**Correctness.** A temporary check of the frames' invariants at every call
+into the VM found nothing in the compiled kernel tests, with and without
+GC stress, then was removed. The gates of section 11 pass: check; the
+compiled kernel tests (2648 methods) give native's outcomes, also under GC
+stress; the compiled-GC probe; genesis, kernel, reflection, replay.
+
+**Speed.** Node 26, runs per second, every method compiled at its first
+activation:
+
+| Benchmark | section 12 | step 1 | now | psoup wasm (Chrome, section 10) |
+|---|---:|---:|---:|---:|
+| SlotRead | 490 | 478 | 488 | 65.6 |
+| SlotWrite | 373 | 364 | 381 | 42.1 |
+| NLRLoop | 259 | 269 | 293 | 166 |
+| MethodFibonacci | 86.7 | 106 | 193 | 69.4 |
+| ClosureFibonacci | 61.2 | 67.1 | 75.4 | 55.8 |
+| Richards | 185 | 209 | 286 | 153 |
+| DeltaBlue | 175 | 194 | 243 | 136 |
+| Splay | 226 | 220 | 268 | 240 |
+| NLRImmediate | 623 | 612 | 686 | 787 |
+| ClosureDefFibonacci | 30.5 | 32.6 | 35.7 | 33.4 |
+| ParserCombinators | 10.5 | 10.9 | 12.2 | 14.9 |
+
+Every benchmark but NLRImmediate and ParserCombinators now beats psoup.
+
+**The interpreter pays a little.** Finding a frame's code through its
+method costs the native interpreter about 2 to 3% (DeltaBlue 101.7 against
+98.9, ClosureFibonacci 37.8 against 36.6, the committed build and this one
+alternating on the same image; Splay within noise). Recovering it would
+take caching the code table's index in the frame, renumbered at every
+collection.
+
+**What is left.** Closure frames are still pushed in Rust
+(`direct_closure`), and closure creation is a runtime call that makes an
+activation for the defining frame. The allocation natives (`new:`,
+`basicNew`), Float arithmetic and comparisons, and `valueWithArguments:`
+still take the general path. Then the top of the operand stack in wasm
+locals, and recording with compilation on.
 

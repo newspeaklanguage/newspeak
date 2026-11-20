@@ -7,6 +7,7 @@ done, with the first of stage 3's inline caches (section 10). Stage 3, sends
 without the general path (section 11), done; more inline caches (section
 12), done; frames compiled code pushes and pops itself (section 13),
 done; outer sends, non-local returns and closure calls (section 14),
+done; natives through `call` and in-place arrays (section 15),
 uncommitted.
 **Context:** `EURASIA_PERFORMANCE_2026-11-19.md` (the interpreter is about
 1.7x behind psoup; sections 6 to 12 say interpreter tuning has run its
@@ -672,4 +673,55 @@ are made by `step`. The allocation natives (`new:`, `basicNew`), Float
 arithmetic and comparisons, and `valueWithArguments:` take the general
 send. Then the top of the operand stack in wasm locals, recording with
 compilation on, and a Chrome measurement.
+
+## 15. Natives through `call`; arrays filled in place
+
+After section 14, the general sends left in ParserCombinators (counted, as
+before, with temporary counters since removed) were natives with no inline
+form: per run, 5.9M `new:`, 1.45M each of `valueWithArguments:` and
+`numArgs`, 1.1M `basicNew`. Each went through `compiled_send`'s lookup-cache
+probe and the selector's decoding. `Heap::push` was 5% of the profile:
+`new:` and `PUSH_NEW_ARRAY` built the array's elements in a temporary
+vector, then copied them into the arena.
+
+**What changed.**
+- **Native targets.** A native with no inline form, sent to the receiver
+  itself (ordinary, or self or implicit to the frame's), now gets a method
+  target whose function is `NATIVE_FUNCTION`. A site's hit goes to `call`,
+  which runs the native as the general send would (`activate_with`, then
+  the checks after a call). Compiled code pushes no frame for it.
+- **Arrays filled in place.** `new:` (Array and WeakArray) and
+  `PUSH_NEW_ARRAY` allocate their nils straight into the arena
+  (`Heap::allocate_array_of`), as `basicNew` already did. That helps the
+  interpreter too.
+
+After this, a ParserCombinators run makes a few thousand general sends.
+
+**Correctness.** The gates of section 11 pass.
+
+**Speed.** Node 26, runs per second, every method compiled at its first
+activation:
+
+| Benchmark | section 14 | now | psoup wasm (Chrome, section 10) |
+|---|---:|---:|---:|
+| SlotRead | 485 | 480 | 65.6 |
+| SlotWrite | 378 | 373 | 42.1 |
+| NLRLoop | 444 | 465 | 166 |
+| MethodFibonacci | 194 | 183 | 69.4 |
+| ClosureFibonacci | 188 | 185 | 55.8 |
+| Richards | 294 | 295 | 153 |
+| DeltaBlue | 237 | 234 | 136 |
+| Splay | 248 to 271 | 277 to 289 | 240 |
+| NLRImmediate | 924 | 925 | 787 |
+| ClosureDefFibonacci | 47.9 | 47.8 | 33.4 |
+| ParserCombinators | 14.5 to 14.7 | 15.5 to 15.6 | 14.9 |
+
+Every benchmark beats psoup's Chrome figures. The native interpreter:
+ParserCombinators 7.3 to 7.9 (in-place arrays); the others as in section 13.
+
+**What is left.** The psoup comparison is against Chrome figures measured
+before this work, and these are Node's: a Chrome measurement of both is
+due. Then closure creation (an activation and a closure allocated through
+the runtime), allocation in wasm, Float arithmetic, and the top of the
+operand stack in wasm locals.
 

@@ -73,8 +73,12 @@ its anchor may lie in white space the view does not show. *)
 			content:: nil.
 			root:: domDocument createElement: 'div'.
 			root setAttribute: 'contenteditable' to: 'true'.
-			root setAttribute: 'style'
-				to: 'white-space: pre-wrap; outline: none; padding: 4px; min-height: 2em;'.
+			root setAttribute: 'style' to: frameStyle.
+			root addEventListener: 'mouseup'
+				action: [:event |
+					rememberFrameWidth.
+					nil
+				].
 			root addEventListener: 'beforeinput'
 				action: [:event |
 					event stopPropagation.
@@ -158,6 +162,31 @@ of its key (Section 7.11 of the specification), or nil. *)
 		elementAt: ss = (
 			| key = stepsString: ss. |
 			^root querySelector: '[data-steps="' , key , '"]'
+		)
+		frameMaxWidth = (
+			(* The widest the frame may be: what the document's page allows (and
+the frame's padding and border), or the space available. *)
+			
+			| w |
+			session tree isNil ifTrue: [ ^'100%' ].
+			w:: blocks pageMaxWidth: session tree state page.
+			w isNil ifTrue: [ ^'100%' ].
+			^'calc(' , w , ' + 12px)'
+		)
+		frameStyle = (
+			(* The live view's frame: a blue border the reader stretches or
+shrinks (its bottom right corner), at most as wide as the page allows, and
+as high as the reader likes. The size the reader gives it is the session's,
+so an image (a Eurasia snapshot) keeps it, but a document opened afresh
+fills the width available and is as high as its content. *)
+			
+			^'white-space: pre-wrap; outline: none; padding: 4px; min-height: 2em; border: 2px solid #4a7bd0; resize: both; overflow: auto; box-sizing: border-box; min-width: 12em; max-width: ' , frameMaxWidth , ';' , (session frameWidth isNil ifTrue: [
+					''
+				]
+				ifFalse: [ ' width: ' , session frameWidth , ';' ]) , (session frameHeight isNil ifTrue: [
+					''
+				]
+				ifFalse: [ ' height: ' , session frameHeight , ';' ])
 		)
 		handle: event = (
 			(* An input event: its edit, applied. The browser gives the range
@@ -385,12 +414,32 @@ misspelled one. *)
 			^pointAt: parent
 				offset: (indexOf: node in: parent) + (o > 0 ifTrue: [ 1 ] ifFalse: [ 0 ])
 		)
+		quoted: p = (
+			(* p as a string literal. *)
+			
+			| out = List new. |
+			out add: 39.
+			(emmanuel codePointsOf: p) do: [:c |
+					out add: c.
+					c = 39 ifTrue: [ out add: 39 ]
+				].
+			out add: 39.
+			^emmanuel stringOfCodePoints: out asArray
+		)
 		rangeTypes = (
 			(* The input events whose edit covers the range the browser gives
 (getTargetRanges), not the selection. Typing it is for a spelling
 correction; the rest delete. *)
 			
 			^{'insertReplacementText'. 'deleteWordBackward'. 'deleteWordForward'. 'deleteSoftLineBackward'. 'deleteSoftLineForward'. 'deleteEntireSoftLine'. 'deleteHardLineBackward'. 'deleteHardLineForward'. 'deleteByDrag'. }
+		)
+		rememberFrameWidth = (
+			(* The reader resized the frame: the session keeps its width and
+height. *)
+			
+			| w = (root at: #style) at: #width. h = (root at: #style) at: #height. |
+			(w isNil or: [ w isEmpty ]) ifFalse: [ session frameWidth: w ].
+			(h isNil or: [ h isEmpty ]) ifFalse: [ session frameHeight: h ]
 		)
 		render = (
 			(* Render the session's tree in place of the previous rendering. *)
@@ -409,7 +458,8 @@ correction; the rest delete. *)
 			session failed ifTrue: [ visual setAttribute: 'style' to: 'opacity: 0.5;' ].
 			content isNil ifTrue: [ root appendChild: visual ]
 				ifFalse: [ root replaceChild: visual with: content ].
-			content:: visual
+			content:: visual.
+			(root at: #style) at: #maxWidth put: frameMaxWidth
 		)
 		renderUnparsable = (
 			(* A source that has never interpreted has no tree to show: its text
@@ -440,6 +490,22 @@ tree that did is shown, dimmed, and typing in it does nothing. *)
 			
 			session reinterpret: (emmanuel codePointsOf: w).
 			hasVisual ifTrue: [ render ]
+		)
+		public sourceWithPage: p = (
+			(* The source with its page: statement set to p: the statement that
+set the page rewritten, or, when there is none, one added at the start. *)
+			
+			| w = session source. lit = emmanuel codePointsOf: 'page: ' , (quoted: p). s |
+			session tree isNil ifTrue: [ ^nil ].
+			s:: session tree messages detect: [:m |
+					m isComment not and: [ m selector = 'page:' ]
+				]
+				ifNone: [ nil ].
+			s isNil ifTrue: [
+					^emmanuel stringOfCodePoints: (emmanuel codePointsOf: '[\') , lit , (emmanuel codePointsOf: '\]') , w
+				].
+			^emmanuel stringOfCodePoints: (w copyFrom: 1 to: s span start) , lit , (w copyFrom: s span end + 1
+					to: w size)
 		)
 		stepsOf: element = (
 			| s = dataAttribute: 'data-steps' of: element. |
@@ -520,12 +586,15 @@ interpreted, when the source does not), and the caret of the last edit. *)
 			public source ::= emmanuel codePointsOf: w.
 			public host = hosts Host evaluator: ev.
 			public amplets = blocks AmpletRunner evaluator: ev.
+			private evaluator = ev.
 			public nodes
 			public tree
 			public failed ::= false.
 			public caret
 			public timings ::= ''.
 			public changeHandler ::= nil.
+			public frameWidth ::= nil.
+			public frameHeight ::= nil.
 		|
 		interpret.
 	) (
@@ -600,7 +669,7 @@ view never goes dead under the user's hands. *)
 			| doc = edits document: image
 				name: 'doc'
 				hostState: nil
-				root: blocks DocumentRoot new
+				root: rootBlock
 				host: host. |
 			doc isNil ifTrue: [
 					failed:: true.
@@ -629,7 +698,7 @@ interpret. *)
 			reparsed:: incremental reparse: nodes old: old new: w name: 'doc' host: host.
 			reparsed isNil ifTrue: [ ^interpret ].
 			done:: (emmanuel Machine host: host) interpret: reparsed
-				root: blocks DocumentRoot new
+				root: rootBlock
 				hostState: nil.
 			done isKindOfDone ifFalse: [
 					failed:: true.
@@ -637,6 +706,14 @@ interpret. *)
 				].
 			nodes:: reparsed.
 			tree:: done tree
+		)
+		rootBlock = (
+			(* The root block to interpret with: the document's stylesheet's, as
+its evaluator gives it (nil, the default, when there is none). *)
+			
+			| r = blocks DocumentRoot new. |
+			evaluator isNil ifFalse: [ r stylesheet: evaluator stylesheet ].
+			^r
 		)
 		public sourceString = (
 			^emmanuel stringOfCodePoints: source

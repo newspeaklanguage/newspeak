@@ -289,6 +289,49 @@ console.log(`${scenarios.length - failures}/${scenarios.length} scenarios passed
   console.log(`viewer: renders the document ${ok ? "yes" : "NO"}; control (source as HTML) caught ${controlOk ? "NO" : "yes"}`);
 }
 
+// Templates and pages. A paper (the core stylesheet) has no underline:
+// Cmd-U does nothing there, while Cmd-B still works. The page limits the
+// frame (the live view's border), and setting it rewrites the one page:
+// statement; the width the reader gives the frame is the session's.
+{
+  await js(`emmanuelLoadPaper(${JSON.stringify(DOC)})`);
+  await js("selectText('world')");
+  await key("CmdU");
+  const paperU = await source();
+  await js("selectText('world')");
+  await key("CmdB");
+  const paperB = await source();
+  const paperOk = paperU === DOC && paperB === DOC.replace("world", "[\\strong\\]world[\\endStrong\\]");
+  await js(`emmanuelLoad(${JSON.stringify(DOC)})`);
+  const before = await js("document.body.firstChild.style.maxWidth");
+  await js("emmanuelSetPage('letter')");
+  const letter = await source();
+  const frame = await js("document.body.firstChild.style.maxWidth");
+  const sheet = await js("getComputedStyle(document.body.querySelector('article')).maxWidth");
+  await js("emmanuelSetPage('a4')");
+  const a4 = await source();
+  const pageOk = before === "100%" && letter === "[\\page: 'letter'\\]" + DOC && frame.includes("828px")
+    && sheet === "816px" && a4 === "[\\page: 'a4'\\]" + DOC;
+  const resize = await js("getComputedStyle(document.body.firstChild).resize");
+  await js("(() => { const r = document.body.firstChild; r.style.width = '300px'; r.style.height = '400px'; r.dispatchEvent(new MouseEvent('mouseup', { bubbles: true })); })()");
+  await js("caretAt('Second', 6)");
+  await type("Z");
+  await js("emmanuelFrameWidth(0)");
+  const kept = await js("emmanuelFrame");
+  const keptHigh = await js("emmanuelFrameHeight");
+  const widthOk = resize === "both" && kept === "300px" && (await js("document.body.firstChild.style.width")) === "300px"
+    && keptHigh === "400px" && (await js("document.body.firstChild.style.height")) === "400px";
+  // A slide in the editor: zoomed to the frame, never past its 1080 pixels;
+  // a long one grows past its 675.
+  await js(`emmanuelLoad(${JSON.stringify("[\\page: 'slide'\\]" + "[\\paragraph\\]Line[\\endParagraph\\]".repeat(30))})`);
+  await sleep(1500);
+  const slide = await js("(() => { const a = document.body.querySelector('article'); return a.dataset.scale + ' ' + a.clientHeight + ' ' + document.body.firstChild.style.maxWidth; })()");
+  const [zoom, high, slideMax] = slide.split(" ");
+  const slideOk = Number(zoom) > 0 && Number(zoom) <= 1 && Number(high) > 675 && slide.includes("calc(1092px)");
+  if (!paperOk || !pageOk || !widthOk || !slideOk) failures++;
+  console.log(`paper has no underline ${paperOk ? "yes" : "NO"}; page ${pageOk ? "yes" : "NO"}; frame size kept ${widthOk ? "yes" : "NO"}; slide zoomed, never past 1, and long ${slideOk ? "yes" : "NO"}\n     paper ${JSON.stringify(paperU)} ${JSON.stringify(paperB)}\n     page: before ${before}, frame ${frame}, sheet ${sheet}\n     ${JSON.stringify(letter)}\n     ${JSON.stringify(a4)}\n     frame resize ${resize}, size ${kept} x ${keptHigh}\n     slide zoom, height, frame max: ${slide}`);
+}
+
 // Cut, copy, and paste, through the browser's own clipboard commands (as
 // Cmd-X, Cmd-C, Cmd-V do): what is cut leaves the source, and what is
 // pasted enters it.

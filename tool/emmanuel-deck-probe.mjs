@@ -71,6 +71,43 @@ if (toggle) {
   await sleep(3000);
   console.log("TOGGLE " + r);
 }
+if (process.env.SURVEY) {
+  // Every slide in turn: whether its content is taller than the canvas
+  // (the slide grows past it) or wider (what is cut off).
+  const fit = `(() => { const a = [...document.querySelectorAll('article')].find((e) => e.dataset.scale);
+    return a ? a.scrollHeight + 'x' + a.scrollWidth + ' of ' + parseInt(getComputedStyle(a).minHeight) + 'x' + a.clientWidth + ' box ' + a.clientHeight : 'no slide'; })()`;
+  let last = null;
+  for (let k = 0; k < 400; k++) {
+    const n = await slide();
+    if (n === last) break;
+    last = n;
+    console.log("FIT " + n + " " + await js(fit));
+    await js(`(() => { const bs = [...document.querySelectorAll('button, a, div, span')].filter(e => e.innerText && e.innerText.trim() === 'Next');
+      const b = bs[bs.length - 1]; if (b) for (const t of ['mousedown', 'mouseup', 'click']) b.dispatchEvent(new MouseEvent(t, { bubbles: true })); })()`);
+    await sleep(1500);
+  }
+  process.exit(0);
+}
+if (process.env.NEWSLIDE) {
+  // Add a slide (the presenter's new-slide button, the first button after
+  // its "Slide n" label): it is made from the presentation's master slide.
+  console.log("SLIDE " + await slide());
+  const r = await js(`(() => { const label = [...document.querySelectorAll('*')].find((e) => e.children.length === 0 && /^Slide \\d+$/.test(e.textContent.trim()));
+    if (!label) return 'no label';
+    const all = [...document.querySelectorAll('img, button')];
+    const b = all.find((e) => label.compareDocumentPosition(e) & Node.DOCUMENT_POSITION_FOLLOWING);
+    if (!b) return 'no button';
+    for (const t of ['mousedown', 'mouseup', 'click']) b.dispatchEvent(new MouseEvent(t, { bubbles: true }));
+    return 'clicked'; })()`);
+  await sleep(4000);
+  console.log("NEW " + r);
+  console.log("SLIDE " + await slide());
+  console.log("BACKGROUND " + await js(`[...document.querySelectorAll('article')].map((a) => getComputedStyle(a).backgroundImage).filter((b) => b !== 'none').join(' ') || 'none'`));
+  console.log("SHOWN " + JSON.stringify(await js(`(() => { const a = [...document.querySelectorAll('article')].find((e) => e.dataset.scale); return a ? a.innerText.trim() + ' / ' + getComputedStyle(a).fontSize : 'no slide; articles ' + document.querySelectorAll('article').length + '; page ' + document.body.innerText.replace(/\s+/g, ' ').slice(-400); })()`)));
+  const errors = consoleLines.filter((l) => l.startsWith("EXCEPTION"));
+  if (errors.length) console.log(errors.join("\n"));
+  process.exit(0);
+}
 console.log("SLIDE " + await slide());
 for (let k = 0; k < 3; k++) {
   await js(`(() => { const bs = [...document.querySelectorAll('button, a, div, span')].filter(e => e.innerText && e.innerText.trim() === 'Next');
@@ -80,6 +117,12 @@ for (let k = 0; k < 3; k++) {
 }
 // The slide shown is on its background image, if it has one.
 console.log("BACKGROUND " + await js(`[...document.querySelectorAll('article')].map((a) => getComputedStyle(a).backgroundImage).filter((b) => b !== 'none').join(' ') || 'none'`));
+// The slide shown: its size, its text's size, and whether its content
+// overflows it (how much is cut off).
+console.log("MEASURE " + await js(`[...document.querySelectorAll('article')].filter((a) => getComputedStyle(a).backgroundImage !== 'none' || a.style.aspectRatio || getComputedStyle(a).aspectRatio !== 'auto').map((a) => {
+  const r = a.getBoundingClientRect(); const p = a.querySelector('p'); const h = a.querySelector('h1, h2, header');
+  return 'box ' + Math.round(r.width) + 'x' + Math.round(r.height) + ' content ' + a.scrollHeight + ' scale ' + (a.dataset.scale || '1') + ' text ' + (p ? getComputedStyle(p).fontSize : '-') + ' title ' + (h ? getComputedStyle(h).fontSize : '-') + ' window ' + innerWidth + 'x' + innerHeight;
+}).join(' | ') || 'none'`));
 const errors = consoleLines.filter((l) => l.startsWith("EXCEPTION"));
 if (errors.length) console.log(errors.join("\n"));
 process.exit(0);

@@ -10,7 +10,10 @@ done; outer sends, non-local returns and closure calls (section 14),
 done; natives through `call` and in-place arrays (section 15),
 done; Chrome measured, activations and closures made in wasm (section
 16), done; allocation and number comparisons in wasm (section 17),
-uncommitted.
+done; two closure bodies per site, a second-level cache tried and
+dropped (section 18), and callbacks compiled, #doesNotUnderstand:
+cached (section 19), and alien sends cached, compiled methods named
+in profiles (section 20), uncommitted.
 **Context:** `EURASIA_PERFORMANCE_2026-11-19.md` (the interpreter is about
 1.7x behind psoup; sections 6 to 12 say interpreter tuning has run its
 course), the arena and nursery designs (objects addressable as base plus
@@ -856,4 +859,190 @@ The native interpreter is unchanged.
 through the runtime. Splay spends about a fifth of its time collecting.
 Then `valueWithArguments:`, the top of the operand stack in wasm locals,
 and a `br_table` for a site's kinds.
+
+## 18. Megamorphic sites: what worked and what did not
+
+After section 17, ParserCombinators spent 69% of its time in compiled
+code, and the rest mostly on sends that missed both of a site's entries:
+per run, 8.3M refills, 5.2M of them outer sends one level out. Those are
+megamorphic in the receiver's class: they inherit into many parser
+subclasses, though their target (the enclosing object's method) is one.
+DeltaBlue lost 6 to 7% in `direct_closure`: closure `value` sites seeing two
+closure bodies, whose frames were pushed in Rust.
+
+**Measuring.** Single runs mislead at the 5% level here: V8 compiles wasm
+first with its baseline compiler (Liftoff) and tiers up to TurboFan on its
+own schedule, which made DeltaBlue and Richards bimodal (Richards 280 or
+350 for the same build). The comparisons below are A/B builds with
+`node --no-liftoff`, five runs each.
+
+**Two closure bodies per site (kept).** The cache's fill put a send of the
+same class in the first entry, so two closure bodies at one site thrashed
+it. Now the first entry is refilled only for the same class *and* slot
+(for every kind but closures, the same class gives the same slot in an
+epoch). A second body goes to the second entry, and a closure send tries
+both entries' targets before the general send (which refills). `call` no
+longer takes closure targets. DeltaBlue 265 to 287 (+8.5%),
+ParserCombinators +3%, ClosureFibonacci unchanged.
+
+**Constants published on entry only (kept).** The classes, the actor's
+space and the meta words compiled code allocates with change only at a
+collection (after which compiled code does not go on) or between turns.
+`jit_publish_constants` publishes them when the host enters compiled
+code, not after every runtime call.
+
+**A second-level cache (dropped).** A VM-wide table in wasm memory, 4096
+entries keyed by receiver class and site (the method's compile serial and
+the site's first global), probed when both inline entries miss and
+written at every fill, by two helper functions in each module (multi-value
+returns). Misses fell from 8.3M to about 2K per ParserCombinators run, and
+ParserCombinators gained 7 to 10%. But:
+- Without refilling the inline entries from a hit, sites stuck with stale
+  classes probed forever (DeltaBlue: 7.5M probes). With a refill (the hit
+  into the first entry), sites cycling through three or more classes
+  (Richards) churned.
+- The code at every site cost DeltaBlue about 5% and Richards about 3% even
+  with the probe's answer ignored; with the helpers emitted only in modules
+  that used them, DeltaBlue still lost 2.6%.
+- Limited to outer-send sites: ParserCombinators +4.5%, Richards +2%,
+  DeltaBlue -2.6%. Not worth a second cache. Caching the target's index in
+  the lookup cache entry (to save a map lookup per refill) changed nothing
+  measurable either.
+
+Both patches are kept in the session's scratch area, not the repository.
+Outer sends' real fix would key their cache by the enclosing object (what
+the target depends on) rather than the receiver's class.
+
+**Correctness.** The gates of section 11 pass.
+
+**Speed.** Runs per second, every method compiled at its first activation:
+
+| Benchmark | Node, section 17 | Node, now | Chrome, now | psoup (Chrome) | Chrome / psoup |
+|---|---:|---:|---:|---:|---:|
+| SlotRead | 487 | 491 | 437 | 66.0 | 6.6 |
+| SlotWrite | 361 | 355 | 331 | 42.2 | 7.8 |
+| NLRLoop | 564 | 597 | 484 | 168 | 2.9 |
+| MethodFibonacci | 203 | 201 | 194 | 70.3 | 2.8 |
+| ClosureFibonacci | 191 | 193 | 178 | 56.4 | 3.2 |
+| Richards | 360 | 360 | 320 | 154 | 2.1 |
+| DeltaBlue | 270 | 305 | 287 | 138 | 2.1 |
+| Splay | 353 to 380 | 395 | 390 | 235 | 1.66 |
+| NLRImmediate | 1240 | 1270 | 1174 | 796 | 1.47 |
+| ClosureDefFibonacci | 99 | 97 | 90 | 33.6 | 2.7 |
+| ParserCombinators | 18.4 to 18.8 | 20.2 | 18.7 | 15.1 | 1.24 |
+
+**What is left.** Outer sends keyed by their enclosing object. String `,`
+in wasm. Splay's collections (about a fifth of its time; the minor
+collection sorts its forwarding table). The top of the operand stack in
+wasm locals, and a `br_table` for a site's kinds.
+
+## 19. The IDE as the test case: typing in an Emmanuel document
+
+Gilad found the IDE on Eurasia (with `?jit`) usable, except that typing in
+a larger Emmanuel document (BitsOfHistoryWordsOfAdvice, 57 KB of source)
+was markedly slower than on psoup, despite the benchmarks.
+
+**The measurement.** `EmmanuelEditorProbeApp` (the editor in a page, with a
+stand-in evaluator) packaged for Eurasia as CounterApp is (a scratch entry
+naming its modules), and a driver over the DevTools protocol in headless
+Chrome: load the document, put the caret at the start of its first
+paragraph, type, and take the editor's own timings of the last keystroke
+(edit, interpret, caret, render) and the wall time until its source holds
+the key. Both VMs in one fresh Chrome (a long-running headless Chrome
+slowed both 2.5x after many page loads):
+
+| Per keystroke | psoup | Eurasia before | callbacks compiled | and DNU cached |
+|---|---:|---:|---:|---:|
+| edit | 4.0 ms | 14.4 ms | 1.4 ms | 1.3 ms |
+| interpret | 26.7 ms | 99 ms | 26.0 ms | 24.8 ms |
+| render | 13.2 ms | 46.8 ms | 23.1 ms | 17.4 ms |
+| wall (the driver's, polling included) | 205 ms | 832 ms | 191 ms | 183 ms |
+
+**Compiled code never ran while typing.** With `?jit` and without, the
+same times: a keystroke reaches the VM as a callback from a DOM event, and
+a callback ran by `step`, one instruction at a time; compiled code is
+entered by returning `Completion::Compiled` to the host's trampoline,
+which a callback (running to completion inside the host's call) does not
+have. Now a callback with no turn under it (an event while the VM is idle)
+runs as a turn does: the event loop's safepoint and interrupt checks, the
+fast loop (`run_simple`), and compiled code through a new host operation,
+`Host::run_compiled`, which the web host implements as its trampoline
+does. A callback inside a turn still steps, so as not to run past its own
+frames. The JS FFI and callback tests give the same outcomes compiled and
+compiled under GC stress, and the full editor probe (31 scenarios, 1229
+link edits, the raw view, the viewer, paper and slides, cut and paste)
+passes on Eurasia compiled as on psoup.
+
+**#doesNotUnderstand: was never cached.** Counting the lookup-cache misses
+over the load and 20 keystrokes: 258K, nearly all not-understood sends,
+of two kinds: predicates answered false by not being understood
+(`isKindOfRaised` 49K, `isKindOfFailure` 18K, `isKindOfString` 11K,
+`isKindOfFinalNode` 8K), and the DOM through aliens (`setAttribute:to:`
+35K, `isDead` 35K, `appendChild:` 14K, `createElement:` 11K). Each walked
+the class chain three times, comparing selector strings at every method
+(`resolve`, `ordinary_send_uncached`, then the search for
+#doesNotUnderstand:). Now an ordinary send that finds no method is cached
+too: the entry holds the #doesNotUnderstand: method the receiver's class
+answers, and a hit sends it the message directly. Every program change
+flushes the cache, as for found methods. Compiled code's caches and the
+fast loop's probe treat such an entry as a miss and leave it to `send`.
+
+**What is left here.** Render is still about 30% slower than psoup's: the
+DOM, through aliens, each a #doesNotUnderstand: that allocates a message
+and goes through the alien's handler to a host operation. A cache kind for
+alien sends (straight to the host operation) is the next thing to try,
+then sends inside a turn's callbacks (still stepped). The benchmarks are
+unchanged: ParserCombinators 20.8 and DeltaBlue 313 runs per second
+under Node.
+
+## 20. Alien sends cached; compiled methods named in profiles
+
+**Alien sends.** A message a host object (an Alien) does not understand
+goes to the host: `Alien>>doesNotUnderstand:` (the kernel's) answers
+false for `isKindOf…`, handles `isDead` and `new` itself, and otherwise
+sends `perform: name withArguments: arguments`, the name being the
+selector's first keyword, cut from it with `indexOf:` and `copyFrom:to:`
+(a new String each time). With section 19 the not-understood send was
+cached, but every call still allocated a message, ran that method and
+made the name. Now, when the receiver's class is the Alien class, the
+lookup cache's not-understood entry records what the method would do
+(`AlienSend`): answer false, or call `perform:withArguments:` (its
+method, native and failure included, as the target) with the name made
+once when the entry is filled. A hit builds the arguments Array and
+activates `perform:withArguments:` directly. `isDead` and `new` still run
+the method. The difference from running the method: no
+`doesNotUnderstand:` frame in a backtrace.
+
+Typing in BitsOfHistoryWordsOfAdvice (section 19's measurement): render
+17.2 to 16.4 ms, interpret unchanged. Rendering's remaining cost is not
+the alien protocol. Benchmarks (which send no aliens): ParserCombinators
+16.6 to 17.6 under `--no-liftoff` (five runs each; the send path's code
+changed), DeltaBlue within the noise (264 to 286 in both builds).
+
+**Compiled methods named, on request.** With names on
+(`Vm::set_jit_names`: `EURASIA_JIT_NAMES=1` under Node, `?names` on
+`index.html` and `ide.html`), each compiled module gets a `name` section
+naming its function `Mixin>>selector`, so a CPU profile shows compiled
+methods by name rather than one `wasm-function[8]`. It is off by default:
+in an A/B (`--no-liftoff`, five runs) DeltaBlue may have been a few
+percent slower with names, within the noise but not worth risking for a
+diagnostic. Typing, by method:
+`List>>add:` 6.4%, `_Array>>do:` 4.2%, `Emmanuel>>fastTokens:from:to:` 3.4%,
+`Host>>parse:` 3.3%, `ByteArray class>>withAll:` 2.6%,
+`StringBuilder>>add:` 2.1%, `Emmanuel>>encodeCodePoint:on:` 1.8%,
+`True>>and:` 1.4%; the VM's own functions are a few percent each. Typing
+is now mostly ordinary Newspeak (collections, string building) in
+compiled code: the code compiled code is made of, not the runtime, is
+what is left (the top of the operand stack in wasm locals; inlining).
+
+**Tried and dropped: a laxer write barrier inline.** `at:put:`, setters
+and indirect stores run inline only into a young or remembered object.
+Storing a SmallInteger or an old reference into an old object needs no
+barrier either, so the check can allow it. Correct (the kernel tests pass
+under GC stress) but no measurable gain on typing (the lists are young),
+for more code at every store: not kept.
+
+**Correctness.** The gates of section 11 pass; the JS FFI and callback
+tests give the same outcomes interpreted, compiled, and compiled under GC
+stress.
 

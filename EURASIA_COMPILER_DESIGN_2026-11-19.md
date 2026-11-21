@@ -8,7 +8,8 @@ without the general path (section 11), done; more inline caches (section
 12), done; frames compiled code pushes and pops itself (section 13),
 done; outer sends, non-local returns and closure calls (section 14),
 done; natives through `call` and in-place arrays (section 15),
-uncommitted.
+done; Chrome measured, activations and closures made in wasm (section
+16), uncommitted.
 **Context:** `EURASIA_PERFORMANCE_2026-11-19.md` (the interpreter is about
 1.7x behind psoup; sections 6 to 12 say interpreter tuning has run its
 course), the arena and nursery designs (objects addressable as base plus
@@ -724,4 +725,79 @@ before this work, and these are Node's: a Chrome measurement of both is
 due. Then closure creation (an activation and a closure allocated through
 the runtime), allocation in wasm, Float arithmetic, and the top of the
 operand stack in wasm locals.
+
+## 16. Chrome against psoup; closures and their activations in wasm
+
+**Chrome, both VMs.** One Chrome session (the browser pane), psoup's wasm
+build (`primordialsoup.html?snapshot=BenchmarkRunner.vfuel`, served from
+`out/`) and Eurasia's (`index.html?snapshot=bench.eus&jit=1`), after
+section 15. psoup's figures match section 10's to within 2%:
+
+| Benchmark | psoup | Eurasia (section 15) | ratio |
+|---|---:|---:|---:|
+| SlotRead | 66.0 | 438 | 6.6 |
+| SlotWrite | 42.2 | 356 | 8.4 |
+| ClosureFibonacci | 56.4 | 167 | 3.0 |
+| MethodFibonacci | 70.3 | 192 | 2.7 |
+| NLRLoop | 168 | 443 | 2.6 |
+| Richards | 154 | 282 | 1.8 |
+| DeltaBlue | 138 | 230 | 1.7 |
+| Splay | 235 | 290 | 1.2 |
+| ClosureDefFibonacci | 33.6 | 45.6 | 1.36 |
+| NLRImmediate | 796 | 894 | 1.12 |
+| ParserCombinators | 15.1 | 15.4 | 1.02 |
+
+The closest three make closures. In ClosureDefFibonacci, about 45% of the
+time was making them: the defining frame's activation handle allocated
+through the generic `Heap::push`, the closure through the runtime's
+`closure`, and every frame with a handle returned through Rust.
+
+**What changed.**
+- **Frames with an activation handle pop in wasm.** The pop marks the
+  handle dead (its frame field SmallInteger -1: a plain store, no write
+  barrier), as `retire` does.
+- **Activation handles allocated directly** (`Heap::allocate_live_activation`),
+  not through a `Body` description: for the interpreter too.
+- **Closures made in wasm.** Compiled code allocates in the arena, as it
+  pushes frames: the VM publishes the arena's length and room, the next
+  sequence number (the allocation counter) and the count at which a
+  safepoint is due, the Closure and Activation classes, and the two meta
+  words for the current actor's space. At every call into the VM, the host
+  adopts the arena's length (`set_len`, as for the stack and the frames),
+  and the VM the sequence numbers and the objects allocated. A
+  `PUSH_CLOSURE` makes, in wasm, the frame's activation handle if it has
+  none, then the closure with its copied values, when there is room and
+  the sequence numbers stay below the safepoint (so no safepoint comes
+  due); otherwise the runtime's `closure`, which allocates and may make the
+  safepoint due, as before. Objects compiled code makes are young (past
+  the nursery's boundary), so no barrier.
+- **`jit_publish` reserves frames only when the room is short.**
+
+**Correctness.** The gates of section 11 pass, the compiled kernel tests
+under GC stress included (with allocation in wasm, the case that matters).
+
+**Speed.** Runs per second, every method compiled at its first activation:
+
+| Benchmark | Node, section 15 | Node, now | Chrome, now | psoup (Chrome) |
+|---|---:|---:|---:|---:|
+| SlotRead | 480 | 490 | 443 | 66.0 |
+| SlotWrite | 373 | 381 | 359 | 42.2 |
+| NLRLoop | 465 | 528 | 457 | 168 |
+| MethodFibonacci | 183 | 180 | 193 | 70.3 |
+| ClosureFibonacci | 185 | 182 | 171 | 56.4 |
+| Richards | 295 | 352 | 323 | 154 |
+| DeltaBlue | 234 | 259 | 239 | 138 |
+| Splay | 277 to 289 | 314 | 279 | 235 |
+| NLRImmediate | 925 | 1235 | 1179 | 796 |
+| ClosureDefFibonacci | 47.8 | 82 to 92 | 87 | 33.6 |
+| ParserCombinators | 15.6 | 17.2 to 17.8 | 16.7 | 15.1 |
+
+In Chrome, every benchmark beats psoup: ParserCombinators by 11%, Splay by
+19%, NLRImmediate by 48%, the rest by 1.6x to 8.5x. The native interpreter
+is unchanged.
+
+**What is left.** Allocation in wasm covers closures and their handles
+only: `basicNew`, `new:` and `PUSH_NEW_ARRAY` could use it. Float
+arithmetic boxes through the runtime. Then the top of the operand stack in
+wasm locals, and recording with compilation on.
 

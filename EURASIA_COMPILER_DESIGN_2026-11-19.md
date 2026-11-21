@@ -9,7 +9,8 @@ without the general path (section 11), done; more inline caches (section
 done; outer sends, non-local returns and closure calls (section 14),
 done; natives through `call` and in-place arrays (section 15),
 done; Chrome measured, activations and closures made in wasm (section
-16), uncommitted.
+16), done; allocation and number comparisons in wasm (section 17),
+uncommitted.
 **Context:** `EURASIA_PERFORMANCE_2026-11-19.md` (the interpreter is about
 1.7x behind psoup; sections 6 to 12 say interpreter tuning has run its
 course), the arena and nursery designs (objects addressable as base plus
@@ -800,4 +801,59 @@ is unchanged.
 only: `basicNew`, `new:` and `PUSH_NEW_ARRAY` could use it. Float
 arithmetic boxes through the runtime. Then the top of the operand stack in
 wasm locals, and recording with compilation on.
+
+## 17. `basicNew`, `new:` and number comparisons in wasm
+
+After section 16, the natives `call` ran most were, per Splay run, 5.9M
+`basicNew`, 5.5M string `,`, 3.3M `<` and 2.5M `>` (Float keys) and 2.8M
+`new:`; per ParserCombinators run, 7.1M `new:` and 1.3M `basicNew`.
+
+**What changed.**
+- **`basicNew` and Array `new:` allocate in wasm** (`IC_BASIC_NEW`,
+  `IC_NEW_ARRAY`), with the arena of section 16. The entry holds the meta
+  word without the space (the current actor's, published as
+  `Regs::space`, is or-ed in) and, for `basicNew`, the slot count. Which
+  classes `basicNew` makes Regular objects of, and with which flags (a
+  value class's instances are values), is one function,
+  `natives::basic_new_regular`, so the cache makes what the native would.
+  `new:` makes in wasm only Arrays of SmallInteger size 0 to 2^16, within
+  the room and below the safepoint, as closures do.
+- **Number comparisons in wasm** (`IC_LT`, `IC_GT`, `IC_LE`, `IC_GE`) for
+  `Number`'s comparison natives when the receiver is a SmallInteger or a
+  Float. They run when the argument is one too: two SmallIntegers are
+  compared exactly (as tagged words); otherwise both as f64s
+  (`f64.convert_i64_s`, the Float's bits), as the native does, NaN
+  comparing false. Anything else takes the general send.
+- **The kinds a site tests, reordered.** A site tests its entry's kind one
+  after another; with the comparisons, one-argument sites test eight
+  binary kinds before a method's. That cost Richards 3% (an A/B of two
+  builds, three runs each). Now a site tests the accessor, then the
+  closure and method kinds (the most common), then the rest, with the
+  binary kinds behind one range test. In the same A/B: DeltaBlue 2.5%
+  faster than without the comparisons, Richards 1%, Splay 23%.
+
+**Correctness.** The gates of section 11 pass.
+
+**Speed.** Runs per second, every method compiled at its first activation:
+
+| Benchmark | Node, section 16 | Node, now | Chrome, now | psoup (Chrome) | Chrome / psoup |
+|---|---:|---:|---:|---:|---:|
+| SlotRead | 490 | 487 | 434 | 66.0 | 6.6 |
+| SlotWrite | 381 | 361 | 340 | 42.2 | 8.1 |
+| NLRLoop | 528 | 564 | 450 | 168 | 2.7 |
+| MethodFibonacci | 180 | 203 | 197 | 70.3 | 2.8 |
+| ClosureFibonacci | 182 | 191 | 178 | 56.4 | 3.2 |
+| Richards | 352 | 360 | 307 | 154 | 2.0 |
+| DeltaBlue | 259 | 270 | 251 | 138 | 1.8 |
+| Splay | 314 | 353 to 380 | 365 | 235 | 1.55 |
+| NLRImmediate | 1235 | 1240 | 1162 | 796 | 1.46 |
+| ClosureDefFibonacci | 82 to 92 | 99 | 90 | 33.6 | 2.7 |
+| ParserCombinators | 17.2 to 17.8 | 18.4 to 18.8 | 17.8 | 15.1 | 1.18 |
+
+The native interpreter is unchanged.
+
+**What is left.** String `,` (Splay: 7M) allocates in the byte space
+through the runtime. Splay spends about a fifth of its time collecting.
+Then `valueWithArguments:`, the top of the operand stack in wasm locals,
+and a `br_table` for a site's kinds.
 

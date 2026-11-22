@@ -379,6 +379,24 @@ console.log(`${scenarios.length - failures}/${scenarios.length} scenarios passed
   console.log(`delete a word ${wordOk ? "yes" : "NO"}, spelling correction ${spellOk ? "yes" : "NO"}\n     after word ${JSON.stringify(afterWord)}\n     after correction ${JSON.stringify(afterSpell)}`);
 }
 
+// A source that does not lex shows, above the dimmed view, what is wrong and
+// where, with the line it is on; one that interprets again shows nothing.
+{
+  const problem = `(() => { const box = [...document.body.firstChild.children].find((e) => e.tagName === 'DIV' && e.getAttribute('contenteditable') === 'false');
+    return box && box.style.display !== 'none' ? box.textContent : ''; })()`;
+  const shown = async (src) => { await js(`emmanuelSetSource(${JSON.stringify(src)})`); return await js(problem); };
+  await js(`emmanuelLoad(${JSON.stringify(DOC)})`);
+  const stray = await shown("[\\paragraph\\]a\\]b[\\endParagraph\\]");
+  const literal = await shown("[\\paragraph\\]a[\\amplet: [ 'x ]\\]b[\\endParagraph\\]");
+  const bracket = await shown("[\\paragraph\\]a\n[\\emphasis");
+  const fine = await shown(DOC);
+  const ok = stray.startsWith("Lexical error at line 1, column 15: this \\] closes no bracket.")
+    && literal.includes("a string or comment begins here and is never closed")
+    && bracket.startsWith("Lexical error at line 2, column 1: this [\\ is never closed.") && fine === "";
+  if (!ok) failures++;
+  console.log(`lexical errors described ${ok ? "yes" : "NO"}\n     ${JSON.stringify(stray)}\n     ${JSON.stringify(literal)}\n     ${JSON.stringify(bracket)}\n     after a fix: ${JSON.stringify(fine)}`);
+}
+
 // The new styles render as their HTML elements, and a background as the
 // document's background image, in the viewer and in the editor. The control
 // renders the source as HTML and must be caught.

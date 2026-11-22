@@ -54,6 +54,7 @@ session's tree. *)
 			root
 			content
 			typed
+			problemBox
 		|
 	) (
 		caretFor: pt = (
@@ -96,6 +97,10 @@ its anchor may lie in white space the view does not show. *)
 						]
 				].
 			root appendChild: styleSheet.
+			problemBox:: domDocument createElement: 'div'.
+			problemBox setAttribute: 'contenteditable' to: 'false'.
+			problemBox setAttribute: 'style' to: 'display: none;'.
+			root appendChild: problemBox.
 			root addEventListener: 'click'
 				action: [:event |
 					[ handleClick: event ] on: Error
@@ -459,7 +464,8 @@ height. *)
 			content isNil ifTrue: [ root appendChild: visual ]
 				ifFalse: [ root replaceChild: visual with: content ].
 			content:: visual.
-			(root at: #style) at: #maxWidth put: frameMaxWidth
+			(root at: #style) at: #maxWidth put: frameMaxWidth.
+			showProblem
 		)
 		renderUnparsable = (
 			(* A source that has never interpreted has no tree to show: its text
@@ -470,7 +476,8 @@ is shown, dimmed, until it does. *)
 			visual at: #textContent put: session sourceString.
 			content isNil ifTrue: [ root appendChild: visual ]
 				ifFalse: [ root replaceChild: visual with: content ].
-			content:: visual
+			content:: visual.
+			showProblem
 		)
 		public replaceSelectionWith: items after: afterItems = (
 			(* Replace the selection with items, the caret after them and before
@@ -482,6 +489,21 @@ afterItems; for commands, such as a toolbar's. *)
 		)
 		public selectedText = (
 			^domDocument getSelection toString
+		)
+		showProblem = (
+			(* Above the view, what is wrong with a source that does not
+interpret (its lexical or syntax error, where, and the line it is on), while
+the view, dimmed, shows the last one that did; nothing when it interprets. *)
+			
+			| p = session problem. |
+			problemBox isNil ifTrue: [ ^self ].
+			p isNil ifTrue: [
+					problemBox at: #textContent put: ''.
+					^problemBox setAttribute: 'style' to: 'display: none;'
+				].
+			problemBox setAttribute: 'style'
+				to: 'color: #8b0000; background-color: #fff0f0; border: 1px solid #e0a0a0; border-radius: 3px; padding: 4px 8px; margin: 0 0 6px 0; font: 12px ui-monospace, Menlo, monospace; white-space: pre; overflow-x: auto;'.
+			problemBox at: #textContent put: p
 		)
 		public source: w = (
 			(* Make the string w the source, as when the raw view changes it: it
@@ -595,6 +617,7 @@ interpreted, when the source does not), and the caret of the last edit. *)
 			public changeHandler ::= nil.
 			public frameWidth ::= nil.
 			public frameHeight ::= nil.
+			public problem ::= nil.
 		|
 		interpret.
 	) (
@@ -645,6 +668,7 @@ view never goes dead under the user's hands. *)
 					nodes:: oldNodes.
 					tree:: oldTree.
 					failed:: false.
+					problem:: nil.
 					Error signal: 'an edit that would leave the source uninterpretable was refused'
 				].
 			changeHandler isNil ifFalse: [ changeHandler value: sourceString ].
@@ -662,6 +686,48 @@ view never goes dead under the user's hands. *)
 			timings:: timings , ', caret ' , (clock now - t2) printString.
 			^caret
 		)
+		describeProblemOf: w = (
+			(* What is wrong with the source w, which does not interpret, for the
+reader: its lexical or syntax error, where, and the line it is on; or what
+an argument raised. *)
+			
+			| parsed = emmanuel parse: 'doc' source: w host: host. done |
+			parsed isKindOfLexFail ifTrue: [ ^lexProblem: parsed error in: w ].
+			parsed isKindOfSyntaxError ifTrue: [
+					^'Syntax error ' , (placeOf: parsed span start in: w) , '.' , (excerptOf: w
+						at: parsed span start)
+				].
+			(parsed isNil or: [ parsed isKindOfParsed not ]) ifTrue: [
+					^'The source could not be parsed.'
+				].
+			done:: (emmanuel Machine host: host) interpret: parsed nodes
+				root: rootBlock
+				hostState: nil.
+			done isKindOfRaised ifTrue: [
+					^'An argument raised an error: ' , (emmanuel termStringOf: done exception)
+				].
+			^'The source could not be interpreted.'
+		)
+		excerptOf: w at: p = (
+			(* The line of w that position p is on (at most 60 characters either
+side of it), and under it a mark at p. *)
+			
+			| start ::= p. stop ::= p + 1. from to line marks = List new. |
+			[ start > 0 and: [ ((w at: start) = 10) not ] ] whileTrue: [
+					start:: start - 1
+				].
+			[ stop <= w size and: [ ((w at: stop) = 10) not ] ] whileTrue: [
+					stop:: stop + 1
+				].
+			from:: start + 1 max: p + 1 - 60.
+			to:: stop - 1 min: p + 60.
+			line:: (w copyFrom: from to: to) collect: [:c |
+					c = 9 ifTrue: [ 32 ] ifFalse: [ c ]
+				].
+			p + 1 - from timesRepeat: [ marks add: 32 ].
+			marks add: 94.
+			^emmanuel stringOfCodePoints: {10. } , line asArray , {10. } , marks asArray
+		)
 		image = (
 			^{{'doc'. source. }. }
 		)
@@ -673,11 +739,30 @@ view never goes dead under the user's hands. *)
 				host: host. |
 			doc isNil ifTrue: [
 					failed:: true.
+					problem:: problemOf: source.
 					^self
 				].
 			failed:: false.
+			problem:: nil.
 			nodes:: doc at: 1.
 			tree:: doc at: 2
+		)
+		lexProblem: e in: w = (
+			(* The reader's description of the lexical error e of the source w. *)
+			
+			| p ::= e position. |
+			e kind = #strayClose ifTrue: [
+					^'Lexical error ' , (placeOf: p in: w) , ': this \] closes no bracket.' , (excerptOf: w
+						at: p)
+				].
+			e kind = #unclosedLiteral ifTrue: [
+					^'Lexical error ' , (placeOf: p in: w) , ': a string or comment begins here and is never closed.' , (excerptOf: w
+						at: p)
+				].
+			p:: unclosedOpenerIn: w.
+			p isNil ifTrue: [ ^'Lexical error: a bracket is never closed.' ].
+			^'Lexical error ' , (placeOf: p in: w) , ': this [\ is never closed.' , (excerptOf: w
+				at: p)
 		)
 		markupSteps: e = (
 			(* The path to the markup an edit is in: its point's path, up to the
@@ -686,6 +771,27 @@ last field it enters. *)
 			| ss = e first point steps. k ::= 0. |
 			ss keysAndValuesDo: [:i :s | s isField ifTrue: [ k:: i ] ].
 			^ss copyFrom: 1 to: k
+		)
+		placeOf: p in: w = (
+			(* Where position p of w is: its line and column, from 1. *)
+			
+			| line ::= 1. column ::= 1. |
+			1 to: (p min: w size)
+				do: [:k |
+					(w at: k) = 10 ifTrue: [
+							line:: line + 1.
+							column:: 1
+						]
+						ifFalse: [ column:: column + 1 ]
+				].
+			^'at line ' , line printString , ', column ' , column printString
+		)
+		problemOf: w = (
+			(* What is wrong with the source w, for the reader; describing it
+must never stop the source being interpreted. *)
+			
+			^[ describeProblemOf: w ] on: Error
+				do: [:e | 'The source does not interpret.' ]
 		)
 		public reinterpret: w = (
 			(* Make w the source: reparse only what the edit damaged
@@ -702,8 +808,10 @@ interpret. *)
 				hostState: nil.
 			done isKindOfDone ifFalse: [
 					failed:: true.
+					problem:: problemOf: source.
 					^self
 				].
+			problem:: nil.
 			nodes:: reparsed.
 			tree:: done tree
 		)
@@ -717,6 +825,27 @@ its evaluator gives it (nil, the default, when there is none). *)
 		)
 		public sourceString = (
 			^emmanuel stringOfCodePoints: source
+		)
+		unclosedOpenerIn: w = (
+			(* The position of the innermost bracket of w that is never closed,
+matching openers and closers as they come; nil when there is none. *)
+			
+			| open = List new. k ::= 1. |
+			[ k < w size ] whileTrue: [
+					((w at: k) = 91 and: [ (w at: k + 1) = 92 ]) ifTrue: [
+							open add: k - 1.
+							k:: k + 2
+						]
+						ifFalse: [
+							((w at: k) = 92 and: [ (w at: k + 1) = 93 ]) ifTrue: [
+									open isEmpty ifFalse: [ open removeLast ].
+									k:: k + 2
+								]
+								ifFalse: [ k:: k + 1 ]
+						]
+				].
+			open isEmpty ifTrue: [ ^nil ].
+			^open last
 		)
 	) : ()
 	public class ViewFragment session: s = Fragment new (

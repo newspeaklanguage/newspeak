@@ -5,11 +5,11 @@ class EurasiaPackager packageUsing: manifest = (
 
 Usage:
 	EurasiaPackager <module.ns> <EntryClassName> <output.eus>                (first light, M1b)
-	EurasiaPackager <kernel.ns> <natives.tsv> <application.ns> <output.eus>  (genesis)
+	EurasiaPackager [--entry-in-kernel] <kernel.ns> <natives.tsv> <application.ns> <output.eus>  (genesis)
 
 M1b (first light) builds classes statically: the module's nested classes become the image's classes, each with the superclass named in its header (no superclass clause means Object, and Object itself has none). The module is instantiated without running its initializer: its slots are nil except the cached nested-class slots, which hold the classes built here, so nested-class accessors answer them. The entry object is an uninitialized instance of the named nested class. Methods listed in the natives table become native methods of the kernel catalog; their source bodies are ignored. How a module-structured kernel is instantiated on Eurasia (running initializers) is open.
 
-Genesis (EURASIA_GENESIS_KERNEL_PLAN_2026-11-17.md) builds the same way from the kernel fork (platform/Eurasia/InternalKernel.ns): _Object is the root and the default superclass, every metaclass's superclass is Class, natives come from the eurasia repository's kernel/natives.tsv, and the packager fills the kernel module's slots (the nested classes, the VM mirror, the on:do: and ensure: methods, the symbol table, and the application). The application module is packaged as if nested in the kernel, so its code sees kernel classes lexically. The image's entry is the kernel module, whose main:args: is the genesis entry.
+Genesis (EURASIA_GENESIS_KERNEL_PLAN_2026-11-17.md) builds the same way from the kernel fork (platform/Eurasia/InternalKernel.ns): _Object is the root and the default superclass, every metaclass's superclass is Class, natives come from the eurasia repository's kernel/natives.tsv, and the packager fills the kernel module's slots (the nested classes, the VM mirror, the on:do: and ensure: methods, the symbol table, and the application). The application module (the entry) is a top-level class the kernel refers to; with --entry-in-kernel it is nested in the kernel instead, so that a test or probe of the kernel sees its members lexically. The image's entry is the kernel module, whose main:args: is the genesis entry.
 
 The native ids and role ids must match eurasia-core's natives.rs and roles.rs. *)
 	
@@ -23,6 +23,9 @@ The native ids and role ids must match eurasia-core's natives.rs and roles.rs. *
 		private foreign ::= false.
 		private allMixinPairs
 		private rootName ::= 'Object'.
+		private compiledSources
+		private entryNestedInKernel ::= false.
+		private keepingSources ::= true.
 	|
 ) (
 	class Image usingPlatform: platform = (
@@ -168,17 +171,20 @@ The native ids and role ids must match eurasia-core's natives.rs and roles.rs. *
 		List:: platform collections List.
 		Map:: platform collections Map.
 		compiler:: (compilationUsingPlatform: platform) Compiler new.
-		kernel:: compiler compileClassSource: kernelSource within: nil.
+		nil = compiledSources ifTrue: [ compiledSources:: Map new ].
+		kernel:: compiledSources at: kernelSource
+			ifAbsentPut: [ compiler compileClassSource: kernelSource within: nil ].
 		app:: compiler compileClassSource: appSource within: nil.
 		modules:: moduleSources collect: [:source |
-				[
-					compiler compileClassSource: (withoutPrimitivePragmas: source) within: nil
-				] on: Exception
-					do: [:e |
-						
-						(* Name the module that does not compile; the compiler's own message does not. *)
-						Error signal: 'Compiling ' , (source copyFrom: 1
-								to: (source size min: 120)) , ' ... : ' , e messageText
+				compiledSources at: source
+					ifAbsentPut: [
+						[ compiler compileClassSource: (withoutPrimitives: source) within: nil ] on: Exception
+							do: [:e |
+								
+								(* Name the module that does not compile; the compiler's own message does not. *)
+								Error signal: 'Compiling ' , (source copyFrom: 1
+										to: (source size min: 120)) , ' ... : ' , e messageText
+							]
 					]
 			].
 		image:: Image usingPlatform: platform.
@@ -195,7 +201,13 @@ The native ids and role ids must match eurasia-core's natives.rs and roles.rs. *
 		mixins at: kernel simpleName put: kTree.
 		1 to: kNested size
 			do: [:i | mixins at: (kNested at: i) simpleName put: ((kTree at: 3) at: i) ].
-		aTree:: mixinTreeFor: app enclosing: kTree image: image platform: platform.
+		
+		(* The entry is a top-level class, as the modules are: nothing of it is nested in the kernel, which only refers to it (slot application), and genesis hands it the kernel as platformOver:'s argument (EURASIA_BUILD_AND_DEPLOY_DESIGN_2026-11-21.md, section 2.1). Only when the packager is asked explicitly (--entry-in-kernel: entryNestedInKernel), for a test or probe of the kernel itself that must reach the kernel's members (vm) lexically, is the entry nested in the kernel. Either way the entry's nested classes take their superclasses from the kernel's classes by name, so the names must not clash. *)
+		aTree:: mixinTreeFor: app
+			enclosing: (entryNestedInKernel ifTrue: [ kTree ]
+				ifFalse: [ {image nilNode. image nilNode. } ])
+			image: image
+			platform: platform.
 		(mixins includesKey: app simpleName) ifTrue: [
 				^Error signal: 'The application ' , app simpleName , ' has the name of a kernel class'
 			].
@@ -267,10 +279,12 @@ The native ids and role ids must match eurasia-core's natives.rs and roles.rs. *
 		kNested do: [:icd |
 				setEnclosingObjectOf: (classes at: icd simpleName) to: kernelInstance
 			].
+		entryNestedInKernel ifTrue: [
+				setEnclosingObjectOf: appClass to: kernelInstance
+			].
 		aNested do: [:icd |
 				setEnclosingObjectOf: (classes at: icd simpleName) to: appInstance
 			].
-		setEnclosingObjectOf: appClass to: kernelInstance.
 		image nilNode klass: (classes at: 'UndefinedObject').
 		markValues: (List new addAll: classes values;
 				add: kernelClass;
@@ -299,6 +313,11 @@ The native ids and role ids must match eurasia-core's natives.rs and roles.rs. *
 				(hasSlot: key in: app) ifTrue: [
 						setSlot: key of: appInstance declaration: app to: (moduleClasses at: i)
 					]
+			].
+		
+		(* An entry's slot InternalKernel (manifest Eurasia InternalKernel, for an IDE on Eurasia) holds the image's own kernel class. *)
+		(hasSlot: 'InternalKernel' in: app) ifTrue: [
+				setSlot: 'InternalKernel' of: appInstance declaration: app to: kernelClass
 			].
 		(hasSlot: 'testCatalog' in: app) ifTrue: [
 				setSlot: 'testCatalog'
@@ -369,6 +388,25 @@ The native ids and role ids must match eurasia-core's natives.rs and roles.rs. *
 				nil = n klass ifTrue: [ n klass: image nilNode ]
 			].
 		^serialize: image roles: roles
+	)
+	public buildGenesisFromKernel: kernelSource natives: nativeRows app: appSource modules: modulePaths sources: moduleSources keepSources: keep <Boolean> platform: platform = (
+		(* For EurasiaBuild, which packages several applications with one packager: the genesis image of the application appSource over the kernel, with the modules (their paths, for their platforms, and their sources). The natives come from the catalog module (EurasiaNatives table: class, side, selector, native name, native id), taken once. A kernel or module source already compiled for an earlier application is not compiled again (compiledSources): building an image reads the compiled declarations and does not change them. The entry, appSource, is compiled each time. *)
+		
+		nil = natives ifTrue: [
+				natives:: platform collections Map new.
+				nativeRows do: [:row |
+						natives at: ((row at: 2) = 'class' ifTrue: [ (row at: 1) , ' class' ]
+								ifFalse: [ row at: 1 ]) , '|' , (row at: 3)
+							put: (row at: 5)
+					]
+			].
+		entryNestedInKernel:: false.
+		keepingSources:: keep.
+		^buildGenesisFrom: kernelSource
+			app: appSource
+			modules: moduleSources
+			prefixes: (modulePaths collect: [:path | foreignPlatformOf: path ])
+			platform: platform
 	)
 	buildSnapshotFrom: source entry: entryName platform: platform = (
 		| List Map compiler module image nested classesByName mixins metaclassClass objectClass moduleClass moduleInstance entryClass roles commonSelectors vmMirrorInstance |
@@ -471,6 +509,47 @@ The native ids and role ids must match eurasia-core's natives.rs and roles.rs. *
 			].
 		^serialize: image roles: roles
 	)
+	carriesPrimitivePragma: source <String> ^<Boolean> = (
+		(* Whether source has a psoup primitive pragma: a comment, outside string literals, that begins :literalmessage: primitive:. Text that only mentions one, in a string (a test's input, generated psoup source), is not one. *)
+		
+		| marker i n |
+		marker:: ' :literalmessage: primitive: '.
+		(source indexOf: marker startingAt: 1) = 0 ifTrue: [ ^false ].
+		n:: source size.
+		i:: 1.
+		[ i <= n ] whileTrue: [
+				| c = source at: i. |
+				c = 39 ifTrue: [
+						
+						(* A string literal: to its closing quote; a doubled quote is part of it. *)
+						i:: i + 1.
+						[
+							i <= n and: [
+									((source at: i) = 39 and: [
+											i = n or: [ ((source at: i + 1) = 39) not ]
+										]) not
+								]
+						] whileTrue: [
+								i:: (source at: i) = 39 ifTrue: [ i + 2 ] ifFalse: [ i + 1 ]
+							].
+						i:: i + 1
+					]
+					ifFalse: [
+						(c = 40 and: [ i < n and: [ (source at: i + 1) = 42 ] ]) ifTrue: [
+								
+								(* A comment: a pragma if it begins with the marker; else skipped to its end. *)
+								(source copyFrom: i + 2 to: (i + 1 + marker size min: n)) = marker ifTrue: [
+										^true
+									].
+								i:: source indexOf: '*' , ')' startingAt: i + 2.
+								i = 0 ifTrue: [ ^false ].
+								i:: i + 2
+							]
+							ifFalse: [ i:: i + 1 ]
+					]
+			].
+		^false
+	)
 	commonSelectorsCheckedWith: compiler = (
 		(* The V5 common-selector table (opcodes 176-207, in order), as in eurasia-core's bytecode.rs. It is checked against the compiler: one method sending each selector must compile to exactly the opcodes 176-207 in order, so a compiler whose table differs fails packaging instead of producing an image whose sends dispatch wrongly. *)
 		
@@ -549,8 +628,7 @@ The native ids and role ids must match eurasia-core's natives.rs and roles.rs. *
 		
 		| compiler icd dump |
 		compiler:: (compilationUsingPlatform: platform) Compiler new.
-		icd:: compiler compileClassSource: (withoutPrimitivePragmas: source)
-			within: nil.
+		icd:: compiler compileClassSource: (withoutPrimitives: source) within: nil.
 		dump:: nil.
 		dump:: [:decl |
 			{decl instanceSide. decl classSide. } do: [:side |
@@ -684,8 +762,15 @@ The native ids and role ids must match eurasia-core's natives.rs and roles.rs. *
 			].
 		^Error signal: 'Unsupported literal: ' , lit printString
 	)
-	public main: platform args: args = (
-		| bytes output |
+	public main: platform args: commandLine = (
+		(* --entry-in-kernel, first, nests a genesis entry in the kernel (buildGenesisFrom:...): a grant of the kernel's internals, for the kernel's own tests and probes, which name it explicitly. *)
+		
+		| args bytes output |
+		args:: commandLine.
+		(args size > 0 and: [ (args at: 1) = '--entry-in-kernel' ]) ifTrue: [
+				entryNestedInKernel:: true.
+				args:: args copyFrom: 2 to: args size
+			].
 		(args size = 3 and: [ (args at: 1) = '--dump' ]) ifTrue: [
 				^dumpMethod: (args at: 3)
 					in: (String withAll: (readFileAsBytes: (args at: 2)))
@@ -707,7 +792,7 @@ The native ids and role ids must match eurasia-core's natives.rs and roles.rs. *
 			ifFalse: [
 				args size < 3 ifTrue: [
 						'Usage: EurasiaPackager <module.ns> <EntryClassName> <output.eus>' out.
-						'   or: EurasiaPackager <kernel.ns> <natives.tsv> <application.ns> [<module.ns> ...] <output.eus>' out.
+						'   or: EurasiaPackager [--entry-in-kernel] <kernel.ns> <natives.tsv> <application.ns> [<module.ns> ...] <output.eus>' out.
 						^nil
 					].
 				output:: args at: 3.
@@ -887,7 +972,10 @@ The native ids and role ids must match eurasia-core's natives.rs and roles.rs. *
 						ifFalse: [ icd factoryName ]). nil = icd headerSource ifTrue: [
 						image nilNode
 					]
-					ifFalse: [ image string: icd headerSource ]. }
+					ifFalse: [
+						keepingSources ifTrue: [ image string: icd headerSource ]
+							ifFalse: [ image nilNode ]
+					]. }
 				space: #program).
 		^{own at: 1. own at: 2. children. }
 	)
@@ -908,6 +996,19 @@ The native ids and role ids must match eurasia-core's natives.rs and roles.rs. *
 				]).
 		^instance
 	)
+	moduleNameOf: source <String> ^<String> = (
+		(* The name of the class source declares: the word after its first 'class '. *)
+		
+		| start stop |
+		start:: source indexOf: 'class ' startingAt: 1.
+		start = 0 ifTrue: [ ^'' ].
+		start:: start + 6.
+		stop:: start.
+		[ stop <= source size and: [ (isSpace: (source at: stop)) not ] ] whileTrue: [
+				stop:: stop + 1
+			].
+		^source copyFrom: start to: stop - 1
+	)
 	moduleSuperclassOf: icd classes: classes = (
 		(* A top-level module's superclass: a kernel class its header names (such as Value, which makes the module a value class), else the root. A module whose header names another module (NewspeakCompilation's names NewspeakASTs) is built on the root, as psoup's runtimes build it: whoever uses it applies its mixin to the real superclass with mixinApply:. *)
 		
@@ -916,7 +1017,7 @@ The native ids and role ids must match eurasia-core's natives.rs and roles.rs. *
 		^classes at: name ifAbsent: [ classes at: rootName ]
 	)
 	nativeIdFor: className selector: selector = (
-		(* The catalog ids of eurasia-core's natives.rs, kernel version 1. *)
+		(* The catalog ids of eurasia-core's natives.rs, kernel version 2. *)
 		
 		| table |
 		foreign ifTrue: [ ^0 ].
@@ -1007,9 +1108,9 @@ The native ids and role ids must match eurasia-core's natives.rs and roles.rs. *
 			byte: 82;
 			byte: 65.
 		
-		(* Format version 7, kernel version 1, bytecode version 1. *)
-		w u16: 7.
-		w u16: 1.
+		(* Format version 8, kernel version 2, bytecode version 1. *)
+		w u16: 8.
+		w u16: 2.
 		w u16: 1.
 		w byte: 64.
 		w byte: 0.
@@ -1045,17 +1146,21 @@ The native ids and role ids must match eurasia-core's natives.rs and roles.rs. *
 	)
 	sourceNodeOf: m image: image = (
 		| node |
+		
+		(* Without sources (keepingSources false: the platform's keepsSources), a method has none, and a lazy slot's metadata has a nil source. *)
 		m isLazySlotMethod ifFalse: [
-				(m isSynthetic or: [ m source isKindOfString not ]) ifTrue: [
-						^image nilNode
-					].
+				((m isSynthetic or: [ m source isKindOfString not ]) or: [
+						keepingSources not
+					]) ifTrue: [ ^image nilNode ].
 				^image string: m source
 			].
 		
 		(* As psoup's compiler does (IntermediateMethod compiledMethod), every lazy-slot method gets metadata, whatever its source, so that the mirrors rebuild the lazy slot when its mixin is rebuilt: a regular object of the kernel's MethodMetadata class, whose slots are source (nil when there is none) and isLazy; its class is set once the classes exist. *)
 		node:: image newNode: #regular space: #program.
 		node payload: #methodMetadata.
-		node edges: {m source isKindOfString ifTrue: [ image string: m source ]
+		node edges: {(m source isKindOfString and: [ keepingSources ]) ifTrue: [
+					image string: m source
+				]
 				ifFalse: [ image nilNode ]. image trueNode. }.
 		^node
 	)
@@ -1105,19 +1210,13 @@ The native ids and role ids must match eurasia-core's natives.rs and roles.rs. *
 		first > last ifTrue: [ ^'' ].
 		^s copyFrom: first to: last
 	)
-	withoutPrimitivePragmas: source = (
-		(* psoup modules mark primitives with literal-message comments naming a primitive number, which the V5 compiler rejects. Eurasia's natives come from the natives table, by class and selector, so the pragmas are removed and the method bodies kept. *)
+	withoutPrimitives: source = (
+		(* source, refused if it carries a psoup primitive pragma: no module Eurasia runs carries a primitive (EURASIA_BUILD_AND_DEPLOY_DESIGN_2026-11-21.md, section 6). Eurasia's natives come from its natives table, by class and selector; a module psoup and Eurasia share that uses primitives has a Eurasia fork without them (eurasia/kernel/fork-apps.py, fork-mirrors.py). *)
 		
-		| result rest start stop marker |
-		marker:: '(' , '* :literalmessage: primitive: '.
-		result:: ''.
-		rest:: source.
-		[ (start:: rest indexOf: marker startingAt: 1) > 0 ] whileTrue: [
-				stop:: rest indexOf: '*' , ')' startingAt: start + marker size.
-				result:: result , (rest copyFrom: 1 to: start - 1).
-				rest:: rest copyFrom: stop + 2 to: rest size
+		(carriesPrimitivePragma: source) ifTrue: [
+				^Error signal: 'The module ' , (moduleNameOf: source) , ' carries psoup primitive pragmas; Eurasia runs only modules without them (package its Eurasia fork, in platform/Eurasia)'
 			].
-		^result , rest
+		^source
 	)
 	writeBytes: bytes toFileNamed: filename = (
 		(* :literalmessage: primitive: 128 *)

@@ -22,7 +22,8 @@ answers the editor, a fragment; its session holds the source.
 The presenters mark their rendering with each block's path (data-steps)
 and each child's index (data-item); the editor maps the browser's selection
 to points through them, and points back to the selection. Typing, deleting,
-Enter, Shift-Enter (a newline), bold and italic (Cmd-B, Cmd-I), and pasting
+Enter, Shift-Enter (a newline), the styles (Cmd-B, Cmd-I, Cmd-U, Cmd-Shift-X,
+Cmd-comma, Cmd-period), and pasting
 plain text are edits; anything else is ignored. The editor keeps its key and input
 events to itself, so that an editable page around it (an Ampleforth
 document's) does not see them. An edit the edit layer
@@ -53,67 +54,14 @@ session's tree. *)
 			root
 			content
 			typed
+			problemBox
 		|
 	) (
-		backspaceAt: c = (
-			(* The edit that deletes the character before a caret, or joins its
-block with the one before it. *)
+		public addMedia: file named: name = (
+			(* Add the file (a host File, or Blob) to the document's media, under
+name, as a dropped image is. *)
 			
-			| pt = c point. kids prev ss |
-			pt isGap ifFalse: [
-					^edits replace: (edits exact: (pt offset = 1 ifTrue: [
-									edits gap: pt steps at: pt child
-								]
-								ifFalse: [ edits in: pt steps at: pt child offset: pt offset - 1 ]))
-						to: c
-						items: {}
-						after: {}
-				].
-			pt child > 0 ifTrue: [
-					kids:: kidsAt: pt steps.
-					prev:: kids at: pt child.
-					prev kind = #run ifTrue: [
-							^edits replace: (edits exact: (prev chars size = 1 ifTrue: [
-											edits gap: pt steps at: pt child - 1
-										]
-										ifFalse: [
-											edits in: pt steps at: pt child - 1 offset: prev chars size - 1
-										]))
-								to: c
-								items: {}
-								after: {}
-						].
-					(isLeaf: prev) ifTrue: [ ^deleteChild: pt child - 1 at: pt steps caret: c ].
-					prev kind = #sub ifTrue: [
-							ss:: pt steps , {edits into: pt child - 1. }.
-							^backspaceAt: (edits exact: (edits gap: ss at: (kidsAt: ss) size))
-						].
-					^nil
-				].
-			ss:: pt steps.
-			[ ss isEmpty not and: [ ss last isField not and: [ ss last index = 0 ] ] ] whileTrue: [
-					ss:: ss copyFrom: 1 to: ss size - 1
-				].
-			(ss isEmpty or: [ ss last isField ]) ifTrue: [ ^nil ].
-			kids:: kidsAt: (ss copyFrom: 1 to: ss size - 1).
-			prev:: kids at: ss last index.
-			(isLeaf: prev) ifTrue: [
-					^deleteChild: ss last index - 1
-						at: (ss copyFrom: 1 to: ss size - 1)
-						caret: c
-				].
-			prev kind = #sub ifFalse: [
-					^
-					(* At the start of an inline block, such as a link, after text:
-the character before the block goes, as it would before any other caret
-there. Only a block before it is joined to. *)
-					backspaceAt: (edits exact: (edits gap: (ss copyFrom: 1 to: ss size - 1)
-								at: ss last index))
-				].
-			^edits backspace: markup
-				tree: session tree
-				steps: (ss copyFrom: 1 to: ss size - 1)
-				index: ss last index
+			session addMedia: file named: name
 		)
 		caretFor: pt = (
 			(* The caret at a point: the session's caret when it is there, since
@@ -126,14 +74,41 @@ its anchor may lie in white space the view does not show. *)
 		)
 		public childrenDo: action = (
 		)
+		commitStringField: element = (
+			(* The reader left a string field: its new text replaces the string
+(an edit #setString of the field of the block it is in), and the view is
+shown again; a string the edit cannot replace is shown as it was. *)
+			
+			| index = Integer parse: (element getAttribute: 'data-string-field')
+				radix: 10. steps = stepsIn: (element getAttribute: 'data-string-steps'). text = emmanuel codePointsOf: (element at: #textContent). e |
+			e:: edits Edit kind: #setString
+				caret: nil
+				caret: nil
+				items: nil
+				after: nil
+				level: nil
+				style: nil
+				steps: steps
+				index: index
+				chars: text.
+			(element at: #textContent) = (element getAttribute: 'data-string-shown') ifTrue: [
+					^self
+				].
+			[ session apply: e ] on: Error do: [:x | nil ].
+			render
+		)
 		createVisual = (
 			(* content is the rendering in the previous visual, if any: one made before the image was restored into a new host is dead. *)
 			
 			content:: nil.
 			root:: domDocument createElement: 'div'.
 			root setAttribute: 'contenteditable' to: 'true'.
-			root setAttribute: 'style'
-				to: 'white-space: pre-wrap; outline: none; padding: 4px; min-height: 2em;'.
+			root setAttribute: 'style' to: frameStyle.
+			root addEventListener: 'mouseup'
+				action: [:event |
+					rememberFrameWidth.
+					nil
+				].
 			root addEventListener: 'beforeinput'
 				action: [:event |
 					event stopPropagation.
@@ -151,6 +126,10 @@ its anchor may lie in white space the view does not show. *)
 						]
 				].
 			root appendChild: styleSheet.
+			problemBox:: domDocument createElement: 'div'.
+			problemBox setAttribute: 'contenteditable' to: 'false'.
+			problemBox setAttribute: 'style' to: 'display: none;'.
+			root appendChild: problemBox.
 			root addEventListener: 'click'
 				action: [:event |
 					[ handleClick: event ] on: Error
@@ -163,6 +142,16 @@ its anchor may lie in white space the view does not show. *)
 					(isOwn: event) ifTrue: [
 							[ handleKey: event ] on: Error
 								do: [:e | console log: 'Emmanuel editor: ' , e messageText printString ]
+						]
+						ifFalse: [ stringFieldKey: event ].
+					nil
+				].
+			root addEventListener: 'focusout'
+				action: [:event |
+					| t = event at: #target. |
+					(isStringField: t) ifTrue: [
+							[ commitStringField: t ] on: Error
+								do: [:e | console log: 'Emmanuel editor: ' , e messageText printString ]
 						].
 					nil
 				].
@@ -173,86 +162,21 @@ its anchor may lie in white space the view does not show. *)
 			(node at: #nodeType) = 1 ifFalse: [ ^nil ].
 			^node getAttribute: name
 		)
-		deleteChild: j at: ss caret: c = (
-			(* The edit that deletes the child j of the block at ss, a leaf. *)
-			
-			^edits replace: (edits exact: (edits gap: ss at: j))
-				to: (edits exact: (edits gap: ss at: j + 1))
-				items: {}
-				after: {}
-		)
-		deleteForwardAt: c = (
-			(* The edit that deletes the character after a caret, or joins the
-next block to its block. *)
-			
-			| pt = c point. kids next ss |
-			kids:: kidsAt: pt steps.
-			pt isGap ifFalse: [
-					next:: kids at: pt child + 1.
-					^edits replace: c
-						to: (edits exact: (pt offset + 1 = next chars size ifTrue: [
-									edits gap: pt steps at: pt child + 1
-								]
-								ifFalse: [ edits in: pt steps at: pt child offset: pt offset + 1 ]))
-						items: {}
-						after: {}
-				].
-			pt child < kids size ifTrue: [
-					next:: kids at: pt child + 1.
-					next kind = #run ifTrue: [
-							^edits replace: c
-								to: (edits exact: (next chars size = 1 ifTrue: [
-											edits gap: pt steps at: pt child + 1
-										]
-										ifFalse: [ edits in: pt steps at: pt child offset: 1 ]))
-								items: {}
-								after: {}
-						].
-					(isLeaf: next) ifTrue: [ ^deleteChild: pt child at: pt steps caret: c ].
-					next kind = #sub ifTrue: [
-							^deleteForwardAt: (edits exact: (edits gap: pt steps , {edits into: pt child. }
-										at: 0))
-						].
-					^nil
-				].
-			ss:: pt steps.
-			[
-				ss isEmpty not and: [
-						ss last isField not and: [
-								ss last index + 1 = (kidsAt: (ss copyFrom: 1 to: ss size - 1)) size
-							]
-					]
-			] whileTrue: [ ss:: ss copyFrom: 1 to: ss size - 1 ].
-			(ss isEmpty or: [ ss last isField ]) ifTrue: [ ^nil ].
-			kids:: kidsAt: (ss copyFrom: 1 to: ss size - 1).
-			next:: kids at: ss last index + 2.
-			(isLeaf: next) ifTrue: [
-					^deleteChild: ss last index + 1
-						at: (ss copyFrom: 1 to: ss size - 1)
-						caret: c
-				].
-			next kind = #sub ifFalse: [
-					^
-					(* At the end of an inline block, such as a link, before text: the
-character after the block goes. Only a block after it is joined. *)
-					deleteForwardAt: (edits exact: (edits gap: (ss copyFrom: 1 to: ss size - 1)
-								at: ss last index + 1))
-				].
-			^edits backspace: markup
-				tree: session tree
-				steps: (ss copyFrom: 1 to: ss size - 1)
-				index: ss last index + 1
-		)
 		edit: makeEdit = (
-			(* Apply the edit makeEdit makes from the selection (its start and
-end carets, and whether it is collapsed); then render again and place the
-caret. *)
+			(* Apply the edit makeEdit makes from the selection. *)
 			
-			| selection = domDocument getSelection. range a b collapsed e caret |
+			| selection = domDocument getSelection. |
+			(selection at: #rangeCount) = 0 ifTrue: [ ^self ].
+			edit: makeEdit range: (selection getRangeAt: 0)
+		)
+		edit: makeEdit range: range = (
+			(* Apply the edit makeEdit makes from a range of the DOM (its start
+and end carets, and whether it is collapsed); then render again and place
+the caret. *)
+			
+			| a b collapsed e caret |
 			typed:: nil.
 			session tree isNil ifTrue: [ ^self ].
-			(selection at: #rangeCount) = 0 ifTrue: [ ^self ].
-			range:: selection getRangeAt: 0.
 			collapsed:: range at: #collapsed.
 			((root contains: (range at: #startContainer)) and: [
 					root contains: (range at: #endContainer)
@@ -272,58 +196,71 @@ caret. *)
 			place: caret point
 		)
 		editFor: type event: event caret: a caret: b collapsed: collapsed = (
-			| text |
-			(type = 'insertText' or: [ type = 'insertReplacementText' ]) ifTrue: [
-					text:: event at: #data.
-					text isNil ifTrue: [ ^nil ].
-					^typing: text from: a to: b
-				].
-			type = 'insertFromPaste' ifTrue: [
-					^typing: ((event at: #dataTransfer) getData: 'text/plain') from: a to: b
-				].
-			type = 'insertParagraph' ifTrue: [
-					collapsed ifFalse: [ ^edits replace: a to: b items: {} after: {} ].
-					^edits enter: markup tree: session tree caret: a
-				].
-			type = 'insertLineBreak' ifTrue: [
-					^edits replace: a
-						to: b
-						items: {emmanuel Item text: nil
-							span: nil
-							statement: (blocks styleOpen: 'newline'). }
-						after: {}
-				].
-			type = 'deleteContentBackward' ifTrue: [
-					collapsed ifFalse: [ ^edits replace: a to: b items: {} after: {} ].
-					^backspaceAt: a
-				].
-			type = 'deleteContentForward' ifTrue: [
-					collapsed ifFalse: [ ^edits replace: a to: b items: {} after: {} ].
-					^deleteForwardAt: a
-				].
-			(type = 'deleteByCut' or: [ type = 'deleteContent' ]) ifTrue: [
-					^edits replace: a to: b items: {} after: {}
-				].
-			(type = 'formatBold' and: [ collapsed not ]) ifTrue: [
-					^styleFrom: a to: b style: 'strong'
-				].
-			(type = 'formatItalic' and: [ collapsed not ]) ifTrue: [
-					^styleFrom: a to: b style: 'emphasis'
-				].
-			^nil
+			(* The edit an input event makes at the selection from a to b: that
+of its key (Section 7.11 of the specification), or nil. *)
+			
+			| ky = keyFor: type event: event. |
+			ky isNil ifTrue: [ ^nil ].
+			^keyEdit: ky from: a to: b
 		)
 		elementAt: ss = (
 			| key = stepsString: ss. |
 			^root querySelector: '[data-steps="' , key , '"]'
 		)
-		handle: event = (
-			(* An input event: its edit, applied. *)
+		enableStringFields = (
+			(* The string fields of the view can be edited in place, as plain
+text: the document's own, not those of what an amplet shows. *)
 			
-			| type = event at: #inputType. |
-			event preventDefault.
-			edit: [:a :b :collapsed |
-					editFor: type event: event caret: a caret: b collapsed: collapsed
+			| fields = root querySelectorAll: '[data-string-field]'. |
+			0 to: (fields at: #length) - 1
+				do: [:i |
+					| f = fields item: i. |
+					(f closest: '[data-amplet]') isNil ifTrue: [
+							f setAttribute: 'contenteditable' to: 'plaintext-only'.
+							f setAttribute: 'data-string-shown' to: (f at: #textContent)
+						]
 				]
+		)
+		frameMaxWidth = (
+			(* The widest the frame may be: what the document's page allows (and
+the frame's padding and border), or the space available. *)
+			
+			| w |
+			session tree isNil ifTrue: [ ^'100%' ].
+			w:: blocks pageMaxWidth: session tree state page.
+			w isNil ifTrue: [ ^'100%' ].
+			^'calc(' , w , ' + 12px)'
+		)
+		frameStyle = (
+			(* The live view's frame: a blue border the reader stretches or
+shrinks (its bottom right corner), at most as wide as the page allows, and
+as high as the reader likes. The size the reader gives it is the session's,
+so an image (a Eurasia snapshot) keeps it, but a document opened afresh
+fills the width available and is as high as its content. *)
+			
+			^'white-space: pre-wrap; outline: none; padding: 4px; min-height: 2em; border: 2px solid #4a7bd0; resize: both; overflow: auto; box-sizing: border-box; min-width: 12em; max-width: ' , frameMaxWidth , ';' , (session frameWidth isNil ifTrue: [
+					''
+				]
+				ifFalse: [ ' width: ' , session frameWidth , ';' ]) , (session frameHeight isNil ifTrue: [
+					''
+				]
+				ifFalse: [ ' height: ' , session frameHeight , ';' ])
+		)
+		handle: event = (
+			(* An input event: its edit, applied. The browser gives the range
+some edits cover, which need not be the selection: a spelling correction's
+word, the word or line a deletion takes. *)
+			
+			| type = event at: #inputType. make ranges |
+			event preventDefault.
+			make:: [:a :b :collapsed |
+				editFor: type event: event caret: a caret: b collapsed: collapsed
+			].
+			(rangeTypes includes: type) ifFalse: [ ^edit: make ].
+			ranges:: event getTargetRanges.
+			(ranges at: #length) = 0 ifTrue: [ ^self ].
+			((ranges at: 0) at: #collapsed) ifTrue: [ ^self ].
+			edit: make range: (ranges at: 0)
 		)
 		handleClick: event = (
 			(* Cmd-click (Ctrl-click elsewhere) on a link opens its target. *)
@@ -336,16 +273,26 @@ caret. *)
 			window open: (anchor getAttribute: 'href') with: '_blank'
 		)
 		handleKey: event = (
-			(* Cmd-B and Cmd-I (Ctrl on other platforms) style the selection. *)
+			(* Cmd-B, Cmd-I, and Cmd-U (Ctrl on other platforms) style the
+selection strong, emphasis, and underline; Cmd-Shift-X strikethrough;
+Cmd-comma subscript and Cmd-period superscript. *)
 			
 			| key = event at: #key. style |
 			((event at: #metaKey) or: [ event at: #ctrlKey ]) ifFalse: [ ^self ].
-			key = 'b' ifTrue: [ style:: 'strong' ].
-			key = 'i' ifTrue: [ style:: 'emphasis' ].
+			(event at: #shiftKey) ifTrue: [
+					(key = 'x' or: [ key = 'X' ]) ifTrue: [ style:: 'strikethrough' ]
+				]
+				ifFalse: [
+					key = 'b' ifTrue: [ style:: 'strong' ].
+					key = 'i' ifTrue: [ style:: 'emphasis' ].
+					key = 'u' ifTrue: [ style:: 'underline' ].
+					key = ',' ifTrue: [ style:: 'subscript' ].
+					key = '.' ifTrue: [ style:: 'superscript' ]
+				].
 			style isNil ifTrue: [ ^self ].
 			event preventDefault.
 			edit: [:a :b :collapsed |
-					collapsed ifTrue: [ nil ] ifFalse: [ styleFrom: a to: b style: style ]
+					keyEdit: (edits Key kind: #style chars: nil style: style) from: a to: b
 				]
 		)
 		indexOf: node in: parent = (
@@ -357,27 +304,42 @@ one node are not ==. *)
 				do: [:i | ((kids at: i) isSameNode: node) ifTrue: [ ^i ] ].
 			^0
 		)
+		public insert: statements after: tree = (
+			(* Add the statements (source text, such as courseNamed: 'Course'
+description: '' wine: '') right after the statement that made tree, in the
+same bracket; the view and the raw view are shown again. For the
+affordances of templates' blocks. *)
+			
+			| w = session source. s = tree messages first. new |
+			new:: (w copyFrom: 1 to: s span end) , (emmanuel codePointsOf: '. ' , statements) , (w copyFrom: s span end + 1
+				to: w size).
+			session reinterpret: new.
+			session failed ifFalse: [
+					session changeHandler isNil ifFalse: [
+							session changeHandler value: session sourceString
+						]
+				].
+			render
+		)
 		public isKindOfEmmanuelEditorFragment = (
 			^true
-		)
-		isLeaf: g = (
-			(* Whether a child is a leaf block (an amplet, a newline): one the
-caret does not go into, which Backspace and Delete delete whole. *)
-			
-			^g kind = #sub and: [
-					g ref messages size = 1 and: [ g ref flag ~= #unclosed ]
-				]
 		)
 		isMyKind: other = (
 			^other isKindOfEmmanuelEditorFragment
 		)
 		isOwn: event = (
-			(* Whether an input or key event is the editor's: one whose target is
-the editor itself. An amplet is not editable in the editor, so an event
-whose target is in one is the amplet's own, a method presenter's code
-editor's say, and goes to it untouched. *)
+			(* Whether an input or key event is the editor's: one whose target
+lies in the editor's own editable content, as opposed to an amplet's. The
+target may be the editor or any element in it (Chrome targets a cut, a
+paste, or a spelling correction at the run's element), so the test is the
+nearest element that sets contenteditable: the editor itself, or an amplet
+(contenteditable false), whose events, a method presenter's code editor's
+say, go to it untouched. *)
 			
-			^(event at: #target) isSameNode: root
+			| target ::= event at: #target. |
+			(target at: #nodeType) = 1 ifFalse: [ target:: target at: #parentElement ].
+			target isNil ifTrue: [ ^false ].
+			^(target closest: '[contenteditable]') isSameNode: root
 		)
 		isRunElement: element = (
 			^(element at: #nodeType) = 1 and: [
@@ -386,6 +348,13 @@ editor's say, and goes to it untouched. *)
 									((element at: #childNodes) at: #length) = 1
 								]
 						]
+				]
+		)
+		isStringField: node = (
+			node isNil ifTrue: [ ^false ].
+			(node at: #nodeType) = 1 ifFalse: [ ^false ].
+			^(node hasAttribute: 'data-string-field') and: [
+					node hasAttribute: 'data-string-shown'
 				]
 		)
 		itemElementsOf: element = (
@@ -399,6 +368,52 @@ their index. *)
 					j isNil ifFalse: [ out add: {Integer parse: j radix: 10. k. } ]
 				].
 			^out asArray
+		)
+		keyEdit: ky from: a to: b = (
+			(* The edit the key ky makes at the selection from a to b, or nil:
+edits key:, with what it types kept for the view's spaces. *)
+			
+			ky kind = #type ifTrue: [ typed:: ky chars ].
+			^edits key: ky markup: markup tree: session tree caret: a caret: b
+		)
+		keyFor: type event: event = (
+			(* The key of the view an input event is, or nil. A cut deletes the
+selection, as Delete does, and so does a deletion of a word or a line over
+the range it covers; a spelling correction types its word over the
+misspelled one. *)
+			
+			| text |
+			(type = 'insertText' or: [ type = 'insertReplacementText' ]) ifTrue: [
+					text:: event at: #data.
+					(text isNil and: [ (event at: #dataTransfer) isNil not ]) ifTrue: [
+							
+							(* A spelling correction's word is in its data transfer. *)
+							text:: (event at: #dataTransfer) getData: 'text/plain'
+						].
+					text isNil ifTrue: [ ^nil ].
+					^edits Key kind: #type chars: (emmanuel codePointsOf: text) style: nil
+				].
+			type = 'insertFromPaste' ifTrue: [
+					^edits Key kind: #type
+						chars: (emmanuel codePointsOf: ((event at: #dataTransfer) getData: 'text/plain'))
+						style: nil
+				].
+			type = 'insertParagraph' ifTrue: [
+					^edits Key kind: #enter chars: nil style: nil
+				].
+			type = 'insertLineBreak' ifTrue: [
+					^edits Key kind: #newline chars: nil style: nil
+				].
+			type = 'deleteContentBackward' ifTrue: [
+					^edits Key kind: #backspace chars: nil style: nil
+				].
+			(({'deleteContentForward'. 'deleteByCut'. 'deleteContent'. } includes: type) or: [
+					rangeTypes includes: type
+				]) ifTrue: [ ^edits Key kind: #delete chars: nil style: nil ].
+			(styleOfFormat: type) isNil ifFalse: [
+					^edits Key kind: #style chars: nil style: (styleOfFormat: type)
+				].
+			^nil
 		)
 		kidsAt: ss = (
 			^(edits nav: markup tree: session tree steps: ss) block items
@@ -481,6 +496,33 @@ their index. *)
 			^pointAt: parent
 				offset: (indexOf: node in: parent) + (o > 0 ifTrue: [ 1 ] ifFalse: [ 0 ])
 		)
+		quoted: p = (
+			(* p as a string literal. *)
+			
+			| out = List new. |
+			out add: 39.
+			(emmanuel codePointsOf: p) do: [:c |
+					out add: c.
+					c = 39 ifTrue: [ out add: 39 ]
+				].
+			out add: 39.
+			^emmanuel stringOfCodePoints: out asArray
+		)
+		rangeTypes = (
+			(* The input events whose edit covers the range the browser gives
+(getTargetRanges), not the selection. Typing it is for a spelling
+correction; the rest delete. *)
+			
+			^{'insertReplacementText'. 'deleteWordBackward'. 'deleteWordForward'. 'deleteSoftLineBackward'. 'deleteSoftLineForward'. 'deleteEntireSoftLine'. 'deleteHardLineBackward'. 'deleteHardLineForward'. 'deleteByDrag'. }
+		)
+		rememberFrameWidth = (
+			(* The reader resized the frame: the session keeps its width and
+height. *)
+			
+			| w = (root at: #style) at: #width. h = (root at: #style) at: #height. |
+			(w isNil or: [ w isEmpty ]) ifFalse: [ session frameWidth: w ].
+			(h isNil or: [ h isEmpty ]) ifFalse: [ session frameHeight: h ]
+		)
 		render = (
 			(* Render the session's tree in place of the previous rendering. *)
 			
@@ -498,7 +540,10 @@ their index. *)
 			session failed ifTrue: [ visual setAttribute: 'style' to: 'opacity: 0.5;' ].
 			content isNil ifTrue: [ root appendChild: visual ]
 				ifFalse: [ root replaceChild: visual with: content ].
-			content:: visual
+			content:: visual.
+			(root at: #style) at: #maxWidth put: frameMaxWidth.
+			enableStringFields.
+			showProblem
 		)
 		renderUnparsable = (
 			(* A source that has never interpreted has no tree to show: its text
@@ -509,7 +554,8 @@ is shown, dimmed, until it does. *)
 			visual at: #textContent put: session sourceString.
 			content isNil ifTrue: [ root appendChild: visual ]
 				ifFalse: [ root replaceChild: visual with: content ].
-			content:: visual
+			content:: visual.
+			showProblem
 		)
 		public replaceSelectionWith: items after: afterItems = (
 			(* Replace the selection with items, the caret after them and before
@@ -522,6 +568,21 @@ afterItems; for commands, such as a toolbar's. *)
 		public selectedText = (
 			^domDocument getSelection toString
 		)
+		showProblem = (
+			(* Above the view, what is wrong with a source that does not
+interpret (its lexical or syntax error, where, and the line it is on), while
+the view, dimmed, shows the last one that did; nothing when it interprets. *)
+			
+			| p = session problem. |
+			problemBox isNil ifTrue: [ ^self ].
+			p isNil ifTrue: [
+					problemBox at: #textContent put: ''.
+					^problemBox setAttribute: 'style' to: 'display: none;'
+				].
+			problemBox setAttribute: 'style'
+				to: 'color: #8b0000; background-color: #fff0f0; border: 1px solid #e0a0a0; border-radius: 3px; padding: 4px 8px; margin: 0 0 6px 0; font: 12px ui-monospace, Menlo, monospace; white-space: pre; overflow-x: auto;'.
+			problemBox at: #textContent put: p
+		)
 		public source: w = (
 			(* Make the string w the source, as when the raw view changes it: it
 is reinterpreted, and shown again. While it does not interpret, the last
@@ -529,6 +590,33 @@ tree that did is shown, dimmed, and typing in it does nothing. *)
 			
 			session reinterpret: (emmanuel codePointsOf: w).
 			hasVisual ifTrue: [ render ]
+		)
+		public sourceWithPage: p = (
+			(* The source with its page: statement set to p: the statement that
+set the page rewritten, or, when there is none, one added at the start. *)
+			
+			| w = session source. lit = emmanuel codePointsOf: 'page: ' , (quoted: p). s |
+			session tree isNil ifTrue: [ ^nil ].
+			s:: session tree messages detect: [:m |
+					m isComment not and: [ m selector = 'page:' ]
+				]
+				ifNone: [ nil ].
+			s isNil ifTrue: [
+					^emmanuel stringOfCodePoints: (emmanuel codePointsOf: '[\') , lit , (emmanuel codePointsOf: '\]') , w
+				].
+			^emmanuel stringOfCodePoints: (w copyFrom: 1 to: s span start) , lit , (w copyFrom: s span end + 1
+					to: w size)
+		)
+		stepsIn: s = (
+			(* The steps the string s (as data-steps holds them) names. *)
+			
+			(s isNil or: [ s isEmpty ]) ifTrue: [ ^{} ].
+			^(words: s) collect: [:w |
+					| cps = emmanuel codePointsOf: w. j = Integer parse: (emmanuel stringOfCodePoints: (cps copyFrom: 2
+								to: cps size))
+						radix: 10. |
+					cps first = 102 ifTrue: [ edits fieldOf: j ] ifFalse: [ edits into: j ]
+				]
 		)
 		stepsOf: element = (
 			| s = dataAttribute: 'data-steps' of: element. |
@@ -548,23 +636,37 @@ tree that did is shown, dimmed, and typing in it does nothing. *)
 				].
 			^out
 		)
-		styleFrom: a to: b style: x = (
-			^edits Edit kind: #style
-				caret: a
-				caret: b
-				items: nil
-				after: nil
-				level: nil
-				style: x
-				steps: nil
-				index: nil
-				chars: nil
+		stringFieldKey: event = (
+			(* In a string field, Enter commits it and Escape abandons it. *)
+			
+			| t = event at: #target. |
+			(isStringField: t) ifFalse: [ ^self ].
+			(event at: #key) = 'Enter' ifTrue: [
+					event preventDefault.
+					^t blur
+				].
+			(event at: #key) = 'Escape' ifTrue: [
+					event preventDefault.
+					render
+				]
+		)
+		styleOfFormat: type = (
+			(* The style a formatting input event asks for, or nil. *)
+			
+			type = 'formatBold' ifTrue: [ ^'strong' ].
+			type = 'formatItalic' ifTrue: [ ^'emphasis' ].
+			type = 'formatUnderline' ifTrue: [ ^'underline' ].
+			type = 'formatStrikeThrough' ifTrue: [ ^'strikethrough' ].
+			type = 'formatSubscript' ifTrue: [ ^'subscript' ].
+			type = 'formatSuperscript' ifTrue: [ ^'superscript' ].
+			^nil
 		)
 		public styleSelection: x = (
-			(* Style the selection: emphasis, strong, or code. *)
+			(* Style the selection: emphasis, strong, underline, strikethrough,
+subscript, superscript, or code. *)
 			
 			edit: [:a :b :collapsed |
-					collapsed ifTrue: [ nil ] ifFalse: [ styleFrom: a to: b style: x ]
+					keyEdit: (edits Key kind: #style chars: nil style: x) from: a to: b
 				]
 		)
 		styleSheet = (
@@ -572,25 +674,22 @@ tree that did is shown, dimmed, and typing in it does nothing. *)
 			
 			| s = domDocument createElement: 'style'. |
 			s at: #textContent
-				put: '[data-steps]:empty { min-height: 1.2em; } span[data-steps]:empty, em[data-steps]:empty, strong[data-steps]:empty, code[data-steps]:empty, a[data-steps]:empty { display: inline-block; min-width: 1px; }'.
+				put: '[data-steps]:empty { min-height: 1.2em; } span[data-steps]:empty, em[data-steps]:empty, strong[data-steps]:empty, u[data-steps]:empty, s[data-steps]:empty, sub[data-steps]:empty, sup[data-steps]:empty, code[data-steps]:empty, a[data-steps]:empty { display: inline-block; min-width: 1px; } span[data-string-field] { min-width: 2em; display: inline-block; } [data-string-field]:empty { min-height: 1.2em; border-bottom: 1px dotted #999; } [data-string-field]:focus { outline: 1px solid #4a7bd0; }'.
 			^s
-		)
-		typing: text from: a to: b = (
-			typed:: emmanuel codePointsOf: text.
-			^edits replace: a
-				to: b
-				items: {emmanuel Item text: (emmanuel codePointsOf: text)
-					span: (emmanuel Span from: 0 to: 0)
-					statement: nil. }
-				after: {}
 		)
 		updateVisualsFromSameKind: oldFragment = (
 			(* A refresh of the GUI reaches the editor of a document as the same
 fragment, since the document keeps its editor: its amplets are run again
-and reconciled, as an Ampleforth document's are. *)
+and reconciled, as an Ampleforth document's are, and its source is
+interpreted again (from its nodes) and shown again, so that a change to the
+document's code, its template's blocks, their presenters, or its
+constructs, is live. A refresh reaches only an editor that is shown; on the
+largest documents it adds tens of milliseconds. *)
 			
 			oldFragment == self ifTrue: [
 					session amplets refresh.
+					session refresh.
+					render.
 					^visual
 				].
 			^replaceVisual: oldFragment visual with: visual
@@ -618,15 +717,25 @@ interpreted, when the source does not), and the caret of the last edit. *)
 			public source ::= emmanuel codePointsOf: w.
 			public host = hosts Host evaluator: ev.
 			public amplets = blocks AmpletRunner evaluator: ev.
+			private evaluator = ev.
 			public nodes
 			public tree
 			public failed ::= false.
 			public caret
 			public timings ::= ''.
 			public changeHandler ::= nil.
+			public frameWidth ::= nil.
+			public frameHeight ::= nil.
+			public problem ::= nil.
 		|
 		interpret.
 	) (
+		public addMedia: file named: name = (
+			(* Add the file to the document's media, when there is a document. *)
+			
+			evaluator isNil ifTrue: [ ^self ].
+			evaluator addMedia: file named: name
+		)
 		public agreesWithWholeParse = (
 			(* Whether the nodes, kept incrementally, are those of parsing the
 whole source; for tests. *)
@@ -664,7 +773,7 @@ becomes a no-break space, so that what one types is what one sees. *)
 			(result isNil or: [ result isRefused ]) ifTrue: [ ^nil ].
 			result sourceName = 'doc' ifFalse: [ ^nil ].
 			reinterpret: (typed isNil ifTrue: [ result chars ]
-					ifFalse: [ keepSpaces: typed in: result chars before: result caret ]).
+					ifFalse: [ edits keepSpaces: typed in: result chars caret: result caret ]).
 			failed ifTrue: [
 					
 					(* An edit in the live view must leave a source that
@@ -674,6 +783,7 @@ view never goes dead under the user's hands. *)
 					nodes:: oldNodes.
 					tree:: oldTree.
 					failed:: false.
+					problem:: nil.
 					Error signal: 'an edit that would leave the source uninterpretable was refused'
 				].
 			changeHandler isNil ifFalse: [ changeHandler value: sourceString ].
@@ -691,6 +801,48 @@ view never goes dead under the user's hands. *)
 			timings:: timings , ', caret ' , (clock now - t2) printString.
 			^caret
 		)
+		describeProblemOf: w = (
+			(* What is wrong with the source w, which does not interpret, for the
+reader: its lexical or syntax error, where, and the line it is on; or what
+an argument raised. *)
+			
+			| parsed = emmanuel parse: 'doc' source: w host: host. done |
+			parsed isKindOfLexFail ifTrue: [ ^lexProblem: parsed error in: w ].
+			parsed isKindOfSyntaxError ifTrue: [
+					^'Syntax error ' , (placeOf: parsed span start in: w) , '.' , (excerptOf: w
+						at: parsed span start)
+				].
+			(parsed isNil or: [ parsed isKindOfParsed not ]) ifTrue: [
+					^'The source could not be parsed.'
+				].
+			done:: (emmanuel Machine host: host) interpret: parsed nodes
+				root: rootBlock
+				hostState: nil.
+			done isKindOfRaised ifTrue: [
+					^'An argument raised an error: ' , (emmanuel termStringOf: done exception)
+				].
+			^'The source could not be interpreted.'
+		)
+		excerptOf: w at: p = (
+			(* The line of w that position p is on (at most 60 characters either
+side of it), and under it a mark at p. *)
+			
+			| start ::= p. stop ::= p + 1. from to line marks = List new. |
+			[ start > 0 and: [ ((w at: start) = 10) not ] ] whileTrue: [
+					start:: start - 1
+				].
+			[ stop <= w size and: [ ((w at: stop) = 10) not ] ] whileTrue: [
+					stop:: stop + 1
+				].
+			from:: start + 1 max: p + 1 - 60.
+			to:: stop - 1 min: p + 60.
+			line:: (w copyFrom: from to: to) collect: [:c |
+					c = 9 ifTrue: [ 32 ] ifFalse: [ c ]
+				].
+			p + 1 - from timesRepeat: [ marks add: 32 ].
+			marks add: 94.
+			^emmanuel stringOfCodePoints: {10. } , line asArray , {10. } , marks asArray
+		)
 		image = (
 			^{{'doc'. source. }. }
 		)
@@ -698,32 +850,42 @@ view never goes dead under the user's hands. *)
 			| doc = edits document: image
 				name: 'doc'
 				hostState: nil
-				root: blocks DocumentRoot new
+				root: rootBlock
 				host: host. |
 			doc isNil ifTrue: [
 					failed:: true.
+					problem:: problemOf: source.
 					^self
 				].
 			failed:: false.
+			problem:: nil.
 			nodes:: doc at: 1.
 			tree:: doc at: 2
 		)
-		keepSpaces: typed in: w before: k = (
-			(* w, a source in which typed ends at offset k, with each space of
-typed that has white space beside it made a no-break space. *)
+		lexProblem: e in: w = (
+			(* The reader's description of the lexical error e of the source w. *)
 			
-			| out = w copy. n = typed size. |
-			(k isNil or: [ k < n or: [ k > w size ] ]) ifTrue: [ ^w ].
-			1 to: n do: [:i | (w at: k - n + i) = (typed at: i) ifFalse: [ ^w ] ].
-			k - n + 1 to: k
-				do: [:i |
-					((out at: i) = 32 and: [
-							(i > 1 and: [ emmanuel isWS: (out at: i - 1) ]) or: [
-									i < out size and: [ emmanuel isWS: (out at: i + 1) ]
-								]
-						]) ifTrue: [ out at: i put: 160 ]
+			| p ::= e position. |
+			e kind = #strayClose ifTrue: [
+					^'Lexical error ' , (placeOf: p in: w) , ': this \] closes no bracket.' , (excerptOf: w
+						at: p)
 				].
-			^out
+			e kind = #unclosedLiteral ifTrue: [
+					^'Lexical error ' , (placeOf: p in: w) , ': a string or comment begins here and is never closed.' , (excerptOf: w
+						at: p)
+				].
+			p:: unclosedOpenerIn: w.
+			p isNil ifTrue: [ ^'Lexical error: a bracket is never closed.' ].
+			^'Lexical error ' , (placeOf: p in: w) , ': this [\ is never closed.' , (excerptOf: w
+				at: p)
+		)
+		library = (
+			(* The document's block library (its template's, which may add
+constructs), as its evaluator gives it; the shared one when there is no
+evaluator, or one that gives no library. *)
+			
+			(evaluator isNil or: [ evaluator blocks isNil ]) ifTrue: [ ^blocks ].
+			^evaluator blocks
 		)
 		markupSteps: e = (
 			(* The path to the markup an edit is in: its point's path, up to the
@@ -732,6 +894,46 @@ last field it enters. *)
 			| ss = e first point steps. k ::= 0. |
 			ss keysAndValuesDo: [:i :s | s isField ifTrue: [ k:: i ] ].
 			^ss copyFrom: 1 to: k
+		)
+		placeOf: p in: w = (
+			(* Where position p of w is: its line and column, from 1. *)
+			
+			| line ::= 1. column ::= 1. |
+			1 to: (p min: w size)
+				do: [:k |
+					(w at: k) = 10 ifTrue: [
+							line:: line + 1.
+							column:: 1
+						]
+						ifFalse: [ column:: column + 1 ]
+				].
+			^'at line ' , line printString , ', column ' , column printString
+		)
+		problemOf: w = (
+			(* What is wrong with the source w, for the reader; describing it
+must never stop the source being interpreted. *)
+			
+			^[ describeProblemOf: w ] on: Error
+				do: [:e | 'The source does not interpret.' ]
+		)
+		public refresh = (
+			(* Interpret the source again, from its nodes, since the document's
+code (its blocks, their presenters, its constructs) may have changed; a
+source that did not interpret is interpreted afresh. *)
+			
+			| done |
+			library forgetConstructs.
+			(failed or: [ nodes isNil ]) ifTrue: [ ^interpret ].
+			done:: (emmanuel Machine host: host) interpret: nodes
+				root: rootBlock
+				hostState: nil.
+			done isKindOfDone ifFalse: [
+					failed:: true.
+					problem:: problemOf: source.
+					^self
+				].
+			problem:: nil.
+			tree:: done tree
 		)
 		public reinterpret: w = (
 			(* Make w the source: reparse only what the edit damaged
@@ -744,17 +946,48 @@ interpret. *)
 			reparsed:: incremental reparse: nodes old: old new: w name: 'doc' host: host.
 			reparsed isNil ifTrue: [ ^interpret ].
 			done:: (emmanuel Machine host: host) interpret: reparsed
-				root: blocks DocumentRoot new
+				root: rootBlock
 				hostState: nil.
 			done isKindOfDone ifFalse: [
 					failed:: true.
+					problem:: problemOf: source.
 					^self
 				].
+			problem:: nil.
 			nodes:: reparsed.
 			tree:: done tree
 		)
+		rootBlock = (
+			(* The root block to interpret with: the root of the document's block
+library, with its stylesheet, as its evaluator gives them. *)
+			
+			| r = library DocumentRoot new. |
+			evaluator isNil ifFalse: [ r stylesheet: evaluator stylesheet ].
+			^r
+		)
 		public sourceString = (
 			^emmanuel stringOfCodePoints: source
+		)
+		unclosedOpenerIn: w = (
+			(* The position of the innermost bracket of w that is never closed,
+matching openers and closers as they come; nil when there is none. *)
+			
+			| open = List new. k ::= 1. |
+			[ k < w size ] whileTrue: [
+					((w at: k) = 91 and: [ (w at: k + 1) = 92 ]) ifTrue: [
+							open add: k - 1.
+							k:: k + 2
+						]
+						ifFalse: [
+							((w at: k) = 92 and: [ (w at: k + 1) = 93 ]) ifTrue: [
+									open isEmpty ifFalse: [ open removeLast ].
+									k:: k + 2
+								]
+								ifFalse: [ k:: k + 1 ]
+						]
+				].
+			open isEmpty ifTrue: [ ^nil ].
+			^open last
 		)
 	) : ()
 	public class ViewFragment session: s = Fragment new (

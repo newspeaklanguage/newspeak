@@ -94,6 +94,14 @@ const keys = {
   Delete: { key: "Delete", code: "Delete", windowsVirtualKeyCode: 46 },
   Enter: { key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, text: "\r" },
   CmdB: { key: "b", code: "KeyB", windowsVirtualKeyCode: 66, modifiers: 4 },
+  CmdX: { key: "x", code: "KeyX", windowsVirtualKeyCode: 88, modifiers: 4, commands: ["cut"] },
+  CmdC: { key: "c", code: "KeyC", windowsVirtualKeyCode: 67, modifiers: 4, commands: ["copy"] },
+  CmdV: { key: "v", code: "KeyV", windowsVirtualKeyCode: 86, modifiers: 4, commands: ["paste"] },
+  AltBackspace: { key: "Backspace", code: "Backspace", windowsVirtualKeyCode: 8, modifiers: 1, commands: ["deleteWordBackward"] },
+  CmdU: { key: "u", code: "KeyU", windowsVirtualKeyCode: 85, modifiers: 4 },
+  CmdShiftX: { key: "X", code: "KeyX", windowsVirtualKeyCode: 88, modifiers: 12 },
+  CmdComma: { key: ",", code: "Comma", windowsVirtualKeyCode: 188, modifiers: 4 },
+  CmdPeriod: { key: ".", code: "Period", windowsVirtualKeyCode: 190, modifiers: 4 },
 };
 async function key(name) {
   await send("Input.dispatchKeyEvent", { type: "keyDown", ...keys[name] });
@@ -128,6 +136,10 @@ const scenarios = [
     "[\\title: [\\Doc\\]\\][\\paragraph\\]Hello worldSecond[\\endParagraph\\]"],
   ["bold a selection", async () => { await js("selectText('world')"); await key("CmdB"); },
     "[\\title: [\\Doc\\]\\][\\paragraph\\]Hello [\\strong\\]world[\\endStrong\\][\\endParagraph\\][\\paragraph\\]Second[\\endParagraph\\]"],
+  ...[["CmdU", "underline", "endUnderline"], ["CmdShiftX", "strikethrough", "endStrikethrough"],
+      ["CmdComma", "subscript", "endSubscript"], ["CmdPeriod", "superscript", "endSuperscript"]].map(([k, open, close]) =>
+    [`${open} a selection (${k})`, async () => { await js("selectText('world')"); await key(k); },
+      `[\\title: [\\Doc\\]\\][\\paragraph\\]Hello [\\${open}\\]world[\\${close}\\][\\endParagraph\\][\\paragraph\\]Second[\\endParagraph\\]`]),
   ["a space at the end, then a letter", async () => { await js("caretAt('Second', 6)"); await type(" Z"); },
     "[\\title: [\\Doc\\]\\][\\paragraph\\]Hello world[\\endParagraph\\][\\paragraph\\]Second Z[\\endParagraph\\]"],
   ["type in the title", async () => { await js("caretAt('Doc', 3)"); await type("s"); },
@@ -275,6 +287,154 @@ console.log(`${scenarios.length - failures}/${scenarios.length} scenarios passed
   if (!ok) { failures++; console.log(`     viewer: shows ${JSON.stringify(text)}`); }
   if (controlOk) { failures++; console.log(`     viewer control was not caught: ${JSON.stringify(controlText)}`); }
   console.log(`viewer: renders the document ${ok ? "yes" : "NO"}; control (source as HTML) caught ${controlOk ? "NO" : "yes"}`);
+}
+
+// Templates and pages. A paper (the core stylesheet) has no underline:
+// Cmd-U does nothing there, while Cmd-B still works. The page limits the
+// frame (the live view's border), and setting it rewrites the one page:
+// statement; the width the reader gives the frame is the session's.
+{
+  await js(`emmanuelLoadPaper(${JSON.stringify(DOC)})`);
+  await js("selectText('world')");
+  await key("CmdU");
+  const paperU = await source();
+  await js("selectText('world')");
+  await key("CmdB");
+  const paperB = await source();
+  const paperOk = paperU === DOC && paperB === DOC.replace("world", "[\\strong\\]world[\\endStrong\\]");
+  await js(`emmanuelLoad(${JSON.stringify(DOC)})`);
+  const before = await js("document.body.firstChild.style.maxWidth");
+  await js("emmanuelSetPage('letter')");
+  const letter = await source();
+  const frame = await js("document.body.firstChild.style.maxWidth");
+  const sheet = await js("getComputedStyle(document.body.querySelector('article')).maxWidth");
+  await js("emmanuelSetPage('a4')");
+  const a4 = await source();
+  const pageOk = before === "100%" && letter === "[\\page: 'letter'\\]" + DOC && frame.includes("828px")
+    && sheet === "816px" && a4 === "[\\page: 'a4'\\]" + DOC;
+  const resize = await js("getComputedStyle(document.body.firstChild).resize");
+  await js("(() => { const r = document.body.firstChild; r.style.width = '300px'; r.style.height = '400px'; r.dispatchEvent(new MouseEvent('mouseup', { bubbles: true })); })()");
+  await js("caretAt('Second', 6)");
+  await type("Z");
+  await js("emmanuelFrameWidth(0)");
+  const kept = await js("emmanuelFrame");
+  const keptHigh = await js("emmanuelFrameHeight");
+  const widthOk = resize === "both" && kept === "300px" && (await js("document.body.firstChild.style.width")) === "300px"
+    && keptHigh === "400px" && (await js("document.body.firstChild.style.height")) === "400px";
+  // A slide in the editor: zoomed to the frame, never past its 1080 pixels;
+  // a long one grows past its 675.
+  await js(`emmanuelLoad(${JSON.stringify("[\\page: 'slide'\\]" + "[\\paragraph\\]Line[\\endParagraph\\]".repeat(30))})`);
+  await sleep(1500);
+  const slide = await js("(() => { const a = document.body.querySelector('article'); return a.dataset.scale + ' ' + a.clientHeight + ' ' + document.body.firstChild.style.maxWidth; })()");
+  const [zoom, high, slideMax] = slide.split(" ");
+  const slideOk = Number(zoom) > 0 && Number(zoom) <= 1 && Number(high) > 675 && slide.includes("calc(1092px)");
+  if (!paperOk || !pageOk || !widthOk || !slideOk) failures++;
+  console.log(`paper has no underline ${paperOk ? "yes" : "NO"}; page ${pageOk ? "yes" : "NO"}; frame size kept ${widthOk ? "yes" : "NO"}; slide zoomed, never past 1, and long ${slideOk ? "yes" : "NO"}\n     paper ${JSON.stringify(paperU)} ${JSON.stringify(paperB)}\n     page: before ${before}, frame ${frame}, sheet ${sheet}\n     ${JSON.stringify(letter)}\n     ${JSON.stringify(a4)}\n     frame resize ${resize}, size ${kept} x ${keptHigh}\n     slide zoom, height, frame max: ${slide}`);
+}
+
+// Cut, copy, and paste, through the browser's own clipboard commands (as
+// Cmd-X, Cmd-C, Cmd-V do): what is cut leaves the source, and what is
+// pasted enters it.
+{
+  await send("Browser.grantPermissions", { permissions: ["clipboardReadWrite", "clipboardSanitizedWrite"] });
+  await js(`window.inputLog = []; document.addEventListener('beforeinput', (e) => inputLog.push(e.inputType + '@' + (e.target.tagName || e.target.nodeName) + (e.target.getAttribute && e.target.getAttribute('data-steps') !== null ? '[' + e.target.getAttribute('data-steps') + ']' : '')), true); true`);
+  await js(`emmanuelLoad(${JSON.stringify(DOC)})`);
+  await js("selectText('world')");
+  await key("CmdX");
+  await sleep(300);
+  const afterCut = await source();
+  await js("caretAt('Second', 6)");
+  await key("CmdV");
+  await sleep(300);
+  const afterPaste = await source();
+  const log = await js("inputLog.join(', ')");
+  const cutOk = afterCut === DOC.replace("Hello world", "Hello ");
+  const pasteOk = afterPaste === DOC.replace("Hello world", "Hello ").replace("Second", "Secondworld");
+  if (!cutOk || !pasteOk) failures++;
+  console.log(`cut ${cutOk ? "yes" : "NO"}, paste ${pasteOk ? "yes" : "NO"}\n     after cut ${JSON.stringify(afterCut)}\n     after paste ${JSON.stringify(afterPaste)}\n     input events: ${log}`);
+}
+
+// Edits whose range the browser gives, not the selection: deleting a word
+// (Option-Backspace), and a spelling correction, whose word replaces the
+// misspelled one, wherever the caret is (synthetic, as headless Chrome has no
+// spelling service).
+{
+  await js(`emmanuelLoad(${JSON.stringify(DOC)})`);
+  await js("caretAt('world', 5)");
+  await key("AltBackspace");
+  await sleep(300);
+  const afterWord = await source();
+  await js(`emmanuelLoad(${JSON.stringify(DOC.replace("world", "wrold"))})`);
+  await js("caretAt('Second', 6)");
+  await js(`(() => { const [n, i] = findText('wrold');
+    const range = new StaticRange({ startContainer: n, startOffset: i, endContainer: n, endOffset: i + 5 });
+    const dt = new DataTransfer(); dt.setData('text/plain', 'world');
+    n.parentNode.dispatchEvent(new InputEvent('beforeinput', { inputType: 'insertReplacementText', dataTransfer: dt,
+      targetRanges: [range], bubbles: true, cancelable: true })); })()`);
+  await sleep(300);
+  const afterSpell = await source();
+  const wordOk = afterWord === DOC.replace("Hello world", "Hello ");
+  const spellOk = afterSpell === DOC;
+  if (!wordOk || !spellOk) failures++;
+  console.log(`delete a word ${wordOk ? "yes" : "NO"}, spelling correction ${spellOk ? "yes" : "NO"}\n     after word ${JSON.stringify(afterWord)}\n     after correction ${JSON.stringify(afterSpell)}`);
+}
+
+// A string field (a title given as a string) is edited in place: its new
+// text replaces the string literal when one leaves it; one left unchanged
+// changes nothing.
+{
+  await js(`emmanuelLoad(${JSON.stringify("[\\title: 'Plain'\\][\\paragraph\\]x[\\endParagraph\\]")})`);
+  const field = "[...document.body.firstChild.querySelectorAll('[data-string-field]')].find((e) => e.textContent.startsWith('Plain'))";
+  const editable = await js(`(${field}).getAttribute('contenteditable')`);
+  await js(`(() => { const f = ${field}; f.focus(); f.dispatchEvent(new FocusEvent('focusout', { bubbles: true })); })()`);
+  const unchanged = await source();
+  await js(`(() => { const f = ${field}; f.focus(); f.textContent = 'Plainer'; f.dispatchEvent(new FocusEvent('focusout', { bubbles: true })); })()`);
+  const edited = await source();
+  const ok = editable === "plaintext-only" && unchanged === "[\\title: 'Plain'\\][\\paragraph\\]x[\\endParagraph\\]"
+    && edited === "[\\title: 'Plainer'\\][\\paragraph\\]x[\\endParagraph\\]";
+  if (!ok) failures++;
+  console.log(`string fields edited in place ${ok ? "yes" : "NO"}\n     editable ${editable}; unchanged ${JSON.stringify(unchanged)}; edited ${JSON.stringify(edited)}`);
+}
+
+// A source that does not lex shows, above the dimmed view, what is wrong and
+// where, with the line it is on; one that interprets again shows nothing.
+{
+  const problem = `(() => { const box = [...document.body.firstChild.children].find((e) => e.tagName === 'DIV' && e.getAttribute('contenteditable') === 'false');
+    return box && box.style.display !== 'none' ? box.textContent : ''; })()`;
+  const shown = async (src) => { await js(`emmanuelSetSource(${JSON.stringify(src)})`); return await js(problem); };
+  await js(`emmanuelLoad(${JSON.stringify(DOC)})`);
+  const stray = await shown("[\\paragraph\\]a\\]b[\\endParagraph\\]");
+  const literal = await shown("[\\paragraph\\]a[\\amplet: [ 'x ]\\]b[\\endParagraph\\]");
+  const bracket = await shown("[\\paragraph\\]a\n[\\emphasis");
+  const fine = await shown(DOC);
+  const ok = stray.startsWith("Lexical error at line 1, column 15: this \\] closes no bracket.")
+    && literal.includes("a string or comment begins here and is never closed")
+    && bracket.startsWith("Lexical error at line 2, column 1: this [\\ is never closed.") && fine === "";
+  if (!ok) failures++;
+  console.log(`lexical errors described ${ok ? "yes" : "NO"}\n     ${JSON.stringify(stray)}\n     ${JSON.stringify(literal)}\n     ${JSON.stringify(bracket)}\n     after a fix: ${JSON.stringify(fine)}`);
+}
+
+// The new styles render as their HTML elements, and a background as the
+// document's background image, in the viewer and in the editor. The control
+// renders the source as HTML and must be caught.
+{
+  const src = "[\\background: 'eye.png'\\][\\paragraph\\]a[\\underline\\]u[\\endUnderline. strikethrough\\]s[\\endStrikethrough\\]H[\\subscript\\]2[\\endSubscript\\]x[\\superscript\\]2[\\endSuperscript. endParagraph\\]";
+  const looks = `(() => { const tags = ['u', 's', 'sub', 'sup'].every((t) => document.body.querySelector(t + '[data-steps]'));
+    const art = document.body.querySelector('article'); const bg = art ? getComputedStyle(art).backgroundImage : 'none';
+    return [tags, bg]; })()`;
+  const check = async (asHTML) => {
+    await js(`emmanuelView(${JSON.stringify(src)}, ${asHTML})`);
+    const [tags, bg] = await js(looks);
+    return [tags && bg.includes("eye.png"), `tags ${tags}, background ${bg}`];
+  };
+  const [ok, what] = await check(false);
+  const [controlOk, controlWhat] = await check(true);
+  await js(`emmanuelLoad(${JSON.stringify(src)})`);
+  const [etags, ebg] = await js(looks);
+  const editorOk = etags && ebg.includes("eye.png");
+  if (!ok || !editorOk) { failures++; console.log(`     styles: viewer ${what}; editor tags ${etags}, background ${ebg}`); }
+  if (controlOk) { failures++; console.log(`     styles control was not caught: ${controlWhat}`); }
+  console.log(`styles and background: viewer ${ok ? "yes" : "NO"}, editor ${editorOk ? "yes" : "NO"}; control caught ${controlOk ? "NO" : "yes"}`);
 }
 
 // Links: every place a click can put the caret in a document with links,

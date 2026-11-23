@@ -1,0 +1,679 @@
+diff --git a/crates/eurasia-core/src/builder.rs b/crates/eurasia-core/src/builder.rs
+index 54053a1..98d7edf 100644
+--- a/crates/eurasia-core/src/builder.rs
++++ b/crates/eurasia-core/src/builder.rs
+@@ -68,7 +68,7 @@ impl ImageBuilder {
+         let mut heap = Heap::new();
+         // nil first, with a placeholder class patched below.
+         let placeholder = Value::small_integer(0).expect("small");
+-        let nil = heap.allocate(placeholder, Space::Actor(0), Body::Regular(Vec::new()));
++        let nil = heap.allocate(placeholder, Space::Actor(0), Body::Regular(Vec::new().into()));
+         let mut b = ImageBuilder {
+             heap,
+             nil,
+@@ -86,10 +86,10 @@ impl ImageBuilder {
+         let false_class = b.define_class("False", b.object);
+         b.true_ = b
+             .heap
+-            .allocate(true_class, Space::Actor(0), Body::Regular(Vec::new()));
++            .allocate(true_class, Space::Actor(0), Body::Regular(Vec::new().into()));
+         b.false_ = b
+             .heap
+-            .allocate(false_class, Space::Actor(0), Body::Regular(Vec::new()));
++            .allocate(false_class, Space::Actor(0), Body::Regular(Vec::new().into()));
+         let small_integer = b.define_class("SmallInteger", b.object);
+         let string = b.define_class("String", b.object);
+         let array = b.define_class("Array", b.object);
+@@ -190,26 +190,26 @@ impl ImageBuilder {
+         let metaclass = self.heap.allocate(
+             self.metaclass_class,
+             Space::Actor(0),
+-            Body::Metaclass(Behavior {
++            Body::Metaclass(alloc::boxed::Box::new(Behavior {
+                 mixin: meta_mixin,
+                 superclass: meta_super,
+                 enclosing_object: self.nil,
+                 name: self.nil,
+                 this_class: self.nil,
+                 library: self.nil,
+-            }),
++            })),
+         );
+         let class = self.heap.allocate(
+             metaclass,
+             Space::Actor(0),
+-            Body::Class(Behavior {
++            Body::Class(alloc::boxed::Box::new(Behavior {
+                 mixin,
+                 superclass,
+                 enclosing_object: self.nil,
+                 name: name_string,
+                 this_class: self.nil,
+                 library: self.nil,
+-            }),
++            })),
+         );
+         if let Some(Body::Metaclass(b)) = self.heap.get_mut(metaclass).map(|o| &mut o.body) {
+             b.this_class = class;
+@@ -232,7 +232,7 @@ impl ImageBuilder {
+         let v = self.heap.allocate(
+             self.nil,
+             Space::Program,
+-            Body::Mixin(Mixin {
++            Body::Mixin(alloc::boxed::Box::new(Mixin {
+                 name,
+                 methods,
+                 enclosing_mixin: enclosing,
+@@ -240,7 +240,7 @@ impl ImageBuilder {
+                 slot_count: 0,
+                 class_mixin: self.nil,
+                 library: self.nil,
+-            }),
++            })),
+         );
+         self.heap.get_mut(v).expect("mixin").header.flags = FROZEN;
+         v
+@@ -302,7 +302,7 @@ impl ImageBuilder {
+         let m = self.heap.allocate(
+             method_class,
+             Space::Program,
+-            Body::Method(Method {
++            Body::Method(alloc::boxed::Box::new(Method {
+                 header: MethodHeader {
+                     kind,
+                     access,
+@@ -317,7 +317,7 @@ impl ImageBuilder {
+                 selector: selector_string,
+                 source: self.nil,
+                 library: self.nil,
+-            }),
++            })),
+         );
+         self.heap.get_mut(m).expect("method").header.flags = FROZEN;
+         let methods = self.heap.mixin(mixin).expect("mixin").methods;
+@@ -384,7 +384,7 @@ pub fn first_light_image() -> (Heap, Roles) {
+     );
+     let mirror = b
+         .heap
+-        .allocate(mirror_class, Space::Actor(0), Body::Regular(Vec::new()));
++        .allocate(mirror_class, Space::Actor(0), Body::Regular(Vec::new().into()));
+     b.set_role(Role::VmMirror, mirror);
+     let failure = b.define_class("NativeFailure", object);
+     b.method(failure, "signal", Access::Public, MethodSpec::Getter(3));
+@@ -410,7 +410,7 @@ pub fn first_light_image() -> (Heap, Roles) {
+     let entry_class = b.define_class("Main", object);
+     let entry = b
+         .heap
+-        .allocate(entry_class, Space::Actor(0), Body::Regular(Vec::new()));
++        .allocate(entry_class, Space::Actor(0), Body::Regular(Vec::new().into()));
+     b.set_role(Role::Entry, entry);
+     let print = b.string("print:");
+     let as_string = b.string("asString");
+diff --git a/crates/eurasia-core/src/gc.rs b/crates/eurasia-core/src/gc.rs
+index c6e537e..2e21714 100644
+--- a/crates/eurasia-core/src/gc.rs
++++ b/crates/eurasia-core/src/gc.rs
+@@ -72,7 +72,8 @@ pub struct Statistics {
+ /// elements, nor an Ephemeron's fields (the marker treats those itself).
+ fn for_each_strong(body: &Body, mut f: impl FnMut(Value)) {
+     match body {
+-        Body::Regular(e) | Body::Array(e) => e.iter().copied().for_each(f),
++        Body::Regular(e) => e.iter().copied().for_each(f),
++        Body::Array(e) => e.iter().copied().for_each(f),
+         Body::WeakArray(_) | Body::Ephemeron { .. } => {}
+         Body::Bytes(_) | Body::String(_) | Body::Float(_) | Body::LargeInteger { .. } => {}
+         Body::Method(m) => [m.literals, m.mixin, m.selector, m.source, m.library]
+@@ -148,9 +149,10 @@ impl Heap {
+ 
+ /// Rewrites every reference field of `body`, weak ones included.
+ fn map_all(body: &mut Body, f: &impl Fn(Value) -> Value) {
+-    let each = |e: &mut Vec<Value>| e.iter_mut().for_each(|v| *v = f(*v));
++    let each = |e: &mut [Value]| e.iter_mut().for_each(|v| *v = f(*v));
+     match body {
+-        Body::Regular(e) | Body::Array(e) | Body::WeakArray(e) => each(e),
++        Body::Regular(e) => each(e),
++        Body::Array(e) | Body::WeakArray(e) => each(e),
+         Body::Ephemeron {
+             key,
+             value,
+@@ -504,9 +506,9 @@ mod tests {
+         let nil = h.allocate(
+             Value::reference(0).unwrap(),
+             Space::Actor(0),
+-            Body::Regular(Vec::new()),
++            Body::Regular(Vec::new().into()),
+         );
+-        let class = h.allocate(nil, Space::Actor(0), Body::Regular(Vec::new()));
++        let class = h.allocate(nil, Space::Actor(0), Body::Regular(Vec::new().into()));
+         (h, nil, class)
+     }
+ 
+diff --git a/crates/eurasia-core/src/interpreter.rs b/crates/eurasia-core/src/interpreter.rs
+index b5bc5b8..36402b1 100644
+--- a/crates/eurasia-core/src/interpreter.rs
++++ b/crates/eurasia-core/src/interpreter.rs
+@@ -1630,7 +1630,7 @@ impl Vm {
+         let message = self.heap.allocate(
+             message_class,
+             Space::Actor(self.current as u32),
+-            Body::Regular(alloc::vec![selector, arguments]),
++            Body::Regular(alloc::vec![selector, arguments].into()),
+         );
+         if !present_receiver {
+             self.stack.push(receiver);
+@@ -2308,7 +2308,7 @@ impl Vm {
+         let a = self.heap.allocate(
+             class,
+             Space::Actor(self.current as u32),
+-            Body::Activation(record),
++            Body::Activation(alloc::boxed::Box::new(record)),
+         );
+         self.frames[index].activation = Some(a);
+         a
+@@ -3160,7 +3160,7 @@ impl Vm {
+                         }
+                     })
+                     .collect();
+-                object.body = Body::Regular(slots);
++                object.body = Body::Regular(slots.into());
+                 object.header.class = *new_class;
+             }
+         }
+@@ -3315,7 +3315,7 @@ impl Vm {
+             let class = vm.roles.get(Role::AlienClass);
+             let reference = Value::small_integer(i64::from(r)).expect("small");
+             vm.heap
+-                .allocate(class, space, Body::Regular(alloc::vec![reference]))
++                .allocate(class, space, Body::Regular(alloc::vec![reference].into()))
+         };
+         match v {
+             HostValue::Undefined => alien(self, 0),
+@@ -3541,7 +3541,7 @@ impl Vm {
+         self.heap.allocate(
+             class,
+             Space::Actor(self.current as u32),
+-            Body::Regular(slots),
++            Body::Regular(slots.into()),
+         )
+     }
+ 
+diff --git a/crates/eurasia-core/src/natives.rs b/crates/eurasia-core/src/natives.rs
+index 54819e2..6175d4b 100644
+--- a/crates/eurasia-core/src/natives.rs
++++ b/crates/eurasia-core/src/natives.rs
+@@ -282,26 +282,26 @@ pub fn apply_mixin(m: Value, s: Value, eo: Value, ctx: &mut NativeContext) -> Ou
+     let metaclass = ctx.heap.allocate(
+         metaclass_class,
+         ctx.space,
+-        Body::Metaclass(Behavior {
++        Body::Metaclass(alloc::boxed::Box::new(Behavior {
+             mixin: cm,
+             superclass: meta_super,
+             enclosing_object: eo,
+             name: nil,
+             this_class: nil,
+             library: nil,
+-        }),
++        })),
+     );
+     let class = ctx.heap.allocate(
+         metaclass,
+         ctx.space,
+-        Body::Class(Behavior {
++        Body::Class(alloc::boxed::Box::new(Behavior {
+             mixin: m,
+             superclass: s,
+             enclosing_object: eo,
+             name,
+             this_class: nil,
+             library: nil,
+-        }),
++        })),
+     );
+     if let Some(Body::Metaclass(b)) = ctx.heap.get_mut(metaclass).map(|o| &mut o.body) {
+         b.this_class = class;
+@@ -334,7 +334,7 @@ pub fn new_alien(ctx: &mut NativeContext<'_>, r: u32) -> Value {
+     ctx.heap.allocate(
+         class,
+         space,
+-        Body::Regular(alloc::vec![small(i64::from(r))]),
++        Body::Regular(alloc::vec![small(i64::from(r))].into()),
+     )
+ }
+ 
+@@ -1230,7 +1230,7 @@ fn bytes_of(heap: &Heap, v: Value) -> Option<&[u8]> {
+ /// snapshot format's edge order (format section 5).
+ pub(crate) fn readable_fields(body: &Body) -> Option<Vec<Value>> {
+     Some(match body {
+-        Body::Regular(slots) => slots.clone(),
++        Body::Regular(slots) => slots.to_vec(),
+         Body::Ephemeron {
+             key,
+             value,
+@@ -1578,7 +1578,7 @@ pub fn invoke(
+                 return Outcome::Answer(ctx.heap.allocate(
+                     receiver,
+                     ctx.space,
+-                    Body::Method(Method {
++                    Body::Method(alloc::boxed::Box::new(Method {
+                         header: MethodHeader {
+                             kind: MethodKind::Ordinary,
+                             access: Access::Public,
+@@ -1593,7 +1593,7 @@ pub fn invoke(
+                         selector: nil,
+                         source: nil,
+                         library: nil,
+-                    }),
++                    })),
+                 ));
+             }
+             if (receiver == ctx.roles.get(Role::InstanceMixinClass)
+@@ -1603,7 +1603,7 @@ pub fn invoke(
+                 return Outcome::Answer(ctx.heap.allocate(
+                     receiver,
+                     ctx.space,
+-                    Body::Mixin(Mixin {
++                    Body::Mixin(alloc::boxed::Box::new(Mixin {
+                         name: nil,
+                         methods: nil,
+                         enclosing_mixin: nil,
+@@ -1611,7 +1611,7 @@ pub fn invoke(
+                         slot_count: 0,
+                         class_mixin: nil,
+                         library: nil,
+-                    }),
++                    })),
+                 ));
+             }
+             match instance_slots(ctx.heap, ctx.roles, receiver) {
+@@ -1619,7 +1619,7 @@ pub fn invoke(
+                     let nil = ctx.nil();
+                     let instance =
+                         ctx.heap
+-                            .allocate(receiver, ctx.space, Body::Regular(alloc::vec![nil; n]));
++                            .allocate(receiver, ctx.space, Body::Regular(if n <= crate::object::INLINE_SLOTS { crate::object::Slots::Inline(n as u8, [nil; crate::object::INLINE_SLOTS]) } else { alloc::vec![nil; n].into() }));
+                     // An instance of a value class is a value from allocation;
+                     // its init setters check what it is given (the end of
+                     // construction is not marked yet: design doc section 5).
+@@ -1894,7 +1894,7 @@ pub fn invoke(
+             Outcome::Answer(ctx.heap.allocate(
+                 class,
+                 space,
+-                Body::Activation(crate::object::Activation {
++                Body::Activation(alloc::boxed::Box::new(crate::object::Activation {
+                     frame: None,
+                     method: nil,
+                     receiver: nil,
+@@ -1904,7 +1904,7 @@ pub fn invoke(
+                         bci: nil,
+                         temps: Vec::new(),
+                     }),
+-                }),
++                })),
+             ))
+         }
+         Native::VmMarkSimulationRoot => match ctx.heap.get_mut(arg(0)) {
+@@ -2274,13 +2274,13 @@ pub fn invoke(
+             Outcome::Answer(ctx.heap.allocate(
+                 class,
+                 space,
+-                Body::Promise(PromiseRecord {
++                Body::Promise(alloc::boxed::Box::new(PromiseRecord {
+                     state: PromiseRecord::PENDING,
+                     value: ctx.nil(),
+                     owner,
+                     waiters: Vec::new(),
+                     queue: Vec::new(),
+-                }),
++                })),
+             ))
+         }
+         Native::VmResolvePromise | Native::VmBreakPromise => {
+diff --git a/crates/eurasia-core/src/object.rs b/crates/eurasia-core/src/object.rs
+index 1853226..e0e4821 100644
+--- a/crates/eurasia-core/src/object.rs
++++ b/crates/eurasia-core/src/object.rs
+@@ -236,10 +236,29 @@ impl PromiseRecord {
+ }
+ 
+ /// An object's contents.
++pub const INLINE_SLOTS: usize = 8;
++#[derive(Clone, Debug)]
++pub enum Slots { Inline(u8, [Value; INLINE_SLOTS]), Spilled(Vec<Value>) }
++impl From<Vec<Value>> for Slots {
++    fn from(v: Vec<Value>) -> Slots {
++        if v.len() <= INLINE_SLOTS {
++            let mut a = [Value::from_bits(0); INLINE_SLOTS];
++            a[..v.len()].copy_from_slice(&v);
++            Slots::Inline(v.len() as u8, a)
++        } else { Slots::Spilled(v) }
++    }
++}
++impl core::ops::Deref for Slots {
++    type Target = [Value];
++    fn deref(&self) -> &[Value] { match self { Slots::Inline(n, a) => &a[..*n as usize], Slots::Spilled(v) => v } }
++}
++impl core::ops::DerefMut for Slots {
++    fn deref_mut(&mut self) -> &mut [Value] { match self { Slots::Inline(n, a) => &mut a[..*n as usize], Slots::Spilled(v) => v } }
++}
+ #[derive(Clone, Debug)]
+ pub enum Body {
+     /// Ordinary slots.
+-    Regular(Vec<Value>),
++    Regular(Slots),
+     /// A ByteArray.
+     Bytes(Vec<u8>),
+     /// A String, as UTF-8.
+@@ -267,17 +286,17 @@ pub enum Body {
+         magnitude: Vec<u8>,
+     },
+     /// A method.
+-    Method(Method),
++    Method(alloc::boxed::Box<Method>),
+     /// A mixin.
+-    Mixin(Mixin),
++    Mixin(alloc::boxed::Box<Mixin>),
+     /// A class.
+-    Class(Behavior),
++    Class(alloc::boxed::Box<Behavior>),
+     /// A metaclass.
+-    Metaclass(Behavior),
++    Metaclass(alloc::boxed::Box<Behavior>),
+     /// A closure.
+     Closure(Closure),
+     /// An activation handle.
+-    Activation(Activation),
++    Activation(alloc::boxed::Box<Activation>),
+     /// A far reference (hidden layout; `actor-semantics.tex`, the table Φ):
+     /// the one place a reference into another actor's heap may be held.
+     FarRef {
+@@ -287,7 +306,7 @@ pub enum Body {
+         target: Value,
+     },
+     /// A promise record.
+-    Promise(PromiseRecord),
++    Promise(alloc::boxed::Box<PromiseRecord>),
+ }
+ 
+ /// An object.
+@@ -498,7 +517,7 @@ mod tests {
+     #[test]
+     fn allocation_assigns_increasing_sequence_numbers() {
+         let mut h = Heap::new();
+-        let a = h.allocate(nil(), Space::Actor(0), Body::Regular(Vec::new()));
++        let a = h.allocate(nil(), Space::Actor(0), Body::Regular(Vec::new().into()));
+         let b = h.allocate(nil(), Space::Actor(0), Body::Bytes(Vec::new()));
+         assert_eq!(h.get(a).unwrap().header.seq, 0);
+         assert_eq!(h.get(b).unwrap().header.seq, 1);
+@@ -509,20 +528,20 @@ mod tests {
+     fn loaded_objects_keep_their_sequence_numbers_and_gaps() {
+         let mut h = Heap::new();
+         let a = h
+-            .insert_loaded(5, nil(), 0, Space::Program, Body::Regular(Vec::new()))
++            .insert_loaded(5, nil(), 0, Space::Program, Body::Regular(Vec::new().into()))
+             .unwrap();
+         let b = h
+-            .insert_loaded(9, nil(), FROZEN, Space::Program, Body::Regular(Vec::new()))
++            .insert_loaded(9, nil(), FROZEN, Space::Program, Body::Regular(Vec::new().into()))
+             .unwrap();
+         assert_eq!(h.get(a).unwrap().header.seq, 5);
+         assert_eq!(h.get(b).unwrap().header.flags, FROZEN);
+         assert_eq!(
+-            h.insert_loaded(9, nil(), 0, Space::Program, Body::Regular(Vec::new()))
++            h.insert_loaded(9, nil(), 0, Space::Program, Body::Regular(Vec::new().into()))
+                 .unwrap_err(),
+             HeapError::SequenceNotIncreasing { seq: 9 }
+         );
+         h.set_allocation_counter(20).unwrap();
+-        let c = h.allocate(nil(), Space::Actor(0), Body::Regular(Vec::new()));
++        let c = h.allocate(nil(), Space::Actor(0), Body::Regular(Vec::new().into()));
+         assert_eq!(h.get(c).unwrap().header.seq, 20);
+         assert!(h.set_allocation_counter(20).is_err());
+     }
+diff --git a/crates/eurasia-snapshot/src/image.rs b/crates/eurasia-snapshot/src/image.rs
+index 12bd79f..e62d82f 100644
+--- a/crates/eurasia-snapshot/src/image.rs
++++ b/crates/eurasia-snapshot/src/image.rs
+@@ -508,7 +508,8 @@ fn write_edges(w: &mut Writer, o: &Object, to_node: &dyn Fn(Value) -> Value) {
+     let mut v = |x: Value| w.value(to_node(x));
+     v(o.header.class);
+     match &o.body {
+-        Body::Regular(e) | Body::Array(e) | Body::WeakArray(e) => e.iter().for_each(|&x| v(x)),
++        Body::Regular(e) => e.iter().for_each(|&x| v(x)),
++        Body::Array(e) | Body::WeakArray(e) => e.iter().for_each(|&x| v(x)),
+         Body::Ephemeron {
+             key,
+             value,
+@@ -734,7 +735,7 @@ fn read_node(r: &mut Reader<'_>, node: u64, placeholder: Value) -> Result<(u8, B
+     };
+     let p = placeholder;
+     let body = match kind {
+-        KIND_REGULAR => Body::Regular(alloc::vec![p; len(r)?]),
++        KIND_REGULAR => Body::Regular(alloc::vec![p; len(r)?].into()),
+         KIND_BYTES => {
+             let n = len(r)?;
+             Body::Bytes(r.bytes(n)?.to_vec())
+@@ -798,7 +799,7 @@ fn read_node(r: &mut Reader<'_>, node: u64, placeholder: Value) -> Result<(u8, B
+             if !consistent {
+                 return Err(LoadError::BadMethodHeader { node });
+             }
+-            Body::Method(Method {
++            Body::Method(alloc::boxed::Box::new(Method {
+                 header: MethodHeader {
+                     kind,
+                     access,
+@@ -813,9 +814,9 @@ fn read_node(r: &mut Reader<'_>, node: u64, placeholder: Value) -> Result<(u8, B
+                 selector: p,
+                 source: p,
+                 library: p,
+-            })
++            }))
+         }
+-        KIND_MIXIN => Body::Mixin(Mixin {
++        KIND_MIXIN => Body::Mixin(alloc::boxed::Box::new(Mixin {
+             name: p,
+             methods: p,
+             enclosing_mixin: p,
+@@ -824,7 +825,7 @@ fn read_node(r: &mut Reader<'_>, node: u64, placeholder: Value) -> Result<(u8, B
+                 .map_err(|_| LoadError::UnknownKind { node, kind })?,
+             class_mixin: p,
+             library: p,
+-        }),
++        })),
+         KIND_CLASS | KIND_METACLASS => {
+             let b = Behavior {
+                 mixin: p,
+@@ -835,9 +836,9 @@ fn read_node(r: &mut Reader<'_>, node: u64, placeholder: Value) -> Result<(u8, B
+                 library: p,
+             };
+             if kind == KIND_CLASS {
+-                Body::Class(b)
++                Body::Class(alloc::boxed::Box::new(b))
+             } else {
+-                Body::Metaclass(b)
++                Body::Metaclass(alloc::boxed::Box::new(b))
+             }
+         }
+         KIND_CLOSURE => {
+@@ -867,13 +868,13 @@ fn read_node(r: &mut Reader<'_>, node: u64, placeholder: Value) -> Result<(u8, B
+                 ),
+                 _ => return Err(LoadError::UnknownKind { node, kind }),
+             };
+-            Body::Activation(Activation {
++            Body::Activation(alloc::boxed::Box::new(Activation {
+                 frame,
+                 method: p,
+                 receiver: p,
+                 closure: p,
+                 detached,
+-            })
++            }))
+         }
+         KIND_FAR_REFERENCE => Body::FarRef {
+             actor: u32::try_from(r.uv()?).map_err(|_| LoadError::UnknownKind { node, kind })?,
+@@ -886,13 +887,13 @@ fn read_node(r: &mut Reader<'_>, node: u64, placeholder: Value) -> Result<(u8, B
+                 .ok_or(LoadError::UnknownKind { node, kind })?;
+             let waiters = len(r)?;
+             let queue = len(r)?;
+-            Body::Promise(PromiseRecord {
++            Body::Promise(alloc::boxed::Box::new(PromiseRecord {
+                 state,
+                 value: p,
+                 owner: p,
+                 waiters: alloc::vec![p; waiters],
+                 queue: alloc::vec![p; queue],
+-            })
++            }))
+         }
+         _ => return Err(LoadError::UnknownKind { node, kind }),
+     };
+@@ -901,7 +902,8 @@ fn read_node(r: &mut Reader<'_>, node: u64, placeholder: Value) -> Result<(u8, B
+ 
+ fn edge_count(body: &Body) -> usize {
+     1 + match body {
+-        Body::Regular(e) | Body::Array(e) | Body::WeakArray(e) => e.len(),
++        Body::Regular(e) => e.len(),
++        Body::Array(e) | Body::WeakArray(e) => e.len(),
+         Body::Ephemeron { .. } => 3,
+         Body::Mixin(_) => 6,
+         Body::Method(_) | Body::Class(_) | Body::Metaclass(_) => 5,
+@@ -930,7 +932,7 @@ fn fill_body(
+     let all =
+         |e: &[Value]| -> Result<Vec<Value>, LoadError> { e.iter().map(|&v| resolve(v)).collect() };
+     Ok(match body {
+-        Body::Regular(_) => Body::Regular(all(e)?),
++        Body::Regular(_) => Body::Regular(all(e)?.into()),
+         Body::Array(_) => Body::Array(all(e)?),
+         Body::WeakArray(_) => Body::WeakArray(all(e)?),
+         Body::Ephemeron { .. } => Body::Ephemeron {
+@@ -938,45 +940,45 @@ fn fill_body(
+             value: resolve(e[1])?,
+             finalizer: resolve(e[2])?,
+         },
+-        Body::Method(m) => Body::Method(Method {
++        Body::Method(m) => Body::Method(alloc::boxed::Box::new(Method {
+             literals: resolve(e[0])?,
+             mixin: resolve(e[1])?,
+             selector: resolve(e[2])?,
+             source: resolve(e[3])?,
+             library: resolve(e[4])?,
+-            ..m
+-        }),
+-        Body::Mixin(m) => Body::Mixin(Mixin {
++            ..*m
++        })),
++        Body::Mixin(m) => Body::Mixin(alloc::boxed::Box::new(Mixin {
+             name: resolve(e[0])?,
+             methods: resolve(e[1])?,
+             enclosing_mixin: resolve(e[2])?,
+             slot_names: resolve(e[3])?,
+             class_mixin: resolve(e[4])?,
+             library: resolve(e[5])?,
+-            ..m
+-        }),
+-        Body::Class(_) => Body::Class(Behavior {
++            ..*m
++        })),
++        Body::Class(_) => Body::Class(alloc::boxed::Box::new(Behavior {
+             mixin: resolve(e[0])?,
+             superclass: resolve(e[1])?,
+             enclosing_object: resolve(e[2])?,
+             name: resolve(e[3])?,
+             this_class: Value::small_integer(0).expect("small"),
+             library: resolve(e[4])?,
+-        }),
+-        Body::Metaclass(_) => Body::Metaclass(Behavior {
++        })),
++        Body::Metaclass(_) => Body::Metaclass(alloc::boxed::Box::new(Behavior {
+             mixin: resolve(e[0])?,
+             superclass: resolve(e[1])?,
+             enclosing_object: resolve(e[2])?,
+             name: Value::small_integer(0).expect("small"),
+             this_class: resolve(e[3])?,
+             library: resolve(e[4])?,
+-        }),
++        })),
+         Body::Closure(c) => Body::Closure(Closure {
+             defining: resolve(e[0])?,
+             copied: all(&e[1..])?,
+             ..c
+         }),
+-        Body::Activation(a) => Body::Activation(Activation {
++        Body::Activation(a) => Body::Activation(alloc::boxed::Box::new(Activation {
+             frame: a.frame,
+             method: resolve(e[0])?,
+             receiver: resolve(e[1])?,
+@@ -989,18 +991,18 @@ fn fill_body(
+                 }),
+                 None => None,
+             },
+-        }),
++        })),
+         Body::FarRef { actor, .. } => Body::FarRef {
+             actor,
+             target: resolve(e[0])?,
+         },
+-        Body::Promise(p) => Body::Promise(PromiseRecord {
++        Body::Promise(p) => Body::Promise(alloc::boxed::Box::new(PromiseRecord {
+             value: resolve(e[0])?,
+             owner: resolve(e[1])?,
+             waiters: all(&e[2..2 + p.waiters.len()])?,
+             queue: all(&e[2 + p.waiters.len()..])?,
+-            ..p
+-        }),
++            ..*p
++        })),
+         other => other,
+     })
+ }
+diff --git a/crates/eurasia-snapshot/tests/images.rs b/crates/eurasia-snapshot/tests/images.rs
+index dc2a0d5..3f3d9af 100644
+--- a/crates/eurasia-snapshot/tests/images.rs
++++ b/crates/eurasia-snapshot/tests/images.rs
+@@ -126,13 +126,13 @@ fn closures_and_dead_activations_round_trip() {
+     let activation = b.heap.allocate(
+         activation_class,
+         Space::Actor(0),
+-        Body::Activation(Activation {
++        Body::Activation(Box::new(Activation {
+             frame: None,
+             method: nil,
+             receiver: nil,
+             closure: nil,
+             detached: None,
+-        }),
++        })),
+     );
+     let closure = b.heap.allocate(
+         closure_class,
+@@ -177,18 +177,18 @@ fn checkpoints_keep_frames_and_detached_activations() {
+     let live = b.heap.allocate(
+         activation_class,
+         Space::Actor(0),
+-        Body::Activation(Activation {
++        Body::Activation(Box::new(Activation {
+             frame: Some(3),
+             method: nil,
+             receiver: seven,
+             closure: nil,
+             detached: None,
+-        }),
++        })),
+     );
+     let detached = b.heap.allocate(
+         activation_class,
+         Space::Actor(0),
+-        Body::Activation(Activation {
++        Body::Activation(Box::new(Activation {
+             frame: None,
+             method: nil,
+             receiver: nil,
+@@ -198,7 +198,7 @@ fn checkpoints_keep_frames_and_detached_activations() {
+                 bci: seven,
+                 temps: vec![seven, nil, live],
+             }),
+-        }),
++        })),
+     );
+     let (heap, roles) = b.finish();
+     let state = MachineState {

@@ -204,7 +204,11 @@ layout in a flow cell, not trimming the cell shorthand, not flagging a
 `popReject`, dropping the refused leaf, printing no closer for a rejected
 block; in the library, allowing a second title, accepting any label value,
 flat section depths, ignoring errors in fields, making an item a paragraph
-block, interpreting a taken title's argument; in the edit layer, never cancelling an
+block, interpreting a taken title's argument, allowing a second background,
+giving underline another style's closer; in the view, Backspace at the start
+of an inline block after text doing nothing, no leaf blocks, Enter over a
+selection splitting, judging a typed space beside the character before it as
+it was, dropping the View-Raises rule; in the edit layer, never cancelling an
 adjacent open and close, never joining blocks, not widening the splice over
 cancelled messages, not reopening blocks after a split, not closing crossed
 blocks before a style, printing the text left or right of a splice

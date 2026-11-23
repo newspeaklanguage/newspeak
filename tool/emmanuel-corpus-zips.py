@@ -20,7 +20,9 @@ relative path under OUTDIR that holds the document as an Emmanuel document
 A slide (a converted document laid out for page: 'slide') whose class body
 is empty gets the slide template's, which interprets it with the slide
 stylesheet; one with code of its own keeps it, with the template's
-stylesheet method added, and is listed. The Telescreen
+stylesheet method added, and is listed. A document whose conversion gives
+looks (a centered title) gets a stylesheet method that adds them to its
+stylesheet. The Telescreen
 template is written twice: TelescreenTemplate, whose master slide
 (MasterSlide) has no background, and NewspeakTelescreenTemplate, whose
 NewspeakMasterSlide is on the Newspeak background.
@@ -50,6 +52,7 @@ spec = importlib.util.spec_from_file_location("corpus", TOOL / "emmanuel-corpus.
 corpus = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(corpus)
 
+LOOKS = {}  # a document's looks, as the converter gives their source
 CLASS_BODY = re.compile(r'classBody\s*=\s*"([^"]*)"', re.S)
 EMPTY_BODY = re.compile(r'^\(\s*\)\s*\(\s*\)(\s*:\s*\(\s*\))?$')
 SLIDE_BODY = "()(public stylesheet = ( ^slideStylesheet ))"
@@ -82,13 +85,16 @@ def convert(key, data, sources, unconverted, custom=None):
         return data
     m = CLASS_BODY.search(page)
     class_body = html.unescape(m.group(1)).strip() if m else "()()"
-    if SLIDE_PAGE in sources[key]:
-        if EMPTY_BODY.match(class_body):
-            class_body = SLIDE_BODY
-        else:
-            class_body = with_slide_stylesheet(class_body)
-            if custom is not None:
-                custom.append(key)
+    looks = LOOKS.get(key, "")
+    slide = SLIDE_PAGE in sources[key]
+    if slide and not looks and EMPTY_BODY.match(class_body):
+        class_body = SLIDE_BODY
+    elif slide or looks:
+        own_code = not EMPTY_BODY.match(class_body)
+        base = "slideStylesheet" if slide else "super stylesheet"
+        class_body = with_stylesheet(class_body, base + (" withLooks: " + looks if looks else ""))
+        if custom is not None and own_code:
+            custom.append(key)
     out = io.BytesIO()
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
         for folder in ("", "contents/", "images/", "video/", "audio/", "documents/", "classes/"):
@@ -107,16 +113,39 @@ def convert(key, data, sources, unconverted, custom=None):
     return out.getvalue()
 
 
-def with_slide_stylesheet(body):
-    """The class body with the slide template's stylesheet method first on
-    its instance side (after the header's closing parenthesis and the
-    opening one of the instance side), unless it defines a stylesheet."""
+def instance_side(body):
+    """The index just after the parenthesis that opens the instance side of
+    the class body: past the header's balanced parentheses, skipping string
+    literals and comments, then the next opening parenthesis."""
+    i, depth, n = body.index("("), 0, len(body)
+    while i < n:
+        if body.startswith("(*", i):
+            i = body.index("*)", i + 2) + 2
+            continue
+        c = body[i]
+        if c == "'":
+            i = body.index("'", i + 1) + 1
+            continue
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                j = body.index("(", i + 1)
+                if body[i + 1:j].strip():
+                    raise SystemExit("unexpected text between header and instance side:\n" + body)
+                return j + 1
+        i += 1
+    raise SystemExit("no instance side in the class body:\n" + body)
+
+
+def with_stylesheet(body, expression):
+    """The class body with a stylesheet method answering expression first
+    on its instance side, unless it defines a stylesheet already."""
     if re.search(r"\bstylesheet\s*=", body):
         return body
-    m = re.match(r"(\(.*?\)\s*\()", body, re.S)
-    if m is None:
-        raise SystemExit("cannot add a stylesheet to the class body:\n" + body)
-    return body[:m.end()] + "\n\tpublic stylesheet = (\n\t\t^slideStylesheet\n\t)" + body[m.end():]
+    i = instance_side(body)
+    return body[:i] + "\n\tpublic stylesheet = (\n\t\t^" + expression + "\n\t)" + body[i:]
 
 
 def renamed(data, renames, edit=lambda path, text: text):
@@ -170,6 +199,7 @@ def main():
     if out_dir == docs_dir or docs_dir in out_dir.parents:
         raise SystemExit("OUTDIR must not be DOCS, or inside it")
     results = corpus.run(work, docs_dir)
+    LOOKS.update({r["name"]: r["result"].get("looks", "") for r in results if "source" in r["result"]})
     sources = {r["name"]: r["result"]["source"] for r in results
                if "source" in r["result"] and r["result"].get("done")}
     unconverted, custom, kept = [], [], []
@@ -200,7 +230,7 @@ def main():
     for key in unconverted:
         print("  unconverted:", key)
     for key in custom:
-        print("  slide with a class body of its own (given the slide stylesheet method):", key)
+        print("  class body of its own, given a stylesheet method:", key)
     for name in kept:
         print("  edited since it was written, so left as it is:", name)
 

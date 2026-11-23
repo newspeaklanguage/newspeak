@@ -379,6 +379,23 @@ console.log(`${scenarios.length - failures}/${scenarios.length} scenarios passed
   console.log(`delete a word ${wordOk ? "yes" : "NO"}, spelling correction ${spellOk ? "yes" : "NO"}\n     after word ${JSON.stringify(afterWord)}\n     after correction ${JSON.stringify(afterSpell)}`);
 }
 
+// A string field (a title given as a string) is edited in place: its new
+// text replaces the string literal when one leaves it; one left unchanged
+// changes nothing.
+{
+  await js(`emmanuelLoad(${JSON.stringify("[\\title: 'Plain'\\][\\paragraph\\]x[\\endParagraph\\]")})`);
+  const field = "[...document.body.firstChild.querySelectorAll('[data-string-field]')].find((e) => e.textContent.startsWith('Plain'))";
+  const editable = await js(`(${field}).getAttribute('contenteditable')`);
+  await js(`(() => { const f = ${field}; f.focus(); f.dispatchEvent(new FocusEvent('focusout', { bubbles: true })); })()`);
+  const unchanged = await source();
+  await js(`(() => { const f = ${field}; f.focus(); f.textContent = 'Plainer'; f.dispatchEvent(new FocusEvent('focusout', { bubbles: true })); })()`);
+  const edited = await source();
+  const ok = editable === "plaintext-only" && unchanged === "[\\title: 'Plain'\\][\\paragraph\\]x[\\endParagraph\\]"
+    && edited === "[\\title: 'Plainer'\\][\\paragraph\\]x[\\endParagraph\\]";
+  if (!ok) failures++;
+  console.log(`string fields edited in place ${ok ? "yes" : "NO"}\n     editable ${editable}; unchanged ${JSON.stringify(unchanged)}; edited ${JSON.stringify(edited)}`);
+}
+
 // A source that does not lex shows, above the dimmed view, what is wrong and
 // where, with the line it is on; one that interprets again shows nothing.
 {

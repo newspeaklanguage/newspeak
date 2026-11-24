@@ -19,6 +19,43 @@ http://localhost:8080/croquetpsoup.html
     &reflector=ws://localhost:9090
 ```
 
+## On Eurasia (2026-11-23)
+
+The same sessions run on Eurasia, with the same reflector, file server and
+parameters. `eurasia/scripts/ide.sh` builds and stages it:
+
+```
+http://localhost:8080/eurasia-croquet.html?app=viewer&docName=About
+    &sessionId=<fresh>&pwd=x&appId=org.newspeaklanguage.eurasia.viewer
+    &apiKey=none&reflector=ws://localhost:9090&files=http://localhost:8080/files
+```
+
+`app=ide` runs the IDE instead (the image `ide/croquet.eus`); `app=viewer` is the default
+(`viewer/croquet.eus`). `?interpret` turns off the compiler.
+
+- **Platform.** `platform/Eurasia/CroquetRuntime.ns`. Its Platform subclasses
+  WebRuntime's and overrides `js`, `hopscotch` and `host` with the same three
+  wrappers psoup uses (JSForCroquet, HopscotchForCroquet, HostForCroquet).
+  JSForCroquet's `Js` inherits through `BaseJS`, which gives Eurasia's js the
+  `usingPlatform:` factory psoup's Aliens has.
+- **Build.** The platform definition is `withMirrorsHopscotchAndCroquet` in
+  EurasiaDeployment.ns. The build-list entries are `croquet-viewer` and
+  `croquet-ide`.
+- **Page.** `eurasia/web/croquet.html` loads the JS deploy's copy of the glue,
+  `croquet-glue.js`, which `tool/mirror-croquet-glue.py --emit` makes.
+  `nsProgramSrc` names `croquet-boot.js`, which starts Eurasia once
+  `Session.join` has produced the view.
+- **Verified 2026-11-23**, in two tabs:
+  - the viewer synchronises navigation;
+  - a late joiner catches up by replay;
+  - the IDE shares typing and evaluation in a workspace;
+  - there are no console errors.
+- **Not yet tried on Eurasia:**
+  - other browsers;
+  - the probes in `croquet-probes/`;
+  - large edits;
+  - file drops.
+
 ## The hosted service is gone; we self-host
 
 - `api.croquet.io` does not answer (HTTP 000, though DNS still resolves).

@@ -98,6 +98,7 @@ const keys = {
   CmdC: { key: "c", code: "KeyC", windowsVirtualKeyCode: 67, modifiers: 4, commands: ["copy"] },
   CmdV: { key: "v", code: "KeyV", windowsVirtualKeyCode: 86, modifiers: 4, commands: ["paste"] },
   AltBackspace: { key: "Backspace", code: "Backspace", windowsVirtualKeyCode: 8, modifiers: 1, commands: ["deleteWordBackward"] },
+  CtrlT: { key: "t", code: "KeyT", windowsVirtualKeyCode: 84, modifiers: 2, commands: ["transpose"] },
   CmdU: { key: "u", code: "KeyU", windowsVirtualKeyCode: 85, modifiers: 4 },
   CmdShiftX: { key: "X", code: "KeyX", windowsVirtualKeyCode: 88, modifiers: 12 },
   CmdComma: { key: ",", code: "Comma", windowsVirtualKeyCode: 188, modifiers: 4 },
@@ -377,6 +378,26 @@ console.log(`${scenarios.length - failures}/${scenarios.length} scenarios passed
   const spellOk = afterSpell === DOC;
   if (!wordOk || !spellOk) failures++;
   console.log(`delete a word ${wordOk ? "yes" : "NO"}, spelling correction ${spellOk ? "yes" : "NO"}\n     after word ${JSON.stringify(afterWord)}\n     after correction ${JSON.stringify(afterSpell)}`);
+}
+
+// Ctrl-T transposes: the characters on either side of the caret, or at the
+// end of a text the two before it (the browser's insertTranspose, whose range
+// is the two characters and whose data is them swapped).
+{
+  await js(`emmanuelLoad(${JSON.stringify(DOC)})`);
+  await js("caretAt('Hello', 2)");
+  await key("CtrlT");
+  await sleep(300);
+  const inside = await source();
+  await js(`emmanuelLoad(${JSON.stringify(DOC)})`);
+  await js("caretAt('world', 5)");
+  await key("CtrlT");
+  await sleep(300);
+  const atEnd = await source();
+  const insideOk = inside === DOC.replace("Hello", "Hlelo");
+  const atEndOk = atEnd === DOC.replace("world", "wordl");
+  if (!insideOk || !atEndOk) failures++;
+  console.log(`transpose inside a word ${insideOk ? "yes" : "NO"}, at the end of a text ${atEndOk ? "yes" : "NO"}\n     inside ${JSON.stringify(inside)}\n     at the end ${JSON.stringify(atEnd)}`);
 }
 
 // A string field (a title given as a string) is edited in place: its new

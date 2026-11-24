@@ -8,7 +8,7 @@ Converts every document under DOCS (default ~/newspeak/dev/web/docs) with
 emmanuel-corpus.py (headless Chrome; the static server must be serving out/
 on localhost:8080), then writes, for each zip under DOCS, a zip at the same
 relative path under OUTDIR that holds the document as an Emmanuel document
-(EmmanuelDocuments.ns):
+(Ampleforth.ns):
 
   NAME/NAME.ems    the converted source
   NAME/NAME.class  the class body, from the HTML's classBody attribute

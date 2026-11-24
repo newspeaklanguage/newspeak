@@ -51,12 +51,19 @@ def documents_in(name, data, out):
             documents_in(name + "/" + parts[2][:-4], archive.read(entry), out)
 
 
+def from_tree(name):
+    """Whether the module named name is taken from the source tree rather
+    than from out/, which may hold older copies: the Emmanuel modules and the
+    Ampleforth editor modules made from them."""
+    return name.startswith("Emmanuel") or name in ("Ampleforth.ns", "AmpleforthEditor.ns", "AmpleforthView.ns")
+
+
 def build(app="EmmanuelCorpusApp", snapshot="EmmanuelCorpus.vfuel", tree=()):
     # The Emmanuel modules, and those named in tree, come from the source
     # tree, not from out/, which may hold older copies (an IDE build copies
     # the tree there).
-    sources = [str(p) for p in sorted(OUT.glob("*.ns")) if not p.name.startswith("Emmanuel") and p.name not in tree]
-    sources += [str(p) for p in sorted(NEWSPEAK.glob("Emmanuel*.ns"))]
+    sources = [str(p) for p in sorted(OUT.glob("*.ns")) if not from_tree(p.name) and p.name not in tree]
+    sources += [str(p) for p in sorted(NEWSPEAK.glob("*.ns")) if from_tree(p.name)]
     sources += [str(NEWSPEAK / name) for name in tree]
     sources += [str(p) for p in sorted(OUT.glob("platform/*/*.ns"))]
     images = [str(p) for p in sorted(OUT.glob("*.png"))]

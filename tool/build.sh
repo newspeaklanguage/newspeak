@@ -228,7 +228,6 @@ python3 ${NEWSPEAK}/tool/check-duplicate-modules.py . || exit 1
 # not needed, included in html both index.html for WebIDE and primordialsoup.html:    CodeMirror/addon/display/autorefresh.js \
 #     PrimordialSoup/WebRuntime HopscotchWebIDE HopscotchWebIDE.vfuel \
 #     RuntimeForElectron HopscotchWebIDE HopscotchElectronIDE.vfuel \
-#     PrimordialSoup/WebRuntime Ampleforth Ampleforth.vfuel  \
 #     PrimordialSoup/WebRuntime AmpleforthViewer AmpleforthViewer.vfuel  \
 # not in git:   PrimordialSoup/WebRuntime Live22Submission Live22Submission.vfuel  \
 # not in git:   PrimordialSoup/WebRuntime Smalltalks22Tutorial Smalltalks22.vfuel  \
@@ -259,7 +258,6 @@ ${PRIMORDIALSOUP}/out/ReleaseX64/primordialsoup \
     $PLATFORM_NS \
     ./*.png \
     PrimordialSoup/WebRuntime HopscotchWebIDE HopscotchWebIDE.vfuel \
-    PrimordialSoup/WebRuntime Ampleforth Ampleforth.vfuel  \
     PrimordialSoup/WebRuntime AmpleforthViewer AmpleforthViewer.vfuel  \
     PrimordialSoup/CroquetRuntime CounterApp CroquetCounterApp.vfuel \
     PrimordialSoup/WebRuntime CounterApp CounterApp.vfuel \

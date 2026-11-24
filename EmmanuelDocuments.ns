@@ -111,6 +111,19 @@ media, and what the document's own class adds to contents/. *)
 			(type isNil not and: [ (type indexOf: 'audio') = 1 ]) ifTrue: [ ^'audio' ].
 			^'images'
 		)
+		public mutateContentsTo: s <String> from: origin = (
+			(* Set the source and publish it on contentsChanged. The live editor is
+the document's own, so it is brought to the new source here, whoever wrote it
+(a tool, a chat, an editor's raw view), unless it holds that source already,
+as when it made the change itself. While no editor shows it, it shows the new
+source when one next does. *)
+			
+			contents:: s.
+			(editor isNil or: [ editor session sourceString = s ]) ifFalse: [
+					editor source: s
+				].
+			contentsChanged send: {self. origin. }
+		)
 		public newLibrary: libraryClass = (
 			(* A library of the class libraryClass, a template's subclass of
 BlocksLibrary. *)
@@ -140,17 +153,32 @@ library's styles, and its stylesheet's. *)
 			^editors blocks slideStylesheet
 		)
 		public sourceFromLiveView: s = (
-			(* The live editor changed the source. *)
+			sourceFromLiveView: s from: nil
+		)
+		public sourceFromLiveView: s from: origin = (
+			(* The live editor changed the source. It is published on contentsChanged,
+as an HTML document's edits are, so that the document's other presentations,
+such as its viewer where another document transcludes it, show the change.
+origin is the editor presenter the change was made in, or nil. The live
+editor holds s already, so it is not brought to it (mutateContentsTo:from:
+would compare it with s, at the cost of converting the whole source, at every
+keystroke). *)
 			
-			contents:: s
+			s = contents ifTrue: [ ^self ].
+			contents:: s.
+			contentsChanged send: {self. origin. }
 		)
 		public sourceFromRawView: s = (
-			(* The raw view changed the source: the live editor shows it. While
-the source does not interpret, the editor shows the last one that did,
-dimmed. *)
+			sourceFromRawView: s from: nil
+		)
+		public sourceFromRawView: s from: origin = (
+			(* The raw view changed the source: the live editor shows it
+(mutateContentsTo:from:). While the source does not interpret, the editor
+shows the last one that did, dimmed. It is published on contentsChanged, as
+sourceFromLiveView: is. *)
 			
-			contents:: s.
-			editor isNil ifFalse: [ editor source: s ]
+			s = contents ifTrue: [ ^self ].
+			mutateContentsTo: s from: origin
 		)
 		public Stylesheet = (
 			(* A stylesheet, for templates that define their own: Stylesheet
@@ -194,24 +222,61 @@ live editor; and the document toolbar's commands, as edits of the source. *)
 			private cm
 			private live
 			private rawView
+			
+			(* This presenter's outlet on the document's contentsChanged duct, so
+that a change made elsewhere (a tool, a chat, another editor) is shown in the
+raw view; the document brings the live view up to date itself. *)
+			private contentsOutlet ::= nil.
+			
+			(* Set when a newer generation adopts this presenter's DOM: a retired
+presenter must not update. *)
+			public retired ::= false.
 		|
 	) (
 		definition = (
 			| doc = subject document. |
+			detachContentsOutlet.
+			contentsOutlet:: doc contentsChanged => [:packet |
+				(retired or: [ (packet at: 2) == self ]) ifFalse: [
+						[ cm text: doc contents ] on: Exception
+							do: [:e |
+								ide noteSwallowed: e in: 'updating an Emmanuel raw view'.
+								nil
+							]
+					].
+				nil
+			].
 			cm:: codeMirror: doc contents.
 			cm changeResponse: [:ed :event |
 					| incoming = ed textBeingAccepted. |
-					incoming = doc contents ifFalse: [ doc sourceFromRawView: incoming ].
+					incoming = doc contents ifFalse: [
+							doc sourceFromRawView: incoming from: self
+						].
 					nil
 				];
 				acceptResponse: [:ed :event |
 						| incoming = ed textBeingAccepted. |
-						incoming = doc contents ifFalse: [ doc sourceFromRawView: incoming ].
+						incoming = doc contents ifFalse: [
+								doc sourceFromRawView: incoming from: self
+							].
 						nil
 					].
 			live:: holder: (wired: doc liveEditor).
 			rawView:: collapsed: [ nothing ] expanded: [ cm ].
 			^row: {rawView. live. }
+		)
+		public detachContentsOutlet = (
+			(* Remove this presenter's outlet from the document's contentsChanged
+duct, so that a retired generation stops updating and the duct's outlets stay
+bounded. *)
+			
+			contentsOutlet isNil ifTrue: [ ^self ].
+			[ contentsOutlet detachFromAll ] on: Exception
+				do: [:e |
+					ide noteSwallowed: e in: 'detaching an Emmanuel editor outlet'.
+					nil
+				].
+			contentsOutlet:: nil
 		)
 		editor = (
 			^subject document liveEditor
@@ -289,7 +354,7 @@ live editor; and the document toolbar's commands, as edits of the source. *)
 			
 			| src = subject document liveEditor sourceWithPage: p. |
 			src isNil ifTrue: [ ^self ].
-			subject document sourceFromRawView: src.
+			subject document sourceFromRawView: src from: self.
 			cm text: src origin: 'liveview'
 		)
 		public respondToShowIt = (
@@ -307,11 +372,21 @@ live editor; and the document toolbar's commands, as edits of the source. *)
 		public toggleRawView = (
 			rawView toggle
 		)
+		updateVisualsFromSameKind: oldPresenter = (
+			(* A newer generation is adopting the old one's DOM: retire the old one
+and detach its contentsChanged outlet, so that only the live generation
+updates. *)
+			
+			| result = super updateVisualsFromSameKind: oldPresenter. |
+			oldPresenter retired: true.
+			oldPresenter detachContentsOutlet.
+			^result
+		)
 		wired: liveEditor = (
 			(* The live editor, its changes copied to the document and the raw view. *)
 			
 			liveEditor session changeHandler: [:src |
-					subject document sourceFromLiveView: src.
+					subject document sourceFromLiveView: src from: self.
 					cm text: src origin: 'liveview'.
 					nil
 				].

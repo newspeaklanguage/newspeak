@@ -6,7 +6,7 @@ Run from tool/:
   python3 emmanuel-liveness-probe.py WORKDIR DOCZIP [NAME] [--variant LABEL=FILE[,FILE2] ...] [--runs N]
 
 DOCZIP is an Emmanuel document zip; NAME defaults to its file name. Each
-variant is a version of EmmanuelDocuments.ns, and optionally of Documents.ns
+variant is a version of Ampleforth.ns, and optionally of Documents.ns
 (FILE2; the source tree's by default; with no variant, both the tree's, labelled
 "tree"); the IDE is built with EmmanuelDeckProbeApp and those versions
 into out/EmmanuelLiveness-LABEL.vfuel (the static server must be serving out/
@@ -49,11 +49,11 @@ def outer_zip(path, doc, name):
 
 
 def build(snapshot, documents, docs=None):
-    """The probe IDE, with documents as its EmmanuelDocuments.ns and docs (the
+    """The probe IDE, with documents as its Ampleforth.ns and docs (the
     tree's by default) as its Documents.ns."""
     tree = ("HopscotchForHTML5.ns", "Documents.ns")
-    sources = [str(p) for p in sorted(corpus.OUT.glob("*.ns")) if not p.name.startswith("Emmanuel") and p.name not in tree]
-    sources += [str(p) for p in sorted(corpus.NEWSPEAK.glob("Emmanuel*.ns")) if p.name != "EmmanuelDocuments.ns"]
+    sources = [str(p) for p in sorted(corpus.OUT.glob("*.ns")) if not corpus.from_tree(p.name) and p.name not in tree]
+    sources += [str(p) for p in sorted(corpus.NEWSPEAK.glob("*.ns")) if corpus.from_tree(p.name) and p.name != "Ampleforth.ns"]
     sources += [str(documents)]
     sources += [str(corpus.NEWSPEAK / "HopscotchForHTML5.ns"), str(docs or corpus.NEWSPEAK / "Documents.ns")]
     sources += [str(p) for p in sorted(corpus.OUT.glob("platform/*/*.ns"))]
@@ -93,7 +93,7 @@ def main():
         runs = int(args[i + 1])
         del args[i:i + 2]
     if not variants:
-        variants = [("tree", corpus.NEWSPEAK / "EmmanuelDocuments.ns", None)]
+        variants = [("tree", corpus.NEWSPEAK / "Ampleforth.ns", None)]
     work = Path(args[0]).resolve()
     work.mkdir(parents=True, exist_ok=True)
     doc = Path(args[1]).resolve()

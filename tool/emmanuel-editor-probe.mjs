@@ -1,4 +1,4 @@
-// Types into EmmanuelLiveEditor in a headless Chrome over the DevTools
+// Types into AmpleforthEditor in a headless Chrome over the DevTools
 // protocol and checks the sources it edits:
 // node emmanuel-editor-probe.mjs <debugging port> <page url>
 // Run by emmanuel-editor-probe.py, which starts Chrome and builds the snapshot.

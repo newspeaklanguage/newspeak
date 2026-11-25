@@ -30,7 +30,9 @@ instead.
 the image and provenance, the field interface (declared there; the
 library defines its block side in `07-library.spectec`, the fixture host its
 host side), points, anchors, carets, splices, the edits (`$replace`,
-`$split`, `$style`, setting a string, detaching), tidying, and the
+`$split`, `$style`, `$vstyle` for a style with a value such as `size:
+#large`, which a different value replaces, and `$unstyle`, setting a string,
+detaching), tidying, and the
 relation `Edit` with its refusals. A caret (`EXACT point` or `AT point
 anchor`) can lie in white space the view does not show, such as a trimmed
 trailing space; `$place` resolves an anchor to the point the view shows,
@@ -42,7 +44,9 @@ wrapped in `AFTERCARET`, because the pinned SpecTec mis-elaborates two
 adjacent lists of the same type in one constructor. Its regressions run in the library configuration, since
 edits need real blocks. The keys of the view (`$typeText`, `$deleteRange`,
 `$backspace`) are in 08-edit; Enter, block templates, and insertion
-(`$enter`, `$template`, `$insertAt`) are the library's. Every example in
+(`$enter`, `$template`, `$insertAt`) are the library's. The fixture host
+prints a sourceless keyword send whose one argument is a string constant,
+as an edit's valued style is, with that argument as the symbol `#u`. Every example in
 Section 7 of the LaTeX names the regression that checks it; the helper
 relations `LibAnchor`, `LibLoc`, `LibIsPoint`, `LibBackspace`, `LibEnter`,
 `LibInsertable`, `LibInsert`, `LibPlace`, `LibCaretOK`, and `LibEditCaret`

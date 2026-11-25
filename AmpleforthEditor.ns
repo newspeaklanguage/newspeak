@@ -658,6 +658,25 @@ tree that did is shown, dimmed, and typing in it does nothing. *)
 			session reinterpret: (emmanuel codePointsOf: w).
 			hasVisual ifTrue: [ render ]
 		)
+		public sourceAligning: a = (
+			(* The source with the blocks at the selection aligned to a, and the
+offset of the selection's start in it (Session align:from:to:); nil when the
+selection is not in this view, or there is nothing there to align. *)
+			
+			| selection range r |
+			selection:: domDocument getSelection.
+			(selection at: #rangeCount) = 0 ifTrue: [ ^nil ].
+			range:: selection getRangeAt: 0.
+			(root contains: (range at: #startContainer)) ifFalse: [ ^nil ].
+			r:: [
+				session align: a
+					from: (pointAt: (range at: #startContainer)
+						offset: (range at: #startOffset))
+					to: (pointAt: (range at: #endContainer) offset: (range at: #endOffset))
+			] on: Error do: [:e | nil ].
+			r isNil ifTrue: [ ^nil ].
+			^{emmanuel stringOfCodePoints: (r at: 1). r at: 2. }
+		)
 		public sourceOffsetAtX: x y: y = (
 			(* Sync: the offset (in code points) of the source of what this view
 shows at the point x, y of the window; nil when there is none. *)
@@ -873,6 +892,77 @@ whole source; for tests. *)
 				].
 			^true
 		)
+		public align: a from: p1 to: p2 = (
+			(* Alignment: the blocks of flow content from the point p1 to the point
+p2 (paragraphs, lists, quotes, tables, displays) aligned to a ('left',
+'center', or 'right') with the stylesheet's align: container, as {the new
+source (code points). the offset of p1 in it}; the source unchanged when it
+is aligned so already; nil when there is nothing there an align: can hold (a
+heading, or blocks of different sections). An align: that holds just those
+blocks, or that is the one block, is changed: left, where nothing around it
+aligns, removes it. Any other blocks are put in an align: of their own, inside
+any around them. *)
+			
+			| s e c path i j parent items target |
+			(failed or: [ p1 isNil or: [ p2 isNil ] ]) ifTrue: [ ^nil ].
+			s:: flowItemPathOf: p1.
+			e:: flowItemPathOf: p2.
+			(s isNil or: [ e isNil ]) ifTrue: [ ^nil ].
+			c:: 0.
+			[ c < s size and: [ c < e size and: [ (s at: c + 1) = (e at: c + 1) ] ] ] whileTrue: [
+					c:: c + 1
+				].
+			(c = s size or: [ c = e size ]) ifTrue: [
+					| p = s size <= e size ifTrue: [ s ] ifFalse: [ e ]. |
+					path:: p copyFrom: 1 to: p size - 1.
+					i:: p last.
+					j:: p last
+				]
+				ifFalse: [
+					path:: s copyFrom: 1 to: c.
+					i:: (s at: c + 1) min: (e at: c + 1).
+					j:: (s at: c + 1) max: (e at: c + 1)
+				].
+			parent:: treeAt: path.
+			items:: parent items copyFrom: i + 1 to: j + 1.
+			(items allSatisfy: [:g | g kind ~= #sub or: [ isFlowItem: g ref in: parent ] ]) ifFalse: [
+					^nil
+				].
+			target:: nil.
+			((isAlign: parent) and: [
+					(parent items select: [:g | g kind = #sub ]) allSatisfy: [:g |
+							items includes: g
+						]
+				]) ifTrue: [ target:: parent ].
+			(target isNil and: [ i = j and: [ isAlign: (parent items at: i + 1) ref ] ]) ifTrue: [
+					target:: (parent items at: i + 1) ref.
+					path:: path , {i. }
+				]
+				ifFalse: [
+					target isNil ifFalse: [ path:: path copyFrom: 1 to: path size - 1 ]
+				].
+			target isNil ifFalse: [
+					^edited: (realign: target to: a around: (alignsAround: path))
+						caret: (sourceOffsetAt: p1)
+				].
+			^edited: (wrap: (parent items at: i + 1) ref
+					to: (parent items at: j + 1) ref
+					in: a
+					around: (alignsAround: path , {i. }))
+				caret: (sourceOffsetAt: p1)
+		)
+		alignsAround: path = (
+			(* Whether a block on the path from the root to the block at path, not
+counting that block, is an align:. *)
+			
+			| tr ::= tree. |
+			1 to: path size - 1
+				do: [:k |
+					tr:: (tr items at: (path at: k) + 1) ref.
+					(isAlign: tr) ifTrue: [ ^true ]
+				].
+			^false
+		)
 		public apply: e = (
 			^apply: e typed: nil
 		)
@@ -952,6 +1042,21 @@ is the receiver of its amplets' code, so code that navigates
 			
 			evaluator isNil ifFalse: [ evaluator displayedIn: fragment ]
 		)
+		edited: changes caret: k = (
+			(* The source with the changes made, each {start. end. code points}
+replacing the source from start to end, in descending order of start; and
+the offset k after them. Nil changes leave the source as it is. *)
+			
+			| w ::= source. caret ::= k isNil ifTrue: [ 0 ] ifFalse: [ k ]. |
+			changes isNil ifTrue: [ ^{w. caret. } ].
+			changes do: [:ch |
+					| p = ch at: 1. q = ch at: 2. ins = ch at: 3. |
+					w:: (w copyFrom: 1 to: p) , ins , (w copyFrom: q + 1 to: w size).
+					q <= caret ifTrue: [ caret:: caret + ins size - (q - p) ]
+						ifFalse: [ p < caret ifTrue: [ caret:: p ] ]
+				].
+			^{w. caret. }
+		)
 		excerptOf: w at: p = (
 			(* The line of w that position p is on (at most 60 characters either
 side of it), and under it a mark at p. *)
@@ -972,6 +1077,22 @@ side of it), and under it a mark at p. *)
 			marks add: 94.
 			^emmanuel stringOfCodePoints: {10. } , line asArray , {10. } , marks asArray
 		)
+		flowItemPathOf: pt = (
+			(* The child indices from the root to the innermost block at the point
+pt that an align: can hold; nil when there is none, as in a section's
+heading. *)
+			
+			| tr ::= tree. path = List new. best ::= nil. |
+			pt steps do: [:st |
+					| child |
+					st isField ifTrue: [ ^best ].
+					child:: (tr items at: st index + 1) ref.
+					path add: st index.
+					(isFlowItem: child in: tr) ifTrue: [ best:: path asArray ].
+					tr:: child
+				].
+			^best
+		)
 		image = (
 			^{{'doc'. source. }. }
 		)
@@ -990,6 +1111,21 @@ side of it), and under it a mark at p. *)
 			problem:: nil.
 			nodes:: doc at: 1.
 			tree:: doc at: 2
+		)
+		isAlign: tr = (
+			^tr state stateName = 'align:'
+		)
+		isFlowItem: tr in: parent = (
+			(* Whether the block tr, a child of parent, is flow content that an
+align: there could hold: parent takes an align:, and tr is neither a section
+nor inline. *)
+			
+			^(parent state understands: 'align:') and: [
+					tr state stateName ~= 'section' and: [ tr state contentClass ~= #inline ]
+				]
+		)
+		isSpace: c = (
+			^{32. 9. 10. 13. } includes: c
 		)
 		lexProblem: e in: w = (
 			(* The reader's description of the lexical error e of the source w. *)
@@ -1054,6 +1190,19 @@ must never stop the source being interpreted. *)
 			^[ describeProblemOf: w ] on: Error
 				do: [:e | 'The source does not interpret.' ]
 		)
+		realign: tr to: a around: aligned = (
+			(* The changes that align the align: tr to a: none when it does
+already; removing it for left when nothing around it aligns; otherwise its
+alignment rewritten. Nil when it is not closed. *)
+			
+			| open = tr messages first. close = tr messages last. |
+			(tr flag = #closed and: [ tr messages size > 1 ]) ifFalse: [ ^nil ].
+			tr state args first = a ifTrue: [ ^nil ].
+			(a = 'left' and: [ aligned not ]) ifTrue: [
+					^{(removal: close) , {{}. }. (removal: open) , {{}. }. }
+				].
+			^{{open span start. open span end. emmanuel codePointsOf: 'align: ''' , a , ''''. }. }
+		)
 		public refresh = (
 			(* Interpret the source again, from its nodes, since the document's
 code (its blocks, their presenters, its constructs) may have changed; a
@@ -1095,6 +1244,29 @@ interpret. *)
 			nodes:: reparsed.
 			tree:: done tree
 		)
+		removal: s = (
+			(* The range of the source to delete to remove the statement s: with
+the period that separates it from the next statement, or from the one before;
+with its brackets when it is alone in them. *)
+			
+			| w = source. a = s span start. b = s span end. o ::= b. |
+			(o < w size and: [ (w at: o + 1) = 46 ]) ifTrue: [
+					o:: o + 1.
+					[ o < w size and: [ isSpace: (w at: o + 1) ] ] whileTrue: [ o:: o + 1 ].
+					^{a. o. }
+				].
+			o:: a - 1.
+			[ o >= 0 and: [ isSpace: (w at: o + 1) ] ] whileTrue: [ o:: o - 1 ].
+			(o >= 0 and: [ (w at: o + 1) = 46 ]) ifTrue: [ ^{o. b. } ].
+			(a >= 2 and: [
+					(w at: a - 1) = 91 and: [
+							(w at: a) = 92 and: [
+									b + 2 <= w size and: [ (w at: b + 1) = 92 and: [ (w at: b + 2) = 93 ] ]
+								]
+						]
+				]) ifTrue: [ ^{a - 2. b + 2. } ].
+			^{a. b. }
+		)
 		rootBlock = (
 			(* The root block to interpret with: the root of the document's block
 library, with its stylesheet, as its evaluator gives them. *)
@@ -1114,6 +1286,11 @@ the view; nil when the source does not interpret, or the point has no offset. *)
 		)
 		public sourceString = (
 			^emmanuel stringOfCodePoints: source
+		)
+		treeAt: path = (
+			| tr ::= tree. |
+			path do: [:k | tr:: (tr items at: k + 1) ref ].
+			^tr
 		)
 		unclosedOpenerIn: w = (
 			(* The position of the innermost bracket of w that is never closed,
@@ -1135,6 +1312,15 @@ matching openers and closers as they come; nil when there is none. *)
 				].
 			open isEmpty ifTrue: [ ^nil ].
 			^open last
+		)
+		wrap: first to: last in: a around: aligned = (
+			(* The changes that put the blocks from first to last in an align: to
+a: none for left when nothing around them aligns; nil when last is not
+closed. *)
+			
+			(a = 'left' and: [ aligned not ]) ifTrue: [ ^nil ].
+			(last flag = #closed or: [ last messages size = 1 ]) ifFalse: [ ^nil ].
+			^{{last messages last span end. last messages last span end. emmanuel codePointsOf: '. endAlign'. }. {first messages first span start. first messages first span start. emmanuel codePointsOf: 'align: ''' , a , '''. '. }. }
 		)
 	) : ()
 	public class ViewFragment session: s = Fragment new (

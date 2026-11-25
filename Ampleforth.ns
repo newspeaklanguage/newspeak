@@ -36,6 +36,7 @@ Emmanuel modules in Root. *)
 			emmanuel: (EmmanuelClass usingPlatform: p).
 	|
 ) (
+	lazy private JSObject = (* A host object: a lazy slot, so that a restore into a new host (Eurasia) looks it up again. *) window at: 'Object'.
 	lazy private JSString = (* A host object: a lazy slot, so that a restore into a new host (Eurasia) looks it up again. *) window at: 'String'.
 	public class EmmanuelDocument named: n contents: s = Document named: n
 		contents: s (
@@ -300,6 +301,17 @@ presenter must not update. *)
 			public retired ::= false.
 		|
 	) (
+		codePointIndexOf: u = (
+			(* The offset in code points of the source of the UTF-16 index u,
+which CodeMirror counts in. *)
+			
+			| cps = editor session source. n ::= 0. i ::= 0. |
+			[ n < u and: [ i < cps size ] ] whileTrue: [
+					n:: n + ((cps at: i + 1) > 65535 ifTrue: [ 2 ] ifFalse: [ 1 ]).
+					i:: i + 1
+				].
+			^i
+		)
 		definition = (
 			| doc = subject document. |
 			detachContentsOutlet.
@@ -361,18 +373,59 @@ bounded. *)
 		editor = (
 			^subject document liveEditor
 		)
+		public isFollowing = (
+			^editor following == true
+		)
 		public isKindOfEmmanuelEditorPresenter = (
 			^true
 		)
 		isMyKind: other = (
 			^other isKindOfEmmanuelEditorPresenter
 		)
+		markInRawView: k jump: jump = (
+			(* Show the offset k of the source in the raw view, and mark the word
+there for a moment; on a jump, put the raw view's cursor there. *)
+			
+			| ed = cm editor. pos word options mark |
+			ed isNil ifTrue: [ ^self ].
+			pos:: ed posFromIndex: (utf16IndexOf: k).
+			jump ifTrue: [
+					ed focus.
+					ed setCursor: pos
+				].
+			ed scrollIntoView: pos margin: 60.
+			word:: ed findWordAt: pos.
+			options:: JSObject new.
+			options at: #css put: 'background-color: rgba(240, 170, 0, 0.45)'.
+			mark:: ed markText: (word at: #anchor) to: (word at: #head) options: options.
+			window setTimeout: [
+					mark clear.
+					nil
+				]
+				with: 900
+		)
 		public noticeExposure = (
 			reclaimLiveEditor.
+			wireSync.
 			super noticeExposure
 		)
 		notYet: what = (
 			window alert: what , ' is not in Emmanuel yet.'
+		)
+		rawOffsetOf: ev in: cmi jump: jump = (
+			(* The offset in code points of the source in the raw view, the
+CodeMirror cmi: where the event ev happened, on a jump; its cursor, while
+following. *)
+			
+			| pos coords |
+			jump ifTrue: [
+					coords:: JSObject new.
+					coords at: #left put: (ev at: #clientX);
+						at: #top put: (ev at: #clientY).
+					pos:: cmi coordsChar: coords mode: 'window'
+				]
+				ifFalse: [ pos:: cmi getCursor ].
+			^codePointIndexOf: (cmi indexFromPos: pos)
 		)
 		reclaimLiveEditor = (
 			(* The document has one live editor, which all its editor presenters
@@ -463,8 +516,60 @@ back, or its live view would be empty. *)
 		public respondToUnderline = (
 			editor styleSelection: 'underline'
 		)
+		showInRawView: k jump: jump = (
+			(* Show the offset k of the source in the raw view: on a jump, opening
+the raw view if it is closed; while following, only when it is open. *)
+			
+			rawView isExpanded ifTrue: [ ^markInRawView: k jump: jump ].
+			jump ifFalse: [ ^self ].
+			rawView expand.
+			window setTimeout: [
+					markInRawView: k jump: jump.
+					nil
+				]
+				with: 50
+		)
 		stringLiteral: s = (
 			^'''' , ((JSString new: s) replaceAll: '''' with: '''''') , ''''
+		)
+		public syncFrom: ev jump: jump = (
+			(* The sync between the two views (issue #114), for the event ev in
+this presenter's view. A jump, Cmd-click (Ctrl-click elsewhere) in either
+view, puts the other's caret at the same place and shows it there; while
+following, a click or a key in either view shows the place of its caret in
+the other. *)
+			
+			| target = ev at: #target. ed = editor. cmElement k |
+			jump ifTrue: [
+					(((ev at: #metaKey) or: [ ev at: #ctrlKey ]) and: [ (ev at: #shiftKey) not ]) ifFalse: [
+							^self
+						]
+				]
+				ifFalse: [ isFollowing ifFalse: [ ^self ] ].
+			cmElement:: target closest: '.CodeMirror'.
+			cmElement isNil ifFalse: [
+					k:: rawOffsetOf: ev in: (cmElement at: #CodeMirror) jump: jump.
+					jump ifFalse: [ ^ed revealSourceOffset: k ].
+					ev preventDefault.
+					ev stopPropagation.
+					^ed showSourceOffset: k
+				].
+			(ed hasVisual and: [ ed visual contains: target ]) ifFalse: [ ^self ].
+			jump ifFalse: [
+					k:: ed sourceOffsetOfSelection.
+					k isNil ifFalse: [ showInRawView: k jump: false ].
+					^self
+				].
+			ev preventDefault.
+			k:: ed sourceOffsetAtX: (ev at: #clientX) y: (ev at: #clientY).
+			k isNil ifFalse: [ showInRawView: k jump: true ]
+		)
+		public toggleFollowing = (
+			(* Follow the caret between the views, or stop; following opens the
+raw view. *)
+			
+			editor following: isFollowing not.
+			(isFollowing and: [ rawView isExpanded not ]) ifTrue: [ rawView expand ]
 		)
 		public toggleRawView = (
 			rawView toggle
@@ -480,15 +585,55 @@ updates. *)
 			reclaimLiveEditor.
 			^result
 		)
-		wired: liveEditor = (
-			(* The live editor, its changes copied to the document and the raw view. *)
+		utf16IndexOf: k = (
+			(* The UTF-16 index, which CodeMirror counts in, of the offset k in
+code points of the source. *)
 			
+			| cps = editor session source. n ::= 0. |
+			1 to: (k min: cps size)
+				do: [:i | n:: n + ((cps at: i) > 65535 ifTrue: [ 2 ] ifFalse: [ 1 ]) ].
+			^n
+		)
+		wired: liveEditor = (
+			(* The live editor, its changes copied to the document and the raw view;
+this presenter syncs it with the raw view. *)
+			
+			liveEditor syncPresenter: self.
 			liveEditor session changeHandler: [:src |
 					subject document sourceFromLiveView: src from: self.
 					cm text: src origin: 'liveview'.
 					nil
 				].
 			^liveEditor
+		)
+		wireSync = (
+			(* Listen, once for each element this presenter's view is in, for the
+events of the sync between the views. The generations of presenters that
+adopt the element come and go; the listeners act through the presenter that
+shows the document's live editor now, when the element holds it. *)
+			
+			| v ed handler |
+			hasVisual ifFalse: [ ^self ].
+			v:: visual.
+			(v at: #emmanuelSync) == true ifTrue: [ ^self ].
+			v at: #emmanuelSync put: true.
+			ed:: editor.
+			handler:: [:ev :jump |
+				| p = ed syncPresenter. |
+				(p isNil not and: [ ed hasVisual and: [ v contains: ed visual ] ]) ifTrue: [
+						[ p syncFrom: ev jump: jump ] on: Error
+							do: [:e |
+								ide noteSwallowed: e in: 'syncing an Emmanuel document''s views'.
+								nil
+							]
+					].
+				nil
+			].
+			v addEventListener: 'mousedown'
+				action: [:ev | handler value: ev value: true ]
+				options: true.
+			v addEventListener: 'mouseup' action: [:ev | handler value: ev value: false ].
+			v addEventListener: 'keyup' action: [:ev | handler value: ev value: false ]
 		)
 	) : ()
 	public class EmmanuelEditorSubject onModel: doc = Subject onModel: doc (

@@ -541,6 +541,26 @@ the edit, or nil when it makes none. *)
 			].
 		^Error signal: 'between: the anchors are out of order'
 	)
+	blockAt: k tree: tr steps: ss = (
+		(* The point just before the block of tr, which is at ss, whose
+creating message holds the offset k, or just after the one whose closing
+message does; nil when no such message holds it. *)
+		
+		tr items keysAndValuesDo: [:j :g |
+				g kind = #sub ifTrue: [
+						| ms = g ref messages. r |
+						(ms isEmpty not and: [ span: ms first span holds: k ]) ifTrue: [
+								^gap: ss at: j - 1
+							].
+						(ms size > 1 and: [ span: ms last span holds: k ]) ifTrue: [
+								^gap: ss at: j
+							].
+						r:: blockAt: k tree: g ref steps: ss , {into: j - 1. }.
+						r isNil ifFalse: [ ^r ]
+					]
+			].
+		^nil
+	)
 	bracket: w statements: ss host: host = (
 		^openSeq , (emmanuel show: (host print: ss source: w) source: w host: host) , closeSeq
 	)
@@ -1176,6 +1196,27 @@ at the carets of the selection, or nil when it makes none. *)
 	litem: w = (
 		^LItem kind: #it ident: nil inline: false statement: nil origin: nil item: w
 	)
+	literalAt: k name: y tree: tr steps: ss = (
+		(* The path from tr, which is at ss, to the field of one of its blocks
+that holds a markup literal of the source y around the offset k, and the
+field's value; nil when there is none. *)
+		
+		(tr state fields: tr messages) keysAndValuesDo: [:i :phi |
+				| v = phi value. |
+				(v isKindOfTreeValue and: [
+						v literal sourceName = y and: [
+								v literal span start < k and: [ k < v literal span end ]
+							]
+					]) ifTrue: [ ^{ss , {fieldOf: i - 1. }. v. } ]
+			].
+		tr items keysAndValuesDo: [:j :g |
+				g kind = #sub ifTrue: [
+						| r = literalAt: k name: y tree: g ref steps: ss , {into: j - 1. }. |
+						r isNil ifFalse: [ ^r ]
+					]
+			].
+		^nil
+	)
 	loAt: is point: pt level: lv = (
 		lv < is size ifTrue: [ ^(is at: lv + 1) + 1 ].
 		pt isGap ifTrue: [ ^pt child ].
@@ -1338,6 +1379,19 @@ among the items, marked. *)
 			].
 		^{giveUp. }
 	)
+	offsetOf: a nodes: nodes source: w end: k = (
+		(* The offset in the source w of the anchor a among nodes, whose markup
+ends at k: the inverse of anchorAt:. *)
+		
+		| n |
+		a isEnd ifTrue: [ ^k ].
+		n:: nodes at: a node + 1.
+		a kind = #txt ifTrue: [
+				^n contentSpan start + (sourceLengthOf: a offset
+					in: (drop: n contentSpan start from: w))
+			].
+		^(n statements at: a offset + 1) span start
+	)
 	openLevels: path indices: is point: pt from: lv to: lv2 = (
 		(* op(R_l) M(R_l) for l from lv in to the innermost. *)
 		
@@ -1396,6 +1450,57 @@ among the items, marked. *)
 		count = 0 ifTrue: [ ^gap: found steps at: found index ].
 		count = ranges size ifTrue: [ ^gap: found steps at: found index + 1 ].
 		^in: found steps at: found index offset: count
+	)
+	public pointIn: image name: y document: doc offset: k = (
+		(* Sync (issue #114): the point of the view of the source y, whose nodes
+and tree are doc, that shows what is at its offset k. An offset in a markup
+literal that fills a field of a block, such as a section's heading, is in
+that field; one in the message that creates a block (or a leaf, such as an
+html: display, its string included) is just before the block, and one in the
+message that closes it just after it; one in text is at that text; any
+other, in a bracket, is where the bracket's effect shows: the start of the
+text after it. *)
+		
+		^pointIn: image
+			name: y
+			nodes: (doc at: 1)
+			tree: (doc at: 2)
+			markup: (docMarkup: y)
+			steps: {}
+			offset: k
+	)
+	pointIn: image name: y nodes: ns tree: tr markup: mk steps: ss offset: k = (
+		| found v mc nodes next |
+		found:: literalAt: k name: y tree: tr steps: {}.
+		found isNil ifFalse: [
+				v:: found at: 2.
+				^pointIn: image
+					name: y
+					nodes: v literal nodes
+					tree: v tree
+					markup: (Markup document: nil literal: v literal)
+					steps: ss , (found at: 1)
+					offset: k
+			].
+		found:: blockAt: k tree: tr steps: {}.
+		found isNil ifFalse: [ ^prefix: ss point: found ].
+		mc:: mctx: image nodes: ns markup: mk.
+		nodes:: mc nodes.
+		next:: k.
+		(nodes anySatisfy: [:n |
+				n contentSpan start <= k and: [ k <= n contentSpan end ]
+			]) ifFalse: [
+				next:: mc end.
+				nodes do: [:n |
+						(n contentSpan start > k and: [ n contentSpan start < next ]) ifTrue: [
+								next:: n contentSpan start
+							]
+					]
+			].
+		^prefix: ss
+			point: (place: nodes
+				tree: tr
+				anchor: (anchorAt: nodes source: (source: image name: y) offset: next))
 	)
 	posOf: s in: statements = (
 		statements keysAndValuesDo: [:i :t | (same: t as: s) ifTrue: [ ^i - 1 ] ].
@@ -1529,6 +1634,50 @@ among the items, marked. *)
 	source: image name: y = (
 		image do: [:entry | (entry at: 1) = y ifTrue: [ ^entry at: 2 ] ].
 		^Error signal: 'no source ' , y
+	)
+	sourceLengthOf: j in: u = (
+		(* The number of code points at the start of the source text u that lex
+to j characters: an escape is two; the inverse of lenU:. *)
+		
+		| n ::= 0. i ::= 1. |
+		[ n < j and: [ i <= u size ] ] whileTrue: [
+				((u at: i) = 92 and: [
+						i < u size and: [ (u at: i + 1) = 92 or: [ (u at: i + 1) = 91 ] ]
+					]) ifTrue: [ i:: i + 2 ] ifFalse: [ i:: i + 1 ].
+				n:: n + 1
+			].
+		^i - 1
+	)
+	public sourceOffsetIn: image name: y document: doc point: pt = (
+		(* Sync (issue #114): the offset in the source y, whose nodes and tree
+are doc, of the point pt of its view. A point in text that y does not hold,
+in a field that a literal of another source fills (a template's, say), is at
+the statement that sets the field; a point just before a block is at the
+message that creates it. *)
+		
+		| nv mk mc fr kids |
+		nv:: nav: (docMarkup: y) tree: (doc at: 2) steps: pt steps.
+		mk:: nv markup.
+		mk sourceName = y ifFalse: [
+				fr:: nv fieldRef.
+				fr markup sourceName = y ifTrue: [ ^fr field statement span start ].
+				^sourceOffsetIn: image name: y document: doc point: (gap: fr steps at: 0)
+			].
+		kids:: nv block items.
+		(pt isGap and: [ pt child < kids size ]) ifTrue: [
+				| g = kids at: pt child + 1. |
+				(g kind = #sub and: [ g ref messages isEmpty not ]) ifTrue: [
+						^g ref messages first span start
+					]
+			].
+		mc:: mctx: image nodes: (doc at: 1) markup: mk.
+		^offsetOf: (anchor: mc nodes nav: nv point: pt)
+			nodes: mc nodes
+			source: (source: image name: y)
+			end: mc end
+	)
+	span: s holds: k = (
+		^s start <= k and: [ k < s end ]
 	)
 	splice: w context: mc from: a to: b items: ws after: ws2 host: host = (
 		| lp = lpos: mc nodes end: mc end anchor: a. left = left: w

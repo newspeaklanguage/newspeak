@@ -111,14 +111,17 @@ OUTDIR/
 
 It builds with `scripts/build.sh viewer` and copies only tracked files:
 
-- The libraries are vendored in the eurasia repository (`web/vendor/`), at
-  pinned versions, with their licences: CodeMirror (the `lib/` and
-  `addon/display/autorefresh.js` files the pages load), JSZip, buffer,
-  isomorphic-git, lightning-fs, diff_match_patch.
-- The image list is the platform's: `PlatformDefinition` already answers the
-  images its WebRuntime resolves (EurasiaDeployment.ns, the `resolveImage:`
-  scan); the script copies those PNGs from the newspeak checkout, all of which
-  must then be tracked there.
+- The libraries are vendored in the eurasia repository (`web/libs/`, laid
+  out as they are served, so it is copied as it is), at pinned versions, with
+  their licences: CodeMirror (the `lib/` and `addon/display/autorefresh.js`
+  files the pages load), JSZip, buffer, isomorphic-git, lightning-fs,
+  diff_match_patch. `scripts/ide.sh` uses them too.
+- The image list is the application's: the build writes each one's image
+  resources (`Application>>imageResources`: its manifest's and its platform's)
+  as `target/build/<name>.images.txt`, and the script copies those PNGs from
+  the newspeak checkout, stopping if one is not tracked there.
+  `privateImage`, `protectedImage` and `publicImage` were only in `out/`
+  (copies of the tracked `*AccessImage.png`); they are now tracked too.
 
 Prerequisites, documented in `eurasia/BUILDING.md`: git checkouts of
 `eurasia` and `newspeak` side by side (or `NEWSPEAK` set), rustup (the
@@ -206,20 +209,54 @@ lands, with psoup a documented prerequisite of the build until then.
 
 ## 3. Steps
 
-1. Vendor the libraries; `site-runtime.sh`; `BUILDING.md`. Acceptance: the
+1. Vendor the libraries; `site-runtime.sh`; `BUILDING.md`. **Done 2026-11-25.** Acceptance: the
    runtime built from fresh clones in a temporary directory serves
    `eurasia-viewer.html?docName=Room101` from a local server.
 2. The Eurasia `deploy-boot.js` with the psoup fallback; the viewer reads
    `data-ampleforth-doc`. Acceptance: a copy of bracha.org, served locally,
-   shows every page on Eurasia, and `?psoup` shows it on psoup.
+   shows every page on Eurasia, and `?psoup` shows it on psoup. **Done 2026-11-25**, in the interim form of
+   §5.1: `DEFAULT_RUNTIME` in `deploy-boot.js` is `'psoup'`, `?eurasia` (or
+   `data-ampleforth-runtime="eurasia"`) opts in; the swap is that one line.
+   `eurasia-viewer.html` boots through the same script. Not yet: the version
+   query on `viewer/base.eus` (§4, Caching).
 3. Live URLs (2.3). Acceptance: on a local copy of the blog, open a post from
    the index, reload, and the post is shown; back returns to the index with
-   its URL; a post linked from a post works the same.
+   its URL; a post linked from a post works the same. **Done 2026-11-25**:
+   `Presenter>>pageURL` (nil by default) is pushed by
+   `SinglePageNavigationHistory>>visit:`; `DocumentViewerPresenter` answers
+   `<name>.html` (keeping `eurasia`/`psoup`/`interpret`), or, for the page's
+   own document, the page as opened (so `index.html` stays). Folder documents
+   push nothing. Back or forward to an entry a previous run pushed (before a
+   reload) reloads the page rather than showing the wrong document. Tested on
+   Eurasia on a local blog copy: post to post, back, forward, reload, back
+   across the reload. psoup gets it when its viewer is rebuilt. Found:
+   Room101's "Open in new tab" links are content naming
+   `primordialsoup.html?snapshot=...&docName=...`; they must become
+   `<Post>.html` before the swap.
 4. Deploy for Web on Eurasia (2.4); `deploy-site.sh`. Acceptance: Room101
    deployed from the Eurasia IDE gives the same pages as the current site
-   (diff of the unzipped bundles).
+   (diff of the unzipped bundles). **Done 2026-11-25.** Room101 deployed from
+   the Eurasia IDE (`ide.html?jit`, from a workspace, the bundle handed to a
+   block instead of the Save dialog): the same 186 files as the published
+   `deploy.Room101.zip`. Against the pages the blog serves, 82 of 84 pages are
+   byte-identical; ExpressionProblem and FreeObjectAlgebras differ only in
+   class code printed without `= Object new` (today's printer). Each document
+   zip differs only in its class-body header (the printer's form of an empty
+   body), plus, in Its_Alive, an empty `title=""` on the body that the site's
+   copy has and the new one drops; images are identical. `tool/deploy-site.sh
+   TARGET [BUNDLE]` (tracked) unzips the bundle, then builds the Eurasia site
+   runtime into TARGET (`site-runtime.sh`); `PSOUP_RUNTIME=dir` refreshes psoup's
+   runtime, otherwise the site's is kept. Tested into a copy of the blog: pages
+   boot on Eurasia (`?eurasia`) and psoup (default).
 5. Publish bracha.org, then the blog, then newspeaklanguage.org's documents.
    Each is checked live before the next.
+   **bracha.org published 2026-11-25** (gbracha/site `636aac0`, on top of
+   `0fa29d3`; to undo, revert `636aac0` and push), in the interim form:
+   psoup stays the default, `?eurasia` opts in. Checked live: all 10 pages
+   boot on Eurasia, the default still boots psoup, nav links push
+   `<Page>.html?eurasia` and back works. GitHub Pages serves `.eus` gzipped
+   (`viewer/base.eus` 7.8 MB, 2.4 MB on the wire; psoup's vfuel is 1.9 MB) with
+   `max-age=600`, which answers the compression question of section 4.
 6. The CI workflow (2.1).
 7. Stage 0 (2.5); psoup leaves `BUILDING.md`.
 

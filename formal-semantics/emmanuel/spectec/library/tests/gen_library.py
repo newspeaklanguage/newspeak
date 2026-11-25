@@ -274,7 +274,8 @@ errors('lib-misplaced-errors', W9,
 
 # ---- Editing (Section 7). Expected sources are hand-written.
 CONST.update({"actTitle": 1009, "standardTitle": 1010, "'Act I'": 1011, "'y := 2'": 1012,
-              "scratchTitle": 1013, "'http://x'": 1015, "'http://y'": 1016})
+              "scratchTitle": 1013, "'http://x'": 1015, "'http://y'": 1016,
+              "#large": 1017, "#small": 1018, "#xLarge": 1019})
 TEMPLATES = "standardTitle = ( ^[\\The Play\\] )"
 SRCNAME[0] = 'Templates'
 template_lit, _ = parse_literal(TEMPLATES, TEMPLATES.index(OPEN))
@@ -298,6 +299,8 @@ def AT(p, a): return '(AT %s (%s))' % (p, a)
 def REPLACE(p, q, *items, after=()): return '(REPLACE %s %s %s (AFTERCARET %s))' % (ex(p), ex(q), seq(*items), seq(*after))
 def SPLIT(p, lv): return '(SPLIT %s %d)' % (ex(p), lv)
 def STYLE(p, q, x): return '(STYLE %s %s "%s")' % (ex(p), ex(q), x)
+def VSTYLE(p, q, sigma): return '(VSTYLE %s %s %s)' % (ex(p), ex(q), sigma)
+def UNSTYLE(p, q, x): return '(UNSTYLE %s %s "%s")' % (ex(p), ex(q), x)
 def plain(src): return src.replace(CARET, '')
 def mark(src, before=None):
     """src with the caret just before the one occurrence of `before`, or at
@@ -408,6 +411,34 @@ O4u = "[\\paragraph\\][\\underline\\]Hi[\\endUnderline\\] [\\emphasis\\]all[\\en
 edit('edit-style-underline', E1, STYLE(GAPP(path(INTO(0)), 0), INP(path(INTO(0)), 0, 2), 'underline'),
      edited(mark(O4u, '[\\endUnderline\\] ')), out=O4u)
 tree('edit-style-underline-tree', O4u, doc(DOCF, [para(simple('underline', 'underline', 'endUnderline', run('Hi')), run(' '), emph_all)]))
+
+# Styles with a value (eq:edit-vstyle): applied, replaced over all or part
+# of a block of the style, removed by the same value, and unstyle.
+def size(step): return S('size:', C('#' + step))
+SZ0 = "[\\paragraph\\]Hello world[\\endParagraph\\]"
+SZ1 = "[\\paragraph\\]Hello [\\size: #large\\]world[\\endSize\\][\\endParagraph\\]"
+SZ2 = "[\\paragraph\\]Hello [\\size: #large\\]world[\\endSize. endParagraph\\]"
+SZ3 = "[\\paragraph\\]Hello [\\size: #xLarge\\]world[\\endSize. endParagraph\\]"
+P_SZ0, P_SZ1 = GAPP(path(INTO(0), INTO(1)), 0), GAPP(path(INTO(0), INTO(1)), 1)
+edit('edit-vstyle-apply', SZ0, VSTYLE(INP(path(INTO(0)), 0, 6), GAPP(path(INTO(0)), 1), size('large')),
+     edited(mark(SZ1, '[\\endSize')), out=SZ1)
+tree('edit-vstyle-apply-tree', SZ1, doc(DOCF, [para(run('Hello '),
+    sub(T(st('size:', strv('large')), [run('world')], [size('large'), S('endSize')])))]))
+O_SZr = "[\\paragraph\\]Hello [\\size: #small\\]world[\\endSize\\][\\endParagraph\\]"
+edit('edit-vstyle-replace', SZ2, VSTYLE(P_SZ0, P_SZ1, size('small')),
+     edited(mark(O_SZr, '[\\endSize')), out=O_SZr)
+O_SZp = "[\\paragraph\\]Hello [\\size: #small\\]wor[\\endSize. size: #large\\]ld[\\endSize. endParagraph\\]"
+edit('edit-vstyle-replace-part', SZ2, VSTYLE(P_SZ0, INP(path(INTO(0), INTO(1)), 0, 3), size('small')),
+     edited(mark(O_SZp, '[\\endSize. size:')), out=O_SZp)
+tree('edit-vstyle-replace-part-tree', O_SZp, doc(DOCF, [para(run('Hello '),
+    sub(T(st('size:', strv('small')), [run('wor')], [size('small'), S('endSize')])),
+    sub(T(st('size:', strv('large')), [run('ld')], [size('large'), S('endSize')])))]))
+edit('edit-vstyle-remove', SZ2, VSTYLE(P_SZ0, P_SZ1, size('large')),
+     edited(mark(SZ0, '[\\endParagraph')))
+edit('edit-unstyle', SZ3, UNSTYLE(P_SZ0, P_SZ1, 'size:'),
+     edited(mark(SZ0, '[\\endParagraph')))
+edit('edit-unstyle-plain', SZ0, UNSTYLE(INP(path(INTO(0)), 0, 6), GAPP(path(INTO(0)), 1), 'size:'),
+     edited(SZ0))
 
 # Deleting all of an emphasis removes it rather than leaving it empty.
 O6 = "[\\paragraph\\]Hi [\\endParagraph\\]"
@@ -677,6 +708,10 @@ VS3 = "[\\paragraph\\]H  Xi [\\emphasis\\]all[\\endEmphasis. endParagraph\\]"
 view1('view-spaces-typed', E1, INP(P0, 0, 1), KTYPE('  X'), viewed(mark(VS3, 'i [')), out=VS3)
 view1('view-style-collapsed', E1, INP(P0, 0, 1), KSTYLE('underline'), KEPT)
 view('view-style-unknown', E1, GAPP(P0, 0), INP(P0, 0, 2), KSTYLE('frobnicate'), KEPT)
+def KVSTYLE(sigma): return '(KVSTYLE %s)' % sigma
+def KUNSTYLE(x): return '(KUNSTYLE "%s")' % x
+view('view-vstyle', SZ0, INP(P0, 0, 6), GAPP(P0, 1), KVSTYLE(size('large')), viewed(mark(SZ1, '[\\endSize')), out=SZ1)
+view1('view-unstyle-collapsed', SZ2, INP(path(INTO(0), INTO(1)), 0, 2), KUNSTYLE('size:'), KEPT)
 view('view-style', E1, GAPP(P0, 0), INP(P0, 0, 2), KSTYLE('underline'), viewed(mark(O4u, '[\\endUnderline\\] ')), out=O4u)
 
 EB = "[\\paragraph\\]a [\\emphasis\\]bc[\\endEmphasis\\]d[\\endParagraph\\]"

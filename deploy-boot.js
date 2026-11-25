@@ -19,7 +19,9 @@
 //
 // The runtime is DEFAULT_RUNTIME, unless the page's body says otherwise
 // (data-ampleforth-runtime="psoup" or "eurasia"), and the URL overrides both
-// (?psoup or ?eurasia). On Eurasia, ?interpret runs without the compiler.
+// (?psoup or ?eurasia). On Eurasia, ?interpret runs without the compiler,
+// and Save Image keeps the image in the browser, to be offered at the next
+// load (?image=<name> opens one).
 //
 // Eurasia's files are fetched relative to this script, so a page in a
 // subdirectory that loads ../deploy-boot.js finds the runtime beside it;
@@ -43,7 +45,7 @@
         var added = muts[i].addedNodes;
         for (var j = 0; j < added.length; j++) {
           var n = added[j];
-          if (n.nodeType === 1 && n.id !== 'ampleforth-ssr' && n.tagName !== 'SCRIPT' && n.tagName !== 'LINK') {
+          if (n.nodeType === 1 && n.id !== 'ampleforth-ssr' && n.id !== 'eurasia-images' && n.tagName !== 'SCRIPT' && n.tagName !== 'LINK') {
             obs.disconnect();
             requestAnimationFrame(function () { if (ssr && ssr.parentNode) ssr.parentNode.removeChild(ssr); });
             return;
@@ -105,9 +107,36 @@
         }).then(function (b) { return new Uint8Array(b); });
       }
       var jit = here.searchParams.has('interpret') ? 0 : 1;
-      Promise.all([import(at('eurasia.mjs')), bytes('eurasia_web.wasm'), bytes('viewer/base.eus')])
+      // Saved images (eurasia's images.mjs): Save Image keeps the running
+      // image in the browser, and the page offers the saved ones, or a fresh
+      // start on its own document, the next time it loads; ?image=<name>
+      // opens one directly.
+      var images = import(at('images.mjs'))
+        .then(function (m) { return m.imageStore('eurasia-document-images'); })
+        .catch(function (e) { console.warn('deploy-boot: images are not kept:', e.message); return null; });
+      var start = images.then(function (store) {
+        if (!store) return null;
+        if (here.searchParams.has('image')) return store.read(here.searchParams.get('image'));
+        return store.list().then(function (saved) {
+          return saved.length > 0 ? store.choose(saved, 'Start fresh') : null;
+        });
+      }).catch(function (e) {
+        console.warn('deploy-boot: no saved images:', e.message);
+        return null;
+      }).then(function (saved) { return saved || bytes('viewer/base.eus'); });
+      Promise.all([import(at('eurasia.mjs')), bytes('eurasia_web.wasm'), start, images])
         .then(function (parts) {
-          return parts[0].run(parts[1], parts[2], { print: function (line) { console.log(line); }, jit: jit });
+          var store = parts[3];
+          return parts[0].run(parts[1], parts[2], {
+            print: function (line) { console.log(line); },
+            jit: jit,
+            onSaveImage: store && function (name, image) {
+              store.store(name, image).catch(function (e) {
+                console.error('deploy-boot: the image was not saved:', e);
+                alert('The image ' + name + ' was not saved: ' + e.message);
+              });
+            }
+          });
         })
         .then(function (result) {
           if (result.status === 'exited') console.log('eurasia: exited ' + result.code);

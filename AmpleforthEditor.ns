@@ -625,6 +625,12 @@ points) of the source, leaving the caret where it is. *)
 		public selectedText = (
 			^domDocument getSelection toString
 		)
+		public selectWordAtCaret = (
+			(* Extend the selection from the caret over the word after it, so that
+typing replaces it: a new section's heading. *)
+			
+			domDocument getSelection modify: 'extend' with: 'forward' with: 'word'
+		)
 		showProblem = (
 			(* Above the view, what is wrong with a source that does not
 interpret (its lexical or syntax error, where, and the line it is on), while
@@ -677,6 +683,30 @@ selection is not in this view, or there is nothing there to align. *)
 			r isNil ifTrue: [ ^nil ].
 			^{emmanuel stringOfCodePoints: (r at: 1). r at: 2. }
 		)
+		sourceAtCaret: op = (
+			(* What op, given the point of the start of the selection, answers: {a
+source (code points). an offset}, with the source as a string; nil when the
+selection is not in this view, or op answers nil. *)
+			
+			| selection range r |
+			selection:: domDocument getSelection.
+			(selection at: #rangeCount) = 0 ifTrue: [ ^nil ].
+			range:: selection getRangeAt: 0.
+			(root contains: (range at: #startContainer)) ifFalse: [ ^nil ].
+			r:: [
+				op value: (pointAt: (range at: #startContainer)
+						offset: (range at: #startOffset))
+			] on: Error do: [:e | nil ].
+			r isNil ifTrue: [ ^nil ].
+			^{emmanuel stringOfCodePoints: (r at: 1). r at: 2. }
+		)
+		public sourceEndingSection = (
+			(* The source with the section the caret is in ended after the caret's
+block, and the offset of what now follows it (Session endSectionAt:); nil
+when there is none. *)
+			
+			^sourceAtCaret: [:pt | session endSectionAt: pt ]
+		)
 		public sourceOffsetAtX: x y: y = (
 			(* Sync: the offset (in code points) of the source of what this view
 shows at the point x, y of the window; nil when there is none. *)
@@ -706,6 +736,12 @@ view (the focus of the selection); nil when the caret is elsewhere. *)
 							]
 					]
 			] on: Error do: [:e | nil ]
+		)
+		public sourceOpeningSection = (
+			(* The source with a new subsection after the caret's block, and the
+offset of its heading (Session openSectionAt:); nil when there is none. *)
+			
+			^sourceAtCaret: [:pt | session openSectionAt: pt ]
 		)
 		public sourceWithPage: p = (
 			(* The source with its page: statement set to p: the statement that
@@ -1057,6 +1093,41 @@ the offset k after them. Nil changes leave the source as it is. *)
 				].
 			^{w. caret. }
 		)
+		public endSectionAt: pt = (
+			(* Sections: the section the point pt is in ended just after the block
+pt is in, so that what followed it in the section is in the section around
+it, or the document, instead; at the end of the section, an empty paragraph
+added after it. As {the new source. the offset of the start of what now
+follows the section}; nil when pt is in no section. *)
+			
+			| found sec c close later at |
+			failed ifTrue: [ ^nil ].
+			found:: sectionChildPathOf: pt.
+			found isNil ifTrue: [ ^nil ].
+			(found at: 2) ifTrue: [
+					sec:: treeAt: (found at: 1).
+					c:: -1
+				]
+				ifFalse: [
+					sec:: treeAt: ((found at: 1) copyFrom: 1 to: (found at: 1) size - 1).
+					c:: (found at: 1) last
+				].
+			(sec state stateName = 'section' and: [ sec flag = #closed ]) ifFalse: [
+					^nil
+				].
+			close:: sec messages last.
+			later:: (sec items copyFrom: c + 2 to: sec items size) select: [:g |
+					g kind = #sub
+				].
+			later isEmpty ifTrue: [
+					^{(edited: {{close span end. close span end. emmanuel codePointsOf: '. paragraph\][\endParagraph'. }. }
+						caret: nil) at: 1. close span end + 13. }
+				].
+			at:: c < 0 ifTrue: [ sec messages first span end ]
+				ifFalse: [ (sec items at: c + 1) ref messages last span end ].
+			^edited: {(removal: close) , {{}. }. {at. at. emmanuel codePointsOf: '. endSection'. }. }
+				caret: (textOffsetOf: later first ref)
+		)
 		excerptOf: w at: p = (
 			(* The line of w that position p is on (at most 60 characters either
 side of it), and under it a mark at p. *)
@@ -1127,6 +1198,20 @@ nor inline. *)
 		isSpace: c = (
 			^{32. 9. 10. 13. } includes: c
 		)
+		lastRunIn: tr = (
+			(* The last run of text in the block tr, in it or in the blocks in
+it; nil when it has none. *)
+			
+			| r ::= nil. |
+			tr items do: [:g |
+					g kind = #run ifTrue: [ r:: g ].
+					g kind = #sub ifTrue: [
+							| x = lastRunIn: g ref. |
+							x isNil ifFalse: [ r:: x ]
+						]
+				].
+			^r
+		)
 		lexProblem: e in: w = (
 			(* The reader's description of the lexical error e of the source w. *)
 			
@@ -1159,6 +1244,55 @@ last field it enters. *)
 			| ss = e first point steps. k ::= 0. |
 			ss keysAndValuesDo: [:i :s | s isField ifTrue: [ k:: i ] ].
 			^ss copyFrom: 1 to: k
+		)
+		public openSectionAt: pt = (
+			(* Sections: a new section, with the heading Heading and an empty
+paragraph, at the point pt, a subsection of the section pt is in. In the
+middle of a block's text, the block is split there, and the section goes
+between the two halves; at the start of the block, before any of its text,
+it goes just before the block; at its end, just after it. When pt is in a
+section's heading, the new section starts that section. The block is the
+innermost one around pt that a section can follow: one whose parent is the
+document or a section. As {the new source. the offset of the new heading};
+nil when there is no such block. *)
+			
+			^openSectionAt: pt splitting: true
+		)
+		public openSectionAt: pt splitting: splitting = (
+			(* openSectionAt:, splitting the block in the middle of its text only
+when splitting; public for the session of the split source to answer. *)
+			
+			| found tr at k last r |
+			failed ifTrue: [ ^nil ].
+			found:: sectionChildPathOf: pt.
+			found isNil ifTrue: [ ^nil ].
+			tr:: treeAt: (found at: 1).
+			(found at: 2) ifTrue: [ at:: tr messages first span end ]
+				ifFalse: [
+					k:: sourceOffsetAt: pt.
+					(k isNil not and: [
+							k <= (sourceOffsetAt: (pointAtSourceOffset: (textOffsetOf: tr)))
+						]) ifTrue: [
+							at:: tr messages first span start.
+							^{(edited: {{at. at. emmanuel codePointsOf: 'section: [\Heading\]. paragraph\][\endParagraph. endSection. '. }. }
+								caret: nil) at: 1. at + 11. }
+						].
+					last:: lastRunIn: tr.
+					(splitting and: [
+							k isNil not and: [
+									last isNil not and: [
+											k < (sourceOffsetAt: (pointAtSourceOffset: last span end))
+										]
+								]
+						]) ifTrue: [
+							r:: splitAt: pt level: (found at: 1) size.
+							r isNil ifFalse: [ ^r ]
+						].
+					(tr flag = #closed or: [ tr messages size = 1 ]) ifFalse: [ ^nil ].
+					at:: tr messages last span end
+				].
+			^{(edited: {{at. at. emmanuel codePointsOf: '. section: [\Heading\]. paragraph\][\endParagraph. endSection'. }. }
+				caret: nil) at: 1. at + 13. }
 		)
 		placeOf: p in: w = (
 			(* Where position p of w is: its line and column, from 1. *)
@@ -1275,6 +1409,27 @@ library, with its stylesheet, as its evaluator gives them. *)
 			evaluator isNil ifFalse: [ r stylesheet: evaluator stylesheet ].
 			^r
 		)
+		sectionChildPathOf: pt = (
+			(* The path to the innermost block around the point pt whose parent
+takes sections (the document, or a section), and whether pt is in its
+heading: {path. inHeading}; nil when there is none. *)
+			
+			| tr ::= tree. path = List new. best ::= nil. |
+			pt steps do: [:st |
+					| child |
+					st isField ifTrue: [
+							^best isNil ifTrue: [ nil ]
+								ifFalse: [
+									{best. best size = path size and: [ tr state stateName = 'section' ]. }
+								]
+						].
+					child:: (tr items at: st index + 1) ref.
+					path add: st index.
+					(tr state understands: 'section:') ifTrue: [ best:: path asArray ].
+					tr:: child
+				].
+			^best isNil ifTrue: [ nil ] ifFalse: [ {best. false. } ]
+		)
 		public sourceOffsetAt: pt = (
 			(* Sync: the offset (in code points) of the source of the point pt of
 the view; nil when the source does not interpret, or the point has no offset. *)
@@ -1286,6 +1441,37 @@ the view; nil when the source does not interpret, or the point has no offset. *)
 		)
 		public sourceString = (
 			^emmanuel stringOfCodePoints: source
+		)
+		splitAt: pt level: lv = (
+			(* A new section between the two halves of the block at the level lv
+of the path to the point pt, split there as Enter splits a paragraph; nil
+when the edit layer refuses the split. *)
+			
+			| r s |
+			r:: [
+				edits edit: (edits split: (edits exact: pt) level: lv)
+					image: image
+					name: 'doc'
+					document: {nodes. tree. }
+					host: host
+			] on: Error do: [:e | nil ].
+			(r isNil or: [
+					r isRefused or: [ r sourceName ~= 'doc' or: [ r caret isNil ] ]
+				]) ifTrue: [ ^nil ].
+			s:: Session source: (emmanuel stringOfCodePoints: r chars)
+				evaluator: evaluator.
+			^s openSectionAt: (s pointAtSourceOffset: r caret) splitting: false
+		)
+		textOffsetOf: tr = (
+			(* An offset of the source where a caret shows the block tr: in its
+heading, when it has one (a section); otherwise just after the message that
+creates it, which is where its text starts. *)
+			
+			| fields = tr state fields: tr messages. |
+			(fields isEmpty not and: [ fields first value isKindOfTreeValue ]) ifTrue: [
+					^fields first value literal span start + 2
+				].
+			^tr messages first span end
 		)
 		treeAt: path = (
 			| tr ::= tree. |

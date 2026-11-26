@@ -722,6 +722,16 @@ activation or loop turn).
   arguments go, then the copied values, and the closure's compiled body
   is called. Anything else, or a body not compiled: the operands are
   put back and the helper runs the send.
+- **Methods of SmallInteger** (fourteenth step, 2026-11-26). A case
+  whose receiver is a SmallInteger and whose method is ordinary is now
+  called in line like any other; the call never needed the receiver's
+  header, only the compiler's choice of cases left it out.
+- **Float arithmetic and `asFloat`** (fifteenth step, 2026-11-26).
+  `+`, `-`, `*` and `/` of a Float with a Float or a SmallInteger, and
+  `asFloat` of a SmallInteger: the fresh Float (its header is in the
+  register block, like a String's) is written in the nursery, NaN made
+  canonical as the native makes it. Another operand, no room, no
+  allowance: the helper.
 - **Through one helper:** every other instruction: sends to receivers no
   case fits, other natives, a non-local
   return that meets `ensure:` or cannot complete. The helper runs it as the interpreter would, on the
@@ -786,7 +796,11 @@ activation or loop turn).
   unchanged. Helper calls over the whole run, counted without the
   profile: 23.6 million to 12.2 million. The thirteenth against the
   twelfth: ParserCombinators 46.9 to 59.4, the rest unchanged (Splay
-  904 against 936, within what it varies by).
+  904 against 936, within what it varies by). The fourteenth against
+  the thirteenth: nothing measurable (Splay 922 against 880, which it
+  varies by). The fifteenth against the fourteenth: nothing measurable
+  either (Splay 929 against 908); compiled code 2,103,320 to 2,118,796
+  bytes over the run.
 - **What still calls the helper** (`EASTASIA_JIT_PROFILE=1` counts its
   calls by kind; measured before the third step, 128 million calls):
   closure `value` 28 million, closure creation 19 million, returns from
@@ -825,7 +839,11 @@ activation or loop turn).
   loop fall from 345 thousand to 70 thousand: a Float's `asString` 0.8
   million, ordinary methods of SmallInteger 0.6 million, an Array's
   `replaceFrom:to:with:startingAt:` 0.4 million, Float division and
-  `asFloat` 0.2 million each.
+  `asFloat` 0.2 million each. After the fourteenth, 2.0 million, no
+  method of SmallInteger among them. After the fifteenth, 1.6
+  million: a Float's `asString` 0.9 million, an Array's
+  `replaceFrom:to:with:startingAt:` 0.4 million, instruction 255 0.18
+  million; nothing else above 35 thousand.
 - **A fault found on the way.** The native that replaces a method's
   bytecode left the old compiled code and its table entry in place. It
   now discards compiled code, like any other program change.
@@ -834,8 +852,7 @@ activation or loop turn).
   13 seconds interpreted: every change discards all code, which is then
   compiled again. Dependencies (7.6) are the cure; a cheaper first step is
   to raise the threshold after each discard.
-- **Next, in order of what the numbers say:** methods of SmallInteger
-  called in line; Float division and `asFloat`; discarding
+- **Next:** the helper is no longer where the time goes; discarding
   less on a program change; then the graph and inlining of 7.1, which is where values start
   to live in registers and where a closure that does not escape need not
   be created at all.

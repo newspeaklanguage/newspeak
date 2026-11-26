@@ -383,6 +383,24 @@ W15 = "[\\page: nil. page: 'Hamlet'. page: 'x := 1'\\]"
 s_pn, s_ph, s_px = S('page:', C('nil')), S('page:', C("'Hamlet'")), S('page:', C("'x := 1'"))
 tree('lib-page', W15, doc((NIL, NIL, NIL, strv('Hamlet')), [refused(s_pn), mut(s_ph), refused(s_px)], [s_ph]))
 
+# Notes (eq:lib-note-numbers): a note is an inline block that holds
+# anything, other notes and flow content included; notes are numbered in
+# document order, a block's fields before its children.
+def note(*items): return simple('footnote', 'note', 'endNote', *items)
+def notes(name, src, *paths):
+    register(src); rel(name, 'LibNotes', '(HOSTSTATE 0, %s)' % chars(src),
+                        ' '.join('(NOTEAT %s)' % path(*p) for p in paths) if paths else 'eps')
+WN1 = "[\\paragraph\\]Hi[\\note\\]a remark[\\endNote\\] there.[\\endParagraph\\]"
+tree('lib-notes', WN1, doc(DOCF, [para(run('Hi'), note(run('a remark')), run(' there.'))]))
+WN2 = ("[\\paragraph\\]x[\\note\\]see[\\note\\]deep[\\endNote. paragraph\\]more"
+       "[\\endParagraph. endNote\\]y[\\endParagraph\\]")
+tree('lib-notes-anything', WN2, doc(DOCF, [para(run('x'),
+    note(run('see'), note(run('deep')), para(run('more'))), run('y'))]))
+errors('lib-notes-anything-errors', WN2, [], [])
+WN3 = ("[\\title: [\\T[\\note\\]t[\\endNote\\]\\]. paragraph\\]a[\\note\\]1[\\endNote\\]b"
+       "[\\note\\]2[\\note\\]3[\\endNote. endNote. endParagraph\\]")
+notes('lib-note-numbers', WN3, (FLD(0), INTO(1)), (INTO(1), INTO(1)), (INTO(1), INTO(3)), (INTO(1), INTO(3), INTO(1)))
+
 rows.append('# Editing (Section 7).')
 emph_all = simple('emph', 'emphasis', 'endEmphasis', run('all'))
 E1 = "[\\paragraph\\]Hi [\\emphasis\\]all[\\endEmphasis. endParagraph\\]"

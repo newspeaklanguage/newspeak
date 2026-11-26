@@ -124,6 +124,14 @@ shows, another document's view, say. *)
 			f attributes: f attributes , {{'data-amplet'. ''. }. }.
 			^f
 		)
+		styleOf: b = (
+			(* An amplet's content is not the text around it: an align: around a
+block amplet places it as a whole (Presentation align:), and does not align
+what it shows. *)
+			
+			b isInline ifTrue: [ ^super styleOf: b ].
+			^(super styleOf: b) , ' text-align: start; margin-left: var(--emmanuel-amplet-left, 0); margin-right: var(--emmanuel-amplet-right, 0); width: var(--emmanuel-amplet-width, auto); max-width: 100%;'
+		)
 	) : ()
 	public class AmpletRunner evaluator: ev = (
 		(* Runs the amplets of the trees a view renders, and keeps what they
@@ -141,6 +149,11 @@ evaluator, an amplet shows its code. *)
 			private cache ::= Map new.
 			private next ::= Map new.
 			private counts ::= Map new.
+			
+			(* The view's notes: their numbers in the current rendering, and the
+open ones (openNotes); nil until there are some, as in a hot-loaded runner. *)
+			private numbers
+			private notesOpen
 		|
 	) (
 		public adopt: other = (
@@ -170,8 +183,45 @@ document does from the one it replaces. *)
 			next at: key put: result.
 			^result
 		)
+		public fragmentsDo: action = (
+			(* Evaluate action with each fragment the amplets of the current
+rendering show: the logical children of the view that renders them, for
+Hopscotch's walks of the fragment tree (noticeExposure, refresh,
+hasPendingChanges). *)
+			
+			cache keysAndValuesDo: [:key :r |
+					r isKindOfFragment ifTrue: [ action value: r ]
+				]
+		)
+		public isNoteOpen: key = (
+			(* Whether the note at the path key (as data-steps writes it) is
+open in this view. *)
+			
+			^openNotes includesKey: key
+		)
 		public keptResults = (
 			^cache
+		)
+		public noteNumbers: keys = (
+			(* Number the notes of a rendering: keys, their paths in document
+order. *)
+			
+			numbers:: Map new.
+			keys keysAndValuesDo: [:i :k | numbers at: k put: i ]
+		)
+		public numberOfNote: key = (
+			numbers isNil ifTrue: [ ^nil ].
+			^numbers at: key ifAbsent: [ nil ]
+		)
+		public openNote: key = (
+			openNotes at: key put: true
+		)
+		openNotes = (
+			(* The paths of the open notes: the view's state, kept across
+renderings, as the amplets' results are. *)
+			
+			notesOpen isNil ifTrue: [ notesOpen:: Map new ].
+			^notesOpen
 		)
 		public refresh = (
 			(* Run the kept amplets that answered fragments again, as an
@@ -202,6 +252,16 @@ shows the change (a presentation's next slide). Other results are kept. *)
 			value isKindOfFragment ifTrue: [ ^value ].
 			value isKindOfString ifTrue: [ ^value ].
 			^value printString
+		)
+		public toggleNote: key = (
+			(* Open the note at key, or close it; answers whether it is open. *)
+			
+			(openNotes includesKey: key) ifTrue: [
+					openNotes removeKey: key.
+					^false
+				].
+			openNotes at: key put: true.
+			^true
 		)
 		public urlOfImage: name = (
 			(* The URL of the image a document names: the evaluator's answer
@@ -436,8 +496,13 @@ of templates' blocks, which do not see the library's. *)
 		(* A document shows its title, subtitle, and authors before its body,
 all on its background image, if it has one. A slide is laid out at its own
 size and zoomed to the space it has, so its text, images, and layout shrink
-or grow together. *)
+or grow together. Printed, its notes are collected at its end. *)
 		
+		(* The document's notes in this rendering (notesIn:steps:). *)
+		
+		|
+			notes
+		|
 	) (
 		backgroundStyle = (
 			| url |
@@ -447,9 +512,27 @@ or grow together. *)
 			^' background-image: url("' , url , '"); background-repeat: no-repeat;'
 		)
 		definition = (
-			| f = super definition. |
+			| f |
+			notes:: notesIn: tree steps: subject steps.
+			subject amplets isNil ifFalse: [
+					subject amplets noteNumbers: (notes collect: [:n | n at: 1 ])
+				].
+			f:: super definition.
 			block page = 'slide' ifTrue: [ f onVisual: [:e | fitSlide: e ] ].
 			^f
+		)
+		ensurePrintStyle: element = (
+			(* The print stylesheet, once in the page: printed, the notes'
+contents are hidden in the text, leaving their numbers, and collected at the
+end of the document (endnotes). *)
+			
+			| d = element at: #ownerDocument. s |
+			(d getElementById: 'emmanuel-print-style') isNil ifFalse: [ ^self ].
+			s:: d createElement: 'style'.
+			s setAttribute: 'id' to: 'emmanuel-print-style'.
+			s at: #textContent
+				put: '.emmanuel-endnotes { display: none; } @media print { .emmanuel-endnotes { display: block; } [data-note] > :not([data-note-marker]) { display: none !important; } [data-note] { background-color: transparent !important; } }'.
+			(d at: #head) appendChild: s
 		)
 		fitSlide: element = (
 			(* Zoom the slide element whenever it, the space around it, or the
@@ -486,7 +569,32 @@ window changes size. *)
 			^out asArray
 		)
 		styleOf: b = (
-			^(super styleOf: b) , (block sheet lookOf: #document) , backgroundStyle , (pageStyleOf: block page)
+			(* A document shown in an amplet of an aligned container does not
+place its own amplets by that alignment (Presentation align:). *)
+			
+			^(super styleOf: b) , (block sheet lookOf: #document) , backgroundStyle , (pageStyleOf: block page) , ' --emmanuel-amplet-left: 0; --emmanuel-amplet-right: 0; --emmanuel-amplet-width: auto;'
+		)
+		trailingFragments = (
+			(* Printed, the notes are collected at the end, numbered, each with
+its content; on the screen this is hidden (ensurePrintStyle:). *)
+			
+			| list f |
+			(notes isNil or: [ notes isEmpty ]) ifTrue: [ ^{} ].
+			list:: List new.
+			list add: (ElementFragment tag: 'h3'
+					style: 'margin: 1.5em 0 0.5em 0;'
+					children: {'Notes'. }).
+			notes keysAndValuesDo: [:i :n |
+					list add: (ElementFragment tag: 'div'
+							style: 'margin: 0.3em 0;'
+							children: {i printString , '. '. } , (fragmentsOfItems: (n at: 2) items
+								steps: (n at: 3)
+								amplets: subject amplets))
+				].
+			f:: ElementFragment tag: 'div' style: '' children: list asArray.
+			f attributes: {{'class'. 'emmanuel-endnotes'. }. }.
+			f onVisual: [:e | ensurePrintStyle: e ].
+			^{noEdit: f. }
 		)
 		zoomSlide: element in: p = (
 			(* Zoom the slide to the width it has, the editor's frame or the
@@ -726,6 +834,29 @@ document body, so it can be inline. *)
 		trailingFragments = (
 			block caption isNil ifTrue: [ ^{} ].
 			^{field: block caption tag: 'figcaption' style: ''. }
+		)
+	) : ()
+	public class Footnote new = LibraryBlock new (
+		(* A note (note ... endNote): a footnote, or in a shared document a
+comment, written where it is used. It is inline, so that in a cell's text or
+another note's it is an inline child, and it holds anything: inline content,
+other notes included, and flow content. *)
+		
+	) (
+		public contentClass = (
+			^#inline
+		)
+		public htmlTag = (
+			^'span'
+		)
+		public model = (
+			^flowContent , inlineContent , {'endNote'. }
+		)
+		public presenterOn: s = (
+			^NotePresenter onSubject: s
+		)
+		public stateName = (
+			^'footnote'
 		)
 	) : ()
 	public class HeaderRow new = LibraryBlock new (
@@ -981,7 +1112,7 @@ string is taken as it is; anything else is refused. *)
 			^{'section:'. 'title:'. 'subtitle:'. 'author:'. 'attribution:'. 'caption:'. }
 		)
 		inlineContent = (
-			^{'emphasis'. 'strong'. 'strikethrough'. 'subscript'. 'superscript'. 'code'. 'newline'. 'amplet:'. 'link:'. } , sheet inlineOpeners
+			^{'emphasis'. 'strong'. 'strikethrough'. 'subscript'. 'superscript'. 'code'. 'newline'. 'amplet:'. 'link:'. 'note'. } , sheet inlineOpeners
 		)
 		isConstruct: x = (
 			(* Whether x is a construct of this block's template. *)
@@ -1205,6 +1336,67 @@ which may be shown within another. *)
 			^'newline'
 		)
 	) : ()
+	public class NotePresenter onSubject: s = BlockPresenter onSubject: s (
+		(* A note shows as its number, a superscript marker; a click on it opens
+the note's content in place, in the middle of the sentence, and closes it
+again. Its number, and whether it is open, are the view's, which its amplets
+runner keeps across renderings. *)
+		
+	) (
+		apply: open to: element = (
+			(* Show or hide the note's content: every child of its element but
+the marker. *)
+			
+			| kids = element at: #children. |
+			(element at: #style) at: #backgroundColor
+				put: (open ifTrue: [ 'rgba(255, 236, 153, 0.45)' ] ifFalse: [ '' ]).
+			0 to: (kids at: #length) - 1
+				do: [:i |
+					| k = kids item: i. |
+					(k getAttribute: 'data-note-marker') isNil ifTrue: [
+							(k at: #style) at: #display
+								put: (open ifTrue: [ '' ] ifFalse: [ 'none' ])
+						]
+				]
+		)
+		definition = (
+			| f = super definition. |
+			f attributes: f attributes , {{'data-note'. key. }. }.
+			f onVisual: [:e | apply: isOpen to: e ].
+			^f
+		)
+		isOpen = (
+			subject amplets isNil ifTrue: [ ^false ].
+			^subject amplets isNoteOpen: key
+		)
+		key = (
+			^join: subject steps with: ' '
+		)
+		leadingFragments = (
+			| n = subject amplets isNil ifTrue: [ nil ]
+				ifFalse: [ subject amplets numberOfNote: key ]. marker = ElementFragment tag: 'sup'
+				style: 'cursor: pointer; color: #2a5db0; font-weight: bold; padding: 0 0.1em;'
+				children: {n isNil ifTrue: [ '*' ] ifFalse: [ n printString ]. }. |
+			marker attributes: {{'data-note-marker'. 'true'. }. {'title'. 'Show or hide this note'. }. }.
+			marker onVisual: [:e |
+					e addEventListener: 'click'
+						action: [:ev |
+							| open = toggle. |
+							ev preventDefault.
+							ev stopPropagation.
+							apply: open to: (e at: #parentElement).
+							nil
+						]
+				].
+			^{noEdit: marker. }
+		)
+		toggle = (
+			(* Open the note, or close it; answers whether it is now open. *)
+			
+			subject amplets isNil ifTrue: [ ^false ].
+			^subject amplets toggleNote: key
+		)
+	) : ()
 	public class NumberedList new = LibraryBlock new (
 	) (
 		public htmlTag = (
@@ -1246,9 +1438,19 @@ out of its CSS declaration is ignored. *)
 		|
 	) (
 		public align: a = (
-			({'left'. 'center'. 'right'. 'justify'. } includes: a) ifTrue: [
-					declare: 'text-align' value: a
-				]
+			(* Text aligned to a; a block amplet in it is placed so as a whole
+(AmpletPresenter), told where by the custom properties
+--emmanuel-amplet-left, -right, and -width, which its content inherits. *)
+			
+			| placed = a = 'center' or: [ a = 'right' ]. |
+			({'left'. 'center'. 'right'. 'justify'. } includes: a) ifFalse: [ ^self ].
+			declare: 'text-align' value: a.
+			declare: '--emmanuel-amplet-left'
+				value: (placed ifTrue: [ 'auto' ] ifFalse: [ '0' ]).
+			declare: '--emmanuel-amplet-right'
+				value: (a = 'center' ifTrue: [ 'auto' ] ifFalse: [ '0' ]).
+			declare: '--emmanuel-amplet-width'
+				value: (placed ifTrue: [ 'fit-content' ] ifFalse: [ 'auto' ])
 		)
 		public backgroundColor: c = (
 			declare: 'background-color' value: c
@@ -1623,6 +1825,7 @@ its code, or, with none, the code itself. *)
 	) : ()
 	public closerOf: x = (
 		x = 'paragraph' ifTrue: [ ^'endParagraph' ].
+		x = 'note' ifTrue: [ ^'endNote' ].
 		x = 'emphasis' ifTrue: [ ^'endEmphasis' ].
 		x = 'strong' ifTrue: [ ^'endStrong' ].
 		x = 'strikethrough' ifTrue: [ ^'endStrikethrough' ].
@@ -1643,7 +1846,7 @@ its code, or, with none, the code itself. *)
 		^Error signal: 'no closer: ' , x
 	)
 	closers = (
-		^{'endParagraph'. 'endEmphasis'. 'endStrong'. 'endStrikethrough'. 'endSubscript'. 'endSuperscript'. 'endCode'. 'endSection'. 'endList'. 'endNumberedList'. 'endItem'. 'endQuote'. 'endTable'. 'endRow'. 'endCell'. 'endFigure'. 'endLink'. }
+		^{'endParagraph'. 'endEmphasis'. 'endStrong'. 'endStrikethrough'. 'endSubscript'. 'endSuperscript'. 'endCode'. 'endSection'. 'endList'. 'endNumberedList'. 'endItem'. 'endQuote'. 'endTable'. 'endRow'. 'endCell'. 'endFigure'. 'endLink'. 'endNote'. }
 	)
 	constructsOf: blockClass = (
 		(* The constructs blocks of the class blockClass understand: the
@@ -1787,6 +1990,39 @@ this library's class, on this library's platform and core. *)
 		f attributes: f attributes , {{'contenteditable'. 'false'. }. }.
 		^f
 	)
+	public notePathsIn: tr steps: ss = (
+		(* The paths of the notes of the tree tr, which is at the path ss, in
+document order (eq:lib-note-numbers), each as data-steps writes it. *)
+		
+		^(notesIn: tr steps: ss) collect: [:n | n at: 1 ]
+	)
+	public notesIn: tr steps: ss = (
+		(* The notes of the tree tr, which is at the path ss, in document
+order (eq:lib-note-numbers): a block itself, then the trees of its fields
+that hold markup, then its subtrees. Each is {its path as data-steps writes
+it. its tree. its steps}. *)
+		
+		| out = List new. |
+		notesIn: tr steps: ss into: out.
+		^out asArray
+	)
+	notesIn: tr steps: ss into: out = (
+		tr state stateName = 'footnote' ifTrue: [
+				out add: {join: ss with: ' '. tr. ss. }
+			].
+		(tr state fields: tr messages) keysAndValuesDo: [:i :phi |
+				phi value isKindOfTreeValue ifTrue: [
+						notesIn: phi value tree
+							steps: ss , {'f' , (i - 1) printString. }
+							into: out
+					]
+			].
+		tr items keysAndValuesDo: [:i :g |
+				g kind = #sub ifTrue: [
+						notesIn: g ref steps: ss , {'i' , (i - 1) printString. } into: out
+					]
+			]
+	)
 	opened: x = (
 		x = 'paragraph' ifTrue: [ ^Paragraph new ].
 		x = 'emphasis' ifTrue: [ ^Emphasis new ].
@@ -1803,10 +2039,11 @@ this library's class, on this library's platform and core. *)
 		x = 'headerRow' ifTrue: [ ^HeaderRow new ].
 		x = 'row' ifTrue: [ ^Row new ].
 		x = 'cell' ifTrue: [ ^Cell new ].
+		x = 'note' ifTrue: [ ^Footnote new ].
 		^Figure new
 	)
 	public openers = (
-		^{'paragraph'. 'emphasis'. 'strong'. 'strikethrough'. 'subscript'. 'superscript'. 'code'. 'list'. 'numberedList'. 'item'. 'quote'. 'table'. 'headerRow'. 'row'. 'cell'. 'figure'. }
+		^{'paragraph'. 'emphasis'. 'strong'. 'strikethrough'. 'subscript'. 'superscript'. 'code'. 'list'. 'numberedList'. 'item'. 'quote'. 'table'. 'headerRow'. 'row'. 'cell'. 'figure'. 'note'. }
 	)
 	public pageMaxWidth: page = (
 		(* The widest the view may lay a document out whose page is page (a

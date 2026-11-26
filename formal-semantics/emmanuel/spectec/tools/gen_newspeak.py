@@ -25,7 +25,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 LIBRARY_RELATIONS = {"LibTree", "LibErrors", "LibRoundTrip", "Edit", "LibAnchor", "LibIsPoint",
                      "LibLoc", "LibBackspace", "LibEnter", "LibInsertable", "LibInsert",
-                     "LibPlace", "LibCaretOK", "LibEditCaret", "ViewKey"}
+                     "LibPlace", "LibCaretOK", "LibEditCaret", "ViewKey", "LibNotes"}
 
 # Library rows the Newspeak library cannot satisfy, with the reason. They
 # are listed in the generated file's comment instead of becoming tests.

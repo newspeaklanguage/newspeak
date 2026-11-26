@@ -20,6 +20,15 @@
 #    site that has it keeps it as it is. To refresh it, set PSOUP_RUNTIME to a
 #    directory that holds a built one (newspeak's out/ after tool/build.sh).
 #
+# 4. A site with a webIDE/ (newspeaklanguage.org's PWA) also gets the Eurasia
+#    IDE (site-runtime.sh --with-ide): webIDE/eurasia.html is eurasia-ide.html
+#    with <base href="/">, so that it lies within the service worker's scope
+#    (webIDE/) while what it loads comes from the site's root, as psoup's
+#    webIDE/index.html does, and it registers the service worker itself (one
+#    may never open psoup's page); webIDE/index.html?eurasia opens it. The service
+#    worker answers from its cache first, so an installed PWA sees a new
+#    runtime only when sw.js changes: pwaVersion in webIDE/sw.js is bumped.
+#
 # It does not commit or push: review the result in TARGET, then commit there.
 #
 # The eurasia checkout is the one beside newspeak's, or $EURASIA.
@@ -39,8 +48,22 @@ if [ -n "$BUNDLE" ]; then
   echo "$(unzip -Z1 "$BUNDLE" | grep -c '\.html$') pages"
 fi
 
-echo "== the Eurasia site runtime (eurasia/scripts/site-runtime.sh)"
-"$EURASIA/scripts/site-runtime.sh" "$TARGET"
+if [ -d "$TARGET/webIDE" ]; then
+  echo "== the Eurasia site runtime, with the IDE (eurasia/scripts/site-runtime.sh --with-ide)"
+  "$EURASIA/scripts/site-runtime.sh" --with-ide "$TARGET"
+  echo "== the webIDE: webIDE/eurasia.html, and pwaVersion in webIDE/sw.js"
+  awk '{ print } /<meta charset="utf-8">/ && !done { print "<base href=\"/\">"; print "<script>if (\"serviceWorker\" in navigator) navigator.serviceWorker.register(\"/webIDE/sw.js\");</script>"; done = 1 }' \
+    "$TARGET/eurasia-ide.html" > "$TARGET/webIDE/eurasia.html"
+  grep -q '<base href="/">' "$TARGET/webIDE/eurasia.html" || { echo "no <base> in webIDE/eurasia.html" >&2; exit 1; }
+  if [ -f "$TARGET/webIDE/sw.js" ]; then
+    awk '/^const pwaVersion = [0-9]+;/ { sub(/[0-9]+/, $4 + 1) } { print }' \
+      "$TARGET/webIDE/sw.js" > "$TARGET/webIDE/sw.js.new" && mv "$TARGET/webIDE/sw.js.new" "$TARGET/webIDE/sw.js"
+    grep '^const pwaVersion' "$TARGET/webIDE/sw.js"
+  fi
+else
+  echo "== the Eurasia site runtime (eurasia/scripts/site-runtime.sh)"
+  "$EURASIA/scripts/site-runtime.sh" "$TARGET"
+fi
 
 if [ -n "${PSOUP_RUNTIME:-}" ]; then
   echo "== psoup's runtime, from $PSOUP_RUNTIME"

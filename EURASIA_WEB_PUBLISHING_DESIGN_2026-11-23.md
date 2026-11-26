@@ -257,6 +257,23 @@ lands, with psoup a documented prerequisite of the build until then.
    `<Page>.html?eurasia` and back works. GitHub Pages serves `.eus` gzipped
    (`viewer/base.eus` 7.8 MB, 2.4 MB on the wire; psoup's vfuel is 1.9 MB) with
    `max-age=600`, which answers the compression question of section 4.
+   **blog.bracha.org published 2026-11-25** (gbracha/gbracha.github.io
+   `4166519` on top of `97676ec`; to undo, revert `4166519` and push), the
+   same way. Checked live on Eurasia: the index, posts, a post-to-post link
+   naming `<Post>.html?eurasia`, back, and a live class browser
+   (ExpressionProblem); the default still boots psoup. The first deploy
+   deleted the blog's README.md (site-runtime.sh removed the libraries'
+   README from the target); restored before committing, and fixed in eurasia
+   `ce60f5a`.
+   **newspeaklanguage.org published 2026-11-25** (newspeaklanguage/
+   newspeaklanguage.github.io `671f8bc` on top of `e1f8423`; to undo, revert
+   `671f8bc` and push). Checked live on Eurasia: every document page, nav
+   links naming `<Page>.html?eurasia`, back; the default still boots psoup;
+   `webIDE/` untouched. Found: the Demos page is tracked as `demos.html` (a
+   case mismatch hidden by macOS), while the static nav links and the live URL
+   name `Demos.html`, which GitHub Pages answers with 404. Predates this work
+   (2026-07). Fixed the same day: renamed to `Demos.html` (`621adaa`);
+   `/Demos.html` now serves on both runtimes, `/demos.html` is gone.
 6. The CI workflow (2.1).
 7. Stage 0 (2.5); psoup leaves `BUILDING.md`.
 
@@ -288,6 +305,15 @@ The four open questions of the first draft are settled:
    `?psoup` / `data-ampleforth-runtime` switch of §2.2 then runs the other way
    during that period: psoup stays the default and Eurasia is opt-in
    (`?eurasia`), until the swap.
+   **Done 2026-11-25 (opt-in inside the PWA):** `/webIDE/?eurasia` opens
+   `/webIDE/eurasia.html?jit`, eurasia's `ide.html` with `<base href="/">` (in
+   the service worker's scope, loading from the site's root) that registers
+   the service worker itself; `sw.js` precaches the Eurasia files, and
+   `tool/deploy-site.sh` (for a target with `webIDE/`) builds with
+   `site-runtime.sh --with-ide`, writes `eurasia.html` and bumps `pwaVersion`.
+   `sw.js` precached `/dropdownImage.png` (the file is `dropDownImage.png`), so
+   `cache.addAll` had been caching nothing; fixed. Checked in headless Chrome:
+   registered, 64 files precached, the IDE runs offline.
 2. **No smaller viewer for now.** A viewer without sources is interesting as
    an option, but documents could not be edited in it, so it would be a third
    variant beside the IDE and today's viewer. Skipped.

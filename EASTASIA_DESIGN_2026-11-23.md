@@ -707,6 +707,21 @@ activation or loop turn).
   that make an Array, of nils or of the operands on top, write it in the
   nursery as `new:` does; its size is in the instruction, so the stores
   are straight-line code. No room, or no allowance: the helper.
+- **String concatenation** (twelfth step, 2026-11-25). `,` of a String
+  with a String, when the result is at most 1024 bytes: the fresh
+  String's header (which the register block now holds, as it does an
+  Array's) and size are written in the nursery, and a small function of
+  the runtime, called directly, copies the two bodies and zeroes what
+  is left of the last word. Longer results, no room, no allowance: the
+  helper.
+- **`numArgs` and `valueWithArguments:`** (thirteenth step,
+  2026-11-25). `numArgs` of a closure reads the count from the closure.
+  `valueWithArguments:` is the code of `value:` with the arguments
+  taken from an Array: the operand must be an Array whose size is the
+  closure's count; its elements are copied onto the stack where
+  arguments go, then the copied values, and the closure's compiled body
+  is called. Anything else, or a body not compiled: the operands are
+  put back and the helper runs the send.
 - **Through one helper:** every other instruction: sends to receivers no
   case fits, other natives, a non-local
   return that meets `ensure:` or cannot complete. The helper runs it as the interpreter would, on the
@@ -767,6 +782,11 @@ activation or loop turn).
   ParserCombinators 35.1 to 43.6, the rest unchanged. The eleventh
   against the tenth: ParserCombinators 43.0 to 46.0, the rest unchanged
   (Splay varies between 525 and 590 from run to run on either build).
+  The twelfth against the eleventh: Splay 534 to 938, the rest
+  unchanged. Helper calls over the whole run, counted without the
+  profile: 23.6 million to 12.2 million. The thirteenth against the
+  twelfth: ParserCombinators 46.9 to 59.4, the rest unchanged (Splay
+  904 against 936, within what it varies by).
 - **What still calls the helper** (`EASTASIA_JIT_PROFILE=1` counts its
   calls by kind; measured before the third step, 128 million calls):
   closure `value` 28 million, closure creation 19 million, returns from
@@ -798,7 +818,14 @@ activation or loop turn).
   case calls in line) 0.6 million. After the tenth step the String
   `size` and `at:` calls are gone, and after the eleventh the array
   literals: 11 million left, of which string concatenation 5 million,
-  `valueWithArguments:` and `numArgs` 1.9 million each.
+  `valueWithArguments:` and `numArgs` 1.9 million each. After the
+  twelfth, 6 million: those two, a Float's `asString` 0.9 million,
+  ordinary methods of SmallInteger 0.6 million. After the thirteenth,
+  2.5 million, and entries into compiled code from the interpreter's
+  loop fall from 345 thousand to 70 thousand: a Float's `asString` 0.8
+  million, ordinary methods of SmallInteger 0.6 million, an Array's
+  `replaceFrom:to:with:startingAt:` 0.4 million, Float division and
+  `asFloat` 0.2 million each.
 - **A fault found on the way.** The native that replaces a method's
   bytecode left the old compiled code and its table entry in place. It
   now discards compiled code, like any other program change.
@@ -807,8 +834,8 @@ activation or loop turn).
   13 seconds interpreted: every change discards all code, which is then
   compiled again. Dependencies (7.6) are the cure; a cheaper first step is
   to raise the threshold after each discard.
-- **Next, in order of what the numbers say:** string concatenation; `valueWithArguments:`
-  and `numArgs`; methods of SmallInteger called in line; discarding
+- **Next, in order of what the numbers say:** methods of SmallInteger
+  called in line; Float division and `asFloat`; discarding
   less on a program change; then the graph and inlining of 7.1, which is where values start
   to live in registers and where a closure that does not escape need not
   be created at all.
